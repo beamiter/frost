@@ -34,6 +34,7 @@ pub enum Command {
     TerminalScrollDown,
     TerminalPromptPrev,
     TerminalPromptNext,
+    TerminalCopyLastOutput,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -91,6 +92,7 @@ impl std::fmt::Display for Command {
             Command::TerminalScrollDown => write!(f, "terminal:scroll_down"),
             Command::TerminalPromptPrev => write!(f, "terminal:prompt_prev"),
             Command::TerminalPromptNext => write!(f, "terminal:prompt_next"),
+            Command::TerminalCopyLastOutput => write!(f, "terminal:copy_last_output"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -143,6 +145,7 @@ impl std::str::FromStr for Command {
             "terminal:scroll_down" => Ok(Command::TerminalScrollDown),
             "terminal:prompt_prev" => Ok(Command::TerminalPromptPrev),
             "terminal:prompt_next" => Ok(Command::TerminalPromptNext),
+            "terminal:copy_last_output" => Ok(Command::TerminalCopyLastOutput),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -466,6 +469,10 @@ impl KeyBindings {
         bindings.bindings.insert(
             "ctrl+shift+down".to_string(),
             "terminal:prompt_next".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+g".to_string(),
+            "terminal:copy_last_output".to_string(),
         );
 
         // 字体缩放

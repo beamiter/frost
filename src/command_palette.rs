@@ -36,6 +36,7 @@ pub enum PaletteAction {
     ScrollToBottom,
     PromptJumpPrev,
     PromptJumpNext,
+    CopyLastOutput,
     ClearScreen,
 }
 
@@ -259,6 +260,12 @@ impl PaletteState {
                 action: PaletteAction::PromptJumpNext,
             },
             PaletteItem {
+                name: "Copy Last Command Output",
+                description: "Copy the previous command's output (OSC 133)",
+                shortcut: "Ctrl+Shift+G",
+                action: PaletteAction::CopyLastOutput,
+            },
+            PaletteItem {
                 name: "Clear Screen",
                 description: "Clear the terminal screen",
                 shortcut: "",
@@ -407,6 +414,7 @@ mod tests {
             (PaletteAction::ZoomIn, "Ctrl+="),
             (PaletteAction::PromptJumpPrev, "Ctrl+Shift+Up"),
             (PaletteAction::PromptJumpNext, "Ctrl+Shift+Down"),
+            (PaletteAction::CopyLastOutput, "Ctrl+Shift+G"),
         ];
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");

@@ -1452,6 +1452,69 @@ impl TerminalState {
             .chain(active)
     }
 
+    /// Plain text of the most recent completed command's output (OSC 133),
+    /// soft-wrapped rows joined and per-line trailing padding trimmed.
+    /// Returns None when no zone recorded any output or the output is blank.
+    /// Capped at 1 MiB so a huge scrollback range cannot balloon a clipboard
+    /// write.
+    pub fn last_command_output_text(&self) -> Option<String> {
+        const MAX_BYTES: usize = 1 << 20;
+        let zone = self
+            .command_zones
+            .iter()
+            .rev()
+            .find(|zone| zone.output_start.is_some())?;
+        let start = zone.output_start?;
+        let scrollback_len = self.scrollback.len();
+        let end = zone
+            .output_end
+            .unwrap_or(start)
+            .min(scrollback_len + self.grid.rows());
+        if end <= start {
+            return None;
+        }
+        let mut out = String::new();
+        for abs_row in start..end {
+            let (mut segment, wrapped) = if abs_row < scrollback_len {
+                let line = &self.scrollback[abs_row];
+                let text: String = line
+                    .decompress()
+                    .iter()
+                    .filter(|cell| !cell.flags.wide_continuation())
+                    .map(|cell| cell.character)
+                    .collect();
+                (text, line.is_wrapped)
+            } else {
+                let grid_row = abs_row - scrollback_len;
+                if grid_row >= self.grid.rows() {
+                    break;
+                }
+                let text: String = (0..self.grid.row_len())
+                    .map(|col| self.grid.get(grid_row, col))
+                    .filter(|cell| !cell.flags.wide_continuation())
+                    .map(|cell| cell.character)
+                    .collect();
+                (text, self.grid.row_wrapped[grid_row])
+            };
+            if !wrapped {
+                // Hard line end: trailing cell padding is not real output.
+                segment.truncate(segment.trim_end_matches(' ').len());
+            }
+            out.push_str(&segment);
+            if out.len() >= MAX_BYTES {
+                break;
+            }
+            if !wrapped && abs_row + 1 < end {
+                out.push('\n');
+            }
+        }
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
     /// Scroll so the closest prompt above the current view lands at the top
     /// of the viewport. Returns true when the viewport moved.
     pub fn jump_to_prev_prompt(&mut self) -> bool {
@@ -6259,6 +6322,39 @@ mod tests {
             "zone anchors {:?}",
             buffer_row_text(&terminal, row)
         );
+    }
+
+    #[test]
+    fn last_command_output_text_returns_trimmed_output_lines() {
+        let mut terminal = TerminalState::new(20, 6);
+        assert_eq!(terminal.last_command_output_text(), None);
+
+        emit_zone(&mut terminal, 0);
+        assert_eq!(
+            terminal.last_command_output_text().as_deref(),
+            Some("out\nout\nout")
+        );
+
+        // A newer command's output supersedes the previous zone.
+        terminal.process_input(b"\x1b]133;A\x07\x1b]133;B\x07");
+        terminal.process_input(b"$ true\r\n");
+        terminal.process_input(b"\x1b]133;C\x07final line\r\n\x1b]133;D;0\x07");
+        assert_eq!(
+            terminal.last_command_output_text().as_deref(),
+            Some("final line")
+        );
+    }
+
+    #[test]
+    fn last_command_output_survives_scrollback_trim_or_disappears() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.set_max_scrollback(6);
+        emit_zone(&mut terminal, 0);
+        // Trim until the zone's output is gone along with its rows.
+        for _ in 0..30 {
+            terminal.process_input(b"fill\r\n");
+        }
+        assert_eq!(terminal.last_command_output_text(), None);
     }
 
     #[test]

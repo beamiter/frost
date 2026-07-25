@@ -2560,6 +2560,7 @@ impl Jterm {
                 }
                 Task::none()
             }
+            C::TerminalCopyLastOutput => self.copy_last_output_task(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(cmd, C::TerminalPromptPrev) {
@@ -3307,6 +3308,7 @@ impl Jterm {
                 }
                 Task::none()
             }
+            PaletteAction::CopyLastOutput => self.copy_last_output_task(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(action, PaletteAction::PromptJumpPrev) {
@@ -3327,6 +3329,32 @@ impl Jterm {
                     sess.terminal.process_batch(b"\x1b[3J\x1b[2J\x1b[H");
                     sess.refresh();
                 }
+                Task::none()
+            }
+        }
+    }
+
+    /// Copy the previous command's output (OSC 133 zones) to the clipboard,
+    /// shared by the Ctrl+Shift+G binding and the command palette.
+    fn copy_last_output_task(&mut self) -> Task<Message> {
+        let text = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.terminal.last_command_output_text());
+        match text {
+            Some(text) => {
+                let n = text.chars().count();
+                self.push_toast(
+                    format!("Copied last output ({} chars)", n),
+                    ToastKind::Success,
+                );
+                iced::clipboard::write(text)
+            }
+            None => {
+                self.push_toast(
+                    "No command output to copy (needs OSC 133 shell integration)".to_string(),
+                    ToastKind::Info,
+                );
                 Task::none()
             }
         }
@@ -6089,6 +6117,7 @@ impl Jterm {
             section("Edit / Clipboard"),
             kb("Ctrl+Shift+C", "Copy selection"),
             kb("Ctrl+Shift+V", "Paste"),
+            kb("Ctrl+Shift+G", "Copy last command output (OSC 133)"),
             kb("Drag", "Select text"),
             kb("Ctrl+Click", "Open link under cursor"),
             section("Scroll / Search"),
