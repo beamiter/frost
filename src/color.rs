@@ -1,3 +1,4 @@
+use crate::theme::ThemeExt as _;
 use crate::terminal::{Color, DynamicColorPalette};
 use crate::theme::Theme;
 use iced::Color as IColor;

@@ -1,3 +1,4 @@
+use crate::theme::ThemeExt as _;
 use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
 use crate::search::SearchMatch;
 use crate::terminal::{

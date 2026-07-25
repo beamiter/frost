@@ -1,4 +1,5 @@
 pub(crate) use jterm_core::char_width;
+use crate::theme::ThemeExt as _;
 use jterm_core::pane_layout::{
     self, collect_pane_rects, directional_focus_target, equalize_shares, normalized_shares,
     set_divider_share, split_node_rect, Axis, DividerId, PaneDirection, PaneRect, PaneTree,
