@@ -347,6 +347,10 @@ mod tests {
             command: command.to_string(),
             exit_code: Some(exit),
             output: output.to_string(),
+            id: None,
+            output_available: true,
+            truncated: false,
+            total_bytes: output.len(),
         }
     }
 

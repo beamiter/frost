@@ -1532,6 +1532,9 @@ impl Jterm {
         }
         self.agent.persist();
         self.save_session_snapshot();
+        if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
+            log::warn!("rsh execution journal did not flush before exit");
+        }
         iced::exit()
     }
 
@@ -3120,6 +3123,24 @@ impl Jterm {
                     }
                 }
 
+                // Mirror captured command output into rsh's execution journal
+                // (no-op unless RSH_EXECUTION_JOURNAL is enabled).
+                for completed in &completed_commands {
+                    let Some(id) = completed.id.clone() else {
+                        continue;
+                    };
+                    if let Err(error) = jterm_core::execution_journal::submit(
+                        jterm_core::execution_journal::CompletedExecution {
+                            id,
+                            output: completed.output.clone(),
+                            output_available: completed.output_available,
+                            truncated: completed.truncated,
+                            total_bytes: completed.total_bytes,
+                        },
+                    ) {
+                        log::warn!("cannot journal completed command output: {error:?}");
+                    }
+                }
                 for completed in &completed_commands {
                     self.agent.handle_completed(id, completed);
                 }

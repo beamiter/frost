@@ -1023,6 +1023,8 @@ pub struct TerminalState {
     /// Commands finished per OSC 133 `D`, with their text reconstructed from
     /// the buffer. Bounded; drained by the AI agent panel each PTY batch.
     pub pending_completed_commands: std::collections::VecDeque<CompletedCommand>,
+    /// rsh execution id announced by the most recent OSC 133 params.
+    current_command_id: Option<String>,
 }
 
 /// One OSC 133 command lifecycle captured for the AI agent: the typed
@@ -1033,6 +1035,14 @@ pub struct CompletedCommand {
     pub command: String,
     pub exit_code: Option<i32>,
     pub output: String,
+    /// rsh correlation id from an OSC 133 `id=`/`execution_id=` param.
+    pub id: Option<String>,
+    /// Whether the shell reported an output region for this command.
+    pub output_available: bool,
+    /// The captured output hit the byte cap.
+    pub truncated: bool,
+    /// Bytes retained (row-reconstructed capture, equals `output.len()`).
+    pub total_bytes: usize,
 }
 
 impl TerminalState {
@@ -1188,6 +1198,7 @@ impl TerminalState {
             dynamic_palette: [None; 256],
             pending_notifications: Vec::new(),
             pending_completed_commands: std::collections::VecDeque::new(),
+            current_command_id: None,
         }
     }
 
@@ -1354,8 +1365,20 @@ impl TerminalState {
     }
 
     fn handle_osc_133(&mut self, value: &str) {
+        const MAX_EXECUTION_ID_BYTES: usize = 192;
         let absolute_row = self.scrollback.len() + self.cursor_row;
         let mark = value.chars().next().unwrap_or('\0');
+        // rsh correlation metadata rides on any mark as `key=value` params.
+        for part in value.split(';').skip(1) {
+            if let Some((key, id)) = part.split_once('=') {
+                if matches!(key, "id" | "rsh_id" | "execution_id" | "command_id")
+                    && !id.is_empty()
+                    && id.len() <= MAX_EXECUTION_ID_BYTES
+                {
+                    self.current_command_id = Some(id.to_string());
+                }
+            }
+        }
         match mark {
             'A' => {
                 // Prompt start
@@ -1376,8 +1399,17 @@ impl TerminalState {
                 }
             }
             'D' => {
-                // Command finished
-                let exit_code = value.get(2..).and_then(|s| s.parse::<i32>().ok());
+                // Command finished. Exit code arrives positionally (`D;0`) or
+                // as an rsh-style `exit=`/`exit_code=` param.
+                let exit_code = value.split(';').skip(1).find_map(|part| {
+                    match part.split_once('=') {
+                        Some(("exit" | "exit_code" | "exit_status", v)) => {
+                            v.trim().parse::<i32>().ok()
+                        }
+                        Some(_) => None,
+                        None => part.trim().parse::<i32>().ok(),
+                    }
+                });
                 match self.current_zone_state {
                     ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
                         let zone = CommandZone {
@@ -1516,16 +1548,23 @@ impl TerminalState {
         if command.is_empty() {
             return;
         }
+        let output_available = output.is_some();
         let output = output
             .map(|(start, end)| self.rows_text(start, end, MAX_OUTPUT_BYTES))
             .unwrap_or_default();
         if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED {
             self.pending_completed_commands.pop_front();
         }
+        let truncated = output.len() >= MAX_OUTPUT_BYTES;
+        let total_bytes = output.len();
         self.pending_completed_commands.push_back(CompletedCommand {
             command,
             exit_code,
             output,
+            id: self.current_command_id.take(),
+            output_available,
+            truncated,
+            total_bytes,
         });
     }
 
@@ -5115,6 +5154,33 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn osc_133_id_params_correlate_completed_commands() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A;id=rsh-abc.123\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(b"\x1b]133;C\x07hi\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id.as_deref(), Some("rsh-abc.123"));
+        assert!(completed[0].output_available);
+        assert!(!completed[0].truncated);
+        assert_eq!(completed[0].total_bytes, completed[0].output.len());
+        assert_eq!(completed[0].exit_code, Some(0));
+
+        // The id is consumed with its command; the next one must not inherit it.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;C\x07");
+        terminal.process_input(b"\x1b]133;D;exit_code=1\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, None);
+        assert_eq!(completed[0].exit_code, Some(1));
+    }
+
     use super::{
         ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell, TerminalState,
         MAX_TERMINAL_TITLE_CHARS,
