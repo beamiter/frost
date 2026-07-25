@@ -1398,6 +1398,90 @@ impl TerminalState {
         }
     }
 
+    /// Keep OSC 133 bookkeeping aligned with the buffer after `count` rows
+    /// fell off the top of scrollback. Completed zones anchored in the
+    /// trimmed region are dropped; the in-progress zone clamps to row zero
+    /// so a still-running command keeps producing a usable zone.
+    fn on_scrollback_rows_trimmed(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.command_zones.retain_mut(|zone| {
+            if zone.prompt_start < count {
+                return false;
+            }
+            zone.prompt_start -= count;
+            for row in [
+                zone.command_start.as_mut(),
+                zone.output_start.as_mut(),
+                zone.output_end.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *row = row.saturating_sub(count);
+            }
+            true
+        });
+        self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
+            ZoneState::Idle => ZoneState::Idle,
+            ZoneState::PromptStarted(p) => ZoneState::PromptStarted(p.saturating_sub(count)),
+            ZoneState::CommandStarted(p, c) => {
+                ZoneState::CommandStarted(p.saturating_sub(count), c.saturating_sub(count))
+            }
+            ZoneState::OutputStarted(p, c, o) => ZoneState::OutputStarted(
+                p.saturating_sub(count),
+                c.saturating_sub(count),
+                o.saturating_sub(count),
+            ),
+        };
+    }
+
+    /// Absolute buffer row of every known shell prompt (OSC 133), oldest
+    /// first, including the prompt of a command that is still running.
+    fn prompt_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        let active = match self.current_zone_state {
+            ZoneState::Idle => None,
+            ZoneState::PromptStarted(p)
+            | ZoneState::CommandStarted(p, _)
+            | ZoneState::OutputStarted(p, _, _) => Some(p),
+        };
+        self.command_zones
+            .iter()
+            .map(|zone| zone.prompt_start)
+            .chain(active)
+    }
+
+    /// Scroll so the closest prompt above the current view lands at the top
+    /// of the viewport. Returns true when the viewport moved.
+    pub fn jump_to_prev_prompt(&mut self) -> bool {
+        let start = self.viewport_absolute_start();
+        let Some(target) = self.prompt_rows().filter(|&row| row < start).max() else {
+            return false;
+        };
+        let before = self.scroll_offset;
+        self.set_scroll_offset(self.scrollback.len().saturating_sub(target));
+        self.scroll_offset != before
+    }
+
+    /// Scroll so the closest prompt below the current view lands at the top
+    /// of the viewport; past the last prompt this returns to the live view.
+    /// Returns true when the viewport moved.
+    pub fn jump_to_next_prompt(&mut self) -> bool {
+        if self.scroll_offset == 0 {
+            return false;
+        }
+        let start = self.viewport_absolute_start();
+        let before = self.scroll_offset;
+        match self.prompt_rows().filter(|&row| row > start).min() {
+            Some(target) if target < self.scrollback.len() => {
+                self.set_scroll_offset(self.scrollback.len() - target);
+            }
+            _ => self.scroll_to_bottom(),
+        }
+        self.scroll_offset != before
+    }
+
     fn handle_osc_52(&mut self, value: &str) {
         // OSC 52 format: <selection>;<base64-data>
         // selection: c=clipboard, p=primary, s=select (we treat all as clipboard)
@@ -2087,6 +2171,7 @@ impl TerminalState {
         }
         if self.scrollback.len() >= self.max_scrollback {
             self.scrollback.pop_front();
+            self.on_scrollback_rows_trimmed(1);
         }
         self.scrollback.push_back(line);
         // Pin the viewport when the user is reading history: without this,
@@ -3563,6 +3648,8 @@ impl TerminalState {
         // xterm RIS also discards saved lines and resets cursor style, dynamic
         // colors, keyboard-protocol state, selection, and any open hyperlink.
         self.scrollback.clear();
+        self.command_zones.clear();
+        self.current_zone_state = ZoneState::default();
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
         self.cursor_shape = CursorShape::default();
@@ -3923,9 +4010,12 @@ impl TerminalState {
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
         self.max_scrollback = max_scrollback.max(1);
 
+        let mut trimmed = 0usize;
         while self.scrollback.len() > self.max_scrollback {
             self.scrollback.pop_front();
+            trimmed += 1;
         }
+        self.on_scrollback_rows_trimmed(trimmed);
 
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
     }
@@ -6096,5 +6186,116 @@ mod tests {
 
         let release = terminal.get_mouse_release_report(0, 299, 10).unwrap();
         assert_eq!(release, b"\x1b[35;300;11M");
+    }
+
+    /// Emit one complete OSC 133 command zone: prompt, command line, output.
+    fn emit_zone(terminal: &mut TerminalState, index: usize) {
+        terminal.process_input(b"\x1b]133;A\x07\x1b]133;B\x07");
+        terminal.process_input(format!("$ cmd{index}\r\n").as_bytes());
+        terminal.process_input(b"\x1b]133;C\x07");
+        terminal.process_input(b"out\r\nout\r\nout\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+    }
+
+    /// Text content of an absolute buffer row (scrollback + live grid).
+    fn buffer_row_text(terminal: &TerminalState, row: usize) -> String {
+        terminal
+            .search_lines()
+            .nth(row)
+            .map(|line| line.iter().map(|cell| cell.character).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn command_zones_shift_and_drop_as_scrollback_trims() {
+        const MAX: usize = 8;
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.set_max_scrollback(MAX);
+
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        assert_eq!(terminal.command_zones.len(), 2);
+        let first = terminal.command_zones[0].prompt_start;
+        assert!(buffer_row_text(&terminal, first).starts_with("$ cmd0"));
+
+        // Fill to capacity, then trim exactly enough rows to push the first
+        // zone's prompt off the top.
+        let fills = (MAX - terminal.scrollback_len()) + first + 1;
+        for _ in 0..fills {
+            terminal.process_input(b"fill\r\n");
+        }
+        assert_eq!(terminal.command_zones.len(), 1);
+        // The surviving zone must still anchor the second command's prompt.
+        let shifted = terminal.command_zones[0].prompt_start;
+        assert!(
+            buffer_row_text(&terminal, shifted).starts_with("$ cmd1"),
+            "zone anchors {:?}",
+            buffer_row_text(&terminal, shifted)
+        );
+
+        // Trim past the second prompt as well: no zones may remain.
+        let fills = terminal.command_zones[0].prompt_start + 1;
+        for _ in 0..fills {
+            terminal.process_input(b"fill\r\n");
+        }
+        assert!(terminal.command_zones.is_empty());
+    }
+
+    #[test]
+    fn set_max_scrollback_shrink_realigns_command_zones() {
+        let mut terminal = TerminalState::new(20, 4);
+        for _ in 0..12 {
+            terminal.process_input(b"fill\r\n");
+        }
+        emit_zone(&mut terminal, 7);
+        assert_eq!(terminal.command_zones.len(), 1);
+
+        terminal.set_max_scrollback(6);
+
+        assert_eq!(terminal.command_zones.len(), 1);
+        let row = terminal.command_zones[0].prompt_start;
+        assert!(
+            buffer_row_text(&terminal, row).starts_with("$ cmd7"),
+            "zone anchors {:?}",
+            buffer_row_text(&terminal, row)
+        );
+    }
+
+    #[test]
+    fn prompt_jumps_walk_history_and_return_to_live_view() {
+        let mut terminal = TerminalState::new(20, 4);
+        for i in 0..6 {
+            emit_zone(&mut terminal, i);
+        }
+        let history = terminal.scrollback_len();
+        let prompts: Vec<usize> = terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.prompt_start)
+            .collect();
+        assert!(prompts.len() >= 4);
+
+        // At the live view, "next prompt" has nowhere to go.
+        assert!(!terminal.jump_to_next_prompt());
+
+        // Walking up visits each prompt in scrollback, newest first, landing
+        // the prompt row exactly at the top of the viewport.
+        let mut visited = Vec::new();
+        while terminal.jump_to_prev_prompt() {
+            visited.push(terminal.viewport_absolute_start());
+        }
+        let mut expected: Vec<usize> = prompts.iter().copied().filter(|&r| r < history).collect();
+        expected.reverse();
+        assert_eq!(visited, expected);
+
+        // Walking down visits them in order and ends back at the live view.
+        let mut down = Vec::new();
+        while terminal.jump_to_next_prompt() {
+            down.push(terminal.viewport_absolute_start());
+        }
+        let mut expected_down: Vec<usize> = expected.iter().rev().skip(1).copied().collect();
+        expected_down.push(history);
+        assert_eq!(down, expected_down);
+        assert_eq!(terminal.scroll_offset, 0);
     }
 }

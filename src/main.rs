@@ -2560,6 +2560,19 @@ impl Jterm {
                 }
                 Task::none()
             }
+            C::TerminalPromptPrev | C::TerminalPromptNext => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    let moved = if matches!(cmd, C::TerminalPromptPrev) {
+                        sess.terminal.jump_to_prev_prompt()
+                    } else {
+                        sess.terminal.jump_to_next_prompt()
+                    };
+                    if moved {
+                        sess.refresh();
+                    }
+                }
+                Task::none()
+            }
             C::TerminalSplitVertical => {
                 self.split(Axis::Vertical);
                 Task::none()
@@ -3291,6 +3304,19 @@ impl Jterm {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     sess.terminal.scroll_to_bottom();
                     sess.refresh();
+                }
+                Task::none()
+            }
+            PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    let moved = if matches!(action, PaletteAction::PromptJumpPrev) {
+                        sess.terminal.jump_to_prev_prompt()
+                    } else {
+                        sess.terminal.jump_to_next_prompt()
+                    };
+                    if moved {
+                        sess.refresh();
+                    }
                 }
                 Task::none()
             }
@@ -6068,6 +6094,7 @@ impl Jterm {
             section("Scroll / Search"),
             kb("Shift+Home", "Scroll to top"),
             kb("Shift+End", "Scroll to bottom (live)"),
+            kb("Ctrl+Shift+Up / Down", "Previous / next prompt (OSC 133)"),
             kb("Ctrl+Shift+F", "Find"),
             section("Panels"),
             kb("Ctrl+\\", "Toggle tabs / files sidebar"),

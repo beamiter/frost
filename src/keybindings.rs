@@ -32,6 +32,8 @@ pub enum Command {
     TerminalClear,      // Ctrl+L
     TerminalScrollUp,
     TerminalScrollDown,
+    TerminalPromptPrev,
+    TerminalPromptNext,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -87,6 +89,8 @@ impl std::fmt::Display for Command {
             Command::TerminalClear => write!(f, "terminal:clear"),
             Command::TerminalScrollUp => write!(f, "terminal:scroll_up"),
             Command::TerminalScrollDown => write!(f, "terminal:scroll_down"),
+            Command::TerminalPromptPrev => write!(f, "terminal:prompt_prev"),
+            Command::TerminalPromptNext => write!(f, "terminal:prompt_next"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -137,6 +141,8 @@ impl std::str::FromStr for Command {
             "terminal:clear" => Ok(Command::TerminalClear),
             "terminal:scroll_up" => Ok(Command::TerminalScrollUp),
             "terminal:scroll_down" => Ok(Command::TerminalScrollDown),
+            "terminal:prompt_prev" => Ok(Command::TerminalPromptPrev),
+            "terminal:prompt_next" => Ok(Command::TerminalPromptNext),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -453,6 +459,14 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+down".to_string(), "terminal:scroll_down".to_string());
+        bindings.bindings.insert(
+            "ctrl+shift+up".to_string(),
+            "terminal:prompt_prev".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+down".to_string(),
+            "terminal:prompt_next".to_string(),
+        );
 
         // 字体缩放
         bindings

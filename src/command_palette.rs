@@ -34,6 +34,8 @@ pub enum PaletteAction {
     ZoomReset,
     ScrollToTop,
     ScrollToBottom,
+    PromptJumpPrev,
+    PromptJumpNext,
     ClearScreen,
 }
 
@@ -245,6 +247,18 @@ impl PaletteState {
                 action: PaletteAction::ScrollToBottom,
             },
             PaletteItem {
+                name: "Previous Prompt",
+                description: "Scroll to the previous shell prompt (OSC 133)",
+                shortcut: "Ctrl+Shift+Up",
+                action: PaletteAction::PromptJumpPrev,
+            },
+            PaletteItem {
+                name: "Next Prompt",
+                description: "Scroll to the next shell prompt (OSC 133)",
+                shortcut: "Ctrl+Shift+Down",
+                action: PaletteAction::PromptJumpNext,
+            },
+            PaletteItem {
                 name: "Clear Screen",
                 description: "Clear the terminal screen",
                 shortcut: "",
@@ -391,6 +405,8 @@ mod tests {
             (PaletteAction::ToggleSidebar, "Ctrl+\\"),
             (PaletteAction::QuickTabSwitch, "Ctrl+Shift+L"),
             (PaletteAction::ZoomIn, "Ctrl+="),
+            (PaletteAction::PromptJumpPrev, "Ctrl+Shift+Up"),
+            (PaletteAction::PromptJumpNext, "Ctrl+Shift+Down"),
         ];
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");

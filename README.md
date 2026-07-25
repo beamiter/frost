@@ -12,6 +12,7 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
+- OSC 133 shell 集成：在回滚中沿命令提示符逐条跳转（`Ctrl+Shift+↑/↓`），历史修剪时命令区保持对齐
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
 - PTY 启动采用 fork→exec 错误握手；无效目录、shell/exec 失败会显示可重试诊断而不是崩溃
 - 配置与快捷键热重载采用 last-known-good；坏文件会显示路径/行列并暂停自动写回
@@ -50,6 +51,7 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 新建标签 | `Ctrl+Shift+T` |
 | 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | 搜索全部回滚 | `Ctrl+Shift+F` |
+| 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
 | 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
