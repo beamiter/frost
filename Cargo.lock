@@ -1959,6 +1959,7 @@ dependencies = [
  "fuzzy-matcher",
  "iced",
  "image",
+ "jterm_core",
  "libc",
  "log",
  "lru 0.18.1",
@@ -1967,10 +1968,23 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tokio",
  "toml",
  "unicode-normalization",
  "unicode-width",
  "uuid",
+]
+
+[[package]]
+name = "jterm_core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "memchr",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2017,9 +2031,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -3819,7 +3833,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

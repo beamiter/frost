@@ -61,6 +61,7 @@ pub enum Command {
     ConfigClose,
     ConfigToggle,
     SidebarToggle,
+    AgentToggle,
 
     // === 字体缩放 ===
     FontZoomIn,
@@ -113,6 +114,7 @@ impl std::fmt::Display for Command {
             Command::ConfigClose => write!(f, "config:close"),
             Command::ConfigToggle => write!(f, "config:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
+            Command::AgentToggle => write!(f, "agent:toggle"),
             Command::FontZoomIn => write!(f, "font:zoom_in"),
             Command::FontZoomOut => write!(f, "font:zoom_out"),
             Command::FontZoomReset => write!(f, "font:zoom_reset"),
@@ -166,6 +168,7 @@ impl std::str::FromStr for Command {
             "config:close" => Ok(Command::ConfigClose),
             "config:toggle" => Ok(Command::ConfigToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
+            "agent:toggle" => Ok(Command::AgentToggle),
             "font:zoom_in" => Ok(Command::FontZoomIn),
             "font:zoom_out" => Ok(Command::FontZoomOut),
             "font:zoom_reset" => Ok(Command::FontZoomReset),
@@ -454,6 +457,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+a".to_string(), "agent:toggle".to_string());
 
         // 终端操作
         bindings
@@ -660,6 +666,7 @@ mod tests {
             ("ctrl+shift+f", Command::SearchOpen),
             ("ctrl+shift+o", Command::ConfigToggle),
             ("ctrl+backslash", Command::SidebarToggle),
+            ("ctrl+shift+a", Command::AgentToggle),
             ("ctrl+shift+e", Command::TerminalSplitVertical),
             ("ctrl+shift+d", Command::TerminalSplitHorizontal),
             ("ctrl+shift+z", Command::PaneZoomToggle),

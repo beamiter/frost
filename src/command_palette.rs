@@ -26,6 +26,7 @@ pub enum PaletteAction {
     ZoomPane,
     SwapPanes,
     ToggleSidebar,
+    ToggleAgent,
     OpenSettings,
     QuickTabSwitch,
     OpenHelp,
@@ -198,6 +199,12 @@ impl PaletteState {
                 description: "Show or hide the tabs and files sidebar",
                 shortcut: "Ctrl+\\",
                 action: PaletteAction::ToggleSidebar,
+            },
+            PaletteItem {
+                name: "Toggle AI Agent",
+                description: "Open or close the AI agent panel (per-command approval)",
+                shortcut: "Ctrl+Shift+A",
+                action: PaletteAction::ToggleAgent,
             },
             PaletteItem {
                 name: "Settings",

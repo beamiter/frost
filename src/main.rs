@@ -1,5 +1,6 @@
 mod char_width;
 mod color;
+mod agent;
 mod command_palette;
 mod config;
 mod debug;
@@ -81,6 +82,10 @@ static SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-input"));
 static PALETTE_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-palette-input"));
+static AGENT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-input"));
+static AGENT_EDIT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-edit-input"));
 static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
 
@@ -695,6 +700,12 @@ fn resolve_optional_font(family: Option<&str>) -> Option<iced::Font> {
 }
 
 fn main() -> iced::Result {
+    // Shared jterm_core modules brand themselves per app (env prefixes,
+    // prompt strings) from this identity.
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "jterm3",
+        app_id: "io.github.beamiter.jterm3",
+    });
     env_logger::init();
     let config_load = Config::load_with_diagnostics();
     let config_diagnostic = config_load.diagnostic;
@@ -725,6 +736,29 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    // AI agent panel (per-command approval agent over jterm_core).
+    AgentInput(String),
+    AgentSubmit,
+    AgentApprove(jterm_core::agent::ProposalId),
+    AgentEditStart(jterm_core::agent::ProposalId, String),
+    AgentEditInput(String),
+    AgentEditApprove(jterm_core::agent::ProposalId),
+    AgentEditCancel,
+    AgentReject(jterm_core::agent::ProposalId),
+    /// One model reply for the given request generation (stale ones dropped).
+    AgentModelReply(u64, Result<String, String>),
+    AgentContinueTask,
+    AgentNewTask,
+    AgentClearContext,
+    AgentClose,
+    SetAiEnabled(bool),
+    SetAiProvider(String),
+    SetAiModel(String),
+    SetAiBaseUrl(String),
+    SetAiMaxTokens(u32),
+    SetAiRedactSecrets(bool),
+    SetAiKeyFile(String),
+    SetAgentMaxTurns(u32),
     PtyOutput(usize, RawFd, Vec<u8>),
     PtyExited(usize, RawFd, i32),
     Key(keyboard::Event),
@@ -1187,6 +1221,7 @@ struct Jterm {
     /// bursts so each chunk does not rescan the entire scrollback.
     search_dirty: bool,
     palette: command_palette::PaletteState,
+    agent: agent::AgentUi,
     keybindings: keybindings::KeyBindings,
     config_panel_open: bool,
     help_open: bool,
@@ -1343,6 +1378,7 @@ impl Jterm {
             search: search::SearchState::new(),
             search_dirty: false,
             palette: command_palette::PaletteState::new(),
+            agent: agent::AgentUi::new(),
             keybindings: keybindings_load.bindings,
             config_panel_open: false,
             help_open: false,
@@ -1904,6 +1940,7 @@ impl Jterm {
             );
             return Task::none();
         }
+        self.agent.persist();
         self.save_session_snapshot();
         iced::exit()
     }
@@ -2644,6 +2681,20 @@ impl Jterm {
                 Task::none()
             }
             C::SidebarToggle => self.toggle_sidebar(),
+            C::AgentToggle => {
+                if self.agent.is_open {
+                    self.agent.close();
+                    Task::none()
+                } else {
+                    let session_id = self.sessions.get(self.active).map(|s| s.id).unwrap_or(0);
+                    self.agent.open(&self.config, session_id);
+                    let focus = iced::widget::operation::focus(AGENT_INPUT_ID.clone());
+                    match self.agent_drive_task() {
+                        Some(task) => Task::batch([focus, task]),
+                        None => focus,
+                    }
+                }
+            }
             C::FontZoomIn => {
                 self.adjust_font_size(1.0);
                 Task::none()
@@ -3269,6 +3320,20 @@ impl Jterm {
             }
             PaletteAction::ClosePane => self.close_focused_pane(),
             PaletteAction::ToggleSidebar => self.toggle_sidebar(),
+            PaletteAction::ToggleAgent => {
+                if self.agent.is_open {
+                    self.agent.close();
+                    Task::none()
+                } else {
+                    let session_id = self.sessions.get(self.active).map(|s| s.id).unwrap_or(0);
+                    self.agent.open(&self.config, session_id);
+                    let focus = iced::widget::operation::focus(AGENT_INPUT_ID.clone());
+                    match self.agent_drive_task() {
+                        Some(task) => Task::batch([focus, task]),
+                        None => focus,
+                    }
+                }
+            }
             PaletteAction::OpenSettings => {
                 self.config_panel_open = true;
                 Task::none()
@@ -3372,6 +3437,7 @@ impl Jterm {
                 let mut clip_query = false;
                 let mut clip_requests: Vec<terminal::ClipboardReadKind> = Vec::new();
                 let mut notifications: Vec<(String, String)> = Vec::new();
+                let mut completed_commands: Vec<terminal::CompletedCommand> = Vec::new();
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.terminal.process_batch(&data);
                     sess.flush_responses();
@@ -3385,6 +3451,7 @@ impl Jterm {
                         .map(|r| r.kind)
                         .collect();
                     notifications = sess.terminal.pending_notifications.drain(..).collect();
+                    completed_commands = sess.terminal.take_completed_commands();
                 }
                 self.last_ingest_us = t0.elapsed().as_micros();
                 self.last_ingest_bytes = data.len();
@@ -3501,9 +3568,102 @@ impl Jterm {
                     }
                 }
 
+                for completed in &completed_commands {
+                    self.agent.handle_completed(id, completed);
+                }
+                if let Some(task) = self.agent_drive_task() {
+                    tasks.push(task);
+                }
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
                 }
+            }
+            Message::AgentClose => self.agent.close(),
+            Message::AgentInput(value) => self.agent.input = value,
+            Message::AgentSubmit => {
+                self.agent.submit_input();
+                if let Some(task) = self.agent_drive_task() {
+                    return task;
+                }
+            }
+            Message::AgentApprove(id) => {
+                if let Some(task) = self.agent_run_approved(id, None) {
+                    return task;
+                }
+            }
+            Message::AgentEditStart(id, command) => {
+                self.agent.edit = Some((id, command));
+            }
+            Message::AgentEditInput(value) => {
+                if let Some((_, buffer)) = self.agent.edit.as_mut() {
+                    *buffer = value;
+                }
+            }
+            Message::AgentEditCancel => self.agent.edit = None,
+            Message::AgentEditApprove(id) => {
+                let edited = self
+                    .agent
+                    .edit
+                    .take()
+                    .filter(|(edit_id, _)| *edit_id == id)
+                    .map(|(_, buffer)| buffer);
+                if let Some(task) = self.agent_run_approved(id, edited) {
+                    return task;
+                }
+            }
+            Message::AgentReject(id) => {
+                self.agent.reject(id);
+                if let Some(task) = self.agent_drive_task() {
+                    return task;
+                }
+            }
+            Message::AgentModelReply(generation, result) => {
+                self.agent.model_reply(generation, result);
+                if let Some(task) = self.agent_drive_task() {
+                    return task;
+                }
+            }
+            Message::AgentContinueTask => {
+                self.agent.continue_task();
+            }
+            Message::AgentNewTask => {
+                self.agent.new_task();
+            }
+            Message::AgentClearContext => {
+                self.agent.last_manual_completed = None;
+            }
+            Message::SetAiEnabled(enabled) => {
+                self.config.ai_enabled = enabled;
+                self.config_dirty = true;
+            }
+            Message::SetAiProvider(provider) => {
+                self.config.ai_provider = provider;
+                self.config_dirty = true;
+            }
+            Message::SetAiModel(model) => {
+                self.config.ai_model = model;
+                self.config_dirty = true;
+            }
+            Message::SetAiBaseUrl(url) => {
+                self.config.ai_base_url = url;
+                self.config_dirty = true;
+            }
+            Message::SetAiMaxTokens(tokens) => {
+                self.config.ai_max_tokens = tokens.clamp(64, 32_768);
+                self.config_dirty = true;
+            }
+            Message::SetAiRedactSecrets(redact) => {
+                self.config.ai_redact_secrets = redact;
+                self.config_dirty = true;
+            }
+            Message::SetAiKeyFile(path) => {
+                // Keep the raw editing text; only fully-blank clears the key.
+                self.config.ai_api_key_file = Some(path).filter(|p| !p.trim().is_empty());
+                self.config_dirty = true;
+            }
+            Message::SetAgentMaxTurns(turns) => {
+                self.config.agent_max_turns = turns.clamp(1, 100);
+                self.config_dirty = true;
             }
             Message::Osc52Query(id, fd, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
@@ -5547,6 +5707,12 @@ impl Jterm {
         };
         // Help and the debug panel float above any other overlay so they can be
         // summoned at any time (and the debug panel can sit alongside others).
+        // Agent panel floats above the terminal but below help/debug.
+        let body: Element<'_, Message> = if self.agent.is_open {
+            stack![body, self.agent_panel()].into()
+        } else {
+            body
+        };
         let body: Element<'_, Message> = if self.help_open {
             stack![body, self.help_panel()].into()
         } else if self.debug_open {
@@ -5554,6 +5720,7 @@ impl Jterm {
         } else {
             body
         };
+
         // Optional left dock (file tree and/or tab list) beside the terminal,
         // separated by a draggable resize divider.
         let main_area: Element<'_, Message> = if self.dock_open() {
@@ -5951,6 +6118,83 @@ impl Jterm {
                 .into(),
         );
 
+        // ── AI & Agent ────────────────────────────────────────────────────
+        let ai_header = text("AI & Agent").size(15);
+        let ai_enable_row = responsive_control_row(
+            compact,
+            "AI",
+            checkbox(self.config.ai_enabled)
+                .label("Enable AI features")
+                .text_size(13)
+                .on_toggle(Message::SetAiEnabled)
+                .into(),
+        );
+        let ai_providers = vec![
+            "anthropic".to_string(),
+            "openai-compatible".to_string(),
+            "ollama".to_string(),
+        ];
+        let ai_provider_row = responsive_control_row(
+            compact,
+            "Provider",
+            pick_list(
+                ai_providers,
+                Some(self.config.ai_provider.clone()),
+                Message::SetAiProvider,
+            )
+            .text_size(13)
+            .width(Length::Fill)
+            .into(),
+        );
+        let ai_model_row = responsive_control_row(
+            compact,
+            "Model",
+            text_input("claude-sonnet-4-6", &self.config.ai_model)
+                .on_input(Message::SetAiModel)
+                .size(13)
+                .into(),
+        );
+        let ai_base_url_row = responsive_control_row(
+            compact,
+            "Base URL",
+            text_input("https://api.anthropic.com", &self.config.ai_base_url)
+                .on_input(Message::SetAiBaseUrl)
+                .size(13)
+                .into(),
+        );
+        let ai_tokens_row = responsive_slider_row(
+            compact,
+            "Max tokens",
+            format!("{}", self.config.ai_max_tokens),
+            slider(64..=32_768u32, self.config.ai_max_tokens, Message::SetAiMaxTokens).into(),
+        );
+        let ai_key_file_row = responsive_control_row(
+            compact,
+            "Key file",
+            text_input(
+                "~/.config/jterm3/ai.key (chmod 600)",
+                self.config.ai_api_key_file.as_deref().unwrap_or(""),
+            )
+            .on_input(Message::SetAiKeyFile)
+            .size(13)
+            .into(),
+        );
+        let ai_redact_row = responsive_control_row(
+            compact,
+            "Privacy",
+            checkbox(self.config.ai_redact_secrets)
+                .label("Redact secrets in AI-bound text")
+                .text_size(13)
+                .on_toggle(Message::SetAiRedactSecrets)
+                .into(),
+        );
+        let agent_turns_row = responsive_slider_row(
+            compact,
+            "Agent turns",
+            format!("{}", self.config.agent_max_turns),
+            slider(1..=100u32, self.config.agent_max_turns, Message::SetAgentMaxTurns).into(),
+        );
+
         let buttons = row![
             button(text("Save").size(13)).on_press(Message::ConfigSave),
             button(text("Reset").size(13))
@@ -5982,6 +6226,15 @@ impl Jterm {
             alt_screen_row,
             clipboard_row,
             tab_position_row,
+            ai_header,
+            ai_enable_row,
+            ai_provider_row,
+            ai_model_row,
+            ai_base_url_row,
+            ai_tokens_row,
+            ai_key_file_row,
+            ai_redact_row,
+            agent_turns_row,
             buttons,
             footer,
         ]
@@ -6232,6 +6485,379 @@ impl Jterm {
             .align_right(Length::Fill)
             .align_top(Length::Fill)
             .padding(8)
+            .into()
+    }
+
+
+    /// Launch the next agent model request (if the protocol is waiting on
+    /// the model) as a blocking task off the UI thread.
+    fn agent_drive_task(&mut self) -> Option<Task<Message>> {
+        if !self.agent.is_open {
+            return None;
+        }
+        let cwd = self
+            .agent
+            .bound_session_id
+            .and_then(|sid| self.sessions.iter().find(|s| s.id == sid))
+            .and_then(|s| s.cwd_cache.clone());
+        let request = self.agent.next_model_request(&self.config, cwd.as_deref())?;
+        let agent::ModelRequest {
+            generation,
+            client,
+            system,
+            user,
+            token,
+        } = request;
+        Some(Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    client
+                        .send_turns_blocking_cancellable(
+                            Some(&system),
+                            &[jterm_core::ai::Turn {
+                                role: jterm_core::ai::Role::User,
+                                text: user,
+                            }],
+                            &token,
+                        )
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("AI worker task failed: {error}")),
+                }
+            },
+            move |result| Message::AgentModelReply(generation, result),
+        ))
+    }
+
+    /// Approve a proposal and type it (plus carriage return) into the bound
+    /// session's PTY, then continue driving the protocol.
+    fn agent_run_approved(
+        &mut self,
+        id: jterm_core::agent::ProposalId,
+        edited: Option<String>,
+    ) -> Option<Task<Message>> {
+        let command = self.agent.approve(id, edited)?;
+        let Some(bound) = self.agent.bound_session_id else {
+            return None;
+        };
+        match self.sessions.iter_mut().find(|s| s.id == bound) {
+            Some(sess) => {
+                let mut bytes = command.into_bytes();
+                bytes.push(b'\r');
+                sess.terminal.scroll_to_bottom();
+                if !sess.write_pty(&bytes) {
+                    self.agent.status =
+                        "Agent command rejected: PTY input queue is full".to_string();
+                }
+                sess.refresh();
+            }
+            None => {
+                self.agent.status = "Agent session's terminal no longer exists".to_string();
+            }
+        }
+        self.agent_drive_task()
+    }
+
+    /// Overlay panel for Agent mode: transcript, per-command approval cards,
+    /// and the composer. All state lives in `agent::AgentUi`.
+    fn agent_panel(&self) -> Element<'_, Message> {
+        use jterm_core::agent::{AgentState, ProposalStatus, Turn as AgentTurn};
+
+        let mut transcript = column![].spacing(8);
+        let session = self.agent.session.as_ref();
+        if let Some(session) = session {
+            for (index, turn) in session.transcript().iter().enumerate() {
+                let element: Element<'_, Message> = match turn {
+                    AgentTurn::User(message) => {
+                        text(format!("You: {message}")).size(13).into()
+                    }
+                    AgentTurn::AssistantThought(thought) => text(format!("thought: {thought}"))
+                        .size(12)
+                        .style(text::secondary)
+                        .into(),
+                    AgentTurn::AssistantSay(message) => {
+                        text(format!("Agent: {message}")).size(13).into()
+                    }
+                    AgentTurn::ProtocolError(message) => text(format!("protocol: {message}"))
+                        .size(12)
+                        .style(text::danger)
+                        .into(),
+                    AgentTurn::Observation {
+                        exit_code,
+                        output_sample,
+                        ..
+                    } => {
+                        let head = text(format!(
+                            "Output (exit {exit_code}, {} bytes)",
+                            output_sample.len()
+                        ))
+                        .size(12)
+                        .style(if *exit_code == 0 {
+                            text::secondary
+                        } else {
+                            text::danger
+                        });
+                        let body = text(output_sample.clone())
+                            .size(12)
+                            .font(iced::Font::MONOSPACE);
+                        container(column![head, body].spacing(4))
+                            .padding(6)
+                            .style(container::bordered_box)
+                            .width(Length::Fill)
+                            .into()
+                    }
+                    AgentTurn::AssistantProposed {
+                        id,
+                        command,
+                        status,
+                    } => {
+                        let danger = jterm_core::agent::is_dangerous(command);
+                        let is_current = matches!(
+                            session.state(),
+                            AgentState::AwaitingApproval { proposal_id }
+                                if proposal_id == *id
+                        );
+                        let mut card = column![].spacing(6);
+                        if let Some(reason) = danger {
+                            card = card.push(
+                                text(format!("⚠ destructive: {reason}"))
+                                    .size(12)
+                                    .style(text::danger),
+                            );
+                        }
+                        if let Some((edit_id, buffer)) = self
+                            .agent
+                            .edit
+                            .as_ref()
+                            .filter(|(edit_id, _)| edit_id == id)
+                        {
+                            card = card.push(
+                                text_input("command", buffer)
+                                    .id(AGENT_EDIT_INPUT_ID.clone())
+                                    .on_input(Message::AgentEditInput)
+                                    .on_submit(Message::AgentEditApprove(*edit_id))
+                                    .size(13)
+                                    .font(iced::Font::MONOSPACE),
+                            );
+                            card = card.push(
+                                row![
+                                    button(text("Approve edited").size(12))
+                                        .on_press(Message::AgentEditApprove(*edit_id)),
+                                    button(text("Cancel").size(12))
+                                        .style(button::secondary)
+                                        .on_press(Message::AgentEditCancel),
+                                ]
+                                .spacing(6),
+                            );
+                        } else {
+                            card = card.push(
+                                text(command.clone()).size(13).font(iced::Font::MONOSPACE),
+                            );
+                            let status_row: Element<'_, Message> = match status {
+                                ProposalStatus::Pending if is_current => {
+                                    let approve_label = if danger.is_some() {
+                                        "Approve & Run (destructive)"
+                                    } else {
+                                        "Approve & Run"
+                                    };
+                                    let approve = button(text(approve_label).size(12))
+                                        .style(if danger.is_some() {
+                                            button::danger
+                                        } else {
+                                            button::primary
+                                        })
+                                        .on_press(Message::AgentApprove(*id));
+                                    row![
+                                        approve,
+                                        button(text("Edit").size(12))
+                                            .style(button::secondary)
+                                            .on_press(Message::AgentEditStart(
+                                                *id,
+                                                command.clone()
+                                            )),
+                                        button(text("Reject").size(12))
+                                            .style(button::secondary)
+                                            .on_press(Message::AgentReject(*id)),
+                                    ]
+                                    .spacing(6)
+                                    .into()
+                                }
+                                ProposalStatus::Pending => {
+                                    text("pending").size(12).style(text::secondary).into()
+                                }
+                                ProposalStatus::Approved => {
+                                    text("✓ ran").size(12).style(text::secondary).into()
+                                }
+                                ProposalStatus::Rejected => {
+                                    text("✗ rejected").size(12).style(text::secondary).into()
+                                }
+                                ProposalStatus::ManualReview => text("moved to manual review")
+                                    .size(12)
+                                    .style(text::secondary)
+                                    .into(),
+                            };
+                            card = card.push(status_row);
+                        }
+                        let _ = index;
+                        container(card)
+                            .padding(8)
+                            .style(container::bordered_box)
+                            .width(Length::Fill)
+                            .into()
+                    }
+                };
+                transcript = transcript.push(element);
+            }
+        }
+        if self.agent.loading {
+            transcript = transcript.push(
+                text("waiting for the model…")
+                    .size(12)
+                    .style(text::secondary),
+            );
+        }
+
+        let (turns_used, max_turns, state_line, can_submit) = match session {
+            Some(session) => (
+                session.turns_used(),
+                session.max_turns(),
+                match session.state() {
+                    AgentState::Ready => "ready",
+                    AgentState::AwaitingModel => "waiting for the model",
+                    AgentState::AwaitingApproval { .. } => {
+                        "a command is waiting for approval"
+                    }
+                    AgentState::AwaitingObservation { .. } => {
+                        "waiting for the approved command to finish"
+                    }
+                    AgentState::Completed => "task completed",
+                    AgentState::Cancelled => "session cancelled",
+                    AgentState::TurnLimitReached => "turn limit reached",
+                },
+                session.state() == AgentState::Ready
+                    && session.turns_used() < session.max_turns(),
+            ),
+            None => (0, 0, "no session", false),
+        };
+
+        let header = row![
+            text("AI Agent").size(14),
+            text(if self.agent.provider_label.is_empty() {
+                "not configured".to_string()
+            } else {
+                self.agent.provider_label.clone()
+            })
+            .size(12)
+            .style(text::secondary),
+            Space::new().width(Length::Fill),
+            text(format!("turns {turns_used}/{max_turns}"))
+                .size(12)
+                .style(text::secondary),
+            button(text("✕").size(12))
+                .style(button::secondary)
+                .on_press(Message::AgentClose),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let status_line: Element<'_, Message> = if self.agent.status.is_empty() {
+            text(state_line).size(11).style(text::secondary).into()
+        } else {
+            text(self.agent.status.clone())
+                .size(11)
+                .style(text::danger)
+                .into()
+        };
+        let context_line: Element<'_, Message> = match self.agent.last_manual_completed.as_ref() {
+            Some(context) => row![
+                text(format!(
+                    "attached context: `{}` (exit {})",
+                    context.cmd, context.exit_code
+                ))
+                .size(10)
+                .style(text::secondary),
+                button(text("✕").size(10))
+                    .style(button::secondary)
+                    .padding(2)
+                    .on_press(Message::AgentClearContext),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            None => Space::new().into(),
+        };
+
+        // A finished task can be followed up (same transcript, budget
+        // permitting) or replaced by a fresh one in the same binding.
+        let (can_continue, can_restart) = match session {
+            Some(session) => (
+                session.can_continue_after_completion(),
+                matches!(
+                    session.state(),
+                    AgentState::Completed | AgentState::TurnLimitReached
+                ),
+            ),
+            None => (false, false),
+        };
+        let followup_row: Element<'_, Message> = if can_continue || can_restart {
+            let mut buttons = row![].spacing(6);
+            if can_continue {
+                buttons = buttons.push(
+                    button(text("Continue task").size(12)).on_press(Message::AgentContinueTask),
+                );
+            }
+            if can_restart {
+                buttons = buttons.push(
+                    button(text("New task").size(12))
+                        .style(button::secondary)
+                        .on_press(Message::AgentNewTask),
+                );
+            }
+            buttons.into()
+        } else {
+            Space::new().into()
+        };
+
+        let mut input = text_input(
+            "What do you want to do? Every command needs your approval.",
+            &self.agent.input,
+        )
+        .id(AGENT_INPUT_ID.clone())
+        .size(13);
+        if can_submit {
+            input = input
+                .on_input(Message::AgentInput)
+                .on_submit(Message::AgentSubmit);
+        }
+        let mut send = button(text("Send").size(12));
+        if can_submit {
+            send = send.on_press(Message::AgentSubmit);
+        }
+
+        let inner = container(
+            column![
+                header,
+                scrollable(transcript)
+                    .height(Length::Fill)
+                    .anchor_bottom(),
+                status_line,
+                context_line,
+                followup_row,
+                row![input, send].spacing(6),
+            ]
+            .spacing(8),
+        )
+        .width(Length::Fixed(560.0))
+        .height(Length::Fixed(520.0))
+        .padding(12)
+        .style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(10)
             .into()
     }
 

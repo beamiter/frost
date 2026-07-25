@@ -1019,6 +1019,20 @@ pub struct TerminalState {
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,
+
+    /// Commands finished per OSC 133 `D`, with their text reconstructed from
+    /// the buffer. Bounded; drained by the AI agent panel each PTY batch.
+    pub pending_completed_commands: std::collections::VecDeque<CompletedCommand>,
+}
+
+/// One OSC 133 command lifecycle captured for the AI agent: the typed
+/// command line, its exit code (when the shell reported one), and a bounded
+/// sample of its output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedCommand {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub output: String,
 }
 
 impl TerminalState {
@@ -1173,6 +1187,7 @@ impl TerminalState {
             dynamic_cursor_color: None,
             dynamic_palette: [None; 256],
             pending_notifications: Vec::new(),
+            pending_completed_commands: std::collections::VecDeque::new(),
         }
     }
 
@@ -1376,6 +1391,12 @@ impl TerminalState {
                         if self.command_zones.len() > 256 {
                             self.command_zones.pop_front();
                         }
+                        self.record_completed_command(
+                            cmd_start,
+                            out_start,
+                            Some((out_start, absolute_row)),
+                            exit_code,
+                        );
                     }
                     ZoneState::CommandStarted(prompt_start, cmd_start) => {
                         let zone = CommandZone {
@@ -1389,6 +1410,7 @@ impl TerminalState {
                         if self.command_zones.len() > 256 {
                             self.command_zones.pop_front();
                         }
+                        self.record_completed_command(cmd_start, absolute_row, None, exit_code);
                     }
                     _ => {}
                 }
@@ -1465,13 +1487,61 @@ impl TerminalState {
             .rev()
             .find(|zone| zone.output_start.is_some())?;
         let start = zone.output_start?;
+        let end = zone.output_end.unwrap_or(start);
+        let out = self.rows_text(start, end, MAX_BYTES);
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Capture one finished OSC 133 command for the AI agent queue. The
+    /// command line spans `cmd_start..cmd_end`; `output` gives the output row
+    /// range when the shell reported one.
+    fn record_completed_command(
+        &mut self,
+        cmd_start: usize,
+        cmd_end: usize,
+        output: Option<(usize, usize)>,
+        exit_code: Option<i32>,
+    ) {
+        const MAX_COMMAND_BYTES: usize = 16 * 1024;
+        const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+        const MAX_PENDING_COMPLETED: usize = 32;
+        let command = self
+            .rows_text(cmd_start, cmd_end, MAX_COMMAND_BYTES)
+            .trim()
+            .to_string();
+        if command.is_empty() {
+            return;
+        }
+        let output = output
+            .map(|(start, end)| self.rows_text(start, end, MAX_OUTPUT_BYTES))
+            .unwrap_or_default();
+        if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED {
+            self.pending_completed_commands.pop_front();
+        }
+        self.pending_completed_commands.push_back(CompletedCommand {
+            command,
+            exit_code,
+            output,
+        });
+    }
+
+    /// Drain commands finished since the last call (for the AI agent panel).
+    pub fn take_completed_commands(&mut self) -> Vec<CompletedCommand> {
+        self.pending_completed_commands.drain(..).collect()
+    }
+
+    /// Plain text of the absolute buffer rows `start..end` (scrollback plus
+    /// live grid), soft-wrapped rows joined, per-line trailing padding
+    /// trimmed, and the total capped at `max_bytes`.
+    fn rows_text(&self, start: usize, end: usize, max_bytes: usize) -> String {
         let scrollback_len = self.scrollback.len();
-        let end = zone
-            .output_end
-            .unwrap_or(start)
-            .min(scrollback_len + self.grid.rows());
+        let end = end.min(scrollback_len + self.grid.rows());
         if end <= start {
-            return None;
+            return String::new();
         }
         let mut out = String::new();
         for abs_row in start..end {
@@ -1501,18 +1571,14 @@ impl TerminalState {
                 segment.truncate(segment.trim_end_matches(' ').len());
             }
             out.push_str(&segment);
-            if out.len() >= MAX_BYTES {
+            if out.len() >= max_bytes {
                 break;
             }
             if !wrapped && abs_row + 1 < end {
                 out.push('\n');
             }
         }
-        if out.trim().is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+        out
     }
 
     /// Scroll so the closest prompt above the current view lands at the top

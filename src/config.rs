@@ -106,6 +106,37 @@ pub enum TabPosition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// AI features master switch. Off by default: nothing leaves the machine
+    /// unless the user opts in.
+    #[serde(default)]
+    pub ai_enabled: bool,
+
+    /// AI provider: "anthropic", "openai-compatible", or "ollama".
+    #[serde(default = "default_ai_provider")]
+    pub ai_provider: String,
+
+    #[serde(default = "default_ai_base_url")]
+    pub ai_base_url: String,
+
+    #[serde(default = "default_ai_model")]
+    pub ai_model: String,
+
+    #[serde(default = "default_ai_max_tokens")]
+    pub ai_max_tokens: u32,
+
+    /// Scrub high-confidence secrets from AI-bound text (default on).
+    #[serde(default = "default_ai_redact_secrets")]
+    pub ai_redact_secrets: bool,
+
+    /// Optional path to a 0600 file holding the provider API key, so the key
+    /// never has to live in the process environment or this config file.
+    #[serde(default)]
+    pub ai_api_key_file: Option<String>,
+
+    /// Turn budget for one Agent-mode session.
+    #[serde(default = "default_agent_max_turns")]
+    pub agent_max_turns: u32,
+
     #[serde(default = "default_font_size")]
     pub font_size: f32,
 
@@ -187,6 +218,30 @@ pub struct Config {
     /// remote-shell trust boundary.
     #[serde(default)]
     pub allow_clipboard_read: bool,
+}
+
+fn default_ai_provider() -> String {
+    "anthropic".to_string()
+}
+
+fn default_ai_base_url() -> String {
+    "https://api.anthropic.com".to_string()
+}
+
+fn default_ai_model() -> String {
+    "claude-sonnet-4-6".to_string()
+}
+
+fn default_ai_max_tokens() -> u32 {
+    1_024
+}
+
+fn default_ai_redact_secrets() -> bool {
+    true
+}
+
+fn default_agent_max_turns() -> u32 {
+    20
 }
 
 fn default_font_size() -> f32 {
@@ -341,6 +396,14 @@ fn default_subpixel_rendering() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            ai_enabled: false,
+            ai_provider: default_ai_provider(),
+            ai_base_url: default_ai_base_url(),
+            ai_model: default_ai_model(),
+            ai_max_tokens: default_ai_max_tokens(),
+            ai_redact_secrets: default_ai_redact_secrets(),
+            ai_api_key_file: None,
+            agent_max_turns: default_agent_max_turns(),
             font_size: default_font_size(),
             font_family: default_font_family(),
             font_weight: default_font_weight(),
