@@ -825,7 +825,26 @@ impl Theme {
     /// 保存主题到文件
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        jterm_core::atomic_file::write_atomic(path, content.as_bytes())?;
+        Ok(())
+    }
+
+    /// The themes directory must be a real directory, not a symlink that could
+    /// redirect theme saves and deletes elsewhere.
+    fn validate_custom_themes_dir(dir: &Path) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(dir)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "custom themes directory must not be a symbolic link",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "custom themes path is not a directory",
+            ));
+        }
         Ok(())
     }
 
@@ -839,11 +858,18 @@ impl Theme {
         let Some(dir) = Self::custom_themes_dir() else {
             return Vec::new();
         };
+        if Self::validate_custom_themes_dir(&dir).is_err() {
+            return Vec::new();
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
         let mut themes = Vec::new();
         for entry in entries.flatten() {
+            // Do not read through a symlink planted in the themes directory.
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "toml") {
                 if let Ok(theme) = Self::from_file(&path) {
@@ -898,6 +924,7 @@ impl Theme {
         }
         let dir = Self::custom_themes_dir().ok_or("Cannot determine config directory")?;
         std::fs::create_dir_all(&dir)?;
+        Self::validate_custom_themes_dir(&dir)?;
         let filename = format!("{}.toml", self.name);
         let path = dir.join(filename);
         self.save(&path)
@@ -915,6 +942,10 @@ impl Theme {
             .into());
         }
         let dir = Self::custom_themes_dir().ok_or("Cannot determine config directory")?;
+        match Self::validate_custom_themes_dir(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            other => other?,
+        }
         let filename = format!("{}.toml", name);
         let path = dir.join(filename);
         if path.exists() {
