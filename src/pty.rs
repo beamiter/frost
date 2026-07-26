@@ -22,12 +22,18 @@ extern "C" {
 mod unix_pty {
     use super::*;
     use std::path::Path;
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
     // Keep local launches effectively immediate while allowing automounts and
     // network-backed working directories a reasonable window to resolve.
     // Most importantly, this bounds the synchronous fork-to-exec handshake.
     const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    // Identifying the `rsh` on PATH runs once per process and blocks the first
+    // PTY spawn, so keep the window short: our own shell answers `--version`
+    // immediately, and anything slower is not worth waiting on.
+    const RSH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[derive(Clone, Copy)]
     #[repr(i32)]
@@ -361,6 +367,74 @@ mod unix_pty {
             .map(|p| p.to_string_lossy().to_string())
     }
 
+    /// jterm3 prefers its companion shell `rsh`, but that name collides with the
+    /// classic BSD remote shell: on Debian-family systems `/usr/bin/rsh` is an
+    /// alternatives symlink that usually resolves to `ssh`. Exec'ing that as the
+    /// login shell only prints a usage line and exits, which closes the sole tab
+    /// and quits jterm3 the instant it starts. Accept a PATH hit only when it
+    /// still resolves to a binary named `rsh` and identifies itself.
+    fn find_jterm_rsh() -> Option<String> {
+        static RESOLVED: OnceLock<Option<String>> = OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                let candidate = find_executable_in_path(DEFAULT_SHELL_NAME)?;
+                if is_jterm_rsh(Path::new(&candidate)) {
+                    return Some(candidate);
+                }
+                eprintln!(
+                    "[PTY] '{candidate}' is not jterm3's rsh shell (most likely the BSD \
+                     remote shell), falling back to the login shell"
+                );
+                None
+            })
+            .clone()
+    }
+
+    pub(crate) fn is_jterm_rsh(path: &Path) -> bool {
+        // An alternatives symlink pointing at ssh or netkit-rsh is rejected
+        // without spawning anything.
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if resolved.file_name().and_then(|name| name.to_str()) != Some(DEFAULT_SHELL_NAME) {
+            return false;
+        }
+        rsh_version_banner(path).is_some_and(|banner| banner.starts_with("rsh "))
+    }
+
+    /// Run `<path> --version` under a short deadline. A remote shell answers a
+    /// usage error, and anything that instead waits on the network (or on stdin,
+    /// which is /dev/null here) is killed and treated as "not our shell".
+    fn rsh_version_banner(path: &Path) -> Option<String> {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + RSH_PROBE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    let mut banner = String::new();
+                    child.stdout.take()?.read_to_string(&mut banner).ok()?;
+                    return Some(banner);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(Some(_)) => return None,
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+    }
+
     fn shell_from_passwd() -> Option<String> {
         let uid = unsafe { libc::getuid() };
         let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -430,7 +504,7 @@ mod unix_pty {
         // Priority 2: rsh is jterm3's preferred shell. It gets a session id
         // argv below when one is available, while still letting users override
         // it through config.shell.
-        if let Some(rsh_path) = find_executable_in_path(DEFAULT_SHELL_NAME) {
+        if let Some(rsh_path) = find_jterm_rsh() {
             return rsh_path;
         }
 
@@ -544,6 +618,9 @@ mod unix_pty {
                 // could deadlock. So argv and a custom envp are built here and the
                 // child branch only reads already-allocated memory.
                 let shell_path = choose_shell(configured_shell);
+                // A shell that exits right away takes the whole window down with
+                // it, so make the choice visible in the log for that diagnosis.
+                log::info!("[PTY] starting shell: {shell_path}");
                 let shell_name = std::path::Path::new(&shell_path)
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -1223,6 +1300,44 @@ mod tests {
             super::unix_pty::shell_single_quote("/tmp/it's"),
             "'/tmp/it'\"'\"'s'"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_masquerading_as_rsh_is_not_taken_for_the_jterm_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("jterm3-rsh-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+
+        // Stands in for /usr/bin/rsh -> /usr/bin/ssh: right name, wrong binary.
+        let ssh_like = dir.join("ssh");
+        std::fs::write(&ssh_like, b"#!/bin/sh\necho 'usage: ssh' >&2\nexit 255\n")
+            .expect("write ssh stand-in");
+        std::fs::set_permissions(&ssh_like, std::fs::Permissions::from_mode(0o700))
+            .expect("make ssh stand-in executable");
+        let alternatives_link = dir.join("rsh");
+        let _ = std::fs::remove_file(&alternatives_link);
+        std::os::unix::fs::symlink(&ssh_like, &alternatives_link).expect("link rsh -> ssh");
+        assert!(!super::unix_pty::is_jterm_rsh(&alternatives_link));
+
+        // A real rsh answers `--version` with its own banner.
+        let real = dir.join("real").join("rsh");
+        std::fs::create_dir_all(real.parent().expect("parent")).expect("create rsh dir");
+        std::fs::write(&real, b"#!/bin/sh\necho 'rsh 0.1.0'\n").expect("write rsh stand-in");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+            .expect("make rsh stand-in executable");
+        assert!(super::unix_pty::is_jterm_rsh(&real));
+
+        // Named rsh, but silent about `--version`: not ours either.
+        let mute = dir.join("mute").join("rsh");
+        std::fs::create_dir_all(mute.parent().expect("parent")).expect("create mute dir");
+        std::fs::write(&mute, b"#!/bin/sh\nexit 2\n").expect("write mute stand-in");
+        std::fs::set_permissions(&mute, std::fs::Permissions::from_mode(0o700))
+            .expect("make mute stand-in executable");
+        assert!(!super::unix_pty::is_jterm_rsh(&mute));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
