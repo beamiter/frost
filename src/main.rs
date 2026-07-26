@@ -346,6 +346,7 @@ enum Message {
     SetAiModel(String),
     SetAiBaseUrl(String),
     SetAiMaxTokens(u32),
+    SetAiTemperature(String),
     SetAiRedactSecrets(bool),
     SetAiKeyFile(String),
     SetAgentMaxTurns(u32),
@@ -830,6 +831,8 @@ struct Jterm {
     session_diagnostic: Option<String>,
     /// Persistent settings-panel changes are live-applied immediately and saved
     /// on the next config tick. Ephemeral font zoom never sets this flag.
+    /// 温度输入框的原始文本（含合法值之外的中间编辑态）。
+    ai_temperature_draft: String,
     config_dirty: bool,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
@@ -910,6 +913,10 @@ struct Jterm {
 
 impl Jterm {
     fn new(config: Config, config_diagnostic: Option<String>) -> (Self, Task<Message>) {
+        let ai_temperature_draft = config
+            .ai_temperature
+            .map(|t| format!("{t}"))
+            .unwrap_or_default();
         let theme = Theme::get_theme(&config.theme).unwrap_or_default();
         let metrics = Metrics::new(config.font_size, config.line_spacing, config.padding);
         let cols = config.cols.max(1);
@@ -981,6 +988,7 @@ impl Jterm {
             keybindings_mtime,
             keybindings_diagnostics: keybindings_load.diagnostics,
             session_diagnostic,
+            ai_temperature_draft,
             config_dirty: false,
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             links: Vec::new(),
@@ -3223,6 +3231,16 @@ impl Jterm {
             }
             Message::SetAiMaxTokens(tokens) => {
                 self.config.ai_max_tokens = tokens.clamp(64, 32_768);
+                self.config_dirty = true;
+            }
+            Message::SetAiTemperature(raw) => {
+                // Keep the raw editing text; only a valid value reaches config.
+                self.config.ai_temperature = raw
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
+                self.ai_temperature_draft = raw;
                 self.config_dirty = true;
             }
             Message::SetAiRedactSecrets(redact) => {
@@ -5741,6 +5759,14 @@ impl Jterm {
             format!("{}", self.config.ai_max_tokens),
             slider(64..=32_768u32, self.config.ai_max_tokens, Message::SetAiMaxTokens).into(),
         );
+        let ai_temperature_row = responsive_control_row(
+            compact,
+            "Temperature",
+            text_input("provider default (0.0-2.0)", &self.ai_temperature_draft)
+                .on_input(Message::SetAiTemperature)
+                .size(13)
+                .into(),
+        );
         let ai_key_file_row = responsive_control_row(
             compact,
             "Key file",
@@ -5805,6 +5831,7 @@ impl Jterm {
             ai_model_row,
             ai_base_url_row,
             ai_tokens_row,
+            ai_temperature_row,
             ai_key_file_row,
             ai_redact_row,
             agent_turns_row,
