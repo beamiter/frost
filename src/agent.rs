@@ -22,14 +22,18 @@ use jterm_core::agent::{AgentSession, AgentState, ProposalId};
 use jterm_core::ai::{AiCancellationToken, AiClient, AiSettings, BlockContext};
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("jterm3").join("agent_session.json"))
+    Some(
+        dirs::config_dir()?
+            .join("jterm3")
+            .join("agent_session.json"),
+    )
 }
 
 pub fn client_from_config(config: &Config) -> Result<AiClient, String> {
     AiClient::from_settings(&AiSettings {
         enabled: config.ai_enabled,
         provider: config.ai_provider.clone(),
-        api_key_file: config.ai_api_key_file.clone(),
+        api_key_file: jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref()),
         model: config.ai_model.clone(),
         base_url: config.ai_base_url.clone(),
         max_tokens: config.ai_max_tokens,
@@ -175,7 +179,11 @@ impl AgentUi {
 
     /// When the protocol is waiting on the model and nothing is in flight,
     /// produce the request the update loop should run on a blocking task.
-    pub fn next_model_request(&mut self, config: &Config, cwd: Option<&str>) -> Option<ModelRequest> {
+    pub fn next_model_request(
+        &mut self,
+        config: &Config,
+        cwd: Option<&str>,
+    ) -> Option<ModelRequest> {
         let session = self.session.as_ref()?;
         if self.loading || session.state() != AgentState::AwaitingModel {
             return None;
@@ -335,12 +343,13 @@ mod tests {
     use super::*;
 
     fn ai_config() -> Config {
-        let mut config = Config::default();
-        config.ai_enabled = true;
-        config.ai_provider = "ollama".into();
-        config.ai_base_url = "http://localhost:11434".into();
-        config.ai_model = "codellama:7b".into();
-        config
+        Config {
+            ai_enabled: true,
+            ai_provider: "ollama".into(),
+            ai_base_url: "http://localhost:11434".into(),
+            ai_model: "codellama:7b".into(),
+            ..Config::default()
+        }
     }
 
     fn completed(command: &str, exit: i32, output: &str) -> CompletedCommand {
@@ -406,7 +415,10 @@ mod tests {
 
         // Reopening invalidates the generation; the late reply is ignored.
         agent.open(&ai_config(), 2);
-        agent.model_reply(request.generation, Ok("{\"action\":\"say\",\"message\":\"hi\"}".into()));
+        agent.model_reply(
+            request.generation,
+            Ok("{\"action\":\"say\",\"message\":\"hi\"}".into()),
+        );
         assert_eq!(agent.session.as_ref().unwrap().transcript().len(), 0);
     }
 

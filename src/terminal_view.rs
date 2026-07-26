@@ -1,10 +1,10 @@
-use crate::theme::ThemeExt as _;
 use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
 use crate::search::SearchMatch;
 use crate::terminal::{
     clamp_terminal_dimensions, CursorShape, DynamicColorPalette, TerminalCell, UnderlineStyle,
 };
 use crate::theme::Theme;
+use crate::theme::ThemeExt as _;
 
 use std::time::Instant;
 

@@ -1,11 +1,11 @@
-pub(crate) use jterm_core::char_width;
 use crate::theme::ThemeExt as _;
+pub(crate) use jterm_core::char_width;
 use jterm_core::pane_layout::{
     self, collect_pane_rects, directional_focus_target, equalize_shares, normalized_shares,
     set_divider_share, split_node_rect, Axis, DividerId, PaneDirection, PaneRect, PaneTree,
 };
-mod color;
 mod agent;
+mod color;
 mod command_palette;
 mod config;
 mod debug;
@@ -122,7 +122,6 @@ enum SidebarPanel {
     Tabs,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChromeShortcut {
     CommandPalette,
@@ -151,8 +150,6 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
         _ => None,
     }
 }
-
-
 
 fn last_session_index(session_count: usize) -> Option<usize> {
     session_count.checked_sub(1)
@@ -349,6 +346,8 @@ enum Message {
     SetAiTemperature(String),
     SetAiRedactSecrets(bool),
     SetAiKeyFile(String),
+    SetAiKeyDraft(String),
+    StoreAiKey,
     SetAgentMaxTurns(u32),
     PtyOutput(usize, RawFd, Vec<u8>),
     PtyExited(usize, RawFd, i32),
@@ -833,6 +832,8 @@ struct Jterm {
     /// on the next config tick. Ephemeral font zoom never sets this flag.
     /// 温度输入框的原始文本（含合法值之外的中间编辑态）。
     ai_temperature_draft: String,
+    /// 设置面板中待存储的 API key 明文；提交后立即清空，从不落入配置。
+    ai_key_draft: String,
     config_dirty: bool,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
@@ -989,6 +990,7 @@ impl Jterm {
             keybindings_diagnostics: keybindings_load.diagnostics,
             session_diagnostic,
             ai_temperature_draft,
+            ai_key_draft: String::new(),
             config_dirty: false,
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             links: Vec::new(),
@@ -3251,6 +3253,35 @@ impl Jterm {
                 // Keep the raw editing text; only fully-blank clears the key.
                 self.config.ai_api_key_file = Some(path).filter(|p| !p.trim().is_empty());
                 self.config_dirty = true;
+            }
+            Message::SetAiKeyDraft(value) => {
+                self.ai_key_draft = value;
+            }
+            Message::StoreAiKey => {
+                let key = self.ai_key_draft.trim().to_string();
+                if key.is_empty() {
+                    self.push_toast("Paste an API key first", ToastKind::Warning);
+                } else {
+                    // Same write target rule as jterm4: the configured path,
+                    // otherwise the per-app default. The environment override
+                    // stays read-only and is never chosen as a write target.
+                    let path = self
+                        .config
+                        .ai_api_key_file
+                        .clone()
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or_else(jterm_core::ai::default_api_key_path);
+                    match jterm_core::ai::write_api_key_file(&path, &key) {
+                        Ok(()) => {
+                            self.ai_key_draft.clear();
+                            self.config.ai_api_key_file = Some(path);
+                            self.config_dirty = true;
+                            self.push_toast("API key stored (0600)", ToastKind::Success);
+                        }
+                        Err(error) => self
+                            .push_toast(format!("API key not saved: {error}"), ToastKind::Warning),
+                    }
+                }
             }
             Message::SetAgentMaxTurns(turns) => {
                 self.config.agent_max_turns = turns.clamp(1, 100);
@@ -5757,7 +5788,12 @@ impl Jterm {
             compact,
             "Max tokens",
             format!("{}", self.config.ai_max_tokens),
-            slider(64..=32_768u32, self.config.ai_max_tokens, Message::SetAiMaxTokens).into(),
+            slider(
+                64..=32_768u32,
+                self.config.ai_max_tokens,
+                Message::SetAiMaxTokens,
+            )
+            .into(),
         );
         let ai_temperature_row = responsive_control_row(
             compact,
@@ -5778,6 +5814,19 @@ impl Jterm {
             .size(13)
             .into(),
         );
+        let ai_key_store_row = responsive_control_row(
+            compact,
+            "API Key",
+            text_input(
+                "paste key, Enter stores it as a 600 file",
+                &self.ai_key_draft,
+            )
+            .secure(true)
+            .on_input(Message::SetAiKeyDraft)
+            .on_submit(Message::StoreAiKey)
+            .size(13)
+            .into(),
+        );
         let ai_redact_row = responsive_control_row(
             compact,
             "Privacy",
@@ -5791,7 +5840,12 @@ impl Jterm {
             compact,
             "Agent turns",
             format!("{}", self.config.agent_max_turns),
-            slider(1..=100u32, self.config.agent_max_turns, Message::SetAgentMaxTurns).into(),
+            slider(
+                1..=100u32,
+                self.config.agent_max_turns,
+                Message::SetAgentMaxTurns,
+            )
+            .into(),
         );
 
         let buttons = row![
@@ -5833,6 +5887,7 @@ impl Jterm {
             ai_tokens_row,
             ai_temperature_row,
             ai_key_file_row,
+            ai_key_store_row,
             ai_redact_row,
             agent_turns_row,
             buttons,
@@ -6088,7 +6143,6 @@ impl Jterm {
             .into()
     }
 
-
     /// Launch the next agent model request (if the protocol is waiting on
     /// the model) as a blocking task off the UI thread.
     fn agent_drive_task(&mut self) -> Option<Task<Message>> {
@@ -6100,7 +6154,9 @@ impl Jterm {
             .bound_session_id
             .and_then(|sid| self.sessions.iter().find(|s| s.id == sid))
             .and_then(|s| s.cwd_cache.clone());
-        let request = self.agent.next_model_request(&self.config, cwd.as_deref())?;
+        let request = self
+            .agent
+            .next_model_request(&self.config, cwd.as_deref())?;
         let agent::ModelRequest {
             generation,
             client,
@@ -6140,9 +6196,7 @@ impl Jterm {
         edited: Option<String>,
     ) -> Option<Task<Message>> {
         let command = self.agent.approve(id, edited)?;
-        let Some(bound) = self.agent.bound_session_id else {
-            return None;
-        };
+        let bound = self.agent.bound_session_id?;
         match self.sessions.iter_mut().find(|s| s.id == bound) {
             Some(sess) => {
                 let mut bytes = command.into_bytes();
@@ -6171,9 +6225,7 @@ impl Jterm {
         if let Some(session) = session {
             for (index, turn) in session.transcript().iter().enumerate() {
                 let element: Element<'_, Message> = match turn {
-                    AgentTurn::User(message) => {
-                        text(format!("You: {message}")).size(13).into()
-                    }
+                    AgentTurn::User(message) => text(format!("You: {message}")).size(13).into(),
                     AgentTurn::AssistantThought(thought) => text(format!("thought: {thought}"))
                         .size(12)
                         .style(text::secondary)
@@ -6253,9 +6305,8 @@ impl Jterm {
                                 .spacing(6),
                             );
                         } else {
-                            card = card.push(
-                                text(command.clone()).size(13).font(iced::Font::MONOSPACE),
-                            );
+                            card = card
+                                .push(text(command.clone()).size(13).font(iced::Font::MONOSPACE));
                             let status_row: Element<'_, Message> = match status {
                                 ProposalStatus::Pending if is_current => {
                                     let approve_label = if danger.is_some() {
@@ -6327,9 +6378,7 @@ impl Jterm {
                 match session.state() {
                     AgentState::Ready => "ready",
                     AgentState::AwaitingModel => "waiting for the model",
-                    AgentState::AwaitingApproval { .. } => {
-                        "a command is waiting for approval"
-                    }
+                    AgentState::AwaitingApproval { .. } => "a command is waiting for approval",
                     AgentState::AwaitingObservation { .. } => {
                         "waiting for the approved command to finish"
                     }
@@ -6337,8 +6386,7 @@ impl Jterm {
                     AgentState::Cancelled => "session cancelled",
                     AgentState::TurnLimitReached => "turn limit reached",
                 },
-                session.state() == AgentState::Ready
-                    && session.turns_used() < session.max_turns(),
+                session.state() == AgentState::Ready && session.turns_used() < session.max_turns(),
             ),
             None => (0, 0, "no session", false),
         };
@@ -6440,9 +6488,7 @@ impl Jterm {
         let inner = container(
             column![
                 header,
-                scrollable(transcript)
-                    .height(Length::Fill)
-                    .anchor_bottom(),
+                scrollable(transcript).height(Length::Fill).anchor_bottom(),
                 status_line,
                 context_line,
                 followup_row,
@@ -7310,8 +7356,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn pane_tree_snapshot_round_trips() {
         let tree = PaneTree::Split {
@@ -7333,7 +7377,6 @@ mod tests {
         // Out-of-range session indices are rejected.
         assert!(!valid_restored_layout(&back, 2));
     }
-
 
     #[test]
     fn session_last_targets_the_final_index_without_underflow() {

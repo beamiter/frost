@@ -1401,15 +1401,17 @@ impl TerminalState {
             'D' => {
                 // Command finished. Exit code arrives positionally (`D;0`) or
                 // as an rsh-style `exit=`/`exit_code=` param.
-                let exit_code = value.split(';').skip(1).find_map(|part| {
-                    match part.split_once('=') {
-                        Some(("exit" | "exit_code" | "exit_status", v)) => {
-                            v.trim().parse::<i32>().ok()
-                        }
-                        Some(_) => None,
-                        None => part.trim().parse::<i32>().ok(),
-                    }
-                });
+                let exit_code =
+                    value
+                        .split(';')
+                        .skip(1)
+                        .find_map(|part| match part.split_once('=') {
+                            Some(("exit" | "exit_code" | "exit_status", v)) => {
+                                v.trim().parse::<i32>().ok()
+                            }
+                            Some(_) => None,
+                            None => part.trim().parse::<i32>().ok(),
+                        });
                 match self.current_zone_state {
                     ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
                         let zone = CommandZone {

@@ -90,6 +90,15 @@ shell = "/bin/bash"
 
 # 安全默认值。开启后，SSH 中的程序也能读取宿主剪贴板。
 allow_clipboard_read = false
+
+# AI / Agent（默认关闭；不开启则没有任何数据离开本机）
+ai_enabled = false
+ai_provider = "anthropic"   # anthropic | openai-compatible | ollama
+ai_model = "claude-sonnet-4-6"
+# API key 文件：一行 key、权限 600。未设置时在设置面板粘贴 key 即可，
+# 会自动写入 ~/.config/jterm3/ai.key。环境变量 JTERM3_AI_API_KEY_FILE
+# 优先于此项（与 jterm4 一致），且不会被写回配置文件。
+# ai_api_key_file = "~/.config/jterm3/ai.key"
 ```
 
 `Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
