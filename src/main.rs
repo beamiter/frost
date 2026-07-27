@@ -47,6 +47,10 @@ const SIDEBAR_W_MIN: f32 = 120.0;
 const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
+/// Height of the status strip above each pane while split. A single pane has
+/// no strip: the tab bar and status bar already name it, and the row would
+/// only cost a terminal line.
+const PANE_HEADER_H: f32 = 20.0;
 /// Maximum total leaves (panes) across the whole layout tree; a PTY guard.
 const MAX_PANES: usize = 12;
 const SPLIT_RATIO_KEY_STEP: f32 = 0.05;
@@ -103,6 +107,22 @@ struct Toast {
     text: String,
     kind: ToastKind,
     expires_at: std::time::Instant,
+}
+
+/// A pane-header press that may turn into a rearrange drag.
+///
+/// The source is held by stable session id rather than index: a background
+/// session can exit mid-drag, which shifts every later index and would
+/// otherwise make the release swap two unrelated panes.
+///
+/// A press that never leaves its own pane simply focuses it, exactly like
+/// clicking into the terminal; only a release over a *different* pane swaps.
+#[derive(Debug, Clone)]
+struct PaneDrag {
+    session_id: usize,
+    /// Session index the pointer is currently over, when it differs from the
+    /// source. `None` means releasing now would do nothing.
+    target: Option<usize>,
 }
 
 /// State for the Ctrl+Shift+L quick tab switcher overlay.
@@ -171,6 +191,24 @@ fn axis_to_str(axis: Axis) -> &'static str {
 }
 
 /// Serialize a live layout tree for session persistence.
+/// Exchange two session indices wherever they appear in a pane tree.
+///
+/// One pass, not two: remapping `a`→`b` and then `b`→`a` would send both
+/// leaves to the same session and lose one of them.
+fn swap_sessions_in_tree(tree: &mut PaneTree, a: usize, b: usize) {
+    let remap = |session: usize| {
+        if session == a {
+            b
+        } else if session == b {
+            a
+        } else {
+            session
+        }
+    };
+    let remap_ref: &dyn Fn(usize) -> usize = &remap;
+    tree.remap_sessions(remap_ref);
+}
+
 fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapshot {
     match tree {
         PaneTree::Leaf(session) => {
@@ -396,6 +434,11 @@ enum Message {
     DividerDragMove(iced::Point),
     DividerDragEnd,
     DividerHover(Option<DividerId>),
+    /// Press on a pane's header strip: focuses it, and may become a drag that
+    /// swaps it with whichever pane the pointer is released over.
+    PaneDragStart(usize),
+    PaneDragMove(iced::Point),
+    PaneDragEnd,
     SearchToggleRegex,
     SearchToggleCase,
     SearchInput(String),
@@ -585,6 +628,42 @@ impl Session {
             (Some(p), None) => p.clone(),
             (None, Some(d)) => d,
             (None, None) => format!("Session {}", self.id + 1),
+        }
+    }
+
+    /// Pane-header title. Same preference order as [`Session::label`], minus
+    /// the foreground process: the header shows that in its own field, and
+    /// repeating it there would crowd out the directory.
+    fn pane_title(&self) -> String {
+        let title = self.terminal.window_title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+        self.cwd_cache
+            .as_deref()
+            .and_then(Self::cwd_basename)
+            .unwrap_or_else(|| format!("Session {}", self.id + 1))
+    }
+
+    /// Full working directory for the pane header, with `$HOME` collapsed to
+    /// `~`. `None` while the cwd is unknown.
+    fn cwd_display(&self) -> Option<String> {
+        let cwd = self.cwd_cache.as_deref()?;
+        let Some(home) = std::env::var_os("HOME") else {
+            return Some(cwd.to_string());
+        };
+        let home = home.to_string_lossy();
+        if home.is_empty() {
+            return Some(cwd.to_string());
+        }
+        if cwd == home {
+            return Some("~".to_string());
+        }
+        // Only substitute at a component boundary: `/home/user2` merely shares
+        // a prefix with `/home/user` and is a different directory.
+        match cwd.strip_prefix(home.as_ref()) {
+            Some(rest) if rest.starts_with('/') => Some(format!("~{rest}")),
+            _ => Some(cwd.to_string()),
         }
     }
 
@@ -879,6 +958,8 @@ struct Jterm {
     /// Focused pane temporarily expanded to the full terminal area (tmux-style
     /// zoom). Only meaningful while split; cleared when the split collapses.
     pane_zoomed: bool,
+    /// In-flight header drag that will swap two panes on release.
+    pane_drag: Option<PaneDrag>,
     /// Stable id of the tab the pointer is hovering (drives close-button reveal).
     hovered_tab: Option<usize>,
     /// Source-tab id recorded on mouse press over a tab. Cleared on mouse
@@ -1011,6 +1092,7 @@ impl Jterm {
             hovered_divider: None,
             last_divider_press: None,
             pane_zoomed: false,
+            pane_drag: None,
             hovered_tab: None,
             dragging_tab: None,
             tab_menu: None,
@@ -1791,7 +1873,11 @@ impl Jterm {
             for pane in self.pane_rects() {
                 if pane.session < targets.len() {
                     let w = (pane.rect.width - terminal_view::SCROLLBAR_WIDTH).max(0.0);
-                    targets[pane.session] = self.metrics.grid_size(w, pane.rect.height);
+                    // The header strip sits inside the pane rect, above the
+                    // grid. Charging the PTY for those pixels would make the
+                    // shell believe it has one row more than it can show.
+                    let h = (pane.rect.height - PANE_HEADER_H).max(0.0);
+                    targets[pane.session] = self.metrics.grid_size(w, h);
                 }
             }
         }
@@ -1898,6 +1984,32 @@ impl Jterm {
         self.refresh_active_context();
     }
 
+    /// Current index of the session with this stable id, if it is still open.
+    /// Anything held across UI events must go through here: indices shift when
+    /// a session is closed or the tabs are reordered.
+    fn session_index_by_id(&self, id: usize) -> Option<usize> {
+        self.sessions.iter().position(|sess| sess.id == id)
+    }
+
+    /// Exchange the sessions shown by two panes. Only the contents move: the
+    /// split topology and every ratio the user arranged stay exactly as they
+    /// were, and focus follows the dragged session into its new pane.
+    fn swap_pane_sessions(&mut self, dragged: usize, target: usize) {
+        if dragged == target
+            || !self.layout.contains_session(dragged)
+            || !self.layout.contains_session(target)
+        {
+            return;
+        }
+        swap_sessions_in_tree(&mut self.layout, dragged, target);
+        self.active = dragged;
+        self.session_dirty = true;
+        // The two panes usually differ in size, so both shells need a resize.
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+    }
+
     /// Move keyboard focus to the pane physically adjacent in `direction`
     /// (tmux-style spatial navigation across nesting). No wrap at the edges.
     fn focus_pane_direction(&mut self, direction: PaneDirection) {
@@ -1975,20 +2087,7 @@ impl Jterm {
         }
         let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
         let other = leaves[(pos + 1) % leaves.len()];
-        let (a, b) = (self.active, other);
-        self.layout.remap_sessions(&|s| {
-            if s == a {
-                b
-            } else if s == b {
-                a
-            } else {
-                s
-            }
-        });
-        // Focus follows the moved session to its new leaf.
-        self.relayout();
-        self.refresh_active_context();
-        self.save_session_snapshot();
+        self.swap_pane_sessions(self.active, other);
     }
 
     /// Close the focused pane's session; the remaining panes keep the split
@@ -3623,6 +3722,52 @@ impl Jterm {
                     }
                 }
             }
+            Message::PaneDragStart(session) => {
+                // A press on the header focuses its pane, exactly like a click
+                // in the terminal below it. The swap only happens if the
+                // pointer is released somewhere else.
+                if self.layout.contains_session(session) {
+                    self.active = session;
+                    self.session_dirty = true;
+                    self.refresh_active_context();
+                }
+                if let Some(sess) = self.sessions.get(session) {
+                    self.pane_drag = Some(PaneDrag {
+                        session_id: sess.id,
+                        target: None,
+                    });
+                }
+            }
+            Message::PaneDragMove(pt) => {
+                let source = self
+                    .pane_drag
+                    .as_ref()
+                    .and_then(|drag| self.session_index_by_id(drag.session_id));
+                let target = source.and_then(|source| {
+                    self.pane_rects()
+                        .into_iter()
+                        .find(|pane| {
+                            pt.x >= pane.rect.x
+                                && pt.x < pane.rect.x + pane.rect.width
+                                && pt.y >= pane.rect.y
+                                && pt.y < pane.rect.y + pane.rect.height
+                        })
+                        .map(|pane| pane.session)
+                        .filter(|hit| *hit != source)
+                });
+                if let Some(drag) = self.pane_drag.as_mut() {
+                    drag.target = target;
+                }
+            }
+            Message::PaneDragEnd => {
+                if let Some(drag) = self.pane_drag.take() {
+                    if let (Some(source), Some(target)) =
+                        (self.session_index_by_id(drag.session_id), drag.target)
+                    {
+                        self.swap_pane_sessions(source, target);
+                    }
+                }
+            }
             Message::SidebarDragStart => self.dragging_sidebar = true,
             Message::SidebarDragEnd => self.dragging_sidebar = false,
             Message::SidebarDragMove(pt) => {
@@ -5187,9 +5332,24 @@ impl Jterm {
     fn render_tree(&self, node: &PaneTree, path: &[usize]) -> Element<'_, Message> {
         match node {
             PaneTree::Leaf(session) => {
-                // The focus outline is only meaningful while split.
-                let focused = self.is_split() && *session == self.active;
-                container(self.pane_view(*session))
+                // The focus outline and the header strip are only meaningful
+                // while split: a lone pane is already named by the tab bar.
+                let split = self.is_split();
+                let focused = split && *session == self.active;
+                let body: Element<'_, Message> = if split {
+                    column![
+                        self.pane_header(*session),
+                        container(self.pane_view(*session))
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    ]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+                } else {
+                    self.pane_view(*session)
+                };
+                container(body)
                     .style(self.pane_frame_style(focused))
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -5243,6 +5403,115 @@ impl Jterm {
                         .height(Length::Fill)
                         .into()
                 }
+            }
+        }
+    }
+
+    /// Status strip above a split pane: its position in the layout, its title,
+    /// its working directory, and the command it is currently running.
+    ///
+    /// The strip doubles as the rearrange handle. Pressing it focuses the pane
+    /// (as clicking the terminal would); releasing over a different pane swaps
+    /// the two sessions without disturbing the split geometry.
+    fn pane_header(&self, session: usize) -> Element<'_, Message> {
+        let Some(sess) = self.sessions.get(session) else {
+            return Space::new().height(Length::Fixed(PANE_HEADER_H)).into();
+        };
+        let position = self
+            .layout
+            .leaves()
+            .iter()
+            .position(|&leaf| leaf == session)
+            .unwrap_or(0);
+        let focused = session == self.active;
+        let drag_source = self
+            .pane_drag
+            .as_ref()
+            .is_some_and(|drag| drag.target.is_some() && drag.session_id == sess.id);
+        let drop_target = self
+            .pane_drag
+            .as_ref()
+            .is_some_and(|drag| drag.target == Some(session));
+
+        let mut line = row![
+            text(format!("{}", position + 1))
+                .size(11)
+                .color(self.c_accent()),
+            text(sess.pane_title()).size(11),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        // The title is usually the directory's leaf; the full path only earns
+        // its space when it says something the title does not.
+        if let Some(cwd) = sess.cwd_display() {
+            if cwd != sess.pane_title() {
+                line = line.push(text(cwd).size(11).color(self.c_text_dim()));
+            }
+        }
+        if let Some(command) = sess.fg_proc_cache.as_deref() {
+            line = line.push(
+                text(format!("▶ {command}"))
+                    .size(11)
+                    .color(blend(self.c_text_dim(), self.c_accent(), 0.6)),
+            );
+        }
+        line = line.push(Space::new().width(Length::Fill));
+        if drop_target {
+            line = line.push(text("⇄").size(12).color(self.c_accent()));
+        }
+
+        let strip = container(line)
+            .width(Length::Fill)
+            .height(Length::Fixed(PANE_HEADER_H))
+            .padding([0, 6])
+            .clip(true)
+            .style(self.pane_header_style(focused, drag_source, drop_target));
+
+        mouse_area(strip)
+            .on_press(Message::PaneDragStart(session))
+            .interaction(iced::mouse::Interaction::Grab)
+            .into()
+    }
+
+    /// Pane header background: accent-tinted when focused, strongly tinted
+    /// when it is the pending drop target, and faded while it is the pane
+    /// being dragged away.
+    fn pane_header_style(
+        &self,
+        focused: bool,
+        drag_source: bool,
+        drop_target: bool,
+    ) -> impl Fn(&iced::Theme) -> container::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        let border = self.c_border();
+        let active_text = Theme::rgb_to_color32(self.theme.tabbar.active_text);
+        let inactive_text = Theme::rgb_to_color32(self.theme.tabbar.inactive_text);
+        move |_| {
+            let mut bg = if drop_target {
+                blend(base, accent, 0.45)
+            } else if focused {
+                blend(base, accent, 0.18)
+            } else {
+                base
+            };
+            if drag_source {
+                bg = Color { a: 0.55, ..bg };
+            }
+            container::Style {
+                text_color: Some(if focused || drop_target {
+                    active_text
+                } else {
+                    inactive_text
+                }),
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: if drop_target { accent } else { border },
+                    width: if drop_target { 1.0 } else { 0.0 },
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
             }
         }
     }
@@ -5306,6 +5575,15 @@ impl Jterm {
                 .on_move(Message::DividerDragMove)
                 .on_release(Message::DividerDragEnd)
                 .on_exit(Message::DividerDragEnd)
+                .into()
+        } else if self.pane_drag.is_some() {
+            // Same pattern as the divider drag: pointer moves track which pane
+            // is under the cursor and release commits the swap.
+            mouse_area(panes_body)
+                .on_move(Message::PaneDragMove)
+                .on_release(Message::PaneDragEnd)
+                .on_exit(Message::PaneDragEnd)
+                .interaction(iced::mouse::Interaction::Grabbing)
                 .into()
         } else {
             panes_body
@@ -7376,6 +7654,50 @@ mod tests {
         assert!(valid_restored_layout(&back, 3));
         // Out-of-range session indices are rejected.
         assert!(!valid_restored_layout(&back, 2));
+    }
+
+    #[test]
+    fn swapping_two_panes_exchanges_only_them_and_keeps_the_shape() {
+        let original = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.3, 0.7],
+                },
+            ],
+            ratios: vec![0.6, 0.4],
+        };
+
+        let mut tree = original.clone();
+        swap_sessions_in_tree(&mut tree, 0, 2);
+        assert_eq!(tree.leaves(), vec![2, 1, 0]);
+
+        // Ratios and nesting describe the geometry; a swap must not touch them.
+        let ratios_of = |tree: &PaneTree| match tree {
+            PaneTree::Split {
+                ratios, children, ..
+            } => {
+                let nested = match &children[1] {
+                    PaneTree::Split { ratios, .. } => ratios.clone(),
+                    PaneTree::Leaf(_) => Vec::new(),
+                };
+                (ratios.clone(), nested)
+            }
+            PaneTree::Leaf(_) => (Vec::new(), Vec::new()),
+        };
+        assert_eq!(ratios_of(&tree), ratios_of(&original));
+
+        // Swapping back restores the original exactly; a two-pass remap would
+        // instead have collapsed both leaves onto one session.
+        swap_sessions_in_tree(&mut tree, 0, 2);
+        assert_eq!(tree, original);
+
+        // Swapping a pane with itself is a no-op rather than a corruption.
+        swap_sessions_in_tree(&mut tree, 1, 1);
+        assert_eq!(tree, original);
     }
 
     #[test]
