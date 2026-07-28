@@ -39,6 +39,7 @@ pub enum PaletteAction {
     PromptJumpNext,
     CopyLastOutput,
     ClearScreen,
+    InstallRsh,
 }
 
 /// 面板中的一条命令项（展示信息 + 关联动作）。
@@ -277,6 +278,12 @@ impl PaletteState {
                 description: "Clear the terminal screen",
                 shortcut: "",
                 action: PaletteAction::ClearScreen,
+            },
+            PaletteItem {
+                name: "Install or update rsh",
+                description: "Install jterm's companion shell, or update the installed one",
+                shortcut: "",
+                action: PaletteAction::InstallRsh,
             },
         ];
         Self {

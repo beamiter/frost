@@ -376,6 +376,13 @@ enum Message {
     AgentNewTask,
     AgentClearContext,
     AgentClose,
+    /// Result of the background rsh update check (boxed: one rare message must
+    /// not widen every other variant).
+    RshChecked(Box<jterm_core::rsh_install::Status>),
+    /// Install rsh, or update the installed one, in a dedicated session.
+    RshInstall,
+    /// Hide the rsh notice until the next launch.
+    RshNoticeDismiss,
     SetAiEnabled(bool),
     SetAiProvider(String),
     SetAiModel(String),
@@ -576,7 +583,20 @@ impl Session {
         rows: usize,
         cwd: Option<&str>,
     ) -> anyhow::Result<Session> {
-        let pty = Pty::new_with_cwd(cols, rows, cwd, None, config.shell.as_deref())
+        Self::spawn_argv(config, id, cols, rows, cwd, None)
+    }
+
+    /// Spawn a session that runs an explicit argv instead of the configured
+    /// shell — used for one-shot helpers such as the rsh installer.
+    fn spawn_argv(
+        config: &Config,
+        id: usize,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+        command_argv: Option<&[String]>,
+    ) -> anyhow::Result<Session> {
+        let pty = Pty::new_with_cwd(cols, rows, cwd, None, config.shell.as_deref(), command_argv)
             .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
         let master_fd = pty.master_fd();
         let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -972,6 +992,10 @@ struct Jterm {
     /// Transient bottom-right toast queue with absolute expiry timestamps.
     /// Cleared lazily on each render and on ConfigTick.
     toasts: Vec<Toast>,
+    /// Offer produced by the background "is a newer rsh published?" check, and
+    /// whether the user waved it away for this launch.
+    rsh_prompt: Option<jterm_core::rsh_install::Prompt>,
+    rsh_notice_dismissed: bool,
     /// Tab-switcher overlay (Ctrl+Shift+L): when open, a small fuzzy list of
     /// tab labels lets the user jump by typing. Field holds the typed query
     /// and current selection index.
@@ -1097,6 +1121,8 @@ impl Jterm {
             dragging_tab: None,
             tab_menu: None,
             toasts: Vec::new(),
+            rsh_prompt: None,
+            rsh_notice_dismissed: false,
             tab_switcher: None,
             tab_close_confirm: None,
             last_notification_at: None,
@@ -1125,7 +1151,11 @@ impl Jterm {
                 app.relayout();
             }
         }
-        (app, Task::none())
+        // jterm3 prefers rsh as its shell, so it is worth noticing when the
+        // machine has none or an old one. Nothing is installed without an
+        // explicit click.
+        let rsh_check = Self::rsh_update_check_task(&app.config.rsh_update_check);
+        (app, rsh_check)
     }
 
     fn title(&self) -> String {
@@ -1488,6 +1518,72 @@ impl Jterm {
                 self.push_toast(message, ToastKind::Warning);
             }
         }
+    }
+
+    /// Run the rsh installer in its own session. The script narrates what it
+    /// does, so the session is the progress UI — the user can read a failure or
+    /// interrupt it with Ctrl+C like any other command.
+    fn install_or_update_rsh(&mut self) {
+        self.rsh_notice_dismissed = true;
+        let argv = match jterm_core::rsh_install::install_argv() {
+            Ok(argv) => argv,
+            Err(error) => {
+                log::warn!("cannot stage the rsh installer: {error}");
+                self.push_toast(
+                    format!("Could not write the installer script: {error}"),
+                    ToastKind::Warning,
+                );
+                return;
+            }
+        };
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            None,
+            Some(&argv),
+        ) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                self.active = insert;
+                self.unsplit();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.push_toast(message, ToastKind::Warning);
+            }
+        }
+    }
+
+    /// Ask the installer what is published, off the UI thread. A check that
+    /// fails, or finds nothing to do, stays silent: an offline laptop must not
+    /// be nagged about a button that cannot work.
+    fn rsh_update_check_task(policy: &str) -> Task<Message> {
+        // "startup" asks the network every launch; "daily" reuses the
+        // installer's cache, which every jterm on this machine shares.
+        let Some(max_age) = jterm_core::rsh_install::UpdateCheck::parse(policy).max_age() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    jterm_core::rsh_install::check_blocking(max_age)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    log::warn!("rsh update check did not finish: {error}");
+                    jterm_core::rsh_install::Status::default()
+                })
+            },
+            |status| Message::RshChecked(Box::new(status)),
+        )
     }
 
     fn close_session(&mut self, index: usize) -> Task<Message> {
@@ -2893,6 +2989,10 @@ impl Jterm {
                 self.new_session();
                 Task::none()
             }
+            PaletteAction::InstallRsh => {
+                self.install_or_update_rsh();
+                Task::none()
+            }
             PaletteAction::CloseTab => self.request_close_session(self.active),
             PaletteAction::NextTab => {
                 self.next_session();
@@ -3260,6 +3360,23 @@ impl Jterm {
                     return Task::batch(tasks);
                 }
             }
+            Message::RshChecked(status) => {
+                if let Some(error) = &status.error {
+                    log::info!("rsh update check unavailable: {error}");
+                }
+                if let Some(other) = &status.shadowed_by {
+                    // Usually /usr/bin/rsh, the BSD remote shell. Installing
+                    // does not fix PATH order, so the installer explains it in
+                    // the session; here it is only worth a log line.
+                    log::warn!("PATH resolves rsh to {other}, which jterm3 does not manage");
+                }
+                self.rsh_prompt = jterm_core::rsh_install::prompt_for(&status);
+                if let Some(prompt) = &self.rsh_prompt {
+                    log::info!("rsh notice: {}", prompt.banner_title());
+                }
+            }
+            Message::RshInstall => self.install_or_update_rsh(),
+            Message::RshNoticeDismiss => self.rsh_notice_dismissed = true,
             Message::AgentClose => self.agent.close(),
             Message::AgentInput(value) => self.agent.input = value,
             Message::AgentSubmit => {
@@ -4974,6 +5091,40 @@ impl Jterm {
             .into()
     }
 
+    /// One-line offer to install or update rsh, shown under the tab bar only
+    /// while the background check has something actionable and the user has not
+    /// waved it away.
+    fn rsh_notice(&self) -> Option<Element<'_, Message>> {
+        if self.rsh_notice_dismissed {
+            return None;
+        }
+        let prompt = self.rsh_prompt.as_ref()?;
+        let dim = self.c_text_dim();
+        let bar = row![
+            text(prompt.banner_title())
+                .size(12)
+                .style(move |_t: &iced::Theme| text::Style { color: Some(dim) }),
+            Space::new().width(Length::Fill),
+            button(text(prompt.button_label()).size(12))
+                .on_press(Message::RshInstall)
+                .padding([3, 9])
+                .style(self.ghost_btn_style()),
+            button(text("×").size(12))
+                .on_press(Message::RshNoticeDismiss)
+                .padding([3, 9])
+                .style(self.ghost_btn_style()),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        Some(
+            container(bar)
+                .width(Length::Fill)
+                .padding([2, 10])
+                .style(self.chrome_bar_style())
+                .into(),
+        )
+    }
+
     /// Build the terminal widget for the pane showing `sess_idx`.
     /// Overlay-style decorations (search, links, Kitty images) are only attached
     /// to the active pane; the other panes render plain.
@@ -5642,7 +5793,14 @@ impl Jterm {
         };
         // The top bar is always present: in Top mode it holds the tab strip; in
         // Side mode it holds the dock toggle so chrome never overlaps the grid.
-        let root: Element<'_, Message> = column![self.tab_bar(), main_area, self.status_bar()]
+        // The rsh notice, when there is one, sits directly under it.
+        let mut chrome = column![self.tab_bar()];
+        if let Some(notice) = self.rsh_notice() {
+            chrome = chrome.push(notice);
+        }
+        let root: Element<'_, Message> = chrome
+            .push(main_area)
+            .push(self.status_bar())
             .width(Length::Fill)
             .height(Length::Fill)
             .into();

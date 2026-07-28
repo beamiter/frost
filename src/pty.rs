@@ -539,15 +539,18 @@ mod unix_pty {
     impl Pty {
         #[allow(dead_code)]
         pub fn new(cols: usize, rows: usize) -> Result<Self> {
-            Self::new_with_cwd(cols, rows, None, None, None)
+            Self::new_with_cwd(cols, rows, None, None, None, None)
         }
 
+        /// `command_argv` replaces the interactive shell with an explicit argv,
+        /// for one-shot helper sessions such as the rsh installer.
         pub fn new_with_cwd(
             cols: usize,
             rows: usize,
             cwd: Option<&str>,
             session_id: Option<&str>,
             configured_shell: Option<&str>,
+            command_argv: Option<&[String]>,
         ) -> Result<Self> {
             // Reject stale session-history paths before allocating a PTY or
             // forking. The child still reports chdir failures through the setup
@@ -656,8 +659,31 @@ mod unix_pty {
                     None
                 };
 
+                // A one-shot helper (for example the rsh installer) is exec'd
+                // exactly as given: no login-shell wrapping, no --session.
+                let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
+                    Some(argv) => {
+                        let program = argv
+                            .first()
+                            .ok_or_else(|| anyhow!("command argv must not be empty"))?;
+                        let program_path =
+                            find_executable_in_path(program).unwrap_or_else(|| program.clone());
+                        let mut args = Vec::with_capacity(argv.len());
+                        for arg in argv {
+                            args.push(cstr_or_bail!(arg.clone(), "command argument contains NUL"));
+                        }
+                        Some((
+                            cstr_or_bail!(program_path, "command path contains NUL"),
+                            args,
+                        ))
+                    }
+                    None => None,
+                };
+
                 let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
-                    if let ("rsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
+                    if let Some(command) = command_cstrings {
+                        command
+                    } else if let ("rsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
                         let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
                         (
                             cstr_or_bail!(bash_path, "bash path contains NUL"),
@@ -1240,7 +1266,7 @@ mod unix_pty {
 
         #[test]
         fn terminate_is_idempotent_at_the_lifecycle_boundary() {
-            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"))
+            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"), None)
                 .expect("start /bin/sh in a PTY");
             assert_eq!(pty.lifecycle, ChildLifecycle::Running);
 
@@ -1327,7 +1353,18 @@ mod tests {
         std::fs::write(&real, b"#!/bin/sh\necho 'rsh 0.1.0'\n").expect("write rsh stand-in");
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
             .expect("make rsh stand-in executable");
-        assert!(super::unix_pty::is_jterm_rsh(&real));
+        // Retry briefly: a sibling test that forks while this file is still
+        // open for writing makes the exec fail with ETXTBSY until that child
+        // execs and drops the inherited descriptor.
+        let mut identified = false;
+        for _ in 0..50 {
+            if super::unix_pty::is_jterm_rsh(&real) {
+                identified = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(identified, "a real rsh banner must identify the shell");
 
         // Named rsh, but silent about `--version`: not ours either.
         let mute = dir.join("mute").join("rsh");
@@ -1353,7 +1390,7 @@ mod tests {
         ));
         assert!(!missing.exists());
 
-        let error = Pty::new_with_cwd(80, 24, missing.to_str(), None, Some("/bin/sh"))
+        let error = Pty::new_with_cwd(80, 24, missing.to_str(), None, Some("/bin/sh"), None)
             .err()
             .expect("a missing cwd must be rejected");
         assert!(
@@ -1380,7 +1417,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("make test script executable");
 
-        let error = Pty::new_with_cwd(80, 24, Some("/"), None, script.to_str())
+        let error = Pty::new_with_cwd(80, 24, Some("/"), None, script.to_str(), None)
             .err()
             .expect("execve failure must be returned to the parent");
         let _ = std::fs::remove_file(&script);
@@ -1390,10 +1427,50 @@ mod tests {
         );
     }
 
+    /// The one-shot helper path (rsh installer) must exec the given argv
+    /// verbatim: no login-shell wrapping, no --session injection.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_argv_is_exec_ed_verbatim() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'argv0=%s arg=%s' \"$0\" \"$1\"".to_string(),
+            "jterm-command-label".to_string(),
+            "payload".to_string(),
+        ];
+        let pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+            .expect("explicit argv must spawn");
+
+        let fd = pty.master_fd();
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut buf = [0u8; 1024];
+        while std::time::Instant::now() < deadline && !seen.contains("arg=payload") {
+            // SAFETY: `fd` is the live PTY master owned by `pty`, and `buf` is a
+            // valid mutable slice of the length passed to read(2).
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                seen.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        assert!(
+            seen.contains("argv0=jterm-command-label"),
+            "argv[0] must reach the child unchanged: {seen:?}"
+        );
+        assert!(
+            seen.contains("arg=payload"),
+            "remaining arguments must reach the child: {seen:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn normal_shell_startup_and_exit_succeeds() {
-        let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"))
+        let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"), None)
             .expect("start /bin/sh in a PTY");
 
         let command = b"exit 0\n";

@@ -88,6 +88,9 @@ disable_alt_screen = false
 # 可选：明确指定 shell
 shell = "/bin/bash"
 
+# 何时检查 rsh 是否有新版本：startup 每次启动联网 | daily（默认）复用缓存 | never 关闭
+rsh_update_check = "daily"
+
 # 安全默认值。开启后，SSH 中的程序也能读取宿主剪贴板。
 allow_clipboard_read = false
 
@@ -106,6 +109,21 @@ ai_model = "claude-sonnet-4-6"
 如果 `config.toml` 或 `keybindings.toml` 编辑出错，jterm3 会保留最后一次可用配置并在窗口内显示诊断。主配置有错误时自动保存会暂停，避免默认值覆盖原文件；修正文件后会自动恢复热重载。
 
 内置主题包括 Dark、Light、Monokai、Dracula、Nord、Gruvbox Dark、Tokyo Night、One Dark、Catppuccin Mocha 和 Solarized Light。自定义主题保存在 `~/.config/jterm3/themes/`。
+
+## 安装与更新 rsh
+
+jterm3 优先使用配套 shell [`rsh`](https://github.com/beamiter/rsh)，找不到才退回 bash。
+命令面板中的 **Install or update rsh** 会在独立会话里运行安装脚本：会话本身就是进度界面，
+可以 Ctrl+C 中断，脚本结束后等待 Enter 再关闭，失败原因不会一闪而过。
+
+安装脚本来自 rsh 仓库并内嵌在二进制里，因此一台从未装过 rsh 的机器也能引导；校验和验证、
+`rename(2)` 原子替换（**运行中的 shell 不受影响，新会话才使用新版本**）、旧二进制回滚副本，
+以及 `PATH` 被 `/usr/bin/rsh`（Debian 系的 BSD remote shell）遮蔽时的提示，都由脚本统一处理。
+
+缺少 rsh 或有新版本时，标签栏下方出现一条可忽略的提示行。检查在后台线程进行、从不自动安装，
+离线时保持静默。`rsh_update_check = "daily"`（默认）复用安装脚本自己的缓存
+（`~/.cache/rsh/update-check.json`），同机同时开着多个 jterm 也只产生一次网络请求；
+`"startup"` 每次启动都联网，`"never"` 关闭检查。
 
 ## 安全说明
 
