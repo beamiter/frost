@@ -242,6 +242,23 @@ pub struct Config {
     /// Show each pane's git branch and dirty marker in its header strip.
     #[serde(default = "default_show_repo_strip")]
     pub show_repo_strip: bool,
+
+    /// Append each OSC 133 completed command to the family-shared JSONL
+    /// history index (same keys and file format as jterm1/jterm4), so the
+    /// Ctrl+Shift+H picker can recall commands across restarts. Only the
+    /// command line, cwd, exit code, and end time are stored — never output.
+    #[serde(default = "default_command_history_enabled")]
+    pub command_history_enabled: bool,
+
+    /// History index location. Defaults to the XDG state directory
+    /// (`~/.local/state/jterm3/history.jsonl`); point siblings at one file to
+    /// share history between them.
+    #[serde(default)]
+    pub command_history_path: Option<PathBuf>,
+
+    /// Entries kept when the index compacts.
+    #[serde(default = "default_command_history_max_entries")]
+    pub command_history_max_entries: u32,
 }
 
 fn default_ai_provider() -> String {
@@ -429,6 +446,14 @@ fn default_show_repo_strip() -> bool {
     true
 }
 
+fn default_command_history_enabled() -> bool {
+    true
+}
+
+fn default_command_history_max_entries() -> u32 {
+    10_000
+}
+
 fn default_rsh_update_check() -> String {
     jterm_core::rsh_install::UpdateCheck::default()
         .as_str()
@@ -477,6 +502,9 @@ impl Default for Config {
             notify_long_blocks: default_notify_long_blocks(),
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: default_show_repo_strip(),
+            command_history_enabled: default_command_history_enabled(),
+            command_history_path: None,
+            command_history_max_entries: default_command_history_max_entries(),
         }
     }
 }
@@ -520,6 +548,8 @@ impl Config {
             .shell
             .map(|shell| shell.trim().to_string())
             .filter(|shell| !shell.is_empty());
+        // Same retention bounds as jterm1/jterm4 apply to their shared index.
+        self.command_history_max_entries = self.command_history_max_entries.clamp(100, 1_000_000);
         self
     }
 
@@ -617,6 +647,31 @@ impl Config {
             }
         }
         Ok(config_dir.join("jterm3").join(path))
+    }
+
+    /// Where the shared command-history index lives, or `None` while history
+    /// recording is disabled. Explicit paths support `~` expansion; relative
+    /// paths land beside the default so growing data stays out of the config
+    /// directory. The default follows the family's XDG state-dir semantics.
+    pub fn resolved_command_history_path(&self) -> Option<PathBuf> {
+        if !self.command_history_enabled {
+            return None;
+        }
+        let state_dir = dirs::state_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))?
+            .join("jterm3");
+        let Some(path) = self.command_history_path.as_ref() else {
+            return Some(state_dir.join("history.jsonl"));
+        };
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+        if let Ok(rest) = path.strip_prefix("~") {
+            if let Some(home) = dirs::home_dir() {
+                return Some(home.join(rest));
+            }
+        }
+        Some(state_dir.join(path))
     }
 
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -755,6 +810,48 @@ mod tests {
         assert!(!config.notify_long_blocks);
         assert_eq!(config.notify_long_block_threshold_ms, 250);
         assert!(!config.show_repo_strip);
+    }
+
+    #[test]
+    fn command_history_defaults_match_the_family() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(config.command_history_enabled);
+        assert_eq!(config.command_history_max_entries, 10_000);
+        let path = config
+            .resolved_command_history_path()
+            .expect("enabled history resolves a path");
+        assert!(path.ends_with("jterm3/history.jsonl"), "{}", path.display());
+    }
+
+    #[test]
+    fn command_history_overrides_are_resolved_and_bounded() {
+        let config = Config::from_toml(
+            "command_history_enabled = false\n\
+             command_history_path = '/tmp/shared-history.jsonl'\n\
+             command_history_max_entries = 7\n",
+        )
+        .expect("overrides parse");
+        assert_eq!(config.resolved_command_history_path(), None);
+        assert_eq!(config.command_history_max_entries, 100);
+
+        let config = Config {
+            command_history_enabled: true,
+            command_history_path: Some(PathBuf::from("/tmp/shared-history.jsonl")),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.resolved_command_history_path(),
+            Some(PathBuf::from("/tmp/shared-history.jsonl"))
+        );
+
+        let config = Config {
+            command_history_path: Some(PathBuf::from("~/history.jsonl")),
+            ..config
+        };
+        assert_eq!(
+            config.resolved_command_history_path(),
+            dirs::home_dir().map(|home| home.join("history.jsonl"))
+        );
     }
 
     #[test]

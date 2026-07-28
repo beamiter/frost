@@ -6,6 +6,7 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 
 - 多标签、拖动排序、快速标签切换，以及 tmux 风格的树状分屏（任意 pane 可再沿任一方向嵌套拆分）
 - 搜索当前屏幕与全部 scrollback，支持大小写匹配、正则和自动滚动定位
+- 查找替换面板（`Ctrl+Alt+R`）：scrollback 是只读输出，替换作用于当前选中文本——结果复制到剪贴板，或不带回车回填到提示符；支持字面/正则、大小写与全部替换
 - UTF-8、中文宽字符、True Color、256 色、鼠标报告、括号粘贴和扩展键盘协议
 - Kitty 图像直接传输（PNG、RGB、RGBA），带传输、像素、解压内存和放置数量上限
 - 文件侧栏、路径插入、链接识别、命令面板、主题编辑和实时设置
@@ -13,6 +14,7 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 shell 集成：沿命令提示符逐条跳转（`Ctrl+Shift+↑/↓`）、一键复制上一条命令输出（`Ctrl+Shift+G`），历史修剪时命令区保持对齐
+- 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 jterm1/jterm4 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
@@ -53,8 +55,10 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 新建标签 | `Ctrl+Shift+T` |
 | 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | 搜索全部回滚 | `Ctrl+Shift+F` |
+| 查找替换（选中文本） | `Ctrl+Alt+R`（替换结果进剪贴板或回填提示符，从不改写 scrollback） |
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
+| 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
 | 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
@@ -102,6 +106,12 @@ notify_long_block_threshold_ms = 10000
 
 # 分屏 pane 标题栏中的 git 分支/脏状态
 show_repo_strip = true
+
+# 持久化命令历史（与 jterm1/jterm4 同名键、同 JSONL 格式，可指向同一文件共享）
+# 默认写入 ~/.local/state/jterm3/history.jsonl，只记录命令、目录、退出码与时间
+command_history_enabled = true
+# command_history_path = "~/.local/state/jterm3/history.jsonl"
+command_history_max_entries = 10000
 
 # AI / Agent（默认关闭；不开启则没有任何数据离开本机）
 ai_enabled = false

@@ -25,6 +25,7 @@ pub enum Command {
     SearchPrev,
     SearchHistoryPrev,
     SearchHistoryNext,
+    SearchReplaceToggle,
 
     // === 终端操作 ===
     TerminalSendSigint, // Ctrl+C
@@ -86,6 +87,7 @@ impl std::fmt::Display for Command {
             Command::SearchPrev => write!(f, "search:prev"),
             Command::SearchHistoryPrev => write!(f, "search:history:prev"),
             Command::SearchHistoryNext => write!(f, "search:history:next"),
+            Command::SearchReplaceToggle => write!(f, "search:replace:toggle"),
             Command::TerminalSendSigint => write!(f, "terminal:send_sigint"),
             Command::TerminalSendEof => write!(f, "terminal:send_eof"),
             Command::TerminalClear => write!(f, "terminal:clear"),
@@ -140,6 +142,7 @@ impl std::str::FromStr for Command {
             "search:prev" => Ok(Command::SearchPrev),
             "search:history:prev" => Ok(Command::SearchHistoryPrev),
             "search:history:next" => Ok(Command::SearchHistoryNext),
+            "search:replace:toggle" => Ok(Command::SearchReplaceToggle),
             "terminal:send_sigint" => Ok(Command::TerminalSendSigint),
             "terminal:send_eof" => Ok(Command::TerminalSendEof),
             "terminal:clear" => Ok(Command::TerminalClear),
@@ -449,6 +452,12 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+f".to_string(), "search:open".to_string());
+        // Same chord as jterm2's Find & Replace panel; Ctrl+Alt is otherwise
+        // only used for pane focus (arrow keys), so the letter chord is free.
+        bindings.bindings.insert(
+            "ctrl+alt+r".to_string(),
+            "search:replace:toggle".to_string(),
+        );
 
         // 配置操作
         bindings
@@ -664,6 +673,7 @@ mod tests {
             ("ctrl+shift+c", Command::EditCopy),
             ("ctrl+shift+v", Command::EditPaste),
             ("ctrl+shift+f", Command::SearchOpen),
+            ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+o", Command::ConfigToggle),
             ("ctrl+backslash", Command::SidebarToggle),
             ("ctrl+shift+a", Command::AgentToggle),

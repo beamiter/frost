@@ -12,6 +12,7 @@ pub enum PaletteAction {
     Copy,
     Paste,
     OpenSearch,
+    OpenSearchReplace,
     SplitVertical,
     SplitHorizontal,
     FocusPaneLeft,
@@ -38,6 +39,7 @@ pub enum PaletteAction {
     PromptJumpPrev,
     PromptJumpNext,
     CopyLastOutput,
+    CommandHistory,
     ClearScreen,
     InstallRsh,
 }
@@ -116,6 +118,12 @@ impl PaletteState {
                 description: "Open the search overlay",
                 shortcut: "Ctrl+Shift+F",
                 action: PaletteAction::OpenSearch,
+            },
+            PaletteItem {
+                name: "Find & Replace",
+                description: "Search-and-replace the current selection (clipboard or prompt)",
+                shortcut: "Ctrl+Alt+R",
+                action: PaletteAction::OpenSearchReplace,
             },
             PaletteItem {
                 name: "Split Right",
@@ -274,6 +282,12 @@ impl PaletteState {
                 action: PaletteAction::CopyLastOutput,
             },
             PaletteItem {
+                name: "Command History",
+                description: "Fuzzy-search persisted commands and type one into the prompt",
+                shortcut: "Ctrl+Shift+H",
+                action: PaletteAction::CommandHistory,
+            },
+            PaletteItem {
                 name: "Clear Screen",
                 description: "Clear the terminal screen",
                 shortcut: "",
@@ -429,6 +443,8 @@ mod tests {
             (PaletteAction::PromptJumpPrev, "Ctrl+Shift+Up"),
             (PaletteAction::PromptJumpNext, "Ctrl+Shift+Down"),
             (PaletteAction::CopyLastOutput, "Ctrl+Shift+G"),
+            (PaletteAction::CommandHistory, "Ctrl+Shift+H"),
+            (PaletteAction::OpenSearchReplace, "Ctrl+Alt+R"),
         ];
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");

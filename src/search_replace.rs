@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 
 /// 高级搜索配置
@@ -14,6 +13,8 @@ pub struct SearchConfig {
 #[derive(Clone, Debug)]
 pub struct ReplaceOptions {
     pub replace_all: bool,
+    /// 引擎尚未实现大小写保留；面板不展示该开关，仅保留默认值。
+    #[allow(dead_code)]
     pub preserve_case: bool,
 }
 
@@ -157,7 +158,8 @@ impl SearchAndReplaceEngine {
         Ok((result, count))
     }
 
-    /// 获取搜索匹配的上下文（用于预览）
+    /// 获取搜索匹配的上下文（用于预览；面板暂未接入）
+    #[allow(dead_code)]
     pub fn get_match_context(text: &str, pattern: &str, context_lines: usize) -> Vec<String> {
         let lines: Vec<&str> = text.lines().collect();
         let mut result = Vec::new();

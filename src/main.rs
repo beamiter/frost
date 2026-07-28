@@ -9,12 +9,14 @@ mod color;
 mod command_palette;
 mod config;
 mod debug;
+mod history_picker;
 mod keybindings;
 mod kitty_graphics;
 mod link;
 mod pty;
 mod search;
 mod search_replace;
+mod search_replace_panel;
 mod session_persistence;
 mod sidebar;
 mod terminal;
@@ -92,6 +94,10 @@ static AGENT_EDIT_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-agent-edit-input"));
 static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
+static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));
+static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 
 /// Toast kind drives the accent color of the floating notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +153,7 @@ enum ChromeShortcut {
     CommandPalette,
     Help,
     TabSwitcher,
+    HistoryPicker,
     Debug,
 }
 
@@ -167,6 +174,8 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
         'p' => Some(ChromeShortcut::CommandPalette),
         '/' | '?' => Some(ChromeShortcut::Help),
         'l' => Some(ChromeShortcut::TabSwitcher),
+        // Same chord as jterm4's history palette (Ctrl+R stays with readline).
+        'h' => Some(ChromeShortcut::HistoryPicker),
         _ => None,
     }
 }
@@ -449,6 +458,15 @@ enum Message {
     SearchToggleRegex,
     SearchToggleCase,
     SearchInput(String),
+    SearchReplaceFindInput(String),
+    SearchReplaceReplaceInput(String),
+    SearchReplaceToggleRegex,
+    SearchReplaceToggleCase,
+    SearchReplaceToggleAll,
+    /// Run the Find & Replace panel against the current selection and route
+    /// the result to the clipboard or the prompt.
+    SearchReplaceApply(search_replace_panel::SearchReplaceAction),
+    SearchReplaceClose,
     PaletteInput(String),
     PaletteExecute(usize),
     ToggleConfigPanel,
@@ -494,6 +512,12 @@ enum Message {
     TabSwitcherClose,
     /// Jump to the given stable session id from the tab switcher (and close it).
     TabSwitcherJump(usize),
+    /// Filter text changed in the history picker.
+    HistoryPickerInput(String),
+    /// Cancel the history picker overlay.
+    HistoryPickerClose,
+    /// Type the clicked command into the active pane's prompt (and close).
+    HistoryPickerAccept(String),
     /// User confirmed closing a tab with a running foreground process.
     TabCloseConfirmYes,
     /// User cancelled the close-confirmation overlay.
@@ -927,6 +951,9 @@ struct Jterm {
     /// PTY output marks active-search results stale; a short timer coalesces
     /// bursts so each chunk does not rescan the entire scrollback.
     search_dirty: bool,
+    /// Find & Replace modal (Ctrl+Alt+R): rewrites the current selection into
+    /// the clipboard or the prompt — the scrollback itself is never mutated.
+    search_replace: search_replace_panel::SearchReplacePanelState,
     palette: command_palette::PaletteState,
     agent: agent::AgentUi,
     keybindings: keybindings::KeyBindings,
@@ -1018,6 +1045,9 @@ struct Jterm {
     /// tab labels lets the user jump by typing. Field holds the typed query
     /// and current selection index.
     tab_switcher: Option<TabSwitcherState>,
+    /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
+    /// command-history index; Enter types the selection into the active pane.
+    history_picker: Option<history_picker::HistoryPickerState>,
     /// Close-confirmation overlay for a tab with a running foreground process.
     /// Holds `(target_id, process_name, activate_after_id)`.
     tab_close_confirm: Option<(usize, String, Option<usize>)>,
@@ -1098,6 +1128,7 @@ impl Jterm {
             nerd_symbol,
             search: search::SearchState::new(),
             search_dirty: false,
+            search_replace: search_replace_panel::SearchReplacePanelState::new(),
             palette: command_palette::PaletteState::new(),
             agent: agent::AgentUi::new(),
             keybindings: keybindings_load.bindings,
@@ -1142,6 +1173,7 @@ impl Jterm {
             rsh_prompt: None,
             rsh_notice_dismissed: false,
             tab_switcher: None,
+            history_picker: None,
             tab_close_confirm: None,
             last_notification_at: None,
             history_reflow_sessions: std::collections::HashSet::new(),
@@ -1295,24 +1327,28 @@ impl Jterm {
     /// editable field or modal action takes ownership until it closes.
     fn terminal_input_active(&self) -> bool {
         !self.search.is_open
+            && !self.search_replace.is_open
             && !self.palette.is_open
             && !self.config_panel_open
             && !self.help_open
             && !self.debug_open
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
+            && self.history_picker.is_none()
             && self.tab_close_confirm.is_none()
     }
 
     /// Search is intentionally non-modal for scrolling/selection. The remaining
     /// overlays block pointer actions from reaching panes underneath them.
     fn terminal_mouse_active(&self) -> bool {
-        !self.palette.is_open
+        !self.search_replace.is_open
+            && !self.palette.is_open
             && !self.config_panel_open
             && !self.help_open
             && !self.debug_open
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
+            && self.history_picker.is_none()
             && self.tab_close_confirm.is_none()
     }
 
@@ -1740,6 +1776,11 @@ impl Jterm {
         self.save_session_snapshot();
         if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
             log::warn!("rsh execution journal did not flush before exit");
+        }
+        if let Err(error) =
+            jterm_core::command_history::flush_pending(std::time::Duration::from_secs(2))
+        {
+            log::warn!("command history did not flush before exit: {error}");
         }
         iced::exit()
     }
@@ -2350,6 +2391,14 @@ impl Jterm {
                 self.reveal_current_search_match();
                 Task::none()
             }
+            C::SearchReplaceToggle => {
+                self.search_replace.toggle();
+                if self.search_replace.is_open {
+                    iced::widget::operation::focus(SEARCH_REPLACE_FIND_ID.clone())
+                } else {
+                    Task::none()
+                }
+            }
             C::TerminalSendSigint => {
                 send(&[0x03]);
                 Task::none()
@@ -2520,6 +2569,13 @@ impl Jterm {
                     TAB_SWITCHER_INPUT_ID.clone(),
                 ))
             }
+            ChromeShortcut::HistoryPicker => {
+                if self.history_picker.is_some() {
+                    self.history_picker = None;
+                    return Some(Task::none());
+                }
+                Some(self.open_history_picker())
+            }
             ChromeShortcut::Debug => {
                 self.debug_open = !self.debug_open;
                 Some(Task::none())
@@ -2573,6 +2629,89 @@ impl Jterm {
                         state.selected - 1
                     };
                 }
+                return Some(Task::none());
+            }
+            Key::Named(Named::Backspace) => {
+                state.query.pop();
+                state.selected = 0;
+                return Some(Task::none());
+            }
+            _ => {}
+        }
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
+                if !printable.is_empty() {
+                    state.query.push_str(&printable);
+                    state.selected = 0;
+                    return Some(Task::none());
+                }
+            }
+        }
+        // Swallow all other keys while the overlay owns the keyboard.
+        Some(Task::none())
+    }
+
+    /// Open the history picker over a bounded recent slice of the persisted
+    /// command index. Shared by Ctrl+Shift+H and the command palette so both
+    /// entry points behave identically, including the disabled-history hint.
+    fn open_history_picker(&mut self) -> Task<Message> {
+        let Some(path) = self.config.resolved_command_history_path() else {
+            self.push_toast(
+                "Command history is disabled (command_history_enabled = false)",
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        self.history_picker = Some(history_picker::HistoryPickerState::load(&path));
+        iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
+    }
+
+    /// Paste-to-prompt: queue `text` into the active pane exactly like a
+    /// clipboard paste (bracketed framing, input-queue bounds, rejection
+    /// toast) and never append Enter — the user still submits explicitly.
+    fn type_into_active_pane(&mut self, text: String) -> Task<Message> {
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
+        Task::done(Message::Pasted(id, Some(text)))
+    }
+
+    /// History picker key handling. Mirrors `handle_tab_switcher_key`: typed
+    /// text filters, arrows move the selection, Enter types the highlighted
+    /// command into the active pane's prompt, Esc/Ctrl+Shift+H dismisses.
+    fn handle_history_picker_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::HistoryPicker) {
+            self.history_picker = None;
+            return Some(Task::none());
+        }
+        let state = self.history_picker.as_mut()?;
+        match key {
+            Key::Named(Named::Escape) => {
+                self.history_picker = None;
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                let command = state.selected_command();
+                self.history_picker = None;
+                return Some(match command {
+                    Some(command) => self.type_into_active_pane(command),
+                    None => Task::none(),
+                });
+            }
+            Key::Named(Named::ArrowDown) => {
+                state.select_next();
+                return Some(Task::none());
+            }
+            Key::Named(Named::ArrowUp) => {
+                state.select_prev();
                 return Some(Task::none());
             }
             Key::Named(Named::Backspace) => {
@@ -2902,6 +3041,61 @@ impl Jterm {
         true
     }
 
+    /// While the Find & Replace panel is open, swallow keys so they don't
+    /// reach the PTY; its text inputs handle their own events while focused.
+    /// Esc or the toggle chord closes the panel.
+    fn handle_search_replace_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if !self.search_replace.is_open {
+            return None;
+        }
+        let toggle_chord = key_to_binding_string(key, mods).is_some_and(|binding| {
+            self.keybindings.get_command(&binding)
+                == Some(keybindings::Command::SearchReplaceToggle)
+        });
+        if toggle_chord || matches!(key, Key::Named(Named::Escape)) {
+            self.search_replace.is_open = false;
+        }
+        Some(Task::none())
+    }
+
+    /// Run the Find & Replace panel against the active pane's selection and
+    /// route the result. Mirrors jterm2's semantics: the scrollback is
+    /// read-only program output and is never mutated — the transformed text
+    /// goes to the clipboard, or to the prompt via the paste path (bracketed
+    /// framing, bounded input queue, no trailing newline).
+    fn apply_search_replace(
+        &mut self,
+        action: search_replace_panel::SearchReplaceAction,
+    ) -> Task<Message> {
+        let selection = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.terminal.copy_selection())
+            .filter(|t| !t.is_empty());
+        let Some(text) = selection else {
+            self.search_replace.status = "No selection".to_string();
+            return Task::none();
+        };
+        let Some(result) = self.search_replace.apply(&text) else {
+            return Task::none();
+        };
+        match action {
+            search_replace_panel::SearchReplaceAction::ReplaceToClipboard => {
+                iced::clipboard::write(result)
+            }
+            search_replace_panel::SearchReplaceAction::TypeIntoTerminal => {
+                self.search_replace.status = "Typed into terminal".to_string();
+                self.type_into_active_pane(result)
+            }
+        }
+    }
+
     /// While the config panel is open, swallow keys so they don't reach the
     /// PTY; Esc closes it. The panel's own widgets handle their own events.
     fn handle_config_panel_key(
@@ -3052,6 +3246,14 @@ impl Jterm {
                     Task::none()
                 }
             }
+            PaletteAction::OpenSearchReplace => {
+                self.search_replace.toggle();
+                if self.search_replace.is_open {
+                    iced::widget::operation::focus(SEARCH_REPLACE_FIND_ID.clone())
+                } else {
+                    Task::none()
+                }
+            }
             PaletteAction::SplitVertical => {
                 self.split(Axis::Vertical);
                 Task::none()
@@ -3156,6 +3358,7 @@ impl Jterm {
                 Task::none()
             }
             PaletteAction::CopyLastOutput => self.copy_last_output_task(),
+            PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(action, PaletteAction::PromptJumpPrev) {
@@ -3395,6 +3598,42 @@ impl Jterm {
                         },
                     ) {
                         log::warn!("cannot journal completed command output: {error:?}");
+                    }
+                }
+
+                // Persist each finished command into the family-shared JSONL
+                // history index (jterm1/jterm4 file format) so the
+                // Ctrl+Shift+H picker recalls it across restarts. Writes go
+                // through jterm_core's bounded background writer; unsafe
+                // reconstructions (multiline heredoc text) are skipped rather
+                // than rejected noisily.
+                if !completed_commands.is_empty() {
+                    if let Some(path) = self.config.resolved_command_history_path() {
+                        let max_entries = self.config.command_history_max_entries as usize;
+                        let cwd = self
+                            .session_by_identity(id, fd)
+                            .and_then(|sess| sess.cwd_cache.clone().or_else(|| sess.cwd()));
+                        let end_time_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                        for completed in &completed_commands {
+                            let Some(command) =
+                                history_picker::sanitized_command(&completed.command)
+                            else {
+                                continue;
+                            };
+                            if let Err(error) = jterm_core::command_history::enqueue(
+                                &path,
+                                max_entries,
+                                command,
+                                cwd.as_deref(),
+                                completed.exit_code.unwrap_or(0),
+                                end_time_ms,
+                            ) {
+                                log::warn!("command history: {error}");
+                            }
+                        }
                     }
                 }
                 for completed in &completed_commands {
@@ -3637,6 +3876,15 @@ impl Jterm {
                             return task;
                         }
                     }
+                    // The history picker owns the keyboard the same way (Enter
+                    // types the selection, Esc/Ctrl+Shift+H dismisses).
+                    if self.history_picker.is_some() {
+                        if let Some(task) =
+                            self.handle_history_picker_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
                     if self.help_open || self.debug_open {
                         let active_overlay_toggle = (self.help_open
                             && chrome_shortcut(&key, modifiers) == Some(ChromeShortcut::Help))
@@ -3656,6 +3904,9 @@ impl Jterm {
                         return task;
                     }
                     if let Some(task) = self.handle_palette_key(&key, modifiers, text.as_deref()) {
+                        return task;
+                    }
+                    if let Some(task) = self.handle_search_replace_key(&key, modifiers) {
                         return task;
                     }
                     if self.handle_search_key(&key, modifiers, text.as_deref()) {
@@ -4021,6 +4272,26 @@ impl Jterm {
                 self.recompute_search();
                 self.reveal_current_search_match();
             }
+            Message::SearchReplaceFindInput(value) => {
+                self.search_replace.search_input = value;
+            }
+            Message::SearchReplaceReplaceInput(value) => {
+                self.search_replace.replace_input = value;
+            }
+            Message::SearchReplaceToggleRegex => {
+                self.search_replace.config.use_regex = !self.search_replace.config.use_regex;
+            }
+            Message::SearchReplaceToggleCase => {
+                self.search_replace.config.case_sensitive =
+                    !self.search_replace.config.case_sensitive;
+            }
+            Message::SearchReplaceToggleAll => {
+                self.search_replace.options.replace_all = !self.search_replace.options.replace_all;
+            }
+            Message::SearchReplaceApply(action) => {
+                return self.apply_search_replace(action);
+            }
+            Message::SearchReplaceClose => self.search_replace.is_open = false,
             Message::PaletteInput(value) => {
                 self.palette.query = value;
                 self.palette.selected = 0;
@@ -4405,6 +4676,17 @@ impl Jterm {
                         self.activate_session(index);
                     }
                 }
+            }
+            Message::HistoryPickerClose => self.history_picker = None,
+            Message::HistoryPickerInput(q) => {
+                if let Some(s) = self.history_picker.as_mut() {
+                    s.query = q;
+                    s.selected = 0;
+                }
+            }
+            Message::HistoryPickerAccept(command) => {
+                self.history_picker = None;
+                return self.type_into_active_pane(command);
             }
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
@@ -5066,20 +5348,94 @@ impl Jterm {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
+    /// Ctrl+Shift+H persisted-command history picker overlay (palette-style).
+    /// Enter/click types the command into the active pane; nothing executes.
+    fn history_picker_view(
+        &self,
+        state: &history_picker::HistoryPickerState,
+    ) -> Element<'_, Message> {
+        let filtered = state.filtered();
+
+        let query: Element<'_, Message> = text_input("Recall a command…", &state.query)
+            .id(HISTORY_PICKER_INPUT_ID.clone())
+            .on_input(Message::HistoryPickerInput)
+            .size(14)
+            .into();
+        let query_line = row![text("↺").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        if filtered.is_empty() {
+            let hint = if state.query.is_empty() {
+                "No persisted commands yet (recorded via OSC 133 shell integration)"
+            } else {
+                "No commands match"
+            };
+            list = list.push(text(hint).size(13).style(text::secondary));
+        } else {
+            for (pos, record) in filtered.iter().enumerate() {
+                let selected = pos == state.selected;
+                let mut info =
+                    row![text(history_picker::display_command(&record.command)).size(13)]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center);
+                info = info.push(Space::new().width(Length::Fill));
+                if record.exit_code != 0 {
+                    info = info.push(
+                        text(format!("✗ {}", record.exit_code))
+                            .size(12)
+                            .style(text::danger),
+                    );
+                }
+                if let Some(cwd) = record.cwd.as_deref() {
+                    info = info.push(text(abbreviate_home(cwd)).size(12).style(text::secondary));
+                }
+                let accent = self.c_accent();
+                let body = container(info).width(Length::Fill).padding([3, 8]).style(
+                    move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let row_btn =
+                    mouse_area(body).on_press(Message::HistoryPickerAccept(record.command.clone()));
+                list = list.push(row_btn);
+            }
+        }
+
+        let body = column![query_line, list].spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(560.0))
+            .max_height(480.0)
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::HistoryPickerClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
     /// Bottom status bar: cwd, grid size, cursor position, and search state.
     fn status_bar(&self) -> Element<'_, Message> {
         let sess = self.sessions.get(self.active);
         let cwd = sess
             .and_then(|s| s.cwd_cache.clone())
-            .map(|p| {
-                // Abbreviate the home directory to `~` to keep the bar compact.
-                if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(String::from)) {
-                    if let Some(rest) = p.strip_prefix(&home) {
-                        return format!("~{rest}");
-                    }
-                }
-                p
-            })
+            .map(|p| abbreviate_home(&p))
             .unwrap_or_default();
         let (cur_row, cur_col) = sess.map(|s| s.cursor).unwrap_or((0, 0));
         // Report the active pane's own grid size; when split it differs from the
@@ -5832,6 +6188,8 @@ impl Jterm {
             stack![body, overlay].into()
         } else if self.palette.is_open {
             stack![body, self.command_palette()].into()
+        } else if self.search_replace.is_open {
+            stack![body, self.search_replace_panel()].into()
         } else if self.search.is_open {
             stack![body, self.search_bar()].into()
         } else {
@@ -5885,8 +6243,9 @@ impl Jterm {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
-        // Tab context menu, tab switcher, and toasts float above everything
-        // so they remain accessible regardless of which other panel is open.
+        // Tab context menu, tab switcher, history picker, and toasts float
+        // above everything so they remain accessible regardless of which
+        // other panel is open.
         let root = if let Some(i) = self.tab_menu {
             stack![root, self.tab_context_menu(i)].into()
         } else {
@@ -5894,6 +6253,11 @@ impl Jterm {
         };
         let root: Element<'_, Message> = if let Some(s) = &self.tab_switcher {
             stack![root, self.tab_switcher_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.history_picker {
+            stack![root, self.history_picker_view(s)].into()
         } else {
             root
         };
@@ -5971,6 +6335,97 @@ impl Jterm {
             .align_top(Length::Fill)
             .padding(8)
             .into()
+    }
+
+    /// Centered Find & Replace modal (Ctrl+Alt+R). The scrollback is read-only
+    /// program output, so the replacement runs on the current selection and the
+    /// result goes to the clipboard or — without a trailing newline — to the
+    /// active pane's prompt.
+    fn search_replace_panel(&self) -> Element<'_, Message> {
+        let label = |s: &str| container(text(s.to_string()).size(13)).width(Length::Fixed(64.0));
+        let find_input = text_input("find…", &self.search_replace.search_input)
+            .id(SEARCH_REPLACE_FIND_ID.clone())
+            .on_input(Message::SearchReplaceFindInput)
+            .size(13);
+        let replace_input = text_input("replace with…", &self.search_replace.replace_input)
+            .on_input(Message::SearchReplaceReplaceInput)
+            .size(13);
+        let inputs = column![
+            row![label("Find:"), find_input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            row![label("Replace:"), replace_input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        ]
+        .spacing(6);
+
+        let toggles = row![
+            checkbox(self.search_replace.config.use_regex)
+                .label("Regex")
+                .text_size(13)
+                .on_toggle(|_| Message::SearchReplaceToggleRegex),
+            checkbox(self.search_replace.config.case_sensitive)
+                .label("Case")
+                .text_size(13)
+                .on_toggle(|_| Message::SearchReplaceToggleCase),
+            checkbox(self.search_replace.options.replace_all)
+                .label("All")
+                .text_size(13)
+                .on_toggle(|_| Message::SearchReplaceToggleAll),
+        ]
+        .spacing(12);
+
+        let actions = row![
+            button(text("Replace → Clipboard").size(13)).on_press(Message::SearchReplaceApply(
+                search_replace_panel::SearchReplaceAction::ReplaceToClipboard
+            )),
+            button(text("Type into terminal").size(13)).on_press(Message::SearchReplaceApply(
+                search_replace_panel::SearchReplaceAction::TypeIntoTerminal
+            )),
+        ]
+        .spacing(8);
+
+        let title = row![
+            text("Find & Replace").size(14),
+            Space::new().width(Length::Fill),
+            button(text("✕").size(12))
+                .padding([2, 6])
+                .style(button::text)
+                .on_press(Message::SearchReplaceClose),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let mut body = column![title, inputs, toggles, actions].spacing(10);
+        if !self.search_replace.status.is_empty() {
+            body = body.push(
+                text(self.search_replace.status.clone())
+                    .size(12)
+                    .style(text::secondary),
+            );
+        }
+        body = body.push(
+            text("Runs on the current selection · Esc close")
+                .size(10)
+                .style(text::secondary),
+        );
+
+        // Stay inside the window like the settings modal does.
+        let panel_width = (self.win_size.width - 32.0).clamp(240.0, 380.0);
+        let panel = container(body)
+            .width(Length::Fixed(panel_width))
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SearchReplaceClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
     /// Centered, fuzzy-filtered command palette overlay. Keys are handled at
@@ -6565,6 +7020,10 @@ impl Jterm {
             kb("Ctrl+Shift+C", "Copy selection"),
             kb("Ctrl+Shift+V", "Paste"),
             kb("Ctrl+Shift+G", "Copy last command output (OSC 133)"),
+            kb(
+                "Ctrl+Shift+H",
+                "Command history picker (types into the prompt)"
+            ),
             kb("Drag", "Select text"),
             kb("Ctrl+Click", "Open link under cursor"),
             section("Scroll / Search"),
@@ -6572,6 +7031,10 @@ impl Jterm {
             kb("Shift+End", "Scroll to bottom (live)"),
             kb("Ctrl+Shift+Up / Down", "Previous / next prompt (OSC 133)"),
             kb("Ctrl+Shift+F", "Find"),
+            kb(
+                "Ctrl+Alt+R",
+                "Find & replace in selection (clipboard / prompt)"
+            ),
             section("Panels"),
             kb("Ctrl+\\", "Toggle tabs / files sidebar"),
             kb("Ctrl+Shift+P", "Command palette"),
@@ -7200,6 +7663,17 @@ fn btn_code(button: MouseButton) -> u8 {
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
     }
+}
+
+/// Abbreviate the home directory to `~` for compact path display (status bar,
+/// history picker rows).
+fn abbreviate_home(path: &str) -> String {
+    if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(String::from)) {
+        if let Some(rest) = path.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
 }
 
 /// Shell-quote a path for typing into the terminal, with a trailing space.
@@ -7849,6 +8323,10 @@ mod tests {
         assert_eq!(
             chrome_shortcut(&character("l"), ctrl_shift),
             Some(ChromeShortcut::TabSwitcher)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("h"), ctrl_shift),
+            Some(ChromeShortcut::HistoryPicker)
         );
         assert_eq!(
             chrome_shortcut(&keyboard::Key::Named(Named::F12), keyboard::Modifiers::NONE),
