@@ -53,6 +53,137 @@ pub struct ModelRequest {
     pub token: AiCancellationToken,
 }
 
+/// Human-readable fields extracted from a partial, still-streaming agent
+/// reply. The protocol reply is one strict JSON object
+/// (`{"action":…,"thought":…,"command"|"message":…}`), so raw deltas are
+/// unreadable; this pulls out the string-field *contents* as they arrive.
+/// Purely a live preview — the transcript is only ever fed the complete
+/// reply through `AgentSession::accept_model_reply`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReplyPreview {
+    pub thought: Option<String>,
+    pub message: Option<String>,
+    pub command: Option<String>,
+}
+
+impl ReplyPreview {
+    pub fn is_empty(&self) -> bool {
+        self.thought.is_none() && self.message.is_none() && self.command.is_none()
+    }
+}
+
+/// Decode one JSON string body (opening quote already consumed). Escapes are
+/// decoded; an escape truncated by the end of the fragment is dropped rather
+/// than shown raw. Returns the content and whether the closing quote arrived.
+fn parse_json_string(chars: &mut std::str::Chars) -> (String, bool) {
+    let mut out = String::new();
+    loop {
+        let Some(c) = chars.next() else {
+            return (out, false);
+        };
+        match c {
+            '"' => return (out, true),
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    return (out, false);
+                };
+                match escape {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{0008}'),
+                    'f' => out.push('\u{000C}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let mut code = String::new();
+                        for _ in 0..4 {
+                            let Some(digit) = chars.next() else {
+                                return (out, false);
+                            };
+                            code.push(digit);
+                        }
+                        // Lone surrogates fail `from_u32` and are dropped;
+                        // this is a preview, not the recorded reply.
+                        if let Some(decoded) =
+                            u32::from_str_radix(&code, 16).ok().and_then(char::from_u32)
+                        {
+                            out.push(decoded);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Best-effort extraction of `thought` / `message` / `command` values from a
+/// possibly-incomplete reply. Tolerates one leading code fence (as
+/// `parse_action` does) and an unterminated final string; anything that stops
+/// scanning simply ends the preview — never an error, the complete reply is
+/// still parsed strictly on arrival.
+pub fn preview_model_reply(raw: &str) -> ReplyPreview {
+    let mut preview = ReplyPreview::default();
+    let trimmed = raw.trim_start();
+    let body = match trimmed.strip_prefix("```") {
+        // A fenced reply only becomes previewable once the fence line ends.
+        Some(rest) => match rest.split_once('\n') {
+            Some((_, tail)) => tail,
+            None => return preview,
+        },
+        None => trimmed,
+    };
+    let Some(start) = body.find('{') else {
+        return preview;
+    };
+    let mut chars = body[start + 1..].chars();
+    loop {
+        // Key: skip separators up to the next string; '}' ends the object.
+        let key = loop {
+            match chars.next() {
+                Some('"') => {
+                    let (key, closed) = parse_json_string(&mut chars);
+                    if !closed {
+                        return preview;
+                    }
+                    break key;
+                }
+                Some(c) if c.is_whitespace() || c == ',' => continue,
+                _ => return preview,
+            }
+        };
+        // Separator.
+        loop {
+            match chars.next() {
+                Some(':') => break,
+                Some(c) if c.is_whitespace() => continue,
+                _ => return preview,
+            }
+        }
+        // Value: only string values are previewed; the protocol has no other
+        // value type, so anything else just ends the scan.
+        let value = loop {
+            match chars.next() {
+                Some('"') => break parse_json_string(&mut chars).0,
+                Some(c) if c.is_whitespace() => continue,
+                _ => return preview,
+            }
+        };
+        let slot = match key.as_str() {
+            "thought" => &mut preview.thought,
+            "message" => &mut preview.message,
+            "command" => &mut preview.command,
+            _ => continue,
+        };
+        if !value.is_empty() {
+            *slot = Some(value);
+        }
+    }
+}
+
 pub struct AgentUi {
     pub is_open: bool,
     pub session: Option<AgentSession>,
@@ -74,6 +205,12 @@ pub struct AgentUi {
     /// generation (from a closed/replaced session) are dropped.
     generation: u64,
     in_flight: Option<AiCancellationToken>,
+    /// Raw streamed reply text accumulated for the current generation. Only
+    /// a live preview: the transcript records the complete returned text via
+    /// `accept_model_reply`, so streaming and blocking store identical
+    /// conversations. Kept after a mid-stream failure so already-shown
+    /// partial text stays visible next to the recorded error.
+    stream_raw: String,
 }
 
 impl AgentUi {
@@ -91,6 +228,7 @@ impl AgentUi {
             provider_label: String::new(),
             generation: 0,
             in_flight: None,
+            stream_raw: String::new(),
         }
     }
 
@@ -156,6 +294,7 @@ impl AgentUi {
         self.last_manual_completed = None;
         self.loading = false;
         self.edit = None;
+        self.stream_raw.clear();
         // Invalidate any reply still in flight.
         self.generation = self.generation.wrapping_add(1);
     }
@@ -214,6 +353,7 @@ impl AgentUi {
         self.in_flight = Some(token.clone());
         self.loading = true;
         self.status.clear();
+        self.stream_raw.clear();
         self.generation = self.generation.wrapping_add(1);
         Some(ModelRequest {
             generation: self.generation,
@@ -224,8 +364,29 @@ impl AgentUi {
         })
     }
 
+    /// Append one streamed fragment of the in-flight reply. Fragments from a
+    /// stale generation (a cancelled or replaced request) are dropped, as are
+    /// fragments arriving after the final reply.
+    pub fn model_delta(&mut self, generation: u64, fragment: &str) {
+        if generation != self.generation || !self.loading {
+            return;
+        }
+        self.stream_raw.push_str(fragment);
+    }
+
+    /// Live preview of the streaming reply, if any of it is displayable yet.
+    /// Also set after a mid-stream failure, so partial text stays visible.
+    pub fn reply_preview(&self) -> Option<ReplyPreview> {
+        if self.stream_raw.is_empty() {
+            return None;
+        }
+        Some(preview_model_reply(&self.stream_raw)).filter(|preview| !preview.is_empty())
+    }
+
     /// Feed a finished model reply back into the protocol. Stale generations
-    /// (an older, cancelled request) are ignored.
+    /// (an older, cancelled request) are ignored. On success the complete
+    /// returned text — the single source of truth — replaces the streamed
+    /// preview; on failure the preview is kept alongside the recorded error.
     pub fn model_reply(&mut self, generation: u64, result: Result<String, String>) {
         if generation != self.generation {
             return;
@@ -236,7 +397,10 @@ impl AgentUi {
             return;
         };
         let outcome = match result {
-            Ok(raw) => session.accept_model_reply(&raw).map(|_| ()),
+            Ok(raw) => {
+                self.stream_raw.clear();
+                session.accept_model_reply(&raw).map(|_| ())
+            }
             Err(error) => session.model_failed(error).map(|_| ()),
         };
         if let Err(error) = outcome {
@@ -428,5 +592,133 @@ mod tests {
         let mut agent = AgentUi::new();
         agent.open(&Config::default(), 0);
         assert!(agent.status.contains("disabled"));
+    }
+
+    #[test]
+    fn preview_extracts_fields_from_partial_replies() {
+        // Nothing displayable yet.
+        assert!(preview_model_reply("").is_empty());
+        assert!(preview_model_reply("{\"act").is_empty());
+        assert!(preview_model_reply("I will run ls for you").is_empty());
+
+        // A message cut mid-string grows fragment by fragment.
+        let preview = preview_model_reply(r#"{"action":"say","message":"Hel"#);
+        assert_eq!(preview.message.as_deref(), Some("Hel"));
+        let preview = preview_model_reply(r#"{"action":"say","message":"Hello there"#);
+        assert_eq!(preview.message.as_deref(), Some("Hello there"));
+
+        // Complete replies expose thought and command too.
+        let preview =
+            preview_model_reply(r#"{"action":"run","thought":"check first","command":"ls -la"}"#);
+        assert_eq!(preview.thought.as_deref(), Some("check first"));
+        assert_eq!(preview.command.as_deref(), Some("ls -la"));
+        assert_eq!(preview.message, None);
+    }
+
+    #[test]
+    fn preview_decodes_escapes_and_tolerates_fences() {
+        let preview = preview_model_reply(r#"{"message":"a\"b\né"#);
+        assert_eq!(preview.message.as_deref(), Some("a\"b\né"));
+
+        // An escape truncated by the fragment boundary is dropped, not shown raw.
+        let preview = preview_model_reply(r#"{"message":"tail\u00"#);
+        assert_eq!(preview.message.as_deref(), Some("tail"));
+        let preview = preview_model_reply(r#"{"message":"tail\"#);
+        assert_eq!(preview.message.as_deref(), Some("tail"));
+
+        // One leading code fence is tolerated, like parse_action; before the
+        // fence line ends nothing is previewed.
+        assert!(preview_model_reply("```json").is_empty());
+        let preview = preview_model_reply("```json\n{\"message\":\"hi\"}\n```");
+        assert_eq!(preview.message.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn streamed_deltas_preview_then_final_reply_replaces_them() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 1);
+        agent.input = "hello".into();
+        agent.submit_input();
+        let generation = agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("request should start")
+            .generation;
+
+        agent.model_delta(generation, r#"{"action":"say","#);
+        assert!(agent.reply_preview().is_none());
+        agent.model_delta(generation, r#""message":"Hi the"#);
+        assert_eq!(
+            agent
+                .reply_preview()
+                .expect("previewable")
+                .message
+                .as_deref(),
+            Some("Hi the")
+        );
+        // Stale generations never touch the preview.
+        agent.model_delta(generation.wrapping_add(1), "garbage");
+        assert_eq!(
+            agent
+                .reply_preview()
+                .expect("previewable")
+                .message
+                .as_deref(),
+            Some("Hi the")
+        );
+
+        // The final complete text replaces the preview and is the only thing
+        // recorded — the transcript matches the blocking path exactly.
+        let raw = r#"{"action":"say","message":"Hi there"}"#;
+        agent.model_reply(generation, Ok(raw.into()));
+        assert!(agent.reply_preview().is_none());
+        assert!(!agent.loading);
+
+        let mut blocking = AgentUi::new();
+        blocking.open(&ai_config(), 1);
+        blocking.input = "hello".into();
+        blocking.submit_input();
+        let generation = blocking
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("request should start")
+            .generation;
+        blocking.model_reply(generation, Ok(raw.into()));
+        assert_eq!(
+            agent.session.as_ref().unwrap().transcript(),
+            blocking.session.as_ref().unwrap().transcript(),
+        );
+    }
+
+    #[test]
+    fn mid_stream_failure_keeps_the_partial_preview_visible() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 1);
+        agent.input = "hello".into();
+        agent.submit_input();
+        let generation = agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("request should start")
+            .generation;
+        agent.model_delta(generation, r#"{"action":"say","message":"partial ans"#);
+
+        agent.model_reply(generation, Err("connection reset".into()));
+        assert!(!agent.loading);
+        // Partial text stays visible next to the recorded protocol error.
+        assert_eq!(
+            agent.reply_preview().expect("kept").message.as_deref(),
+            Some("partial ans")
+        );
+        assert!(matches!(
+            agent.session.as_ref().unwrap().transcript().last(),
+            Some(jterm_core::agent::Turn::ProtocolError(error))
+                if error.contains("connection reset")
+        ));
+
+        // The next request discards the stale preview.
+        agent.input = "try again".into();
+        agent.submit_input();
+        assert!(agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .is_some());
+        assert!(agent.reply_preview().is_none());
     }
 }

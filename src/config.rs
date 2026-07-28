@@ -132,6 +132,12 @@ pub struct Config {
     #[serde(default = "default_ai_redact_secrets")]
     pub ai_redact_secrets: bool,
 
+    /// Stream model replies into the Agent panel as they are generated
+    /// (default on). Off falls back to one blocking request per turn; the
+    /// recorded transcript is identical either way.
+    #[serde(default = "default_ai_stream")]
+    pub ai_stream: bool,
+
     /// Optional path to a 0600 file holding the provider API key, so the key
     /// never has to live in the process environment or this config file.
     #[serde(default)]
@@ -278,6 +284,10 @@ fn default_ai_max_tokens() -> u32 {
 }
 
 fn default_ai_redact_secrets() -> bool {
+    true
+}
+
+fn default_ai_stream() -> bool {
     true
 }
 
@@ -471,6 +481,7 @@ impl Default for Config {
             ai_max_tokens: default_ai_max_tokens(),
             ai_temperature: None,
             ai_redact_secrets: default_ai_redact_secrets(),
+            ai_stream: default_ai_stream(),
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
             font_size: default_font_size(),
@@ -810,6 +821,15 @@ mod tests {
         assert!(!config.notify_long_blocks);
         assert_eq!(config.notify_long_block_threshold_ms, 250);
         assert!(!config.show_repo_strip);
+    }
+
+    #[test]
+    fn ai_stream_defaults_on_and_can_be_disabled() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(config.ai_stream);
+
+        let config = Config::from_toml("ai_stream = false\n").expect("override parses");
+        assert!(!config.ai_stream);
     }
 
     #[test]

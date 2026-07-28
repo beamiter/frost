@@ -379,6 +379,9 @@ enum Message {
     AgentEditApprove(jterm_core::agent::ProposalId),
     AgentEditCancel,
     AgentReject(jterm_core::agent::ProposalId),
+    /// One streamed fragment of the in-flight model reply for the given
+    /// request generation (stale ones dropped).
+    AgentModelDelta(u64, String),
     /// One model reply for the given request generation (stale ones dropped).
     AgentModelReply(u64, Result<String, String>),
     AgentContinueTask,
@@ -399,6 +402,7 @@ enum Message {
     SetAiMaxTokens(u32),
     SetAiTemperature(String),
     SetAiRedactSecrets(bool),
+    SetAiStream(bool),
     SetAiKeyFile(String),
     SetAiKeyDraft(String),
     StoreAiKey,
@@ -3696,6 +3700,9 @@ impl Jterm {
                     return task;
                 }
             }
+            Message::AgentModelDelta(generation, fragment) => {
+                self.agent.model_delta(generation, &fragment);
+            }
             Message::AgentModelReply(generation, result) => {
                 self.agent.model_reply(generation, result);
                 if let Some(task) = self.agent_drive_task() {
@@ -3743,6 +3750,10 @@ impl Jterm {
             }
             Message::SetAiRedactSecrets(redact) => {
                 self.config.ai_redact_secrets = redact;
+                self.config_dirty = true;
+            }
+            Message::SetAiStream(stream) => {
+                self.config.ai_stream = stream;
                 self.config_dirty = true;
             }
             Message::SetAiKeyFile(path) => {
@@ -6831,6 +6842,15 @@ impl Jterm {
                 .on_toggle(Message::SetAiRedactSecrets)
                 .into(),
         );
+        let ai_stream_row = responsive_control_row(
+            compact,
+            "Streaming",
+            checkbox(self.config.ai_stream)
+                .label("Stream agent replies as they arrive")
+                .text_size(13)
+                .on_toggle(Message::SetAiStream)
+                .into(),
+        );
         let agent_turns_row = responsive_slider_row(
             compact,
             "Agent turns",
@@ -6886,6 +6906,7 @@ impl Jterm {
             ai_key_file_row,
             ai_key_store_row,
             ai_redact_row,
+            ai_stream_row,
             agent_turns_row,
             buttons,
             footer,
@@ -7169,18 +7190,37 @@ impl Jterm {
             user,
             token,
         } = request;
+        let turns = [jterm_core::ai::Turn {
+            role: jterm_core::ai::Role::User,
+            text: user,
+        }];
+        if self.config.ai_stream {
+            // Streaming: a dedicated worker thread runs the request and
+            // forwards each assistant fragment (and finally the complete
+            // reply) as Messages through an unbounded channel the runtime
+            // drains as a Task stream. The complete returned text is the
+            // single source of truth — `AgentUi::model_reply` records it
+            // exactly as the blocking path would; fragments only feed the
+            // live preview. The same cancellation token kills curl
+            // mid-stream when the panel closes.
+            let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            std::thread::spawn(move || {
+                let mut on_delta = |fragment: &str| {
+                    let _ = tx
+                        .unbounded_send(Message::AgentModelDelta(generation, fragment.to_string()));
+                };
+                let result = client
+                    .send_turns_streaming_cancellable(Some(&system), &turns, &token, &mut on_delta)
+                    .map_err(|error| error.to_string());
+                let _ = tx.unbounded_send(Message::AgentModelReply(generation, result));
+            });
+            return Some(Task::stream(rx));
+        }
         Some(Task::perform(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
                     client
-                        .send_turns_blocking_cancellable(
-                            Some(&system),
-                            &[jterm_core::ai::Turn {
-                                role: jterm_core::ai::Role::User,
-                                text: user,
-                            }],
-                            &token,
-                        )
+                        .send_turns_blocking_cancellable(Some(&system), &turns, &token)
                         .map_err(|error| error.to_string())
                 })
                 .await;
@@ -7368,12 +7408,42 @@ impl Jterm {
                 transcript = transcript.push(element);
             }
         }
-        if self.agent.loading {
-            transcript = transcript.push(
-                text("waiting for the model…")
-                    .size(12)
-                    .style(text::secondary),
-            );
+        // While a reply streams in, its readable fields grow in place of the
+        // static waiting line; the completed reply then replaces the preview
+        // with real transcript turns. After a mid-stream failure the partial
+        // text stays visible next to the recorded protocol error.
+        match self.agent.reply_preview() {
+            Some(preview) => {
+                if let Some(thought) = &preview.thought {
+                    transcript = transcript.push(
+                        text(format!("thought: {thought}"))
+                            .size(12)
+                            .style(text::secondary),
+                    );
+                }
+                if let Some(command) = &preview.command {
+                    transcript = transcript.push(
+                        text(format!("proposing: {command}"))
+                            .size(13)
+                            .font(iced::Font::MONOSPACE),
+                    );
+                }
+                if let Some(message) = &preview.message {
+                    transcript = transcript.push(text(format!("Agent: {message}")).size(13));
+                }
+                if !self.agent.loading {
+                    transcript =
+                        transcript.push(text("reply interrupted").size(11).style(text::secondary));
+                }
+            }
+            None if self.agent.loading => {
+                transcript = transcript.push(
+                    text("waiting for the model…")
+                        .size(12)
+                        .style(text::secondary),
+                );
+            }
+            None => {}
         }
 
         let (turns_used, max_turns, state_line, can_submit) = match session {

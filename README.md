@@ -117,6 +117,9 @@ command_history_max_entries = 10000
 ai_enabled = false
 ai_provider = "anthropic"   # anthropic | openai-compatible | ollama
 ai_model = "claude-sonnet-4-6"
+# 流式回复：Agent 面板边生成边显示模型回复（三家 provider 均支持）。
+# 关闭则退回整段阻塞请求；两种方式记录到会话里的内容完全一致。
+ai_stream = true
 # API key 文件：一行 key、权限 600。未设置时在设置面板粘贴 key 即可，
 # 会自动写入 ~/.config/jterm3/ai.key。环境变量 JTERM3_AI_API_KEY_FILE
 # 优先于此项（与 jterm4 一致），且不会被写回配置文件。
