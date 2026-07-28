@@ -7948,74 +7948,78 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
     )
 }
 
-/// Build the normalized binding string (e.g. `"ctrl+shift+t"`) for a key event,
-/// matching the lowercase `modifier+...+key` format stored in keybindings.toml.
+/// Build the canonical binding string (e.g. `"ctrl+shift+t"`) for a key event
+/// by constructing a `jterm_core::keybindings::Chord` from the iced key data
+/// and rendering `Chord::canonical()` — the exact form `KeyBinding::canonical`
+/// produces for keybindings.toml strings, so the runtime and config sides can
+/// never disagree on folding. (The previous hand-rolled version lowercased
+/// with `to_ascii_lowercase`, so a non-ASCII binding like `ctrl+ю` was never
+/// stored in the same case the keyboard delivered.)
 /// Returns `None` for keys that should never be treated as shortcuts — plain
 /// character input (no Ctrl/Alt/Super) and unmappable named keys — so ordinary
 /// typing is never swallowed by the keybinding layer.
 fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<String> {
+    use jterm_core::keybindings::{Chord, KeySym, Mods, NamedKey};
     use keyboard::key::Named;
     use keyboard::Key;
-    let name: String = match key {
+    let sym = match key {
         Key::Character(s) => {
             // Shift alone just changes case; require a "real" modifier so typing
             // an uppercase letter can't trigger a command.
             if !(mods.control() || mods.alt() || mods.logo()) {
                 return None;
             }
-            match s.chars().next()?.to_ascii_lowercase() {
-                '\\' => "backslash".to_string(),
-                c => c.to_string(),
+            // Unicode-lowercase, matching the chord core's storage invariant.
+            // A char whose lowercase expands to several chars ('İ') has no
+            // storable chord form; core's parser rejects it too.
+            let mut lower = s.chars().next()?.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(c), None) => KeySym::Char(c),
+                _ => return None,
             }
         }
         Key::Named(named) => match named {
-            Named::Tab => "tab",
-            Named::Enter => "enter",
-            Named::Escape => "escape",
-            Named::Backspace => "backspace",
-            Named::Delete => "delete",
-            Named::Insert => "insert",
-            Named::Home => "home",
-            Named::End => "end",
-            Named::PageUp => "pageup",
-            Named::PageDown => "pagedown",
-            Named::ArrowUp => "up",
-            Named::ArrowDown => "down",
-            Named::ArrowLeft => "left",
-            Named::ArrowRight => "right",
-            Named::Space => "space",
-            Named::F1 => "f1",
-            Named::F2 => "f2",
-            Named::F3 => "f3",
-            Named::F4 => "f4",
-            Named::F5 => "f5",
-            Named::F6 => "f6",
-            Named::F7 => "f7",
-            Named::F8 => "f8",
-            Named::F9 => "f9",
-            Named::F10 => "f10",
-            Named::F11 => "f11",
-            Named::F12 => "f12",
+            Named::Tab => KeySym::Named(NamedKey::Tab),
+            Named::Enter => KeySym::Named(NamedKey::Return),
+            Named::Escape => KeySym::Named(NamedKey::Escape),
+            Named::Backspace => KeySym::Named(NamedKey::Backspace),
+            Named::Delete => KeySym::Named(NamedKey::Delete),
+            Named::Insert => KeySym::Named(NamedKey::Insert),
+            Named::Home => KeySym::Named(NamedKey::Home),
+            Named::End => KeySym::Named(NamedKey::End),
+            Named::PageUp => KeySym::Named(NamedKey::PageUp),
+            Named::PageDown => KeySym::Named(NamedKey::PageDown),
+            Named::ArrowUp => KeySym::Named(NamedKey::Up),
+            Named::ArrowDown => KeySym::Named(NamedKey::Down),
+            Named::ArrowLeft => KeySym::Named(NamedKey::Left),
+            Named::ArrowRight => KeySym::Named(NamedKey::Right),
+            Named::Space => KeySym::Named(NamedKey::Space),
+            Named::F1 => KeySym::Function(1),
+            Named::F2 => KeySym::Function(2),
+            Named::F3 => KeySym::Function(3),
+            Named::F4 => KeySym::Function(4),
+            Named::F5 => KeySym::Function(5),
+            Named::F6 => KeySym::Function(6),
+            Named::F7 => KeySym::Function(7),
+            Named::F8 => KeySym::Function(8),
+            Named::F9 => KeySym::Function(9),
+            Named::F10 => KeySym::Function(10),
+            Named::F11 => KeySym::Function(11),
+            Named::F12 => KeySym::Function(12),
             _ => return None,
-        }
-        .to_string(),
+        },
         _ => return None,
     };
-    let mut binding = String::new();
-    if mods.control() {
-        binding.push_str("ctrl+");
-    }
-    if mods.shift() {
-        binding.push_str("shift+");
-    }
-    if mods.alt() {
-        binding.push_str("alt+");
-    }
-    if mods.logo() {
-        binding.push_str("super+");
-    }
-    binding.push_str(&name);
-    Some(binding)
+    let chord = Chord {
+        mods: Mods {
+            ctrl: mods.control(),
+            shift: mods.shift(),
+            alt: mods.alt(),
+            sup: mods.logo(),
+        },
+        key: sym,
+    };
+    Some(chord.canonical())
 }
 
 /// Flags describing which enhanced-keyboard protocols an application has
@@ -8429,6 +8433,46 @@ mod tests {
                 "{named:?}"
             );
         }
+    }
+
+    /// Regression: the runtime mapper used `to_ascii_lowercase` while the
+    /// config side folded with Unicode `to_lowercase`, so a non-ASCII chord
+    /// canonicalized differently depending on which side produced it. Both
+    /// paths now go through `jterm_core::keybindings`, and must agree.
+    #[test]
+    fn runtime_and_config_paths_agree_on_non_ascii_case_folding() {
+        // The keyboard delivers the shifted/uppercase 'Ю'; the config file
+        // says "ctrl+ю". Identical canonical form or the binding never fires.
+        let runtime = key_to_binding_string(
+            &keyboard::Key::Character("Ю".into()),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(runtime.as_deref(), Some("ctrl+ю"));
+        assert_eq!(runtime, keybindings::KeyBinding::canonical("ctrl+ю"));
+        assert_eq!(runtime, keybindings::KeyBinding::canonical("Ctrl+Ю"));
+
+        // 'ß' has no single-char uppercase; both sides store it verbatim.
+        let runtime = key_to_binding_string(
+            &keyboard::Key::Character("ß".into()),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(runtime.as_deref(), Some("ctrl+ß"));
+        assert_eq!(runtime, keybindings::KeyBinding::canonical("ctrl+ß"));
+
+        // End to end: a non-ASCII user binding is found from the key event.
+        let loaded =
+            keybindings::KeyBindings::from_toml_with_diagnostics("\"ctrl+ю\" = \"session:new\"\n")
+                .expect("valid TOML");
+        assert!(loaded.diagnostics.is_empty());
+        let binding = key_to_binding_string(
+            &keyboard::Key::Character("Ю".into()),
+            keyboard::Modifiers::CTRL,
+        )
+        .expect("chord expected");
+        assert_eq!(
+            loaded.bindings.get_command(&binding),
+            Some(keybindings::Command::SessionNew)
+        );
     }
 
     #[test]

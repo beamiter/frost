@@ -191,154 +191,28 @@ impl std::str::FromStr for Command {
     }
 }
 
-/// 快捷键修饰符
-#[allow(dead_code)]
-#[derive(
-    Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
-)]
-pub struct Modifiers {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub super_key: bool,
-}
-
-/// 快捷键（可配置）
-#[allow(dead_code)]
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct KeyBinding {
-    pub key: String, // "a", "Tab", "F1", 等
-    pub modifiers: Modifiers,
-    pub command: Command,
-}
+/// 快捷键字符串归一化。chord 的解析/序列化本体在家族共享的
+/// `jterm_core::keybindings`（jterm1..4 共用一套语法）；这里只保留
+/// jterm3 的入口名。
+pub struct KeyBinding;
 
 impl KeyBinding {
-    #[cfg(test)]
-    pub fn new(key: &str, modifiers: Modifiers, command: Command) -> Self {
-        Self {
-            key: key.to_lowercase(),
-            modifiers,
-            command,
-        }
-    }
-
-    /// 从快捷键字符串解析（格式：ctrl+shift+a, alt+F1 等）
-    #[cfg(test)]
-    pub fn from_string(binding_str: &str, command: Command) -> Result<Self, String> {
-        let binding_lower = binding_str.to_lowercase();
-        let parts: Vec<&str> = binding_lower.split('+').collect();
-
-        if parts.is_empty() {
-            return Err("Empty binding string".to_string());
-        }
-
-        let mut modifiers = Modifiers::default();
-        let mut key = "";
-
-        for (i, part) in parts.iter().enumerate() {
-            match *part {
-                "ctrl" => modifiers.ctrl = true,
-                "shift" => modifiers.shift = true,
-                "alt" => modifiers.alt = true,
-                "super" | "cmd" => modifiers.super_key = true,
-                _ => {
-                    // 最后一部分应该是按键
-                    if i == parts.len() - 1 {
-                        key = part;
-                    } else {
-                        return Err(format!("Invalid modifier or key: {}", part));
-                    }
-                }
-            }
-        }
-
-        if key.is_empty() {
-            return Err("No key specified".to_string());
-        }
-
-        Ok(Self::new(key, modifiers, command))
-    }
-
     /// Canonicalize a binding string to the `ctrl+shift+alt+super+key` order
-    /// (all lowercase) used internally, accepting any modifier order and the
-    /// common aliases (`cmd`/`command`/`win`/`meta` -> super, `option` -> alt,
-    /// `control` -> ctrl). Returns `None` if the string isn't a valid binding.
-    /// This is what lets a user-written `shift+ctrl+f` or `cmd+c` actually match.
+    /// (all lowercase) used internally. Parsing is the family union grammar
+    /// from `jterm_core::keybindings::parse`: any modifier order, modifier
+    /// aliases (`control` -> ctrl, `option` -> alt, `cmd`/`command`/`win`/
+    /// `meta` -> super), named-key aliases (`enter`/`return`, `esc`/`escape`,
+    /// `arrowleft`/`left`, `page_up`/`prior`/`pageup`, ...), the plus-as-key
+    /// forms (`ctrl++`, `ctrl+shift++`), `f1`..`f24`, and Unicode (not ASCII)
+    /// lowercasing. `\` folds to the word `backslash` so stored strings never
+    /// need TOML escaping. Returns `None` if the string isn't a valid binding
+    /// — the per-entry diagnostics in
+    /// [`KeyBindings::from_toml_with_diagnostics`] rely on that. This is what
+    /// lets a user-written `shift+ctrl+f` or `cmd+c` actually match.
     pub fn canonical(binding_str: &str) -> Option<String> {
-        let lower = binding_str.to_lowercase();
-        let (mut ctrl, mut shift, mut alt, mut sup) = (false, false, false, false);
-        let mut key: Option<String> = None;
-        let parts: Vec<&str> = lower.split('+').collect();
-        for (i, part) in parts.iter().enumerate() {
-            match *part {
-                "ctrl" | "control" => ctrl = true,
-                "shift" => shift = true,
-                "alt" | "option" => alt = true,
-                "super" | "cmd" | "command" | "win" | "meta" => sup = true,
-                "" => return None,
-                other => {
-                    if i == parts.len() - 1 {
-                        key = Some(other.to_string());
-                    } else {
-                        return None;
-                    }
-                }
-            }
-        }
-        let key = match key?.as_str() {
-            "\\" | "backslash" => "backslash".to_string(),
-            other => other.to_string(),
-        };
-        let mut out = String::new();
-        if ctrl {
-            out.push_str("ctrl+");
-        }
-        if shift {
-            out.push_str("shift+");
-        }
-        if alt {
-            out.push_str("alt+");
-        }
-        if sup {
-            out.push_str("super+");
-        }
-        out.push_str(&key);
-        Some(out)
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Display for KeyBinding {
-    /// 转换为快捷键字符串表示。
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = Vec::new();
-
-        if self.modifiers.ctrl {
-            parts.push("Ctrl");
-        }
-        if self.modifiers.shift {
-            parts.push("Shift");
-        }
-        if self.modifiers.alt {
-            parts.push("Alt");
-        }
-        if self.modifiers.super_key {
-            parts.push("Super");
-        }
-
-        // 按键首字母大写
-        let key = if self.key.len() == 1 {
-            self.key.to_uppercase()
-        } else {
-            format!(
-                "{}{}",
-                self.key.chars().next().unwrap().to_uppercase(),
-                &self.key[1..]
-            )
-        };
-        parts.push(&key);
-
-        formatter.write_str(&parts.join("+"))
+        jterm_core::keybindings::parse(binding_str)
+            .ok()
+            .map(|chord| chord.canonical())
     }
 }
 
@@ -624,6 +498,7 @@ impl Default for KeyBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jterm_core::keybindings::{CommonAction, DEFAULT_CHORDS};
 
     #[test]
     fn test_command_parse() {
@@ -638,52 +513,114 @@ mod tests {
     }
 
     #[test]
-    fn test_keybinding_from_string() {
-        let binding = KeyBinding::from_string("ctrl+shift+a", Command::EditCopy).unwrap();
-        assert!(binding.modifiers.ctrl);
-        assert!(binding.modifiers.shift);
-        assert_eq!(binding.key, "a");
+    fn canonical_accepts_the_family_union_grammar() {
+        // Reordering and aliases collapse to the one stored spelling.
+        for (input, want) in [
+            ("shift+ctrl+f", "ctrl+shift+f"),
+            ("Control+Shift+T", "ctrl+shift+t"),
+            ("cmd+c", "super+c"),
+            ("option+left", "alt+left"),
+            ("ctrl+enter", "ctrl+return"),
+            ("ctrl+esc", "ctrl+escape"),
+            ("ctrl+alt+arrowleft", "ctrl+alt+left"),
+            ("ctrl+page_up", "ctrl+pageup"),
+            ("ctrl+\\", "ctrl+backslash"),
+            // Plus-as-key: jterm3 alone used to reject these; the family
+            // grammar accepts them (canonical form keeps the literal '+').
+            ("ctrl++", "ctrl++"),
+            ("ctrl+shift++", "ctrl+shift++"),
+            ("ctrl+plus", "ctrl++"),
+            // Unicode (not ASCII) lowercasing — same fold as the runtime
+            // key mapper in main.rs.
+            ("ctrl+Ю", "ctrl+ю"),
+        ] {
+            assert_eq!(
+                KeyBinding::canonical(input).as_deref(),
+                Some(want),
+                "{input}"
+            );
+        }
+        // Still invalid: empties, duplicate modifiers, and a doubled
+        // separator mid-chord ("ctrl++x" is an empty modifier, not a key).
+        for input in ["", "  ", "ctrl", "ctrl+shift", "ctrl+ctrl+t", "ctrl++x"] {
+            assert_eq!(KeyBinding::canonical(input), None, "{input:?}");
+        }
     }
 
-    #[test]
-    fn test_keybinding_display() {
-        let binding = KeyBinding::new(
-            "a",
-            Modifiers {
-                ctrl: true,
-                shift: true,
-                alt: false,
-                super_key: false,
-            },
-            Command::EditCopy,
-        );
-
-        let display = binding.to_string();
-        assert!(display.contains("Ctrl"));
-        assert!(display.contains("Shift"));
-        assert!(display.contains("A"));
+    /// jterm3's command for each family-contract action. `None` rows are
+    /// handled by the fixed app-chrome layer (`chrome_shortcut` in main.rs)
+    /// rather than the configurable map.
+    fn common_action_command(action: CommonAction) -> Option<Command> {
+        use CommonAction as A;
+        Some(match action {
+            A::NewTab => Command::SessionNew,
+            A::ClosePaneOrTab => Command::TerminalClosePane,
+            A::Copy => Command::EditCopy,
+            A::Paste => Command::EditPaste,
+            A::NextTab | A::NextTabPage => Command::SessionNext,
+            A::PrevTab | A::PrevTabPage => Command::SessionPrev,
+            A::QuickSwitch(n) => Command::SessionJump(usize::from(n) - 1),
+            A::LastTab => Command::SessionLast,
+            A::FontIncrease => Command::FontZoomIn,
+            A::FontDecrease => Command::FontZoomOut,
+            A::FontReset => Command::FontZoomReset,
+            A::Search => Command::SearchOpen,
+            A::Settings => Command::ConfigToggle,
+            A::Sidebar => Command::SidebarToggle,
+            A::ScrollUp => Command::TerminalScrollUp,
+            A::ScrollDown => Command::TerminalScrollDown,
+            A::PaneFocusLeft => Command::PaneFocusLeft,
+            A::PaneFocusRight => Command::PaneFocusRight,
+            A::PaneFocusUp => Command::PaneFocusUp,
+            A::PaneFocusDown => Command::PaneFocusDown,
+            A::PaneResizeLeft => Command::PaneResizeLeft,
+            A::PaneResizeRight => Command::PaneResizeRight,
+            A::PaneResizeUp => Command::PaneResizeUp,
+            A::PaneResizeDown => Command::PaneResizeDown,
+            A::SplitSideBySide => Command::TerminalSplitVertical,
+            A::SplitStacked => Command::TerminalSplitHorizontal,
+            A::PaneZoom => Command::PaneZoomToggle,
+            A::CommandPalette | A::DebugPanel => return None,
+        })
     }
 
+    /// The family ergonomic contract, driven by core's table so jterm3 can't
+    /// silently drift from jterm1/2/4: every `DEFAULT_CHORDS` row is either
+    /// bound to the mapped command or deliberately owned by the chrome layer
+    /// (in which case the configurable map must leave the chord free).
     #[test]
     fn common_default_chord_matrix() {
         let bindings = KeyBindings::default_bindings();
+        for (action, chord) in DEFAULT_CHORDS {
+            match common_action_command(*action) {
+                Some(expected) => assert_eq!(
+                    bindings.get_command(chord),
+                    Some(expected),
+                    "{action:?} ({chord})"
+                ),
+                None => assert_eq!(
+                    bindings.get_command(chord),
+                    None,
+                    "{action:?} ({chord}) belongs to the chrome layer; a map \
+                     binding would shadow it"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn jterm3_chords_beyond_the_family_contract() {
+        let bindings = KeyBindings::default_bindings();
         let cases = [
-            ("ctrl+shift+t", Command::SessionNew),
-            ("ctrl+shift+w", Command::TerminalClosePane),
-            ("ctrl+shift+c", Command::EditCopy),
-            ("ctrl+shift+v", Command::EditPaste),
-            ("ctrl+shift+f", Command::SearchOpen),
-            ("ctrl+alt+r", Command::SearchReplaceToggle),
-            ("ctrl+shift+o", Command::ConfigToggle),
-            ("ctrl+backslash", Command::SidebarToggle),
+            // Excluded from DEFAULT_CHORDS by design (jterm1/4 bind it to
+            // SelectAllBlocks); jterm3 keeps its lineage meaning.
             ("ctrl+shift+a", Command::AgentToggle),
-            ("ctrl+shift+e", Command::TerminalSplitVertical),
-            ("ctrl+shift+d", Command::TerminalSplitHorizontal),
-            ("ctrl+shift+z", Command::PaneZoomToggle),
+            ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+x", Command::PaneSwap),
-            ("ctrl+=", Command::FontZoomIn),
-            ("ctrl+-", Command::FontZoomOut),
-            ("ctrl+0", Command::FontZoomReset),
+            ("ctrl+d", Command::TerminalSendEof),
+            ("ctrl+shift+up", Command::TerminalPromptPrev),
+            ("ctrl+shift+down", Command::TerminalPromptNext),
+            ("ctrl+shift+g", Command::TerminalCopyLastOutput),
         ];
         for (chord, expected) in cases {
             assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
@@ -698,39 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn browser_style_digit_bindings_use_nine_for_last_and_zero_for_zoom() {
-        let bindings = KeyBindings::default_bindings();
-        for digit in 1usize..=8 {
-            let chord = format!("ctrl+{digit}");
-            assert_eq!(
-                bindings.get_command(&chord),
-                Some(Command::SessionJump(digit - 1)),
-                "{chord}"
-            );
-        }
-        assert_eq!(bindings.get_command("ctrl+9"), Some(Command::SessionLast));
-        assert_eq!(bindings.get_command("ctrl+0"), Some(Command::FontZoomReset));
-    }
-
-    #[test]
-    fn pane_direction_and_resize_chords_are_complete() {
-        let bindings = KeyBindings::default_bindings();
-        let cases = [
-            ("ctrl+alt+left", Command::PaneFocusLeft),
-            ("ctrl+alt+right", Command::PaneFocusRight),
-            ("ctrl+alt+up", Command::PaneFocusUp),
-            ("ctrl+alt+down", Command::PaneFocusDown),
-            ("ctrl+alt+shift+left", Command::PaneResizeLeft),
-            ("ctrl+alt+shift+right", Command::PaneResizeRight),
-            ("ctrl+alt+shift+up", Command::PaneResizeUp),
-            ("ctrl+alt+shift+down", Command::PaneResizeDown),
-        ];
-        for (chord, expected) in cases {
-            assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
-        }
-    }
-
-    #[test]
     fn test_conflict_detection() {
         let bindings = KeyBindings::default_bindings();
         let conflicts = bindings.check_conflicts();
@@ -742,10 +646,13 @@ mod tests {
 
     #[test]
     fn invalid_user_entries_do_not_discard_valid_overrides() {
+        // "ctrl+shift+b" is a valid chord bound to a nonexistent command;
+        // "ctrl++x" is genuinely malformed under the family grammar too (a
+        // doubled separator mid-chord — not the valid plus-as-key "ctrl++").
         let loaded = KeyBindings::from_toml_with_diagnostics(
             r#"
 "shift+ctrl+k" = "session:new"
-"ctrl+shift+broken" = "command:does-not-exist"
+"ctrl+shift+b" = "command:does-not-exist"
 "ctrl++x" = "edit:copy"
 "#,
         )
