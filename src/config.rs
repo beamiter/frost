@@ -228,6 +228,20 @@ pub struct Config {
     /// remote-shell trust boundary.
     #[serde(default)]
     pub allow_clipboard_read: bool,
+
+    /// Post a desktop notification when a command tracked via OSC 133 runs
+    /// longer than `notify_long_block_threshold_ms` and finishes while the
+    /// user is not watching that pane (window unfocused or pane inactive).
+    #[serde(default = "default_notify_long_blocks")]
+    pub notify_long_blocks: bool,
+
+    /// Threshold (in milliseconds) above which `notify_long_blocks` fires.
+    #[serde(default = "default_notify_long_block_threshold_ms")]
+    pub notify_long_block_threshold_ms: u64,
+
+    /// Show each pane's git branch and dirty marker in its header strip.
+    #[serde(default = "default_show_repo_strip")]
+    pub show_repo_strip: bool,
 }
 
 fn default_ai_provider() -> String {
@@ -403,6 +417,18 @@ fn default_subpixel_rendering() -> bool {
     true
 }
 
+fn default_notify_long_blocks() -> bool {
+    true
+}
+
+fn default_notify_long_block_threshold_ms() -> u64 {
+    10_000
+}
+
+fn default_show_repo_strip() -> bool {
+    true
+}
+
 fn default_rsh_update_check() -> String {
     jterm_core::rsh_install::UpdateCheck::default()
         .as_str()
@@ -448,6 +474,9 @@ impl Default for Config {
             ui_scale: None,
             shell: None,
             allow_clipboard_read: false,
+            notify_long_blocks: default_notify_long_blocks(),
+            notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
+            show_repo_strip: default_show_repo_strip(),
         }
     }
 }
@@ -708,6 +737,24 @@ mod tests {
 
         assert_eq!(normalized.theme, default_theme());
         assert_eq!(normalized.shell, None);
+    }
+
+    #[test]
+    fn notification_and_repo_strip_defaults_match_family() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(config.notify_long_blocks);
+        assert_eq!(config.notify_long_block_threshold_ms, 10_000);
+        assert!(config.show_repo_strip);
+
+        let config = Config::from_toml(
+            "notify_long_blocks = false\n\
+             notify_long_block_threshold_ms = 250\n\
+             show_repo_strip = false\n",
+        )
+        .expect("overrides parse");
+        assert!(!config.notify_long_blocks);
+        assert_eq!(config.notify_long_block_threshold_ms, 250);
+        assert!(!config.show_repo_strip);
     }
 
     #[test]

@@ -361,6 +361,7 @@ mod tests {
             output_available: true,
             truncated: false,
             total_bytes: output.len(),
+            duration_ms: None,
         }
     }
 

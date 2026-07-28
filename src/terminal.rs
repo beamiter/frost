@@ -1025,6 +1025,9 @@ pub struct TerminalState {
     pub pending_completed_commands: std::collections::VecDeque<CompletedCommand>,
     /// rsh execution id announced by the most recent OSC 133 params.
     current_command_id: Option<String>,
+    /// When the currently executing command began (OSC 133 `C`), so the
+    /// finished record can carry a wall-clock duration.
+    current_command_started_at: Option<std::time::Instant>,
 }
 
 /// One OSC 133 command lifecycle captured for the AI agent: the typed
@@ -1043,6 +1046,9 @@ pub struct CompletedCommand {
     pub truncated: bool,
     /// Bytes retained (row-reconstructed capture, equals `output.len()`).
     pub total_bytes: usize,
+    /// Wall-clock run time from OSC 133 `C` (execution start) to `D`. None
+    /// when the shell never reported an execution phase.
+    pub duration_ms: Option<u64>,
 }
 
 impl TerminalState {
@@ -1199,6 +1205,7 @@ impl TerminalState {
             pending_notifications: Vec::new(),
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
+            current_command_started_at: None,
         }
     }
 
@@ -1381,8 +1388,11 @@ impl TerminalState {
         }
         match mark {
             'A' => {
-                // Prompt start
+                // Prompt start. Any leftover execution timestamp belongs to a
+                // command that never reported `D`; drop it so it cannot leak
+                // into a later command's duration.
                 self.current_zone_state = ZoneState::PromptStarted(absolute_row);
+                self.current_command_started_at = None;
             }
             'B' => {
                 // Command start (user is typing the command)
@@ -1396,6 +1406,7 @@ impl TerminalState {
                 {
                     self.current_zone_state =
                         ZoneState::OutputStarted(prompt_start, cmd_start, absolute_row);
+                    self.current_command_started_at = Some(std::time::Instant::now());
                 }
             }
             'D' => {
@@ -1412,6 +1423,10 @@ impl TerminalState {
                             Some(_) => None,
                             None => part.trim().parse::<i32>().ok(),
                         });
+                let duration_ms = self
+                    .current_command_started_at
+                    .take()
+                    .map(|started| started.elapsed().as_millis() as u64);
                 match self.current_zone_state {
                     ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
                         let zone = CommandZone {
@@ -1430,6 +1445,7 @@ impl TerminalState {
                             out_start,
                             Some((out_start, absolute_row)),
                             exit_code,
+                            duration_ms,
                         );
                     }
                     ZoneState::CommandStarted(prompt_start, cmd_start) => {
@@ -1444,7 +1460,15 @@ impl TerminalState {
                         if self.command_zones.len() > 256 {
                             self.command_zones.pop_front();
                         }
-                        self.record_completed_command(cmd_start, absolute_row, None, exit_code);
+                        // Without a `C` the command never reported an execution
+                        // phase, so there is no meaningful duration.
+                        self.record_completed_command(
+                            cmd_start,
+                            absolute_row,
+                            None,
+                            exit_code,
+                            None,
+                        );
                     }
                     _ => {}
                 }
@@ -1539,6 +1563,7 @@ impl TerminalState {
         cmd_end: usize,
         output: Option<(usize, usize)>,
         exit_code: Option<i32>,
+        duration_ms: Option<u64>,
     ) {
         const MAX_COMMAND_BYTES: usize = 16 * 1024;
         const MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -1567,6 +1592,7 @@ impl TerminalState {
             output_available,
             truncated,
             total_bytes,
+            duration_ms,
         });
     }
 
@@ -3820,6 +3846,7 @@ impl TerminalState {
         self.scrollback.clear();
         self.command_zones.clear();
         self.current_zone_state = ZoneState::default();
+        self.current_command_started_at = None;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
         self.cursor_shape = CursorShape::default();
@@ -5002,6 +5029,7 @@ impl TerminalState {
         self.selection = None;
         self.command_zones.clear();
         self.current_zone_state = ZoneState::default();
+        self.current_command_started_at = None;
         self.grid_version = self.grid_version.wrapping_add(1);
         self.visible_cells_cache = None;
     }
@@ -5181,6 +5209,28 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].id, None);
         assert_eq!(completed[0].exit_code, Some(1));
+    }
+
+    #[test]
+    fn osc_133_duration_spans_command_execution() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07make\r\n");
+        terminal.process_input(b"\x1b]133;C\x07building\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].duration_ms.is_some());
+
+        // Without a `C` there is no execution phase, so no duration — and the
+        // previous command's start must not leak into this record.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].duration_ms, None);
     }
 
     use super::{

@@ -463,6 +463,8 @@ enum Message {
     SetScrollbarAlways(bool),
     SetDisableAltScreen(bool),
     SetAllowClipboardRead(bool),
+    SetNotifyLongBlocks(bool),
+    SetShowRepoStrip(bool),
     ThemeEditOpen,
     ThemeEditClose,
     ThemeEditName(String),
@@ -564,6 +566,11 @@ struct Session {
     /// refreshed on the same cadence as `cwd_cache`. Empty/None when the
     /// shell itself is in the foreground so tab labels can hide it.
     fg_proc_cache: Option<String>,
+    /// Formatted git branch/dirty text for `cwd_cache`, refreshed on the same
+    /// cadence (plus once when a command finishes) via the coalesced
+    /// background probe in `jterm_core::git_meta` — the pane header only ever
+    /// reads this cache, so git never runs per frame. None outside a repo.
+    git_strip_cache: Option<String>,
     /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
     /// short-lived timer drain it without ever stalling iced's UI thread.
     write_queue: std::collections::VecDeque<PtyWriteChunk>,
@@ -625,6 +632,7 @@ impl Session {
             cursor_visible,
             cwd_cache: None,
             fg_proc_cache: None,
+            git_strip_cache: None,
             write_queue: std::collections::VecDeque::new(),
             write_queue_offset: 0,
             queued_write_bytes: 0,
@@ -685,6 +693,16 @@ impl Session {
             Some(rest) if rest.starts_with('/') => Some(format!("~{rest}")),
             _ => Some(cwd.to_string()),
         }
+    }
+
+    /// Branch/dirty text for the pane header, probed through the coalesced
+    /// background worker in `jterm_core::git_meta` (bounded UI wait, git runs
+    /// off-thread). Callers cache the result; None outside a repository or
+    /// while `cwd_cache` is unknown.
+    fn git_strip(&self) -> Option<String> {
+        let cwd = self.cwd_cache.as_deref()?;
+        let meta = jterm_core::git_meta::read(std::path::Path::new(cwd))?;
+        Some(jterm_core::git_meta::format_strip(&meta))
     }
 
     /// Short, human-friendly form of an absolute cwd: "~" for $HOME, just the
@@ -3238,6 +3256,35 @@ impl Jterm {
                     }
                 }
 
+                // Desktop notification when a long-running command finishes
+                // (duration measured by the OSC 133 bookkeeping). Mirrors the
+                // block-view gating in jterm1: an opt-out config flag plus a
+                // duration threshold, with iced window focus standing in for
+                // its background-block check — a command the user is actively
+                // watching (focused window, active pane) never toasts.
+                if self.config.notify_long_blocks && !(self.focused && is_active_output) {
+                    for completed in &completed_commands {
+                        if let Some(ms) = completed.duration_ms {
+                            if ms >= self.config.notify_long_block_threshold_ms {
+                                jterm_core::notify::long_block_finished(
+                                    &completed.command,
+                                    completed.exit_code.unwrap_or(0),
+                                    ms,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // A finished command may have changed branch/dirty state;
+                // re-probe the pane's git strip now instead of waiting for the
+                // next periodic tick (same immediate refresh jterm1 does).
+                if !completed_commands.is_empty() && self.config.show_repo_strip {
+                    if let Some(sess) = self.session_by_identity(id, fd) {
+                        sess.git_strip_cache = sess.git_strip();
+                    }
+                }
+
                 // Clipboard set/query via OSC 52. The query path reads the
                 // system clipboard asynchronously and writes the base64
                 // response back to the originating session's PTY.
@@ -4091,6 +4138,21 @@ impl Jterm {
                 self.config.allow_clipboard_read = allow;
                 self.config_dirty = true;
             }
+            Message::SetNotifyLongBlocks(enabled) => {
+                self.config.notify_long_blocks = enabled;
+                self.config_dirty = true;
+            }
+            Message::SetShowRepoStrip(show) => {
+                self.config.show_repo_strip = show;
+                // Hide immediately; the periodic tick would otherwise show a
+                // stale strip until the next refresh.
+                if !show {
+                    for sess in self.sessions.iter_mut() {
+                        sess.git_strip_cache = None;
+                    }
+                }
+                self.config_dirty = true;
+            }
             Message::ThemeEditOpen => {
                 // Seed the editor from the current theme; suggest a fresh name so
                 // saving doesn't silently overwrite a builtin.
@@ -4296,12 +4358,20 @@ impl Jterm {
                 // Refresh cwd + foreground-process caches for every session so
                 // tab labels reflect both. These are cheap /proc reads at 1.5s
                 // cadence and let inactive tabs still show "vim · src" etc.
+                // The git strip rides the same cadence; its probe is served by
+                // a coalesced background worker with a bounded wait.
+                let show_repo_strip = self.config.show_repo_strip;
                 for sess in self.sessions.iter_mut() {
                     sess.terminal.kitty_graphics.expire_pending_transfer();
                     sess.terminal.check_sync_output_timeout();
                     sess.refresh();
                     sess.cwd_cache = sess.cwd();
                     sess.fg_proc_cache = sess.fg_proc();
+                    sess.git_strip_cache = if show_repo_strip {
+                        sess.git_strip()
+                    } else {
+                        None
+                    };
                 }
                 self.expire_toasts();
             }
@@ -5600,12 +5670,23 @@ impl Jterm {
                 line = line.push(text(cwd).size(11).color(self.c_text_dim()));
             }
         }
+        // Branch/dirty strip for the pane's repo, straight from the session
+        // cache (refreshed on the periodic tick and after command completion).
+        if self.config.show_repo_strip {
+            if let Some(git) = sess.git_strip_cache.as_deref() {
+                line = line.push(text(git).size(11).color(blend(
+                    self.c_text_dim(),
+                    self.c_accent(),
+                    0.35,
+                )));
+            }
+        }
         if let Some(command) = sess.fg_proc_cache.as_deref() {
-            line = line.push(
-                text(format!("▶ {command}"))
-                    .size(11)
-                    .color(blend(self.c_text_dim(), self.c_accent(), 0.6)),
-            );
+            line = line.push(text(format!("▶ {command}")).size(11).color(blend(
+                self.c_text_dim(),
+                self.c_accent(),
+                0.6,
+            )));
         }
         line = line.push(Space::new().width(Length::Fill));
         if drop_target {
@@ -6176,6 +6257,26 @@ impl Jterm {
                 .into(),
         );
 
+        let notify_row = responsive_control_row(
+            compact,
+            "Notify",
+            checkbox(self.config.notify_long_blocks)
+                .label("Toast when long commands finish unwatched")
+                .text_size(13)
+                .on_toggle(Message::SetNotifyLongBlocks)
+                .into(),
+        );
+
+        let repo_strip_row = responsive_control_row(
+            compact,
+            "Git",
+            checkbox(self.config.show_repo_strip)
+                .label("Branch/dirty in pane headers")
+                .text_size(13)
+                .on_toggle(Message::SetShowRepoStrip)
+                .into(),
+        );
+
         // ── AI & Agent ────────────────────────────────────────────────────
         let ai_header = text("AI & Agent").size(15);
         let ai_enable_row = responsive_control_row(
@@ -6315,6 +6416,8 @@ impl Jterm {
             alt_screen_row,
             clipboard_row,
             tab_position_row,
+            notify_row,
+            repo_strip_row,
             ai_header,
             ai_enable_row,
             ai_provider_row,

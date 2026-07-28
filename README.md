@@ -13,6 +13,8 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 shell 集成：沿命令提示符逐条跳转（`Ctrl+Shift+↑/↓`）、一键复制上一条命令输出（`Ctrl+Shift+G`），历史修剪时命令区保持对齐
+- 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
+- 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
 - PTY 启动采用 fork→exec 错误握手；无效目录、shell/exec 失败会显示可重试诊断而不是崩溃
 - 配置与快捷键热重载采用 last-known-good；坏文件会显示路径/行列并暂停自动写回
@@ -93,6 +95,13 @@ rsh_update_check = "daily"
 
 # 安全默认值。开启后，SSH 中的程序也能读取宿主剪贴板。
 allow_clipboard_read = false
+
+# 长命令完成桌面通知（OSC 133 计时；正被注视的 pane 不提醒）
+notify_long_blocks = true
+notify_long_block_threshold_ms = 10000
+
+# 分屏 pane 标题栏中的 git 分支/脏状态
+show_repo_strip = true
 
 # AI / Agent（默认关闭；不开启则没有任何数据离开本机）
 ai_enabled = false
