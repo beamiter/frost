@@ -102,6 +102,37 @@ mod tests {
     }
 
     #[test]
+    fn apply_whole_word_skips_substring_matches() {
+        let mut panel = SearchReplacePanelState::new();
+        panel.search_input = "cat".to_string();
+        panel.replace_input = "dog".to_string();
+        panel.config.whole_word = true;
+        panel.options.replace_all = true;
+
+        assert_eq!(
+            panel.apply("cat category cat").as_deref(),
+            Some("dog category dog")
+        );
+        assert_eq!(panel.status, "2 replacement(s)");
+    }
+
+    #[test]
+    fn apply_whole_word_bounds_regex_matches() {
+        let mut panel = SearchReplacePanelState::new();
+        panel.search_input = "err".to_string();
+        panel.replace_input = "X".to_string();
+        panel.config.use_regex = true;
+        panel.config.whole_word = true;
+        panel.options.replace_all = true;
+
+        assert_eq!(
+            panel.apply("Err error ERRORS").as_deref(),
+            Some("X error ERRORS")
+        );
+        assert_eq!(panel.status, "1 replacement(s)");
+    }
+
+    #[test]
     fn apply_empty_pattern_is_a_noop_with_zero_count() {
         let mut panel = SearchReplacePanelState::new();
         panel.replace_input = "hi".to_string();

@@ -462,6 +462,7 @@ enum Message {
     SearchReplaceReplaceInput(String),
     SearchReplaceToggleRegex,
     SearchReplaceToggleCase,
+    SearchReplaceToggleWord,
     SearchReplaceToggleAll,
     /// Run the Find & Replace panel against the current selection and route
     /// the result to the clipboard or the prompt.
@@ -748,19 +749,14 @@ impl Session {
     /// Foreground process name on the PTY, or None when it's the shell itself
     /// (so the tab label doesn't redundantly show "bash" / "zsh" / "fish").
     fn fg_proc(&self) -> Option<String> {
-        let pgid = unsafe { libc::tcgetpgrp(self.master_fd) };
-        if pgid <= 0 {
-            return None;
-        }
-        let comm = std::fs::read_to_string(format!("/proc/{pgid}/comm")).ok()?;
-        let comm = comm.trim().to_string();
-        if comm.is_empty() {
-            return None;
-        }
+        let pgid = jterm_core::process::tty_foreground_pgid(self.master_fd)?;
         // Hide when the foreground process *is* the shell — that's the idle case.
-        if pgid as i32 == self.pty.get_child_pid() {
+        if pgid == self.pty.get_child_pid() {
             return None;
         }
+        let comm = jterm_core::process::process_comm(pgid)?;
+        // App policy: also hide other interactive shells so the tab label never
+        // redundantly shows a shell name (e.g. a nested `zsh` under bash).
         const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"];
         if SHELLS.contains(&comm.as_str()) {
             return None;
@@ -922,9 +918,7 @@ impl Session {
 
     /// Working directory of the shell child, used when spawning a sibling.
     fn cwd(&self) -> Option<String> {
-        std::fs::read_link(format!("/proc/{}/cwd", self.pty.get_child_pid()))
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
+        jterm_core::process::process_cwd(self.pty.get_child_pid())
     }
 }
 
@@ -4231,7 +4225,9 @@ impl Jterm {
                 // Type the (shell-quoted) path into the active terminal so the
                 // sidebar doubles as a path picker.
                 if let Some(sess) = self.sessions.get_mut(self.active) {
-                    let quoted = shell_quote(&path.to_string_lossy());
+                    // Trailing space so the picked path is ready to extend.
+                    let mut quoted = jterm_core::process::shell_quote_path(&path.to_string_lossy());
+                    quoted.push(' ');
                     sess.terminal.scroll_to_bottom();
                     sess.write_pty(quoted.as_bytes());
                     sess.refresh();
@@ -4284,6 +4280,9 @@ impl Jterm {
             Message::SearchReplaceToggleCase => {
                 self.search_replace.config.case_sensitive =
                     !self.search_replace.config.case_sensitive;
+            }
+            Message::SearchReplaceToggleWord => {
+                self.search_replace.config.whole_word = !self.search_replace.config.whole_word;
             }
             Message::SearchReplaceToggleAll => {
                 self.search_replace.options.replace_all = !self.search_replace.options.replace_all;
@@ -6369,6 +6368,10 @@ impl Jterm {
                 .label("Case")
                 .text_size(13)
                 .on_toggle(|_| Message::SearchReplaceToggleCase),
+            checkbox(self.search_replace.config.whole_word)
+                .label("Word")
+                .text_size(13)
+                .on_toggle(|_| Message::SearchReplaceToggleWord),
             checkbox(self.search_replace.options.replace_all)
                 .label("All")
                 .text_size(13)
@@ -7674,21 +7677,6 @@ fn abbreviate_home(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-/// Shell-quote a path for typing into the terminal, with a trailing space.
-fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let safe = s
-        .chars()
-        .all(|c| c.is_alphanumeric() || "._-/~".contains(c));
-    if safe {
-        format!("{s} ")
-    } else {
-        format!("'{}' ", s.replace('\'', "'\\''"))
-    }
 }
 
 /// Submit an OSC 9/777 notification to one bounded worker. The worker owns and

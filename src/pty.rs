@@ -466,29 +466,6 @@ mod unix_pty {
         }
     }
 
-    pub(crate) fn shell_single_quote(s: &str) -> String {
-        let mut quoted = String::with_capacity(s.len() + 2);
-        quoted.push('\'');
-        for ch in s.chars() {
-            if ch == '\'' {
-                quoted.push_str("'\"'\"'");
-            } else {
-                quoted.push(ch);
-            }
-        }
-        quoted.push('\'');
-        quoted
-    }
-
-    fn build_rsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
-        let mut exec_cmd = format!("exec {}", shell_single_quote(shell_path));
-        if let Some(sid) = session_id {
-            exec_cmd.push_str(" --session ");
-            exec_cmd.push_str(&shell_single_quote(sid));
-        }
-        exec_cmd
-    }
-
     fn choose_shell(configured_shell: Option<&str>) -> String {
         // Priority 1: explicit config (needed when PATH is stripped by launchers like wofi)
         if let Some(path) = configured_shell {
@@ -684,7 +661,8 @@ mod unix_pty {
                     if let Some(command) = command_cstrings {
                         command
                     } else if let ("rsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
-                        let exec_cmd = build_rsh_exec_command(&shell_path, session_id);
+                        let exec_cmd =
+                            jterm_core::process::build_rsh_exec_command(&shell_path, session_id);
                         (
                             cstr_or_bail!(bash_path, "bash path contains NUL"),
                             vec![
@@ -1318,15 +1296,6 @@ pub use windows_pty::Pty;
 mod tests {
     #[cfg(unix)]
     use super::unix_pty::Pty;
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_single_quote_escapes_embedded_quotes() {
-        assert_eq!(
-            super::unix_pty::shell_single_quote("/tmp/it's"),
-            "'/tmp/it'\"'\"'s'"
-        );
-    }
 
     #[cfg(unix)]
     #[test]

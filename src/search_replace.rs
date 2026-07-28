@@ -10,21 +10,9 @@ pub struct SearchConfig {
 }
 
 /// 替换选项
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ReplaceOptions {
     pub replace_all: bool,
-    /// 引擎尚未实现大小写保留；面板不展示该开关，仅保留默认值。
-    #[allow(dead_code)]
-    pub preserve_case: bool,
-}
-
-impl Default for ReplaceOptions {
-    fn default() -> Self {
-        ReplaceOptions {
-            replace_all: false,
-            preserve_case: true,
-        }
-    }
 }
 
 /// 搜索和替换引擎
@@ -46,7 +34,9 @@ impl SearchAndReplaceEngine {
         }
     }
 
-    /// 文字替换
+    /// 文字替换。逐字符扫描（语义与 jterm2 引擎一致）：大小写折叠按字符比较
+    /// （`match_len_at`），全词由 `is_whole_word` 判定；替换后从匹配末尾继续，
+    /// 已替换文本绝不重扫（替换串仍含 pattern 时不会死循环）。
     fn literal_replace(
         text: &str,
         pattern: &str,
@@ -54,73 +44,37 @@ impl SearchAndReplaceEngine {
         config: &SearchConfig,
         options: &ReplaceOptions,
     ) -> Result<(String, usize), String> {
-        let search_pattern = if config.case_sensitive {
-            pattern.to_string()
-        } else {
-            pattern.to_lowercase()
-        };
-
         // Empty pattern would match endlessly; treat as a no-op.
-        if search_pattern.is_empty() {
+        if pattern.is_empty() {
             return Ok((text.to_string(), 0));
-        }
-
-        if !config.case_sensitive {
-            use regex::RegexBuilder;
-
-            let re = RegexBuilder::new(&regex::escape(pattern))
-                .case_insensitive(true)
-                .build()
-                .map_err(|e| format!("Invalid search pattern: {}", e))?;
-
-            let result = if options.replace_all {
-                re.replace_all(text, |_: &regex::Captures| replacement)
-                    .to_string()
-            } else {
-                re.replace(text, |_: &regex::Captures| replacement)
-                    .to_string()
-            };
-
-            let count = if options.replace_all {
-                re.find_iter(text).count()
-            } else if re.is_match(text) {
-                1
-            } else {
-                0
-            };
-
-            return Ok((result, count));
         }
 
         let mut result = String::with_capacity(text.len());
         let mut count = 0;
-        let mut rest = text;
+        let mut i = 0;
 
-        loop {
-            let hay = if config.case_sensitive {
-                rest.to_string()
-            } else {
-                rest.to_lowercase()
-            };
-
-            if let Some(pos) = hay.find(&search_pattern) {
-                // Copy the unmatched prefix, emit the replacement, then continue
-                // AFTER the match so replaced text is never rescanned (the old
-                // code rescanned from 0 and looped forever when the replacement
-                // still contained the pattern, e.g. "a" -> "ba").
-                result.push_str(&rest[..pos]);
-                result.push_str(replacement);
-                count += 1;
-                rest = &rest[pos + pattern.len()..];
-
-                if !options.replace_all {
-                    break;
+        while i < text.len() {
+            let take_more = options.replace_all || count == 0;
+            if take_more {
+                if let Some(mlen) = match_len_at(text, i, pattern, config.case_sensitive) {
+                    if mlen > 0 && (!config.whole_word || is_whole_word(text, i, i + mlen)) {
+                        result.push_str(replacement);
+                        i += mlen;
+                        count += 1;
+                        continue;
+                    }
                 }
-            } else {
-                break;
             }
+            // Copy a single UTF-8 character from the original text.
+            // text.get 避免 i 落在非字符边界时的切片 panic(mlen 理论上总落边界,
+            // 但此处容错跳过一字节,绝不 panic)。
+            let Some(ch) = text.get(i..).and_then(|s| s.chars().next()) else {
+                i += 1;
+                continue;
+            };
+            result.push(ch);
+            i += ch.len_utf8();
         }
-        result.push_str(rest);
 
         Ok((result, count))
     }
@@ -135,7 +89,13 @@ impl SearchAndReplaceEngine {
     ) -> Result<(String, usize), String> {
         use regex::RegexBuilder;
 
-        let regex = RegexBuilder::new(pattern)
+        let effective = if config.whole_word {
+            format!(r"\b(?:{pattern})\b")
+        } else {
+            pattern.to_string()
+        };
+
+        let regex = RegexBuilder::new(&effective)
             .case_insensitive(!config.case_sensitive)
             .multi_line(config.multi_line)
             .build()
@@ -182,6 +142,42 @@ impl SearchAndReplaceEngine {
     }
 }
 
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// True when `text[start..end]` is bounded by non-word characters (or the ends
+/// of the string), i.e. it forms a whole word.
+fn is_whole_word(text: &str, start: usize, end: usize) -> bool {
+    let before_ok = text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !is_word_char(c));
+    let after_ok = text[end..].chars().next().is_none_or(|c| !is_word_char(c));
+    before_ok && after_ok
+}
+
+/// If `pattern` matches `text` at byte offset `idx`, returns the byte length of
+/// the match within `text`; otherwise `None`. Honors case sensitivity using
+/// Unicode-aware case folding.
+fn match_len_at(text: &str, idx: usize, pattern: &str, case_sensitive: bool) -> Option<usize> {
+    let mut chars = text[idx..].chars();
+    let mut consumed = 0;
+    for pc in pattern.chars() {
+        let tc = chars.next()?;
+        let eq = if case_sensitive {
+            tc == pc
+        } else {
+            tc.to_lowercase().eq(pc.to_lowercase())
+        };
+        if !eq {
+            return None;
+        }
+        consumed += tc.len_utf8();
+    }
+    Some(consumed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,10 +203,7 @@ mod tests {
     #[test]
     fn test_replace_all() {
         let config = SearchConfig::default();
-        let options = ReplaceOptions {
-            replace_all: true,
-            ..ReplaceOptions::default()
-        };
+        let options = ReplaceOptions { replace_all: true };
 
         let (result, count) = SearchAndReplaceEngine::search_and_replace(
             "hello world hello",
@@ -223,6 +216,52 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(result, "hi world hi");
+    }
+
+    #[test]
+    fn test_whole_word_literal() {
+        let config = SearchConfig {
+            whole_word: true,
+            ..Default::default()
+        };
+        let options = ReplaceOptions { replace_all: true };
+
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "cat category cat",
+            "cat",
+            "dog",
+            &config,
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(result, "dog category dog");
+    }
+
+    #[test]
+    fn test_regex_case_insensitive_and_whole_word() {
+        let config = SearchConfig {
+            use_regex: true,
+            case_sensitive: false,
+            whole_word: true,
+            ..Default::default()
+        };
+        let options = ReplaceOptions { replace_all: true };
+
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "Err error ERRORS",
+            "err",
+            "X",
+            &config,
+            &options,
+        )
+        .unwrap();
+
+        // "Err" matches (whole word, case-insensitive); "error" and "ERRORS"
+        // do not because of the word boundary.
+        assert_eq!(count, 1);
+        assert_eq!(result, "X error ERRORS");
     }
 
     #[test]
