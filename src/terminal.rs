@@ -2544,6 +2544,26 @@ impl TerminalState {
         self.output_buffer.extend_from_slice(Self::osc_terminator());
     }
 
+    /// Feed one APC-G payload to the graphics state and write back whatever the
+    /// protocol responder produced. Replies go into `output_buffer`, the same
+    /// path OSC color and OSC 52 clipboard queries answer through, so clients
+    /// that address a command with `i=` (kitten icat) no longer wait for a
+    /// timeout.
+    fn handle_kitty_graphics_apc(&mut self, payload: &[u8]) {
+        let cursor_col = self.cursor_col as u32;
+        let cursor_row = self.cursor_row as u32;
+        if let Err(_error) = self
+            .kitty_graphics
+            .parse_graphics_payload_at(payload, cursor_col, cursor_row)
+        {
+            crate::debug_log!("[APC] Kitty graphics error: {}", _error);
+        }
+        let responses = self.kitty_graphics.take_responses();
+        if !responses.is_empty() {
+            self.output_buffer.extend_from_slice(&responses);
+        }
+    }
+
     /// Check if sync output timed out (>1s) and auto-clear if so
     pub fn check_sync_output_timeout(&mut self) {
         if self.sync_output_active {
@@ -2850,6 +2870,11 @@ impl TerminalState {
                             }
                         }
                         b'P' | b'X' | b'^' | b'_' => {
+                            // DCS (ESC P), SOS (ESC X), PM (ESC ^) and APC (ESC _)
+                            // all end at ST, but only APC carries Kitty graphics.
+                            // Sniffing every string for `a=` used to hand an
+                            // unrelated DCS to the graphics state.
+                            let is_apc = data_slice[i + 1] == b'_';
                             i += 2;
 
                             let mut terminated = false;
@@ -2859,27 +2884,12 @@ impl TerminalState {
                                     && data_slice[i] == 0x1b
                                     && data_slice[i + 1] == 0x5c
                                 {
-                                    // Extract DCS payload
                                     let payload = &data_slice[dcs_start..i];
 
-                                    // Check if this is a Kitty graphics protocol DCS
-                                    if let Ok(payload_str) = std::str::from_utf8(payload) {
-                                        // Kitty graphics protocol starts with @ or other specific markers
-                                        if payload_str.starts_with('@')
-                                            || payload_str.starts_with('G')
-                                            || payload_str.contains("a=")
-                                            || payload_str.starts_with("kitty")
-                                        {
-                                            if let Err(_e) = self
-                                                .kitty_graphics
-                                                .parse_graphics_payload(payload_str)
-                                            {
-                                                crate::debug_log!(
-                                                    "[DCS] Kitty graphics error: {}",
-                                                    _e
-                                                );
-                                            }
-                                        }
+                                    if is_apc
+                                        && jterm_core::kitty_graphics::is_graphics_payload(payload)
+                                    {
+                                        self.handle_kitty_graphics_apc(payload);
                                     }
 
                                     i += 2;
@@ -3860,6 +3870,10 @@ impl TerminalState {
         self.alt_keyboard_enhancement_stack.clear();
         self.selection = None;
         self.current_hyperlink = None;
+        // A half-finished Kitty upload must not survive into the reset screen.
+        // There is no wall clock behind this: RIS plus the shared aggregate
+        // in-flight cap replace the old 10-second pending-transfer expiry.
+        self.kitty_graphics.reset_transfers();
         self.clear_screen();
     }
 
@@ -5787,6 +5801,88 @@ mod tests {
         assert_eq!(terminal.kitty_graphics.get_placements().len(), 1);
         assert_eq!(terminal.grid[0][0].character, 'X');
         assert_eq!(terminal.grid[0][1].character, ' ');
+    }
+
+    #[test]
+    fn kitty_graphics_does_not_route_dcs_sos_pm_or_non_g_apc() {
+        // Only an APC whose payload starts with `G` is a graphics command. The
+        // old `payload.contains("a=")` sniff handed an unrelated DCS — a
+        // DECRQSS reply, a tmux passthrough — straight to the graphics state.
+        let body = b"Ga=t,i=41,f=32,s=1,v=1;/wAA/w==";
+
+        for introducer in *b"PX^" {
+            let mut terminal = TerminalState::new(8, 2);
+            let mut sequence = vec![0x1b, introducer];
+            sequence.extend_from_slice(body);
+            sequence.extend_from_slice(b"\x1b\\");
+
+            terminal.process_input(&sequence);
+            assert!(
+                terminal.kitty_graphics.get_image(41).is_none(),
+                "non-APC introducer {introducer:#x} was routed as Kitty graphics"
+            );
+            assert!(terminal.get_output().is_empty());
+        }
+
+        // An APC that is not a graphics command is ignored too.
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b_a=t,i=41,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        assert!(terminal.kitty_graphics.get_image(41).is_none());
+        assert!(terminal.get_output().is_empty());
+    }
+
+    #[test]
+    fn kitty_graphics_answers_an_addressed_command_through_the_output_buffer() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b_Ga=q,i=31\x1b\\");
+
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b_Gi=31;OK\x1b\\"
+        );
+    }
+
+    #[test]
+    fn kitty_graphics_reports_an_unsupported_file_transport() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        // t=f used to hand a base64-encoded *file path* to the image decoder and
+        // fail silently; it is now a typed ENOTSUP the client can see.
+        terminal.process_input(b"\x1b_Gf=32,t=f,s=1,v=1,a=T,i=32;L3RtcC9pbWFnZQ==\x1b\\");
+
+        assert!(terminal.kitty_graphics.get_image(32).is_none());
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b_Gi=32;ENOTSUP:unsupported kitty graphics transport\x1b\\"
+        );
+    }
+
+    #[test]
+    fn kitty_placement_anchors_at_the_cursor_and_x_y_crop_the_source() {
+        let mut terminal = TerminalState::new(8, 4);
+
+        // Park the cursor at row 2, column 3, then transmit-and-display a 2x2
+        // image cropped to its bottom-right pixel.
+        terminal.process_input(b"\x1b[3;4H");
+        terminal
+            .process_input(b"\x1b_Gf=32,s=2,v=2,a=T,i=33,x=1,y=1;AAAA/wEAAP8AAQD/AQEA/w==\x1b\\");
+
+        let placement = &terminal.kitty_graphics.get_placements()[0];
+        assert_eq!((placement.col, placement.row), (3, 2));
+        assert_eq!((placement.src_x, placement.src_y), (1, 1));
+    }
+
+    #[test]
+    fn ris_drops_an_unfinished_kitty_transfer() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.process_input(b"\x1b_Gf=32,s=1,v=1,a=t,i=34,m=1;AQID\x1b\\");
+        terminal.process_input(b"\x1bc");
+        let _ = terminal.get_output();
+        terminal.process_input(b"\x1b_Gm=0;BA==\x1b\\");
+
+        assert!(terminal.kitty_graphics.get_image(34).is_none());
     }
 
     #[test]

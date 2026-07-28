@@ -926,6 +926,10 @@ impl Session {
     }
 }
 
+/// Texture-cache key for one Kitty placement: stable session id, image id and
+/// the clamped source-crop rectangle the placement shows.
+type KittyHandleKey = (usize, u32, kitty_graphics::Crop);
+
 struct Jterm {
     config: Config,
     theme: Theme,
@@ -981,9 +985,11 @@ struct Jterm {
     links: Vec<link::Link>,
     /// `(stable_session_id, grid_version, scroll_offset)` for cached `links`.
     links_cache_key: Option<(usize, u64, usize)>,
-    /// Cached GPU image handles keyed by (stable session id, Kitty image id).
-    /// The generation invalidates same-sized retransmissions.
-    kitty_handles: std::collections::HashMap<(usize, u32), (iced::advanced::image::Handle, u64)>,
+    /// Cached GPU image handles keyed by (stable session id, Kitty image id,
+    /// source-crop rectangle). The generation invalidates same-sized
+    /// retransmissions; the crop is part of the key because `x=`/`y=`/`w=`/`h=`
+    /// let two placements show different sub-rectangles of one image.
+    kitty_handles: std::collections::HashMap<KittyHandleKey, (iced::advanced::image::Handle, u64)>,
     /// Last persisted session-snapshot JSON, to skip redundant disk writes.
     last_session_save: Option<String>,
     /// Set when session state that feeds the snapshot may have changed (PTY
@@ -4643,7 +4649,6 @@ impl Jterm {
                 // a coalesced background worker with a bounded wait.
                 let show_repo_strip = self.config.show_repo_strip;
                 for sess in self.sessions.iter_mut() {
-                    sess.terminal.kitty_graphics.expire_pending_transfer();
                     sess.terminal.check_sync_output_timeout();
                     sess.refresh();
                     sess.cwd_cache = sess.cwd();
@@ -4714,11 +4719,11 @@ impl Jterm {
         Task::none()
     }
 
-    /// Build/refresh cached image handles for the active session's Kitty images.
-    /// New or content-changed images get a fresh handle; handles for images no
-    /// longer referenced by any placement are dropped.
+    /// Build/refresh cached image handles for the active session's Kitty
+    /// placements. New, content-changed or differently-cropped placements get a
+    /// fresh handle; handles no longer referenced by any placement are dropped.
     fn refresh_kitty_handles(&mut self) {
-        type PendingHandle = ((usize, u32), u64, u32, u32, Vec<u8>);
+        type PendingHandle = (KittyHandleKey, u64, u32, u32, Vec<u8>);
         // Collect, under an immutable borrow, which images need a (re)build and
         // which ids are still live, then release the borrow before mutating.
         let mut needed: Vec<PendingHandle> = Vec::new();
@@ -4730,10 +4735,15 @@ impl Jterm {
             };
             let kg = &sess.terminal.kitty_graphics;
             for p in kg.get_placements() {
-                let key = (sess.id, p.image_id);
                 let Some(img) = kg.get_image(p.image_id) else {
                     continue;
                 };
+                // `x=`/`y=`/`w=`/`h=` select a sub-rectangle of the image, so the
+                // uploaded texture is the crop, not the whole image.
+                let Some(crop) = kitty_graphics::placement_crop(img, p) else {
+                    continue;
+                };
+                let key = (sess.id, p.image_id, crop);
                 // Many placements may reference one image. Schedule/cache each
                 // texture once so placement fan-out cannot clone and upload the
                 // same (potentially large) pixel buffer hundreds of times.
@@ -4746,7 +4756,13 @@ impl Jterm {
                     .map(|(_, generation)| *generation != img.generation)
                     .unwrap_or(true);
                 if stale {
-                    needed.push((key, img.generation, img.width, img.height, img.data.clone()));
+                    needed.push((
+                        key,
+                        img.generation,
+                        crop.2,
+                        crop.3,
+                        kitty_graphics::crop_rgba(img, crop),
+                    ));
                 }
             }
         }
@@ -4764,17 +4780,18 @@ impl Jterm {
         kg.get_placements()
             .iter()
             .filter_map(|p| {
-                let (handle, _) = self.kitty_handles.get(&(sess.id, p.image_id))?;
                 let img = kg.get_image(p.image_id)?;
+                let crop = kitty_graphics::placement_crop(img, p)?;
+                let (handle, _) = self.kitty_handles.get(&(sess.id, p.image_id, crop))?;
                 Some(KittyRender {
                     handle: handle.clone(),
-                    col: p.x as usize,
-                    row: p.y as usize,
-                    cols: (p.width as usize).max(1),
-                    rows: (p.height as usize).max(1),
+                    col: p.col as usize,
+                    row: p.row as usize,
+                    cols: (p.cols as usize).max(1),
+                    rows: (p.rows as usize).max(1),
                     id: p.image_id,
-                    px_w: img.width,
-                    px_h: img.height,
+                    px_w: crop.2,
+                    px_h: crop.3,
                 })
             })
             .collect()
