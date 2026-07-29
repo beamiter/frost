@@ -42,6 +42,16 @@ pub enum PaneTreeSnapshot {
     },
 }
 
+/// 一个标签页的窗格树快照。窗格归标签页所有，所以布局必须按标签页存。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabSnapshot {
+    pub tree: PaneTreeSnapshot,
+    /// 该标签页中拥有键盘焦点的窗格所显示的会话索引。标签页标题、激活时
+    /// 恢复的焦点都以它为准。
+    #[serde(default)]
+    pub focus: Option<usize>,
+}
+
 /// 会话列表快照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsSnapshot {
@@ -52,23 +62,37 @@ pub struct SessionsSnapshot {
     /// 旧的扁平分屏布局(单轴)。仅用于读取旧快照,新快照不再写入。
     #[serde(default)]
     pub split: Option<SplitSnapshot>,
-    /// 递归分屏布局树;`None` 表示单 pane。旧快照缺省为 `None`,向后兼容。
+    /// v1 的全局单棵布局树。仅用于读取旧快照并迁移成第一个标签页；新快照
+    /// 仍会写出当前标签页的树，好让旧版本至少能开出用户最后看到的那组窗格。
     #[serde(default)]
     pub tree: Option<PaneTreeSnapshot>,
+    /// v2：每个标签页一棵树。空表示旧快照，由 `tree` 迁移。
+    #[serde(default)]
+    pub tabs: Vec<TabSnapshot>,
+    #[serde(default)]
+    pub active_tab: Option<usize>,
 }
 
 impl SessionsSnapshot {
     pub fn new(
         sessions: Vec<SessionSnapshot>,
         active_index: Option<usize>,
-        tree: Option<PaneTreeSnapshot>,
+        tabs: Vec<TabSnapshot>,
+        active_tab: Option<usize>,
     ) -> Self {
+        // 兼容字段：给旧版本当前标签页的树，而不是一个空布局。
+        let tree = active_tab
+            .and_then(|idx| tabs.get(idx))
+            .or_else(|| tabs.first())
+            .map(|tab| tab.tree.clone());
         SessionsSnapshot {
-            version: 1,
+            version: 2,
             sessions,
             active_index,
             split: None,
             tree,
+            tabs,
+            active_tab,
         }
     }
 
@@ -92,7 +116,7 @@ impl SessionsSnapshot {
     /// 从文件加载；文件不存在时返回空快照。
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         if !path.exists() {
-            return Ok(SessionsSnapshot::new(Vec::new(), None, None));
+            return Ok(SessionsSnapshot::new(Vec::new(), None, Vec::new(), None));
         }
         let content = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&content)?)
@@ -160,31 +184,53 @@ mod tests {
                 SessionSnapshot { cwd: None },
             ],
             Some(1),
-            Some(PaneTreeSnapshot::Split {
-                axis: "vertical".to_string(),
-                ratios: vec![0.6, 0.4],
-                children: vec![
-                    PaneTreeSnapshot::Leaf { session: 0 },
-                    PaneTreeSnapshot::Split {
-                        axis: "horizontal".to_string(),
-                        ratios: vec![0.5, 0.5],
-                        children: vec![
-                            PaneTreeSnapshot::Leaf { session: 2 },
-                            PaneTreeSnapshot::Leaf { session: 1 },
-                        ],
-                    },
-                ],
-            }),
+            vec![TabSnapshot {
+                tree: PaneTreeSnapshot::Split {
+                    axis: "vertical".to_string(),
+                    ratios: vec![0.6, 0.4],
+                    children: vec![
+                        PaneTreeSnapshot::Leaf { session: 0 },
+                        PaneTreeSnapshot::Split {
+                            axis: "horizontal".to_string(),
+                            ratios: vec![0.5, 0.5],
+                            children: vec![
+                                PaneTreeSnapshot::Leaf { session: 2 },
+                                PaneTreeSnapshot::Leaf { session: 1 },
+                            ],
+                        },
+                    ],
+                },
+                focus: Some(1),
+            }],
+            Some(0),
         );
         let json = snap.to_json().unwrap();
         let back: SessionsSnapshot = serde_json::from_str(&json).unwrap();
-        let PaneTreeSnapshot::Split { axis, children, .. } = back.tree.unwrap() else {
+        assert_eq!(back.tabs.len(), 1);
+        assert_eq!(back.tabs[0].focus, Some(1));
+        assert_eq!(back.active_tab, Some(0));
+        let PaneTreeSnapshot::Split { axis, children, .. } = back.tabs[0].tree.clone() else {
             panic!("expected a split at the root");
         };
         assert_eq!(axis, "vertical");
         assert_eq!(children.len(), 2);
         assert!(matches!(children[0], PaneTreeSnapshot::Leaf { session: 0 }));
         assert!(matches!(children[1], PaneTreeSnapshot::Split { .. }));
+        // The compat field still carries the active tab's tree for old builds.
+        assert!(back.tree.is_some());
+    }
+
+    #[test]
+    fn a_v1_snapshot_has_no_tabs_and_migrates_from_tree() {
+        let legacy = r#"{"version":1,"sessions":[{"cwd":null},{"cwd":null}],
+            "active_index":1,
+            "tree":{"kind":"split","axis":"vertical","ratios":[0.5,0.5],
+                "children":[{"kind":"leaf","session":0},{"kind":"leaf","session":1}]}}"#;
+        let snap: SessionsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.tabs.is_empty());
+        assert!(snap.active_tab.is_none());
+        // The restore path turns this single tree into the first tab.
+        assert!(snap.tree.is_some());
     }
 
     #[test]

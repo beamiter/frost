@@ -131,6 +131,79 @@ struct PaneDrag {
     target: Option<usize>,
 }
 
+/// A tab and the panes it owns.
+///
+/// Tabs own their panes: splitting only touches the active tab's tree, so it
+/// never adds a row to the tab bar, and closing a tab closes every session in
+/// it. Previously one global tree held every session while the tab bar showed
+/// one tab per session — a pane and a tab were the same object seen from two
+/// places, so a split spawned a tab and clicking a tab reached into a split to
+/// swap that session into the focused pane.
+struct Tab {
+    /// Stable identity for UI events. Tab-bar gestures (drag, close, context
+    /// menu) must survive index shifts *and* focus moving between this tab's
+    /// panes, so they cannot key off a session id.
+    id: usize,
+    /// tmux-style recursive pane layout. `Leaf(s)` when this tab has one pane.
+    tree: PaneTree,
+    /// Session shown by the pane holding keyboard focus in this tab. The tab's
+    /// label and the focus restored when the tab is activated both read this.
+    focus: usize,
+}
+
+impl Tab {
+    fn new(id: usize, session: usize) -> Self {
+        Tab {
+            id,
+            tree: PaneTree::Leaf(session),
+            focus: session,
+        }
+    }
+
+    fn sessions(&self) -> Vec<usize> {
+        self.tree.leaves()
+    }
+
+    fn contains(&self, session: usize) -> bool {
+        self.tree.contains_session(session)
+    }
+
+    /// Keep `focus` pointing at a pane this tab still owns.
+    fn repair_focus(&mut self) {
+        if !self.tree.contains_session(self.focus) {
+            if let Some(&first) = self.tree.leaves().first() {
+                self.focus = first;
+            }
+        }
+    }
+}
+
+/// What a confirmed close should actually tear down. Closing a tab takes every
+/// pane in it, so the confirmation has to remember which of the two was asked
+/// for rather than always closing the one busy session it named.
+#[derive(Debug, Clone, Copy)]
+enum PendingClose {
+    /// Close this one session (one pane), then optionally activate another tab.
+    Session { activate_after: Option<usize> },
+    /// Close the whole tab that owns the named session.
+    Tab,
+}
+
+/// What `restore_or_spawn` recovered: the sessions it could bring back, plus
+/// the snapshot's layout fields, which the caller validates against them.
+#[derive(Default)]
+struct RestoredState {
+    sessions: Vec<Session>,
+    active: usize,
+    next_id: usize,
+    tabs: Vec<session_persistence::TabSnapshot>,
+    active_tab: Option<usize>,
+    /// v1 fallbacks: one global tree, or the even older flat single-axis split.
+    legacy_tree: Option<session_persistence::PaneTreeSnapshot>,
+    legacy_split: Option<session_persistence::SplitSnapshot>,
+    diagnostic: Option<String>,
+}
+
 /// State for the Ctrl+Shift+L quick tab switcher overlay.
 #[derive(Debug, Clone, Default)]
 struct TabSwitcherState {
@@ -281,12 +354,109 @@ fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<P
     })
 }
 
+/// Turn validated pane trees into the tab list, and say which tab is active.
+///
+/// Every index came from a snapshot, so it is checked here: a tab keeps only
+/// leaves naming a session that exists and that no earlier tab already claimed
+/// — two tabs sharing a pane would fight over one PTY.
+///
+/// The closing pass adopts orphans. Validation can reject a tab, a shell can
+/// fail to restore, and a v1 snapshot's sessions may not appear in its single
+/// tree at all; every session no tab claims gets a one-pane tab of its own,
+/// because an unclaimed session is a live PTY nothing can switch to.
+fn build_restored_tabs(
+    trees: Vec<(PaneTree, Option<usize>)>,
+    session_count: usize,
+    active_session: usize,
+    saved_active_tab: Option<usize>,
+) -> (Vec<Tab>, usize, usize) {
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut tabs: Vec<Tab> = Vec::new();
+    let mut next_id = 0usize;
+    for (tree, saved_focus) in trees {
+        if !valid_restored_layout(&tree, session_count) {
+            continue;
+        }
+        let leaves = tree.leaves();
+        if leaves.iter().any(|leaf| claimed.contains(leaf)) {
+            // A leaf is already owned by an earlier tab; drop this whole tab
+            // and let the adoption pass place its sessions.
+            continue;
+        }
+        claimed.extend(leaves.iter().copied());
+        let focus = saved_focus
+            .filter(|session| tree.contains_session(*session))
+            .or_else(|| leaves.first().copied());
+        let Some(focus) = focus else { continue };
+        tabs.push(Tab {
+            id: next_id,
+            tree,
+            focus,
+        });
+        next_id += 1;
+    }
+    for session in 0..session_count {
+        if claimed.insert(session) {
+            tabs.push(Tab::new(next_id, session));
+            next_id += 1;
+        }
+    }
+    if tabs.is_empty() {
+        // Zero tabs is not a renderable state.
+        tabs.push(Tab::new(next_id, 0));
+        next_id += 1;
+    }
+
+    let active_tab = saved_active_tab
+        .filter(|index| *index < tabs.len())
+        // No recorded tab (or it did not survive): follow the active session.
+        .or_else(|| tabs.iter().position(|tab| tab.contains(active_session)))
+        .unwrap_or(0);
+    tabs[active_tab].repair_focus();
+    (tabs, active_tab, next_id)
+}
+
+/// Re-index every tab's tree after a session was inserted at `inserted`.
+///
+/// Session indices are global, so an insert in the middle shifts the panes of
+/// every tab, not just the active one.
+fn reindex_tabs_for_insert(tabs: &mut [Tab], inserted: usize) {
+    let remap = |s: usize| if s >= inserted { s + 1 } else { s };
+    for tab in tabs {
+        tab.tree.remap_sessions(&remap);
+        tab.focus = remap(tab.focus);
+    }
+}
+
+/// Re-index every tab's tree after the session at `removed` left the vector.
+///
+/// The tab owning that session drops its leaf — folding the freed share into a
+/// neighbor — and then every tab shifts the indices above the removed slot
+/// down. A tab whose only pane was the removed session keeps its (now stale)
+/// leaf: emptying a tree is not representable, so the caller removes that tab
+/// before calling here.
+fn reindex_tabs_for_removal(tabs: &mut [Tab], removed: usize) {
+    let remap = |s: usize| if s > removed { s - 1 } else { s };
+    for tab in tabs {
+        if tab.tree.contains_session(removed) && tab.tree.leaf_count() > 1 {
+            tab.tree.remove_leaf(removed);
+        }
+        tab.tree.remap_sessions(&remap);
+        tab.focus = remap(tab.focus);
+        tab.repair_focus();
+    }
+}
+
 /// Validate a candidate restored layout: every leaf session must be in range and
-/// appear at most once, and the total pane count must stay within `MAX_PANES`.
+/// appear at most once, and the pane count must stay within `MAX_PANES`.
+///
+/// One leaf is valid — a tab with a single pane is the ordinary case now that
+/// tabs own their panes. It used to be rejected because a one-leaf tree meant
+/// "not split" back when there was a single global layout.
 fn valid_restored_layout(tree: &PaneTree, session_count: usize) -> bool {
     let leaves = tree.leaves();
     let n = leaves.len();
-    if !(2..=MAX_PANES).contains(&n) {
+    if !(1..=MAX_PANES).contains(&n) {
         return false;
     }
     if leaves.iter().any(|&s| s >= session_count) {
@@ -1002,10 +1172,13 @@ struct Jterm {
     /// to derive a throughput figure for profiling.
     last_ingest_us: u128,
     last_ingest_bytes: usize,
-    /// tmux-style recursive pane layout of the active view. `Leaf(active)` when
-    /// unsplit. Invariant: the focused leaf is the one showing `active`, and
-    /// each session appears in at most one leaf.
-    layout: PaneTree,
+    /// Open tabs, each owning its own pane tree. Invariants: every session
+    /// appears in exactly one leaf of exactly one tab, `active_tab` is in
+    /// range, and `active == tabs[active_tab].focus`.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// Monotonic source of `Tab::id`.
+    next_tab_id: usize,
     /// Active custom-theme editor overlay, or `None` when closed.
     theme_editor: Option<ThemeEditState>,
     /// File-tree sidebar (left panel) and whether it is currently shown.
@@ -1052,9 +1225,9 @@ struct Jterm {
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
-    /// Close-confirmation overlay for a tab with a running foreground process.
-    /// Holds `(target_id, process_name, activate_after_id)`.
-    tab_close_confirm: Option<(usize, String, Option<usize>)>,
+    /// Close-confirmation overlay for a pane or tab with a running foreground
+    /// process. Holds `(target_id, process_name, what_to_close)`.
+    tab_close_confirm: Option<(usize, String, PendingClose)>,
     /// Last desktop notification launch. OSC 9/777 originates inside the PTY
     /// (and may be remote over SSH), so process spawning is globally rate-limited.
     last_notification_at: Option<std::time::Instant>,
@@ -1100,8 +1273,16 @@ impl Jterm {
 
         // Restore prior tabs (their cwds + active index) when enabled and we are
         // the first instance; otherwise start with a single default session.
-        let (sessions, active, next_id, saved_tree, saved_split, session_diagnostic) =
-            Self::restore_or_spawn(&config, cols, rows, is_first_instance);
+        let RestoredState {
+            sessions,
+            active,
+            next_id,
+            tabs: saved_tabs,
+            active_tab: saved_active_tab,
+            legacy_tree: saved_tree,
+            legacy_split: saved_split,
+            diagnostic: session_diagnostic,
+        } = Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
         // In Side mode the dock hosts the tab list and starts open (there is no
         // top bar to show tabs otherwise); in Top mode it starts collapsed.
@@ -1158,7 +1339,11 @@ impl Jterm {
             session_dirty: true,
             last_ingest_us: 0,
             last_ingest_bytes: 0,
-            layout: PaneTree::Leaf(active),
+            // Placeholder; the real tabs are installed below, after the
+            // snapshot has been validated against the sessions that spawned.
+            tabs: vec![Tab::new(0, active)],
+            active_tab: 0,
+            next_tab_id: 1,
             theme_editor: None,
             sidebar: sidebar::Sidebar::new(),
             sidebar_open,
@@ -1185,26 +1370,10 @@ impl Jterm {
             _instance_lock: instance_lock,
             is_first_instance,
         };
-        // Re-apply a saved layout once the sessions exist. The snapshot is
-        // external input, so every index is validated before use. The recursive
-        // `tree` is preferred; a legacy single-axis `split` is the fallback.
-        let restored = saved_tree
-            .as_ref()
-            .and_then(pane_tree_from_snapshot)
-            .or_else(|| saved_split.as_ref().and_then(pane_tree_from_legacy));
-        if let Some(tree) = restored {
-            if valid_restored_layout(&tree, app.sessions.len()) {
-                // Keep focus on the saved active session when it is on screen;
-                // otherwise fall back to the first leaf.
-                if !tree.contains_session(app.active) {
-                    if let Some(&first) = tree.leaves().first() {
-                        app.active = first;
-                    }
-                }
-                app.layout = tree;
-                app.relayout();
-            }
-        }
+        // Re-apply the saved tabs once the sessions exist. The snapshot is
+        // external input, so every index is validated before use.
+        app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
+        app.relayout();
         // jterm3 prefers rsh as its shell, so it is worth noticing when the
         // machine has none or an old one. Nothing is installed without an
         // explicit click.
@@ -1434,24 +1603,18 @@ impl Jterm {
         cols: usize,
         rows: usize,
         is_first_instance: bool,
-    ) -> (
-        Vec<Session>,
-        usize,
-        usize,
-        Option<session_persistence::PaneTreeSnapshot>,
-        Option<session_persistence::SplitSnapshot>,
-        Option<String>,
-    ) {
+    ) -> RestoredState {
         let default = |id_start: usize| match Session::spawn(config, id_start, cols, rows, None) {
-            Ok(session) => (vec![session], 0usize, id_start + 1, None, None, None),
-            Err(error) => (
-                Vec::new(),
-                0usize,
-                id_start,
-                None,
-                None,
-                Some(error.to_string()),
-            ),
+            Ok(session) => RestoredState {
+                sessions: vec![session],
+                next_id: id_start + 1,
+                ..RestoredState::default()
+            },
+            Err(error) => RestoredState {
+                next_id: id_start,
+                diagnostic: Some(error.to_string()),
+                ..RestoredState::default()
+            },
         };
         if !config.restore_session || !is_first_instance {
             return default(0);
@@ -1510,14 +1673,16 @@ impl Jterm {
             sessions.len(),
             path.display()
         );
-        (
+        RestoredState {
             sessions,
             active,
             next_id,
-            snapshot.tree,
-            snapshot.split,
-            (!restore_warnings.is_empty()).then(|| restore_warnings.join("\n")),
-        )
+            tabs: snapshot.tabs,
+            active_tab: snapshot.active_tab,
+            legacy_tree: snapshot.tree,
+            legacy_split: snapshot.split,
+            diagnostic: (!restore_warnings.is_empty()).then(|| restore_warnings.join("\n")),
+        }
     }
 
     /// Persist the current tabs (live cwd of each + active index) when enabled.
@@ -1534,9 +1699,22 @@ impl Jterm {
             .iter()
             .map(|s| session_persistence::SessionSnapshot { cwd: s.cwd() })
             .collect();
-        // Persist the split layout so a restart restores the same pane view.
-        let tree = self.is_split().then(|| pane_tree_to_snapshot(&self.layout));
-        let snapshot = session_persistence::SessionsSnapshot::new(snaps, Some(self.active), tree);
+        // Persist every tab's pane tree so a restart restores the same tabs
+        // with the same panes in each.
+        let tabs: Vec<session_persistence::TabSnapshot> = self
+            .tabs
+            .iter()
+            .map(|tab| session_persistence::TabSnapshot {
+                tree: pane_tree_to_snapshot(&tab.tree),
+                focus: Some(tab.focus),
+            })
+            .collect();
+        let snapshot = session_persistence::SessionsSnapshot::new(
+            snaps,
+            Some(self.active),
+            tabs,
+            Some(self.active_tab),
+        );
         let Some(json) = snapshot.to_json() else {
             return;
         };
@@ -1564,8 +1742,11 @@ impl Jterm {
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
                 self.sessions.insert(insert, session);
-                self.active = insert;
-                self.unsplit();
+                self.reindex_tabs_after_insert(insert);
+                // A new session opens its own tab; it is never grafted into
+                // the current tab's split.
+                self.open_tab_with(insert);
+                self.relayout();
                 self.refresh_active_context();
                 self.save_session_snapshot();
             }
@@ -1607,8 +1788,11 @@ impl Jterm {
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
                 self.sessions.insert(insert, session);
-                self.active = insert;
-                self.unsplit();
+                self.reindex_tabs_after_insert(insert);
+                // A new session opens its own tab; it is never grafted into
+                // the current tab's split.
+                self.open_tab_with(insert);
+                self.relayout();
                 self.refresh_active_context();
                 self.save_session_snapshot();
             }
@@ -1644,6 +1828,61 @@ impl Jterm {
         )
     }
 
+    /// Close every session in `tab`. This is what the tab bar's × does: panes
+    /// belong to their tab, so none of them outlive it as a hidden PTY.
+    ///
+    /// Sessions are closed highest-index-first so the indices still queued are
+    /// never shifted by an earlier removal.
+    fn close_tab(&mut self, tab: usize) -> Task<Message> {
+        let Some(state) = self.tabs.get(tab) else {
+            return Task::none();
+        };
+        let mut owned = state.sessions();
+        owned.sort_unstable_by(|a, b| b.cmp(a));
+        let mut tasks = Vec::new();
+        for index in owned {
+            tasks.push(self.close_session(index));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Ask to close every session in `tab`, confirming first if any of them is
+    /// running a foreground process.
+    fn request_close_tab(&mut self, tab: usize) -> Task<Message> {
+        let owned = self
+            .tabs
+            .get(tab)
+            .map(|state| state.sessions())
+            .unwrap_or_default();
+        if let Some((index, process)) = owned
+            .iter()
+            .find_map(|&index| self.busy_session_name(index).map(|name| (index, name)))
+        {
+            // Show the user which pane is holding the tab open before it is
+            // torn down together with its siblings.
+            self.focus_session(index);
+            self.refresh_active_context();
+            if let Some(session) = self.sessions.get(index) {
+                self.tab_close_confirm = Some((session.id, process, PendingClose::Tab));
+            }
+            return Task::none();
+        }
+        self.close_tab(tab)
+    }
+
+    /// Carry out a close the user just confirmed.
+    fn execute_pending_close(&mut self, index: usize, pending: PendingClose) -> Task<Message> {
+        match pending {
+            PendingClose::Session { activate_after } => {
+                self.close_session_then(index, activate_after)
+            }
+            PendingClose::Tab => match self.tab_of_session(index) {
+                Some(tab) => self.close_tab(tab),
+                None => self.close_session(index),
+            },
+        }
+    }
+
     fn close_session(&mut self, index: usize) -> Task<Message> {
         if index >= self.sessions.len() {
             return Task::none();
@@ -1657,15 +1896,10 @@ impl Jterm {
         let mut sess = self.sessions.remove(index);
         let closed_id = sess.id;
         self.history_reflow_sessions.remove(&closed_id);
-        if self.hovered_tab == Some(closed_id) {
-            self.hovered_tab = None;
-        }
-        if self.dragging_tab == Some(closed_id) {
-            self.dragging_tab = None;
-        }
-        if self.tab_menu == Some(closed_id) {
-            self.tab_menu = None;
-        }
+        // The strip's transient state is keyed by tab id; a closed tab is
+        // dropped from it in `prune_closed_pane` once we know whether the tab
+        // itself went away.
+
         let _ = sess.pty.terminate();
         // `prune_closed_pane` is authoritative for `active` (it must pick a
         // neighbor leaf when the focused pane's session is the one closing).
@@ -1676,36 +1910,59 @@ impl Jterm {
         Task::none()
     }
 
-    /// Reconcile the layout after `sessions[index]` was removed (in old index
-    /// space): drop its leaf (folding its share into a neighbor and collapsing
-    /// any split left with one child), shift the remaining leaf indices down,
-    /// and pick a new focus. When the removed pane held keyboard focus, focus
-    /// follows the freed space into the preceding leaf. `old_active` is the
+    /// Reconcile every tab after `sessions[index]` was removed (in old index
+    /// space): the owning tab drops its leaf — folding its share into a
+    /// neighbor and collapsing any split left with one child — or, if that was
+    /// its only pane, the whole tab goes away. Every tab then shifts the
+    /// indices above the removed slot down by one.
+    ///
+    /// When the removed pane held keyboard focus, focus follows the freed
+    /// space into the preceding leaf of the same tab. `old_active` is the
     /// focused session before removal.
     fn prune_closed_pane(&mut self, index: usize, old_active: usize) {
-        // Neighbor of the focused leaf, computed in old index space before the
+        let owner = self.tab_of_session(index);
+        // Neighbor of the closing leaf, computed in old index space before the
         // tree mutates (previous leaf in render order, else the next).
-        let leaves = self.layout.leaves();
-        let removed_was_focused = old_active == index;
-        let on_screen = self.layout.remove_leaf(index);
-        let mut new_active = if removed_was_focused && on_screen {
-            let pos = leaves.iter().position(|&s| s == index).unwrap_or(0);
+        let neighbor = owner.and_then(|tab| {
+            let leaves = self.tabs[tab].sessions();
+            let pos = leaves.iter().position(|&s| s == index)?;
             if pos > 0 {
-                leaves[pos - 1]
+                leaves.get(pos - 1).copied()
             } else {
-                leaves.get(1).copied().unwrap_or(old_active)
+                leaves.get(1).copied()
             }
-        } else {
-            old_active
-        };
-        // Shift indices above the removed slot down by one (sessions Vec shrank).
+        });
+        if let (Some(tab), Some(neighbor)) = (owner, neighbor) {
+            // Keep the tab focused on a surviving pane before the reindex, so
+            // `repair_focus` does not have to guess.
+            if self.tabs[tab].focus == index {
+                self.tabs[tab].focus = neighbor;
+            }
+        }
+
+        // A tab whose only pane just closed has nothing left to show.
+        let emptied = owner.filter(|&tab| self.tabs[tab].tree.leaf_count() <= 1);
+        if let Some(tab) = emptied {
+            if self.tabs.len() > 1 {
+                self.tabs.remove(tab);
+                if tab < self.active_tab {
+                    self.active_tab -= 1;
+                }
+                self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            }
+        }
+
+        self.reindex_tabs_after_removal(index);
+
         let remap = |s: usize| if s > index { s - 1 } else { s };
-        self.layout.remap_sessions(&remap);
-        new_active = remap(new_active).min(self.sessions.len().saturating_sub(1));
-        self.active = new_active;
-        if !self.is_split() {
-            // Back to a single pane showing the focused session.
-            self.layout = PaneTree::Leaf(self.active);
+        let fallback = remap(old_active).min(self.sessions.len().saturating_sub(1));
+        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        self.active = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.focus)
+            .unwrap_or(fallback);
+        if emptied.is_some() {
             self.pane_zoomed = false;
             self.hovered_divider = None;
             self.dragging_divider = None;
@@ -1735,7 +1992,8 @@ impl Jterm {
         let busy = self.busy_session_name(index);
         if let Some(name) = busy {
             if let Some(session) = self.sessions.get(index) {
-                self.tab_close_confirm = Some((session.id, name, activate_after));
+                self.tab_close_confirm =
+                    Some((session.id, name, PendingClose::Session { activate_after }));
             }
             return Task::none();
         }
@@ -1746,13 +2004,10 @@ impl Jterm {
         let task = self.close_session(index);
         if let Some(id) = activate_after {
             if let Some(remaining) = self.sessions.iter().position(|session| session.id == id) {
-                if self.layout.contains_session(remaining) {
-                    // Target is still on screen: focus its pane, keep the split.
-                    self.active = remaining;
-                } else {
-                    self.active = remaining;
-                    self.unsplit();
-                }
+                // The target lives in some tab's pane; switch to it there
+                // instead of pulling it into the current tab.
+                self.focus_session(remaining);
+                self.relayout();
                 self.refresh_active_context();
                 self.save_session_snapshot();
             }
@@ -1767,8 +2022,8 @@ impl Jterm {
         if let Some((index, process)) = (0..self.sessions.len())
             .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
         {
-            self.active = index;
-            self.unsplit();
+            self.focus_session(index);
+            self.relayout();
             self.refresh_active_context();
             self.push_toast(
                 format!("{process} is still running — close its tab first"),
@@ -1789,24 +2044,24 @@ impl Jterm {
         iced::exit()
     }
 
+    /// Next/Prev walk tabs, not the session vector: the extra sessions a split
+    /// creates live inside a tab, and cycling through them here would treat
+    /// panes as tabs. Moving between panes is PaneNext/PanePrev.
     fn next_session(&mut self) {
-        if let Some(target) =
-            (!self.sessions.is_empty()).then(|| (self.active + 1) % self.sessions.len())
-        {
-            self.activate_session(target);
+        if self.tabs.len() > 1 {
+            self.activate_tab((self.active_tab + 1) % self.tabs.len());
         }
     }
 
     fn prev_session(&mut self) {
-        if let Some(target) = (!self.sessions.is_empty())
-            .then(|| (self.active + self.sessions.len() - 1) % self.sessions.len())
-        {
-            self.activate_session(target);
+        if self.tabs.len() > 1 {
+            self.activate_tab((self.active_tab + self.tabs.len() - 1) % self.tabs.len());
         }
     }
 
+    /// Alt+N selects the Nth tab, matching the order in the strip.
     fn jump_session(&mut self, index: usize) {
-        self.activate_session(index);
+        self.activate_tab(index);
     }
 
     /// Push a transient bottom-right toast. Auto-expires; dismissable.
@@ -1832,84 +2087,45 @@ impl Jterm {
     }
 
     /// Apply a tab context-menu action. Close/CloseOthers/CloseToRight close
-    /// the matching sessions (terminating their PTYs); Duplicate clones the
-    /// target's cwd into a new tab adjacent to it.
+    /// whole tabs — every pane in them, PTYs included; Duplicate opens a new
+    /// tab at the target's cwd next to it.
+    ///
+    /// The ids are tab ids, and every batch preflights each affected tab for a
+    /// running foreground process before anything is torn down.
     fn execute_tab_menu_action(&mut self, action: TabMenuAction) -> Task<Message> {
         match action {
             TabMenuAction::Close(id) => {
-                let Some(index) = self.sessions.iter().position(|session| session.id == id) else {
+                let Some(tab) = self.tab_index_by_id(id) else {
                     return Task::none();
                 };
-                self.request_close_session(index)
+                self.request_close_tab(tab)
             }
             TabMenuAction::CloseOthers(keep_id) => {
-                let Some(keep) = self
-                    .sessions
-                    .iter()
-                    .position(|session| session.id == keep_id)
-                else {
+                let Some(keep) = self.tab_index_by_id(keep_id) else {
                     return Task::none();
                 };
-                if let Some((index, process)) = (0..self.sessions.len())
-                    .filter(|&index| index != keep)
-                    .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
-                {
-                    self.active = index;
-                    self.unsplit();
-                    self.refresh_active_context();
-                    self.push_toast(
-                        format!("{process} is still running — close that tab explicitly"),
-                        ToastKind::Warning,
-                    );
-                    return Task::none();
-                }
-                // Close from the back so indices stay valid; skip `keep`.
-                let mut tasks: Vec<Task<Message>> = Vec::new();
-                let mut i = self.sessions.len();
-                while i > 0 {
-                    i -= 1;
-                    if i != keep {
-                        tasks.push(self.close_session(i));
-                    }
-                }
-                self.push_toast("Closed other tabs", ToastKind::Info);
-                Task::batch(tasks)
+                let targets: Vec<usize> = (0..self.tabs.len()).filter(|&i| i != keep).collect();
+                self.close_tabs("Closed other tabs", targets)
             }
             TabMenuAction::CloseToRight(anchor_id) => {
-                let Some(anchor) = self
-                    .sessions
-                    .iter()
-                    .position(|session| session.id == anchor_id)
-                else {
+                let Some(anchor) = self.tab_index_by_id(anchor_id) else {
                     return Task::none();
                 };
-                if let Some((index, process)) = ((anchor + 1)..self.sessions.len())
-                    .find_map(|index| self.busy_session_name(index).map(|name| (index, name)))
-                {
-                    self.active = index;
-                    self.unsplit();
-                    self.refresh_active_context();
-                    self.push_toast(
-                        format!("{process} is still running — close that tab explicitly"),
-                        ToastKind::Warning,
-                    );
-                    return Task::none();
-                }
-                let mut tasks: Vec<Task<Message>> = Vec::new();
-                while self.sessions.len() > anchor + 1 {
-                    let last = self.sessions.len() - 1;
-                    tasks.push(self.close_session(last));
-                }
-                self.push_toast("Closed tabs to the right", ToastKind::Info);
-                Task::batch(tasks)
+                let targets: Vec<usize> = ((anchor + 1)..self.tabs.len()).collect();
+                self.close_tabs("Closed tabs to the right", targets)
             }
             TabMenuAction::Duplicate(id) => {
-                let Some(i) = self.sessions.iter().position(|session| session.id == id) else {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                // Duplicate copies the tab's selected pane, matching the label
+                // the user right-clicked.
+                let Some(source) = self.tab_focus(tab) else {
                     return Task::none();
                 };
                 let cwd = self
                     .sessions
-                    .get(i)
+                    .get(source)
                     .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()));
                 match Session::spawn(
                     &self.config,
@@ -1921,10 +2137,12 @@ impl Jterm {
                     Ok(session) => {
                         self.session_diagnostic = None;
                         self.next_id += 1;
-                        let insert = (i + 1).min(self.sessions.len());
+                        let insert = (source + 1).min(self.sessions.len());
                         self.sessions.insert(insert, session);
-                        self.active = insert;
-                        self.unsplit();
+                        self.reindex_tabs_after_insert(insert);
+                        self.active_tab = tab;
+                        self.open_tab_with(insert);
+                        self.relayout();
                         self.refresh_active_context();
                         self.save_session_snapshot();
                         self.push_toast("Duplicated tab", ToastKind::Success);
@@ -1941,37 +2159,237 @@ impl Jterm {
         }
     }
 
-    /// Move `sessions[from]` to position `to`, shifting items between them.
-    /// `active` and every leaf session index are rewritten so the same tab stays
-    /// selected before/after the reorder.
-    fn reorder_session(&mut self, from: usize, to: usize) {
-        if from >= self.sessions.len() || to >= self.sessions.len() || from == to {
+    /// Close a set of tabs, refusing the whole batch if any pane in any of them
+    /// still runs a foreground process — a bulk action should not be the way a
+    /// running job gets killed without a prompt.
+    ///
+    /// Tabs are resolved to stable ids up front and closed one at a time, since
+    /// each close shifts the indices of the tabs still queued.
+    fn close_tabs(&mut self, done_message: &str, targets: Vec<usize>) -> Task<Message> {
+        if let Some((index, process)) = targets
+            .iter()
+            .flat_map(|&tab| self.tabs_sessions(tab))
+            .find_map(|session| self.busy_session_name(session).map(|name| (session, name)))
+        {
+            self.focus_session(index);
+            self.relayout();
+            self.refresh_active_context();
+            self.push_toast(
+                format!("{process} is still running — close that tab explicitly"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        let ids: Vec<usize> = targets
+            .iter()
+            .filter_map(|&tab| self.tabs.get(tab).map(|tab| tab.id))
+            .collect();
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        for id in ids {
+            if let Some(tab) = self.tab_index_by_id(id) {
+                tasks.push(self.close_tab(tab));
+            }
+        }
+        self.push_toast(done_message.to_string(), ToastKind::Info);
+        Task::batch(tasks)
+    }
+
+    fn tabs_sessions(&self, tab: usize) -> Vec<usize> {
+        self.tabs
+            .get(tab)
+            .map(|tab| tab.sessions())
+            .unwrap_or_default()
+    }
+
+    /// Move tab `from` to position `to`, shifting the tabs in between.
+    ///
+    /// Only the strip's order changes. The session vector and every tab's
+    /// panes stay put: dragging one tab must not permute the panes inside
+    /// another one, which is exactly what reordering the session vector did
+    /// back when a tab *was* a session.
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return;
         }
-        let sess = self.sessions.remove(from);
-        self.sessions.insert(to, sess);
-        let remap = |idx: usize| -> usize {
-            if idx == from {
-                to
-            } else if from < idx && to >= idx {
-                idx - 1
-            } else if from > idx && to <= idx {
-                idx + 1
-            } else {
-                idx
-            }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = match self.active_tab {
+            a if a == from => to,
+            a if from < to && a > from && a <= to => a - 1,
+            a if to < from && a >= to && a < from => a + 1,
+            a => a,
         };
-        let remap_ref: &dyn Fn(usize) -> usize = &remap;
-        self.active = remap_ref(self.active);
-        self.layout.remap_sessions(remap_ref);
         self.session_dirty = true;
         self.refresh_active_context();
         self.save_session_snapshot();
     }
 
-    /// Whether the layout is currently split (more than one pane).
+    /// The active tab's pane tree. Every split/focus/divider operation goes
+    /// through here, so it cannot reach into another tab.
+    fn layout(&self) -> &PaneTree {
+        &self.tabs[self.active_tab.min(self.tabs.len() - 1)].tree
+    }
+
+    fn layout_mut(&mut self) -> &mut PaneTree {
+        let idx = self.active_tab.min(self.tabs.len() - 1);
+        &mut self.tabs[idx].tree
+    }
+
+    /// Move keyboard focus to a pane of the *active* tab. Also records the
+    /// choice on the tab, so returning to it restores the same pane.
+    fn set_focus(&mut self, session: usize) {
+        self.active = session;
+        let idx = self.active_tab.min(self.tabs.len() - 1);
+        self.tabs[idx].focus = session;
+    }
+
+    /// The tab owning `session`. Each session lives in exactly one pane of one
+    /// tab, so there is at most one answer.
+    fn tab_of_session(&self, session: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.contains(session))
+    }
+
+    /// The session a tab displays: its selected pane. Tab labels, the tab
+    /// switcher and the window title all read this.
+    fn tab_focus(&self, tab: usize) -> Option<usize> {
+        self.tabs.get(tab).map(|tab| tab.focus)
+    }
+
+    /// One label per tab, in strip order — what the switcher matches against.
+    fn tab_labels(&self) -> Vec<String> {
+        (0..self.tabs.len()).map(|i| self.tab_label(i)).collect()
+    }
+
+    fn tab_label(&self, tab: usize) -> String {
+        self.tab_focus(tab)
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| session.label())
+            .unwrap_or_default()
+    }
+
+    /// Switch to `tab` and hand keyboard focus to the pane it had selected.
+    fn activate_tab(&mut self, tab: usize) {
+        if tab >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = tab;
+        self.tabs[tab].repair_focus();
+        self.active = self.tabs[tab].focus;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+        self.session_dirty = true;
+        self.relayout();
+        self.refresh_active_context();
+    }
+
+    /// Focus `session` wherever it lives, switching tabs if it belongs to
+    /// another one. Unlike the old `focus_or_replace_session`, a session is
+    /// never moved into a different pane: pane ownership is fixed.
+    fn focus_session(&mut self, session: usize) -> bool {
+        let Some(tab) = self.tab_of_session(session) else {
+            return false;
+        };
+        if tab != self.active_tab {
+            self.active_tab = tab;
+            self.pane_zoomed = false;
+            self.hovered_divider = None;
+            self.dragging_divider = None;
+        }
+        self.set_focus(session);
+        true
+    }
+
+    /// Rebuild the tab list from a snapshot, after the sessions have spawned.
+    ///
+    /// The snapshot is external input, so every index is validated: a tab keeps
+    /// only leaves that name a session that exists and that no earlier tab
+    /// already claimed — two tabs sharing a pane would fight over one PTY.
+    ///
+    /// The closing step adopts orphans. Validation can empty a tab, a shell can
+    /// fail to restore, and a v1 snapshot's sessions may not appear in its
+    /// single tree at all; every session no tab claims gets a one-pane tab,
+    /// because an unclaimed session is a live PTY nothing can switch to.
+    fn restore_tabs(
+        &mut self,
+        saved_tabs: Vec<session_persistence::TabSnapshot>,
+        saved_active_tab: Option<usize>,
+        legacy_tree: Option<session_persistence::PaneTreeSnapshot>,
+        legacy_split: Option<session_persistence::SplitSnapshot>,
+    ) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        // A v1 snapshot has one global tree: it described the panes the user
+        // last saw, so it migrates into the first tab rather than scattering.
+        let migrated: Vec<(PaneTree, Option<usize>)> = if saved_tabs.is_empty() {
+            legacy_tree
+                .as_ref()
+                .and_then(pane_tree_from_snapshot)
+                .or_else(|| legacy_split.as_ref().and_then(pane_tree_from_legacy))
+                // v1 had no per-tab focus; the snapshot's active session is
+                // the pane the user was in, so seed the migrated tab with it.
+                .map(|tree| vec![(tree, Some(self.active))])
+                .unwrap_or_default()
+        } else {
+            saved_tabs
+                .iter()
+                .filter_map(|snapshot| {
+                    pane_tree_from_snapshot(&snapshot.tree).map(|tree| (tree, snapshot.focus))
+                })
+                .collect()
+        };
+
+        let (tabs, active_tab, next_tab_id) =
+            build_restored_tabs(migrated, self.sessions.len(), self.active, saved_active_tab);
+        self.tabs = tabs;
+        self.active_tab = active_tab;
+        self.next_tab_id = next_tab_id;
+        self.active = self.tabs[active_tab].focus;
+    }
+
+    /// Current index of the tab with this stable id, if it is still open.
+    /// Anything held across UI events must go through here: tab indices shift
+    /// when a tab is closed or the strip is reordered.
+    fn tab_index_by_id(&self, id: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Open `session` in a brand new tab placed after the active one.
+    fn open_tab_with(&mut self, session: usize) {
+        let at = (self.active_tab + 1).min(self.tabs.len());
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.insert(at, Tab::new(id, session));
+        self.active_tab = at;
+        self.active = session;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+    }
+
+    /// Re-index every tab's tree after a session was inserted at `inserted`.
+    /// Session indices are global, so an insert in the middle shifts the panes
+    /// of every tab, not just the active one.
+    fn reindex_tabs_after_insert(&mut self, inserted: usize) {
+        reindex_tabs_for_insert(&mut self.tabs, inserted);
+        self.active = if self.active >= inserted {
+            self.active + 1
+        } else {
+            self.active
+        };
+    }
+
+    /// Re-index every tab's tree after `removed` left the session vector.
+    /// The owning tab drops its leaf first; a tab left with no pane is gone
+    /// (its caller removed it), and the rest only shift indices down.
+    fn reindex_tabs_after_removal(&mut self, removed: usize) {
+        reindex_tabs_for_removal(&mut self.tabs, removed);
+    }
+
+    /// Whether the active tab is currently split (more than one pane).
     fn is_split(&self) -> bool {
-        !self.layout.is_leaf()
+        !self.layout().is_leaf()
     }
 
     /// The whole terminal-area rectangle the pane tree is laid out within.
@@ -1987,13 +2405,13 @@ impl Jterm {
     /// Every leaf's session index and pixel rectangle, in render order.
     fn pane_rects(&self) -> Vec<PaneRect> {
         let mut out = Vec::new();
-        collect_pane_rects(&self.layout, self.layout_area(), DIVIDER, &mut out);
+        collect_pane_rects(self.layout(), self.layout_area(), DIVIDER, &mut out);
         out
     }
 
     /// The focused leaf's position in depth-first order (for status readouts).
     fn focused_pane_pos(&self) -> usize {
-        self.layout
+        self.layout()
             .leaves()
             .iter()
             .position(|&s| s == self.active)
@@ -2053,24 +2471,12 @@ impl Jterm {
         }
     }
 
-    /// Collapse back to a single pane showing the active session.
-    fn unsplit(&mut self) {
-        let was_split = self.is_split();
-        self.pane_zoomed = false;
-        self.hovered_divider = None;
-        self.dragging_divider = None;
-        self.layout = PaneTree::Leaf(self.active);
-        if was_split {
-            self.relayout();
-        }
-    }
-
     /// Split the focused pane along `axis`, spawning a fresh session at its cwd
     /// (tmux `split-window`). If the focused leaf's parent already splits along
     /// `axis` the new pane joins as a sibling; otherwise the leaf becomes a
     /// nested split. Capped at [`MAX_PANES`] total leaves as a PTY guard.
     fn split(&mut self, axis: Axis) {
-        if self.layout.leaf_count() >= MAX_PANES {
+        if self.layout().leaf_count() >= MAX_PANES {
             self.push_toast(
                 format!("Split limit reached ({MAX_PANES} panes)"),
                 ToastKind::Warning,
@@ -2089,9 +2495,12 @@ impl Jterm {
                 self.session_diagnostic = None;
                 self.next_id += 1;
                 self.sessions.push(session);
+                // Appending keeps every existing index valid, so no tab needs
+                // reindexing here.
                 let new_idx = self.sessions.len() - 1;
-                self.layout.split_leaf(self.active, axis, new_idx);
-                self.active = new_idx;
+                let focused = self.active;
+                self.layout_mut().split_leaf(focused, axis, new_idx);
+                self.set_focus(new_idx);
                 // Splitting while zoomed lands in the new multi-pane layout.
                 self.pane_zoomed = false;
                 self.relayout();
@@ -2109,35 +2518,34 @@ impl Jterm {
 
     /// Move keyboard focus to the next leaf in render order (wraps).
     fn focus_next_pane(&mut self) {
-        let leaves = self.layout.leaves();
+        let leaves = self.layout().leaves();
         if leaves.len() < 2 {
             return;
         }
         let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
-        self.active = leaves[(pos + 1) % leaves.len()];
+        self.set_focus(leaves[(pos + 1) % leaves.len()]);
         self.refresh_active_context();
     }
 
     /// Move keyboard focus to the previous leaf in render order (wraps).
     fn focus_prev_pane(&mut self) {
-        let leaves = self.layout.leaves();
+        let leaves = self.layout().leaves();
         if leaves.len() < 2 {
             return;
         }
         let pos = leaves.iter().position(|&s| s == self.active).unwrap_or(0);
-        self.active = leaves[(pos + leaves.len() - 1) % leaves.len()];
+        self.set_focus(leaves[(pos + leaves.len() - 1) % leaves.len()]);
         self.refresh_active_context();
     }
 
-    /// Activate `sessions[index]` through the single tab/session switching path.
-    /// A visible target is focused in its existing pane; a hidden target replaces
-    /// the focused leaf in place. Split topology and ratios are never discarded.
+    /// Activate `sessions[index]` through the single tab/session switching path:
+    /// switch to the tab that owns it and focus its pane there. A session is
+    /// never moved into another pane — pane ownership is fixed, so split
+    /// topology and ratios are untouched.
     fn activate_session(&mut self, index: usize) {
-        if index >= self.sessions.len() || !self.layout.focus_or_replace_session(self.active, index)
-        {
+        if index >= self.sessions.len() || !self.focus_session(index) {
             return;
         }
-        self.active = index;
         self.session_dirty = true;
         self.relayout();
         self.refresh_active_context();
@@ -2155,13 +2563,13 @@ impl Jterm {
     /// were, and focus follows the dragged session into its new pane.
     fn swap_pane_sessions(&mut self, dragged: usize, target: usize) {
         if dragged == target
-            || !self.layout.contains_session(dragged)
-            || !self.layout.contains_session(target)
+            || !self.layout().contains_session(dragged)
+            || !self.layout().contains_session(target)
         {
             return;
         }
-        swap_sessions_in_tree(&mut self.layout, dragged, target);
-        self.active = dragged;
+        swap_sessions_in_tree(self.layout_mut(), dragged, target);
+        self.set_focus(dragged);
         self.session_dirty = true;
         // The two panes usually differ in size, so both shells need a resize.
         self.relayout();
@@ -2174,7 +2582,7 @@ impl Jterm {
     fn focus_pane_direction(&mut self, direction: PaneDirection) {
         let rects = self.pane_rects();
         if let Some(session) = directional_focus_target(&rects, self.active, direction) {
-            self.active = session;
+            self.set_focus(session);
             self.refresh_active_context();
         }
     }
@@ -2183,7 +2591,7 @@ impl Jterm {
     /// that side. Walks up to the nearest ancestor split whose axis matches the
     /// direction; no-op if there is no such divider.
     fn resize_pane_direction(&mut self, direction: PaneDirection) {
-        let Some(path) = self.layout.path_to_session(self.active) else {
+        let Some(path) = self.layout().path_to_session(self.active) else {
             return;
         };
         let wanted = direction.axis();
@@ -2197,7 +2605,7 @@ impl Jterm {
                 axis,
                 children,
                 ratios,
-            }) = self.layout.node_at_path_mut(node_path)
+            }) = self.layout_mut().node_at_path_mut(node_path)
             else {
                 continue;
             };
@@ -2240,7 +2648,7 @@ impl Jterm {
     /// Exchange the focused pane's session with the next leaf's (render order);
     /// geometry stays put and focus follows the moved session, tmux-style.
     fn swap_panes(&mut self) {
-        let leaves = self.layout.leaves();
+        let leaves = self.layout().leaves();
         if leaves.len() < 2 {
             return;
         }
@@ -2258,7 +2666,7 @@ impl Jterm {
         let victim = self.active;
         // Focus lands on the preceding leaf (or the next when closing the first),
         // matching where the freed space goes.
-        let leaves = self.layout.leaves();
+        let leaves = self.layout().leaves();
         let pos = leaves.iter().position(|&s| s == victim).unwrap_or(0);
         let keep = if pos > 0 {
             leaves.get(pos - 1)
@@ -2300,7 +2708,9 @@ impl Jterm {
                 self.new_session();
                 Task::none()
             }
-            C::SessionClose => return Some(self.request_close_session(self.active)),
+            // Closing "the session" from a keybinding means the tab, panes
+            // and all; a single pane is TerminalClosePane.
+            C::SessionClose => return Some(self.request_close_tab(self.active_tab)),
             C::WindowClose => return Some(self.request_window_close()),
             C::SessionNext => {
                 self.next_session();
@@ -2315,7 +2725,7 @@ impl Jterm {
                 Task::none()
             }
             C::SessionLast => {
-                if let Some(last) = last_session_index(self.sessions.len()) {
+                if let Some(last) = last_session_index(self.tabs.len()) {
                     self.jump_session(last);
                 }
                 Task::none()
@@ -2601,9 +3011,10 @@ impl Jterm {
             self.tab_switcher = None;
             return Some(Task::none());
         }
+        let labels = self.tab_labels();
         let state = self.tab_switcher.as_mut()?;
         // Recompute the visible order once so Enter/arrows agree with what's drawn.
-        let filtered = tab_switcher_filtered(&self.sessions, &state.query);
+        let filtered = tab_switcher_filtered(&labels, &state.query);
         match key {
             Key::Named(Named::Escape) => {
                 self.tab_switcher = None;
@@ -3856,11 +4267,9 @@ impl Jterm {
                     // Esc cancels, and every other key is swallowed.
                     if self.tab_close_confirm.is_some() {
                         if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
-                            if let Some((id, _, activate_after)) = self.tab_close_confirm.take() {
-                                if let Some(index) =
-                                    self.sessions.iter().position(|session| session.id == id)
-                                {
-                                    return self.close_session_then(index, activate_after);
+                            if let Some((id, _, pending)) = self.tab_close_confirm.take() {
+                                if let Some(index) = self.session_index_by_id(id) {
+                                    return self.execute_pending_close(index, pending);
                                 }
                             }
                         } else if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
@@ -3992,9 +4401,9 @@ impl Jterm {
                 // bounds-gated in the widget, so every pane emits them — letting
                 // those move focus would let the wrong pane steal it on release.
                 if matches!(input, MouseInput::Press { .. })
-                    && self.layout.contains_session(session)
+                    && self.layout().contains_session(session)
                 {
-                    self.active = session;
+                    self.set_focus(session);
                     self.session_dirty = true;
                     self.refresh_active_context();
                 }
@@ -4064,32 +4473,29 @@ impl Jterm {
             }
             Message::NewSession => self.new_session(),
             Message::CloseTab(id) => {
-                if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
-                    return self.request_close_session(index);
+                // Closing a tab closes every pane in it.
+                if let Some(tab) = self.tab_index_by_id(id) {
+                    return self.request_close_tab(tab);
                 }
             }
             Message::WindowClose => return self.request_window_close(),
             Message::TabHover(id) => self.hovered_tab = id,
             Message::TabDragStart(id) => {
-                if self.sessions.iter().any(|session| session.id == id) {
+                if self.tab_index_by_id(id).is_some() {
                     self.dragging_tab = Some(id);
                 }
             }
             Message::TabDragEnd(target_id) => {
                 if let Some(source_id) = self.dragging_tab.take() {
-                    let source = self
-                        .sessions
-                        .iter()
-                        .position(|session| session.id == source_id);
-                    let target = self
-                        .sessions
-                        .iter()
-                        .position(|session| session.id == target_id);
+                    let source = self.tab_index_by_id(source_id);
+                    let target = self.tab_index_by_id(target_id);
                     if let (Some(from), Some(to)) = (source, target) {
                         if from == to {
-                            self.jump_session(to);
+                            self.activate_tab(to);
                         } else {
-                            self.reorder_session(from, to);
+                            // Reordering moves tabs only; the session vector
+                            // and every tab's panes stay as they are.
+                            self.reorder_tab(from, to);
                         }
                     }
                 }
@@ -4108,7 +4514,7 @@ impl Jterm {
                 self.last_divider_press = Some((now, divider.clone()));
                 if double {
                     if let Some(PaneTree::Split { ratios, .. }) =
-                        self.layout.node_at_path_mut(&divider.path)
+                        self.layout_mut().node_at_path_mut(&divider.path)
                     {
                         equalize_shares(ratios);
                         self.relayout();
@@ -4124,7 +4530,7 @@ impl Jterm {
                     // Locate the dragged divider's owning split node rectangle so
                     // the pointer maps to a fraction of that node's own extent.
                     let Some((axis, node_rect)) =
-                        split_node_rect(&self.layout, &divider.path, self.layout_area(), DIVIDER)
+                        split_node_rect(self.layout(), &divider.path, self.layout_area(), DIVIDER)
                     else {
                         return Task::none();
                     };
@@ -4133,7 +4539,7 @@ impl Jterm {
                         Axis::Horizontal => (pt.y - node_rect.y) / node_rect.height.max(1.0),
                     };
                     if let Some(PaneTree::Split { ratios, .. }) =
-                        self.layout.node_at_path_mut(&divider.path)
+                        self.layout_mut().node_at_path_mut(&divider.path)
                     {
                         if divider.gap + 1 < ratios.len() {
                             // Pointer fraction minus the children before this gap
@@ -4152,8 +4558,8 @@ impl Jterm {
                 // A press on the header focuses its pane, exactly like a click
                 // in the terminal below it. The swap only happens if the
                 // pointer is released somewhere else.
-                if self.layout.contains_session(session) {
-                    self.active = session;
+                if self.layout().contains_session(session) {
+                    self.set_focus(session);
                     self.session_dirty = true;
                     self.refresh_active_context();
                 }
@@ -4707,9 +5113,9 @@ impl Jterm {
                 self.tab_close_confirm = None;
             }
             Message::TabCloseConfirmYes => {
-                if let Some((id, _, activate_after)) = self.tab_close_confirm.take() {
-                    if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
-                        return self.close_session_then(index, activate_after);
+                if let Some((id, _, pending)) = self.tab_close_confirm.take() {
+                    if let Some(index) = self.session_index_by_id(id) {
+                        return self.execute_pending_close(index, pending);
                     }
                 }
             }
@@ -5017,10 +5423,11 @@ impl Jterm {
                 .padding([3, 8])
                 .style(self.ghost_btn_style()),
         );
-        for (i, sess) in self.sessions.iter().enumerate() {
-            let id = sess.id;
-            let active = i == self.active;
-            let label = sess.label();
+        for i in 0..self.tabs.len() {
+            let id = self.tabs[i].id;
+            let active = i == self.active_tab;
+            // A tab shows its selected pane.
+            let label = self.tab_label(i);
             let label = if label.chars().count() > 24 {
                 let truncated: String = label.chars().take(23).collect();
                 format!("{truncated}…")
@@ -5306,7 +5713,8 @@ impl Jterm {
 
     /// Ctrl+Shift+L fuzzy tab switcher overlay (palette-style).
     fn tab_switcher_view(&self, state: &TabSwitcherState) -> Element<'_, Message> {
-        let filtered = tab_switcher_filtered(&self.sessions, &state.query);
+        let labels = self.tab_labels();
+        let filtered = tab_switcher_filtered(&labels, &state.query);
 
         let query: Element<'_, Message> = text_input("Jump to tab…", &state.query)
             .id(TAB_SWITCHER_INPUT_ID.clone())
@@ -5500,7 +5908,7 @@ impl Jterm {
         .align_y(iced::Alignment::Center);
         // Split indicator: which pane is focused, and whether it is zoomed.
         if self.is_split() {
-            let count = self.layout.leaf_count();
+            let count = self.layout().leaf_count();
             let focused = self.focused_pane_pos() + 1;
             let label = if self.pane_zoomed {
                 format!("⊞ {focused}/{count} zoom")
@@ -5784,10 +6192,10 @@ impl Jterm {
     /// click to select, hover to reveal close, and a trailing "new tab" button.
     fn sidebar_tabs_view(&self) -> Element<'_, Message> {
         let mut list = column![].spacing(2).padding([2, 4]);
-        for (i, sess) in self.sessions.iter().enumerate() {
-            let id = sess.id;
-            let active = i == self.active;
-            let label = sess.label();
+        for i in 0..self.tabs.len() {
+            let id = self.tabs[i].id;
+            let active = i == self.active_tab;
+            let label = self.tab_label(i);
             let label = if label.chars().count() > 22 {
                 let truncated: String = label.chars().take(21).collect();
                 format!("{truncated}…")
@@ -6022,7 +6430,7 @@ impl Jterm {
             return Space::new().height(Length::Fixed(PANE_HEADER_H)).into();
         };
         let position = self
-            .layout
+            .layout()
             .leaves()
             .iter()
             .position(|&leaf| leaf == session)
@@ -6180,7 +6588,7 @@ impl Jterm {
         } else {
             // Recursive tiled layout with a draggable divider between each pair
             // of siblings. Integer FillPortions approximate the float shares.
-            self.render_tree(&self.layout, &[])
+            self.render_tree(self.layout(), &[])
         };
         // While dragging the divider, wrap the panes in a mouse_area so pointer
         // moves drive the resize and release ends it. The handler is attached
@@ -7124,7 +7532,7 @@ impl Jterm {
                     format!(
                         "{}/{} panes",
                         self.focused_pane_pos() + 1,
-                        self.layout.leaf_count()
+                        self.layout().leaf_count()
                     )
                 } else {
                     "Single".to_string()
@@ -7644,7 +8052,7 @@ impl Jterm {
         // to animate blinking cells. Run it only while focused AND when a visible
         // pane actually has blinking text — the common case (no blink, or
         // unfocused) then stays fully idle.
-        let has_blink = self.layout.leaves().iter().any(|&idx| {
+        let has_blink = self.layout().leaves().iter().any(|&idx| {
             self.sessions.get(idx).is_some_and(|s| {
                 s.terminal
                     .grid
@@ -7711,20 +8119,22 @@ fn sidebar_load_task(request: sidebar::DirectoryRequest) -> Task<Message> {
 }
 
 /// Score and sort tabs against the switcher query. Empty query returns all in
-/// declaration order; otherwise returns matches highest score first as
-/// `(filtered_position, session_index)` tuples. Used by both the renderer and
-/// the key handler so navigation matches the visible list.
-fn tab_switcher_filtered(sessions: &[Session], query: &str) -> Vec<(usize, usize)> {
+/// strip order; otherwise returns matches highest score first as
+/// `(filtered_position, tab_index)` tuples. Used by both the renderer and the
+/// key handler so navigation matches the visible list.
+///
+/// `labels` holds one entry per tab, taken from that tab's selected pane.
+fn tab_switcher_filtered(labels: &[String], query: &str) -> Vec<(usize, usize)> {
     use fuzzy_matcher::skim::SkimMatcherV2;
     use fuzzy_matcher::FuzzyMatcher;
     if query.is_empty() {
-        return sessions.iter().enumerate().map(|(i, _)| (i, i)).collect();
+        return labels.iter().enumerate().map(|(i, _)| (i, i)).collect();
     }
     let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, usize)> = sessions
+    let mut scored: Vec<(i64, usize)> = labels
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| matcher.fuzzy_match(&s.label(), query).map(|sc| (sc, i)))
+        .filter_map(|(i, label)| matcher.fuzzy_match(label, query).map(|sc| (sc, i)))
         .collect();
     scored.sort_by_key(|item| std::cmp::Reverse(item.0));
     scored
@@ -8512,6 +8922,125 @@ mod tests {
         assert!(valid_restored_layout(&back, 3));
         // Out-of-range session indices are rejected.
         assert!(!valid_restored_layout(&back, 2));
+    }
+
+    fn split_tab(id: usize, sessions: &[usize]) -> Tab {
+        Tab {
+            id,
+            tree: PaneTree::Split {
+                axis: Axis::Vertical,
+                children: sessions.iter().map(|&s| PaneTree::Leaf(s)).collect(),
+                ratios: vec![1.0 / sessions.len() as f32; sessions.len()],
+            },
+            focus: sessions[0],
+        }
+    }
+
+    /// The headline rule: a tab owns its panes, so closing it takes every
+    /// session in it and leaves the neighbouring tabs pointing where they were.
+    #[test]
+    fn closing_a_tab_takes_all_its_sessions_without_disturbing_neighbours() {
+        // tab0: [0]  tab1: [1, 2, 3]  tab2: [4]
+        let mut tabs = vec![Tab::new(0, 0), split_tab(1, &[1, 2, 3]), Tab::new(2, 4)];
+
+        // What `close_tab` does: drop the tab, then close its sessions from the
+        // highest index down so the ones still queued do not shift.
+        let owned = tabs[1].sessions();
+        assert_eq!(owned, vec![1, 2, 3]);
+        tabs.remove(1);
+        for session in owned.into_iter().rev() {
+            reindex_tabs_for_removal(&mut tabs, session);
+        }
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].sessions(), vec![0]);
+        // Session 4 slid down to 1 as the three below it went away.
+        assert_eq!(tabs[1].sessions(), vec![1]);
+        assert_eq!(tabs[1].focus, 1);
+    }
+
+    #[test]
+    fn closing_one_pane_leaves_its_tab_and_reindexes_the_rest() {
+        let mut tabs = vec![split_tab(0, &[0, 1]), Tab::new(1, 2)];
+        tabs[0].focus = 1;
+
+        reindex_tabs_for_removal(&mut tabs, 0);
+
+        // The tab survives with its remaining pane, now at index 0.
+        assert_eq!(tabs[0].sessions(), vec![0]);
+        assert_eq!(tabs[0].focus, 0);
+        assert_eq!(tabs[1].sessions(), vec![1]);
+    }
+
+    #[test]
+    fn inserting_a_session_shifts_every_tab_not_just_the_active_one() {
+        let mut tabs = vec![Tab::new(0, 0), split_tab(1, &[1, 2])];
+
+        reindex_tabs_for_insert(&mut tabs, 1);
+
+        assert_eq!(tabs[0].sessions(), vec![0]);
+        assert_eq!(tabs[1].sessions(), vec![2, 3]);
+        assert_eq!(tabs[1].focus, 2);
+    }
+
+    #[test]
+    fn a_v1_layout_becomes_one_tab_and_loose_sessions_are_adopted() {
+        // The old global tree held sessions 0 and 1; session 2 was a hidden tab.
+        let tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(0), PaneTree::Leaf(1)],
+            ratios: vec![0.5, 0.5],
+        };
+
+        // v1 has no per-tab focus, so the restore path seeds it with the
+        // snapshot's active session (1 here).
+        let (tabs, active, next_id) = build_restored_tabs(vec![(tree, Some(1))], 3, 1, None);
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].sessions(), vec![0, 1]);
+        assert_eq!(tabs[0].focus, 1);
+        // The orphan was adopted rather than left unreachable.
+        assert_eq!(tabs[1].sessions(), vec![2]);
+        assert_eq!(active, 0);
+        assert_eq!(next_id, 2);
+    }
+
+    #[test]
+    fn a_session_claimed_twice_lands_in_exactly_one_tab() {
+        // Two tabs both name session 0; the second is dropped, and the adoption
+        // pass then gives session 1 its own tab.
+        let (tabs, _, _) = build_restored_tabs(
+            vec![(PaneTree::Leaf(0), None), (PaneTree::Leaf(0), None)],
+            2,
+            0,
+            Some(0),
+        );
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].sessions(), vec![0]);
+        assert_eq!(tabs[1].sessions(), vec![1]);
+    }
+
+    #[test]
+    fn an_out_of_range_active_tab_falls_back_to_the_active_session() {
+        let (tabs, active, _) = build_restored_tabs(
+            vec![(PaneTree::Leaf(0), None), (PaneTree::Leaf(1), None)],
+            2,
+            1,
+            Some(9),
+        );
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(active, 1);
+        assert_eq!(tabs[active].focus, 1);
+    }
+
+    #[test]
+    fn a_restored_tab_may_hold_a_single_pane() {
+        // One leaf used to be rejected: it meant "not split" when there was a
+        // single global layout. It is the ordinary case for a tab.
+        assert!(valid_restored_layout(&PaneTree::Leaf(0), 1));
+        assert!(!valid_restored_layout(&PaneTree::Leaf(3), 1));
     }
 
     #[test]
