@@ -23,7 +23,7 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 
 ## 构建与运行
 
-目前支持 Linux。项目固定使用 Rust 1.97.0（`rust-toolchain.toml` 会由 rustup 自动选择），并需要 Fontconfig、Wayland/X11 和 OpenGL/EGL 的开发库。Ubuntu/Debian 可安装：
+目前支持 Linux。项目使用 Rust stable 工具链（`rust-toolchain.toml` 会由 rustup 自动选择），并需要 Fontconfig、Wayland/X11 和 OpenGL/EGL 的开发库。Ubuntu/Debian 可安装：
 
 ```bash
 sudo apt-get install pkg-config libfontconfig1-dev libwayland-dev \
@@ -35,7 +35,7 @@ sudo apt-get install pkg-config libfontconfig1-dev libwayland-dev \
 然后构建：
 
 ```bash
-rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+rustup toolchain install stable --profile minimal --component rustfmt --component clippy
 cargo build --release --locked
 ./target/release/jterm3
 ```
