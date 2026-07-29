@@ -49,6 +49,12 @@ const SIDEBAR_W_MIN: f32 = 120.0;
 const SIDEBAR_W_MAX: f32 = 500.0;
 /// Thickness of the divider drawn between split panes (also its drag hit area).
 const DIVIDER: f32 = 6.0;
+/// Hit width of the invisible window-resize strips along the window edges.
+/// The window is undecorated (see `main`), so nothing else offers a resize
+/// grip. Wide enough to grab without swallowing clicks meant for the chrome.
+const RESIZE_EDGE: f32 = 5.0;
+/// Hit size of the diagonal resize grips in the window corners.
+const RESIZE_CORNER: f32 = 12.0;
 /// Height of the status strip above each pane while split. A single pane has
 /// no strip: the tab bar and status bar already name it, and the row would
 /// only cost a terminal line.
@@ -518,6 +524,14 @@ fn main() -> iced::Result {
         size: Size::new(config.initial_width, config.initial_height),
         // Route window-manager close requests through our foreground-job guard.
         exit_on_close_request: false,
+        // Draw our own title bar. GNOME and other wlroots-style compositors
+        // offer no server-side decorations, so winit falls back to drawing one
+        // with `sctk-adwaita`, whose renderer maps the whole title through a
+        // single system font with no fallback chain — every CJK codepoint came
+        // out as .notdef. jterm3's own chrome uses the configured CJK fallback
+        // font, so the title renders like the rest of the UI. See
+        // `Jterm::top_bar_with_close` and `Jterm::window_resize_edges`.
+        decorations: false,
         ..Default::default()
     };
     iced::application(
@@ -600,6 +614,14 @@ enum Message {
     /// Close the tab with this stable session id.
     CloseTab(usize),
     WindowClose,
+    /// Title-bar press on empty chrome: hand the window to the compositor to
+    /// be moved. The window is undecorated, so nothing else offers this.
+    WindowDrag,
+    /// Press on one of the invisible edge/corner strips: resize in that
+    /// direction for as long as the button is held.
+    WindowResizeDrag(iced::window::Direction),
+    WindowMinimize,
+    WindowToggleMaximize,
     TabHover(Option<usize>),
     /// User pressed the mouse over a tab — start tracking its stable session id.
     TabDragStart(usize),
@@ -4479,6 +4501,22 @@ impl Jterm {
                 }
             }
             Message::WindowClose => return self.request_window_close(),
+            // Window moves and resizes are compositor operations: we only get
+            // to ask, and only while the button that started them is held.
+            // `latest()` resolves the single application window.
+            Message::WindowDrag => {
+                return iced::window::latest().and_then(iced::window::drag);
+            }
+            Message::WindowResizeDrag(direction) => {
+                return iced::window::latest()
+                    .and_then(move |id| iced::window::drag_resize(id, direction));
+            }
+            Message::WindowMinimize => {
+                return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
+            }
+            Message::WindowToggleMaximize => {
+                return iced::window::latest().and_then(iced::window::toggle_maximize);
+            }
             Message::TabHover(id) => self.hovered_tab = id,
             Message::TabDragStart(id) => {
                 if self.tab_index_by_id(id).is_some() {
@@ -5486,14 +5524,52 @@ impl Jterm {
         self.top_bar_with_close(scroller.into())
     }
 
+    /// The top bar doubles as the window's title bar: the window is
+    /// undecorated, so this row owns the title, the window buttons, and
+    /// drag-to-move.
     fn top_bar_with_close<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+        let window_btn = |glyph: &str, msg: Message| {
+            button(text(glyph.to_string()).size(13))
+                .on_press(msg)
+                .padding([3, 9])
+                .style(self.ghost_btn_style())
+        };
         let close = button(text("×").size(14))
             .on_press(Message::WindowClose)
             .padding([3, 9])
             .style(self.close_btn_style());
-        let bar = row![container(content).width(Length::Fill), close]
+
+        let mut bar = row![container(content).width(Length::Fill)];
+        // In Side mode the tab labels live in the dock, so the title is the
+        // only place the active session is named and there is room for it. In
+        // Top mode the active tab already shows the very same string
+        // (`Jterm::title` is the active session's label), so repeating it here
+        // would only steal width from the strip.
+        if self.config.tab_position == config::TabPosition::Side {
+            bar = bar.push(
+                container(
+                    text(self.title())
+                        .size(13)
+                        .wrapping(text::Wrapping::None)
+                        .style(text::secondary),
+                )
+                .padding([0, 8])
+                .clip(true),
+            );
+        }
+        let bar = bar
+            .push(window_btn("—", Message::WindowMinimize))
+            .push(window_btn("▢", Message::WindowToggleMaximize))
+            .push(close)
             .align_y(iced::Alignment::Center)
             .width(Length::Fill);
+        // Presses that no button or tab consumed fall through to here and move
+        // the window, the way a title bar is expected to behave. `mouse_area`
+        // runs its content first and bails once the event is captured, so the
+        // chrome above keeps working.
+        let bar = mouse_area(bar)
+            .on_press(Message::WindowDrag)
+            .on_double_click(Message::WindowToggleMaximize);
         container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(TAB_BAR_H))
@@ -6113,6 +6189,105 @@ impl Jterm {
             .into()
     }
 
+    /// Invisible resize grips hugging the window border, stacked over the rest
+    /// of the UI. An undecorated window has no frame to grab, so without these
+    /// the window could not be resized at all.
+    ///
+    /// Only the strips themselves react: the middle of the overlay is bare
+    /// [`Space`], which captures nothing, so `stack` passes those events down
+    /// to the terminal underneath.
+    fn window_resize_edges(&self) -> Element<'_, Message> {
+        use iced::mouse::Interaction;
+        use iced::window::Direction;
+
+        fn grip<'a>(
+            width: Length,
+            height: Length,
+            direction: Direction,
+            cursor: Interaction,
+        ) -> Element<'a, Message> {
+            mouse_area(container(Space::new()).width(width).height(height))
+                .on_press(Message::WindowResizeDrag(direction))
+                .interaction(cursor)
+                .into()
+        }
+        let corner = Length::Fixed(RESIZE_CORNER);
+        let edge = Length::Fixed(RESIZE_EDGE);
+
+        // Corners come first in each row so a diagonal drag wins over the
+        // edge it overlaps.
+        let top: Element<'_, Message> = row![
+            grip(
+                corner,
+                edge,
+                Direction::NorthWest,
+                Interaction::ResizingDiagonallyDown
+            ),
+            grip(
+                Length::Fill,
+                edge,
+                Direction::North,
+                Interaction::ResizingVertically
+            ),
+            grip(
+                corner,
+                edge,
+                Direction::NorthEast,
+                Interaction::ResizingDiagonallyUp
+            ),
+        ]
+        .width(Length::Fill)
+        .into();
+        let middle: Element<'_, Message> = row![
+            grip(
+                edge,
+                Length::Fill,
+                Direction::West,
+                Interaction::ResizingHorizontally
+            ),
+            Space::new().width(Length::Fill).height(Length::Fill),
+            grip(
+                edge,
+                Length::Fill,
+                Direction::East,
+                Interaction::ResizingHorizontally
+            ),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+        let bottom: Element<'_, Message> = row![
+            grip(
+                corner,
+                edge,
+                Direction::SouthWest,
+                Interaction::ResizingDiagonallyUp
+            ),
+            grip(
+                Length::Fill,
+                edge,
+                Direction::South,
+                Interaction::ResizingVertically
+            ),
+            grip(
+                corner,
+                edge,
+                Direction::SouthEast,
+                Interaction::ResizingDiagonallyDown
+            ),
+        ]
+        .width(Length::Fill)
+        .into();
+
+        // Every row has to fill the width explicitly: a `Row` defaults to
+        // `Shrink`, which would collapse the fill between the grips and bunch
+        // them all against the left border instead of hugging it.
+        column![top, middle, bottom]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     /// Draggable vertical strip between the dock and the terminal body. Pressing
     /// it starts a width-resize drag (continued via the row's `on_move`).
     fn sidebar_divider(&self) -> Element<'_, Message> {
@@ -6709,11 +6884,14 @@ impl Jterm {
         } else {
             root
         };
-        if self.toasts.is_empty() {
+        let root: Element<'_, Message> = if self.toasts.is_empty() {
             root
         } else {
             stack![root, self.toast_overlay()].into()
-        }
+        };
+        // Resize grips sit above everything, including the overlays: the
+        // window border has to stay grabbable whatever panel is open.
+        stack![root, self.window_resize_edges()].into()
     }
 
     /// Search bar overlaid at the top-right of the terminal. The query is an
