@@ -1,7 +1,26 @@
 //! 会话持久化：记录每个标签页的工作目录与活动索引，在重启后恢复。
 //! 端口自 jterm2 `session_persistence.rs`，精简为 jterm3 实际需要的字段。
+use jterm_core::snapshot_file;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// 读取快照时的上限。一份快照最多 32 个会话（`MAX_RESTORED_SESSIONS`）的 cwd
+/// 加每个标签页一棵窗格树，实测是几 KB，所以 1 MiB 留了三个数量级的余量。
+/// 有上限本身才是重点：这个文件是启动时按配置路径读进来交给 serde_json 的，
+/// 无上限的 `read_to_string` 会先把一个被撑大的文件整份读进内存，才有机会拒绝它。
+const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+
+/// `load` 的结果。必须把“没有快照”和“快照读不动”分开：后者的字节还在磁盘上，
+/// 而恢复失败之后几秒内定时自动保存就会覆盖同一个路径，所以调用方要先隔离。
+pub enum SnapshotLoad {
+    /// 路径上没有快照（首次启动，或用户自己删了）。
+    Missing,
+    /// Boxed：快照本体比另外两个 variant 大一个数量级，而这个枚举在启动时
+    /// 只会构造一次，多一次间接寻址换的是每个调用点都不用搬 240 字节。
+    Loaded(Box<SessionsSnapshot>),
+    /// 文件存在但读不出来或解析不了；字节仍在原处等待隔离。
+    Unreadable(String),
+}
 
 /// 单个会话快照（jterm3 仅需要 cwd 来重新 spawn）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,25 +120,36 @@ impl SessionsSnapshot {
         serde_json::to_string_pretty(self).ok()
     }
 
-    /// 原子写入到文件（先写 .tmp 再 rename）。
+    /// 原子写入到文件。
+    ///
+    /// 之前这里是 `fs::write` + `rename`，注释却写着“原子写入”：临时文件没有
+    /// `sync_all`，父目录也没有 fsync，所以掉电后 rename 可能已经生效而内容还没
+    /// 落盘，重启后读到的是一份被截断的快照。`write_atomic_private` 连带把目录
+    /// 建成 0700、文件 0600 —— 快照里每个 pane 的 cwd 就是用户文件系统的地图。
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, path)?;
+        snapshot_file::write_atomic_private(path, json.as_bytes())?;
         Ok(())
     }
 
-    /// 从文件加载；文件不存在时返回空快照。
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    /// 从文件加载。文件不存在与文件读不动是两种结果，见 [`SnapshotLoad`]。
+    pub fn load(path: &Path) -> SnapshotLoad {
         if !path.exists() {
-            return Ok(SessionsSnapshot::new(Vec::new(), None, Vec::new(), None));
+            return SnapshotLoad::Missing;
         }
-        let content = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content)?)
+        let content = match snapshot_file::read_bounded(path, MAX_SNAPSHOT_BYTES) {
+            Ok(content) => content,
+            // 和 exists() 之间存在竞争：文件刚被删掉就当成没有快照，否则调用方
+            // 会去隔离一个已经不在那里的文件。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SnapshotLoad::Missing
+            }
+            Err(error) => return SnapshotLoad::Unreadable(error.to_string()),
+        };
+        match serde_json::from_str(&content) {
+            Ok(snapshot) => SnapshotLoad::Loaded(Box::new(snapshot)),
+            Err(error) => SnapshotLoad::Unreadable(error.to_string()),
+        }
     }
 }
 
@@ -165,6 +195,112 @@ pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("jterm3-snapshot-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_missing_snapshot_is_not_reported_as_unreadable() {
+        let root = scratch("missing");
+        assert!(matches!(
+            SessionsSnapshot::load(&root.join("session_history.json")),
+            SnapshotLoad::Missing
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The distinction the restore path depends on: a corrupt snapshot must be
+    /// `Unreadable`, not silently equivalent to "no snapshot", or the caller
+    /// cannot know it has something to quarantine before the next autosave.
+    #[test]
+    fn a_corrupt_snapshot_is_unreadable_and_left_on_disk_for_quarantine() {
+        let root = scratch("corrupt");
+        let path = root.join("session_history.json");
+        std::fs::write(&path, b"{\"version\":2,\"sessions\":[{\"cwd\"").unwrap();
+
+        assert!(matches!(
+            SessionsSnapshot::load(&path),
+            SnapshotLoad::Unreadable(_)
+        ));
+        assert!(path.exists(), "load must not consume the evidence");
+
+        let backup = snapshot_file::quarantine_corrupt(&path).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"{\"version\":2,\"sessions\":[{\"cwd\""
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_oversized_snapshot_is_rejected_rather_than_read() {
+        let root = scratch("oversize");
+        let path = root.join("session_history.json");
+        // Valid JSON, so only the size bound can reject it.
+        let padding = "x".repeat(MAX_SNAPSHOT_BYTES as usize);
+        std::fs::write(
+            &path,
+            format!("{{\"version\":2,\"sessions\":[],\"pad\":\"{padding}\"}}"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SessionsSnapshot::load(&path),
+            SnapshotLoad::Unreadable(_)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_round_trips_and_leaves_the_snapshot_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("save");
+        // A directory level that does not exist yet, so save has to create it.
+        let path = root.join("state").join("session_history.json");
+        let snapshot = SessionsSnapshot::new(
+            vec![SessionSnapshot {
+                cwd: Some("/tmp".to_string()),
+            }],
+            Some(0),
+            Vec::new(),
+            None,
+        );
+        snapshot.save(&path).unwrap();
+
+        let SnapshotLoad::Loaded(back) = SessionsSnapshot::load(&path) else {
+            panic!("a snapshot this app just wrote must load");
+        };
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].cwd.as_deref(), Some("/tmp"));
+
+        // The cwd of every pane is a map of the user's filesystem.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // The old fs::write + rename left a `session_history.json.tmp` behind on
+        // any failure; nothing but the snapshot may remain.
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn snapshots_without_split_field_still_deserialize() {

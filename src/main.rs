@@ -4,6 +4,7 @@ use jterm_core::pane_layout::{
     self, collect_pane_rects, directional_focus_target, equalize_shares, normalized_shares,
     set_divider_share, split_node_rect, Axis, DividerId, PaneDirection, PaneRect, PaneTree,
 };
+use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
 mod color;
 mod command_palette;
@@ -72,7 +73,6 @@ const MAX_PTY_WRITE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// Responses are retried separately so a full user-input queue cannot discard
 /// terminal protocol replies. The combined per-session backlog remains bounded.
 const MAX_PTY_RESPONSE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
-const BRACKETED_PASTE_FRAMING_BYTES: usize = 12;
 /// Byte caps alone do not cover allocator/Vec metadata for one-byte writes.
 const MAX_PTY_QUEUE_ENTRIES: usize = 4096;
 const PTY_QUEUE_COALESCE_BYTES: usize = 64 * 1024;
@@ -515,6 +515,10 @@ fn main() -> iced::Result {
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
         app_name: "jterm3",
         app_id: "io.github.beamiter.jterm3",
+        // From the app crate, not jterm_core's: a shell that pairs
+        // TERM_PROGRAM with TERM_PROGRAM_VERSION must read this binary's
+        // version, not the shared library's.
+        app_version: env!("CARGO_PKG_VERSION"),
     });
     env_logger::init();
     let config_load = Config::load_with_diagnostics();
@@ -602,6 +606,17 @@ enum Message {
     MousePane(usize, MouseInput),
     /// Clipboard result scoped to the stable session that requested the paste.
     Pasted(usize, Option<String>),
+    /// Text this app appends to the child's pending line — a search-replace
+    /// result, a sidebar path pick. Separate from `Pasted` only so it can use
+    /// `PastePolicy::prompt_insert`: this text is app-generated, so stripping
+    /// control bytes out of it would mangle a command that legitimately
+    /// contains an escape.
+    PromptInsert(usize, String),
+    /// A command recalled from history onto the prompt. Unlike `PromptInsert`
+    /// it kills the pending line first: a recall that merely appends is glued
+    /// to whatever the user had half-typed (the failure mode jterm4 shipped),
+    /// and the mangled line is one Enter away from running.
+    PromptRecall(usize, String),
     /// System clipboard contents read in response to an OSC 52 query from the
     /// app running in the session identified by the file descriptor.
     Osc52Query(usize, RawFd, Option<String>),
@@ -1112,9 +1127,18 @@ impl Session {
         self.queued_write_bytes != 0 || self.queued_response_bytes != 0
     }
 
-    /// Working directory of the shell child, used when spawning a sibling.
+    /// Working directory of the shell child, used when spawning a sibling and
+    /// when persisting the session.
+    ///
+    /// OSC 7 first: `/proc/<pid>/cwd` is the *direct* child's directory, so it
+    /// reports where ssh was launched from rather than where the user is, and it
+    /// does not exist at all on a non-Linux kernel. The OSC 7 value has already
+    /// been rejected unless it named a local host (`TerminalState::decode_osc7_cwd`).
     fn cwd(&self) -> Option<String> {
-        jterm_core::process::process_cwd(self.pty.get_child_pid())
+        self.terminal
+            .current_working_dir()
+            .map(str::to_string)
+            .or_else(|| jterm_core::process::process_cwd(self.pty.get_child_pid()))
     }
 }
 
@@ -1645,8 +1669,44 @@ impl Jterm {
             return default(0);
         };
         let snapshot = match session_persistence::SessionsSnapshot::load(&path) {
-            Ok(s) if !s.sessions.is_empty() => s,
-            _ => return default(0),
+            session_persistence::SnapshotLoad::Loaded(s) if !s.sessions.is_empty() => s,
+            session_persistence::SnapshotLoad::Loaded(_)
+            | session_persistence::SnapshotLoad::Missing => return default(0),
+            // Quarantine before returning, because returning is what lets the
+            // app start — and `save_session_snapshot` then writes a fresh
+            // snapshot over this same path on the first periodic tick. Retaining
+            // the unreadable file and overwriting it seconds later destroys the
+            // only copy of the user's tabs.
+            session_persistence::SnapshotLoad::Unreadable(reason) => {
+                let mut state = default(0);
+                let note = match jterm_core::snapshot_file::quarantine_corrupt(&path) {
+                    Ok(backup) => {
+                        log::warn!(
+                            "[SessionPersistence] Cannot read {} ({reason}); moved it to {}",
+                            path.display(),
+                            backup.display()
+                        );
+                        format!(
+                            "Could not read the saved session ({reason}).\nThe old file was kept as {}",
+                            backup.display()
+                        )
+                    }
+                    Err(move_error) => {
+                        log::warn!(
+                            "[SessionPersistence] Cannot read {} ({reason}) and cannot move it aside ({move_error})",
+                            path.display()
+                        );
+                        format!(
+                            "Could not read the saved session ({reason}), and it could not be moved aside ({move_error}); it will be overwritten"
+                        )
+                    }
+                };
+                state.diagnostic = Some(match state.diagnostic.take() {
+                    Some(existing) => format!("{note}\n{existing}"),
+                    None => note,
+                });
+                return state;
+            }
         };
         let mut sessions = Vec::new();
         let mut next_id = 0usize;
@@ -3104,14 +3164,73 @@ impl Jterm {
         iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
     }
 
-    /// Paste-to-prompt: queue `text` into the active pane exactly like a
-    /// clipboard paste (bracketed framing, input-queue bounds, rejection
-    /// toast) and never append Enter — the user still submits explicitly.
+    /// Paste-to-prompt: queue `text` into the active pane with the same framing,
+    /// input-queue bounds and rejection toast as a clipboard paste, and never
+    /// append Enter — the user still submits explicitly. The text is appended
+    /// to the pending line; command recall goes through
+    /// [`Self::recall_into_active_pane`] instead.
     fn type_into_active_pane(&mut self, text: String) -> Task<Message> {
         let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
             return Task::none();
         };
-        Task::done(Message::Pasted(id, Some(text)))
+        Task::done(Message::PromptInsert(id, text))
+    }
+
+    /// History recall: replace the prompt's pending line with `command`. Still
+    /// never appends Enter — the user submits explicitly.
+    fn recall_into_active_pane(&mut self, command: String) -> Task<Message> {
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
+        Task::done(Message::PromptRecall(id, command))
+    }
+
+    /// Encode one payload for session `id` and queue it on that PTY.
+    ///
+    /// The single choke point for everything this app writes as a *payload*
+    /// rather than a keystroke, and it goes through `pty_input` because that
+    /// unconditionally removes `ESC[200~`/`ESC[201~` from the body.
+    /// The local encoder this replaced framed the clipboard verbatim, so a
+    /// payload carrying its own `ESC[201~` closed the frame early and the shell
+    /// read the remainder as typed lines and ran them. Do not add a second path
+    /// that frames a payload without coming through here.
+    ///
+    /// `clear_line_first` prefixes a `Ctrl+U`; with it `false` this is exactly
+    /// `encode_paste`. True for command recall, false for pastes and appends.
+    fn write_paste_to_session(
+        &mut self,
+        id: usize,
+        text: &str,
+        policy: PastePolicy,
+        clear_line_first: bool,
+    ) {
+        let mut rejected = false;
+        if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
+            let modes = PasteModes {
+                bracketed: sess.terminal.is_bracketed_paste_enabled(),
+            };
+            let paste = pty_input::encode_prompt_insert(text, modes, policy, clear_line_first);
+            // A clipboard that was nothing but paste markers normalizes away
+            // entirely; writing zero bytes would toast about a full queue.
+            if paste.is_empty() {
+                return;
+            }
+            // Size-check the *encoded* bytes: framing and control stripping have
+            // already changed the length the queue must accept.
+            if !sess.can_queue_user_bytes(paste.bytes.len()) {
+                rejected = true;
+            } else {
+                sess.terminal.scroll_to_bottom();
+                rejected = !sess.write_pty(&paste.bytes);
+                sess.refresh();
+            }
+        }
+        if rejected {
+            self.push_toast(
+                "Paste rejected: terminal input queue is full",
+                ToastKind::Warning,
+            );
+        }
     }
 
     /// History picker key handling. Mirrors `handle_tab_switcher_key`: typed
@@ -3139,7 +3258,7 @@ impl Jterm {
                 let command = state.selected_command();
                 self.history_picker = None;
                 return Some(match command {
-                    Some(command) => self.type_into_active_pane(command),
+                    Some(command) => self.recall_into_active_pane(command),
                     None => Task::none(),
                 });
             }
@@ -4432,36 +4551,30 @@ impl Jterm {
                 return self.handle_mouse(input);
             }
             Message::Pasted(id, Some(text)) => {
-                let mut rejected = false;
-                if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
-                    let bracketed = sess.terminal.is_bracketed_paste_enabled();
-                    let framing = if bracketed {
-                        BRACKETED_PASTE_FRAMING_BYTES
-                    } else {
-                        0
-                    };
-                    let required = text.len().saturating_add(framing);
-                    if !sess.can_queue_user_bytes(required) {
-                        rejected = true;
-                    } else {
-                        let bytes = if bracketed {
-                            wrap_bracketed_paste(text.into_bytes())
-                        } else {
-                            text.into_bytes()
-                        };
-                        sess.terminal.scroll_to_bottom();
-                        rejected = !sess.write_pty(&bytes);
-                        sess.refresh();
-                    }
-                }
-                if rejected {
-                    self.push_toast(
-                        "Paste rejected: terminal input queue is full",
-                        ToastKind::Warning,
-                    );
-                }
+                self.write_paste_to_session(
+                    id,
+                    &text,
+                    PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                    false,
+                );
             }
             Message::Pasted(_, None) => {}
+            Message::PromptInsert(id, text) => {
+                self.write_paste_to_session(
+                    id,
+                    &text,
+                    PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
+                    false,
+                );
+            }
+            Message::PromptRecall(id, command) => {
+                self.write_paste_to_session(
+                    id,
+                    &command,
+                    PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
+                    true,
+                );
+            }
             Message::Resized(size) => {
                 self.win_size = size;
                 let term_h = self.term_height();
@@ -4685,14 +4798,16 @@ impl Jterm {
             Message::SidebarInsertPath(path) => {
                 // Type the (shell-quoted) path into the active terminal so the
                 // sidebar doubles as a path picker.
-                if let Some(sess) = self.sessions.get_mut(self.active) {
-                    // Trailing space so the picked path is ready to extend.
-                    let mut quoted = jterm_core::process::shell_quote_path(&path.to_string_lossy());
-                    quoted.push(' ');
-                    sess.terminal.scroll_to_bottom();
-                    sess.write_pty(quoted.as_bytes());
-                    sess.refresh();
-                }
+                // Trailing space so the picked path is ready to extend.
+                let mut quoted = jterm_core::process::shell_quote_path(&path.to_string_lossy());
+                quoted.push(' ');
+                // Through the paste choke point, not a raw write: quoting
+                // protects the *shell parser*, but at the input layer a
+                // filename carrying a raw CR would still submit the pending
+                // line and an embedded `ESC[201~` would still close a paste
+                // frame. (An insert, not a recall: the picked path is appended
+                // to whatever command the user is composing.)
+                return self.type_into_active_pane(quoted);
             }
             Message::SidebarGoParent => {
                 if let Some(parent) = self
@@ -5145,7 +5260,7 @@ impl Jterm {
             }
             Message::HistoryPickerAccept(command) => {
                 self.history_picker = None;
-                return self.type_into_active_pane(command);
+                return self.recall_into_active_pane(command);
             }
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
@@ -7836,8 +7951,8 @@ impl Jterm {
         ))
     }
 
-    /// Approve a proposal and type it (plus carriage return) into the bound
-    /// session's PTY, then continue driving the protocol.
+    /// Approve a proposal, put it on the bound session's prompt in place of the
+    /// pending line, submit it, then continue driving the protocol.
     fn agent_run_approved(
         &mut self,
         id: jterm_core::agent::ProposalId,
@@ -7847,10 +7962,15 @@ impl Jterm {
         let bound = self.agent.bound_session_id?;
         match self.sessions.iter_mut().find(|s| s.id == bound) {
             Some(sess) => {
-                let mut bytes = command.into_bytes();
-                bytes.push(b'\r');
+                // This used to append a raw `command + CR`, the last payload
+                // writer bypassing `pty_input`: an approved (or hand-edited)
+                // command carrying its own `ESC[201~` could close an open paste
+                // frame, and whatever the user had half-typed at the prompt was
+                // glued to the front of the command and run with it.
+                let paste =
+                    agent_command_payload(&command, sess.terminal.is_bracketed_paste_enabled());
                 sess.terminal.scroll_to_bottom();
-                if !sess.write_pty(&bytes) {
+                if !sess.write_pty(&paste.bytes) {
                     self.agent.status =
                         "Agent command rejected: PTY input queue is full".to_string();
                 }
@@ -8379,17 +8499,26 @@ fn enqueue_desktop_notification(title: String, body: String) {
     let _ = sender.try_send((title, body));
 }
 
-/// Wrap a paste payload in bracketed-paste delimiters.
-fn wrap_bracketed_paste(mut payload: Vec<u8>) -> Vec<u8> {
-    const PREFIX: &[u8] = b"\x1b[200~";
-    const SUFFIX: &[u8] = b"\x1b[201~";
-    let payload_len = payload.len();
-    payload.reserve(BRACKETED_PASTE_FRAMING_BYTES);
-    payload.resize(payload_len + BRACKETED_PASTE_FRAMING_BYTES, 0);
-    payload.copy_within(0..payload_len, PREFIX.len());
-    payload[..PREFIX.len()].copy_from_slice(PREFIX);
-    payload[PREFIX.len() + payload_len..].copy_from_slice(SUFFIX);
-    payload
+/// Bytes that put an approved agent command on the bound session's prompt and
+/// run it.
+///
+/// `clear_line_first` is unconditional: the "prompt is ready" the approval UI
+/// implies says nothing about the line buffer being empty, so without the
+/// `Ctrl+U` the command is appended to whatever the user had half-typed and
+/// submitted in that mangled form. The submitting CR lands outside the frame
+/// because readline deliberately does not execute newlines inside a bracketed
+/// paste. Control bytes are kept — the command is the agent's reviewed text,
+/// not clipboard data.
+fn agent_command_payload(command: &str, bracketed: bool) -> pty_input::Paste {
+    pty_input::encode_prompt_insert(
+        command,
+        PasteModes { bracketed },
+        PastePolicy {
+            submit: true,
+            ..PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim)
+        },
+        true,
+    )
 }
 
 /// Build a single OSC 5522 packet: `ESC ] 5522 ; <metadata> [; <payload>] ESC \`.
@@ -9272,13 +9401,131 @@ mod tests {
         assert_eq!(last_session_index(12), Some(11));
     }
 
+    /// Replaces the old `bracketed_paste_framing_preserves_payload`, which
+    /// pinned the local encoder's *verbatim* framing — the bug. What must hold
+    /// now is that a payload cannot close the frame it is carried in.
     #[test]
-    fn bracketed_paste_framing_preserves_payload() {
-        assert_eq!(
-            wrap_bracketed_paste(b"hello\nworld".to_vec()),
-            b"\x1b[200~hello\nworld\x1b[201~"
+    fn paste_framing_cannot_be_closed_by_its_own_payload() {
+        let policy = PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim);
+        let paste = pty_input::encode_paste(
+            "docs\x1b[201~\rrm -rf ~\r",
+            PasteModes { bracketed: true },
+            policy,
         );
-        assert_eq!(wrap_bracketed_paste(Vec::new()), b"\x1b[200~\x1b[201~");
+
+        // One frame, and the terminator appears exactly once: at the end.
+        assert!(paste.bytes.starts_with(b"\x1b[200~"));
+        assert!(paste.bytes.ends_with(b"\x1b[201~"));
+        assert_eq!(
+            paste
+                .bytes
+                .windows(6)
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1,
+            "payload still carries a frame terminator: {:?}",
+            String::from_utf8_lossy(&paste.bytes)
+        );
+        assert!(paste.risk.had_embedded_paste_marker);
+        // jterm3 sends every line of an unbracketed multiline paste, unchanged.
+        assert_eq!(paste.echo_text, "docs\nrm -rf ~\n");
+    }
+
+    /// jterm3 keeps `SendVerbatim`: a multiline paste into a shell that never
+    /// advertised DECSET 2004 is still sent whole, framing omitted.
+    #[test]
+    fn unbracketed_multiline_paste_stays_verbatim() {
+        let paste = pty_input::encode_paste(
+            "one\ntwo",
+            PasteModes { bracketed: false },
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+        );
+        assert_eq!(paste.bytes, b"one\ntwo");
+        assert!(!paste.risk.truncated_to_first_line);
+    }
+
+    /// Prompt insertion carries this app's own history, so an escape inside a
+    /// recalled command must survive — the clipboard policy would strip it.
+    #[test]
+    fn prompt_insert_keeps_control_bytes_the_clipboard_would_strip() {
+        let modes = PasteModes { bracketed: true };
+        let recalled = pty_input::encode_paste(
+            "printf '\x1b[31m'",
+            modes,
+            PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
+        );
+        assert_eq!(recalled.echo_text, "printf '\x1b[31m'");
+
+        let clipboard = pty_input::encode_paste(
+            "printf '\x1b[31m'",
+            modes,
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+        );
+        assert_eq!(clipboard.echo_text, "printf '[31m'");
+    }
+
+    /// Replaces the raw `command + CR` write in `agent_run_approved`: the
+    /// approved command must replace the pending line (`Ctrl+U` first), carry
+    /// no frame terminator of its own, and submit *outside* the frame.
+    #[test]
+    fn an_approved_agent_command_replaces_the_line_and_submits_outside_the_frame() {
+        let paste = agent_command_payload("git status\x1b[201~; rm -rf ~", true);
+        assert_eq!(paste.bytes[0], 0x15, "line kill must come first");
+        assert!(paste.bytes[1..].starts_with(b"\x1b[200~"));
+        assert!(paste.bytes.ends_with(b"\x1b[201~\r"));
+        // The embedded terminator was removed, not framed.
+        assert_eq!(paste.echo_text, "git status; rm -rf ~");
+        assert!(paste.risk.had_embedded_paste_marker);
+
+        // A shell without DECSET 2004 still gets the kill and the submit.
+        let plain = agent_command_payload("echo hi", false);
+        assert_eq!(plain.bytes, b"\x15echo hi\r");
+    }
+
+    /// `Message::PromptRecall` (history picker) kills the pending line before
+    /// typing; `Message::PromptInsert` (search-replace, sidebar path picks)
+    /// appends instead. Both routes use the same policy, so the flag is the
+    /// only difference `write_paste_to_session` applies.
+    #[test]
+    fn history_recall_replaces_the_pending_line_and_inserts_append() {
+        let modes = PasteModes { bracketed: true };
+        let policy = PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim);
+        let recall = pty_input::encode_prompt_insert("cargo test", modes, policy, true);
+        assert_eq!(recall.bytes[0], 0x15);
+        assert_eq!(&recall.bytes[1..], b"\x1b[200~cargo test\x1b[201~");
+
+        let insert = pty_input::encode_prompt_insert("cargo test", modes, policy, false);
+        assert_eq!(insert.bytes, b"\x1b[200~cargo test\x1b[201~");
+    }
+
+    /// Why `SidebarInsertPath` routes through the paste choke point instead of
+    /// writing raw bytes: `shell_quote_path` protects the *shell parser*, but at
+    /// the input layer a filename carrying a raw CR would still submit the
+    /// pending line and an embedded `ESC[201~` would still close a paste frame.
+    #[test]
+    fn a_sidebar_path_pick_cannot_close_a_frame_or_submit_the_line() {
+        let hostile = "evil\x1b[201~\rrm -rf ~";
+        let mut quoted = jterm_core::process::shell_quote_path(hostile);
+        quoted.push(' ');
+        let paste = pty_input::encode_prompt_insert(
+            &quoted,
+            PasteModes { bracketed: true },
+            PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
+            false,
+        );
+        // Exactly one frame terminator, and it is the frame's own.
+        assert_eq!(
+            paste
+                .bytes
+                .windows(6)
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1
+        );
+        assert!(paste.bytes.ends_with(b"\x1b[201~"));
+        // The CR that would have submitted the line is folded to a newline the
+        // frame keeps inert.
+        assert!(!paste.echo_text.contains('\r'));
     }
 
     #[test]

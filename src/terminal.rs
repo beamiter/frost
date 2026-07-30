@@ -940,6 +940,10 @@ pub struct TerminalState {
     pub window_title: String,
     icon_title: String,
     title_stack: Vec<(Option<String>, Option<String>)>,
+    /// Working directory the child reported through OSC 7, if any. Without it
+    /// the cwd comes only from `/proc/<pid>/cwd`, which is the *local* shell's
+    /// directory and therefore always wrong once the pane is running ssh.
+    current_working_dir: Option<String>,
 
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
@@ -1159,6 +1163,7 @@ impl TerminalState {
             window_title: String::new(),
             icon_title: String::new(),
             title_stack: Vec::new(),
+            current_working_dir: None,
             global_bg: Color::Default,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -1799,6 +1804,70 @@ impl TerminalState {
         let state = self.decrqm_private_mode_state(mode);
         let response = format!("\x1b[?{};{}$y", mode, state);
         self.output_buffer.extend_from_slice(response.as_bytes());
+    }
+
+    /// The cwd the child last reported through OSC 7, if any.
+    pub fn current_working_dir(&self) -> Option<&str> {
+        self.current_working_dir.as_deref()
+    }
+
+    /// Decode an OSC 7 payload into a local filesystem path.
+    ///
+    /// Accepts `file://host/%-encoded-path` or a bare absolute path. A non-local
+    /// hostname is rejected, and that check is not optional: this value drives
+    /// the file-tree sidebar and the cwd a split inherits, so without it a shell
+    /// on the far side of ssh could point the sidebar at any local directory it
+    /// named — and the session snapshot would restore the next launch there.
+    /// Ported from jterm2 `src/terminal/state.rs::decode_osc7_cwd`.
+    fn decode_osc7_cwd(value: &str) -> Option<String> {
+        let path_part = if let Some(rest) = value.strip_prefix("file://") {
+            let slash = rest.find('/')?;
+            if !Self::osc7_host_is_local(&rest[..slash]) {
+                return None;
+            }
+            &rest[slash..]
+        } else if value.starts_with('/') {
+            value
+        } else {
+            // A relative path has no anchor here — the shell's idea of "here" is
+            // exactly what this sequence was supposed to tell us.
+            return None;
+        };
+
+        // Percent-decode by hand: the alphabet is three characters wide and a
+        // url crate is not worth linking for it.
+        let bytes = path_part.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        let decoded = String::from_utf8(out).ok()?;
+        // A decoded path with an interior NUL cannot be opened and would be
+        // truncated by any C API it reached, so reject it rather than store it.
+        if decoded.is_empty() || decoded.contains('\0') {
+            return None;
+        }
+        Some(decoded)
+    }
+
+    fn osc7_host_is_local(host: &str) -> bool {
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        let local_hostname = std::env::var("HOSTNAME").ok().or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|hostname| hostname.trim().to_string())
+        });
+        local_hostname.is_some_and(|local| host.eq_ignore_ascii_case(&local))
     }
 
     fn sanitized_title(title: &str) -> String {
@@ -2787,6 +2856,17 @@ impl TerminalState {
                                             self.icon_title = Self::sanitized_title(value);
                                         } else if command == "2" {
                                             self.window_title = Self::sanitized_title(value);
+                                        } else if command == "7" {
+                                            // OSC 7 — the child reporting its cwd
+                                            // as `file://host/%-encoded-path`, or
+                                            // a bare path. Only overwrite on a
+                                            // payload we accept: a rejected
+                                            // remote path must leave the last
+                                            // known local directory alone rather
+                                            // than blanking it.
+                                            if let Some(cwd) = Self::decode_osc7_cwd(value) {
+                                                self.current_working_dir = Some(cwd);
+                                            }
                                         } else if command == "8" {
                                             // OSC 8 - Hyperlinks
                                             // Format: ESC ] 8 ; params ; URI ST
@@ -5934,6 +6014,54 @@ mod tests {
             String::from_utf8(terminal.get_output()).unwrap(),
             "\x1b]Licon\x1b\\\x1b]lwindow\x1b\\"
         );
+    }
+
+    #[test]
+    fn osc7_reports_the_childs_cwd_through_the_terminal_state() {
+        let mut terminal = TerminalState::new(80, 24);
+        assert_eq!(terminal.current_working_dir(), None);
+
+        terminal.process_input(b"\x1b]7;file://localhost/home/user/My%20Files\x1b\\");
+        assert_eq!(terminal.current_working_dir(), Some("/home/user/My Files"));
+
+        // An empty host is the shape `vte.sh` emits most often.
+        terminal.process_input(b"\x1b]7;file:///tmp\x1b\\");
+        assert_eq!(terminal.current_working_dir(), Some("/tmp"));
+
+        // A bare absolute path is accepted too; some shells emit only that.
+        terminal.process_input(b"\x1b]7;/srv\x1b\\");
+        assert_eq!(terminal.current_working_dir(), Some("/srv"));
+    }
+
+    /// The reason OSC 7 could not be added without the host check: this value
+    /// drives the file-tree sidebar and the cwd a split or a restored session
+    /// inherits, so a shell on the far side of ssh must not be able to steer it.
+    #[test]
+    fn osc7_from_a_remote_host_does_not_move_the_local_cwd() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_input(b"\x1b]7;file:///home/user\x1b\\");
+
+        terminal.process_input(b"\x1b]7;file://definitely-remote.invalid/etc\x1b\\");
+        assert_eq!(
+            terminal.current_working_dir(),
+            Some("/home/user"),
+            "a rejected payload must leave the last known local directory alone"
+        );
+
+        // Malformed payloads are rejected on the same terms.
+        for payload in [
+            "\x1b]7;\x1b\\",
+            "\x1b]7;relative/path\x1b\\",
+            "\x1b]7;file://localhost/%zz\x1b\\",
+            "\x1b]7;file://localhost/tmp/%00etc\x1b\\",
+        ] {
+            terminal.process_input(payload.as_bytes());
+            assert_eq!(
+                terminal.current_working_dir(),
+                Some("/home/user"),
+                "payload {payload:?} must be rejected"
+            );
+        }
     }
 
     #[test]
