@@ -572,13 +572,13 @@ enum Message {
     AgentNewTask,
     AgentClearContext,
     AgentClose,
-    /// Result of the background rsh update check (boxed: one rare message must
+    /// Result of the background jsh update check (boxed: one rare message must
     /// not widen every other variant).
-    RshChecked(Box<jterm_core::rsh_install::Status>),
-    /// Install rsh, or update the installed one, in a dedicated session.
-    RshInstall,
-    /// Hide the rsh notice until the next launch.
-    RshNoticeDismiss,
+    JshChecked(Box<jterm_core::jsh_install::Status>),
+    /// Install jsh, or update the installed one, in a dedicated session.
+    JshInstall,
+    /// Hide the jsh notice until the next launch.
+    JshNoticeDismiss,
     SetAiEnabled(bool),
     SetAiProvider(String),
     SetAiModel(String),
@@ -815,7 +815,7 @@ impl Session {
     }
 
     /// Spawn a session that runs an explicit argv instead of the configured
-    /// shell — used for one-shot helpers such as the rsh installer.
+    /// shell — used for one-shot helpers such as the jsh installer.
     fn spawn_argv(
         config: &Config,
         id: usize,
@@ -1236,10 +1236,10 @@ struct Jterm {
     /// Transient bottom-right toast queue with absolute expiry timestamps.
     /// Cleared lazily on each render and on ConfigTick.
     toasts: Vec<Toast>,
-    /// Offer produced by the background "is a newer rsh published?" check, and
+    /// Offer produced by the background "is a newer jsh published?" check, and
     /// whether the user waved it away for this launch.
-    rsh_prompt: Option<jterm_core::rsh_install::Prompt>,
-    rsh_notice_dismissed: bool,
+    jsh_prompt: Option<jterm_core::jsh_install::Prompt>,
+    jsh_notice_dismissed: bool,
     /// Tab-switcher overlay (Ctrl+Shift+L): when open, a small fuzzy list of
     /// tab labels lets the user jump by typing. Field holds the typed query
     /// and current selection index.
@@ -1381,8 +1381,8 @@ impl Jterm {
             dragging_tab: None,
             tab_menu: None,
             toasts: Vec::new(),
-            rsh_prompt: None,
-            rsh_notice_dismissed: false,
+            jsh_prompt: None,
+            jsh_notice_dismissed: false,
             tab_switcher: None,
             history_picker: None,
             tab_close_confirm: None,
@@ -1396,11 +1396,11 @@ impl Jterm {
         // external input, so every index is validated before use.
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
         app.relayout();
-        // jterm3 prefers rsh as its shell, so it is worth noticing when the
+        // jterm3 prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. Nothing is installed without an
         // explicit click.
-        let rsh_check = Self::rsh_update_check_task(&app.config.rsh_update_check);
-        (app, rsh_check)
+        let jsh_check = Self::jsh_update_check_task(&app.config.jsh_update_check);
+        (app, jsh_check)
     }
 
     fn title(&self) -> String {
@@ -1781,15 +1781,15 @@ impl Jterm {
         }
     }
 
-    /// Run the rsh installer in its own session. The script narrates what it
+    /// Run the jsh installer in its own session. The script narrates what it
     /// does, so the session is the progress UI — the user can read a failure or
     /// interrupt it with Ctrl+C like any other command.
-    fn install_or_update_rsh(&mut self) {
-        self.rsh_notice_dismissed = true;
-        let argv = match jterm_core::rsh_install::install_argv() {
+    fn install_or_update_jsh(&mut self) {
+        self.jsh_notice_dismissed = true;
+        let argv = match jterm_core::jsh_install::install_argv() {
             Ok(argv) => argv,
             Err(error) => {
-                log::warn!("cannot stage the rsh installer: {error}");
+                log::warn!("cannot stage the jsh installer: {error}");
                 self.push_toast(
                     format!("Could not write the installer script: {error}"),
                     ToastKind::Warning,
@@ -1829,24 +1829,24 @@ impl Jterm {
     /// Ask the installer what is published, off the UI thread. A check that
     /// fails, or finds nothing to do, stays silent: an offline laptop must not
     /// be nagged about a button that cannot work.
-    fn rsh_update_check_task(policy: &str) -> Task<Message> {
+    fn jsh_update_check_task(policy: &str) -> Task<Message> {
         // "startup" asks the network every launch; "daily" reuses the
         // installer's cache, which every jterm on this machine shares.
-        let Some(max_age) = jterm_core::rsh_install::UpdateCheck::parse(policy).max_age() else {
+        let Some(max_age) = jterm_core::jsh_install::UpdateCheck::parse(policy).max_age() else {
             return Task::none();
         };
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    jterm_core::rsh_install::check_blocking(max_age)
+                    jterm_core::jsh_install::check_blocking(max_age)
                 })
                 .await
                 .unwrap_or_else(|error| {
-                    log::warn!("rsh update check did not finish: {error}");
-                    jterm_core::rsh_install::Status::default()
+                    log::warn!("jsh update check did not finish: {error}");
+                    jterm_core::jsh_install::Status::default()
                 })
             },
-            |status| Message::RshChecked(Box::new(status)),
+            |status| Message::JshChecked(Box::new(status)),
         )
     }
 
@@ -2056,7 +2056,7 @@ impl Jterm {
         self.agent.persist();
         self.save_session_snapshot();
         if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
-            log::warn!("rsh execution journal did not flush before exit");
+            log::warn!("jsh execution journal did not flush before exit");
         }
         if let Err(error) =
             jterm_core::command_history::flush_pending(std::time::Duration::from_secs(2))
@@ -3638,8 +3638,8 @@ impl Jterm {
                 self.new_session();
                 Task::none()
             }
-            PaletteAction::InstallRsh => {
-                self.install_or_update_rsh();
+            PaletteAction::InstallJsh => {
+                self.install_or_update_jsh();
                 Task::none()
             }
             PaletteAction::CloseTab => self.request_close_session(self.active),
@@ -4019,8 +4019,8 @@ impl Jterm {
                     }
                 }
 
-                // Mirror captured command output into rsh's execution journal
-                // (no-op unless RSH_EXECUTION_JOURNAL is enabled).
+                // Mirror captured command output into jsh's execution journal
+                // (no-op unless JSH_EXECUTION_JOURNAL is enabled).
                 for completed in &completed_commands {
                     let Some(id) = completed.id.clone() else {
                         continue;
@@ -4083,23 +4083,23 @@ impl Jterm {
                     return Task::batch(tasks);
                 }
             }
-            Message::RshChecked(status) => {
+            Message::JshChecked(status) => {
                 if let Some(error) = &status.error {
-                    log::info!("rsh update check unavailable: {error}");
+                    log::info!("jsh update check unavailable: {error}");
                 }
                 if let Some(other) = &status.shadowed_by {
-                    // Usually /usr/bin/rsh, the BSD remote shell. Installing
+                    // Some other binary named jsh, earlier on PATH. Installing
                     // does not fix PATH order, so the installer explains it in
                     // the session; here it is only worth a log line.
-                    log::warn!("PATH resolves rsh to {other}, which jterm3 does not manage");
+                    log::warn!("PATH resolves jsh to {other}, which jterm3 does not manage");
                 }
-                self.rsh_prompt = jterm_core::rsh_install::prompt_for(&status);
-                if let Some(prompt) = &self.rsh_prompt {
-                    log::info!("rsh notice: {}", prompt.banner_title());
+                self.jsh_prompt = jterm_core::jsh_install::prompt_for(&status);
+                if let Some(prompt) = &self.jsh_prompt {
+                    log::info!("jsh notice: {}", prompt.banner_title());
                 }
             }
-            Message::RshInstall => self.install_or_update_rsh(),
-            Message::RshNoticeDismiss => self.rsh_notice_dismissed = true,
+            Message::JshInstall => self.install_or_update_jsh(),
+            Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
             Message::AgentClose => self.agent.close(),
             Message::AgentInput(value) => self.agent.input = value,
             Message::AgentSubmit => {
@@ -6028,14 +6028,14 @@ impl Jterm {
             .into()
     }
 
-    /// One-line offer to install or update rsh, shown under the tab bar only
+    /// One-line offer to install or update jsh, shown under the tab bar only
     /// while the background check has something actionable and the user has not
     /// waved it away.
-    fn rsh_notice(&self) -> Option<Element<'_, Message>> {
-        if self.rsh_notice_dismissed {
+    fn jsh_notice(&self) -> Option<Element<'_, Message>> {
+        if self.jsh_notice_dismissed {
             return None;
         }
-        let prompt = self.rsh_prompt.as_ref()?;
+        let prompt = self.jsh_prompt.as_ref()?;
         let dim = self.c_text_dim();
         let bar = row![
             text(prompt.banner_title())
@@ -6043,11 +6043,11 @@ impl Jterm {
                 .style(move |_t: &iced::Theme| text::Style { color: Some(dim) }),
             Space::new().width(Length::Fill),
             button(text(prompt.button_label()).size(12))
-                .on_press(Message::RshInstall)
+                .on_press(Message::JshInstall)
                 .padding([3, 9])
                 .style(self.ghost_btn_style()),
             button(text("×").size(12))
-                .on_press(Message::RshNoticeDismiss)
+                .on_press(Message::JshNoticeDismiss)
                 .padding([3, 9])
                 .style(self.ghost_btn_style()),
         ]
@@ -6842,9 +6842,9 @@ impl Jterm {
         };
         // The top bar is always present: in Top mode it holds the tab strip; in
         // Side mode it holds the dock toggle so chrome never overlaps the grid.
-        // The rsh notice, when there is one, sits directly under it.
+        // The jsh notice, when there is one, sits directly under it.
         let mut chrome = column![self.tab_bar()];
-        if let Some(notice) = self.rsh_notice() {
+        if let Some(notice) = self.jsh_notice() {
             chrome = chrome.push(notice);
         }
         let root: Element<'_, Message> = chrome

@@ -5,7 +5,7 @@ use std::os::unix::io::RawFd;
 const TERM_PROGRAM_NAME: &str = "jterm3";
 const TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VTE_VERSION: &str = "7802";
-const DEFAULT_SHELL_NAME: &str = "rsh";
+const DEFAULT_SHELL_NAME: &str = "jsh";
 const DEFAULT_LS_COLORS: &str = concat!(
     "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:",
     "do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:",
@@ -30,10 +30,10 @@ mod unix_pty {
     // Most importantly, this bounds the synchronous fork-to-exec handshake.
     const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
-    // Identifying the `rsh` on PATH runs once per process and blocks the first
+    // Identifying the `jsh` on PATH runs once per process and blocks the first
     // PTY spawn, so keep the window short: our own shell answers `--version`
     // immediately, and anything slower is not worth waiting on.
-    const RSH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+    const JSH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[derive(Clone, Copy)]
     #[repr(i32)]
@@ -367,43 +367,48 @@ mod unix_pty {
             .map(|p| p.to_string_lossy().to_string())
     }
 
-    /// jterm3 prefers its companion shell `rsh`, but that name collides with the
-    /// classic BSD remote shell: on Debian-family systems `/usr/bin/rsh` is an
-    /// alternatives symlink that usually resolves to `ssh`. Exec'ing that as the
-    /// login shell only prints a usage line and exits, which closes the sole tab
-    /// and quits jterm3 the instant it starts. Accept a PATH hit only when it
-    /// still resolves to a binary named `rsh` and identifies itself.
-    fn find_jterm_rsh() -> Option<String> {
+    /// jterm3 prefers its companion shell `jsh`, but a PATH hit on that name is
+    /// not proof: the name can be taken by an unrelated binary or point
+    /// elsewhere through a symlink. Exec'ing such a program as the login shell
+    /// only prints a usage line and exits, which closes the sole tab and quits
+    /// jterm3 the instant it starts. Accept a PATH hit only when it still
+    /// resolves to a binary named `jsh` and identifies itself by banner.
+    ///
+    /// (The shell was called `rsh` until 0.3, when the name really did collide
+    /// with the BSD remote shell. The rename removed that collision; the check
+    /// stays because only the banner proves what we are about to exec.)
+    fn find_jterm_jsh() -> Option<String> {
         static RESOLVED: OnceLock<Option<String>> = OnceLock::new();
         RESOLVED
             .get_or_init(|| {
                 let candidate = find_executable_in_path(DEFAULT_SHELL_NAME)?;
-                if is_jterm_rsh(Path::new(&candidate)) {
+                if is_jterm_jsh(Path::new(&candidate)) {
                     return Some(candidate);
                 }
                 eprintln!(
-                    "[PTY] '{candidate}' is not jterm3's rsh shell (most likely the BSD \
-                     remote shell), falling back to the login shell"
+                    "[PTY] '{candidate}' is not jterm3's jsh shell (it does not identify \
+                     itself as one), falling back to the login shell"
                 );
                 None
             })
             .clone()
     }
 
-    pub(crate) fn is_jterm_rsh(path: &Path) -> bool {
-        // An alternatives symlink pointing at ssh or netkit-rsh is rejected
-        // without spawning anything.
+    pub(crate) fn is_jterm_jsh(path: &Path) -> bool {
+        // A symlink pointing at some other program is rejected on the basename
+        // alone, without spawning anything.
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if resolved.file_name().and_then(|name| name.to_str()) != Some(DEFAULT_SHELL_NAME) {
             return false;
         }
-        rsh_version_banner(path).is_some_and(|banner| banner.starts_with("rsh "))
+        jsh_version_banner(path).is_some_and(|banner| banner.starts_with("jsh "))
     }
 
-    /// Run `<path> --version` under a short deadline. A remote shell answers a
-    /// usage error, and anything that instead waits on the network (or on stdin,
-    /// which is /dev/null here) is killed and treated as "not our shell".
-    fn rsh_version_banner(path: &Path) -> Option<String> {
+    /// Run `<path> --version` under a short deadline. An impostor typically
+    /// answers a usage error, and anything that instead waits on the network (or
+    /// on stdin, which is /dev/null here) is killed and treated as "not our
+    /// shell".
+    fn jsh_version_banner(path: &Path) -> Option<String> {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
@@ -414,7 +419,7 @@ mod unix_pty {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        let deadline = Instant::now() + RSH_PROBE_TIMEOUT;
+        let deadline = Instant::now() + JSH_PROBE_TIMEOUT;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
@@ -478,11 +483,11 @@ mod unix_pty {
             );
         }
 
-        // Priority 2: rsh is jterm3's preferred shell. It gets a session id
+        // Priority 2: jsh is jterm3's preferred shell. It gets a session id
         // argv below when one is available, while still letting users override
         // it through config.shell.
-        if let Some(rsh_path) = find_jterm_rsh() {
-            return rsh_path;
+        if let Some(jsh_path) = find_jterm_jsh() {
+            return jsh_path;
         }
 
         // Priority 3: the user's login shell, matching VTE terminals such as
@@ -520,7 +525,7 @@ mod unix_pty {
         }
 
         /// `command_argv` replaces the interactive shell with an explicit argv,
-        /// for one-shot helper sessions such as the rsh installer.
+        /// for one-shot helper sessions such as the jsh installer.
         pub fn new_with_cwd(
             cols: usize,
             rows: usize,
@@ -630,13 +635,13 @@ mod unix_pty {
                 };
                 let session_flag = CString::new("--session").unwrap();
                 let session_id_cstr = session_id.and_then(|s| CString::new(s).ok());
-                let bash_path = if shell_name == "rsh" {
+                let bash_path = if shell_name == "jsh" {
                     find_executable_in_path("bash").filter(|p| is_executable(Path::new(p)))
                 } else {
                     None
                 };
 
-                // A one-shot helper (for example the rsh installer) is exec'd
+                // A one-shot helper (for example the jsh installer) is exec'd
                 // exactly as given: no login-shell wrapping, no --session.
                 let command_cstrings: Option<(CString, Vec<CString>)> = match command_argv {
                     Some(argv) => {
@@ -660,9 +665,9 @@ mod unix_pty {
                 let (exec_cstr, argv_cstrings): (CString, Vec<CString>) =
                     if let Some(command) = command_cstrings {
                         command
-                    } else if let ("rsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
+                    } else if let ("jsh", Some(bash_path)) = (shell_name.as_str(), bash_path) {
                         let exec_cmd =
-                            jterm_core::process::build_rsh_exec_command(&shell_path, session_id);
+                            jterm_core::process::build_jsh_exec_command(&shell_path, session_id);
                         (
                             cstr_or_bail!(bash_path, "bash path contains NUL"),
                             vec![
@@ -676,7 +681,7 @@ mod unix_pty {
                         if let Some(ref arg) = login_arg {
                             argv.push(arg.clone());
                         }
-                        if shell_name == "rsh" {
+                        if shell_name == "jsh" {
                             if let Some(ref sid) = session_id_cstr {
                                 argv.push(session_flag.clone());
                                 argv.push(sid.clone());
@@ -1299,49 +1304,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ssh_masquerading_as_rsh_is_not_taken_for_the_jterm_shell() {
+    fn ssh_masquerading_as_jsh_is_not_taken_for_the_jterm_shell() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("jterm3-rsh-probe-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("jterm3-jsh-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create probe dir");
 
-        // Stands in for /usr/bin/rsh -> /usr/bin/ssh: right name, wrong binary.
+        // A `jsh` on PATH that is really ssh: right name, wrong binary.
         let ssh_like = dir.join("ssh");
         std::fs::write(&ssh_like, b"#!/bin/sh\necho 'usage: ssh' >&2\nexit 255\n")
             .expect("write ssh stand-in");
         std::fs::set_permissions(&ssh_like, std::fs::Permissions::from_mode(0o700))
             .expect("make ssh stand-in executable");
-        let alternatives_link = dir.join("rsh");
+        let alternatives_link = dir.join("jsh");
         let _ = std::fs::remove_file(&alternatives_link);
-        std::os::unix::fs::symlink(&ssh_like, &alternatives_link).expect("link rsh -> ssh");
-        assert!(!super::unix_pty::is_jterm_rsh(&alternatives_link));
+        std::os::unix::fs::symlink(&ssh_like, &alternatives_link).expect("link jsh -> ssh");
+        assert!(!super::unix_pty::is_jterm_jsh(&alternatives_link));
 
-        // A real rsh answers `--version` with its own banner.
-        let real = dir.join("real").join("rsh");
-        std::fs::create_dir_all(real.parent().expect("parent")).expect("create rsh dir");
-        std::fs::write(&real, b"#!/bin/sh\necho 'rsh 0.1.0'\n").expect("write rsh stand-in");
+        // A real jsh answers `--version` with its own banner.
+        let real = dir.join("real").join("jsh");
+        std::fs::create_dir_all(real.parent().expect("parent")).expect("create jsh dir");
+        std::fs::write(&real, b"#!/bin/sh\necho 'jsh 0.1.0'\n").expect("write jsh stand-in");
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
-            .expect("make rsh stand-in executable");
+            .expect("make jsh stand-in executable");
         // Retry briefly: a sibling test that forks while this file is still
         // open for writing makes the exec fail with ETXTBSY until that child
         // execs and drops the inherited descriptor.
         let mut identified = false;
         for _ in 0..50 {
-            if super::unix_pty::is_jterm_rsh(&real) {
+            if super::unix_pty::is_jterm_jsh(&real) {
                 identified = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(identified, "a real rsh banner must identify the shell");
+        assert!(identified, "a real jsh banner must identify the shell");
 
-        // Named rsh, but silent about `--version`: not ours either.
-        let mute = dir.join("mute").join("rsh");
+        // Named jsh, but silent about `--version`: not ours either.
+        let mute = dir.join("mute").join("jsh");
         std::fs::create_dir_all(mute.parent().expect("parent")).expect("create mute dir");
         std::fs::write(&mute, b"#!/bin/sh\nexit 2\n").expect("write mute stand-in");
         std::fs::set_permissions(&mute, std::fs::Permissions::from_mode(0o700))
             .expect("make mute stand-in executable");
-        assert!(!super::unix_pty::is_jterm_rsh(&mute));
+        assert!(!super::unix_pty::is_jterm_jsh(&mute));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1396,7 +1401,7 @@ mod tests {
         );
     }
 
-    /// The one-shot helper path (rsh installer) must exec the given argv
+    /// The one-shot helper path (jsh installer) must exec the given argv
     /// verbatim: no login-shell wrapping, no --session injection.
     #[cfg(unix)]
     #[test]

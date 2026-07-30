@@ -1023,7 +1023,7 @@ pub struct TerminalState {
     /// Commands finished per OSC 133 `D`, with their text reconstructed from
     /// the buffer. Bounded; drained by the AI agent panel each PTY batch.
     pub pending_completed_commands: std::collections::VecDeque<CompletedCommand>,
-    /// rsh execution id announced by the most recent OSC 133 params.
+    /// jsh execution id announced by the most recent OSC 133 params.
     current_command_id: Option<String>,
     /// When the currently executing command began (OSC 133 `C`), so the
     /// finished record can carry a wall-clock duration.
@@ -1038,7 +1038,7 @@ pub struct CompletedCommand {
     pub command: String,
     pub exit_code: Option<i32>,
     pub output: String,
-    /// rsh correlation id from an OSC 133 `id=`/`execution_id=` param.
+    /// jsh correlation id from an OSC 133 `id=`/`execution_id=` param.
     pub id: Option<String>,
     /// Whether the shell reported an output region for this command.
     pub output_available: bool,
@@ -1375,10 +1375,10 @@ impl TerminalState {
         const MAX_EXECUTION_ID_BYTES: usize = 192;
         let absolute_row = self.scrollback.len() + self.cursor_row;
         let mark = value.chars().next().unwrap_or('\0');
-        // rsh correlation metadata rides on any mark as `key=value` params.
+        // jsh correlation metadata rides on any mark as `key=value` params.
         for part in value.split(';').skip(1) {
             if let Some((key, id)) = part.split_once('=') {
-                if matches!(key, "id" | "rsh_id" | "execution_id" | "command_id")
+                if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id")
                     && !id.is_empty()
                     && id.len() <= MAX_EXECUTION_ID_BYTES
                 {
@@ -1411,7 +1411,7 @@ impl TerminalState {
             }
             'D' => {
                 // Command finished. Exit code arrives positionally (`D;0`) or
-                // as an rsh-style `exit=`/`exit_code=` param.
+                // as an jsh-style `exit=`/`exit_code=` param.
                 let exit_code =
                     value
                         .split(';')
@@ -5201,14 +5201,14 @@ mod tests {
     #[test]
     fn osc_133_id_params_correlate_completed_commands() {
         let mut terminal = super::TerminalState::new(40, 8);
-        terminal.process_input(b"\x1b]133;A;id=rsh-abc.123\x07$ ");
+        terminal.process_input(b"\x1b]133;A;id=jsh-abc.123\x07$ ");
         terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
         terminal.process_input(b"\x1b]133;C\x07hi\r\n");
         terminal.process_input(b"\x1b]133;D;0\x07");
 
         let completed = terminal.take_completed_commands();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].id.as_deref(), Some("rsh-abc.123"));
+        assert_eq!(completed[0].id.as_deref(), Some("jsh-abc.123"));
         assert!(completed[0].output_available);
         assert!(!completed[0].truncated);
         assert_eq!(completed[0].total_bytes, completed[0].output.len());
