@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=jterm3
+GenericName=Terminal Emulator
+Comment=Fast, GPU-rendered terminal emulator built with iced
+Exec=jterm3
+TryExec=jterm3
+Icon=io.github.beamiter.jterm3
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;command;developer;gpu;iced;
+StartupNotify=true
+# Measured with xprop, not assumed: iced feeds window::Settings'
+# platform_specific.application_id to winit as both the X11 WM_CLASS pair and
+# the Wayland app_id, so the two stay in sync with this value.
+StartupWMClass=io.github.beamiter.jterm3
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=jterm3

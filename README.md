@@ -40,7 +40,44 @@ cargo build --release --locked
 ./target/release/jterm3
 ```
 
-如需安装到当前用户：
+## 安装（含桌面集成）
+
+```bash
+./scripts/install.sh              # 构建并安装二进制 + 启动器条目
+./scripts/install.sh --dry-run    # 只打印将要执行的命令，不改动文件
+./scripts/install.sh --no-desktop # 只装二进制
+./scripts/uninstall.sh            # 一并移除；配置与历史保留
+```
+
+默认装到 `~/.local`（可用 `--prefix` / `--bin-dir` 覆盖，打包场景用 `DESTDIR`）：
+
+| 内容 | 位置 |
+| --- | --- |
+| 二进制 | `~/.local/bin/jterm3` |
+| 启动器条目 | `~/.local/share/applications/io.github.beamiter.jterm3.desktop` |
+| 图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.jterm3.*` |
+| AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.jterm3.metainfo.xml` |
+
+这套桌面集成才让 jterm3 出现在 GNOME/KDE 的应用列表里，可搜索、可点击启动、可固定到
+dock。有三个细节决定它到底显不显示，安装脚本都已处理：
+
+- `Exec=` / `TryExec=` 会被改写成二进制的绝对路径（`/usr` 这类系统 prefix 保留相对
+  形式以便重定位）。桌面会话的 `PATH` 在登录时就固定了，若 `~/.local/bin` 不在其中，
+  `TryExec=jterm3` 会失败并让条目**整个从应用列表消失**。
+- 安装与卸载后都会刷新 `update-desktop-database` 和 `gtk-update-icon-cache`；陈旧的
+  图标缓存会盖住刚装进去的图标。`DESTDIR` 打包时跳过，交给包管理器处理。
+- `StartupWMClass` 为 `io.github.beamiter.jterm3`，与窗口真实的 `WM_CLASS` 一致。
+  iced 把 `window::Settings` 里的 `platform_specific.application_id` 同时用作 X11
+  `WM_CLASS` 与 Wayland app_id；不设置时两者都是空字符串，桌面环境无法把窗口关联到
+  条目，dock 里只会出现一个没有图标、无法固定的窗口。
+
+窗口本身也带图标：`data/io.github.beamiter.jterm3-128.png` 内嵌进二进制并在启动时交给
+winit，因此即便直接 `cargo run`、或条目还没安装，`_NET_WM_ICON` 也是设好的——启动器条目
+只能覆盖桌面环境能关联上的窗口。
+
+可用 `desktop-file-validate <条目>` 与 `gtk-launch io.github.beamiter.jterm3` 自检。
+
+也可以只手动安装二进制：
 
 ```bash
 install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
@@ -199,3 +236,9 @@ cargo build --release --all-features --locked
 CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛。
 
 调试构建可设置 `JTERM3_DEBUG=1` 输出有界的协议字节预览。
+
+## 许可证
+
+jterm3 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；完整文本见
+[`LICENSE-MIT`](LICENSE-MIT) 与 [`LICENSE-APACHE`](LICENSE-APACHE)。向本仓库提交
+贡献即表示贡献者同意按相同的双许可证条款授权该贡献。

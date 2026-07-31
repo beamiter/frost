@@ -6,6 +6,7 @@ description = "A fast, GPU-rendered Linux terminal emulator built with Rust and 
 repository = "https://github.com/beamiter/jterm3"
 homepage = "https://github.com/beamiter/jterm3"
 readme = "README.md"
+license = "MIT OR Apache-2.0"
 keywords = ["terminal", "terminal-emulator", "iced", "gpu", "linux"]
 categories = ["command-line-utilities"]
 

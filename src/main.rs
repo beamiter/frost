@@ -39,6 +39,15 @@ use terminal::{TerminalCell, TerminalState};
 use terminal_view::{KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
 use theme::Theme;
 
+/// Must stay equal to the installed entry's basename
+/// (`data/io.github.beamiter.jterm3.desktop`): the desktop shell pairs a window
+/// with its launcher entry through this id.
+const WINDOW_APP_ID: &str = "io.github.beamiter.jterm3";
+
+/// The same artwork the installer puts in the icon theme, embedded so a window
+/// carries its icon even when the .desktop entry is not installed.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.jterm3-128.png");
+
 /// Height reserved for the tab bar at the top of the window.
 const TAB_BAR_H: f32 = 30.0;
 /// Height reserved for the status bar at the bottom of the window.
@@ -526,6 +535,29 @@ fn main() -> iced::Result {
     let config = config_load.config;
     let win = iced::window::Settings {
         size: Size::new(config.initial_width, config.initial_height),
+        // Without this the window ships an empty WM_CLASS/app_id, so neither
+        // X11 nor Wayland can tie it to the installed .desktop entry: the shell
+        // shows an unbranded window that cannot be pinned. iced feeds this to
+        // winit as both the X11 WM_CLASS pair and the Wayland app_id.
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: WINDOW_APP_ID.to_string(),
+            ..Default::default()
+        },
+        // The .desktop entry only covers windows the shell can match to it.
+        // Without an icon of its own the window has no _NET_WM_ICON at all, so
+        // anything else — a bare `cargo run`, a session where the entry is not
+        // installed — falls back to a blank placeholder in the dock and the
+        // window switcher.
+        icon: match iced::window::icon::from_file_data(
+            WINDOW_ICON_PNG,
+            Some(image::ImageFormat::Png),
+        ) {
+            Ok(icon) => Some(icon),
+            Err(err) => {
+                log::warn!("Failed to decode the embedded window icon: {err}");
+                None
+            }
+        },
         // Route window-manager close requests through our foreground-job guard.
         exit_on_close_request: false,
         // Draw our own title bar. GNOME and other wlroots-style compositors
