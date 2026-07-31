@@ -34,6 +34,8 @@ pub enum PaletteAction {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    OpacityIncrease,
+    OpacityDecrease,
     ScrollToTop,
     ScrollToBottom,
     PromptJumpPrev,
@@ -250,6 +252,18 @@ impl PaletteState {
                 description: "Restore the configured terminal font size",
                 shortcut: "Ctrl+0",
                 action: PaletteAction::ZoomReset,
+            },
+            PaletteItem {
+                name: "Increase Opacity",
+                description: "Make the window background more opaque",
+                shortcut: "Ctrl+Alt+=",
+                action: PaletteAction::OpacityIncrease,
+            },
+            PaletteItem {
+                name: "Decrease Opacity",
+                description: "Make the window background more transparent",
+                shortcut: "Ctrl+Alt+-",
+                action: PaletteAction::OpacityDecrease,
             },
             PaletteItem {
                 name: "Scroll to Top",

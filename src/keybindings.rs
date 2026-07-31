@@ -68,6 +68,10 @@ pub enum Command {
     FontZoomIn,
     FontZoomOut,
     FontZoomReset,
+
+    // === 窗口透明度 ===
+    OpacityIncrease,
+    OpacityDecrease,
 }
 
 impl std::fmt::Display for Command {
@@ -120,6 +124,8 @@ impl std::fmt::Display for Command {
             Command::FontZoomIn => write!(f, "font:zoom_in"),
             Command::FontZoomOut => write!(f, "font:zoom_out"),
             Command::FontZoomReset => write!(f, "font:zoom_reset"),
+            Command::OpacityIncrease => write!(f, "opacity:increase"),
+            Command::OpacityDecrease => write!(f, "opacity:decrease"),
         }
     }
 }
@@ -175,6 +181,8 @@ impl std::str::FromStr for Command {
             "font:zoom_in" => Ok(Command::FontZoomIn),
             "font:zoom_out" => Ok(Command::FontZoomOut),
             "font:zoom_reset" => Ok(Command::FontZoomReset),
+            "opacity:increase" => Ok(Command::OpacityIncrease),
+            "opacity:decrease" => Ok(Command::OpacityDecrease),
             s if s.starts_with("session:jump:") => {
                 let num_str = &s[13..];
                 let num = num_str
@@ -374,6 +382,14 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+0".to_string(), "font:zoom_reset".to_string());
+
+        // 窗口透明度实时调节，与 jterm1/jterm4 相同的键位。
+        bindings
+            .bindings
+            .insert("ctrl+alt+=".to_string(), "opacity:increase".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+alt+-".to_string(), "opacity:decrease".to_string());
 
         bindings
     }

@@ -108,6 +108,7 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 文件/标签侧栏 | `Ctrl+\` |
 | 设置 | `Ctrl+Shift+O` |
 | 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| 窗口透明度增 / 减 | `Ctrl+Alt+=` / `Ctrl+Alt+-`（写回配置 `opacity`，设置面板也有滑块） |
 
 快捷键从 `$XDG_CONFIG_HOME/jterm3/keybindings.toml`（通常是 `~/.config/jterm3/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
 
@@ -121,6 +122,7 @@ font_size = 14.0
 line_spacing = 1.0
 padding = 2.0
 ui_scale = 1.0
+opacity = 1.0        # 窗口背景透明度 0.05–1.0，Ctrl+Alt+=/- 实时调节
 scrollback_lines = 20000
 scroll_speed = 3
 theme = "tokyo-night"

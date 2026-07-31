@@ -179,6 +179,10 @@ pub struct TermWidget<'a, Message> {
     /// Current phase of the blink clock: when false, cells with the blink
     /// attribute hide their glyph (drawn as background only).
     blink_on: bool,
+    /// Window background opacity (0.05..=1.0). Below 1.0 the widget's own
+    /// default-background fill is skipped so the translucent app background
+    /// shows through; non-default cell backgrounds stay opaque, like jterm2.
+    opacity: f32,
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
@@ -231,7 +235,15 @@ impl<'a, Message> TermWidget<'a, Message> {
             scrollbar_always: true,
             preedit: None,
             blink_on: true,
+            opacity: 1.0,
         }
+    }
+
+    /// Set the window background opacity applied to the widget's default
+    /// background fill.
+    pub fn opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity;
+        self
     }
 
     /// Set the blink clock phase (true = glyphs visible).
@@ -836,8 +848,22 @@ where
             .map(|(r, g, b)| Color::from_rgb8(r, g, b))
             .unwrap_or_else(|| self.theme.terminal_background());
 
-        // Whole-widget background.
-        renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
+        // Whole-widget background. At full opacity this is the classic opaque
+        // fill. Below 1.0 the app-level style already clears the surface with
+        // the translucent theme background, so repainting it here would stack
+        // two alpha layers and defeat the transparency; only a per-pane OSC 11
+        // override still needs its own (equally translucent) fill.
+        if self.opacity >= 1.0 {
+            renderer.fill_quad(solid_quad(bounds), Background::Color(default_bg));
+        } else if self.dynamic_bg.is_some() {
+            renderer.fill_quad(
+                solid_quad(bounds),
+                Background::Color(Color {
+                    a: self.opacity,
+                    ..default_bg
+                }),
+            );
+        }
 
         // Bucket links by visible row so the per-cell hit test scans only the
         // links on that row instead of the whole list. Skipped entirely (no

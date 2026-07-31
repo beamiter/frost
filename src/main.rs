@@ -560,6 +560,10 @@ fn main() -> iced::Result {
         },
         // Route window-manager close requests through our foreground-job guard.
         exit_on_close_request: false,
+        // Ask for an alpha-capable surface so the configured background opacity
+        // (config `opacity`, Ctrl+Alt+=/-) can actually show the desktop
+        // through the window, matching the rest of the jterm family.
+        transparent: true,
         // Draw our own title bar. GNOME and other wlroots-style compositors
         // offer no server-side decorations, so winit falls back to drawing one
         // with `sctk-adwaita`, whose renderer maps the whole title through a
@@ -578,6 +582,7 @@ fn main() -> iced::Result {
     .title(Jterm::title)
     .subscription(Jterm::subscription)
     .theme(Jterm::iced_theme)
+    .style(Jterm::app_style)
     .scale_factor(Jterm::scale_factor)
     // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
     // the "manual shader clears for srgb textures" path, which flashes the whole
@@ -719,6 +724,7 @@ enum Message {
     SetUiScale(f32),
     SetLineSpacing(f32),
     SetPadding(f32),
+    SetOpacity(f32),
     SetScrollback(u32),
     SetScrollSpeed(u32),
     SetFontFamily(String),
@@ -1480,6 +1486,28 @@ impl Jterm {
         )
     }
 
+    /// Application-level surface style. With `transparent: true` on the window
+    /// this is the layer that makes the configured background opacity real:
+    /// the whole surface is cleared with the theme background at that alpha,
+    /// and the terminal widget skips its own default fill below 1.0 so the two
+    /// never stack (see `TermWidget::draw`).
+    fn app_style(&self, theme: &iced::Theme) -> iced::theme::Style {
+        let palette = theme.palette();
+        iced::theme::Style {
+            background_color: self.with_window_opacity(palette.background),
+            text_color: palette.text,
+        }
+    }
+
+    /// Scale a chrome color's alpha by the configured window opacity so tab
+    /// bar, status bar, and dock go translucent together with the terminal.
+    fn with_window_opacity(&self, color: Color) -> Color {
+        Color {
+            a: color.a * self.config.opacity,
+            ..color
+        }
+    }
+
     fn scale_factor(&self) -> f32 {
         self.config.ui_scale.unwrap_or(1.0)
     }
@@ -1551,6 +1579,23 @@ impl Jterm {
         }
         self.font_zoom = 0.0;
         self.apply_config();
+    }
+
+    /// Step the window background opacity (hotkey path). The new value is
+    /// clamped to the config range, persisted via the live-config path, and
+    /// echoed in a toast. Repeat presses update the existing opacity toast
+    /// instead of stacking a new one per step.
+    fn adjust_opacity(&mut self, delta: f32) {
+        let next = Config::clamp_opacity(self.config.opacity + delta);
+        if (next - self.config.opacity).abs() > f32::EPSILON {
+            self.config.opacity = next;
+            self.config_dirty = true;
+        }
+        self.toasts.retain(|t| !t.text.starts_with("Opacity: "));
+        self.push_toast(
+            format!("Opacity: {:.0}%", self.config.opacity * 100.0),
+            ToastKind::Info,
+        );
     }
 
     fn persist_live_config(&mut self) {
@@ -3062,6 +3107,14 @@ impl Jterm {
                 self.reset_font_size();
                 Task::none()
             }
+            C::OpacityIncrease => {
+                self.adjust_opacity(0.025);
+                Task::none()
+            }
+            C::OpacityDecrease => {
+                self.adjust_opacity(-0.025);
+                Task::none()
+            }
         };
         Some(task)
     }
@@ -3928,6 +3981,14 @@ impl Jterm {
             }
             PaletteAction::ZoomReset => {
                 self.reset_font_size();
+                Task::none()
+            }
+            PaletteAction::OpacityIncrease => {
+                self.adjust_opacity(0.025);
+                Task::none()
+            }
+            PaletteAction::OpacityDecrease => {
+                self.adjust_opacity(-0.025);
                 Task::none()
             }
             PaletteAction::ScrollToTop => {
@@ -4985,6 +5046,11 @@ impl Jterm {
                 self.config_dirty = true;
                 self.apply_config();
             }
+            Message::SetOpacity(v) => {
+                // Read directly at view/style time, so no apply_config rebuild.
+                self.config.opacity = Config::clamp_opacity(v);
+                self.config_dirty = true;
+            }
             Message::SetScrollback(v) => {
                 self.config.scrollback_lines = Config::clamp_scrollback_lines(v as usize);
                 self.config_dirty = true;
@@ -5429,7 +5495,7 @@ impl Jterm {
 
     /// Top tab bar / status bar background, matching the theme's tabbar color.
     fn chrome_bar_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
-        let bg = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let bg = self.with_window_opacity(Theme::rgb_to_color32(self.theme.tabbar.bg));
         let text = self.c_text();
         move |_| container::Style {
             text_color: Some(text),
@@ -5440,7 +5506,7 @@ impl Jterm {
 
     /// Sidebar dock background, matching the theme's panel color.
     fn panel_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
-        let bg = self.c_panel();
+        let bg = self.with_window_opacity(self.c_panel());
         let text = self.c_text();
         move |_| container::Style {
             text_color: Some(text),
@@ -6300,6 +6366,7 @@ impl Jterm {
             None
         })
         .blink_on(self.blink_on)
+        .opacity(self.config.opacity)
         .on_mouse(move |inp| Message::MousePane(sess_idx, inp))
         .into()
     }
@@ -7392,6 +7459,14 @@ impl Jterm {
                 .step(1.0_f32)
                 .into(),
         );
+        let opacity = responsive_slider_row(
+            compact,
+            "Opacity",
+            format!("{:.0}%", self.config.opacity * 100.0),
+            slider(0.05..=1.0, self.config.opacity, Message::SetOpacity)
+                .step(0.025_f32)
+                .into(),
+        );
         let scrollback = responsive_slider_row(
             compact,
             "Scrollback",
@@ -7638,6 +7713,7 @@ impl Jterm {
             ui_scale,
             line_spacing,
             padding,
+            opacity,
             scrollback,
             scroll_speed,
             scrollbar_row,
@@ -7819,6 +7895,7 @@ impl Jterm {
             section("Appearance"),
             kb("Ctrl+= / Ctrl+-", "Increase / decrease font size"),
             kb("Ctrl+0", "Reset font size"),
+            kb("Ctrl+Alt+= / Ctrl+Alt+-", "Increase / decrease window opacity"),
         ]
         .spacing(6);
 
