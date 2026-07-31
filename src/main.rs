@@ -1188,9 +1188,6 @@ struct Jterm {
     config: Config,
     theme: Theme,
     metrics: Metrics,
-    /// Ephemeral font zoom applied by Ctrl+/- and Ctrl+wheel. The configured
-    /// font size remains the durable baseline and Ctrl+0 returns to it.
-    font_zoom: f32,
     sessions: Vec<Session>,
     active: usize,
     next_id: usize,
@@ -1382,7 +1379,6 @@ impl Jterm {
             config,
             theme,
             metrics,
-            font_zoom: 0.0,
             sessions,
             active,
             next_id,
@@ -1513,7 +1509,7 @@ impl Jterm {
     }
 
     fn effective_font_size(&self) -> f32 {
-        Config::clamp_font_size(self.config.font_size + self.font_zoom)
+        Config::clamp_font_size(self.config.font_size)
     }
 
     /// Single re-apply path for live config changes (Set*, Reset, hot reload):
@@ -1563,21 +1559,27 @@ impl Jterm {
         }
     }
 
+    /// Step the terminal font size (hotkey / Ctrl+wheel path). The new value
+    /// is clamped to the config range and persisted via the live-config path.
     fn adjust_font_size(&mut self, delta: f32) {
         let current = self.effective_font_size();
         let next = Config::clamp_font_size(current + delta);
         if (next - current).abs() < f32::EPSILON {
             return;
         }
-        self.font_zoom = next - self.config.font_size;
+        self.config.font_size = next;
+        self.config_dirty = true;
         self.apply_config();
     }
 
+    /// Restore the default font size (Ctrl+0) and persist it.
     fn reset_font_size(&mut self) {
-        if self.font_zoom.abs() < f32::EPSILON {
+        let default = Config::default().font_size;
+        if (self.config.font_size - default).abs() < f32::EPSILON {
             return;
         }
-        self.font_zoom = 0.0;
+        self.config.font_size = default;
+        self.config_dirty = true;
         self.apply_config();
     }
 
@@ -5024,7 +5026,6 @@ impl Jterm {
             }
             Message::SetFontSize(v) => {
                 self.config.font_size = Config::clamp_font_size(v);
-                self.font_zoom = 0.0;
                 self.config_dirty = true;
                 self.apply_config();
             }
@@ -5208,7 +5209,6 @@ impl Jterm {
                 self.config = Config::default();
                 self.win_size =
                     logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
-                self.font_zoom = 0.0;
                 self.sync_tab_position_ui();
                 self.apply_config();
                 match self.config.save() {
@@ -7421,15 +7421,7 @@ impl Jterm {
         let font_size = responsive_slider_row(
             compact,
             "Font Size",
-            if self.font_zoom.abs() >= f32::EPSILON {
-                format!(
-                    "{:.0} (live {:.0})",
-                    self.config.font_size,
-                    self.effective_font_size()
-                )
-            } else {
-                format!("{:.0}", self.config.font_size)
-            },
+            format!("{:.0}", self.config.font_size),
             slider(8.0..=72.0, self.config.font_size, Message::SetFontSize)
                 .step(1.0_f32)
                 .into(),

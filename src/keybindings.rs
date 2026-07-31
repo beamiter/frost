@@ -272,7 +272,7 @@ impl KeyBindings {
             .insert("ctrl+pageup".to_string(), "session:prev".to_string());
 
         // Browser-style tab switching: Ctrl+1..8 address the first eight tabs,
-        // Ctrl+9 always selects the last tab, and Ctrl+0 resets font zoom.
+        // Ctrl+9 always selects the last tab, and Ctrl+0 resets the font size.
         for i in 0..8 {
             bindings
                 .bindings

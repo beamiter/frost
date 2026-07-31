@@ -249,7 +249,7 @@ impl PaletteState {
             },
             PaletteItem {
                 name: "Reset Zoom",
-                description: "Restore the configured terminal font size",
+                description: "Restore the default terminal font size",
                 shortcut: "Ctrl+0",
                 action: PaletteAction::ZoomReset,
             },
