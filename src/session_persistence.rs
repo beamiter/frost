@@ -1,14 +1,22 @@
 //! 会话持久化：记录每个标签页的工作目录与活动索引，在重启后恢复。
 //! 端口自 jterm2 `session_persistence.rs`，精简为 jterm3 实际需要的字段。
-use jterm_core::snapshot_file;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+#[cfg(test)]
+use jterm_core::snapshot_file;
 
 /// 读取快照时的上限。一份快照最多 32 个会话（`MAX_RESTORED_SESSIONS`）的 cwd
 /// 加每个标签页一棵窗格树，实测是几 KB，所以 1 MiB 留了三个数量级的余量。
 /// 有上限本身才是重点：这个文件是启动时按配置路径读进来交给 serde_json 的，
 /// 无上限的 `read_to_string` 会先把一个被撑大的文件整份读进内存，才有机会拒绝它。
 const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+pub const MAX_RESTORED_SESSIONS: usize = 32;
+const MAX_RESTORED_TABS: usize = MAX_RESTORED_SESSIONS;
+const MAX_RESTORED_PANES_PER_TAB: usize = 12;
+const MAX_RESTORED_LAYOUT_DEPTH: usize = 64;
+const MAX_RESTORED_LAYOUT_NODES: usize = 64;
+const MAX_RESTORED_CWD_BYTES: usize = 4096;
 
 /// `load` 的结果。必须把“没有快照”和“快照读不动”分开：后者的字节还在磁盘上，
 /// 而恢复失败之后几秒内定时自动保存就会覆盖同一个路径，所以调用方要先隔离。
@@ -117,7 +125,7 @@ impl SessionsSnapshot {
 
     /// 序列化为 JSON 字符串（也用于变更去重）。
     pub fn to_json(&self) -> Option<String> {
-        serde_json::to_string_pretty(self).ok()
+        self.bounded_json().ok().map(|(json, _warnings)| json)
     }
 
     /// 原子写入到文件。
@@ -127,8 +135,11 @@ impl SessionsSnapshot {
     /// 落盘，重启后读到的是一份被截断的快照。`write_atomic_private` 连带把目录
     /// 建成 0700、文件 0600 —— 快照里每个 pane 的 cwd 就是用户文件系统的地图。
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let json = serde_json::to_string_pretty(self)?;
-        snapshot_file::write_atomic_private(path, json.as_bytes())?;
+        let (json, warnings) = self.bounded_json()?;
+        for warning in warnings {
+            log::warn!("[SessionPersistence] {warning}");
+        }
+        crate::persistence::write_snapshot_atomic(path, json.as_bytes(), MAX_SNAPSHOT_BYTES)?;
         Ok(())
     }
 
@@ -137,7 +148,7 @@ impl SessionsSnapshot {
         if !path.exists() {
             return SnapshotLoad::Missing;
         }
-        let content = match snapshot_file::read_bounded(path, MAX_SNAPSHOT_BYTES) {
+        let content = match crate::persistence::read_text_bounded(path, MAX_SNAPSHOT_BYTES) {
             Ok(content) => content,
             // 和 exists() 之间存在竞争：文件刚被删掉就当成没有快照，否则调用方
             // 会去隔离一个已经不在那里的文件。
@@ -146,60 +157,205 @@ impl SessionsSnapshot {
             }
             Err(error) => return SnapshotLoad::Unreadable(error.to_string()),
         };
-        match serde_json::from_str(&content) {
-            Ok(snapshot) => SnapshotLoad::Loaded(Box::new(snapshot)),
+        match serde_json::from_str::<SessionsSnapshot>(&content) {
+            Ok(mut snapshot) if (1..=2).contains(&snapshot.version) => {
+                for warning in snapshot.sanitize() {
+                    log::warn!("[SessionPersistence] {warning}");
+                }
+                SnapshotLoad::Loaded(Box::new(snapshot))
+            }
+            Ok(snapshot) => SnapshotLoad::Unreadable(format!(
+                "unsupported session snapshot version {}",
+                snapshot.version
+            )),
             Err(error) => SnapshotLoad::Unreadable(error.to_string()),
         }
     }
+
+    fn bounded_json(&self) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+        let mut bounded = self.clone();
+        let warnings = bounded.sanitize();
+        let json = serde_json::to_string_pretty(&bounded)?;
+        if json.len() as u64 > MAX_SNAPSHOT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "bounded session snapshot is {} bytes; limit is {MAX_SNAPSHOT_BYTES}",
+                    json.len()
+                ),
+            )
+            .into());
+        }
+        Ok((json, warnings))
+    }
+
+    fn sanitize(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.sessions.len() > MAX_RESTORED_SESSIONS {
+            warnings.push(format!(
+                "restored only the first {MAX_RESTORED_SESSIONS} of {} sessions",
+                self.sessions.len()
+            ));
+            self.sessions.truncate(MAX_RESTORED_SESSIONS);
+        }
+        let mut invalid_cwds = 0usize;
+        for session in &mut self.sessions {
+            if session.cwd.as_ref().is_some_and(|cwd| {
+                cwd.len() > MAX_RESTORED_CWD_BYTES || cwd.as_bytes().contains(&0)
+            }) {
+                session.cwd = None;
+                invalid_cwds += 1;
+            }
+        }
+        if invalid_cwds > 0 {
+            warnings.push(format!(
+                "discarded {invalid_cwds} oversized or invalid working directories"
+            ));
+        }
+        if self
+            .active_index
+            .is_some_and(|index| index >= self.sessions.len())
+        {
+            self.active_index = self.sessions.len().checked_sub(1);
+            warnings.push("active session index was outside the restored list".to_string());
+        }
+
+        let original_tabs = self.tabs.len();
+        self.tabs.truncate(MAX_RESTORED_TABS);
+        self.tabs
+            .retain_mut(|tab| sanitize_tree_shape(&mut tab.tree));
+        if self.tabs.len() != original_tabs {
+            warnings.push("discarded oversized or invalid tab layouts".to_string());
+        }
+        if self
+            .tree
+            .as_mut()
+            .is_some_and(|tree| !sanitize_tree_shape(tree))
+        {
+            self.tree = None;
+            warnings.push("discarded invalid legacy pane layout".to_string());
+        }
+        if self.split.as_mut().is_some_and(|split| {
+            if !matches!(split.mode.as_str(), "vertical" | "horizontal")
+                || !(2..=MAX_RESTORED_PANES_PER_TAB).contains(&split.panes.len())
+            {
+                return true;
+            }
+            split.ratios.truncate(split.panes.len());
+            split.focused = split.focused.min(split.panes.len().saturating_sub(1));
+            false
+        }) {
+            self.split = None;
+            warnings.push("discarded invalid legacy split layout".to_string());
+        }
+        if self
+            .active_tab
+            .is_some_and(|index| index >= self.tabs.len())
+        {
+            self.active_tab = self.tabs.len().checked_sub(1);
+            warnings.push("active tab index was outside the restored list".to_string());
+        }
+        warnings
+    }
+}
+
+fn sanitize_tree_shape(tree: &mut PaneTreeSnapshot) -> bool {
+    fn visit(
+        tree: &mut PaneTreeSnapshot,
+        depth: usize,
+        nodes: &mut usize,
+        leaves: &mut usize,
+    ) -> bool {
+        if depth > MAX_RESTORED_LAYOUT_DEPTH || *nodes >= MAX_RESTORED_LAYOUT_NODES {
+            return false;
+        }
+        *nodes += 1;
+        match tree {
+            PaneTreeSnapshot::Leaf { .. } => {
+                *leaves += 1;
+                *leaves <= MAX_RESTORED_PANES_PER_TAB
+            }
+            PaneTreeSnapshot::Split {
+                axis,
+                ratios,
+                children,
+            } => {
+                if !matches!(axis.as_str(), "vertical" | "horizontal")
+                    || !(2..=MAX_RESTORED_PANES_PER_TAB).contains(&children.len())
+                {
+                    return false;
+                }
+                ratios.truncate(children.len());
+                children
+                    .iter_mut()
+                    .all(|child| visit(child, depth + 1, nodes, leaves))
+            }
+        }
+    }
+
+    visit(tree, 0, &mut 0, &mut 0)
 }
 
 /// 尝试获取单实例锁。成功返回持锁的 `File`（需在进程生命周期内持有），
 /// 失败（已有实例运行）返回 `None`。端口自 jterm2 `try_acquire_instance_lock`。
 pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
     let lock_path = dirs::config_dir()?.join("jterm3").join("instance.lock");
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    try_acquire_instance_lock_at(&lock_path)
+}
 
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        // PTY children are fork/exec'd from this process. Without CLOEXEC they
-        // inherit the flock and can make jterm3 look permanently running after
-        // the UI exits.
-        .custom_flags(libc::O_CLOEXEC)
-        .open(&lock_path)
-        .ok()?;
+fn try_acquire_instance_lock_at(lock_path: &Path) -> Option<std::fs::File> {
+    use std::io::{Seek, Write};
 
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    // LOCK_EX | LOCK_NB: 非阻塞排他锁。fd 来自有效的 File，生命周期覆盖本次调用。
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 {
-        use std::io::{Seek, Write};
-        // Truncate only after owning the lock. Opening with truncate(true)
-        // allowed a second instance to erase the first instance's PID even
-        // though its flock attempt subsequently failed.
-        let _ = file.set_len(0);
-        let mut f = &file;
-        let _ = f.seek(std::io::SeekFrom::Start(0));
-        let _ = write!(f, "{}", std::process::id());
-        Some(file)
-    } else {
-        None
+    // The old create(true) open followed a pre-positioned instance.lock
+    // symlink and later truncated its target. The shared hardened opener uses
+    // O_NOFOLLOW, 0600, owner/nlink validation and CLOEXEC before flocking.
+    let mut file = match crate::persistence::try_acquire_process_lock(lock_path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!("Cannot acquire instance lock: {error}");
+            return None;
+        }
+    };
+    // Truncate only after owning the lock. A losing second instance must not
+    // erase the first instance's diagnostic PID.
+    if let Err(error) = file
+        .set_len(0)
+        .and_then(|_| file.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|_| write!(file, "{}", std::process::id()))
+        .and_then(|_| file.sync_data())
+    {
+        log::warn!(
+            "Cannot initialize instance lock {}: {error}",
+            lock_path.display()
+        );
+        return None;
     }
+    Some(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     fn scratch(label: &str) -> std::path::PathBuf {
         let root =
             std::env::temp_dir().join(format!("jterm3-snapshot-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         root
     }
 
@@ -220,7 +376,7 @@ mod tests {
     fn a_corrupt_snapshot_is_unreadable_and_left_on_disk_for_quarantine() {
         let root = scratch("corrupt");
         let path = root.join("session_history.json");
-        std::fs::write(&path, b"{\"version\":2,\"sessions\":[{\"cwd\"").unwrap();
+        write_private(&path, b"{\"version\":2,\"sessions\":[{\"cwd\"");
 
         assert!(matches!(
             SessionsSnapshot::load(&path),
@@ -243,11 +399,10 @@ mod tests {
         let path = root.join("session_history.json");
         // Valid JSON, so only the size bound can reject it.
         let padding = "x".repeat(MAX_SNAPSHOT_BYTES as usize);
-        std::fs::write(
+        write_private(
             &path,
             format!("{{\"version\":2,\"sessions\":[],\"pad\":\"{padding}\"}}"),
-        )
-        .unwrap();
+        );
 
         assert!(matches!(
             SessionsSnapshot::load(&path),
@@ -299,6 +454,54 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_is_private_exclusive_and_never_truncated_by_a_loser() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("instance-lock");
+        let path = root.join("instance.lock");
+        let first = try_acquire_instance_lock_at(&path).expect("first owner acquires lock");
+        let pid = std::process::id().to_string();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pid);
+        assert!(
+            try_acquire_instance_lock_at(&path).is_none(),
+            "second owner must not acquire or rewrite the held lock"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pid);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(first);
+        assert!(try_acquire_instance_lock_at(&path).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_rejects_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch("instance-symlink");
+        let path = root.join("instance.lock");
+        let victim = root.join("victim.txt");
+        write_private(&victim, b"keep me");
+        symlink(&victim, &path).unwrap();
+
+        assert!(try_acquire_instance_lock_at(&path).is_none());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -381,5 +584,65 @@ mod tests {
         let split = snap.split.unwrap();
         assert_eq!(split.panes, vec![0, 1]);
         assert_eq!(split.mode, "vertical");
+    }
+
+    #[test]
+    fn restored_structure_and_cwds_are_bounded_before_spawn_or_layout_conversion() {
+        let root = scratch("sanitize");
+        let path = root.join("session_history.json");
+        let invalid_tree = PaneTreeSnapshot::Split {
+            axis: "diagonal".to_string(),
+            ratios: vec![1.0; 100],
+            children: vec![PaneTreeSnapshot::Leaf { session: 0 }; 100],
+        };
+        let snapshot = SessionsSnapshot {
+            version: 2,
+            sessions: vec![
+                SessionSnapshot {
+                    cwd: Some("x".repeat(MAX_RESTORED_CWD_BYTES + 1)),
+                };
+                MAX_RESTORED_SESSIONS + 10
+            ],
+            active_index: Some(usize::MAX),
+            split: None,
+            tree: Some(invalid_tree.clone()),
+            tabs: vec![
+                TabSnapshot {
+                    tree: invalid_tree,
+                    focus: Some(0),
+                };
+                MAX_RESTORED_TABS + 10
+            ],
+            active_tab: Some(usize::MAX),
+        };
+        write_private(&path, serde_json::to_vec(&snapshot).unwrap());
+
+        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+            panic!("bounded valid JSON should load");
+        };
+        assert_eq!(restored.sessions.len(), MAX_RESTORED_SESSIONS);
+        assert!(restored
+            .sessions
+            .iter()
+            .all(|session| session.cwd.is_none()));
+        assert_eq!(restored.active_index, Some(MAX_RESTORED_SESSIONS - 1));
+        assert!(restored.tabs.is_empty());
+        assert!(restored.tree.is_none());
+        assert!(restored.active_tab.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn future_snapshot_versions_are_preserved_as_unreadable() {
+        let root = scratch("future-version");
+        let path = root.join("session_history.json");
+        write_private(&path, br#"{"version":99,"sessions":[{"cwd":"/tmp"}]}"#);
+
+        assert!(matches!(
+            SessionsSnapshot::load(&path),
+            SnapshotLoad::Unreadable(reason) if reason.contains("unsupported")
+        ));
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

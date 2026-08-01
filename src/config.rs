@@ -1,8 +1,12 @@
+use crate::persistence::{self, AtomicWriteError, FileRevision};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_CONFIG_NAME_BYTES: usize = 256;
+const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
 
 /// A configuration load outcome keeps the usable value separate from any
 /// diagnostic. This lets the application start with safe defaults while also
@@ -11,6 +15,9 @@ use std::process::Command;
 pub struct ConfigLoad {
     pub config: Config,
     pub diagnostic: Option<String>,
+    /// Exact bytes the usable/default value was loaded against. `None` means
+    /// the file could not be inspected, so optimistic writes must stay off.
+    pub revision: Option<FileRevision>,
 }
 
 // Nerd Font priority list
@@ -527,7 +534,7 @@ impl Config {
         toml::from_str::<Config>(content).map(Self::normalized)
     }
 
-    fn normalized(mut self) -> Self {
+    pub(crate) fn normalized(mut self) -> Self {
         self.font_size = Self::clamp_font_size(self.font_size);
         self.line_spacing = Self::clamp_line_spacing(self.line_spacing);
         self.padding = Self::clamp_padding(self.padding);
@@ -550,15 +557,35 @@ impl Config {
             .ui_scale
             .filter(|value| value.is_finite())
             .map(|value| value.clamp(0.5, 4.0));
+        self.ai_max_tokens = self.ai_max_tokens.clamp(64, 32_768);
+        self.ai_temperature = self
+            .ai_temperature
+            .filter(|value| value.is_finite() && (0.0..=2.0).contains(value));
+        self.agent_max_turns = self.agent_max_turns.clamp(1, 100);
+        self.ai_provider =
+            normalized_text_or(self.ai_provider, MAX_CONFIG_NAME_BYTES, default_ai_provider);
+        self.ai_base_url = normalized_text_or(
+            self.ai_base_url,
+            MAX_CONFIG_VALUE_BYTES,
+            default_ai_base_url,
+        );
+        self.ai_model = normalized_text_or(self.ai_model, MAX_CONFIG_NAME_BYTES, default_ai_model);
+        self.ai_api_key_file =
+            normalized_optional_text(self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES);
         self.font_family = self.font_family.trim().to_string();
+        if !valid_config_text(&self.font_family, MAX_CONFIG_NAME_BYTES) {
+            self.font_family = default_font_family();
+        }
         self.theme = self.theme.trim().to_string();
-        if self.theme.is_empty() {
+        if !valid_config_text(&self.theme, MAX_CONFIG_NAME_BYTES) {
             self.theme = default_theme();
         }
-        self.shell = self
-            .shell
-            .map(|shell| shell.trim().to_string())
-            .filter(|shell| !shell.is_empty());
+        self.shell = normalized_optional_text(self.shell, MAX_CONFIG_VALUE_BYTES);
+        self.session_history_file = bounded_path(self.session_history_file);
+        self.command_history_path = bounded_path(self.command_history_path);
+        self.jsh_update_check = jterm_core::jsh_install::UpdateCheck::parse(&self.jsh_update_check)
+            .as_str()
+            .to_string();
         // Same retention bounds as jterm1/jterm4 apply to their shared index.
         self.command_history_max_entries = self.command_history_max_entries.clamp(100, 1_000_000);
         self
@@ -573,25 +600,40 @@ impl Config {
                 return ConfigLoad {
                     config: Self::default(),
                     diagnostic: Some(diagnostic),
+                    revision: None,
                 };
             }
         };
 
-        if !config_path.exists() {
+        let revision = match persistence::read_revision(&config_path, MAX_CONFIG_BYTES) {
+            Ok(revision) => revision,
+            Err(error) => {
+                let diagnostic = format!("Cannot read {}: {error}", config_path.display());
+                eprintln!("[Config] {diagnostic}");
+                return ConfigLoad {
+                    config: Self::default(),
+                    diagnostic: Some(diagnostic),
+                    revision: None,
+                };
+            }
+        };
+        if revision == FileRevision::Missing {
             eprintln!("[Config] Using default configuration");
             return ConfigLoad {
                 config: Self::default(),
                 diagnostic: None,
+                revision: Some(revision),
             };
         }
 
-        match Self::load_path(&config_path) {
+        match Self::from_revision(&config_path, &revision) {
             Ok(config) => {
                 eprintln!("[Config] Loaded from {}", config_path.display());
                 eprintln!("[Config] Font: {}", config.font_family);
                 ConfigLoad {
                     config,
                     diagnostic: None,
+                    revision: Some(revision),
                 }
             }
             Err(error) => {
@@ -599,6 +641,7 @@ impl Config {
                 ConfigLoad {
                     config: Self::default(),
                     diagnostic: Some(error),
+                    revision: Some(revision),
                 }
             }
         }
@@ -606,41 +649,79 @@ impl Config {
 
     /// Read and validate one configuration file with path-rich errors suitable
     /// for an in-app diagnostic.
+    #[cfg(test)]
     pub fn load_path(path: &std::path::Path) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path)
+        let revision = persistence::read_revision(path, MAX_CONFIG_BYTES)
             .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-        Self::from_toml(&content)
+        Self::from_revision(path, &revision)
+    }
+
+    /// Parse the exact bytes represented by a polled revision. Keeping parsing
+    /// and the revision tied to one byte buffer avoids a check/read race during
+    /// hot reload.
+    pub fn from_revision(path: &std::path::Path, revision: &FileRevision) -> Result<Self, String> {
+        let bytes = revision
+            .bytes()
+            .ok_or_else(|| format!("Cannot read {}: file does not exist", path.display()))?;
+        let content = std::str::from_utf8(bytes)
+            .map_err(|error| format!("Cannot read {} as UTF-8: {error}", path.display()))?;
+        Self::from_toml(content)
             .map_err(|error| format!("Cannot parse {}: {error}", path.display()))
     }
 
+    fn serialized(&self) -> Result<Vec<u8>, AtomicWriteError> {
+        toml::to_string_pretty(&self.clone().normalized())
+            .map(String::into_bytes)
+            .map_err(|error| AtomicWriteError::Io(format!("serialize configuration: {error}")))
+    }
+
+    fn save_path_force(
+        &self,
+        config_path: &std::path::Path,
+    ) -> Result<FileRevision, AtomicWriteError> {
+        let content = self.serialized()?;
+        persistence::write_atomic_private_force(config_path, &content, MAX_CONFIG_BYTES)
+    }
+
+    fn save_path_if_unchanged(
+        &self,
+        config_path: &std::path::Path,
+        expected: Option<&FileRevision>,
+    ) -> Result<FileRevision, AtomicWriteError> {
+        let content = self.serialized()?;
+        persistence::write_atomic_private_if_unchanged(
+            config_path,
+            &content,
+            expected,
+            MAX_CONFIG_BYTES,
+        )
+    }
+
+    /// Unconditional save retained for the explicit default-config creation
+    /// path. Interactive writes use `save_if_unchanged`; Reset is the only UI
+    /// action allowed to force replacement after a malformed/conflicting file.
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let config_path = Self::config_path()?;
-        let config_dir = config_path.parent().ok_or("Config path has no parent")?;
-
-        // Create config directory if it doesn't exist
-        std::fs::create_dir_all(config_dir)?;
-
-        // Write and fsync a sibling temporary file before the atomic rename so
-        // a crash cannot leave a half-written TOML file behind.
-        let content = toml::to_string_pretty(self)?;
-        let tmp = config_path.with_extension(format!("toml.tmp.{}", std::process::id()));
-        let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, &config_path)?;
-            Ok(())
-        })();
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        write_result?;
-        eprintln!("[Config] Saved to {}", config_path.display());
+        self.save_force_revision()?;
         Ok(())
+    }
+
+    pub fn save_force_revision(&self) -> Result<FileRevision, AtomicWriteError> {
+        let config_path = Self::config_path()
+            .map_err(|error| AtomicWriteError::Io(format!("locate configuration file: {error}")))?;
+        let revision = self.save_path_force(&config_path)?;
+        eprintln!("[Config] Saved to {}", config_path.display());
+        Ok(revision)
+    }
+
+    pub fn save_if_unchanged(
+        &self,
+        expected: Option<&FileRevision>,
+    ) -> Result<FileRevision, AtomicWriteError> {
+        let config_path = Self::config_path()
+            .map_err(|error| AtomicWriteError::Io(format!("locate configuration file: {error}")))?;
+        let revision = self.save_path_if_unchanged(&config_path, expected)?;
+        eprintln!("[Config] Saved to {}", config_path.display());
+        Ok(revision)
     }
 
     pub fn session_history_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -690,11 +771,10 @@ impl Config {
         Ok(config_dir.join("jterm3").join("config.toml"))
     }
 
-    pub fn config_mtime() -> Option<std::time::SystemTime> {
-        Self::config_path()
-            .ok()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok())
+    pub fn config_revision() -> Result<FileRevision, String> {
+        let path = Self::config_path().map_err(|error| error.to_string())?;
+        persistence::read_revision(&path, MAX_CONFIG_BYTES)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))
     }
 
     // 配置值约束方法
@@ -749,6 +829,34 @@ impl Config {
     }
 }
 
+fn valid_config_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn normalized_text_or(value: String, max_bytes: usize, fallback: fn() -> String) -> String {
+    let value = value.trim().to_string();
+    if valid_config_text(&value, max_bytes) {
+        value
+    } else {
+        fallback()
+    }
+}
+
+fn normalized_optional_text(value: Option<String>, max_bytes: usize) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| valid_config_text(value, max_bytes))
+}
+
+fn bounded_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| {
+        let value = path.to_string_lossy();
+        !value.is_empty()
+            && value.len() <= MAX_CONFIG_VALUE_BYTES
+            && !value.chars().any(char::is_control)
+    })
+}
+
 fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
     if value.is_finite() {
         value.clamp(min, max)
@@ -769,6 +877,32 @@ pub fn create_default_config() {
 mod tests {
     use super::*;
 
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("jterm3-config-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).expect("create config scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn normalization_bounds_untrusted_numeric_values() {
         let config = Config {
@@ -778,6 +912,9 @@ mod tests {
             cols: usize::MAX,
             rows: 0,
             ui_scale: Some(f32::NAN),
+            ai_max_tokens: u32::MAX,
+            ai_temperature: Some(f32::INFINITY),
+            agent_max_turns: u32::MAX,
             ..Config::default()
         };
 
@@ -789,6 +926,9 @@ mod tests {
         assert_eq!(normalized.cols, crate::terminal::MAX_TERMINAL_COLS);
         assert_eq!(normalized.rows, 1);
         assert_eq!(normalized.ui_scale, None);
+        assert_eq!(normalized.ai_max_tokens, 32_768);
+        assert_eq!(normalized.ai_temperature, None);
+        assert_eq!(normalized.agent_max_turns, 100);
     }
 
     #[test]
@@ -803,6 +943,39 @@ mod tests {
 
         assert_eq!(normalized.theme, default_theme());
         assert_eq!(normalized.shell, None);
+    }
+
+    #[test]
+    fn oversized_or_control_bearing_config_strings_never_reach_consumers() {
+        let config = Config {
+            ai_provider: "p".repeat(MAX_CONFIG_NAME_BYTES + 1),
+            ai_base_url: format!(
+                "https://example.test/{}",
+                "x".repeat(MAX_CONFIG_VALUE_BYTES)
+            ),
+            ai_model: "model\nspoof".to_string(),
+            ai_api_key_file: Some("/tmp/key\0suffix".to_string()),
+            font_family: "f".repeat(MAX_CONFIG_NAME_BYTES + 1),
+            theme: "bad\ntheme".to_string(),
+            shell: Some("/bin/sh\0--arg".to_string()),
+            session_history_file: Some(PathBuf::from("x".repeat(MAX_CONFIG_VALUE_BYTES + 1))),
+            command_history_path: Some(PathBuf::from("history\nspoof")),
+            jsh_update_check: "unexpected".to_string(),
+            ..Config::default()
+        };
+
+        let normalized = config.normalized();
+
+        assert_eq!(normalized.ai_provider, default_ai_provider());
+        assert_eq!(normalized.ai_base_url, default_ai_base_url());
+        assert_eq!(normalized.ai_model, default_ai_model());
+        assert_eq!(normalized.ai_api_key_file, None);
+        assert_eq!(normalized.font_family, default_font_family());
+        assert_eq!(normalized.theme, default_theme());
+        assert_eq!(normalized.shell, None);
+        assert_eq!(normalized.session_history_file, None);
+        assert_eq!(normalized.command_history_path, None);
+        assert_eq!(normalized.jsh_update_check, "daily");
     }
 
     #[test]
@@ -876,14 +1049,108 @@ mod tests {
 
     #[test]
     fn load_path_reports_the_path_and_parse_location() {
-        let path =
-            std::env::temp_dir().join(format!("jterm3-config-{}.toml", uuid::Uuid::new_v4()));
-        std::fs::write(&path, "font_size = [not-valid]\n").expect("write malformed config");
+        let root = ScratchDir::new("malformed");
+        let path = root.0.join("config.toml");
+        write_private(&path, "font_size = [not-valid]\n");
 
         let error = Config::load_path(&path).expect_err("malformed TOML should fail");
 
         assert!(error.contains(&path.display().to_string()));
         assert!(error.contains("font_size"));
-        std::fs::remove_file(path).expect("remove malformed config");
+    }
+
+    #[test]
+    fn concurrent_stale_revisions_allow_exactly_one_commit() {
+        let root = ScratchDir::new("conflict");
+        let path = root.0.join("config.toml");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for font_size in [17.0, 29.0] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let config = Config {
+                    font_size,
+                    ..Config::default()
+                };
+                barrier.wait();
+                (
+                    font_size,
+                    config.save_path_if_unchanged(&path, Some(&FileRevision::Missing)),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, result)| matches!(result, Err(AtomicWriteError::Conflict { .. })))
+                .count(),
+            1
+        );
+        let winner = outcomes
+            .iter()
+            .find_map(|(font_size, result)| result.as_ref().ok().map(|_| *font_size))
+            .unwrap();
+        assert_eq!(Config::load_path(&path).unwrap().font_size, winner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_private_and_never_follows_legacy_temp_or_destination_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = ScratchDir::new("symlink");
+        let path = root.0.join("config.toml");
+        let victim = root.0.join("victim.txt");
+        write_private(&victim, b"do not touch");
+
+        // The old writer opened this predictable path with truncate(true), so
+        // a pre-positioned link caused it to overwrite the link target.
+        let legacy_temp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        symlink(&victim, &legacy_temp).unwrap();
+        Config::default().save_path_force(&path).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&root.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let lock = root.0.join(".config.toml.lock");
+        std::fs::remove_file(&lock).unwrap();
+        symlink(&victim, &lock).unwrap();
+        Config::default()
+            .save_path_force(&path)
+            .expect_err("lock symlink must be rejected");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        std::fs::remove_file(&lock).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        symlink(&victim, &path).unwrap();
+        let error = Config::default()
+            .save_path_force(&path)
+            .expect_err("destination symlink must be rejected");
+        assert!(matches!(error, AtomicWriteError::UnsafeSymlink { .. }));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

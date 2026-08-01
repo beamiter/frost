@@ -13,7 +13,8 @@ categories = ["command-line-utilities"]
 [dependencies]
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
 libc = "0.2"
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", branch = "master" }
+# Pin the shared contract so a branch move cannot silently change a release build.
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "3855746e9e20a1c3658fb56a069ba6340e45935a" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"

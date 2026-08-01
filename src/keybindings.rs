@@ -1,7 +1,10 @@
 /// 快捷键可配置化系统
+use crate::persistence::{self, FileRevision};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+const MAX_KEYBINDINGS_BYTES: u64 = 256 * 1024;
 
 /// 所有可用的命令
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -238,6 +241,10 @@ pub struct KeyBindingsLoad {
     /// False when the file itself could not be read or parsed. Callers doing a
     /// live reload should retain their last-known-good table in that case.
     pub usable: bool,
+    /// Exact observed contents. Parse failures carry a revision so the same
+    /// bad bytes are diagnosed once; transient read failures leave this None
+    /// and are retried on the next tick.
+    pub revision: Option<FileRevision>,
 }
 
 impl KeyBindings {
@@ -441,19 +448,16 @@ impl KeyBindings {
             bindings,
             diagnostics,
             usable: true,
+            revision: None,
         })
     }
 
     /// Load the user file with path-rich, UI-ready diagnostics.
     pub fn load_with_diagnostics() -> KeyBindingsLoad {
-        let mut fallback = KeyBindingsLoad {
-            bindings: Self::default_bindings(),
-            diagnostics: Vec::new(),
-            usable: true,
-        };
         let path = match Self::config_path() {
             Ok(path) => path,
             Err(error) => {
+                let mut fallback = Self::fallback_load();
                 fallback
                     .diagnostics
                     .push(format!("Cannot locate keybindings config: {error}"));
@@ -461,11 +465,22 @@ impl KeyBindings {
                 return fallback;
             }
         };
-        if !path.exists() {
-            return fallback;
+        Self::load_path_with_diagnostics(&path)
+    }
+
+    fn fallback_load() -> KeyBindingsLoad {
+        KeyBindingsLoad {
+            bindings: Self::default_bindings(),
+            diagnostics: Vec::new(),
+            usable: true,
+            revision: None,
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+    }
+
+    fn load_path_with_diagnostics(path: &std::path::Path) -> KeyBindingsLoad {
+        let mut fallback = Self::fallback_load();
+        let revision = match persistence::read_revision(path, MAX_KEYBINDINGS_BYTES) {
+            Ok(revision) => revision,
             Err(error) => {
                 fallback
                     .diagnostics
@@ -474,11 +489,31 @@ impl KeyBindings {
                 return fallback;
             }
         };
-        match Self::from_toml_with_diagnostics(&content) {
+        if revision == FileRevision::Missing {
+            fallback.revision = Some(revision);
+            return fallback;
+        }
+        let content = match revision
+            .bytes()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        {
+            Some(content) => content,
+            None => {
+                fallback.diagnostics.push(format!(
+                    "Cannot parse {}: file is not valid UTF-8",
+                    path.display()
+                ));
+                fallback.usable = false;
+                fallback.revision = Some(revision);
+                return fallback;
+            }
+        };
+        match Self::from_toml_with_diagnostics(content) {
             Ok(mut loaded) => {
                 for diagnostic in &mut loaded.diagnostics {
                     *diagnostic = format!("{}: {diagnostic}", path.display());
                 }
+                loaded.revision = Some(revision);
                 loaded
             }
             Err(error) => {
@@ -486,6 +521,7 @@ impl KeyBindings {
                     .diagnostics
                     .push(format!("Cannot parse {}: {error}", path.display()));
                 fallback.usable = false;
+                fallback.revision = Some(revision);
                 fallback
             }
         }
@@ -497,11 +533,10 @@ impl KeyBindings {
         Ok(config_dir.join("jterm3/keybindings.toml"))
     }
 
-    pub fn config_mtime() -> Option<std::time::SystemTime> {
-        Self::config_path()
-            .ok()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|metadata| metadata.modified().ok())
+    pub fn config_revision() -> Result<FileRevision, String> {
+        let path = Self::config_path().map_err(|error| error.to_string())?;
+        persistence::read_revision(&path, MAX_KEYBINDINGS_BYTES)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))
     }
 }
 
@@ -515,6 +550,34 @@ impl Default for KeyBindings {
 mod tests {
     use super::*;
     use jterm_core::keybindings::{CommonAction, DEFAULT_CHORDS};
+
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "jterm3-keybindings-{label}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn test_command_parse() {
@@ -687,6 +750,40 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("Invalid shortcut")));
+    }
+
+    #[test]
+    fn failed_reload_keeps_last_known_good_and_tracks_only_observed_bytes() {
+        let root = ScratchDir::new("last-known-good");
+        let path = root.0.join("keybindings.toml");
+        write_private(&path, "\"ctrl+shift+k\" = \"session:new\"\n");
+        let loaded = KeyBindings::load_path_with_diagnostics(&path);
+        assert!(loaded.usable);
+        let good_revision = loaded.revision.clone().expect("exact valid revision");
+        let mut active = loaded.bindings;
+        assert_eq!(
+            active.get_command("ctrl+shift+k"),
+            Some(Command::SessionNew)
+        );
+
+        write_private(&path, b"not = [valid toml");
+        let failed = KeyBindings::load_path_with_diagnostics(&path);
+        assert!(!failed.usable);
+        assert_ne!(failed.revision.as_ref(), Some(&good_revision));
+        if failed.usable {
+            active = failed.bindings;
+        }
+        assert_eq!(
+            active.get_command("ctrl+shift+k"),
+            Some(Command::SessionNew),
+            "a parse failure must not replace the live table with defaults"
+        );
+
+        // A transient/non-regular read has no revision, so the polling layer
+        // will retry instead of mistaking the failure for a successful load.
+        let unreadable = KeyBindings::load_path_with_diagnostics(&root.0);
+        assert!(!unreadable.usable);
+        assert!(unreadable.revision.is_none());
     }
 
     #[test]

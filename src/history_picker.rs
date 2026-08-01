@@ -14,24 +14,41 @@ pub const PICKER_MAX_ENTRIES: usize = 2_000;
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更早的命令通过输入查询来召回。
 pub const MAX_RESULTS: usize = 15;
+const MAX_HISTORY_CWD_BYTES: usize = 4 * 1024;
 
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
 /// 多行命令）——家族的 review-only 历史格式拒绝控制字符，这类文本也无法
 /// 安全地回填到提示符。
 pub fn sanitized_command(command: &str) -> Option<&str> {
-    let trimmed = command.trim();
-    jterm_core::review_input::validate(trimmed).ok()
+    let trimmed = command.trim_matches(' ');
+    crate::review_text::validate_single_line(trimmed, crate::review_text::MAX_HISTORY_COMMAND_BYTES)
+        .ok()
+}
+
+pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
+    if cwd.len() > MAX_HISTORY_CWD_BYTES
+        || cwd.chars().any(char::is_control)
+        || crate::review_text::contains_visual_spoofing(cwd)
+    {
+        None
+    } else {
+        Some(cwd)
+    }
 }
 
 /// 行展示的单行截断（按字符计，避免超长命令把浮层撑成多行）。只影响显示；
 /// 回填到提示符的始终是完整命令文本。
 pub fn display_command(command: &str) -> String {
     const MAX_DISPLAY_CHARS: usize = 120;
-    if command.chars().count() <= MAX_DISPLAY_CHARS {
-        return command.to_string();
+    if command.len() > crate::review_text::MAX_HISTORY_COMMAND_BYTES {
+        return "(command omitted: exceeds review limit)".to_string();
     }
-    let mut shortened: String = command.chars().take(MAX_DISPLAY_CHARS - 1).collect();
+    let visible = crate::review_text::visible_bounded(command, 4 * 1024);
+    if visible.chars().count() <= MAX_DISPLAY_CHARS {
+        return visible;
+    }
+    let mut shortened: String = visible.chars().take(MAX_DISPLAY_CHARS - 1).collect();
     shortened.push('…');
     shortened
 }
@@ -47,7 +64,23 @@ pub struct HistoryPickerState {
 }
 
 impl HistoryPickerState {
-    pub fn new(entries: Vec<CommandHistoryRecord>) -> Self {
+    pub fn new(mut entries: Vec<CommandHistoryRecord>) -> Self {
+        entries.retain_mut(|record| {
+            let Some(command) = sanitized_command(&record.command) else {
+                return false;
+            };
+            if command.len() != record.command.len() {
+                record.command = command.to_string();
+            }
+            if record
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| sanitized_cwd(cwd).is_none())
+            {
+                record.cwd = None;
+            }
+            true
+        });
         Self {
             query: String::new(),
             selected: 0,
@@ -59,7 +92,10 @@ impl HistoryPickerState {
     /// 从持久化索引加载最近的一段。读取是有界的（文件尾部窗口 + 条数上限），
     /// 文件缺失或损坏时得到一个空的选择器而不是错误。
     pub fn load(path: &std::path::Path) -> Self {
-        Self::new(command_history::read_recent(path, PICKER_MAX_ENTRIES).unwrap_or_default())
+        let records = crate::persistence::prepare_command_history_path(path, false)
+            .and_then(|()| command_history::read_recent(path, PICKER_MAX_ENTRIES))
+            .unwrap_or_default();
+        Self::new(records)
     }
 
     /// 当前过滤结果（最多 [`MAX_RESULTS`] 条）。空查询保持最新在前；否则按
@@ -118,13 +154,23 @@ impl HistoryPickerState {
     pub fn selected_command(&self) -> Option<String> {
         self.filtered()
             .get(self.selected)
-            .map(|record| record.command.clone())
+            .and_then(|record| sanitized_command(&record.command))
+            .map(str::to_string)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     fn record(command: &str, cwd: Option<&str>, exit_code: i32) -> CommandHistoryRecord {
         CommandHistoryRecord {
@@ -144,6 +190,12 @@ mod tests {
         // prompt line and the family history format rejects control bytes.
         assert_eq!(sanitized_command("cat <<EOF\nhello\nEOF"), None);
         assert_eq!(sanitized_command("printf \u{7}"), None);
+        assert_eq!(sanitized_command("printf safe\u{202e}txt"), None);
+        assert_eq!(sanitized_command("echo\u{00a0}not-a-separator"), None);
+        assert_eq!(
+            sanitized_command(&"x".repeat(crate::review_text::MAX_HISTORY_COMMAND_BYTES + 1)),
+            None
+        );
     }
 
     #[test]
@@ -153,6 +205,19 @@ mod tests {
         let shown = display_command(&long);
         assert_eq!(shown.chars().count(), 120);
         assert!(shown.ends_with('…'));
+        assert_eq!(display_command("safe\u{202e}hidden"), "safe\\u{202E}hidden");
+    }
+
+    #[test]
+    fn constructor_drops_unsafe_commands_and_untrusted_cwds() {
+        let state = HistoryPickerState::new(vec![
+            record("echo safe\u{2066}hidden", Some("/tmp"), 0),
+            record("cargo test", Some("/tmp/\u{202e}spoof"), 0),
+        ]);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].command, "cargo test");
+        assert_eq!(state.entries[0].cwd, None);
+        assert_eq!(state.selected_command().as_deref(), Some("cargo test"));
     }
 
     #[test]
@@ -219,18 +284,24 @@ mod tests {
 
     #[test]
     fn load_reads_a_bounded_newest_first_slice() {
-        let path = std::env::temp_dir().join(format!(
-            "jterm3-history-picker-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("jterm3-history-picker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("create private history fixture directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("make history fixture directory private");
+        }
+        let path = root.join("history.jsonl");
         let mut contents = String::new();
         for i in 0..PICKER_MAX_ENTRIES + 10 {
             contents.push_str(&format!("{{\"command\":\"cmd-{i}\",\"exit_code\":0}}\n"));
         }
-        std::fs::write(&path, contents).expect("write history fixture");
+        write_private(&path, contents);
 
         let state = HistoryPickerState::load(&path);
-        std::fs::remove_file(&path).expect("remove history fixture");
+        std::fs::remove_dir_all(&root).expect("remove history fixture");
 
         assert_eq!(state.entries.len(), PICKER_MAX_ENTRIES);
         assert_eq!(
@@ -241,11 +312,20 @@ mod tests {
 
     #[test]
     fn load_of_a_missing_file_yields_an_empty_picker() {
-        let path = std::env::temp_dir().join(format!(
-            "jterm3-history-picker-missing-{}.jsonl",
+        let root = std::env::temp_dir().join(format!(
+            "jterm3-history-picker-missing-{}",
             uuid::Uuid::new_v4()
         ));
+        std::fs::create_dir(&root).expect("create private history fixture directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("make history fixture directory private");
+        }
+        let path = root.join("history.jsonl");
         let state = HistoryPickerState::load(&path);
+        std::fs::remove_dir_all(&root).expect("remove history fixture");
         assert!(state.filtered().is_empty());
         assert_eq!(state.selected_command(), None);
     }

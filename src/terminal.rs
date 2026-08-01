@@ -69,7 +69,7 @@ pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
 }
 
 /// 连续内存网格存储 - 优化内存局部性和缓存命中率
-/// 内存布局: cells[row * cols + col] 对应 grid[row][col]
+/// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
 #[derive(Clone)]
 pub struct TerminalGrid {
     cells: Vec<TerminalCell>,
@@ -122,7 +122,7 @@ impl TerminalGrid {
         self.rows
     }
 
-    /// 返回行数（兼容 grid[i].len()）
+    /// 返回行数（兼容 `grid[i].len()`）。
     #[inline]
     pub fn row_len(&self) -> usize {
         self.cols
@@ -136,7 +136,7 @@ impl TerminalGrid {
         self.cells[start..start + copy_len].copy_from_slice(&cells[..copy_len]);
     }
 
-    /// 获取所有行为Vec<Vec> (用于兼容旧代码)
+    /// 获取所有行为 `Vec<Vec<_>>`（用于兼容旧代码）。
     pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
         self.cells
             .chunks_exact(self.cols)
@@ -820,6 +820,63 @@ enum ZoneState {
     OutputStarted(usize, usize, usize),
 }
 
+/// Whether Agent is allowed to submit a reviewed command to this terminal.
+///
+/// `Ready` deliberately requires OSC 133's prompt-end marker. Guessing from a
+/// cursor shape or process name is not sufficient: either can also be true
+/// while a foreground program owns the PTY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPromptStatus {
+    Ready,
+    Busy,
+    InputNotEmpty,
+    UnsafeCommand,
+    ShellIntegrationUnavailable,
+}
+
+impl AgentPromptStatus {
+    pub fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+
+    pub fn blocked_message(self) -> &'static str {
+        match self {
+            Self::Ready => "Agent command is ready to run",
+            Self::Busy => "Agent command not run: the terminal is busy",
+            Self::InputNotEmpty => {
+                "Agent command not run: the prompt already contains input; use a fresh empty prompt"
+            }
+            Self::UnsafeCommand => {
+                "Agent command not run: reviewed text contains unsafe invisible or control characters"
+            }
+            Self::ShellIntegrationUnavailable => {
+                "Agent command not run: waiting for an OSC 133 shell prompt"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ArmedAgentExecution {
+    generation: u64,
+    prompt_generation: u64,
+    command: String,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveAgentExecution {
+    generation: u64,
+    execution_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedCommandMetadata {
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    execution_id: Option<String>,
+    agent_generation: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TerminalModes {
     bits: u64,
@@ -1014,6 +1071,24 @@ pub struct TerminalState {
     // OSC 133 shell integration: command zones for prompt navigation
     pub command_zones: VecDeque<CommandZone>,
     current_zone_state: ZoneState,
+    /// Exact cursor column at OSC 133 `B`, after the prompt finished drawing.
+    /// The existing zone model stores only rows for navigation; Agent needs
+    /// the column as well so prompt text cannot be mistaken for command text.
+    current_command_start_col: Option<usize>,
+    /// Furthest row on which command-line echo wrote a character after `B`.
+    /// This catches text to the right of a cursor moved backwards by readline.
+    current_command_extent_row: Option<usize>,
+    /// Once local input is accepted for this prompt, approval stays blocked
+    /// until a fresh `B`. This closes the write-before-echo race.
+    agent_prompt_input_tainted: bool,
+    /// Monotonic identity of the current OSC 133 prompt.
+    agent_prompt_generation: u64,
+    /// Reviewed command waiting for the next exact OSC 133 `C` transition.
+    armed_agent_execution: Option<ArmedAgentExecution>,
+    /// Reviewed command whose exact `C` was accepted and whose `D` is pending.
+    active_agent_execution: Option<ActiveAgentExecution>,
+    /// Exact command captured at `C`, preferring jsh's `cmdline_url` metadata.
+    current_command_text: Option<String>,
 
     // OSC 10/11/12 dynamic colors
     pub dynamic_fg: Option<(u8, u8, u8)>,
@@ -1044,6 +1119,10 @@ pub struct CompletedCommand {
     pub output: String,
     /// jsh correlation id from an OSC 133 `id=`/`execution_id=` param.
     pub id: Option<String>,
+    /// Internal, one-shot Agent approval identity. PTY output cannot choose
+    /// this value; it is attached only after an armed command exactly matches
+    /// the command captured at OSC 133 `C` (and C/D ids agree when present).
+    pub agent_generation: Option<u64>,
     /// Whether the shell reported an output region for this command.
     pub output_available: bool,
     /// The captured output hit the byte cap.
@@ -1203,6 +1282,13 @@ impl TerminalState {
             pending_osc52_clipboard_query: false,
             command_zones: VecDeque::new(),
             current_zone_state: ZoneState::default(),
+            current_command_start_col: None,
+            current_command_extent_row: None,
+            agent_prompt_input_tainted: false,
+            agent_prompt_generation: 0,
+            armed_agent_execution: None,
+            active_agent_execution: None,
+            current_command_text: None,
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor_color: None,
@@ -1376,18 +1462,198 @@ impl TerminalState {
         None
     }
 
+    fn decode_osc_metadata(value: &str, max_bytes: usize) -> Option<String> {
+        if value.len() > max_bytes.saturating_mul(3) {
+            return None;
+        }
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len().min(max_bytes));
+        let mut index = 0;
+        while index < bytes.len() {
+            if decoded.len() >= max_bytes {
+                return None;
+            }
+            if bytes[index] == b'%' {
+                let high = *bytes.get(index + 1)?;
+                let low = *bytes.get(index + 2)?;
+                let nibble = |byte: u8| match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    b'A'..=b'F' => Some(byte - b'A' + 10),
+                    _ => None,
+                };
+                decoded.push((nibble(high)? << 4) | nibble(low)?);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(decoded).ok()
+    }
+
+    /// Exact visible command input after OSC 133 `B`, excluding the prompt.
+    fn current_prompt_command_text(&self) -> Option<String> {
+        const MAX_COMMAND_BYTES: usize = 16 * 1024;
+        let ZoneState::CommandStarted(_, start_row) = self.current_zone_state else {
+            return None;
+        };
+        let start_col = self.current_command_start_col?;
+        let last_row = self
+            .current_command_extent_row
+            .unwrap_or(start_row)
+            .max(start_row);
+        let total_rows = self.scrollback.len() + self.grid.rows();
+        if start_row >= total_rows {
+            return None;
+        }
+        let last_row = last_row.min(total_rows.saturating_sub(1));
+        let mut out = String::new();
+
+        for absolute_row in start_row..=last_row {
+            let append_cells = |out: &mut String, cells: &[TerminalCell], wrapped: bool| {
+                let first_col = if absolute_row == start_row {
+                    start_col.min(cells.len())
+                } else {
+                    0
+                };
+                let mut segment: String = cells[first_col..]
+                    .iter()
+                    .filter(|cell| !cell.flags.wide_continuation())
+                    .map(|cell| cell.character)
+                    .collect();
+                if !wrapped {
+                    segment.truncate(segment.trim_end_matches(' ').len());
+                }
+                out.push_str(&segment);
+                wrapped
+            };
+
+            let wrapped = if absolute_row < self.scrollback.len() {
+                let line = &self.scrollback[absolute_row];
+                let cells = line.decompress();
+                append_cells(&mut out, &cells, line.is_wrapped)
+            } else {
+                let grid_row = absolute_row - self.scrollback.len();
+                append_cells(
+                    &mut out,
+                    &self.grid[grid_row],
+                    self.grid.row_wrapped[grid_row],
+                )
+            };
+            if out.len() >= MAX_COMMAND_BYTES {
+                return None;
+            }
+            if !wrapped && absolute_row < last_row {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    pub fn agent_prompt_status(&self) -> AgentPromptStatus {
+        match self.current_zone_state {
+            ZoneState::CommandStarted(_, _) => {
+                if self.agent_prompt_input_tainted
+                    || self
+                        .current_prompt_command_text()
+                        .is_none_or(|command| !command.is_empty())
+                {
+                    AgentPromptStatus::InputNotEmpty
+                } else {
+                    AgentPromptStatus::Ready
+                }
+            }
+            ZoneState::OutputStarted(_, _, _) => AgentPromptStatus::Busy,
+            ZoneState::Idle | ZoneState::PromptStarted(_) => {
+                AgentPromptStatus::ShellIntegrationUnavailable
+            }
+        }
+    }
+
+    /// Record accepted local input before its echo can return from the PTY.
+    /// Clearing/editing that line does not re-authorize Agent: a new OSC 133
+    /// prompt is the unambiguous reset boundary.
+    pub fn note_user_input(&mut self, input: &[u8]) {
+        if !input.is_empty() && matches!(self.current_zone_state, ZoneState::CommandStarted(_, _)) {
+            self.agent_prompt_input_tainted = true;
+        }
+    }
+
+    pub fn arm_agent_execution(
+        &mut self,
+        generation: u64,
+        command: &str,
+    ) -> Result<(), AgentPromptStatus> {
+        if crate::review_text::validate_single_line(
+            command,
+            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+        )
+        .is_err()
+        {
+            return Err(AgentPromptStatus::UnsafeCommand);
+        }
+        let status = self.agent_prompt_status();
+        if !status.is_ready() || self.armed_agent_execution.is_some() {
+            return Err(if status.is_ready() {
+                AgentPromptStatus::Busy
+            } else {
+                status
+            });
+        }
+        self.armed_agent_execution = Some(ArmedAgentExecution {
+            generation,
+            prompt_generation: self.agent_prompt_generation,
+            command: command.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn disarm_agent_execution(&mut self, generation: u64) {
+        if self
+            .armed_agent_execution
+            .as_ref()
+            .is_some_and(|armed| armed.generation == generation)
+        {
+            self.armed_agent_execution = None;
+        }
+    }
+
+    fn mark_command_echo_extent(&mut self) {
+        if matches!(self.current_zone_state, ZoneState::CommandStarted(_, _)) {
+            let absolute_row = self.scrollback.len() + self.cursor_row;
+            self.current_command_extent_row = Some(
+                self.current_command_extent_row
+                    .unwrap_or(absolute_row)
+                    .max(absolute_row),
+            );
+        }
+    }
+
     fn handle_osc_133(&mut self, value: &str) {
         const MAX_EXECUTION_ID_BYTES: usize = 192;
+        const MAX_COMMAND_METADATA_BYTES: usize = 16 * 1024;
         let absolute_row = self.scrollback.len() + self.cursor_row;
         let mark = value.chars().next().unwrap_or('\0');
-        // jsh correlation metadata rides on any mark as `key=value` params.
+        let mut mark_id = None;
+        let mut metadata_command = None;
+        // jsh correlation metadata rides on C/D as percent-encoded key/value
+        // params. Parse it per mark instead of leaving an id in global state
+        // where an unrelated later D could inherit it.
         for part in value.split(';').skip(1) {
             if let Some((key, id)) = part.split_once('=') {
-                if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id")
-                    && !id.is_empty()
-                    && id.len() <= MAX_EXECUTION_ID_BYTES
+                if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id") && !id.is_empty()
                 {
-                    self.current_command_id = Some(id.to_string());
+                    mark_id = Self::decode_osc_metadata(id, MAX_EXECUTION_ID_BYTES)
+                        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
+                } else if key == "cmdline_url" {
+                    metadata_command = Self::decode_osc_metadata(id, MAX_COMMAND_METADATA_BYTES)
+                        .filter(|command| !command.chars().any(char::is_control));
+                } else if key == "command"
+                    && id.len() <= MAX_COMMAND_METADATA_BYTES
+                    && !id.chars().any(char::is_control)
+                {
+                    metadata_command = Some(id.to_string());
                 }
             }
         }
@@ -1398,17 +1664,58 @@ impl TerminalState {
                 // into a later command's duration.
                 self.current_zone_state = ZoneState::PromptStarted(absolute_row);
                 self.current_command_started_at = None;
+                self.current_command_start_col = None;
+                self.current_command_extent_row = None;
+                self.current_command_text = None;
+                self.current_command_id = mark_id;
+                self.agent_prompt_input_tainted = false;
+                self.armed_agent_execution = None;
+                self.active_agent_execution = None;
             }
             'B' => {
                 // Command start (user is typing the command)
                 if let ZoneState::PromptStarted(prompt_start) = self.current_zone_state {
                     self.current_zone_state = ZoneState::CommandStarted(prompt_start, absolute_row);
+                    self.current_command_start_col = Some(self.cursor_col);
+                    self.current_command_extent_row = Some(absolute_row);
+                    self.current_command_text = None;
+                    if mark_id.is_some() {
+                        self.current_command_id.clone_from(&mark_id);
+                    }
+                    self.agent_prompt_input_tainted = false;
+                    self.agent_prompt_generation = self.agent_prompt_generation.wrapping_add(1);
+                    self.armed_agent_execution = None;
+                    self.active_agent_execution = None;
                 }
             }
             'C' => {
                 // Command executed (output begins)
                 if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state
                 {
+                    let captured_command = metadata_command
+                        .or_else(|| self.current_prompt_command_text())
+                        .unwrap_or_default();
+                    self.current_command_text = Some(captured_command.clone());
+                    if mark_id.is_some() {
+                        self.current_command_id.clone_from(&mark_id);
+                    }
+
+                    let matching_generation = self
+                        .armed_agent_execution
+                        .as_ref()
+                        .filter(|armed| {
+                            !self.agent_prompt_input_tainted
+                                && armed.prompt_generation == self.agent_prompt_generation
+                                && armed.command == captured_command
+                        })
+                        .map(|armed| armed.generation);
+                    if let Some(generation) = matching_generation {
+                        self.armed_agent_execution = None;
+                        self.active_agent_execution = Some(ActiveAgentExecution {
+                            generation,
+                            execution_id: mark_id.clone(),
+                        });
+                    }
                     self.current_zone_state =
                         ZoneState::OutputStarted(prompt_start, cmd_start, absolute_row);
                     self.current_command_started_at = Some(std::time::Instant::now());
@@ -1428,6 +1735,24 @@ impl TerminalState {
                             Some(_) => None,
                             None => part.trim().parse::<i32>().ok(),
                         });
+                let d_mark_id = mark_id.clone();
+                let started_id = self.current_command_id.take();
+                let finished_id = mark_id.or(started_id);
+                // Once an approved command started with a real jsh execution
+                // id, only the D carrying that same id may consume it. A fake
+                // or stale D is ignored and cannot steal the approval.
+                if self.active_agent_execution.as_ref().is_some_and(|active| {
+                    active
+                        .execution_id
+                        .as_ref()
+                        .is_some_and(|expected| d_mark_id.as_ref() != Some(expected))
+                }) {
+                    return;
+                }
+                let agent_generation = self
+                    .active_agent_execution
+                    .take()
+                    .map(|active| active.generation);
                 let duration_ms = self
                     .current_command_started_at
                     .take()
@@ -1449,8 +1774,12 @@ impl TerminalState {
                             cmd_start,
                             out_start,
                             Some((out_start, absolute_row)),
-                            exit_code,
-                            duration_ms,
+                            CompletedCommandMetadata {
+                                exit_code,
+                                duration_ms,
+                                execution_id: finished_id.clone(),
+                                agent_generation,
+                            },
                         );
                     }
                     ZoneState::CommandStarted(prompt_start, cmd_start) => {
@@ -1471,13 +1800,21 @@ impl TerminalState {
                             cmd_start,
                             absolute_row,
                             None,
-                            exit_code,
-                            None,
+                            CompletedCommandMetadata {
+                                exit_code,
+                                duration_ms: None,
+                                execution_id: finished_id,
+                                agent_generation,
+                            },
                         );
                     }
                     _ => {}
                 }
                 self.current_zone_state = ZoneState::Idle;
+                self.current_command_start_col = None;
+                self.current_command_extent_row = None;
+                self.current_command_text = None;
+                self.agent_prompt_input_tainted = false;
             }
             _ => {}
         }
@@ -1520,6 +1857,9 @@ impl TerminalState {
                 o.saturating_sub(count),
             ),
         };
+        self.current_command_extent_row = self
+            .current_command_extent_row
+            .map(|row| row.saturating_sub(count));
     }
 
     /// Absolute buffer row of every known shell prompt (OSC 133), oldest
@@ -1567,16 +1907,16 @@ impl TerminalState {
         cmd_start: usize,
         cmd_end: usize,
         output: Option<(usize, usize)>,
-        exit_code: Option<i32>,
-        duration_ms: Option<u64>,
+        metadata: CompletedCommandMetadata,
     ) {
         const MAX_COMMAND_BYTES: usize = 16 * 1024;
         const MAX_OUTPUT_BYTES: usize = 256 * 1024;
         const MAX_PENDING_COMPLETED: usize = 32;
-        let command = self
-            .rows_text(cmd_start, cmd_end, MAX_COMMAND_BYTES)
-            .trim()
-            .to_string();
+        let command = self.current_command_text.take().unwrap_or_else(|| {
+            self.rows_text(cmd_start, cmd_end, MAX_COMMAND_BYTES)
+                .trim()
+                .to_string()
+        });
         if command.is_empty() {
             return;
         }
@@ -1591,13 +1931,14 @@ impl TerminalState {
         let total_bytes = output.len();
         self.pending_completed_commands.push_back(CompletedCommand {
             command,
-            exit_code,
+            exit_code: metadata.exit_code,
             output,
-            id: self.current_command_id.take(),
+            id: metadata.execution_id,
+            agent_generation: metadata.agent_generation,
             output_available,
             truncated,
             total_bytes,
-            duration_ms,
+            duration_ms: metadata.duration_ms,
         });
     }
 
@@ -2250,6 +2591,7 @@ impl TerminalState {
         }
         // Mark the row as dirty after writing character
         self.mark_row_dirty(self.cursor_row);
+        self.mark_command_echo_extent();
     }
 
     fn put_ascii_run(&mut self, bytes: &[u8]) {
@@ -2308,6 +2650,7 @@ impl TerminalState {
             pos += chunk_len;
 
             self.mark_row_dirty(self.cursor_row);
+            self.mark_command_echo_extent();
 
             if self.cursor_col >= cols {
                 self.cursor_col = cols - 1;
@@ -3936,6 +4279,13 @@ impl TerminalState {
         self.scrollback.clear();
         self.command_zones.clear();
         self.current_zone_state = ZoneState::default();
+        self.current_command_start_col = None;
+        self.current_command_extent_row = None;
+        self.agent_prompt_input_tainted = false;
+        self.armed_agent_execution = None;
+        self.active_agent_execution = None;
+        self.current_command_text = None;
+        self.current_command_id = None;
         self.current_command_started_at = None;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
@@ -5123,6 +5473,13 @@ impl TerminalState {
         self.selection = None;
         self.command_zones.clear();
         self.current_zone_state = ZoneState::default();
+        self.current_command_start_col = None;
+        self.current_command_extent_row = None;
+        self.agent_prompt_input_tainted = false;
+        self.armed_agent_execution = None;
+        self.active_agent_execution = None;
+        self.current_command_text = None;
+        self.current_command_id = None;
         self.current_command_started_at = None;
         self.grid_version = self.grid_version.wrapping_add(1);
         self.visible_cells_cache = None;
@@ -5325,6 +5682,111 @@ mod tests {
         let completed = terminal.take_completed_commands();
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].duration_ms, None);
+    }
+
+    #[test]
+    fn agent_prompt_requires_idle_fresh_and_empty_osc_133_input() {
+        use super::AgentPromptStatus;
+
+        let mut terminal = super::TerminalState::new(40, 8);
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            AgentPromptStatus::ShellIntegrationUnavailable
+        );
+
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Ready);
+
+        // Local input blocks approval immediately, before PTY echo arrives.
+        terminal.note_user_input(b"typed but not echoed");
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            AgentPromptStatus::InputNotEmpty
+        );
+
+        // A fresh prompt clears the local-input taint, but visible command
+        // text is independently detected even without note_user_input.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07typed");
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            AgentPromptStatus::InputNotEmpty
+        );
+        terminal.process_input(b"\r\n\x1b]133;C\x07");
+        assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Busy);
+    }
+
+    #[test]
+    fn agent_arm_rejects_visual_spoofing_at_the_terminal_boundary() {
+        use super::AgentPromptStatus;
+
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            terminal.arm_agent_execution(1, "printf safe\u{202e}hidden"),
+            Err(AgentPromptStatus::UnsafeCommand)
+        );
+        assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Ready);
+    }
+
+    #[test]
+    fn agent_completion_uses_exact_command_generation_and_execution_id_once() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal
+            .arm_agent_execution(41, "ls -la")
+            .expect("fresh prompt is ready");
+        terminal
+            .process_input(b"ls -la\r\n\x1b]133;C;id=jsh-41;cmdline_url=ls%20-la\x07total 0\r\n");
+
+        // A D with a different id cannot steal the armed execution.
+        terminal.process_input(b"\x1b]133;D;0;id=spoof\x07");
+        assert!(terminal.take_completed_commands().is_empty());
+        terminal.process_input(b"\x1b]133;D;0;id=jsh-41\x07");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "ls -la");
+        assert_eq!(completed[0].id.as_deref(), Some("jsh-41"));
+        assert_eq!(completed[0].agent_generation, Some(41));
+
+        // The generation and zone were consumed by the first valid D.
+        terminal.process_input(b"\x1b]133;D;0;id=jsh-41\x07");
+        assert!(terminal.take_completed_commands().is_empty());
+    }
+
+    #[test]
+    fn agent_suffix_collision_never_receives_the_armed_generation() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal
+            .arm_agent_execution(9, "ls -la")
+            .expect("fresh prompt is ready");
+        terminal.process_input(b"echo prefix; ls -la\r\n\x1b]133;C;id=jsh-other\x07spoof\r\n");
+        terminal.process_input(b"\x1b]133;D;0;id=jsh-other\x07");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "echo prefix; ls -la");
+        assert_eq!(completed[0].agent_generation, None);
+    }
+
+    #[test]
+    fn local_input_after_agent_arm_revokes_the_generation_before_echo() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal
+            .arm_agent_execution(9, "ls -la")
+            .expect("fresh prompt is ready");
+        terminal.note_user_input(b"unrelated local input");
+        // Even if hostile metadata reports the originally approved text, the
+        // local input boundary revoked authorization before PTY echo.
+        terminal
+            .process_input(b"ls -la\r\n\x1b]133;C;id=jsh-other;cmdline_url=ls%20-la\x07spoof\r\n");
+        terminal.process_input(b"\x1b]133;D;0;id=jsh-other\x07");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].agent_generation, None);
     }
 
     use super::{

@@ -14,7 +14,9 @@ mod history_picker;
 mod keybindings;
 mod kitty_graphics;
 mod link;
+mod persistence;
 mod pty;
+mod review_text;
 mod search;
 mod search_replace;
 mod search_replace_panel;
@@ -75,8 +77,6 @@ const SPLIT_RATIO_KEY_STEP: f32 = 0.05;
 /// Two presses on the same divider within this window count as a double-click
 /// (equalizes every pane).
 const DIVIDER_DOUBLE_CLICK_MS: u64 = 400;
-/// Guard against a corrupted or hostile session snapshot spawning unbounded PTYs.
-const MAX_RESTORED_SESSIONS: usize = 32;
 /// Bound pending user/protocol input while a child is not reading its PTY.
 const MAX_PTY_WRITE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// Responses are retried separately so a full user-input queue cannot discard
@@ -87,6 +87,9 @@ const MAX_PTY_QUEUE_ENTRIES: usize = 4096;
 const PTY_QUEUE_COALESCE_BYTES: usize = 64 * 1024;
 /// Maximum queued input written during one UI update.
 const PTY_WRITE_DRAIN_BUDGET: usize = 256 * 1024;
+/// jagent accepts at most 16 KiB per proposed command; reserve framing,
+/// Ctrl+U and submitting CR before moving the state machine to approved.
+const MAX_AGENT_APPROVAL_PAYLOAD_BYTES: usize = 16 * 1024 + 32;
 /// Never reflect an unexpectedly huge host clipboard through a terminal escape.
 const MAX_CLIPBOARD_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -217,6 +220,10 @@ struct RestoredState {
     legacy_tree: Option<session_persistence::PaneTreeSnapshot>,
     legacy_split: Option<session_persistence::SplitSnapshot>,
     diagnostic: Option<String>,
+    /// The configured snapshot was unreadable and could not be quarantined.
+    /// Preserve its bytes for this process lifetime instead of letting the
+    /// first autosave destroy the only recoverable copy.
+    session_writes_blocked: bool,
 }
 
 /// State for the Ctrl+Shift+L quick tab switcher overlay.
@@ -530,9 +537,11 @@ fn main() -> iced::Result {
         app_version: env!("CARGO_PKG_VERSION"),
     });
     env_logger::init();
-    let config_load = Config::load_with_diagnostics();
-    let config_diagnostic = config_load.diagnostic;
-    let config = config_load.config;
+    let config::ConfigLoad {
+        config,
+        diagnostic: config_diagnostic,
+        revision: config_revision,
+    } = Config::load_with_diagnostics();
     let win = iced::window::Settings {
         size: Size::new(config.initial_width, config.initial_height),
         // Without this the window ships an empty WM_CLASS/app_id, so neither
@@ -575,7 +584,13 @@ fn main() -> iced::Result {
         ..Default::default()
     };
     iced::application(
-        move || Jterm::new(config.clone(), config_diagnostic.clone()),
+        move || {
+            Jterm::new(
+                config.clone(),
+                config_diagnostic.clone(),
+                config_revision.clone(),
+            )
+        },
         Jterm::update,
         Jterm::view,
     )
@@ -643,11 +658,9 @@ enum Message {
     MousePane(usize, MouseInput),
     /// Clipboard result scoped to the stable session that requested the paste.
     Pasted(usize, Option<String>),
-    /// Text this app appends to the child's pending line — a search-replace
-    /// result, a sidebar path pick. Separate from `Pasted` only so it can use
-    /// `PastePolicy::prompt_insert`: this text is app-generated, so stripping
-    /// control bytes out of it would mangle a command that legitimately
-    /// contains an escape.
+    /// Text appended by search-replace or a sidebar path pick. Both sources
+    /// can contain terminal/file-system controlled bytes, so this is an
+    /// untrusted paste and never receives the control-preserving policy.
     PromptInsert(usize, String),
     /// A command recalled from history onto the prompt. Unlike `PromptInsert`
     /// it kills the pending line first: a recall that merely appends is glued
@@ -836,7 +849,7 @@ struct Session {
     /// Cached working directory, refreshed periodically so the status bar can
     /// display it without a `readlink` syscall on every render frame.
     cwd_cache: Option<String>,
-    /// Cached foreground process name (via tcgetpgrp + /proc/<pgid>/comm),
+    /// Cached foreground process name (via `tcgetpgrp` + `/proc/<pgid>/comm`),
     /// refreshed on the same cadence as `cwd_cache`. Empty/None when the
     /// shell itself is in the foreground so tab labels can hide it.
     fg_proc_cache: Option<String>,
@@ -854,6 +867,21 @@ struct Session {
     /// Host clipboard access is asynchronous. Limit PTY-originated reads to one
     /// per session so a hostile child cannot accumulate work across UI batches.
     clipboard_read_in_flight: bool,
+}
+
+fn agent_prompt_status_with_foreground(
+    terminal_status: terminal::AgentPromptStatus,
+    shell_pid: i32,
+    foreground_pgid: Option<i32>,
+) -> terminal::AgentPromptStatus {
+    if !terminal_status.is_ready() {
+        return terminal_status;
+    }
+    match foreground_pgid {
+        Some(pgid) if pgid == shell_pid => terminal::AgentPromptStatus::Ready,
+        Some(_) => terminal::AgentPromptStatus::Busy,
+        None => terminal::AgentPromptStatus::ShellIntegrationUnavailable,
+    }
 }
 
 impl Session {
@@ -1013,6 +1041,25 @@ impl Session {
         Some(comm)
     }
 
+    /// Agent approval requires both a trusted terminal-state boundary and the
+    /// interactive shell itself owning the foreground process group. OSC 133
+    /// emitted by a running editor/test process must not make that process the
+    /// recipient of an approved shell command.
+    fn agent_prompt_status(&mut self) -> terminal::AgentPromptStatus {
+        let status = self.terminal.agent_prompt_status();
+        if !status.is_ready() {
+            return status;
+        }
+        if !self.pty.is_alive() {
+            return terminal::AgentPromptStatus::ShellIntegrationUnavailable;
+        }
+        agent_prompt_status_with_foreground(
+            status,
+            self.pty.get_child_pid(),
+            jterm_core::process::tty_foreground_pgid(self.master_fd),
+        )
+    }
+
     fn refresh(&mut self) {
         self.grid = self.terminal.get_visible_cells();
         self.cursor = self.terminal.get_cursor_pos();
@@ -1105,6 +1152,17 @@ impl Session {
     /// Queue data in-order and make one non-blocking drain attempt. Returns false
     /// if the bounded queue rejected the write or the PTY has failed.
     fn write_pty(&mut self, data: &[u8]) -> bool {
+        self.write_pty_with_origin(data, true)
+    }
+
+    /// Queue an already-reviewed Agent payload. The terminal was armed before
+    /// this call, so these exact bytes must not taint their own prompt; any
+    /// subsequent ordinary input still goes through `write_pty` and does.
+    fn write_agent_pty(&mut self, data: &[u8]) -> bool {
+        self.write_pty_with_origin(data, false)
+    }
+
+    fn write_pty_with_origin(&mut self, data: &[u8], taint_prompt: bool) -> bool {
         if data.is_empty() {
             return true;
         }
@@ -1120,6 +1178,12 @@ impl Session {
         }
         self.queued_write_bytes += data.len();
         Self::push_queue_copy(&mut self.write_queue, data, false);
+        // The write may complete before its echo returns through the reader.
+        // Taint the current OSC 133 prompt now so Agent approval cannot race a
+        // locally typed-but-not-yet-visible edit line.
+        if taint_prompt {
+            self.terminal.note_user_input(data);
+        }
         self.flush_write_queue()
     }
 
@@ -1216,13 +1280,14 @@ struct Jterm {
     /// Blink clock phase, toggled by a timer; drives blinking-attribute cells.
     blink_on: bool,
     win_size: Size,
-    /// Last observed config-file timestamp, including failed reload attempts.
-    config_mtime: Option<std::time::SystemTime>,
+    /// Exact bytes this in-memory config was loaded/saved against. `None`
+    /// fails closed because a concurrent-safe comparison is impossible.
+    config_revision: Option<persistence::FileRevision>,
     config_diagnostic: Option<String>,
     /// A malformed/unreadable user config must never be overwritten by
     /// background auto-save. Explicit Reset is the recovery escape hatch.
     config_write_blocked: bool,
-    keybindings_mtime: Option<std::time::SystemTime>,
+    keybindings_revision: Option<persistence::FileRevision>,
     keybindings_diagnostics: Vec<String>,
     session_diagnostic: Option<String>,
     /// Persistent settings-panel changes are live-applied immediately and saved
@@ -1248,6 +1313,10 @@ struct Jterm {
     /// save is skipped while this is false, so a fully idle app does no per-tab
     /// `readlink` or JSON serialization on every tick.
     session_dirty: bool,
+    /// Fail closed after an unreadable startup snapshot could not be moved
+    /// aside. The user can repair/move it and restart; this instance will not
+    /// overwrite evidence it was unable to preserve.
+    session_writes_blocked: bool,
     /// Diagnostics (F12): wall-clock microseconds spent ingesting the
     /// most recent PTY-output batch (parse + refresh) and its byte count, used
     /// to derive a throughput figure for profiling.
@@ -1324,7 +1393,11 @@ struct Jterm {
 }
 
 impl Jterm {
-    fn new(config: Config, config_diagnostic: Option<String>) -> (Self, Task<Message>) {
+    fn new(
+        config: Config,
+        config_diagnostic: Option<String>,
+        config_revision: Option<persistence::FileRevision>,
+    ) -> (Self, Task<Message>) {
         let ai_temperature_draft = config
             .ai_temperature
             .map(|t| format!("{t}"))
@@ -1334,9 +1407,8 @@ impl Jterm {
         let cols = config.cols.max(1);
         let rows = config.rows.max(1);
         let win_size = Size::new(config.initial_width, config.initial_height);
-        let config_mtime = Config::config_mtime();
         let keybindings_load = keybindings::KeyBindings::load_with_diagnostics();
-        let keybindings_mtime = keybindings::KeyBindings::config_mtime();
+        let keybindings_revision = keybindings_load.revision.clone();
 
         // Single-instance lock: a second instance starts fresh and never writes
         // the session snapshot, so it cannot clobber the first instance's history.
@@ -1363,6 +1435,7 @@ impl Jterm {
             legacy_tree: saved_tree,
             legacy_split: saved_split,
             diagnostic: session_diagnostic,
+            session_writes_blocked,
         } = Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
         // In Side mode the dock hosts the tab list and starts open (there is no
@@ -1402,10 +1475,10 @@ impl Jterm {
             debug_open: false,
             blink_on: true,
             win_size,
-            config_mtime,
+            config_revision,
             config_write_blocked: config_diagnostic.is_some(),
             config_diagnostic,
-            keybindings_mtime,
+            keybindings_revision,
             keybindings_diagnostics: keybindings_load.diagnostics,
             session_diagnostic,
             ai_temperature_draft,
@@ -1417,6 +1490,7 @@ impl Jterm {
             kitty_handles: std::collections::HashMap::new(),
             last_session_save: None,
             session_dirty: true,
+            session_writes_blocked,
             last_ingest_us: 0,
             last_ingest_bytes: 0,
             // Placeholder; the real tabs are installed below, after the
@@ -1600,18 +1674,119 @@ impl Jterm {
         );
     }
 
+    fn save_config_checked(&mut self) -> Result<(), persistence::AtomicWriteError> {
+        let candidate = self.config.clone().normalized();
+        match candidate.save_if_unchanged(self.config_revision.as_ref()) {
+            Ok(revision) => {
+                self.config = candidate;
+                self.config_revision = Some(revision);
+                self.config_dirty = false;
+                Ok(())
+            }
+            Err(error) => {
+                // A rename can become visible before syncing its parent
+                // directory fails. Adopt that exact disk revision, but keep
+                // the state dirty so the next tick retries durability instead
+                // of misclassifying our own write as an external conflict.
+                if let Some(revision) = error.committed_revision().cloned() {
+                    self.config = candidate;
+                    self.config_revision = Some(revision);
+                    self.config_dirty = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn block_config_writes(&mut self, diagnostic: String) {
+        let changed = self.config_diagnostic.as_deref() != Some(diagnostic.as_str());
+        self.config_write_blocked = true;
+        self.config_diagnostic = Some(diagnostic);
+        if changed {
+            self.push_toast(
+                "Config changed or became unreadable; keeping last-known-good values",
+                ToastKind::Warning,
+            );
+        }
+    }
+
+    fn note_config_save_error(&mut self, error: &persistence::AtomicWriteError) {
+        eprintln!("[Config] Save failed: {error}");
+        if error.blocks_automatic_writes() {
+            self.block_config_writes(error.to_string());
+        }
+    }
+
     fn persist_live_config(&mut self) {
         if !self.config_dirty || self.config_write_blocked {
             return;
         }
-        match self.config.save() {
-            Ok(()) => {
-                self.config_mtime = Config::config_mtime();
+        if let Err(error) = self.save_config_checked() {
+            self.note_config_save_error(&error);
+        }
+    }
+
+    /// Observe external edits before attempting auto-save. Exact content
+    /// revisions detect changes even on filesystems with coarse mtimes. Dirty
+    /// local state is never merged or overwritten silently: it stays live and
+    /// writes are blocked until the user explicitly resets/resolves it.
+    fn reload_config_if_changed(&mut self) {
+        let disk_revision = match Config::config_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.block_config_writes(error);
+                return;
+            }
+        };
+        let changed = self.config_revision.as_ref() != Some(&disk_revision);
+        if !changed && !self.config_write_blocked {
+            return;
+        }
+        if self.config_dirty {
+            if changed {
+                self.config_revision = Some(disk_revision);
+                self.block_config_writes(
+                    "Config changed outside this window while local edits were pending; Reset explicitly before overwriting it"
+                        .to_string(),
+                );
+            }
+            return;
+        }
+        // Preserve the panel's stable editing surface. With no local dirty
+        // state there is nothing to save, so deferring the reload is safe.
+        if self.config_panel_open {
+            return;
+        }
+
+        let path = match Config::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.block_config_writes(error.to_string());
+                return;
+            }
+        };
+        self.config_revision = Some(disk_revision.clone());
+        match Config::from_revision(&path, &disk_revision) {
+            Ok(config) => {
+                let recovered = self.config_diagnostic.take().is_some();
+                let old_scale = self.scale_factor();
+                self.config = config;
+                self.win_size =
+                    logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
+                self.ai_temperature_draft = self
+                    .config
+                    .ai_temperature
+                    .map(|temperature| temperature.to_string())
+                    .unwrap_or_default();
                 self.config_dirty = false;
+                self.config_write_blocked = false;
+                self.sync_tab_position_ui();
+                self.apply_config();
+                if recovered {
+                    self.push_toast("Config fixed and reloaded", ToastKind::Success);
+                }
             }
-            Err(e) => {
-                eprintln!("[Config] Live save failed: {}", e);
-            }
+            Err(error) => self.block_config_writes(error),
         }
     }
 
@@ -1771,12 +1946,13 @@ impl Jterm {
                         )
                     }
                     Err(move_error) => {
+                        state.session_writes_blocked = true;
                         log::warn!(
                             "[SessionPersistence] Cannot read {} ({reason}) and cannot move it aside ({move_error})",
                             path.display()
                         );
                         format!(
-                            "Could not read the saved session ({reason}), and it could not be moved aside ({move_error}); it will be overwritten"
+                            "Could not read the saved session ({reason}), and it could not be moved aside ({move_error}). Automatic session saving is disabled for this run so the original is not overwritten; repair or move it, then restart"
                         )
                     }
                 };
@@ -1790,14 +1966,18 @@ impl Jterm {
         let mut sessions = Vec::new();
         let mut next_id = 0usize;
         let mut restore_warnings = Vec::new();
-        if snapshot.sessions.len() > MAX_RESTORED_SESSIONS {
+        if snapshot.sessions.len() > session_persistence::MAX_RESTORED_SESSIONS {
             log::warn!(
                 "[SessionPersistence] Snapshot has {} sessions; restoring only the first {}",
                 snapshot.sessions.len(),
-                MAX_RESTORED_SESSIONS
+                session_persistence::MAX_RESTORED_SESSIONS
             );
         }
-        for snap in snapshot.sessions.iter().take(MAX_RESTORED_SESSIONS) {
+        for snap in snapshot
+            .sessions
+            .iter()
+            .take(session_persistence::MAX_RESTORED_SESSIONS)
+        {
             match Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
                 Ok(session) => {
                     sessions.push(session);
@@ -1843,16 +2023,18 @@ impl Jterm {
             legacy_tree: snapshot.tree,
             legacy_split: snapshot.split,
             diagnostic: (!restore_warnings.is_empty()).then(|| restore_warnings.join("\n")),
+            session_writes_blocked: false,
         }
     }
 
     /// Persist the current tabs (live cwd of each + active index) when enabled.
     /// De-duplicated against the last write to avoid redundant disk churn.
     fn save_session_snapshot(&mut self) {
-        // Reconciling current state now; clear the dirty flag so an idle app does
-        // not re-walk every tab's cwd on each periodic tick.
-        self.session_dirty = false;
         if self.sessions.is_empty() || !self.config.restore_session || !self.is_first_instance {
+            self.session_dirty = false;
+            return;
+        }
+        if self.session_writes_blocked {
             return;
         }
         let snaps: Vec<session_persistence::SessionSnapshot> = self
@@ -1877,14 +2059,32 @@ impl Jterm {
             Some(self.active_tab),
         );
         let Some(json) = snapshot.to_json() else {
+            log::warn!("[SessionPersistence] Cannot serialize the current session snapshot");
             return;
         };
         if self.last_session_save.as_deref() == Some(json.as_str()) {
+            self.session_dirty = false;
             return;
         }
-        if let Ok(path) = self.config.session_history_path() {
-            if snapshot.save(&path).is_ok() {
+        let path = match self.config.session_history_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("[SessionPersistence] Cannot resolve snapshot path: {error}");
+                return;
+            }
+        };
+        match snapshot.save(&path) {
+            Ok(()) => {
                 self.last_session_save = Some(json);
+                self.session_dirty = false;
+            }
+            Err(error) => {
+                // Keep dirty so the periodic tick retries transient I/O
+                // failures instead of silently abandoning this generation.
+                log::warn!(
+                    "[SessionPersistence] Cannot save {}: {error}",
+                    path.display()
+                );
             }
         }
     }
@@ -4260,29 +4460,34 @@ impl Jterm {
                 // than rejected noisily.
                 if !completed_commands.is_empty() {
                     if let Some(path) = self.config.resolved_command_history_path() {
-                        let max_entries = self.config.command_history_max_entries as usize;
-                        let cwd = self
-                            .session_by_identity(id, fd)
-                            .and_then(|sess| sess.cwd_cache.clone().or_else(|| sess.cwd()));
-                        let end_time_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-                        for completed in &completed_commands {
-                            let Some(command) =
-                                history_picker::sanitized_command(&completed.command)
-                            else {
-                                continue;
-                            };
-                            if let Err(error) = jterm_core::command_history::enqueue(
-                                &path,
-                                max_entries,
-                                command,
-                                cwd.as_deref(),
-                                completed.exit_code.unwrap_or(0),
-                                end_time_ms,
-                            ) {
-                                log::warn!("command history: {error}");
+                        if let Err(error) = persistence::prepare_command_history_path(&path, true) {
+                            log::warn!("unsafe command-history path rejected: {error}");
+                        } else {
+                            let max_entries = self.config.command_history_max_entries as usize;
+                            let cwd = self
+                                .session_by_identity(id, fd)
+                                .and_then(|sess| sess.cwd_cache.clone().or_else(|| sess.cwd()))
+                                .filter(|cwd| history_picker::sanitized_cwd(cwd).is_some());
+                            let end_time_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                            for completed in &completed_commands {
+                                let Some(command) =
+                                    history_picker::sanitized_command(&completed.command)
+                                else {
+                                    continue;
+                                };
+                                if let Err(error) = jterm_core::command_history::enqueue(
+                                    &path,
+                                    max_entries,
+                                    command,
+                                    cwd.as_deref(),
+                                    completed.exit_code.unwrap_or(0),
+                                    end_time_ms,
+                                ) {
+                                    log::warn!("command history: {error}");
+                                }
                             }
                         }
                     }
@@ -4328,11 +4533,34 @@ impl Jterm {
                 }
             }
             Message::AgentEditStart(id, command) => {
-                self.agent.edit = Some((id, command));
+                match crate::review_text::validate_single_line(
+                    &command,
+                    crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                ) {
+                    Ok(_) => self.agent.edit = Some((id, command)),
+                    Err(error) => {
+                        self.agent.status = format!("Agent edit rejected: {error}");
+                        self.agent.edit = None;
+                    }
+                }
             }
             Message::AgentEditInput(value) => {
                 if let Some((_, buffer)) = self.agent.edit.as_mut() {
-                    *buffer = value;
+                    if value.is_empty() {
+                        buffer.clear();
+                    } else {
+                        match crate::review_text::validate_single_line(
+                            &value,
+                            crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                        ) {
+                            Ok(_) => *buffer = value,
+                            Err(error) => {
+                                buffer.clear();
+                                self.agent.status =
+                                    format!("Agent edit cleared before display: {error}");
+                            }
+                        }
+                    }
                 }
             }
             Message::AgentEditCancel => self.agent.edit = None,
@@ -4421,6 +4649,11 @@ impl Jterm {
                 let key = self.ai_key_draft.trim().to_string();
                 if key.is_empty() {
                     self.push_toast("Paste an API key first", ToastKind::Warning);
+                } else if self.config_write_blocked {
+                    self.push_toast(
+                        "API key not stored: config cannot safely record its credential-file path",
+                        ToastKind::Warning,
+                    );
                 } else {
                     // Same write target rule as jterm4: the configured path,
                     // otherwise the per-app default. The environment override
@@ -4431,12 +4664,49 @@ impl Jterm {
                         .clone()
                         .filter(|p| !p.trim().is_empty())
                         .unwrap_or_else(jterm_core::ai::default_api_key_path);
-                    match jterm_core::ai::write_api_key_file(&path, &key) {
+                    match persistence::write_api_key_file(&path, &key) {
                         Ok(()) => {
+                            let mut candidate = self.config.clone();
+                            candidate.ai_api_key_file = Some(path.clone());
+                            let candidate = candidate.normalized();
+                            let needs_config_save = self.config_dirty
+                                || candidate.ai_api_key_file != self.config.ai_api_key_file;
                             self.ai_key_draft.clear();
-                            self.config.ai_api_key_file = Some(path);
-                            self.config_dirty = true;
-                            self.push_toast("API key stored (0600)", ToastKind::Success);
+                            if needs_config_save {
+                                match candidate.save_if_unchanged(self.config_revision.as_ref()) {
+                                    Ok(revision) => {
+                                        self.config = candidate;
+                                        self.config_revision = Some(revision);
+                                        self.config_dirty = false;
+                                        self.push_toast(
+                                            "API key stored (0600) and config path saved",
+                                            ToastKind::Success,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let message = error.to_string();
+                                        if let Some(revision) = error.committed_revision().cloned()
+                                        {
+                                            // The pointer-bearing config is
+                                            // already visible. Keep memory in
+                                            // lockstep with it and retry the
+                                            // uncertain durability boundary.
+                                            self.config = candidate;
+                                            self.config_revision = Some(revision);
+                                            self.config_dirty = true;
+                                        }
+                                        self.note_config_save_error(&error);
+                                        self.push_toast(
+                                            format!(
+                                                "Key file was stored securely, but config persistence needs attention: {message}"
+                                            ),
+                                            ToastKind::Warning,
+                                        );
+                                    }
+                                }
+                            } else {
+                                self.push_toast("API key stored (0600)", ToastKind::Success);
+                            }
                         }
                         Err(error) => self
                             .push_toast(format!("API key not saved: {error}"), ToastKind::Warning),
@@ -4646,29 +4916,58 @@ impl Jterm {
                 return self.handle_mouse(input);
             }
             Message::Pasted(id, Some(text)) => {
-                self.write_paste_to_session(
-                    id,
+                match crate::review_text::sanitize_prompt_payload(
                     &text,
-                    PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
-                    false,
-                );
+                    MAX_PTY_WRITE_QUEUE_BYTES,
+                ) {
+                    Ok(text) => self.write_paste_to_session(
+                        id,
+                        &text,
+                        PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                        false,
+                    ),
+                    Err(error) => self.push_toast(
+                        format!(
+                            "Paste rejected: this build has no safe Unicode-risk confirmation ({error})"
+                        ),
+                        ToastKind::Warning,
+                    ),
+                }
             }
             Message::Pasted(_, None) => {}
             Message::PromptInsert(id, text) => {
-                self.write_paste_to_session(
-                    id,
+                match crate::review_text::sanitize_prompt_payload(
                     &text,
-                    PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
-                    false,
-                );
+                    crate::review_text::MAX_PROMPT_INSERT_BYTES,
+                ) {
+                    Ok(text) => self.write_paste_to_session(
+                        id,
+                        &text,
+                        PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                        false,
+                    ),
+                    Err(error) => self.push_toast(
+                        format!("Prompt insertion rejected: {error}"),
+                        ToastKind::Warning,
+                    ),
+                }
             }
             Message::PromptRecall(id, command) => {
-                self.write_paste_to_session(
-                    id,
+                match crate::review_text::sanitize_untrusted_single_line(
                     &command,
-                    PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
-                    true,
-                );
+                    crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+                ) {
+                    Ok(command) => self.write_paste_to_session(
+                        id,
+                        &command,
+                        PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                        true,
+                    ),
+                    Err(error) => self.push_toast(
+                        format!("History recall rejected: {error}"),
+                        ToastKind::Warning,
+                    ),
+                }
             }
             Message::Resized(size) => {
                 self.win_size = size;
@@ -5192,96 +5491,100 @@ impl Jterm {
                         ToastKind::Warning,
                     );
                 } else {
-                    match self.config.save() {
+                    match self.save_config_checked() {
                         Ok(()) => {
-                            self.config_mtime = Config::config_mtime();
-                            self.config_dirty = false;
                             self.push_toast("Config saved", ToastKind::Success);
                         }
-                        Err(e) => {
-                            self.push_toast(format!("Save failed: {}", e), ToastKind::Warning)
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.note_config_save_error(&error);
+                            self.push_toast(format!("Save failed: {message}"), ToastKind::Warning);
                         }
                     }
                 }
             }
             Message::ConfigReset => {
-                let old_scale = self.scale_factor();
-                self.config = Config::default();
-                self.win_size =
-                    logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
-                self.sync_tab_position_ui();
-                self.apply_config();
-                match self.config.save() {
-                    Ok(()) => {
-                        self.config_mtime = Config::config_mtime();
+                // Stage and durably persist first: a failed reset must not say
+                // "applied" while only mutating this process's memory.
+                let reset = Config::default();
+                match reset.save_force_revision() {
+                    Ok(revision) => {
+                        let old_scale = self.scale_factor();
+                        self.config = reset;
+                        self.config_revision = Some(revision);
+                        self.win_size = logical_viewport_after_scale(
+                            self.win_size,
+                            old_scale,
+                            self.scale_factor(),
+                        );
                         self.config_dirty = false;
                         self.config_write_blocked = false;
                         self.config_diagnostic = None;
+                        self.ai_temperature_draft.clear();
+                        self.sync_tab_position_ui();
+                        self.apply_config();
                         self.push_toast("Config reset to defaults", ToastKind::Info);
                     }
                     Err(error) => {
-                        self.config_dirty = true;
-                        self.push_toast(
-                            format!("Reset applied, save failed: {error}"),
-                            ToastKind::Warning,
-                        );
+                        if let Some(revision) = error.committed_revision().cloned() {
+                            // The reset inode is already visible even though
+                            // the final directory sync failed. Reflect it in
+                            // memory and retry it as dirty on the next tick.
+                            let old_scale = self.scale_factor();
+                            self.config = reset;
+                            self.config_revision = Some(revision);
+                            self.win_size = logical_viewport_after_scale(
+                                self.win_size,
+                                old_scale,
+                                self.scale_factor(),
+                            );
+                            self.config_dirty = true;
+                            self.config_write_blocked = false;
+                            self.config_diagnostic = None;
+                            self.ai_temperature_draft.clear();
+                            self.sync_tab_position_ui();
+                            self.apply_config();
+                            self.push_toast(
+                                format!(
+                                    "Config reset is visible but needs a durability retry: {error}"
+                                ),
+                                ToastKind::Warning,
+                            );
+                        } else {
+                            self.push_toast(
+                                format!("Reset not applied: {error}"),
+                                ToastKind::Warning,
+                            );
+                        }
                     }
                 }
             }
             Message::ConfigTick => {
+                // Reconcile external writers before local auto-save so a dirty
+                // instance cannot erase a newer file without noticing it.
+                self.reload_config_if_changed();
                 self.persist_live_config();
-                // Skip while editing so live (unsaved) edits aren't reverted.
-                if !self.config_panel_open {
-                    let m = Config::config_mtime();
-                    if m != self.config_mtime {
-                        self.config_mtime = m;
-                        if let Ok(path) = Config::config_path() {
-                            match Config::load_path(&path) {
-                                Ok(config) => {
-                                    let recovered = self.config_diagnostic.take().is_some();
-                                    let old_scale = self.scale_factor();
-                                    self.config = config;
-                                    self.win_size = logical_viewport_after_scale(
-                                        self.win_size,
-                                        old_scale,
-                                        self.scale_factor(),
-                                    );
-                                    self.config_dirty = false;
-                                    self.config_write_blocked = false;
-                                    self.sync_tab_position_ui();
-                                    self.apply_config();
-                                    if recovered {
-                                        self.push_toast(
-                                            "Config fixed and reloaded",
-                                            ToastKind::Success,
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    let changed =
-                                        self.config_diagnostic.as_deref() != Some(error.as_str());
-                                    self.config_write_blocked = true;
-                                    self.config_diagnostic = Some(error.clone());
-                                    if changed {
-                                        self.push_toast(
-                                            "Config reload failed; keeping last-known-good values",
-                                            ToastKind::Warning,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+
+                let keybindings_changed = keybindings::KeyBindings::config_revision()
+                    .map(|revision| self.keybindings_revision.as_ref() != Some(&revision))
+                    // A transient read failure must be retried; never record it
+                    // as the last-known-good revision.
+                    .unwrap_or(true);
+                if keybindings_changed {
+                    let keybindings::KeyBindingsLoad {
+                        bindings,
+                        diagnostics,
+                        usable,
+                        revision,
+                    } = keybindings::KeyBindings::load_with_diagnostics();
+                    if usable {
+                        self.keybindings = bindings;
                     }
-                }
-                let keybindings_mtime = keybindings::KeyBindings::config_mtime();
-                if keybindings_mtime != self.keybindings_mtime {
-                    self.keybindings_mtime = keybindings_mtime;
-                    let loaded = keybindings::KeyBindings::load_with_diagnostics();
-                    if loaded.usable {
-                        self.keybindings = loaded.bindings;
+                    if let Some(revision) = revision {
+                        self.keybindings_revision = Some(revision);
                     }
-                    let changed = loaded.diagnostics != self.keybindings_diagnostics;
-                    self.keybindings_diagnostics = loaded.diagnostics;
+                    let changed = diagnostics != self.keybindings_diagnostics;
+                    self.keybindings_diagnostics = diagnostics;
                     if changed {
                         if self.keybindings_diagnostics.is_empty() {
                             self.push_toast("Keybindings reloaded", ToastKind::Success);
@@ -7887,7 +8190,10 @@ impl Jterm {
             section("Appearance"),
             kb("Ctrl+= / Ctrl+-", "Increase / decrease font size"),
             kb("Ctrl+0", "Reset font size"),
-            kb("Ctrl+Alt+= / Ctrl+Alt+-", "Increase / decrease window opacity"),
+            kb(
+                "Ctrl+Alt+= / Ctrl+Alt+-",
+                "Increase / decrease window opacity"
+            ),
         ]
         .spacing(6);
 
@@ -8059,28 +8365,60 @@ impl Jterm {
         id: jterm_core::agent::ProposalId,
         edited: Option<String>,
     ) -> Option<Task<Message>> {
-        let command = self.agent.approve(id, edited)?;
         let bound = self.agent.bound_session_id?;
-        match self.sessions.iter_mut().find(|s| s.id == bound) {
-            Some(sess) => {
-                // This used to append a raw `command + CR`, the last payload
-                // writer bypassing `pty_input`: an approved (or hand-edited)
-                // command carrying its own `ESC[201~` could close an open paste
-                // frame, and whatever the user had half-typed at the prompt was
-                // glued to the front of the command and run with it.
-                let paste =
-                    agent_command_payload(&command, sess.terminal.is_bracketed_paste_enabled());
-                sess.terminal.scroll_to_bottom();
-                if !sess.write_pty(&paste.bytes) {
-                    self.agent.status =
-                        "Agent command rejected: PTY input queue is full".to_string();
-                }
-                sess.refresh();
-            }
-            None => {
-                self.agent.status = "Agent session's terminal no longer exists".to_string();
-            }
+        let Some(session_index) = self.sessions.iter().position(|session| session.id == bound)
+        else {
+            self.agent.status = "Agent session's terminal no longer exists".to_string();
+            return None;
+        };
+
+        // Gate *before* approving in the pure Agent state machine. A rejected
+        // gate therefore leaves the proposal pending and reviewable.
+        let prompt_status = self.sessions[session_index].agent_prompt_status();
+        if !prompt_status.is_ready() {
+            self.agent.status = prompt_status.blocked_message().to_string();
+            return None;
         }
+        if !self.sessions[session_index].can_queue_user_bytes(MAX_AGENT_APPROVAL_PAYLOAD_BYTES) {
+            self.agent.status = "Agent command not run: PTY input queue is full".to_string();
+            return None;
+        }
+
+        let approved = self.agent.approve(id, edited)?;
+        let sess = &mut self.sessions[session_index];
+        let paste = match agent_command_payload(
+            &approved.command,
+            sess.terminal.is_bracketed_paste_enabled(),
+        ) {
+            Ok(paste) => paste,
+            Err(error) => {
+                self.agent.execution_start_failed(
+                    approved.generation,
+                    format!("Agent command rejected at the PTY boundary: {error}"),
+                );
+                return None;
+            }
+        };
+        if let Err(status) = sess
+            .terminal
+            .arm_agent_execution(approved.generation, &approved.command)
+        {
+            self.agent.execution_start_failed(
+                approved.generation,
+                format!("{}; Agent session stopped", status.blocked_message()),
+            );
+            return None;
+        }
+        sess.terminal.scroll_to_bottom();
+        if !sess.write_agent_pty(&paste.bytes) {
+            sess.terminal.disarm_agent_execution(approved.generation);
+            self.agent.execution_start_failed(
+                approved.generation,
+                "Agent command could not be written; Agent session stopped",
+            );
+            return None;
+        }
+        sess.refresh();
         self.agent_drive_task()
     }
 
@@ -8155,8 +8493,12 @@ impl Jterm {
                             .as_ref()
                             .filter(|(edit_id, _)| edit_id == id)
                         {
+                            let visible_buffer = crate::review_text::visible_bounded(
+                                buffer,
+                                crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                            );
                             card = card.push(
-                                text_input("command", buffer)
+                                text_input("command", &visible_buffer)
                                     .id(AGENT_EDIT_INPUT_ID.clone())
                                     .on_input(Message::AgentEditInput)
                                     .on_submit(Message::AgentEditApprove(*edit_id))
@@ -8174,8 +8516,14 @@ impl Jterm {
                                 .spacing(6),
                             );
                         } else {
-                            card = card
-                                .push(text(command.clone()).size(13).font(iced::Font::MONOSPACE));
+                            card = card.push(
+                                text(crate::review_text::visible_bounded(
+                                    command,
+                                    crate::review_text::MAX_AGENT_COMMAND_BYTES,
+                                ))
+                                .size(13)
+                                .font(iced::Font::MONOSPACE),
+                            );
                             let status_row: Element<'_, Message> = match status {
                                 ProposalStatus::Pending if is_current => {
                                     let approve_label = if danger.is_some() {
@@ -8608,18 +8956,26 @@ fn enqueue_desktop_notification(title: String, body: String) {
 /// `Ctrl+U` the command is appended to whatever the user had half-typed and
 /// submitted in that mangled form. The submitting CR lands outside the frame
 /// because readline deliberately does not execute newlines inside a bracketed
-/// paste. Control bytes are kept — the command is the agent's reviewed text,
-/// not clipboard data.
-fn agent_command_payload(command: &str, bracketed: bool) -> pty_input::Paste {
-    pty_input::encode_prompt_insert(
+/// paste. The local compatibility gate rejects visual spoofing, and the
+/// payload policy strips C0/C1 again immediately before the PTY write.
+fn agent_command_payload(
+    command: &str,
+    bracketed: bool,
+) -> Result<pty_input::Paste, crate::review_text::ReviewTextError> {
+    let command = crate::review_text::sanitize_untrusted_single_line(
         command,
+        crate::review_text::MAX_AGENT_COMMAND_BYTES,
+    )?;
+    Ok(pty_input::encode_prompt_insert(
+        &command,
         PasteModes { bracketed },
         PastePolicy {
+            strip_controls: true,
             submit: true,
             ..PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim)
         },
         true,
-    )
+    ))
 }
 
 /// Build a single OSC 5522 packet: `ESC ] 5522 ; <metadata> [; <payload>] ESC \`.
@@ -9174,6 +9530,29 @@ mod tests {
     use iced::keyboard::key::Named;
 
     #[test]
+    fn agent_prompt_requires_the_shell_to_own_the_foreground_pty() {
+        use terminal::AgentPromptStatus;
+
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::Ready, 100, Some(100)),
+            AgentPromptStatus::Ready
+        );
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::Ready, 100, Some(200)),
+            AgentPromptStatus::Busy
+        );
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::Ready, 100, None),
+            AgentPromptStatus::ShellIntegrationUnavailable
+        );
+        // Terminal-level blockers always win, even if the shell is foreground.
+        assert_eq!(
+            agent_prompt_status_with_foreground(AgentPromptStatus::InputNotEmpty, 100, Some(100)),
+            AgentPromptStatus::InputNotEmpty
+        );
+    }
+
+    #[test]
     fn ui_scale_change_resizes_logical_viewport_and_terminal_grid() {
         let old_viewport = Size::new(1200.0, 800.0);
         let old_scale = 1.0;
@@ -9545,24 +9924,34 @@ mod tests {
         assert!(!paste.risk.truncated_to_first_line);
     }
 
-    /// Prompt insertion carries this app's own history, so an escape inside a
-    /// recalled command must survive — the clipboard policy would strip it.
+    /// Search-replace, sidebar paths and recalled history can all contain
+    /// child/filesystem-controlled bytes. Production PromptInsert/Recall uses
+    /// this control-stripping policy; no untrusted route receives the raw
+    /// control-preserving prompt-insert policy.
     #[test]
-    fn prompt_insert_keeps_control_bytes_the_clipboard_would_strip() {
+    fn untrusted_prompt_payloads_strip_control_bytes() {
         let modes = PasteModes { bracketed: true };
-        let recalled = pty_input::encode_paste(
+        let sanitized = crate::review_text::sanitize_prompt_payload(
             "printf '\x1b[31m'",
-            modes,
-            PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
-        );
-        assert_eq!(recalled.echo_text, "printf '\x1b[31m'");
-
-        let clipboard = pty_input::encode_paste(
-            "printf '\x1b[31m'",
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        )
+        .unwrap();
+        let untrusted = pty_input::encode_paste(
+            &sanitized,
             modes,
             PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
         );
-        assert_eq!(clipboard.echo_text, "printf '[31m'");
+        assert_eq!(untrusted.echo_text, "printf '[31m'");
+
+        // jterm3's pinned core has no visual-risk confirmation UI, so a pure
+        // clipboard paste containing hidden formatting must fail closed too.
+        assert!(matches!(
+            crate::review_text::sanitize_prompt_payload(
+                "printf safe\u{202e}hidden",
+                MAX_PTY_WRITE_QUEUE_BYTES,
+            ),
+            Err(crate::review_text::ReviewTextError::VisualSpoof)
+        ));
     }
 
     /// Replaces the raw `command + CR` write in `agent_run_approved`: the
@@ -9570,27 +9959,30 @@ mod tests {
     /// no frame terminator of its own, and submit *outside* the frame.
     #[test]
     fn an_approved_agent_command_replaces_the_line_and_submits_outside_the_frame() {
-        let paste = agent_command_payload("git status\x1b[201~; rm -rf ~", true);
+        let paste = agent_command_payload("git status\x1b[201~; rm -rf ~", true).unwrap();
         assert_eq!(paste.bytes[0], 0x15, "line kill must come first");
         assert!(paste.bytes[1..].starts_with(b"\x1b[200~"));
         assert!(paste.bytes.ends_with(b"\x1b[201~\r"));
-        // The embedded terminator was removed, not framed.
-        assert_eq!(paste.echo_text, "git status; rm -rf ~");
-        assert!(paste.risk.had_embedded_paste_marker);
+        // The embedded ESC control was stripped, leaving inert visible text.
+        assert_eq!(paste.echo_text, "git status[201~; rm -rf ~");
+        assert!(!paste.risk.had_embedded_paste_marker);
 
         // A shell without DECSET 2004 still gets the kill and the submit.
-        let plain = agent_command_payload("echo hi", false);
+        let plain = agent_command_payload("echo hi", false).unwrap();
         assert_eq!(plain.bytes, b"\x15echo hi\r");
+        assert!(matches!(
+            agent_command_payload("echo safe\u{202e}hidden", true),
+            Err(crate::review_text::ReviewTextError::VisualSpoof)
+        ));
     }
 
     /// `Message::PromptRecall` (history picker) kills the pending line before
     /// typing; `Message::PromptInsert` (search-replace, sidebar path picks)
-    /// appends instead. Both routes use the same policy, so the flag is the
-    /// only difference `write_paste_to_session` applies.
+    /// appends instead. Both use the control-stripping untrusted policy.
     #[test]
     fn history_recall_replaces_the_pending_line_and_inserts_append() {
         let modes = PasteModes { bracketed: true };
-        let policy = PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim);
+        let policy = PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim);
         let recall = pty_input::encode_prompt_insert("cargo test", modes, policy, true);
         assert_eq!(recall.bytes[0], 0x15);
         assert_eq!(&recall.bytes[1..], b"\x1b[200~cargo test\x1b[201~");
@@ -9608,10 +10000,15 @@ mod tests {
         let hostile = "evil\x1b[201~\rrm -rf ~";
         let mut quoted = jterm_core::process::shell_quote_path(hostile);
         quoted.push(' ');
+        let quoted = crate::review_text::sanitize_prompt_payload(
+            &quoted,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        )
+        .unwrap();
         let paste = pty_input::encode_prompt_insert(
             &quoted,
             PasteModes { bracketed: true },
-            PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
             false,
         );
         // Exactly one frame terminator, and it is the frame's own.
@@ -9624,9 +10021,20 @@ mod tests {
             1
         );
         assert!(paste.bytes.ends_with(b"\x1b[201~"));
-        // The CR that would have submitted the line is folded to a newline the
-        // frame keeps inert.
+        // The control-stripping prompt boundary removes the CR entirely, so no
+        // executable line break reaches the shell quote or paste frame.
         assert!(!paste.echo_text.contains('\r'));
+        assert!(!paste.echo_text.contains('\n'));
+        assert!(!paste.bytes.ends_with(b"\x1b[201~\r"));
+
+        let rejected_path = jterm_core::process::shell_quote_path("safe\u{2066}hidden");
+        assert_eq!(rejected_path, "''", "the shared quoter fails closed");
+        let sanitized = crate::review_text::sanitize_prompt_payload(
+            &rejected_path,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(sanitized, "''");
     }
 
     #[test]
