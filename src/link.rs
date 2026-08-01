@@ -348,6 +348,38 @@ impl LinkDetector {
     }
 }
 
+/// The one policy every clickable target must satisfy.
+///
+/// A link's text comes from the attached process, so a click is the terminal
+/// acting on untrusted data. Only an absolute HTTP(S) URL with an authority and
+/// no userinfo qualifies: `file:` would open a local file with its default
+/// application, `ssh:` and `git:` would start a network client, and
+/// `https://user:token@host` would hand the opener a credential the user never
+/// typed. Whitespace, controls, backslashes, and visually ambiguous characters
+/// are refused so the target reads as the origin it resolves to.
+pub(crate) fn is_openable_url(url: &str) -> bool {
+    const MAX_URL_BYTES: usize = 2 * 1024;
+
+    if url.is_empty()
+        || url.len() > MAX_URL_BYTES
+        || url
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || url.contains('\\')
+        || crate::review_text::contains_visual_spoofing(url)
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@')
+}
+
 /// 打开链接
 pub fn open_link(link: &Link, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     match link.link_type {
@@ -365,54 +397,85 @@ pub fn open_link(link: &Link, cwd: Option<&Path>) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// 打开 URL（使用系统默认浏览器）
+/// Absolute openers, in preference order, per platform.
+///
+/// A clicked link is terminal-controlled data, so the program that receives it
+/// must not be chosen by a mutable `PATH`: a directory the user happened to
+/// open, or an entry an unrelated install dropped in `~/.local/bin`, would
+/// otherwise decide what a click runs.
 #[cfg(target_os = "linux")]
-fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    std::process::Command::new("xdg-open").arg(url).spawn()?;
-    Ok(())
-}
-
+const OPENER_CANDIDATES: &[&str] = &["/usr/bin/xdg-open", "/bin/xdg-open"];
 #[cfg(target_os = "macos")]
-fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    std::process::Command::new("open").arg(url).spawn()?;
+const OPENER_CANDIDATES: &[&str] = &["/usr/bin/open"];
+#[cfg(target_os = "windows")]
+const OPENER_CANDIDATES: &[&str] = &[r"C:\Windows\explorer.exe"];
+
+fn trusted_opener() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    for candidate in OPENER_CANDIDATES {
+        let path = Path::new(candidate);
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = metadata.permissions().mode();
+            if mode & 0o111 == 0
+                || mode & 0o022 != 0
+                || (metadata.uid() == unsafe { libc::geteuid() } && mode & 0o200 != 0)
+            {
+                continue;
+            }
+        }
+        return Ok(path.to_path_buf());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no trusted system opener is available",
+    )
+    .into())
+}
+
+/// Spawn the opener detached from this process's streams and reap it, so a
+/// clicked link leaves neither a zombie nor a child holding our stdio.
+fn spawn_opener(argv: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut child = std::process::Command::new(trusted_opener()?)
+        .args(argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+/// 打开 URL（使用系统默认浏览器）
 fn open_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    std::process::Command::new("cmd")
-        .args(&["/C", "start", url])
-        .spawn()?;
-    Ok(())
+    if !is_openable_url(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported or unsafe URL",
+        )
+        .into());
+    }
+    spawn_opener(&[std::ffi::OsStr::new(url)])
 }
 
 /// 打开文件路径（使用系统默认应用）
-#[cfg(target_os = "linux")]
 fn open_file_path(path: &str, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let expanded_path = resolve_existing_file_path(path, cwd)?;
-
-    std::process::Command::new("xdg-open")
-        .arg(&expanded_path)
-        .spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn open_file_path(path: &str, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = resolve_existing_file_path(path, cwd)?;
-    std::process::Command::new("open")
-        .arg(&expanded_path)
-        .spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn open_file_path(path: &str, cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let expanded_path = resolve_existing_file_path(path, cwd)?;
-    std::process::Command::new("explorer")
-        .arg(&expanded_path)
-        .spawn()?;
-    Ok(())
+    // `--` first: a detected path beginning with `-` is a file operand, never
+    // an option for the opener.
+    #[cfg(not(target_os = "windows"))]
+    let argv = [std::ffi::OsStr::new("--"), expanded_path.as_os_str()];
+    #[cfg(target_os = "windows")]
+    let argv = [expanded_path.as_os_str()];
+    spawn_opener(&argv)
 }
 
 /// Expand a leading `~/` without invoking a shell.

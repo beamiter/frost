@@ -35,9 +35,41 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// Atomically claim the persisted snapshot and consume it into a session.
+///
+/// A read followed by a separate delete lets two windows opening at the same
+/// moment both restore the same transcript, and loses the session entirely if
+/// the process dies between the two calls. Claiming first means exactly one
+/// caller ever sees the file. Evidence that cannot become a session is left at
+/// the claim path instead of being deleted, so a corrupt or hostile snapshot
+/// stays available for inspection and is never restored by a later opener.
+fn claim_snapshot_session(path: &Path) -> Option<AgentSession> {
+    let claimed = crate::persistence::claim_exclusive(path).ok()?;
+    let restored =
+        crate::persistence::read_text_bounded(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
+            .ok()
+            .and_then(|encoded| AgentSessionSnapshot::from_json(&encoded).ok())
+            .and_then(|snapshot| restore_snapshot_session(snapshot).ok());
+    match restored {
+        Some(session) => {
+            let _ = std::fs::remove_file(&claimed);
+            Some(session)
+        }
+        None => {
+            log::warn!(
+                "agent: quarantined an unusable session snapshot at {}",
+                claimed.display()
+            );
+            None
+        }
+    }
+}
+
 /// Read an Agent snapshot through jterm3's descriptor-validated, bounded
 /// persistence path. Any unsafe, corrupt, or missing entry simply falls back
-/// to a fresh session.
+/// to a fresh session. Production restores go through [`claim_snapshot_session`],
+/// which claims the file before reading it.
+#[cfg(test)]
 fn read_snapshot_file(path: &Path) -> Option<AgentSessionSnapshot> {
     let encoded =
         crate::persistence::read_text_bounded(path, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64).ok()?;
@@ -400,11 +432,7 @@ impl AgentUi {
         self.is_open = true;
         self.bound_session_id = Some(session_id);
         self.status.clear();
-        let restored = snapshot_path().and_then(|path| {
-            let snapshot = read_snapshot_file(&path)?;
-            jterm_core::agent::remove_snapshot_file(&path);
-            restore_snapshot_session(snapshot).ok()
-        });
+        let restored = snapshot_path().and_then(|path| claim_snapshot_session(&path));
         match restored {
             Some(session) => {
                 self.session = Some(session);
@@ -657,13 +685,20 @@ impl AgentUi {
                     self.status = format!("Agent command rejected after approval: {error}");
                     return None;
                 }
-                self.execution_generation = self.execution_generation.wrapping_add(1);
-                if self.execution_generation == 0 {
-                    self.execution_generation = 1;
-                }
+                // Checked, never wrapped: a reused generation would let a late
+                // completion from an earlier execution attach its output to
+                // this approval. Exhaustion needs 2^64 approvals in one
+                // session, so sealing is the honest response.
+                let Some(generation) = self.execution_generation.checked_add(1) else {
+                    session.cancel();
+                    self.awaiting = None;
+                    self.status = "Agent execution identities are exhausted".to_string();
+                    return None;
+                };
+                self.execution_generation = generation;
                 let execution = ApprovedAgentExecution {
                     command: approved.command.clone(),
-                    generation: self.execution_generation,
+                    generation,
                 };
                 self.awaiting = Some(PendingAgentExecution {
                     proposal_id: approved.proposal_id,
@@ -820,6 +855,79 @@ mod tests {
         session
             .snapshot()
             .expect("non-empty session has a snapshot")
+    }
+
+    fn private_test_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("jterm3-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn claiming_a_snapshot_has_exactly_one_winner() {
+        let root = private_test_dir("agent-claim");
+        let path = root.join("agent_session.json");
+        write_snapshot_file(&path, &snapshot_fixture()).unwrap();
+
+        let session = claim_snapshot_session(&path).expect("the first opener restores");
+        assert!(!session.transcript().is_empty());
+        // Consumed: a second opener finds nothing, and no leftover file in the
+        // directory can be restored later.
+        assert!(!path.exists());
+        assert!(claim_snapshot_session(&path).is_none());
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_unusable_claim_is_quarantined_rather_than_deleted() {
+        let root = private_test_dir("agent-quarantine");
+        let path = root.join("agent_session.json");
+
+        for evidence in ["not json", r#"{"version":99}"#] {
+            std::fs::write(&path, evidence).unwrap();
+            assert!(claim_snapshot_session(&path).is_none());
+            assert!(!path.exists(), "the original name is claimed");
+            let preserved: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect();
+            assert_eq!(preserved.len(), 1, "invalid evidence is kept");
+            assert_eq!(std::fs::read_to_string(&preserved[0]).unwrap(), evidence);
+            assert!(claim_snapshot_session(&path).is_none());
+            std::fs::remove_file(&preserved[0]).unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_plain_http_targets_with_an_authority_are_openable() {
+        assert!(crate::link::is_openable_url("https://example.com/path"));
+        assert!(crate::link::is_openable_url("HTTP://example.com"));
+        for rejected in [
+            "file:///etc/passwd",
+            "ssh://host.example/path",
+            "git://host.example/repo",
+            "mailto:person@example.com",
+            "javascript:alert(1)",
+            "https:///path",
+            "https://user:token@example.com/",
+            "https://exam\u{200b}ple.com/",
+            "https://example.com/a b",
+            "https://example.com\\evil",
+            "relative/path",
+        ] {
+            assert!(
+                !crate::link::is_openable_url(rejected),
+                "{rejected:?} must not be openable"
+            );
+        }
     }
 
     #[test]

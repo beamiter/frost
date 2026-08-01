@@ -390,36 +390,76 @@ mod unix_pty {
     /// answers a usage error, and anything that instead waits on the network (or
     /// on stdin, which is /dev/null here) is killed and treated as "not our
     /// shell".
+    ///
+    /// The probe owns the whole process group it starts, not just the direct
+    /// child: a shell that forks a daemon inherits this pipe, and reading to
+    /// EOF would then wait for *that* descendant rather than for the program we
+    /// asked to identify itself. The banner is read concurrently under a byte
+    /// ceiling so the child cannot block on a full pipe either, and the group
+    /// is signalled and reaped at one deadline.
     fn jsh_version_banner(path: &Path) -> Option<String> {
         use std::io::Read;
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
-        let mut child = Command::new(path)
+        /// A version banner is one short line; anything longer is not one.
+        const MAX_BANNER_BYTES: u64 = 4 * 1024;
+
+        let mut command = Command::new(path);
+        command
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let deadline = Instant::now() + JSH_PROBE_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => {
-                    let mut banner = String::new();
-                    child.stdout.take()?.read_to_string(&mut banner).ok()?;
-                    return Some(banner);
+            .stderr(Stdio::null());
+        unsafe {
+            // SAFETY: setpgid is async-signal-safe and only changes the
+            // freshly forked child's process group.
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().ok()?;
+        let group = child.id() as libc::pid_t;
+        let mut stdout = child.stdout.take()?;
+
+        // Drain concurrently: a child that fills the pipe while we wait for it
+        // to exit would deadlock against a reader that only runs afterwards.
+        let reader = std::thread::spawn(move || {
+            let mut banner = Vec::new();
+            let _ = stdout
+                .by_ref()
+                .take(MAX_BANNER_BYTES)
+                .read_to_end(&mut banner);
+            banner
+        });
+
+        let deadline = Instant::now() + JSH_PROBE_TIMEOUT;
+        let exited_cleanly = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Ok(Some(_)) => return None,
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
+                _ => break false,
             }
+        };
+        // Signal the group whether or not the direct child exited: a daemonised
+        // descendant still holds the pipe, and the reader below must be able to
+        // reach EOF.
+        // SAFETY: killpg only signals the group this probe created.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
         }
+        let _ = child.kill();
+        let _ = child.wait();
+        let banner = reader.join().ok()?;
+        if !exited_cleanly {
+            return None;
+        }
+        String::from_utf8(banner).ok()
     }
 
     fn shell_from_passwd() -> Option<String> {
