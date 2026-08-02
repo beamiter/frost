@@ -246,3 +246,40 @@ CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独�
 jterm3 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；完整文本见
 [`LICENSE-MIT`](LICENSE-MIT) 与 [`LICENSE-APACHE`](LICENSE-APACHE)。向本仓库提交
 贡献即表示贡献者同意按相同的双许可证条款授权该贡献。
+
+## Remote hosts and containers
+
+Ctrl+Shift+S opens the remote host picker. An entry in the config file names an
+ssh destination or a running container, and choosing one opens it in a new
+session:
+
+```toml
+[[remote_hosts]]
+name = "myubuntu"
+host = "myubuntu"
+docker = true
+deploy = "incognito"
+
+[[remote_hosts]]
+host = "dev.example.com"
+user = "yj"
+ssh_args = ["-p", "2222"]
+deploy = "persist"
+```
+
+`deploy = "off"` (the default) connects plainly and runs `remote_shell`
+(default `jsh`) as found on the destination. `"persist"` and `"incognito"`
+bring jsh along through the family's `jsh-remote.sh`: when the local jsh is a
+static build — which a Linux install now is — it lends itself, so nothing is
+fetched from anywhere and the far side runs exactly the version that sent it.
+Persist keeps jsh's dot-files and a cached binary in the destination's `$HOME`
+so the next connection skips the transfer; incognito sandboxes `$HOME` and
+deletes it on exit — inside a container the sandbox lives in its tmpfs, so
+`docker diff` stays empty. An entry the config grammar rejects is shown in the
+picker with its reason rather than hidden.
+
+The grammar, validation and argv are shared with the whole jterm family
+(`jterm_core::jsh_remote::RemoteHostConfig`); typing `ssh host` or
+`docker exec -it name bash` into a jsh prompt reaches the same machinery with
+no configuration at all.
+

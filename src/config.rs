@@ -118,6 +118,12 @@ pub struct Config {
     #[serde(default)]
     pub ai_enabled: bool,
 
+    /// Remote destinations for the host picker (Ctrl+Shift+S). Grammar,
+    /// validation and the argv a tab runs are the family-shared
+    /// `jterm_core::jsh_remote::RemoteHostConfig`.
+    #[serde(default)]
+    pub remote_hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+
     /// AI provider: "anthropic", "openai-compatible", or "ollama".
     #[serde(default = "default_ai_provider")]
     pub ai_provider: String,
@@ -482,6 +488,7 @@ impl Default for Config {
         Config {
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
+            remote_hosts: Vec::new(),
             ai_provider: default_ai_provider(),
             ai_base_url: default_ai_base_url(),
             ai_model: default_ai_model(),
@@ -1152,5 +1159,22 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn remote_hosts_deserialize_through_the_shared_family_type() {
+        let config = Config::from_toml(
+            r#"
+[[remote_hosts]]
+name = "build"
+host = "myubuntu"
+docker = true
+deploy = "incognito"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.remote_hosts.len(), 1);
+        assert!(config.remote_hosts[0].validate().is_ok());
+        assert_eq!(config.remote_hosts[0].display_name(), "build");
     }
 }

@@ -249,6 +249,7 @@ enum ChromeShortcut {
     Help,
     TabSwitcher,
     HistoryPicker,
+    RemoteHosts,
     Debug,
 }
 
@@ -271,6 +272,8 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
         'l' => Some(ChromeShortcut::TabSwitcher),
         // Same chord as jterm4's history palette (Ctrl+R stays with readline).
         'h' => Some(ChromeShortcut::HistoryPicker),
+        // Same chord as the rest of the family's remote host picker.
+        's' => Some(ChromeShortcut::RemoteHosts),
         _ => None,
     }
 }
@@ -633,6 +636,10 @@ enum Message {
     JshChecked(Box<jterm_core::jsh_install::Status>),
     /// Install jsh, or update the installed one, in a dedicated session.
     JshInstall,
+    /// Close the remote host picker overlay.
+    RemotePickerClose,
+    /// Open the picked [[remote_hosts]] entry in a new session.
+    RemotePickerConnect(usize),
     /// Hide the jsh notice until the next launch.
     JshNoticeDismiss,
     SetAiEnabled(bool),
@@ -1372,6 +1379,8 @@ struct Jterm {
     /// tab labels lets the user jump by typing. Field holds the typed query
     /// and current selection index.
     tab_switcher: Option<TabSwitcherState>,
+    /// Remote host picker overlay: `Some(selected index)` while open.
+    remote_picker: Option<usize>,
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
@@ -1516,6 +1525,7 @@ impl Jterm {
             jsh_prompt: None,
             jsh_notice_dismissed: false,
             tab_switcher: None,
+            remote_picker: None,
             history_picker: None,
             tab_close_confirm: None,
             last_notification_at: None,
@@ -1808,6 +1818,7 @@ impl Jterm {
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
             && self.history_picker.is_none()
+            && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
     }
 
@@ -1822,6 +1833,7 @@ impl Jterm {
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
             && self.history_picker.is_none()
+            && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
     }
 
@@ -3359,9 +3371,119 @@ impl Jterm {
                 }
                 Some(self.open_history_picker())
             }
+            ChromeShortcut::RemoteHosts => {
+                if self.remote_picker.is_some() {
+                    self.remote_picker = None;
+                } else {
+                    self.remote_picker = Some(0);
+                }
+                Some(Task::none())
+            }
             ChromeShortcut::Debug => {
                 self.debug_open = !self.debug_open;
                 Some(Task::none())
+            }
+        }
+    }
+
+    /// Remote picker key handling. Mirrors `handle_tab_switcher_key`: arrows
+    /// move, Enter connects, Esc or the toggle chord dismisses.
+    fn handle_remote_picker_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::RemoteHosts) {
+            self.remote_picker = None;
+            return Some(Task::none());
+        }
+        let count = self.config.remote_hosts.len();
+        let selected = self.remote_picker.as_mut()?;
+        match key {
+            Key::Named(Named::Escape) => {
+                self.remote_picker = None;
+                Some(Task::none())
+            }
+            Key::Named(Named::Enter) => {
+                let index = *selected;
+                self.remote_picker = None;
+                if index < count {
+                    self.connect_remote_host(index);
+                }
+                Some(Task::none())
+            }
+            Key::Named(Named::ArrowDown) if count > 0 => {
+                *selected = (*selected + 1) % count;
+                Some(Task::none())
+            }
+            Key::Named(Named::ArrowUp) if count > 0 => {
+                *selected = if *selected == 0 {
+                    count - 1
+                } else {
+                    *selected - 1
+                };
+                Some(Task::none())
+            }
+            _ => Some(Task::none()),
+        }
+    }
+
+    /// Open a `[[remote_hosts]]` destination in its own session. The argv is
+    /// the family-shared builder's: the deploy launcher when the entry asks
+    /// for it — lending the local jsh when that one is static — and a plain
+    /// ssh / `docker exec` otherwise.
+    fn connect_remote_host(&mut self, index: usize) {
+        let Some(host) = self.config.remote_hosts.get(index).cloned() else {
+            return;
+        };
+        if let Err(problem) = host.validate() {
+            self.push_toast(
+                format!("Remote host {}: {problem}", host.display_name()),
+                ToastKind::Warning,
+            );
+            return;
+        }
+        let (argv, degraded) = host.tab_argv();
+        if let Some(error) = degraded {
+            // The tab still opens — a plain connection beats no connection —
+            // but quietly pretending jsh was deployed would be worse than
+            // either.
+            log::warn!("cannot publish jsh-remote.sh: {error}; connecting without deployment");
+            self.push_toast(
+                format!(
+                    "Deploy unavailable; connecting to {} plainly",
+                    host.display_name()
+                ),
+                ToastKind::Warning,
+            );
+        }
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            None,
+            Some(&argv),
+        ) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                self.reindex_tabs_after_insert(insert);
+                // A remote session opens its own tab; it is never grafted into
+                // the current tab's split.
+                self.open_tab_with(insert);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.push_toast(message, ToastKind::Warning);
             }
         }
     }
@@ -4518,6 +4640,11 @@ impl Jterm {
                 }
             }
             Message::JshInstall => self.install_or_update_jsh(),
+            Message::RemotePickerClose => self.remote_picker = None,
+            Message::RemotePickerConnect(index) => {
+                self.remote_picker = None;
+                self.connect_remote_host(index);
+            }
             Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
             Message::AgentClose => self.agent.close(),
             Message::AgentInput(value) => self.agent.input = value,
@@ -4799,6 +4926,13 @@ impl Jterm {
                         if let Some(task) =
                             self.handle_tab_switcher_key(&key, modifiers, text.as_deref())
                         {
+                            return task;
+                        }
+                    }
+                    // The remote host picker owns the keyboard the same way
+                    // (Enter connects, arrows move, Esc/Ctrl+Shift+S dismiss).
+                    if self.remote_picker.is_some() {
+                        if let Some(task) = self.handle_remote_picker_key(&key, modifiers) {
                             return task;
                         }
                     }
@@ -6375,6 +6509,106 @@ impl Jterm {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
+    /// Ctrl+Shift+S remote host picker overlay. Enter/click opens the entry
+    /// in a new session; a host that fails validation is shown with its
+    /// reason rather than hidden, so a config typo is discovered here and not
+    /// by its absence.
+    fn remote_picker_view(&self, selected: usize) -> Element<'_, Message> {
+        let mut list = column![].spacing(2);
+        if self.config.remote_hosts.is_empty() {
+            list = list.push(
+                text(
+                    "No [[remote_hosts]] configured. Add one to config.toml:\n\n                     [[remote_hosts]]\n                     host = \"myubuntu\"\n                     docker = true\n                     deploy = \"incognito\"",
+                )
+                .size(13)
+                .style(text::secondary),
+            );
+        }
+        for (index, host) in self.config.remote_hosts.iter().enumerate() {
+            let transport = if host.docker { "docker" } else { "ssh" };
+            let deploy = if host.deploy.is_empty() {
+                "off"
+            } else {
+                host.deploy.as_str()
+            };
+            match host.validate() {
+                Ok(()) => {
+                    let info = row![
+                        text(format!("{:>2}", index + 1))
+                            .size(12)
+                            .style(text::secondary),
+                        text(host.display_name().to_string()).size(13),
+                        Space::new().width(Length::Fill),
+                        text(format!("{transport} · deploy {deploy}"))
+                            .size(12)
+                            .style(text::secondary),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center);
+                    let accent = self.c_accent();
+                    let highlighted = index == selected;
+                    let body = container(info).width(Length::Fill).padding([3, 8]).style(
+                        move |_t: &iced::Theme| container::Style {
+                            background: if highlighted {
+                                Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                            } else {
+                                None
+                            },
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    list =
+                        list.push(mouse_area(body).on_press(Message::RemotePickerConnect(index)));
+                }
+                Err(problem) => {
+                    list = list.push(
+                        row![
+                            text(host.display_name().to_string())
+                                .size(13)
+                                .style(text::secondary),
+                            Space::new().width(Length::Fill),
+                            text(problem).size(12).style(text::secondary),
+                        ]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
+                    );
+                }
+            }
+        }
+        list = list.push(
+            text("deploy off connects plainly; persist/incognito bring jsh along.")
+                .size(11)
+                .style(text::secondary),
+        );
+
+        let body = column![
+            row![text("🖧").size(16), text("Remote hosts").size(14)]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            list
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(460.0))
+            .max_height(420.0)
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::RemotePickerClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
     /// Ctrl+Shift+H persisted-command history picker overlay (palette-style).
     /// Enter/click types the command into the active pane; nothing executes.
     fn history_picker_view(
@@ -7385,6 +7619,11 @@ impl Jterm {
         };
         let root: Element<'_, Message> = if let Some(s) = &self.history_picker {
             stack![root, self.history_picker_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(selected) = self.remote_picker {
+            stack![root, self.remote_picker_view(selected)].into()
         } else {
             root
         };
