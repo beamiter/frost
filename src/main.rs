@@ -52,8 +52,9 @@ const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.jterm3
 
 /// Height reserved for the tab bar at the top of the window.
 const TAB_BAR_H: f32 = 30.0;
-/// Height reserved for the status bar at the bottom of the window.
-const STATUS_BAR_H: f32 = 22.0;
+/// Height reserved for the status bar at the bottom of the window. The family
+/// constant, so all four jterms reserve the same room for the same bar.
+const STATUS_BAR_H: f32 = jterm_core::bottom_bar::BAR_HEIGHT;
 /// Default width of the file-tree sidebar when shown.
 const SIDEBAR_W: f32 = 220.0;
 /// Drag-resize bounds for the sidebar width.
@@ -67,6 +68,12 @@ const DIVIDER: f32 = 6.0;
 const RESIZE_EDGE: f32 = 5.0;
 /// Hit size of the diagonal resize grips in the window corners.
 const RESIZE_CORNER: f32 = 12.0;
+
+/// Vertical chrome around the terminal area: the always-present tab bar plus
+/// the bottom bar when the `bottom_bar` toggle is on.
+fn chrome_height(bottom_bar: bool) -> f32 {
+    TAB_BAR_H + if bottom_bar { STATUS_BAR_H } else { 0.0 }
+}
 /// Height of the status strip above each pane while split. A single pane has
 /// no strip: the tab bar and status bar already name it, and the row would
 /// only cost a terminal line.
@@ -753,6 +760,7 @@ enum Message {
     SetAllowClipboardRead(bool),
     SetNotifyLongBlocks(bool),
     SetShowRepoStrip(bool),
+    SetBottomBar(bool),
     ThemeEditOpen,
     ThemeEditClose,
     ThemeEditName(String),
@@ -860,11 +868,18 @@ struct Session {
     /// refreshed on the same cadence as `cwd_cache`. Empty/None when the
     /// shell itself is in the foreground so tab labels can hide it.
     fg_proc_cache: Option<String>,
-    /// Formatted git branch/dirty text for `cwd_cache`, refreshed on the same
-    /// cadence (plus once when a command finishes) via the coalesced
-    /// background probe in `jterm_core::git_meta` — the pane header only ever
-    /// reads this cache, so git never runs per frame. None outside a repo.
-    git_strip_cache: Option<String>,
+    /// Git metadata for `cwd_cache`, refreshed on the same cadence (plus once
+    /// when a command finishes) via the coalesced background probe in
+    /// `jterm_core::git_meta` — the pane header and bottom bar only ever read
+    /// this cache, so git never runs per frame. None outside a repo.
+    git_meta_cache: Option<jterm_core::git_meta::RepoMeta>,
+    /// Exit code of the last OSC 133 command that finished in this session,
+    /// retained for the bottom bar. None until a command completes (or when
+    /// the shell omitted the code).
+    last_exit: Option<i32>,
+    /// Wall-clock duration of that command, when the shell reported an
+    /// execution phase.
+    last_duration_ms: Option<u64>,
     /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
     /// short-lived timer drain it without ever stalling iced's UI thread.
     write_queue: std::collections::VecDeque<PtyWriteChunk>,
@@ -941,7 +956,9 @@ impl Session {
             cursor_visible,
             cwd_cache: None,
             fg_proc_cache: None,
-            git_strip_cache: None,
+            git_meta_cache: None,
+            last_exit: None,
+            last_duration_ms: None,
             write_queue: std::collections::VecDeque::new(),
             write_queue_offset: 0,
             queued_write_bytes: 0,
@@ -1004,14 +1021,13 @@ impl Session {
         }
     }
 
-    /// Branch/dirty text for the pane header, probed through the coalesced
-    /// background worker in `jterm_core::git_meta` (bounded UI wait, git runs
-    /// off-thread). Callers cache the result; None outside a repository or
-    /// while `cwd_cache` is unknown.
-    fn git_strip(&self) -> Option<String> {
+    /// Git metadata for the pane header and bottom bar, probed through the
+    /// coalesced background worker in `jterm_core::git_meta` (bounded UI wait,
+    /// git runs off-thread). Callers cache the result; None outside a
+    /// repository or while `cwd_cache` is unknown.
+    fn git_meta(&self) -> Option<jterm_core::git_meta::RepoMeta> {
         let cwd = self.cwd_cache.as_deref()?;
-        let meta = jterm_core::git_meta::read(std::path::Path::new(cwd))?;
-        Some(jterm_core::git_meta::format_strip(&meta))
+        jterm_core::git_meta::read(std::path::Path::new(cwd))
     }
 
     /// Short, human-friendly form of an absolute cwd: "~" for $HOME, just the
@@ -1859,11 +1875,12 @@ impl Jterm {
         request.map_or_else(Task::none, sidebar_load_task)
     }
 
-    /// Terminal area height: window minus the tab bar and status bar. The top bar
-    /// is always reserved (even in side-tab mode, where it hosts the dock toggle)
-    /// so floating chrome never overlaps terminal content.
+    /// Terminal area height: window minus the tab bar and (when enabled) the
+    /// status bar. The top bar is always reserved (even in side-tab mode, where
+    /// it hosts the dock toggle) so floating chrome never overlaps terminal
+    /// content.
     fn term_height(&self) -> f32 {
-        (self.win_size.height - TAB_BAR_H - STATUS_BAR_H).max(0.0)
+        (self.win_size.height - chrome_height(self.config.bottom_bar)).max(0.0)
     }
 
     /// Terminal area width: window minus the sidebar (when shown).
@@ -4410,6 +4427,12 @@ impl Jterm {
                         .collect();
                     notifications = sess.terminal.pending_notifications.drain(..).collect();
                     completed_commands = sess.terminal.take_completed_commands();
+                    // Retain the newest completion for the bottom bar; the
+                    // drain above is the only place finished commands surface.
+                    if let Some(last) = completed_commands.last() {
+                        sess.last_exit = last.exit_code;
+                        sess.last_duration_ms = last.duration_ms;
+                    }
                 }
                 self.last_ingest_us = t0.elapsed().as_micros();
                 self.last_ingest_bytes = data.len();
@@ -4453,11 +4476,14 @@ impl Jterm {
                 }
 
                 // A finished command may have changed branch/dirty state;
-                // re-probe the pane's git strip now instead of waiting for the
+                // re-probe the pane's git meta now instead of waiting for the
                 // next periodic tick (same immediate refresh jterm1 does).
-                if !completed_commands.is_empty() && self.config.show_repo_strip {
+                // Both the pane-header strip and the bottom bar read the cache.
+                if !completed_commands.is_empty()
+                    && (self.config.show_repo_strip || self.config.bottom_bar)
+                {
                     if let Some(sess) = self.session_by_identity(id, fd) {
-                        sess.git_strip_cache = sess.git_strip();
+                        sess.git_meta_cache = sess.git_meta();
                     }
                 }
 
@@ -5523,13 +5549,20 @@ impl Jterm {
             Message::SetShowRepoStrip(show) => {
                 self.config.show_repo_strip = show;
                 // Hide immediately; the periodic tick would otherwise show a
-                // stale strip until the next refresh.
-                if !show {
+                // stale strip until the next refresh. The bottom bar reads the
+                // same cache, so keep it while the bar still wants git.
+                if !show && !self.config.bottom_bar {
                     for sess in self.sessions.iter_mut() {
-                        sess.git_strip_cache = None;
+                        sess.git_meta_cache = None;
                     }
                 }
                 self.config_dirty = true;
+            }
+            Message::SetBottomBar(show) => {
+                self.config.bottom_bar = show;
+                self.config_dirty = true;
+                // The bar's row returns to (or leaves) the grid; resize now.
+                self.apply_config();
             }
             Message::ThemeEditOpen => {
                 // Seed the editor from the current theme; suggest a fresh name so
@@ -5739,19 +5772,16 @@ impl Jterm {
                 // Refresh cwd + foreground-process caches for every session so
                 // tab labels reflect both. These are cheap /proc reads at 1.5s
                 // cadence and let inactive tabs still show "vim · src" etc.
-                // The git strip rides the same cadence; its probe is served by
-                // a coalesced background worker with a bounded wait.
-                let show_repo_strip = self.config.show_repo_strip;
+                // The git meta rides the same cadence; its probe is served by
+                // a coalesced background worker with a bounded wait. Probed
+                // while either consumer (pane header, bottom bar) is on.
+                let want_git = self.config.show_repo_strip || self.config.bottom_bar;
                 for sess in self.sessions.iter_mut() {
                     sess.terminal.check_sync_output_timeout();
                     sess.refresh();
                     sess.cwd_cache = sess.cwd();
                     sess.fg_proc_cache = sess.fg_proc();
-                    sess.git_strip_cache = if show_repo_strip {
-                        sess.git_strip()
-                    } else {
-                        None
-                    };
+                    sess.git_meta_cache = if want_git { sess.git_meta() } else { None };
                 }
                 self.expire_toasts();
             }
@@ -6367,14 +6397,16 @@ impl Jterm {
             let clickable = mouse_area(body).on_press(Message::ToastDismiss(idx));
             col = col.push(clickable);
         }
+        // Sit just above the bottom bar — or the window edge when it's off.
+        let bottom = if self.config.bottom_bar {
+            STATUS_BAR_H + 12.0
+        } else {
+            12.0
+        };
         container(col)
             .align_right(Length::Fill)
             .align_bottom(Length::Fill)
-            .padding(
-                iced::Padding::from(0)
-                    .right(16.0)
-                    .bottom(STATUS_BAR_H + 12.0),
-            )
+            .padding(iced::Padding::from(0).right(16.0).bottom(bottom))
             .into()
     }
 
@@ -6691,84 +6723,51 @@ impl Jterm {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
-    /// Bottom status bar: cwd, grid size, cursor position, and search state.
+    /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
+    /// left; last-command status, grid size, and tab count on the right.
     fn status_bar(&self) -> Element<'_, Message> {
         let sess = self.sessions.get(self.active);
         let cwd = sess
-            .and_then(|s| s.cwd_cache.clone())
-            .map(|p| abbreviate_home(&p))
-            .unwrap_or_default();
-        let (cur_row, cur_col) = sess.map(|s| s.cursor).unwrap_or((0, 0));
+            .and_then(|s| s.cwd_cache.as_deref())
+            .map(std::path::Path::new);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         // Report the active pane's own grid size; when split it differs from the
         // whole-window `self.cols`×`self.rows`.
         let (grid_cols, grid_rows) = sess
             .map(|s| (s.terminal.grid.cols(), s.terminal.grid.rows()))
             .unwrap_or((self.cols, self.rows));
-        let grid = format!("{}×{}", grid_cols, grid_rows);
-        let pos = format!("{}:{}", cur_row + 1, cur_col + 1);
-        let scroll = sess
-            .map(|s| {
-                let prefix = if s.terminal.is_alt_buffer_active() {
-                    "alt "
-                } else {
-                    ""
-                };
-                format!(
-                    "{}{}/{}",
-                    prefix,
-                    s.terminal.scroll_offset,
-                    s.terminal.scrollback_len()
-                )
-            })
-            .unwrap_or_else(|| "0/0".to_string());
+        let snapshot = jterm_core::bottom_bar::Snapshot {
+            cwd,
+            home: home.as_deref(),
+            git: sess.and_then(|s| s.git_meta_cache.as_ref()),
+            running: sess.is_some_and(|s| s.terminal.is_command_running()),
+            last_exit: sess.and_then(|s| s.last_exit),
+            last_duration_ms: sess.and_then(|s| s.last_duration_ms),
+            cols: grid_cols as u16,
+            rows: grid_rows as u16,
+            tab_index: self.active_tab,
+            tab_count: self.tabs.len(),
+        };
+        let content = jterm_core::bottom_bar::compose(&snapshot);
 
-        let dim = self.c_text_dim();
-        let dim_style = move |_t: &iced::Theme| text::Style { color: Some(dim) };
-
-        let mut right = row![
-            text(grid).size(11).style(dim_style),
-            text(pos).size(11).style(dim_style),
-            text(scroll).size(11).style(dim_style),
-        ]
-        .spacing(14)
-        .align_y(iced::Alignment::Center);
-        // Split indicator: which pane is focused, and whether it is zoomed.
-        if self.is_split() {
-            let count = self.layout().leaf_count();
-            let focused = self.focused_pane_pos() + 1;
-            let label = if self.pane_zoomed {
-                format!("⊞ {focused}/{count} zoom")
-            } else {
-                format!("⊞ {focused}/{count}")
-            };
-            let accent = self.c_accent();
-            right = right.push(
-                text(label)
-                    .size(11)
-                    .style(move |_t: &iced::Theme| text::Style {
-                        color: Some(accent),
-                    }),
-            );
-        }
-        if self.search.is_open && !self.search.matches.is_empty() {
-            right = right.push(
-                text(format!(
-                    "{}/{}",
-                    self.search.current_match_index + 1,
-                    self.search.matches.len()
-                ))
+        // One label per segment, colored by its tone — the renderer contract.
+        let segment = |seg: &jterm_core::bottom_bar::Segment| {
+            text(seg.text.clone())
                 .size(11)
-                .style(dim_style),
-            );
+                .color(Theme::rgb_to_color32(seg.tone.color(&self.theme)))
+        };
+        let mut left = row![].spacing(12).align_y(iced::Alignment::Center);
+        for seg in &content.left {
+            left = left.push(segment(seg));
+        }
+        let mut right = row![].spacing(12).align_y(iced::Alignment::Center);
+        for seg in &content.right {
+            right = right.push(segment(seg));
         }
 
-        let bar = row![
-            text(cwd).size(11).style(dim_style),
-            Space::new().width(Length::Fill),
-            right,
-        ]
-        .spacing(14)
-        .align_y(iced::Alignment::Center);
+        let bar = row![left, Space::new().width(Length::Fill), right]
+            .spacing(12)
+            .align_y(iced::Alignment::Center);
         container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(STATUS_BAR_H))
@@ -7390,7 +7389,8 @@ impl Jterm {
         // Branch/dirty strip for the pane's repo, straight from the session
         // cache (refreshed on the periodic tick and after command completion).
         if self.config.show_repo_strip {
-            if let Some(git) = sess.git_strip_cache.as_deref() {
+            if let Some(meta) = sess.git_meta_cache.as_ref() {
+                let git = jterm_core::git_meta::format_strip(meta);
                 line = line.push(text(git).size(11).color(blend(
                     self.c_text_dim(),
                     self.c_accent(),
@@ -7598,12 +7598,11 @@ impl Jterm {
         if let Some(notice) = self.jsh_notice() {
             chrome = chrome.push(notice);
         }
-        let root: Element<'_, Message> = chrome
-            .push(main_area)
-            .push(self.status_bar())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        chrome = chrome.push(main_area);
+        if self.config.bottom_bar {
+            chrome = chrome.push(self.status_bar());
+        }
+        let root: Element<'_, Message> = chrome.width(Length::Fill).height(Length::Fill).into();
         // Tab context menu, tab switcher, history picker, and toasts float
         // above everything so they remain accessible regardless of which
         // other panel is open.
@@ -8105,6 +8104,16 @@ impl Jterm {
                 .into(),
         );
 
+        let bottom_bar_row = responsive_control_row(
+            compact,
+            "Bar",
+            checkbox(self.config.bottom_bar)
+                .label("Bottom status bar (cwd, git, last command)")
+                .text_size(13)
+                .on_toggle(Message::SetBottomBar)
+                .into(),
+        );
+
         // ── AI & Agent ────────────────────────────────────────────────────
         let ai_header = text("AI & Agent").size(15);
         let ai_enable_row = responsive_control_row(
@@ -8256,6 +8265,7 @@ impl Jterm {
             tab_position_row,
             notify_row,
             repo_strip_row,
+            bottom_bar_row,
             ai_header,
             ai_enable_row,
             ai_provider_row,
@@ -9811,15 +9821,26 @@ mod tests {
         let metrics = Metrics::new(10.0, 1.0, 0.0);
         let old_grid = metrics.grid_size(
             old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-            old_viewport.height - TAB_BAR_H - STATUS_BAR_H,
+            old_viewport.height - chrome_height(true),
         );
         let new_grid = metrics.grid_size(
             new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-            new_viewport.height - TAB_BAR_H - STATUS_BAR_H,
+            new_viewport.height - chrome_height(true),
         );
         assert!(new_grid.0 < old_grid.0);
         assert!(new_grid.1 < old_grid.1);
         assert_eq!(new_grid, (98, 29));
+    }
+
+    #[test]
+    fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
+        let metrics = Metrics::new(10.0, 1.0, 0.0);
+        let viewport = Size::new(1200.0, 800.0);
+        let width = viewport.width - terminal_view::SCROLLBAR_WIDTH;
+        let with_bar = metrics.grid_size(width, viewport.height - chrome_height(true));
+        let without_bar = metrics.grid_size(width, viewport.height - chrome_height(false));
+        assert_eq!(with_bar.0, without_bar.0);
+        assert!(without_bar.1 > with_bar.1);
     }
 
     #[test]

@@ -1947,6 +1947,12 @@ impl TerminalState {
         self.pending_completed_commands.drain(..).collect()
     }
 
+    /// True while an OSC 133 execution is in flight (`C` seen, `D` not yet) —
+    /// the bottom bar's "running" state.
+    pub fn is_command_running(&self) -> bool {
+        self.current_command_started_at.is_some()
+    }
+
     /// Plain text of the absolute buffer rows `start..end` (scrollback plus
     /// live grid), soft-wrapped rows joined, per-line trailing padding
     /// trimmed, and the total capped at `max_bytes`.
@@ -4782,6 +4788,9 @@ impl TerminalState {
         self.modes.contains(&1002) || self.modes.contains(&1003)
     }
 
+    /// Only tests read this since the bottom bar dropped its scroll-offset
+    /// item; kept as the public view of the alt-screen mode switch.
+    #[allow(dead_code)]
     pub fn is_alt_buffer_active(&self) -> bool {
         self.use_alt_buffer
     }

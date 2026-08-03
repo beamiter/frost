@@ -262,6 +262,11 @@ pub struct Config {
     #[serde(default = "default_show_repo_strip")]
     pub show_repo_strip: bool,
 
+    /// Show the family-wide bottom status bar (cwd, git, last command, grid
+    /// size, tabs). Same `bottom_bar` key and default in every jterm.
+    #[serde(default = "default_bottom_bar")]
+    pub bottom_bar: bool,
+
     /// Append each OSC 133 completed command to the family-shared JSONL
     /// history index (same keys and file format as jterm1/jterm4), so the
     /// Ctrl+Shift+H picker can recall commands across restarts. Only the
@@ -469,6 +474,10 @@ fn default_show_repo_strip() -> bool {
     true
 }
 
+fn default_bottom_bar() -> bool {
+    jterm_core::bottom_bar::ENABLED_BY_DEFAULT
+}
+
 fn default_command_history_enabled() -> bool {
     true
 }
@@ -527,6 +536,7 @@ impl Default for Config {
             notify_long_blocks: default_notify_long_blocks(),
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: default_show_repo_strip(),
+            bottom_bar: default_bottom_bar(),
             command_history_enabled: default_command_history_enabled(),
             command_history_path: None,
             command_history_max_entries: default_command_history_max_entries(),
@@ -1001,6 +1011,15 @@ mod tests {
         assert!(!config.notify_long_blocks);
         assert_eq!(config.notify_long_block_threshold_ms, 250);
         assert!(!config.show_repo_strip);
+    }
+
+    #[test]
+    fn bottom_bar_defaults_on_and_can_be_disabled() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(config.bottom_bar);
+
+        let config = Config::from_toml("bottom_bar = false\n").expect("override parses");
+        assert!(!config.bottom_bar);
     }
 
     #[test]
