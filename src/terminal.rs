@@ -4819,8 +4819,14 @@ impl TerminalState {
         self.xterm_format_other_keys
     }
 
+    /// True only when the app asked for every key press as an escape code, i.e.
+    /// the Kitty "report all keys" flag (0b1000). Private mode 2031 is *not* a
+    /// keyboard mode — it is the in-band light/dark theme-change notification
+    /// (VTE/foot/contour), which apps such as the Claude CLI enable on startup.
+    /// Treating it as a keyboard mode turned ordinary typing into CSI-u reports
+    /// and lost the shifted form of every character.
     pub fn is_report_all_keys_enabled(&self) -> bool {
-        self.modes.contains(&2031) || (self.keyboard_enhancement_flags & 0b1000) != 0
+        (self.keyboard_enhancement_flags & 0b1000) != 0
     }
 
     pub fn build_paste_event(&mut self, mime_types: &[String]) -> Vec<u8> {
@@ -6681,13 +6687,22 @@ mod tests {
     }
 
     #[test]
-    fn vte_report_all_keys_mode_is_tracked() {
+    fn report_all_keys_follows_the_kitty_flag_not_theme_notifications() {
         let mut terminal = TerminalState::new(8, 2);
 
+        // Mode 2031 is the in-band theme-change notification, not a keyboard
+        // mode: it is tracked, but the keyboard stays in its legacy encoding.
         terminal.process_input(b"\x1b[?2031h");
-        assert!(terminal.is_report_all_keys_enabled());
+        assert!(terminal.modes.contains(&2031));
+        assert!(!terminal.is_report_all_keys_enabled());
 
         terminal.process_input(b"\x1b[?2031l");
+        assert!(!terminal.is_report_all_keys_enabled());
+
+        terminal.process_input(b"\x1b[>8u");
+        assert!(terminal.is_report_all_keys_enabled());
+
+        terminal.process_input(b"\x1b[<u");
         assert!(!terminal.is_report_all_keys_enabled());
     }
 

@@ -9493,7 +9493,7 @@ fn encode_key(
     // committed text on this same key event; there is no second text event to
     // suppress. Skipping an alphanumeric key here would therefore violate
     // Kitty's report-all-keys mode and send plain text instead.
-    if let Some(enc) = kitty_encode_key(key, mods, enh.kitty_flags) {
+    if let Some(enc) = kitty_encode_key(key, mods, text, enh.kitty_flags) {
         return Some(enc);
     }
     if let Some(enc) = xterm_modify_other_keys_encode(
@@ -9672,13 +9672,21 @@ fn kitty_text_key_code(key: &keyboard::Key) -> Option<u32> {
 }
 
 /// Codepoint for the xterm modifyOtherKeys report; like [`kitty_text_key_code`]
-/// but prefers iced's committed text when modifiers changed the character.
+/// but prefers iced's committed text, which carries the character the keyboard
+/// layout actually produced. Shift is not the only way to reach the upper case
+/// form — Caps Lock produces "A" with no modifier set at all — so the committed
+/// text wins whenever no modifier rewrote the key into a control byte.
 fn text_key_code(
     key: &keyboard::Key,
     mods: keyboard::Modifiers,
     text: Option<&str>,
 ) -> Option<u32> {
     let codepoint = kitty_text_key_code(key)?;
+    if !(mods.control() || mods.alt() || mods.logo()) {
+        if let Some(character) = text.and_then(|value| value.chars().find(|c| !c.is_control())) {
+            return Some(character as u32);
+        }
+    }
     if mods.shift() {
         if let Some(character) = text.and_then(|value| value.chars().find(|c| !c.is_control())) {
             return Some(character as u32);
@@ -9714,10 +9722,13 @@ fn keyboard_modifier_value(mods: keyboard::Modifiers) -> u8 {
 fn kitty_encode_key(
     key: &keyboard::Key,
     mods: keyboard::Modifiers,
+    text: Option<&str>,
     kitty_flags: u16,
 ) -> Option<Vec<u8>> {
     let disambiguate = (kitty_flags & 0b1) != 0;
+    let report_alternate_keys = (kitty_flags & 0b100) != 0;
     let report_all_keys = (kitty_flags & 0b1000) != 0;
+    let report_associated_text = (kitty_flags & 0b10000) != 0;
     if !disambiguate && !report_all_keys {
         return None;
     }
@@ -9738,7 +9749,31 @@ fn kitty_encode_key(
     if !should_encode {
         return None;
     }
-    Some(format!("\x1b[{};{}u", codepoint, keyboard_modifier_value(mods)).into_bytes())
+    // The key code is always the unshifted key, so the shifted character has to
+    // travel in the fields the app asked for: the alternate-key field (flag 4)
+    // and/or the associated-text field (flag 16). Without them an app in
+    // report-all-keys mode has to derive the case itself.
+    let committed = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+    let mut key_field = codepoint.to_string();
+    if report_alternate_keys && mods.shift() {
+        if let Some(shifted) = committed
+            .and_then(|t| t.chars().next())
+            .map(u32::from)
+            .filter(|shifted| *shifted != codepoint)
+        {
+            key_field = format!("{codepoint}:{shifted}");
+        }
+    }
+    let mut sequence = format!("\x1b[{};{}", key_field, keyboard_modifier_value(mods));
+    if report_associated_text {
+        if let Some(t) = committed {
+            let codepoints: Vec<String> = t.chars().map(|c| u32::from(c).to_string()).collect();
+            sequence.push(';');
+            sequence.push_str(&codepoints.join(":"));
+        }
+    }
+    sequence.push('u');
+    Some(sequence.into_bytes())
 }
 
 /// Encode a key press under xterm's modifyOtherKeys/formatOtherKeys regime.
@@ -9753,13 +9788,17 @@ fn xterm_modify_other_keys_encode(
     let codepoint = text_key_code(key, mods, text)?;
     let modifier_value = keyboard_modifier_value(mods);
     let has_non_shift_modifier = mods.control() || mods.alt() || mods.logo();
+    // xterm builds these reports for keys "modified by Control-, Alt- or
+    // Meta-modifiers" — Shift is not one of them, because a shifted printable
+    // key already produced its own character. Escaping Shift at level 2 turned
+    // every capital letter into a CSI report the app had not asked for.
     let should_encode = if report_all_keys {
         true
     } else {
         match modify_other_keys {
             0 => false,
             1 => mods.alt() || mods.logo(),
-            2 => has_non_shift_modifier || mods.shift(),
+            2 => has_non_shift_modifier,
             _ => true,
         }
     };
@@ -10479,6 +10518,8 @@ mod tests {
 
     #[test]
     fn modify_other_keys_handles_shifted_text_and_level_three() {
+        // Shift alone already produced the character, so xterm leaves it as
+        // text at level 2 — only Ctrl/Alt/Meta build a report.
         let shifted_symbol = encode_key(
             &keyboard::Key::Character("1".into()),
             keyboard::Location::Standard,
@@ -10490,7 +10531,20 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(shifted_symbol.as_deref(), Some(&b"\x1b[27;2;33~"[..]));
+        assert_eq!(shifted_symbol.as_deref(), Some(&b"!"[..]));
+
+        let ctrl_shifted_symbol = encode_key(
+            &keyboard::Key::Character("1".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            Some("!"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctrl_shifted_symbol.as_deref(), Some(&b"\x1b[27;6;33~"[..]));
 
         let shifted_tab = encode_key(
             &keyboard::Key::Named(Named::Tab),
@@ -10503,7 +10557,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(shifted_tab.as_deref(), Some(&b"\x1b[27;2;9~"[..]));
+        assert_eq!(shifted_tab.as_deref(), Some(&b"\x1b[Z"[..]));
 
         let unmodified_level_three = encode_key(
             &keyboard::Key::Character("x".into()),
@@ -10520,6 +10574,99 @@ mod tests {
             unmodified_level_three.as_deref(),
             Some(&b"\x1b[27;1;120~"[..])
         );
+    }
+
+    /// The Claude CLI enables private mode 2031 (in-band theme-change
+    /// notification) on startup. It must not put the keyboard into any enhanced
+    /// mode: every capital letter reached the app as a CSI report carrying the
+    /// unshifted codepoint, so typing "This" produced "this".
+    #[test]
+    fn theme_notification_mode_leaves_capital_letters_as_text() {
+        let mut terminal = terminal::TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b[?2031h");
+        assert!(!terminal.is_report_all_keys_enabled());
+
+        let enh = KeyboardEnhancements {
+            kitty_flags: terminal.keyboard_enhancement_flags(),
+            modify_other_keys: terminal.xterm_modify_other_keys(),
+            format_other_keys: terminal.xterm_format_other_keys(),
+            report_all_keys: terminal.is_report_all_keys_enabled(),
+            application_keypad: terminal.is_application_keypad(),
+        };
+
+        let shifted = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T"),
+            false,
+            enh,
+        );
+        assert_eq!(shifted.as_deref(), Some(&b"T"[..]));
+
+        // Caps Lock reports no modifier at all; only the committed text says
+        // the key produced an upper case character.
+        let caps_lock = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("T"),
+            false,
+            enh,
+        );
+        assert_eq!(caps_lock.as_deref(), Some(&b"T"[..]));
+    }
+
+    /// Under Kitty's report-all-keys mode the key code is the *unshifted* key,
+    /// so the shifted character only survives in the alternate-key (flag 4) and
+    /// associated-text (flag 16) fields the app opted into.
+    #[test]
+    fn kitty_reports_the_shifted_character_when_the_app_asks_for_it() {
+        let base = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b1000,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(base.as_deref(), Some(&b"\x1b[116;2u"[..]));
+
+        let alternate_and_text = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            alternate_and_text.as_deref(),
+            Some(&b"\x1b[116:84;2;84u"[..])
+        );
+
+        // Ctrl+letter commits a control byte, which is never "associated text".
+        let ctrl_letter = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            Some("\u{14}"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctrl_letter.as_deref(), Some(&b"\x1b[116;5u"[..]));
     }
 
     #[test]
