@@ -267,6 +267,12 @@ pub struct Config {
     #[serde(default = "default_bottom_bar")]
     pub bottom_bar: bool,
 
+    /// A plain click in the terminal places the shell's edit cursor there.
+    /// Same `click_moves_cursor` key and default in every jterm; the move
+    /// itself is computed by `jterm_core::click_cursor`.
+    #[serde(default = "default_click_moves_cursor")]
+    pub click_moves_cursor: bool,
+
     /// Append each OSC 133 completed command to the family-shared JSONL
     /// history index (same keys and file format as jterm1/jterm4), so the
     /// Ctrl+Shift+H picker can recall commands across restarts. Only the
@@ -478,6 +484,10 @@ fn default_bottom_bar() -> bool {
     jterm_core::bottom_bar::ENABLED_BY_DEFAULT
 }
 
+fn default_click_moves_cursor() -> bool {
+    jterm_core::click_cursor::ENABLED_BY_DEFAULT
+}
+
 fn default_command_history_enabled() -> bool {
     true
 }
@@ -537,6 +547,7 @@ impl Default for Config {
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: default_show_repo_strip(),
             bottom_bar: default_bottom_bar(),
+            click_moves_cursor: default_click_moves_cursor(),
             command_history_enabled: default_command_history_enabled(),
             command_history_path: None,
             command_history_max_entries: default_command_history_max_entries(),
@@ -1014,6 +1025,15 @@ mod tests {
     }
 
     #[test]
+    fn click_moves_cursor_defaults_on_and_can_be_disabled() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(config.click_moves_cursor);
+
+        let config = Config::from_toml("click_moves_cursor = false\n").expect("override parses");
+        assert!(!config.click_moves_cursor);
+    }
+
+    #[test]
     fn bottom_bar_defaults_on_and_can_be_disabled() {
         let config = Config::from_toml("").expect("empty config parses");
         assert!(config.bottom_bar);
@@ -1031,7 +1051,11 @@ mod tests {
         assert!(!config.ai_stream);
     }
 
-    fn remote_host(name: &str, host: &str, docker: bool) -> jterm_core::jsh_remote::RemoteHostConfig {
+    fn remote_host(
+        name: &str,
+        host: &str,
+        docker: bool,
+    ) -> jterm_core::jsh_remote::RemoteHostConfig {
         jterm_core::jsh_remote::RemoteHostConfig {
             name: name.to_string(),
             host: host.to_string(),

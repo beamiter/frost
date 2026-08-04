@@ -1,5 +1,6 @@
 use crate::theme::ThemeExt as _;
 pub(crate) use jterm_core::char_width;
+use jterm_core::click_cursor;
 use jterm_core::pane_layout::{
     self, collect_pane_rects, directional_focus_target, equalize_shares, normalized_shares,
     set_divider_share, split_node_rect, Axis, DividerId, PaneDirection, PaneRect, PaneTree,
@@ -1291,6 +1292,9 @@ struct Jterm {
     rows: usize,
     focused: bool,
     modifiers: keyboard::Modifiers,
+    /// Tells a plain click apart from the start of a selection drag, so only
+    /// the former places the shell's edit cursor.
+    click_tracker: jterm_core::click_cursor::ClickTracker,
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
     symbol_mono: Option<iced::Font>,
@@ -1493,6 +1497,7 @@ impl Jterm {
             rows,
             focused: true,
             modifiers: keyboard::Modifiers::default(),
+            click_tracker: jterm_core::click_cursor::ClickTracker::default(),
             mono,
             cjk_mono,
             symbol_mono,
@@ -3732,6 +3737,42 @@ impl Jterm {
     fn handle_mouse(&mut self, input: MouseInput) -> Task<Message> {
         let shift = self.modifiers.shift();
         let speed = self.config.scroll_speed.max(1) as isize;
+        // Click-to-place-cursor acts on release, so that a drag which happens
+        // to select nothing does not also walk the shell's cursor. The tracker
+        // is fed here, before the session borrow below.
+        let click_moves_cursor = self.config.click_moves_cursor;
+        let clicked_cell = match input {
+            MouseInput::Press {
+                col,
+                row,
+                button,
+                alt,
+                count,
+                ..
+            } => {
+                let plain = button == MouseButton::Left
+                    && count == 1
+                    && !alt
+                    && !shift
+                    && !self.modifiers.control();
+                self.click_tracker
+                    .press(click_cursor::Cell::new(row as i64, col as i64), plain);
+                None
+            }
+            MouseInput::Drag { col, row, .. } => {
+                self.click_tracker
+                    .pointer_at(click_cursor::Cell::new(row as i64, col as i64));
+                None
+            }
+            MouseInput::Release {
+                button: MouseButton::Left,
+                ..
+            } => self.click_tracker.release(),
+            _ => {
+                self.click_tracker.cancel();
+                None
+            }
+        };
         // Ctrl+Click opens a detected link, taking precedence over selection
         // and app mouse reporting.
         if let MouseInput::Press {
@@ -3833,6 +3874,18 @@ impl Jterm {
                 if button == MouseButton::Left {
                     if let Some(text) = sess.terminal.copy_selection().filter(|t| !t.is_empty()) {
                         return iced::clipboard::write_primary(text);
+                    }
+                    // Nothing was selected, so this was a plain click. Place the
+                    // shell's edit cursor where it landed.
+                    if let Some(cell) = clicked_cell {
+                        let bytes = sess.terminal.click_cursor_move(
+                            cell.row.max(0) as usize,
+                            cell.col.max(0) as usize,
+                            click_moves_cursor,
+                        );
+                        if !bytes.is_empty() {
+                            sess.write_pty(&bytes);
+                        }
                     }
                 }
             }

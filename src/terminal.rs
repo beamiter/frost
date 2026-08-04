@@ -1,5 +1,6 @@
 use crate::kitty_graphics::KittyGraphicsState;
 use base64::Engine;
+use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -4803,6 +4804,111 @@ impl TerminalState {
         self.modes.contains(&1)
     }
 
+    /// How much of the shell's work this terminal can actually see.
+    fn shell_phase(&self) -> click_cursor::ShellPhase {
+        match self.current_zone_state {
+            ZoneState::CommandStarted(_, _) => click_cursor::ShellPhase::Editing,
+            ZoneState::OutputStarted(_, _, _) => click_cursor::ShellPhase::Running,
+            // A shell without OSC 133 integration never leaves `Idle`. Staying
+            // `Unknown` keeps the feature working under plain bash.
+            ZoneState::Idle | ZoneState::PromptStarted(_) => click_cursor::ShellPhase::Unknown,
+        }
+    }
+
+    /// The cells a click is allowed to travel over: the whole soft-wrapped
+    /// logical line the cursor sits on, ending one past its last character.
+    ///
+    /// The prompt is inside this span. That is deliberate — clicking it means
+    /// "go to the start of the line", and a line editor ignores the extra
+    /// `Left`s once the buffer start is reached. The *end* is what has to be
+    /// exact: a `Right` past the buffer end is what accepts jsh's inline
+    /// suggestion.
+    fn editable_span(&self) -> Option<click_cursor::InputSpan> {
+        let rows = self.grid.rows();
+        let cols = self.grid.cols();
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+
+        let cursor_row = self.cursor_row.min(rows - 1);
+        let mut first = cursor_row;
+        while first > 0 && self.grid.row_wrapped[first - 1] {
+            first -= 1;
+        }
+        let mut last = cursor_row;
+        while last + 1 < rows && self.grid.row_wrapped[last] {
+            last += 1;
+        }
+
+        let mut end = click_cursor::Cell::new(first as i64, 0);
+        'scan: for row in (first..=last).rev() {
+            for col in (0..cols).rev() {
+                let cell = self.grid.get(row, col);
+                // A wide character's continuation cell holds a blank but is
+                // still occupied, so trailing CJK must not be trimmed away.
+                if cell.flags.wide_continuation()
+                    || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
+                {
+                    end = click_cursor::Cell::new(row as i64, col as i64 + 1);
+                    break 'scan;
+                }
+            }
+        }
+
+        // Trailing spaces the user typed are part of the buffer even though the
+        // scan above cannot tell them from padding, so never place the end
+        // before where the shell has its cursor.
+        let cursor = click_cursor::Cell::new(cursor_row as i64, self.cursor_col as i64);
+        if (end.row, end.col) < (cursor.row, cursor.col) {
+            end = cursor;
+        }
+
+        Some(click_cursor::InputSpan {
+            start: click_cursor::Cell::new(first as i64, 0),
+            end,
+        })
+    }
+
+    /// Arrow-key bytes that walk the shell's line editor to a clicked cell, or
+    /// nothing when this click must not move it.
+    ///
+    /// `click_row`/`click_col` are viewport coordinates, which only line up
+    /// with the grid while the scrollback is at the bottom — the
+    /// `scrolled_back` guard is what makes that assumption safe.
+    pub fn click_cursor_move(&self, click_row: usize, click_col: usize, enabled: bool) -> Vec<u8> {
+        let guards = click_cursor::Guards {
+            enabled,
+            mouse_reporting: self.is_mouse_enabled(),
+            alt_screen: self.use_alt_buffer,
+            scrolled_back: self.scroll_offset != 0,
+            phase: self.shell_phase(),
+        };
+        if !click_cursor::click_may_move_cursor(&guards) {
+            return Vec::new();
+        }
+
+        let columns = self.grid.cols() as i64;
+        let cursor = click_cursor::Cell::new(self.cursor_row as i64, self.cursor_col as i64);
+        let click = click_cursor::Cell::new(click_row as i64, click_col as i64);
+        let Some(target) = click_cursor::target_cell(cursor, click, columns, self.editable_span())
+        else {
+            return Vec::new();
+        };
+
+        let steps = click_cursor::char_steps(cursor, target, columns, |row, col| {
+            row >= 0
+                && col >= 0
+                && (row as usize) < self.grid.rows()
+                && (col as usize) < self.grid.cols()
+                && self
+                    .grid
+                    .get(row as usize, col as usize)
+                    .flags
+                    .wide_continuation()
+        });
+        click_cursor::arrow_bytes(steps, self.is_application_cursor_keys())
+    }
+
     pub fn is_application_keypad(&self) -> bool {
         self.modes.contains(&66)
     }
@@ -7287,5 +7393,111 @@ mod tests {
         expected_down.push(history);
         assert_eq!(down, expected_down);
         assert_eq!(terminal.scroll_offset, 0);
+    }
+
+    // --- click-to-place-cursor --------------------------------------------
+    //
+    // The arithmetic lives in `jterm_core::click_cursor`; what these pin is the
+    // terminal's half of the contract — which cells count as the editable span,
+    // and which states refuse the click outright.
+
+    /// A prompt with `cmd` typed at it and the cursor left at the end.
+    fn terminal_at_prompt(cols: usize, rows: usize, cmd: &str) -> super::TerminalState {
+        let mut terminal = super::TerminalState::new(cols, rows);
+        terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\");
+        terminal.process_input(cmd.as_bytes());
+        terminal
+    }
+
+    #[test]
+    fn a_click_left_of_the_cursor_walks_back_to_it() {
+        let terminal = terminal_at_prompt(32, 4, "echo hello");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 12));
+        assert_eq!(
+            terminal.click_cursor_move(0, 7, true),
+            b"\x1b[D".repeat(5),
+            "five characters back from the end of `hello`"
+        );
+    }
+
+    #[test]
+    fn a_click_past_the_command_stops_at_its_end() {
+        // The dangerous direction: in jsh a `Right` at end-of-buffer accepts
+        // the inline suggestion, so clicking the empty space after a command
+        // must not spend a single extra arrow.
+        let mut terminal = terminal_at_prompt(32, 4, "echo hi");
+        assert!(terminal.click_cursor_move(0, 30, true).is_empty());
+
+        terminal.process_input(b"\x1b[D\x1b[D\x1b[D");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 6));
+        assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(3));
+    }
+
+    #[test]
+    fn a_click_on_the_prompt_goes_to_the_start_of_the_line() {
+        let terminal = terminal_at_prompt(32, 4, "ls");
+        assert_eq!(terminal.click_cursor_move(0, 0, true), b"\x1b[D".repeat(4));
+    }
+
+    #[test]
+    fn a_click_follows_a_soft_wrap_onto_the_previous_row() {
+        // 10 columns: "$ " plus 12 characters wraps onto a second row.
+        let terminal = terminal_at_prompt(10, 4, "abcdefghijkl");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 4));
+        assert_eq!(terminal.click_cursor_move(0, 4, true), b"\x1b[D".repeat(10));
+    }
+
+    #[test]
+    fn wide_characters_cost_one_arrow_each() {
+        let terminal = terminal_at_prompt(32, 4, "echo 你好世界");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 15));
+        assert_eq!(
+            terminal.click_cursor_move(0, 7, true),
+            b"\x1b[D".repeat(4),
+            "four characters, not the eight cells they cover"
+        );
+    }
+
+    #[test]
+    fn a_disabled_config_sends_nothing() {
+        let terminal = terminal_at_prompt(32, 4, "echo hello");
+        assert!(terminal.click_cursor_move(0, 7, false).is_empty());
+    }
+
+    #[test]
+    fn a_running_command_keeps_the_click() {
+        let mut terminal = terminal_at_prompt(32, 4, "less big.log");
+        terminal.process_input(b"\x1b]133;C\x1b\\");
+        assert!(terminal.click_cursor_move(0, 7, true).is_empty());
+    }
+
+    #[test]
+    fn mouse_reporting_and_the_alternate_screen_keep_the_click() {
+        let mut terminal = terminal_at_prompt(32, 4, "echo hello");
+        terminal.process_input(b"\x1b[?1000h");
+        assert!(terminal.click_cursor_move(0, 7, true).is_empty());
+        terminal.process_input(b"\x1b[?1000l");
+        assert!(!terminal.click_cursor_move(0, 7, true).is_empty());
+
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(terminal.click_cursor_move(0, 7, true).is_empty());
+    }
+
+    #[test]
+    fn scrolled_back_clicks_are_history_not_input() {
+        let mut terminal = terminal_at_prompt(20, 3, "echo hello");
+        terminal.process_input(b"\r\nfiller\r\nfiller\r\nfiller\r\n");
+        terminal.scroll_offset = 1;
+        assert!(
+            terminal.click_cursor_move(0, 3, true).is_empty(),
+            "viewport rows no longer line up with grid rows"
+        );
+    }
+
+    #[test]
+    fn application_cursor_keys_switch_the_arrow_encoding() {
+        let mut terminal = terminal_at_prompt(32, 4, "echo hello");
+        terminal.process_input(b"\x1b[?1h");
+        assert_eq!(terminal.click_cursor_move(0, 11, true), b"\x1bOD".to_vec());
     }
 }
