@@ -1031,6 +1031,53 @@ mod tests {
         assert!(!config.ai_stream);
     }
 
+    fn remote_host(name: &str, host: &str, docker: bool) -> jterm_core::jsh_remote::RemoteHostConfig {
+        jterm_core::jsh_remote::RemoteHostConfig {
+            name: name.to_string(),
+            host: host.to_string(),
+            user: None,
+            docker,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            ssh_args: Vec::new(),
+            deploy: "persist".to_string(),
+            deploy_artifact: None,
+        }
+    }
+
+    #[test]
+    fn remote_hosts_survive_serialization_and_editing() {
+        let mut ssh = remote_host("dev", "dev.example.com", false);
+        ssh.user = Some("yj".to_string());
+        ssh.ssh_args = vec!["-p".to_string(), "22".to_string()];
+        let container = remote_host("myubuntu", "myubuntu", true);
+
+        let round_trip = |config: &Config| -> Config {
+            let bytes = config.serialized().expect("serialize config");
+            Config::from_toml(std::str::from_utf8(&bytes).expect("config is UTF-8"))
+                .expect("reparse serialized config")
+        };
+
+        let mut config = Config {
+            remote_hosts: vec![ssh.clone(), container.clone()],
+            ..Config::default()
+        };
+        assert_eq!(
+            round_trip(&config).remote_hosts,
+            [ssh, container.clone()],
+            "hosts must persist verbatim; normalized() leaves them untouched"
+        );
+
+        // The settings editor appends a template and deletes by index; the
+        // survivors keep their order and content across a save/reload.
+        config.remote_hosts.push(remote_host("", "new-box", false));
+        config.remote_hosts.remove(0);
+        let reloaded = round_trip(&config).remote_hosts;
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded[0], container);
+        assert_eq!(reloaded[1].host, "new-box");
+    }
+
     #[test]
     fn command_history_defaults_match_the_family() {
         let config = Config::from_toml("").expect("empty config parses");

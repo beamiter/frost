@@ -254,18 +254,25 @@ ssh destination or a running container, and choosing one opens it in a new
 session:
 
 ```toml
+# An ssh destination…
+[[remote_hosts]]
+name = "dev"
+host = "dev.example.com"
+user = "yj"
+deploy = "persist"
+ssh_args = ["-p", "22"]
+
+# …and a running container, reached with docker exec.
 [[remote_hosts]]
 name = "myubuntu"
 host = "myubuntu"
 docker = true
-deploy = "incognito"
-
-[[remote_hosts]]
-host = "dev.example.com"
-user = "yj"
-ssh_args = ["-p", "2222"]
 deploy = "persist"
 ```
+
+The settings panel (Ctrl+Shift+O) has a Remote hosts section that adds,
+edits and removes these entries in place; changes auto-save into the same
+`[[remote_hosts]]` tables.
 
 `deploy = "off"` (the default) connects plainly and runs `remote_shell`
 (default `jsh`) as found on the destination. `"persist"` and `"incognito"`

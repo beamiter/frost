@@ -647,6 +647,15 @@ enum Message {
     RemotePickerClose,
     /// Open the picked [[remote_hosts]] entry in a new session.
     RemotePickerConnect(usize),
+    /// Per-field edits of the indexed [[remote_hosts]] entry from Settings.
+    RemoteHostName(usize, String),
+    RemoteHostHost(usize, String),
+    RemoteHostUser(usize, String),
+    RemoteHostDocker(usize, bool),
+    RemoteHostDeploy(usize, String),
+    /// Append a template [[remote_hosts]] entry for in-place editing.
+    RemoteHostAdd,
+    RemoteHostRemove(usize),
     /// Hide the jsh notice until the next launch.
     JshNoticeDismiss,
     SetAiEnabled(bool),
@@ -4671,6 +4680,62 @@ impl Jterm {
                 self.remote_picker = None;
                 self.connect_remote_host(index);
             }
+            Message::RemoteHostName(index, name) => {
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    host.name = name;
+                    self.config_dirty = true;
+                }
+            }
+            Message::RemoteHostHost(index, value) => {
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    host.host = value;
+                    self.config_dirty = true;
+                }
+            }
+            Message::RemoteHostUser(index, user) => {
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    // Blank clears the login/exec user rather than storing "".
+                    host.user = Some(user).filter(|u| !u.trim().is_empty());
+                    self.config_dirty = true;
+                }
+            }
+            Message::RemoteHostDocker(index, docker) => {
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    host.docker = docker;
+                    self.config_dirty = true;
+                }
+            }
+            Message::RemoteHostDeploy(index, deploy) => {
+                if let Some(host) = self.config.remote_hosts.get_mut(index) {
+                    host.deploy = deploy;
+                    self.config_dirty = true;
+                }
+            }
+            Message::RemoteHostAdd => {
+                // Template the inline editor fills in. deploy "persist" so a
+                // fresh host brings jsh along by default; validation stays
+                // advisory until the host field is typed.
+                self.config
+                    .remote_hosts
+                    .push(jterm_core::jsh_remote::RemoteHostConfig {
+                        name: String::new(),
+                        host: String::new(),
+                        user: None,
+                        docker: false,
+                        remote_shell: "jsh".to_string(),
+                        session: None,
+                        ssh_args: Vec::new(),
+                        deploy: "persist".to_string(),
+                        deploy_artifact: None,
+                    });
+                self.config_dirty = true;
+            }
+            Message::RemoteHostRemove(index) => {
+                if index < self.config.remote_hosts.len() {
+                    self.config.remote_hosts.remove(index);
+                    self.config_dirty = true;
+                }
+            }
             Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
             Message::AgentClose => self.agent.close(),
             Message::AgentInput(value) => self.agent.input = value,
@@ -6550,7 +6615,7 @@ impl Jterm {
         if self.config.remote_hosts.is_empty() {
             list = list.push(
                 text(
-                    "No [[remote_hosts]] configured. Add one to config.toml:\n\n                     [[remote_hosts]]\n                     host = \"myubuntu\"\n                     docker = true\n                     deploy = \"incognito\"",
+                    "No [[remote_hosts]] configured. Add one in Settings (Ctrl+Shift+O, Remote hosts) or in config.toml:\n\n[[remote_hosts]]  # ssh\nname = \"dev\"\nhost = \"dev.example.com\"\nuser = \"yj\"\ndeploy = \"persist\"\nssh_args = [\"-p\", \"22\"]\n\n[[remote_hosts]]  # running container\nname = \"myubuntu\"\nhost = \"myubuntu\"\ndocker = true\ndeploy = \"persist\"",
                 )
                 .size(13)
                 .style(text::secondary),
@@ -8231,6 +8296,97 @@ impl Jterm {
             .into(),
         );
 
+        // ── Remote hosts ──────────────────────────────────────────────────
+        // Edited in place; entries ride the same auto-save as every other
+        // setting. Validation is live but advisory — editing and saving are
+        // never blocked, and the Ctrl+Shift+S picker shows the same reason
+        // for an entry it refuses to open.
+        let mut remote_hosts_section = column![text("Remote hosts").size(15)].spacing(8);
+        if self.config.remote_hosts.is_empty() {
+            remote_hosts_section = remote_hosts_section.push(
+                text("None configured. Ctrl+Shift+S opens the picker once a host is added.")
+                    .size(12)
+                    .style(text::secondary),
+            );
+        }
+        for (i, host) in self.config.remote_hosts.iter().enumerate() {
+            let transport = if host.docker { "docker" } else { "ssh" };
+            let deploy = if host.deploy.is_empty() {
+                "off"
+            } else {
+                host.deploy.as_str()
+            };
+            let header = row![
+                text(host.display_name().to_string()).size(13),
+                Space::new().width(Length::Fill),
+                text(format!("{transport} · deploy {deploy}"))
+                    .size(12)
+                    .style(text::secondary),
+                button(text("Delete").size(12))
+                    .on_press(Message::RemoteHostRemove(i))
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+            let name_input = text_input("display name", &host.name)
+                .on_input(move |s| Message::RemoteHostName(i, s))
+                .size(13);
+            let host_placeholder = if host.docker {
+                "container name"
+            } else {
+                "ssh host"
+            };
+            let host_input = text_input(host_placeholder, &host.host)
+                .on_input(move |s| Message::RemoteHostHost(i, s))
+                .size(13);
+            let user_input = text_input("user (optional)", host.user.as_deref().unwrap_or(""))
+                .on_input(move |s| Message::RemoteHostUser(i, s))
+                .size(13);
+            let docker_box = checkbox(host.docker)
+                .label("docker")
+                .text_size(13)
+                .on_toggle(move |v| Message::RemoteHostDocker(i, v));
+            let deploy_pick = pick_list(
+                vec![
+                    "off".to_string(),
+                    "persist".to_string(),
+                    "incognito".to_string(),
+                ],
+                Some(deploy.to_string()),
+                move |v| Message::RemoteHostDeploy(i, v),
+            )
+            .text_size(13)
+            .width(Length::Fixed(110.0));
+            let toggles = row![docker_box, deploy_pick]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
+            let fields: Element<'_, Message> = if compact {
+                column![name_input, host_input, user_input, toggles]
+                    .spacing(6)
+                    .into()
+            } else {
+                column![
+                    row![name_input, host_input].spacing(8),
+                    row![user_input, toggles].spacing(10),
+                ]
+                .spacing(6)
+                .into()
+            };
+            let mut entry = column![header, fields].spacing(6);
+            if let Err(problem) = host.validate() {
+                entry = entry.push(text(problem).size(11).style(text::danger));
+            }
+            remote_hosts_section = remote_hosts_section.push(
+                container(entry)
+                    .width(Length::Fill)
+                    .padding([6, 8])
+                    .style(container::bordered_box),
+            );
+        }
+        remote_hosts_section = remote_hosts_section
+            .push(button(text("Add host").size(13)).on_press(Message::RemoteHostAdd));
+
         let buttons = row![
             button(text("Save").size(13)).on_press(Message::ConfigSave),
             button(text("Reset").size(13))
@@ -8278,6 +8434,7 @@ impl Jterm {
             ai_redact_row,
             ai_stream_row,
             agent_turns_row,
+            remote_hosts_section,
             buttons,
             footer,
         ]
