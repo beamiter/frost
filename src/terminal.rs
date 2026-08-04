@@ -802,14 +802,26 @@ pub struct ClipboardReadRequest {
     pub kind: ClipboardReadKind,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct CommandZone {
+    /// Stable per-terminal identity. Zone *indices* shift whenever scrollback
+    /// trimming drops old zones, so anything that remembers a zone across
+    /// frames (block selection) must key on this instead.
+    pub id: u64,
     pub prompt_start: usize,
     pub command_start: Option<usize>,
     pub output_start: Option<usize>,
     pub output_end: Option<usize>,
     pub exit_code: Option<i32>,
+    /// The executed command line; `None` for background zones (empty prompt).
+    pub command: Option<String>,
+    /// Wall-clock run time from OSC 133 `C` to `D`; `None` without a `C`.
+    pub duration_ms: Option<u64>,
+    /// Unix wall-clock milliseconds when `D` arrived. Captured now so restored
+    /// or future UI (jterm4 shows a block timestamp) has real data; nothing
+    /// renders it yet.
+    #[allow(dead_code)]
+    pub finished_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1071,6 +1083,8 @@ pub struct TerminalState {
 
     // OSC 133 shell integration: command zones for prompt navigation
     pub command_zones: VecDeque<CommandZone>,
+    /// Next [`CommandZone::id`]; monotonic for the life of the terminal.
+    next_zone_id: u64,
     current_zone_state: ZoneState,
     /// Exact cursor column at OSC 133 `B`, after the prompt finished drawing.
     /// The existing zone model stores only rows for navigation; Agent needs
@@ -1282,6 +1296,7 @@ impl TerminalState {
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
             command_zones: VecDeque::new(),
+            next_zone_id: 0,
             current_zone_state: ZoneState::default(),
             current_command_start_col: None,
             current_command_extent_row: None,
@@ -1761,16 +1776,17 @@ impl TerminalState {
                 match self.current_zone_state {
                     ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
                         let zone = CommandZone {
+                            id: 0, // assigned by push_command_zone
                             prompt_start,
                             command_start: Some(cmd_start),
                             output_start: Some(out_start),
                             output_end: Some(absolute_row),
                             exit_code,
+                            command: self.zone_command_text(),
+                            duration_ms,
+                            finished_at_ms: Self::wall_clock_ms(),
                         };
-                        self.command_zones.push_back(zone);
-                        if self.command_zones.len() > 256 {
-                            self.command_zones.pop_front();
-                        }
+                        self.push_command_zone(zone);
                         self.record_completed_command(
                             cmd_start,
                             out_start,
@@ -1785,16 +1801,18 @@ impl TerminalState {
                     }
                     ZoneState::CommandStarted(prompt_start, cmd_start) => {
                         let zone = CommandZone {
+                            id: 0, // assigned by push_command_zone
                             prompt_start,
                             command_start: Some(cmd_start),
                             output_start: None,
                             output_end: Some(absolute_row),
                             exit_code,
+                            command: self.zone_command_text(),
+                            // No `C` means no execution phase: see below.
+                            duration_ms: None,
+                            finished_at_ms: Self::wall_clock_ms(),
                         };
-                        self.command_zones.push_back(zone);
-                        if self.command_zones.len() > 256 {
-                            self.command_zones.pop_front();
-                        }
+                        self.push_command_zone(zone);
                         // Without a `C` the command never reported an execution
                         // phase, so there is no meaningful duration.
                         self.record_completed_command(
@@ -1819,6 +1837,37 @@ impl TerminalState {
             }
             _ => {}
         }
+    }
+
+    /// Append a finished zone, assigning its stable id and enforcing the cap.
+    fn push_command_zone(&mut self, mut zone: CommandZone) {
+        zone.id = self.next_zone_id;
+        self.next_zone_id += 1;
+        self.command_zones.push_back(zone);
+        if self.command_zones.len() > 256 {
+            self.command_zones.pop_front();
+        }
+    }
+
+    /// Command line for a finished zone: the exact text captured at `C`
+    /// (metadata or prompt-row extraction), or `None` when `C` never fired.
+    /// There is deliberately no whole-row fallback: reading raw rows would
+    /// scrape the rendered prompt into the "command" (an empty-prompt Enter
+    /// under bash-preexec-style integrations emits `D` without `C`), turning
+    /// idle prompts into phantom Failed blocks. No `C` means no command, and
+    /// the zone classifies as Background. Blank commands also collapse to
+    /// `None` so a background zone is recognizable as such.
+    fn zone_command_text(&self) -> Option<String> {
+        self.current_command_text
+            .clone()
+            .filter(|command| !command.trim().is_empty())
+    }
+
+    fn wall_clock_ms() -> Option<u64> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_millis() as u64)
     }
 
     /// Keep OSC 133 bookkeeping aligned with the buffer after `count` rows
@@ -1897,6 +1946,56 @@ impl TerminalState {
             None
         } else {
             Some(out)
+        }
+    }
+
+    /// Look up a completed zone by its stable id. `None` when the zone has
+    /// been trimmed away with old scrollback (a stale block selection).
+    pub fn zone_by_id(&self, id: u64) -> Option<&CommandZone> {
+        self.command_zones.iter().find(|zone| zone.id == id)
+    }
+
+    /// Plain text of one zone's output (same trimming and 1 MiB cap as
+    /// [`Self::last_command_output_text`]). `None` when the zone is gone,
+    /// recorded no output range, or the output is blank.
+    pub fn zone_output_text(&self, id: u64) -> Option<String> {
+        const MAX_BYTES: usize = 1 << 20;
+        let zone = self.zone_by_id(id)?;
+        let start = zone.output_start?;
+        let end = zone.output_end.unwrap_or(start);
+        let out = self.rows_text(start, end, MAX_BYTES);
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// The OLDEST completed zone that failed (exit reported and nonzero) —
+    /// "jump to first failed" starts at the earliest failure still in scope.
+    pub fn first_failed_zone(&self) -> Option<&CommandZone> {
+        self.command_zones
+            .iter()
+            .find(|zone| zone.exit_code.is_some_and(|code| code != 0))
+    }
+
+    /// Absolute prompt row of a command currently executing (`C` seen, `D`
+    /// still pending); its block stripe runs from here to the buffer bottom.
+    pub fn running_zone_start(&self) -> Option<usize> {
+        match self.current_zone_state {
+            ZoneState::OutputStarted(prompt_start, _, _) => Some(prompt_start),
+            _ => None,
+        }
+    }
+
+    /// Absolute prompt row of a live prompt still being edited (OSC 133 `A`
+    /// or `B` seen, no `C` yet). Gets a block separator but no stripe.
+    pub fn live_prompt_row(&self) -> Option<usize> {
+        match self.current_zone_state {
+            ZoneState::PromptStarted(prompt_start) | ZoneState::CommandStarted(prompt_start, _) => {
+                Some(prompt_start)
+            }
+            _ => None,
         }
     }
 
@@ -4789,9 +4888,8 @@ impl TerminalState {
         self.modes.contains(&1002) || self.modes.contains(&1003)
     }
 
-    /// Only tests read this since the bottom bar dropped its scroll-offset
-    /// item; kept as the public view of the alt-screen mode switch.
-    #[allow(dead_code)]
+    /// Public view of the alt-screen mode switch; block-mode chrome (and
+    /// tests) read it — a full-screen app owns the whole grid.
     pub fn is_alt_buffer_active(&self) -> bool {
         self.use_alt_buffer
     }
@@ -7302,6 +7400,138 @@ mod tests {
             terminal.process_input(b"fill\r\n");
         }
         assert!(terminal.command_zones.is_empty());
+    }
+
+    #[test]
+    fn zone_state_accessors_expose_the_live_block_boundary() {
+        let mut terminal = TerminalState::new(40, 8);
+        assert_eq!(terminal.running_zone_start(), None);
+        assert_eq!(terminal.live_prompt_row(), None);
+
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        let prompt = terminal.live_prompt_row().expect("prompt started");
+        terminal.process_input(b"\x1b]133;B\x07sleep 5\r\n");
+        assert_eq!(terminal.live_prompt_row(), Some(prompt));
+        assert_eq!(terminal.running_zone_start(), None);
+
+        // `C` flips the block from "editing" to "running": the accent stripe
+        // anchors at the same prompt row until `D` completes the zone.
+        terminal.process_input(b"\x1b]133;C\x07");
+        assert_eq!(terminal.live_prompt_row(), None);
+        assert_eq!(terminal.running_zone_start(), Some(prompt));
+
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.running_zone_start(), None);
+        assert_eq!(terminal.live_prompt_row(), None);
+    }
+
+    #[test]
+    fn command_zones_are_enriched_at_both_push_sites() {
+        let mut terminal = TerminalState::new(40, 8);
+        // Full lifecycle (A/B/C/D): command captured, duration measured.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        // No `C` (empty prompt submit): no output range, no duration.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;D;1\x07");
+
+        assert_eq!(terminal.command_zones.len(), 2);
+        let full = &terminal.command_zones[0];
+        assert_eq!(full.id, 0);
+        assert_eq!(full.command.as_deref(), Some("echo hi"));
+        assert!(full.duration_ms.is_some());
+        assert!(full.finished_at_ms.is_some());
+        assert_eq!(full.exit_code, Some(0));
+
+        let short = &terminal.command_zones[1];
+        assert_eq!(short.id, 1);
+        // Without a `C` the command was never captured; scraping the rows
+        // would swallow the rendered prompt, so the zone carries no command
+        // and classifies as Background regardless of the exit code.
+        assert_eq!(short.command, None);
+        assert_eq!(
+            crate::block_mode::classify(short.command.as_deref(), short.exit_code),
+            crate::block_mode::BlockOutcome::Background
+        );
+        assert_eq!(short.duration_ms, None);
+        assert!(short.finished_at_ms.is_some());
+        assert_eq!(short.exit_code, Some(1));
+    }
+
+    #[test]
+    fn empty_prompt_enter_without_c_is_background_not_a_failed_prompt_scrape() {
+        // bash-preexec-style integrations emit `D` from precmd without a `C`
+        // on every empty-prompt Enter. The rendered prompt must not be
+        // scraped as the zone's command, and the zone must not surface as a
+        // Failed block even when the previous command left a nonzero status.
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;D;1\x07");
+
+        assert_eq!(terminal.command_zones.len(), 1);
+        let zone = &terminal.command_zones[0];
+        assert_eq!(zone.command, None);
+        assert_eq!(zone.exit_code, Some(1));
+        assert_eq!(
+            crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
+            crate::block_mode::BlockOutcome::Background
+        );
+    }
+
+    #[test]
+    fn scrollback_trim_shifts_rows_but_keeps_zone_identity() {
+        const MAX: usize = 8;
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.set_max_scrollback(MAX);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        let survivor = terminal.command_zones[1].clone();
+        assert!(survivor
+            .command
+            .as_deref()
+            .is_some_and(|c| c.contains("cmd1")));
+
+        // Trim exactly past the first zone's prompt row.
+        let fills = (MAX - terminal.scrollback_len()) + terminal.command_zones[0].prompt_start + 1;
+        for _ in 0..fills {
+            terminal.process_input(b"fill\r\n");
+        }
+        assert_eq!(terminal.command_zones.len(), 1);
+        let shifted = &terminal.command_zones[0];
+        // Identity and metadata are untouched; only the rows moved.
+        assert_eq!(shifted.id, survivor.id);
+        assert_eq!(shifted.command, survivor.command);
+        assert_eq!(shifted.duration_ms, survivor.duration_ms);
+        assert_eq!(shifted.finished_at_ms, survivor.finished_at_ms);
+        assert!(shifted.prompt_start < survivor.prompt_start);
+        // Id-keyed lookups survive the index shift; the dropped id is gone.
+        assert!(terminal.zone_by_id(survivor.id).is_some());
+        assert!(terminal.zone_by_id(0).is_none());
+    }
+
+    #[test]
+    fn first_failed_zone_picks_the_oldest_failure() {
+        let mut terminal = TerminalState::new(40, 8);
+        for exit in ["0", "2", "130", "0"] {
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n");
+            terminal
+                .process_input(format!("\x1b]133;C\x07out\r\n\x1b]133;D;{exit}\x07").as_bytes());
+        }
+        let failed = terminal.first_failed_zone().expect("two failures exist");
+        assert_eq!(failed.exit_code, Some(2));
+        assert_eq!(failed.id, 1);
+    }
+
+    #[test]
+    fn zone_output_text_reads_one_zone_by_id() {
+        let mut terminal = TerminalState::new(20, 6);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        let first_id = terminal.command_zones[0].id;
+        assert_eq!(
+            terminal.zone_output_text(first_id).as_deref(),
+            Some("out\nout\nout")
+        );
+        assert_eq!(terminal.zone_output_text(999), None);
     }
 
     #[test]

@@ -273,6 +273,12 @@ pub struct Config {
     #[serde(default = "default_click_moves_cursor")]
     pub click_moves_cursor: bool,
 
+    /// Draw Warp-style command-block chrome over OSC 133 zones: an outcome
+    /// stripe in the left gutter, a separator per prompt, and a first-row
+    /// exit/duration badge. Same `block_mode` key and default as jterm1/4.
+    #[serde(default = "default_block_mode")]
+    pub block_mode: bool,
+
     /// Append each OSC 133 completed command to the family-shared JSONL
     /// history index (same keys and file format as jterm1/jterm4), so the
     /// Ctrl+Shift+H picker can recall commands across restarts. Only the
@@ -488,6 +494,10 @@ fn default_click_moves_cursor() -> bool {
     jterm_core::click_cursor::ENABLED_BY_DEFAULT
 }
 
+fn default_block_mode() -> bool {
+    true
+}
+
 fn default_command_history_enabled() -> bool {
     true
 }
@@ -548,6 +558,7 @@ impl Default for Config {
             show_repo_strip: default_show_repo_strip(),
             bottom_bar: default_bottom_bar(),
             click_moves_cursor: default_click_moves_cursor(),
+            block_mode: default_block_mode(),
             command_history_enabled: default_command_history_enabled(),
             command_history_path: None,
             command_history_max_entries: default_command_history_max_entries(),
@@ -1040,6 +1051,15 @@ mod tests {
 
         let config = Config::from_toml("bottom_bar = false\n").expect("override parses");
         assert!(!config.bottom_bar);
+    }
+
+    #[test]
+    fn block_mode_defaults_on_and_can_be_disabled() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(config.block_mode);
+
+        let config = Config::from_toml("block_mode = false\n").expect("override parses");
+        assert!(!config.block_mode);
     }
 
     #[test]

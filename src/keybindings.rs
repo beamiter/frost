@@ -7,6 +7,9 @@ use std::path::PathBuf;
 const MAX_KEYBINDINGS_BYTES: u64 = 256 * 1024;
 
 /// 所有可用的命令
+// Variant names mirror their `Display` command ids verbatim, even where that
+// ends in "...Command" (block:copy_command / block:recall_command).
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
     // === 会话管理 ===
@@ -39,6 +42,14 @@ pub enum Command {
     TerminalPromptPrev,
     TerminalPromptNext,
     TerminalCopyLastOutput,
+
+    // === 命令块（OSC 133 block mode）===
+    // Unbound by default: ctrl+shift+x (the jterm1/4 chord for jump-first-
+    // failed) already means pane:swap in this repo's defaults.
+    BlockJumpFirstFailed,
+    BlockCopyCommand,
+    BlockCopyOutput,
+    BlockRecallCommand,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -103,6 +114,10 @@ impl std::fmt::Display for Command {
             Command::TerminalPromptPrev => write!(f, "terminal:prompt_prev"),
             Command::TerminalPromptNext => write!(f, "terminal:prompt_next"),
             Command::TerminalCopyLastOutput => write!(f, "terminal:copy_last_output"),
+            Command::BlockJumpFirstFailed => write!(f, "block:jump_first_failed"),
+            Command::BlockCopyCommand => write!(f, "block:copy_command"),
+            Command::BlockCopyOutput => write!(f, "block:copy_output"),
+            Command::BlockRecallCommand => write!(f, "block:recall_command"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -160,6 +175,10 @@ impl std::str::FromStr for Command {
             "terminal:prompt_prev" => Ok(Command::TerminalPromptPrev),
             "terminal:prompt_next" => Ok(Command::TerminalPromptNext),
             "terminal:copy_last_output" => Ok(Command::TerminalCopyLastOutput),
+            "block:jump_first_failed" => Ok(Command::BlockJumpFirstFailed),
+            "block:copy_command" => Ok(Command::BlockCopyCommand),
+            "block:copy_output" => Ok(Command::BlockCopyOutput),
+            "block:recall_command" => Ok(Command::BlockRecallCommand),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -711,6 +730,30 @@ mod tests {
             "literal and named backslash forms must canonicalize identically"
         );
         assert_eq!(bindings.get_command("ctrl+shift+j"), None);
+    }
+
+    #[test]
+    fn block_commands_parse_but_ship_unbound() {
+        for (name, expected) in [
+            ("block:jump_first_failed", Command::BlockJumpFirstFailed),
+            ("block:copy_command", Command::BlockCopyCommand),
+            ("block:copy_output", Command::BlockCopyOutput),
+            ("block:recall_command", Command::BlockRecallCommand),
+        ] {
+            assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
+            assert_eq!(expected.to_string(), name);
+        }
+        // jterm1/4 bind jump-first-failed to ctrl+shift+x, but that chord is
+        // pane:swap here; the block commands therefore have no default chord.
+        let bindings = KeyBindings::default_bindings();
+        assert_eq!(
+            bindings.get_command("ctrl+shift+x"),
+            Some(Command::PaneSwap)
+        );
+        assert!(!bindings
+            .bindings
+            .values()
+            .any(|command| command.starts_with("block:")));
     }
 
     #[test]

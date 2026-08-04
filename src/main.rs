@@ -7,6 +7,7 @@ use jterm_core::pane_layout::{
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
+mod block_mode;
 mod color;
 mod command_palette;
 mod config;
@@ -769,6 +770,7 @@ enum Message {
     SetDisableAltScreen(bool),
     SetAllowClipboardRead(bool),
     SetNotifyLongBlocks(bool),
+    SetBlockMode(bool),
     SetShowRepoStrip(bool),
     SetBottomBar(bool),
     ThemeEditOpen,
@@ -890,6 +892,10 @@ struct Session {
     /// Wall-clock duration of that command, when the shell reported an
     /// execution phase.
     last_duration_ms: Option<u64>,
+    /// Block-mode selection, keyed by [`terminal::CommandZone::id`] so it
+    /// survives scrollback trimming (a trimmed-away zone simply stops
+    /// resolving). Cleared by any non-gutter press or PTY-bound keystroke.
+    selected_block: Option<u64>,
     /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
     /// short-lived timer drain it without ever stalling iced's UI thread.
     write_queue: std::collections::VecDeque<PtyWriteChunk>,
@@ -969,6 +975,7 @@ impl Session {
             git_meta_cache: None,
             last_exit: None,
             last_duration_ms: None,
+            selected_block: None,
             write_queue: std::collections::VecDeque::new(),
             write_queue_offset: 0,
             queued_write_bytes: 0,
@@ -3102,6 +3109,8 @@ impl Jterm {
         // Write raw bytes to the focused session's PTY (control-key commands).
         let mut send = |bytes: &[u8]| {
             if let Some(sess) = self.sessions.get_mut(self.active) {
+                // A PTY-bound keystroke dismisses the block selection.
+                sess.selected_block = None;
                 sess.terminal.scroll_to_bottom();
                 sess.write_pty(bytes);
                 sess.refresh();
@@ -3243,6 +3252,10 @@ impl Jterm {
                 Task::none()
             }
             C::TerminalCopyLastOutput => self.copy_last_output_task(),
+            C::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            C::BlockCopyCommand => self.block_copy_command_task(),
+            C::BlockCopyOutput => self.block_copy_output_task(),
+            C::BlockRecallCommand => self.block_recall_command_task(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(cmd, C::TerminalPromptPrev) {
@@ -3660,6 +3673,10 @@ impl Jterm {
             if !sess.can_queue_user_bytes(paste.bytes.len()) {
                 rejected = true;
             } else {
+                // PTY-bound input dismisses the block selection, same as
+                // `encode_key` and IME commit. Covers every paste flavor
+                // (clipboard, middle-click primary, prompt insert/recall).
+                sess.selected_block = None;
                 sess.terminal.scroll_to_bottom();
                 rejected = !sess.write_pty(&paste.bytes);
                 sess.refresh();
@@ -3731,12 +3748,99 @@ impl Jterm {
         Some(Task::none())
     }
 
+    /// Select the completed block whose row span covers viewport `row` of the
+    /// active session. Returns false (leaving any selection untouched by this
+    /// path) when block mode is off, an alt-screen app owns the grid, or no
+    /// completed block covers the row.
+    fn select_block_at_viewport_row(&mut self, row: usize) -> bool {
+        if !self.config.block_mode {
+            return false;
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return false;
+        };
+        let terminal = &sess.terminal;
+        if terminal.is_alt_buffer_active() {
+            return false;
+        }
+        let abs_row = terminal.viewport_absolute_start() + row;
+        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let live_boundary = terminal
+            .running_zone_start()
+            .or(terminal.live_prompt_row())
+            .unwrap_or(total);
+        let starts: Vec<usize> = terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.prompt_start)
+            .collect();
+        let hit = terminal
+            .command_zones
+            .iter()
+            .zip(block_mode::spans(&starts, live_boundary))
+            .find(|(_, (span_start, span_end))| abs_row >= *span_start && abs_row < *span_end)
+            .map(|(zone, _)| zone.id);
+        match hit {
+            Some(id) => {
+                sess.selected_block = Some(id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Route a grid mouse interaction either to the running application (when it
     /// has enabled mouse reporting and Shift is not held) or to local selection
     /// and scrollback handling.
     fn handle_mouse(&mut self, input: MouseInput) -> Task<Message> {
         let shift = self.modifiers.shift();
         let speed = self.config.scroll_speed.max(1) as isize;
+        // Block selection first: a left press in the stripe gutter selects
+        // the completed block covering that row and consumes the press
+        // entirely (no cursor move, no selection anchor). The widget never
+        // arms the drag pipeline for a gutter press — no Drag/Release will
+        // follow — so a gutter press is always consumed here. Any other
+        // press clears the block selection.
+        if let MouseInput::Press {
+            gutter,
+            row,
+            button,
+            ..
+        } = input
+        {
+            if gutter && button == MouseButton::Left {
+                // The widget already refuses to classify presses as gutter
+                // while the app owns the mouse, but reporting may have been
+                // enabled between render and press. In that race, forwarding
+                // the press would send the app a press with no matching
+                // release (the widget armed no drag pipeline), so drop the
+                // click instead of hijacking or half-forwarding it.
+                let reporting = self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|s| s.terminal.is_mouse_enabled() && !shift);
+                if reporting {
+                    return Task::none();
+                }
+                let hit = self.select_block_at_viewport_row(row);
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    if !hit {
+                        sess.selected_block = None;
+                    }
+                    // The press is consumed, so drop any live text selection:
+                    // the old highlight must not linger, and it must never be
+                    // warped by a later drag or re-copied on release.
+                    if sess.terminal.selection.is_some() {
+                        sess.terminal.selection = None;
+                        sess.refresh();
+                    }
+                }
+                return Task::none();
+            }
+            if let Some(sess) = self.sessions.get_mut(self.active) {
+                sess.selected_block = None;
+            }
+        }
         // Click-to-place-cursor acts on release, so that a drag which happens
         // to select nothing does not also walk the shell's cursor. The tracker
         // is fed here, before the session borrow below.
@@ -4415,6 +4519,10 @@ impl Jterm {
                 Task::none()
             }
             PaletteAction::CopyLastOutput => self.copy_last_output_task(),
+            PaletteAction::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            PaletteAction::BlockCopyCommand => self.block_copy_command_task(),
+            PaletteAction::BlockCopyOutput => self.block_copy_output_task(),
+            PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
@@ -4464,6 +4572,153 @@ impl Jterm {
                 );
                 Task::none()
             }
+        }
+    }
+
+    /// Select and reveal the oldest block whose command failed (exit reported
+    /// and nonzero). Shared by the keybinding and the command palette; works
+    /// even while block-mode rendering is disabled.
+    fn block_jump_first_failed(&mut self) -> Task<Message> {
+        let target = self.sessions.get(self.active).and_then(|sess| {
+            sess.terminal
+                .first_failed_zone()
+                .map(|zone| (zone.id, zone.prompt_start))
+        });
+        match target {
+            Some((id, prompt_row)) => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.selected_block = Some(id);
+                    sess.terminal.reveal_buffer_row(prompt_row);
+                    sess.refresh();
+                }
+            }
+            None => self.push_toast(
+                "No failed command block (needs OSC 133 shell integration)".to_string(),
+                ToastKind::Info,
+            ),
+        }
+        Task::none()
+    }
+
+    /// Drop a block selection whose zone no longer exists (trimmed away with
+    /// old scrollback) and tell the user why nothing was copied or recalled.
+    fn clear_stale_block_selection(&mut self) {
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            sess.selected_block = None;
+        }
+        self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
+    }
+
+    /// The command line a block copy/recall action should act on. With a
+    /// block selected, only THAT block may supply it: a vanished zone clears
+    /// the selection, a command-less zone toasts — never a silent
+    /// substitution of a different block. Only when no block is selected does
+    /// this fall back to the newest completed block with a command. `None`
+    /// means "do nothing" and a toast was already pushed (`verb` names the
+    /// action in the no-fallback message).
+    fn block_action_command(&mut self, verb: &str) -> Option<String> {
+        let sess = self.sessions.get(self.active)?;
+        let Some(id) = sess.selected_block else {
+            let fallback = sess
+                .terminal
+                .command_zones
+                .iter()
+                .rev()
+                .find_map(|zone| zone.command.clone());
+            if fallback.is_none() {
+                self.push_toast(
+                    format!("No block command to {verb} (needs OSC 133 shell integration)"),
+                    ToastKind::Info,
+                );
+            }
+            return fallback;
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            self.clear_stale_block_selection();
+            return None;
+        };
+        let command = zone.command.clone();
+        if command.is_none() {
+            self.push_toast("Selected block has no command".to_string(), ToastKind::Info);
+        }
+        command
+    }
+
+    /// Copy the selected block's command line to the clipboard (the newest
+    /// block's only when nothing is selected).
+    fn block_copy_command_task(&mut self) -> Task<Message> {
+        match self.block_action_command("copy") {
+            Some(text) => {
+                self.push_toast("Copied block command", ToastKind::Success);
+                iced::clipboard::write(text)
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Copy the selected block's output to the clipboard. Falling back to the
+    /// newest completed block with output is only allowed when no block is
+    /// selected; a selected block with no output (or a vanished zone) toasts
+    /// instead of substituting another block's output.
+    fn block_copy_output_task(&mut self) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let text = match sess.selected_block {
+            None => {
+                let fallback = sess.terminal.last_command_output_text();
+                if fallback.is_none() {
+                    self.push_toast(
+                        "No block output to copy (needs OSC 133 shell integration)".to_string(),
+                        ToastKind::Info,
+                    );
+                }
+                fallback
+            }
+            Some(id) => {
+                if sess.terminal.zone_by_id(id).is_none() {
+                    self.clear_stale_block_selection();
+                    return Task::none();
+                }
+                let output = sess.terminal.zone_output_text(id);
+                if output.is_none() {
+                    self.push_toast("Selected block has no output".to_string(), ToastKind::Info);
+                }
+                output
+            }
+        };
+        match text {
+            Some(text) => {
+                let n = text.chars().count();
+                self.push_toast(
+                    format!("Copied block output ({} chars)", n),
+                    ToastKind::Success,
+                );
+                iced::clipboard::write(text)
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Type (never execute) the selected block's command into the prompt
+    /// (the newest block's only when nothing is selected), through the same
+    /// sanitized recall path as the history picker. Refused while a command
+    /// is running — the bytes would reach whatever program owns the PTY, not
+    /// a shell prompt.
+    fn block_recall_command_task(&mut self) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.is_command_running() {
+            self.push_toast(
+                "Command not recalled: the terminal is busy".to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        match self.block_action_command("recall") {
+            Some(command) => self.recall_into_active_pane(command),
+            None => Task::none(),
         }
     }
 
@@ -5144,6 +5399,9 @@ impl Jterm {
                     if let Some(bytes) =
                         encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)
                     {
+                        // Typing into the shell dismisses the block selection
+                        // (any PTY-bound key, not Escape specifically).
+                        sess.selected_block = None;
                         sess.terminal.scroll_to_bottom();
                         sess.write_pty(&bytes);
                         sess.refresh();
@@ -5173,6 +5431,9 @@ impl Jterm {
                     }
                     Ime::Commit(text) => {
                         sess.terminal.clear_preedit();
+                        // PTY-bound input dismisses the block selection, same
+                        // as `encode_key` and the paste paths.
+                        sess.selected_block = None;
                         sess.terminal.scroll_to_bottom();
                         sess.write_pty(text.as_bytes());
                         sess.refresh();
@@ -5667,6 +5928,11 @@ impl Jterm {
             }
             Message::SetNotifyLongBlocks(enabled) => {
                 self.config.notify_long_blocks = enabled;
+                self.config_dirty = true;
+            }
+            Message::SetBlockMode(enabled) => {
+                // Read at view time, so this hot-applies with no grid rebuild.
+                self.config.block_mode = enabled;
                 self.config_dirty = true;
             }
             Message::SetShowRepoStrip(show) => {
@@ -6934,6 +7200,100 @@ impl Jterm {
         )
     }
 
+    /// Block-mode chrome for each of `sess`'s visible rows: outcome stripes,
+    /// per-prompt separators, first-row badges, and the selected-block
+    /// outline. Absolute zone rows translate to viewport rows with the same
+    /// arithmetic (and the same reflow approximation) as search matches.
+    /// Empty when the feature is off or a full-screen app owns the grid.
+    fn block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+        use block_mode::BlockOutcome;
+
+        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            return Vec::new();
+        }
+        let rows = sess.grid.len();
+        if rows == 0 {
+            return Vec::new();
+        }
+        let terminal = &sess.terminal;
+        let start = terminal.viewport_absolute_start();
+        let end = start + rows;
+        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let running = terminal.running_zone_start();
+        let live_prompt = terminal.live_prompt_row();
+        let live_boundary = running.or(live_prompt).unwrap_or(total);
+
+        let starts: Vec<usize> = terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.prompt_start)
+            .collect();
+        let spans = block_mode::spans(&starts, live_boundary);
+        let muted = Theme::rgb_to_color32(self.theme.ui.text_disabled);
+        let accent = self.theme.cursor_color();
+        let mut paint = vec![terminal_view::BlockPaintRow::default(); rows];
+
+        for (zone, &(zone_start, zone_end)) in terminal.command_zones.iter().zip(&spans) {
+            if zone_end <= start || zone_start >= end {
+                continue;
+            }
+            let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+            let color = match outcome {
+                BlockOutcome::Success => self.theme.ansi_color(2),
+                BlockOutcome::Failed(_) => self.theme.ansi_color(1),
+                BlockOutcome::Background | BlockOutcome::Unknown => muted,
+            };
+            let selected = sess.selected_block == Some(zone.id);
+            for abs_row in zone_start.max(start)..zone_end.min(end) {
+                let row = &mut paint[abs_row - start];
+                row.stripe = Some(color);
+                if selected {
+                    row.stripe_strong = true;
+                    row.outline_sides = true;
+                }
+            }
+            if zone_start >= start {
+                let row = &mut paint[zone_start - start];
+                row.separator = true;
+                row.outline_top = selected;
+                if let Some(badge) = block_mode::badge_text(outcome, zone.duration_ms) {
+                    // The badge also spans its inset from the scrollbar gutter
+                    // and its background padding; all of it must be blank.
+                    let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0)
+                        / self.metrics.cell_w.max(1.0))
+                    .ceil() as usize;
+                    let needed = badge.chars().count() + inset;
+                    let chars: Vec<char> = sess.grid[zone_start - start]
+                        .iter()
+                        .map(|cell| cell.character)
+                        .collect();
+                    if block_mode::badge_fits(&chars, needed) {
+                        row.badge = Some((badge, color));
+                    }
+                }
+            }
+            if selected && zone_end > zone_start && zone_end <= end && zone_end > start {
+                paint[zone_end - 1 - start].outline_bottom = true;
+            }
+        }
+
+        // The in-flight execution paints an accent stripe from its prompt row
+        // to the bottom; a live prompt being edited gets only the separator.
+        if let Some(run_start) = running {
+            for abs_row in run_start.max(start)..end.min(total) {
+                paint[abs_row - start].stripe = Some(accent);
+            }
+            if run_start >= start && run_start < end {
+                paint[run_start - start].separator = true;
+            }
+        } else if let Some(prompt_row) = live_prompt {
+            if prompt_row >= start && prompt_row < end {
+                paint[prompt_row - start].separator = true;
+            }
+        }
+        paint
+    }
+
     /// Build the terminal widget for the pane showing `sess_idx`.
     /// Overlay-style decorations (search, links, Kitty images) are only attached
     /// to the active pane; the other panes render plain.
@@ -6981,6 +7341,7 @@ impl Jterm {
         } else {
             Vec::new()
         };
+        let blocks = self.block_paint_rows(sess);
         TermWidget::new(
             &sess.grid,
             sess.cursor,
@@ -7008,6 +7369,8 @@ impl Jterm {
             config::ScrollbarVisibility::Always
         ))
         .search(search_matches, current)
+        .blocks(blocks)
+        .app_mouse(sess.terminal.is_mouse_enabled())
         .links(links)
         .dynamic_palette(&sess.terminal.dynamic_palette)
         .dynamic_defaults(
@@ -8237,6 +8600,16 @@ impl Jterm {
                 .into(),
         );
 
+        let block_mode_row = responsive_control_row(
+            compact,
+            "Blocks",
+            checkbox(self.config.block_mode)
+                .label("Command blocks (OSC 133 stripes and exit badges)")
+                .text_size(13)
+                .on_toggle(Message::SetBlockMode)
+                .into(),
+        );
+
         // ── AI & Agent ────────────────────────────────────────────────────
         let ai_header = text("AI & Agent").size(15);
         let ai_enable_row = responsive_control_row(
@@ -8480,6 +8853,7 @@ impl Jterm {
             notify_row,
             repo_strip_row,
             bottom_bar_row,
+            block_mode_row,
             ai_header,
             ai_enable_row,
             ai_provider_row,

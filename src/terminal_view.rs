@@ -38,6 +38,9 @@ pub enum MouseInput {
         shift: bool,
         alt: bool,
         count: u32,
+        /// The press landed in the left-padding gutter band (block stripes),
+        /// before any cell math. Used for block selection.
+        gutter: bool,
     },
     Drag {
         col: usize,
@@ -82,6 +85,39 @@ pub struct KittyRender {
 pub const SCROLLBAR_WIDTH: f32 = 10.0;
 /// Minimum thumb height so it stays grabbable with deep scrollback.
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+/// Width of the block-outcome stripe at the widget's left edge, in pixels.
+const BLOCK_STRIPE_WIDTH: f32 = 3.0;
+/// Width of the stripe while its block is selected (full opacity too).
+const BLOCK_STRIPE_SELECTED_WIDTH: f32 = 5.0;
+/// Minimum width of the gutter hit band used for block selection. Ties to the
+/// stripe widths above: it must cover the widest stripe
+/// (`BLOCK_STRIPE_SELECTED_WIDTH` = 5px, plus 1px slack) so a press anywhere
+/// on the visible stripe selects the block, even when the configured left
+/// padding is narrower than the stripe. It must also exceed the window's
+/// `RESIZE_EDGE` grip (5px): on a pane flush with the window's left border the
+/// grip overlay swallows presses in its band, so anything narrower would leave
+/// the stripe unclickable there.
+const BLOCK_GUTTER_MIN_HIT_WIDTH: f32 = 8.0;
+
+/// Block-mode chrome for one visible grid row, precomputed by the app the
+/// same way the per-row `selection` spans are. `Default` (all off) rows cost
+/// nothing to draw.
+#[derive(Clone, Debug, Default)]
+pub struct BlockPaintRow {
+    /// Gutter stripe color for this row; `None` draws no stripe.
+    pub stripe: Option<Color>,
+    /// Draw the stripe wider and at full opacity (selected block).
+    pub stripe_strong: bool,
+    /// 1px separator line across the top edge of this row.
+    pub separator: bool,
+    /// Right-aligned first-row badge (text, color). Only set when the cells
+    /// it covers are blank — the app checks before asking for it.
+    pub badge: Option<(String, Color)>,
+    /// Selected-block outline edges crossing this row.
+    pub outline_top: bool,
+    pub outline_bottom: bool,
+    pub outline_sides: bool,
+}
 
 fn hovered_link_color() -> Color {
     Color::from_rgb8(100, 200, 255)
@@ -157,6 +193,9 @@ pub struct TermWidget<'a, Message> {
     selection: Vec<Option<(usize, usize)>>,
     scroll_offset: usize,
     scrollback_len: usize,
+    /// Per visible row block chrome (stripes, separators, badges), aligned
+    /// with the grid rows exactly like `selection`. Empty = no block mode.
+    blocks: Vec<BlockPaintRow>,
     /// Search matches in visible-grid coordinates (line = grid row index).
     search_matches: Vec<SearchMatch>,
     /// Identity `(line, col_start)` of the active match, highlighted distinctly.
@@ -183,6 +222,13 @@ pub struct TermWidget<'a, Message> {
     /// default-background fill is skipped so the translucent app background
     /// shows through; non-default cell backgrounds stay opaque, like jterm2.
     opacity: f32,
+    /// Whether the terminal application currently has mouse reporting
+    /// enabled. While it does (and Shift is not held — the same predicate the
+    /// app uses for `report_to_app`), a press in the stripe gutter must NOT
+    /// be classified as a gutter press: it travels the normal press pipeline
+    /// so the app receives a matched press/release pair instead of block
+    /// selection hijacking the click.
+    app_mouse: bool,
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
@@ -224,6 +270,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             selection,
             scroll_offset,
             scrollback_len,
+            blocks: Vec::new(),
             search_matches: Vec::new(),
             current_match: None,
             shift: false,
@@ -236,7 +283,16 @@ impl<'a, Message> TermWidget<'a, Message> {
             preedit: None,
             blink_on: true,
             opacity: 1.0,
+            app_mouse: false,
         }
+    }
+
+    /// Tell the widget whether the terminal application currently has mouse
+    /// reporting enabled, so gutter (block-select) presses are suppressed
+    /// while an app owns the mouse (see the `app_mouse` field).
+    pub fn app_mouse(mut self, enabled: bool) -> Self {
+        self.app_mouse = enabled;
+        self
     }
 
     /// Set the window background opacity applied to the widget's default
@@ -308,6 +364,12 @@ impl<'a, Message> TermWidget<'a, Message> {
     pub fn search(mut self, matches: Vec<SearchMatch>, current: Option<(usize, usize)>) -> Self {
         self.search_matches = matches;
         self.current_match = current;
+        self
+    }
+
+    /// Supply per-visible-row block chrome (empty disables block painting).
+    pub fn blocks(mut self, blocks: Vec<BlockPaintRow>) -> Self {
+        self.blocks = blocks;
         self
     }
 
@@ -704,7 +766,21 @@ where
                         }
                     }
                 }
-                if button == MouseButton::Left {
+                // The raw pixel decides gutter membership; `cell_at` above has
+                // already clamped a padding press into column 0. The hit band
+                // spans at least `BLOCK_GUTTER_MIN_HIT_WIDTH` so the visible
+                // stripe (3px, 5px selected) is always clickable even with a
+                // narrower padding. A press only counts as a gutter press
+                // when block chrome is painted and the press would not be
+                // reported to the app (`app_mouse` mirrors `report_to_app`):
+                // gutter presses are consumed for block selection and arm no
+                // drag pipeline, so they must never swallow a press that the
+                // app or text selection needs.
+                let gutter = button == MouseButton::Left
+                    && !self.blocks.is_empty()
+                    && !(self.app_mouse && !shift)
+                    && pos.x < bounds.x + self.metrics.padding.max(BLOCK_GUTTER_MIN_HIT_WIDTH);
+                if button == MouseButton::Left && !gutter {
                     state.dragging = true;
                     let now = Instant::now();
                     let same_cell = state
@@ -727,6 +803,7 @@ where
                     shift,
                     alt,
                     count: state.click_count,
+                    gutter,
                 }));
                 shell.capture_event();
             }
@@ -766,6 +843,12 @@ where
                 if button == MouseButton::Left {
                     if state.scrollbar_dragging {
                         state.scrollbar_dragging = false;
+                        return;
+                    }
+                    // Only a press that armed the drag pipeline emits a
+                    // Release. A consumed gutter press never sets `dragging`,
+                    // so no Release (and no selection copy) follows it.
+                    if !state.dragging {
                         return;
                     }
                     state.dragging = false;
@@ -1170,6 +1253,132 @@ where
                 run_fg,
                 run_font,
             );
+        }
+
+        // Block-mode chrome (per-row, precomputed by the app). All quads land
+        // under the glyph pass; the badge only occupies cells verified blank,
+        // so its text never collides with grid text.
+        for (row_idx, block) in self.blocks.iter().enumerate() {
+            let y = oy + row_idx as f32 * ch;
+            let text_right = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
+
+            if block.separator {
+                renderer.fill_quad(
+                    solid_quad(Rectangle {
+                        x: ox,
+                        y,
+                        width: (text_right - ox).max(0.0),
+                        height: 1.0,
+                    }),
+                    Background::Color(Color {
+                        a: 0.15,
+                        ..self.theme.terminal_foreground()
+                    }),
+                );
+            }
+            if let Some(color) = block.stripe {
+                let (width, alpha) = if block.stripe_strong {
+                    (BLOCK_STRIPE_SELECTED_WIDTH, 1.0)
+                } else {
+                    (BLOCK_STRIPE_WIDTH, 0.7)
+                };
+                renderer.fill_quad(
+                    solid_quad(Rectangle {
+                        x: bounds.x,
+                        y,
+                        width,
+                        height: ch,
+                    }),
+                    Background::Color(Color {
+                        a: color.a * alpha,
+                        ..color
+                    }),
+                );
+            }
+            // Selected-block outline: 1px stroke assembled from thin quads.
+            if block.outline_top || block.outline_bottom || block.outline_sides {
+                let accent = self
+                    .dynamic_cursor
+                    .map(|(r, g, b)| Color::from_rgb8(r, g, b))
+                    .unwrap_or_else(|| self.theme.cursor_color());
+                let stroke = Background::Color(Color { a: 0.8, ..accent });
+                let left = bounds.x + BLOCK_STRIPE_SELECTED_WIDTH + 1.0;
+                let width = (text_right - left).max(0.0);
+                if block.outline_top {
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x: left,
+                            y,
+                            width,
+                            height: 1.0,
+                        }),
+                        stroke,
+                    );
+                }
+                if block.outline_bottom {
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x: left,
+                            y: y + ch - 1.0,
+                            width,
+                            height: 1.0,
+                        }),
+                        stroke,
+                    );
+                }
+                if block.outline_sides {
+                    for x in [left, text_right - 1.0] {
+                        renderer.fill_quad(
+                            solid_quad(Rectangle {
+                                x,
+                                y,
+                                width: 1.0,
+                                height: ch,
+                            }),
+                            stroke,
+                        );
+                    }
+                }
+            }
+            if let Some((badge, color)) = &block.badge {
+                let badge_w = badge.chars().count() as f32 * cw;
+                let right = text_right - 4.0;
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle {
+                            x: right - badge_w - 8.0,
+                            y: y + 1.0,
+                            width: badge_w + 8.0,
+                            height: ch - 2.0,
+                        },
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: ((ch - 2.0) / 3.0).into(),
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(Color { a: 0.12, ..*color }),
+                );
+                let shaping = glyph_shaping(badge);
+                renderer.fill_text(
+                    Text {
+                        content: badge.clone(),
+                        bounds: Size::new(badge_w + 8.0, ch),
+                        size: Pixels(self.metrics.font_size),
+                        line_height: text::LineHeight::Absolute(Pixels(ch)),
+                        font: self.mono,
+                        align_x: text::Alignment::Right,
+                        align_y: iced::alignment::Vertical::Center,
+                        shaping,
+                        wrapping: text::Wrapping::None,
+                    },
+                    Point::new(right - 4.0, y + ch / 2.0),
+                    *color,
+                    clip,
+                );
+            }
         }
 
         // Cursor.
