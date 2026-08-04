@@ -3872,12 +3872,12 @@ impl Jterm {
                     return Task::none();
                 }
                 if button == MouseButton::Left {
-                    if let Some(text) = sess.terminal.copy_selection().filter(|t| !t.is_empty()) {
-                        return iced::clipboard::write_primary(text);
-                    }
-                    // Nothing was selected, so this was a plain click. Place the
-                    // shell's edit cursor where it landed.
+                    // A plain click must be handled before the selection copy:
+                    // the press already anchored a one-cell selection, so
+                    // `copy_selection` would return that cell's character and
+                    // swallow the click.
                     if let Some(cell) = clicked_cell {
+                        sess.terminal.selection = None;
                         let bytes = sess.terminal.click_cursor_move(
                             cell.row.max(0) as usize,
                             cell.col.max(0) as usize,
@@ -3886,6 +3886,11 @@ impl Jterm {
                         if !bytes.is_empty() {
                             sess.write_pty(&bytes);
                         }
+                        sess.refresh();
+                    } else if let Some(text) =
+                        sess.terminal.copy_selection().filter(|t| !t.is_empty())
+                    {
+                        return iced::clipboard::write_primary(text);
                     }
                 }
             }
