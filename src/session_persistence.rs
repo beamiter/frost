@@ -17,6 +17,8 @@ const MAX_RESTORED_PANES_PER_TAB: usize = 12;
 const MAX_RESTORED_LAYOUT_DEPTH: usize = 64;
 const MAX_RESTORED_LAYOUT_NODES: usize = 64;
 const MAX_RESTORED_CWD_BYTES: usize = 4096;
+/// 标签页自定义标题的上限。标题只是一行标签文字，不需要更多。
+pub const MAX_RESTORED_TAB_TITLE_BYTES: usize = 256;
 
 /// `load` 的结果。必须把“没有快照”和“快照读不动”分开：后者的字节还在磁盘上，
 /// 而恢复失败之后几秒内定时自动保存就会覆盖同一个路径，所以调用方要先隔离。
@@ -77,6 +79,16 @@ pub struct TabSnapshot {
     /// 恢复的焦点都以它为准。
     #[serde(default)]
     pub focus: Option<usize>,
+    /// 用户在右键菜单里改过的标签页标题。`None` 表示跟随焦点会话自己的标题。
+    /// 旧快照没有这个字段，恢复为 `None`。
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 固定的标签页重启后仍固定，并排在最前。
+    #[serde(default)]
+    pub pinned: bool,
+    /// 「重要」标记（多选模型）。
+    #[serde(default)]
+    pub marked: bool,
 }
 
 /// 会话列表快照。
@@ -224,6 +236,24 @@ impl SessionsSnapshot {
         self.tabs.truncate(MAX_RESTORED_TABS);
         self.tabs
             .retain_mut(|tab| sanitize_tree_shape(&mut tab.tree));
+        // 标题是自由文本，会原样出现在标签栏上：控制字符和超长串在这里就
+        // 丢弃，而不是等到渲染时才发现。
+        let mut invalid_titles = 0usize;
+        for tab in &mut self.tabs {
+            if tab.title.as_ref().is_some_and(|title| {
+                title.trim().is_empty()
+                    || title.len() > MAX_RESTORED_TAB_TITLE_BYTES
+                    || title.chars().any(|c| c.is_control())
+            }) {
+                tab.title = None;
+                invalid_titles += 1;
+            }
+        }
+        if invalid_titles > 0 {
+            warnings.push(format!(
+                "discarded {invalid_titles} oversized or invalid tab titles"
+            ));
+        }
         if self.tabs.len() != original_tabs {
             warnings.push("discarded oversized or invalid tab layouts".to_string());
         }
@@ -524,6 +554,9 @@ mod tests {
             ],
             Some(1),
             vec![TabSnapshot {
+                title: None,
+                pinned: false,
+                marked: false,
                 tree: PaneTreeSnapshot::Split {
                     axis: "vertical".to_string(),
                     ratios: vec![0.6, 0.4],
@@ -610,6 +643,9 @@ mod tests {
                 TabSnapshot {
                     tree: invalid_tree,
                     focus: Some(0),
+                    title: None,
+                    pinned: false,
+                    marked: false,
                 };
                 MAX_RESTORED_TABS + 10
             ],
@@ -629,6 +665,77 @@ mod tests {
         assert!(restored.tabs.is_empty());
         assert!(restored.tree.is_none());
         assert!(restored.active_tab.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Tab titles come from a text field and are drawn verbatim in the strip.
+    /// A restored snapshot must not be able to smuggle control characters or an
+    /// unbounded string into that label; pin/mark ride along unchanged.
+    #[test]
+    fn restored_tab_titles_are_bounded_and_control_free_while_flags_survive() {
+        let root = scratch("tab-titles");
+        let path = root.join("session_history.json");
+        let tab = |title: Option<&str>, pinned: bool, marked: bool| TabSnapshot {
+            tree: PaneTreeSnapshot::Leaf { session: 0 },
+            focus: Some(0),
+            title: title.map(str::to_string),
+            pinned,
+            marked,
+        };
+        let snapshot = SessionsSnapshot {
+            version: 2,
+            sessions: vec![SessionSnapshot { cwd: None }],
+            active_index: Some(0),
+            split: None,
+            tree: None,
+            tabs: vec![
+                tab(Some("build"), true, false),
+                tab(
+                    Some(&"x".repeat(MAX_RESTORED_TAB_TITLE_BYTES + 1)),
+                    false,
+                    true,
+                ),
+                tab(Some("two\nlines"), false, false),
+                tab(Some("   "), false, false),
+            ],
+            active_tab: Some(0),
+        };
+        write_private(&path, serde_json::to_vec(&snapshot).unwrap());
+
+        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+            panic!("bounded valid JSON should load");
+        };
+        assert_eq!(restored.tabs[0].title.as_deref(), Some("build"));
+        assert!(restored.tabs[0].pinned);
+        // Oversized, control-bearing, and blank titles all fall back to
+        // "follow the session's own label".
+        assert_eq!(restored.tabs[1].title, None);
+        assert!(restored.tabs[1].marked);
+        assert_eq!(restored.tabs[2].title, None);
+        assert_eq!(restored.tabs[3].title, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Snapshots written before the context menu existed have none of these
+    /// fields; they must load as plain tabs rather than failing the parse.
+    #[test]
+    fn legacy_tab_snapshots_without_menu_state_still_load() {
+        let root = scratch("legacy-tabs");
+        let path = root.join("session_history.json");
+        write_private(
+            &path,
+            br#"{"version":2,"sessions":[{"cwd":"/tmp"}],"active_index":0,
+                 "tabs":[{"tree":{"kind":"leaf","session":0},"focus":0}],
+                 "active_tab":0}"#,
+        );
+
+        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+            panic!("legacy snapshot should load");
+        };
+        assert_eq!(restored.tabs.len(), 1);
+        assert_eq!(restored.tabs[0].title, None);
+        assert!(!restored.tabs[0].pinned);
+        assert!(!restored.tabs[0].marked);
         let _ = std::fs::remove_dir_all(root);
     }
 

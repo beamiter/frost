@@ -123,6 +123,8 @@ static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
 static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));
+static TAB_RENAME_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-rename-input"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 
@@ -176,6 +178,15 @@ struct Tab {
     /// Session shown by the pane holding keyboard focus in this tab. The tab's
     /// label and the focus restored when the tab is activated both read this.
     focus: usize,
+    /// Title set from the context menu's Rename. `None` falls back to the
+    /// focused session's own label, so a renamed tab keeps its name while an
+    /// untouched one keeps following the shell.
+    title: Option<String>,
+    /// Pinned tabs sort to the front of the strip and stay there.
+    pinned: bool,
+    /// Marking is this family's multi-select model: "Close Marked Tabs" acts
+    /// on exactly the marked set.
+    marked: bool,
 }
 
 impl Tab {
@@ -184,6 +195,9 @@ impl Tab {
             id,
             tree: PaneTree::Leaf(session),
             focus: session,
+            title: None,
+            pinned: false,
+            marked: false,
         }
     }
 
@@ -203,6 +217,43 @@ impl Tab {
             }
         }
     }
+}
+
+/// One tab as it came out of a snapshot: the pane tree plus the per-tab state
+/// that rides along with it. The caller validates every index before any of
+/// this becomes a live [`Tab`].
+struct RestoredTab {
+    tree: PaneTree,
+    focus: Option<usize>,
+    title: Option<String>,
+    pinned: bool,
+    marked: bool,
+}
+
+impl RestoredTab {
+    /// A tab recovered from a layout that carries no per-tab state (the v1
+    /// single-tree snapshots, and the tests).
+    fn plain(tree: PaneTree, focus: Option<usize>) -> Self {
+        RestoredTab {
+            tree,
+            focus,
+            title: None,
+            pinned: false,
+            marked: false,
+        }
+    }
+}
+
+/// Stable-partition `tabs` so pinned ones lead, and report where the tab at
+/// `active` ended up. Mirrors jterm1's `reorder_pinned_first`: relative order
+/// inside the pinned and unpinned groups is preserved, and the active tab
+/// stays active — pinning a tab must never switch which session is on screen.
+fn sort_pinned_first(tabs: &mut [Tab], active: usize) -> usize {
+    let active_id = tabs.get(active).map(|tab| tab.id);
+    tabs.sort_by_key(|tab| !tab.pinned);
+    active_id
+        .and_then(|id| tabs.iter().position(|tab| tab.id == id))
+        .unwrap_or(active)
 }
 
 /// What a confirmed close should actually tear down. Closing a tab takes every
@@ -399,7 +450,7 @@ fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<P
 /// tree at all; every session no tab claims gets a one-pane tab of its own,
 /// because an unclaimed session is a live PTY nothing can switch to.
 fn build_restored_tabs(
-    trees: Vec<(PaneTree, Option<usize>)>,
+    trees: Vec<RestoredTab>,
     session_count: usize,
     active_session: usize,
     saved_active_tab: Option<usize>,
@@ -407,7 +458,14 @@ fn build_restored_tabs(
     let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut tabs: Vec<Tab> = Vec::new();
     let mut next_id = 0usize;
-    for (tree, saved_focus) in trees {
+    for restored in trees {
+        let RestoredTab {
+            tree,
+            focus: saved_focus,
+            title,
+            pinned,
+            marked,
+        } = restored;
         if !valid_restored_layout(&tree, session_count) {
             continue;
         }
@@ -426,6 +484,9 @@ fn build_restored_tabs(
             id: next_id,
             tree,
             focus,
+            title,
+            pinned,
+            marked,
         });
         next_id += 1;
     }
@@ -446,6 +507,10 @@ fn build_restored_tabs(
         // No recorded tab (or it did not survive): follow the active session.
         .or_else(|| tabs.iter().position(|tab| tab.contains(active_session)))
         .unwrap_or(0);
+    // A snapshot can interleave pinned and unpinned tabs (it predates pinning,
+    // or an adopted orphan landed at the end). Restore the invariant here so
+    // the strip never shows an order the app itself would not produce.
+    let active_tab = sort_pinned_first(&mut tabs, active_tab);
     tabs[active_tab].repair_focus();
     (tabs, active_tab, next_id)
 }
@@ -792,6 +857,15 @@ enum Message {
     TabMenuClose,
     /// Execute a menu action against the target tab.
     TabMenuAction(TabMenuAction),
+    /// Pointer moved while a tab was hovered (window logical coordinates).
+    /// Only subscribed to while the pointer is actually over a tab.
+    TabPointerMoved(iced::Point),
+    /// Turn the open tab menu into a rename editor for that tab.
+    TabRenameStart(usize),
+    /// Rename draft edited.
+    TabRenameInput(String),
+    /// Commit the rename draft (Enter or the Rename button).
+    TabRenameSubmit,
     /// Toast queue tick (drop expired entries).
     ToastTick,
     /// Dismiss a specific toast by index.
@@ -814,13 +888,20 @@ enum Message {
     TabCloseConfirmNo,
 }
 
-/// Context-menu actions that target a stable session id.
+/// Context-menu actions that target a stable tab id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabMenuAction {
     Close(usize),
     CloseOthers(usize),
     CloseToRight(usize),
+    /// Close every marked tab at once (marking is the multi-select model).
+    CloseMarked,
     Duplicate(usize),
+    NewTab,
+    TogglePinned(usize),
+    ToggleMarked(usize),
+    /// Open a `[[remote_hosts]]` entry (by config index) in a new tab.
+    ConnectRemote(usize),
 }
 
 /// Subscription identity plus a reader descriptor duplicated synchronously when
@@ -1404,6 +1485,17 @@ struct Jterm {
     /// Right-click context menu state: stable id of its target tab, or None.
     /// Rendered as a centered floating panel (Esc / click-outside dismiss).
     tab_menu: Option<usize>,
+    /// Rename editor inside the open tab menu: target tab id plus the draft.
+    /// Lives beside `tab_menu` rather than inside it because dismissing the
+    /// menu must also drop a half-typed name.
+    tab_rename: Option<(usize, String)>,
+    /// Last pointer position seen over a tab, in the same logical space the
+    /// widget layout uses. `mouse_area` right-presses carry no coordinates, so
+    /// this is what the context menu anchors to.
+    tab_pointer: iced::Point,
+    /// Where the open tab menu was summoned. Frozen at open time: the pointer
+    /// keeps moving as the user walks over to the panel.
+    tab_menu_at: iced::Point,
     /// Transient bottom-right toast queue with absolute expiry timestamps.
     /// Cleared lazily on each render and on ConfigTick.
     toasts: Vec<Toast>,
@@ -1558,6 +1650,9 @@ impl Jterm {
             hovered_tab: None,
             dragging_tab: None,
             tab_menu: None,
+            tab_rename: None,
+            tab_pointer: iced::Point::ORIGIN,
+            tab_menu_at: iced::Point::ORIGIN,
             toasts: Vec::new(),
             jsh_prompt: None,
             jsh_notice_dismissed: false,
@@ -2100,6 +2195,9 @@ impl Jterm {
             .map(|tab| session_persistence::TabSnapshot {
                 tree: pane_tree_to_snapshot(&tab.tree),
                 focus: Some(tab.focus),
+                title: tab.title.clone(),
+                pinned: tab.pinned,
+                marked: tab.marked,
             })
             .collect();
         let snapshot = session_persistence::SessionsSnapshot::new(
@@ -2567,7 +2665,79 @@ impl Jterm {
                 }
                 Task::none()
             }
+            TabMenuAction::CloseMarked => {
+                let targets: Vec<usize> = (0..self.tabs.len())
+                    .filter(|&tab| self.tabs[tab].marked)
+                    .collect();
+                if targets.is_empty() {
+                    return Task::none();
+                }
+                self.close_tabs("Closed marked tabs", targets)
+            }
+            TabMenuAction::NewTab => {
+                self.new_session();
+                Task::none()
+            }
+            TabMenuAction::TogglePinned(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                let pinned = !self.tabs[tab].pinned;
+                self.tabs[tab].pinned = pinned;
+                // Pinning reorders the strip, so the active tab has to be
+                // re-found by identity rather than kept by index.
+                self.active_tab = sort_pinned_first(&mut self.tabs, self.active_tab);
+                self.dragging_tab = None;
+                self.session_dirty = true;
+                self.push_toast(
+                    if pinned { "Pinned tab" } else { "Unpinned tab" },
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            TabMenuAction::ToggleMarked(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                let marked = !self.tabs[tab].marked;
+                self.tabs[tab].marked = marked;
+                self.session_dirty = true;
+                self.push_toast(
+                    if marked {
+                        "Marked tab as important"
+                    } else {
+                        "Cleared tab mark"
+                    },
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            TabMenuAction::ConnectRemote(index) => {
+                self.connect_remote_host(index);
+                Task::none()
+            }
         }
+    }
+
+    /// Apply the context menu's Rename. An empty name clears the custom title,
+    /// putting the tab back to following its focused session's label.
+    fn apply_tab_rename(&mut self, id: usize, raw: String) {
+        let Some(tab) = self.tab_index_by_id(id) else {
+            return;
+        };
+        // The title is persisted and drawn verbatim in the strip; hold it to
+        // the same contract the snapshot loader enforces on the way back in.
+        // `take` counts chars while the snapshot bound counts bytes, and a char
+        // is at most 4 bytes, so this can never exceed that bound.
+        let max_chars = session_persistence::MAX_RESTORED_TAB_TITLE_BYTES / 4;
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(max_chars)
+            .collect();
+        self.tabs[tab].title = (!cleaned.is_empty()).then_some(cleaned);
+        self.session_dirty = true;
     }
 
     /// Close a set of tabs, refusing the whole batch if any pane in any of them
@@ -2671,11 +2841,36 @@ impl Jterm {
         (0..self.tabs.len()).map(|i| self.tab_label(i)).collect()
     }
 
+    /// A tab's strip label. A title set through the context menu's Rename wins;
+    /// otherwise the tab keeps following its focused session's own label.
     fn tab_label(&self, tab: usize) -> String {
+        if let Some(title) = self.tabs.get(tab).and_then(|tab| tab.title.clone()) {
+            return title;
+        }
         self.tab_focus(tab)
             .and_then(|index| self.sessions.get(index))
             .map(|session| session.label())
             .unwrap_or_default()
+    }
+
+    /// Pin / mark indicators prefixed to a tab's label. They are the only
+    /// on-strip evidence of state the context menu can set, so both placements
+    /// (top strip and sidebar dock) render them.
+    fn tab_state_prefix(&self, tab: usize) -> String {
+        let Some(tab) = self.tabs.get(tab) else {
+            return String::new();
+        };
+        let mut prefix = String::new();
+        if tab.pinned {
+            prefix.push('◆');
+        }
+        if tab.marked {
+            prefix.push('★');
+        }
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        prefix
     }
 
     /// Switch to `tab` and hand keyboard focus to the pane it had selected.
@@ -2733,20 +2928,26 @@ impl Jterm {
         }
         // A v1 snapshot has one global tree: it described the panes the user
         // last saw, so it migrates into the first tab rather than scattering.
-        let migrated: Vec<(PaneTree, Option<usize>)> = if saved_tabs.is_empty() {
+        let migrated: Vec<RestoredTab> = if saved_tabs.is_empty() {
             legacy_tree
                 .as_ref()
                 .and_then(pane_tree_from_snapshot)
                 .or_else(|| legacy_split.as_ref().and_then(pane_tree_from_legacy))
                 // v1 had no per-tab focus; the snapshot's active session is
                 // the pane the user was in, so seed the migrated tab with it.
-                .map(|tree| vec![(tree, Some(self.active))])
+                .map(|tree| vec![RestoredTab::plain(tree, Some(self.active))])
                 .unwrap_or_default()
         } else {
             saved_tabs
                 .iter()
                 .filter_map(|snapshot| {
-                    pane_tree_from_snapshot(&snapshot.tree).map(|tree| (tree, snapshot.focus))
+                    pane_tree_from_snapshot(&snapshot.tree).map(|tree| RestoredTab {
+                        tree,
+                        focus: snapshot.focus,
+                        title: snapshot.title.clone(),
+                        pinned: snapshot.pinned,
+                        marked: snapshot.marked,
+                    })
                 })
                 .collect()
         };
@@ -5315,11 +5516,16 @@ impl Jterm {
                         }
                         return Task::none();
                     }
-                    // The tab menu currently has pointer actions only; keep all
-                    // unrelated keypresses out of the PTY while it is visible.
+                    // Apart from the rename editor (whose keys the focused text
+                    // input captures before this point), the tab menu is
+                    // pointer-driven; keep every other keypress out of the PTY
+                    // while it is visible.
                     if self.tab_menu.is_some() {
                         if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                            self.tab_menu = None;
+                            // Esc backs out of the rename first, then the menu.
+                            if self.tab_rename.take().is_none() {
+                                self.tab_menu = None;
+                            }
                         }
                         return Task::none();
                     }
@@ -6175,14 +6381,46 @@ impl Jterm {
                 self.expire_toasts();
             }
             Message::TabMenuOpen(id) => {
-                if self.sessions.iter().any(|session| session.id == id) {
+                // The menu is keyed on the tab id the strip handed out, not on
+                // a session id: a tab with several panes has one id here and a
+                // different one per pane.
+                if self.tab_index_by_id(id).is_some() {
                     self.tab_menu = Some(id);
+                    self.tab_rename = None;
+                    // Freeze the anchor now; the pointer moves on toward the
+                    // panel as soon as it appears.
+                    self.tab_menu_at = self.tab_pointer;
                 }
             }
-            Message::TabMenuClose => self.tab_menu = None,
+            Message::TabPointerMoved(position) => self.tab_pointer = position,
+            Message::TabMenuClose => {
+                self.tab_menu = None;
+                self.tab_rename = None;
+            }
             Message::TabMenuAction(action) => {
                 self.tab_menu = None;
+                self.tab_rename = None;
                 return self.execute_tab_menu_action(action);
+            }
+            Message::TabRenameStart(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                // Seed the editor with what the strip currently shows, so a
+                // rename starts from the label the user just right-clicked.
+                self.tab_rename = Some((id, self.tab_label(tab)));
+                return iced::widget::operation::focus(TAB_RENAME_INPUT_ID.clone());
+            }
+            Message::TabRenameInput(draft) => {
+                if let Some((_, current)) = self.tab_rename.as_mut() {
+                    *current = draft;
+                }
+            }
+            Message::TabRenameSubmit => {
+                if let Some((id, draft)) = self.tab_rename.take() {
+                    self.apply_tab_rename(id, draft);
+                }
+                self.tab_menu = None;
             }
             Message::ToastTick => self.expire_toasts(),
             Message::ToastDismiss(i) => {
@@ -6547,6 +6785,7 @@ impl Jterm {
             // of the chrome.
             let hovered = self.hovered_tab == Some(id);
             let dragging_this = self.dragging_tab == Some(id);
+            let label = format!("{}{label}", self.tab_state_prefix(i));
             let tab_label = container(text(label).size(13))
                 .padding([3, 8])
                 .style(self.tab_container_style(active, hovered, dragging_this));
@@ -6646,19 +6885,22 @@ impl Jterm {
             .into()
     }
 
-    /// Floating tab context menu — Close, Close Others, Close to Right, Duplicate.
-    /// Background mouse_area dismisses on outside-click; Esc also closes via key handler.
+    /// Floating tab context menu, the same item set jterm1/jterm4 put on their
+    /// sidebar tabs: New Tab, Duplicate, Rename, Mark, Pin, the close family,
+    /// and one entry per configured `[[remote_hosts]]` destination.
+    ///
+    /// Background mouse_area dismisses on outside-click; Esc also closes via
+    /// the key handler (and backs out of an open rename editor first).
     fn tab_context_menu(&self, id: usize) -> Element<'_, Message> {
-        let i = self
-            .sessions
-            .iter()
-            .position(|session| session.id == id)
-            .unwrap_or(self.active);
-        let label = self
-            .sessions
-            .get(i)
-            .map(|s| s.label())
-            .unwrap_or_else(|| format!("Tab {}", i + 1));
+        // Everything here is keyed on the tab id, never on a session id: a tab
+        // with several panes owns several sessions but only one strip entry.
+        let i = self.tab_index_by_id(id).unwrap_or(self.active_tab);
+        let label = self.tab_label(i);
+        let label = if label.is_empty() {
+            format!("Tab {}", i + 1)
+        } else {
+            label
+        };
         let row_btn = |t: &str, msg: Message| -> Element<'_, Message> {
             button(text(t.to_string()).size(13))
                 .on_press(msg)
@@ -6667,14 +6909,55 @@ impl Jterm {
                 .style(self.ghost_btn_style())
                 .into()
         };
-        let only_one = self.sessions.len() <= 1;
-        let last_idx = self.sessions.len().saturating_sub(1);
+        let only_one = self.tabs.len() <= 1;
+        let last_idx = self.tabs.len().saturating_sub(1);
+        let pinned = self.tabs.get(i).is_some_and(|tab| tab.pinned);
+        let marked_count = self.tabs.iter().filter(|tab| tab.marked).count();
+        let is_marked = self.tabs.get(i).is_some_and(|tab| tab.marked);
 
-        let mut menu = column![
-            text(label).size(12).style(text::secondary),
-            row_btn("Close", Message::TabMenuAction(TabMenuAction::Close(id)),),
-        ]
-        .spacing(2);
+        let mut menu = column![text(label).size(12).style(text::secondary)].spacing(2);
+
+        // Renaming replaces the item list with an inline editor so the menu
+        // stays one panel; Enter commits, Esc backs out to the items.
+        if let Some((_, draft)) = self.tab_rename.as_ref().filter(|(target, _)| *target == id) {
+            menu = menu.push(
+                text_input("Tab name (empty = follow shell)", draft)
+                    .id(TAB_RENAME_INPUT_ID.clone())
+                    .on_input(Message::TabRenameInput)
+                    .on_submit(Message::TabRenameSubmit)
+                    .size(13),
+            );
+            menu = menu.push(row_btn("Rename", Message::TabRenameSubmit));
+            menu = menu.push(row_btn("Cancel", Message::TabMenuClose));
+            // 3 rows: the input plus two buttons.
+            return self.float_tab_menu(menu, 3);
+        }
+
+        menu = menu.push(row_btn(
+            "New Tab",
+            Message::TabMenuAction(TabMenuAction::NewTab),
+        ));
+        menu = menu.push(row_btn(
+            "Duplicate",
+            Message::TabMenuAction(TabMenuAction::Duplicate(id)),
+        ));
+        menu = menu.push(row_btn("Rename", Message::TabRenameStart(id)));
+        menu = menu.push(row_btn(
+            if is_marked {
+                "Unmark"
+            } else {
+                "Mark Important"
+            },
+            Message::TabMenuAction(TabMenuAction::ToggleMarked(id)),
+        ));
+        menu = menu.push(row_btn(
+            if pinned { "Unpin Tab" } else { "Pin Tab" },
+            Message::TabMenuAction(TabMenuAction::TogglePinned(id)),
+        ));
+        menu = menu.push(row_btn(
+            "Close",
+            Message::TabMenuAction(TabMenuAction::Close(id)),
+        ));
         if !only_one {
             menu = menu.push(row_btn(
                 "Close Others",
@@ -6687,13 +6970,62 @@ impl Jterm {
                 Message::TabMenuAction(TabMenuAction::CloseToRight(id)),
             ));
         }
-        menu = menu.push(row_btn(
-            "Duplicate",
-            Message::TabMenuAction(TabMenuAction::Duplicate(id)),
-        ));
+        if marked_count > 0 {
+            menu = menu.push(row_btn(
+                &format!("Close Marked Tabs ({marked_count})"),
+                Message::TabMenuAction(TabMenuAction::CloseMarked),
+            ));
+        }
+        for (index, host) in self.config.remote_hosts.iter().enumerate() {
+            menu = menu.push(row_btn(
+                &format!("Remote: {}", host.display_name()),
+                Message::TabMenuAction(TabMenuAction::ConnectRemote(index)),
+            ));
+        }
+
+        // Item count for the height estimate the placement clamps against:
+        // the six always-present entries plus the conditional ones.
+        let rows = 6
+            + usize::from(!only_one)
+            + usize::from(i < last_idx)
+            + usize::from(marked_count > 0)
+            + self.config.remote_hosts.len();
+        self.float_tab_menu(menu, rows)
+    }
+
+    /// Place an open tab menu at the pointer position that summoned it, over a
+    /// dismiss-on-outside-click sheet.
+    ///
+    /// The panel is a free-floating overlay, so it has to be positioned by
+    /// hand: iced has no popup anchored to a widget. Centering it (as this did
+    /// before) puts it nowhere near the tab that was right-clicked — obviously
+    /// wrong once the tab list is docked in the sidebar. `rows` drives the
+    /// height estimate that keeps the panel inside the window; being a little
+    /// off only shifts a menu that was near the bottom edge anyway.
+    fn float_tab_menu<'a>(
+        &'a self,
+        menu: iced::widget::Column<'a, Message>,
+        rows: usize,
+    ) -> Element<'a, Message> {
+        const PANEL_W: f32 = 240.0;
+        const ROW_H: f32 = 27.0;
+        /// Header line + the panel's own vertical padding.
+        const PANEL_CHROME_H: f32 = 40.0;
+        const EDGE_GAP: f32 = 4.0;
+
+        let panel_h = PANEL_CHROME_H + rows as f32 * ROW_H;
+        // Keep the whole panel on screen. `max(EDGE_GAP)` runs last so a window
+        // too small to hold the panel still shows its top-left corner rather
+        // than pushing it off past the left/top edge.
+        let x = (self.tab_menu_at.x)
+            .min(self.win_size.width - PANEL_W - EDGE_GAP)
+            .max(EDGE_GAP);
+        let y = (self.tab_menu_at.y)
+            .min(self.win_size.height - panel_h - EDGE_GAP)
+            .max(TAB_BAR_H);
 
         let panel = container(menu)
-            .width(Length::Fixed(200.0))
+            .width(Length::Fixed(PANEL_W))
             .padding(8)
             .style(container::dark);
 
@@ -6704,12 +7036,11 @@ impl Jterm {
                 .height(Length::Fill),
         )
         .on_press(Message::TabMenuClose);
-        let top_gap = TAB_BAR_H + 4.0;
-        let centered = container(panel)
-            .center_x(Length::Fill)
+        let placed = container(panel)
+            .align_left(Length::Fill)
             .align_top(Length::Fill)
-            .padding(iced::Padding::from(0).top(top_gap));
-        stack![Element::from(dismiss), Element::from(centered)].into()
+            .padding(iced::Padding::from(0).top(y).left(x));
+        stack![Element::from(dismiss), Element::from(placed)].into()
     }
 
     /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
@@ -7615,13 +7946,17 @@ impl Jterm {
             };
             let hovered = self.hovered_tab == Some(id);
             let dragging_this = self.dragging_tab == Some(id);
+            let label = format!("{}{label}", self.tab_state_prefix(i));
             let tab_label = container(text(label).size(13).wrapping(text::Wrapping::None))
                 .width(Length::Fill)
                 .padding([4, 8])
                 .style(self.tab_container_style(active, hovered, dragging_this));
+            // Right-click opens the same tab menu the top strip uses — this is
+            // the tab list in Side mode, so it must offer the same actions.
             let tab: Element<'_, Message> = mouse_area(tab_label)
                 .on_press(Message::TabDragStart(id))
                 .on_release(Message::TabDragEnd(id))
+                .on_right_press(Message::TabMenuOpen(id))
                 .into();
             // Reveal the close button on the active or hovered tab only.
             let show_close = active || hovered;
@@ -9630,6 +9965,21 @@ impl Jterm {
             _ => None,
         });
         subs.push(events);
+        // A right-press on a tab carries no coordinates, so the context menu
+        // needs the pointer tracked separately. Track it only while a tab is
+        // hovered: a motion message per event over the whole window would
+        // rebuild the view (grid included) on every mouse move, which is why
+        // the terminal itself only reports motion while dragging.
+        if self.hovered_tab.is_some() {
+            subs.push(iced::event::listen_with(
+                |event, _status, _id| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::TabPointerMoved(position))
+                    }
+                    _ => None,
+                },
+            ));
+        }
         subs.push(
             iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
         );
@@ -10602,6 +10952,9 @@ mod tests {
     fn split_tab(id: usize, sessions: &[usize]) -> Tab {
         Tab {
             id,
+            title: None,
+            pinned: false,
+            marked: false,
             tree: PaneTree::Split {
                 axis: Axis::Vertical,
                 children: sessions.iter().map(|&s| PaneTree::Leaf(s)).collect(),
@@ -10669,7 +11022,8 @@ mod tests {
 
         // v1 has no per-tab focus, so the restore path seeds it with the
         // snapshot's active session (1 here).
-        let (tabs, active, next_id) = build_restored_tabs(vec![(tree, Some(1))], 3, 1, None);
+        let (tabs, active, next_id) =
+            build_restored_tabs(vec![RestoredTab::plain(tree, Some(1))], 3, 1, None);
 
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs[0].sessions(), vec![0, 1]);
@@ -10685,7 +11039,10 @@ mod tests {
         // Two tabs both name session 0; the second is dropped, and the adoption
         // pass then gives session 1 its own tab.
         let (tabs, _, _) = build_restored_tabs(
-            vec![(PaneTree::Leaf(0), None), (PaneTree::Leaf(0), None)],
+            vec![
+                RestoredTab::plain(PaneTree::Leaf(0), None),
+                RestoredTab::plain(PaneTree::Leaf(0), None),
+            ],
             2,
             0,
             Some(0),
@@ -10699,7 +11056,10 @@ mod tests {
     #[test]
     fn an_out_of_range_active_tab_falls_back_to_the_active_session() {
         let (tabs, active, _) = build_restored_tabs(
-            vec![(PaneTree::Leaf(0), None), (PaneTree::Leaf(1), None)],
+            vec![
+                RestoredTab::plain(PaneTree::Leaf(0), None),
+                RestoredTab::plain(PaneTree::Leaf(1), None),
+            ],
             2,
             1,
             Some(9),
@@ -10708,6 +11068,76 @@ mod tests {
         assert_eq!(tabs.len(), 2);
         assert_eq!(active, 1);
         assert_eq!(tabs[active].focus, 1);
+    }
+
+    /// Pin / mark / title are per-tab state the context menu sets. They ride
+    /// the snapshot, and pinned tabs have to lead the strip once restored —
+    /// otherwise "pin" silently becomes a no-op across a restart.
+    #[test]
+    fn restored_tabs_keep_their_menu_state_and_pinned_ones_lead() {
+        let restored = vec![
+            RestoredTab::plain(PaneTree::Leaf(0), None),
+            RestoredTab {
+                tree: PaneTree::Leaf(1),
+                focus: None,
+                title: Some("build".to_string()),
+                pinned: false,
+                marked: true,
+            },
+            RestoredTab {
+                tree: PaneTree::Leaf(2),
+                focus: None,
+                title: None,
+                pinned: true,
+                marked: false,
+            },
+        ];
+
+        // The user was last on the tab holding session 1 (index 1 in the file).
+        let (tabs, active, _) = build_restored_tabs(restored, 3, 1, Some(1));
+
+        assert_eq!(tabs.len(), 3);
+        // The pinned tab moved to the front; the other two kept their order.
+        assert_eq!(tabs[0].sessions(), vec![2]);
+        assert!(tabs[0].pinned);
+        assert_eq!(tabs[1].sessions(), vec![0]);
+        assert_eq!(tabs[2].sessions(), vec![1]);
+        assert_eq!(tabs[2].title.as_deref(), Some("build"));
+        assert!(tabs[2].marked);
+        // The reorder followed the active tab instead of leaving the index put.
+        assert_eq!(tabs[active].sessions(), vec![1]);
+    }
+
+    /// Pinning must not change which tab is on screen, and the relative order
+    /// inside each group has to survive.
+    #[test]
+    fn sorting_pinned_first_is_stable_and_follows_the_active_tab() {
+        let mut tabs = vec![
+            Tab::new(0, 0),
+            Tab::new(1, 1),
+            Tab::new(2, 2),
+            Tab::new(3, 3),
+        ];
+        tabs[2].pinned = true;
+
+        let active = sort_pinned_first(&mut tabs, 1);
+
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![2, 0, 1, 3]
+        );
+        // The tab that was active (id 1) is still the active one.
+        assert_eq!(tabs[active].id, 1);
+
+        // Unpinning puts it back at the head of the unpinned group, and the
+        // active tab still does not move.
+        tabs[0].pinned = false;
+        let active = sort_pinned_first(&mut tabs, active);
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![2, 0, 1, 3]
+        );
+        assert_eq!(tabs[active].id, 1);
     }
 
     #[test]
