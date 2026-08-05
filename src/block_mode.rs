@@ -314,6 +314,189 @@ pub fn select_neighbor(ids: &[u64], current: Option<u64>, older: bool) -> Option
     Some(ids[target])
 }
 
+/// Step the block selection across FAILED zones only (`zones` oldest-first as
+/// `(id, is_failed)` — the same [`classify`]-based predicate the scrollbar
+/// markers use). No selection, or a dangling one, lands on the NEWEST failed
+/// zone in either direction (mirroring [`select_neighbor`]'s reset rule);
+/// from a live selection — failed or not — the step goes to the nearest
+/// failed zone strictly older (`older`) or strictly newer. `None` means "do
+/// nothing": no failed zone exists in the requested direction. This function
+/// is silent about WHY it returned `None`; a caller wanting a "no failed
+/// blocks at all" toast must check for failures itself.
+pub fn select_failed_neighbor(
+    zones: &[(u64, bool)],
+    current: Option<u64>,
+    older: bool,
+) -> Option<u64> {
+    let newest_failed = |slice: &[(u64, bool)]| {
+        slice
+            .iter()
+            .rev()
+            .find(|&&(_, failed)| failed)
+            .map(|&(id, _)| id)
+    };
+    let Some(position) = current.and_then(|id| zones.iter().position(|&(zone, _)| zone == id))
+    else {
+        return newest_failed(zones);
+    };
+    if older {
+        newest_failed(&zones[..position])
+    } else {
+        zones[position + 1..]
+            .iter()
+            .find(|&&(_, failed)| failed)
+            .map(|&(id, _)| id)
+    }
+}
+
+/// Hard cap on the hits one block search returns; the scan stops early once
+/// it is reached (the query can always be refined).
+pub const BLOCK_SEARCH_HIT_CAP: usize = 500;
+
+/// Character cap of a hit's matching-line preview.
+pub const BLOCK_SEARCH_LINE_CHARS: usize = 200;
+
+/// Character cap of a hit's command preview.
+pub const BLOCK_SEARCH_COMMAND_CHARS: usize = 80;
+
+/// One row of the cross-block search picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSearchHit {
+    pub zone_id: u64,
+    /// False when the match is on the command line itself.
+    pub is_output_line: bool,
+    /// 1-based output line number of the match; 0 for command-line hits
+    /// (`is_output_line` is the discriminator).
+    pub line_no: usize,
+    /// The matching line, clipped to [`BLOCK_SEARCH_LINE_CHARS`].
+    pub line_text: String,
+    /// The zone's command line, clipped to [`BLOCK_SEARCH_COMMAND_CHARS`]
+    /// (empty for background zones).
+    pub command_preview: String,
+}
+
+/// One zone's precomputed text for [`search_blocks`] (ember's
+/// `CachedBlockSearchRecord`). Built ONCE per picker-open — the picker
+/// closes on any session churn, so the cache can never outlive its session
+/// — and each keystroke then only rescans these strings instead of
+/// re-extracting terminal output. The lowercase copies are precomputed here
+/// so a query run allocates nothing beyond its needle and its hits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CachedBlockSearchZone {
+    pub zone_id: u64,
+    /// The zone's command, original case; `None` for background zones
+    /// (absent or blank command).
+    pub command: Option<String>,
+    /// Lowercased `command`, for case-insensitive matching.
+    pub command_lowercase: Option<String>,
+    /// The zone's output, original case (the captured-snapshot-first
+    /// extraction — exactly what the copy paths would read); `None` when it
+    /// has none.
+    pub output: Option<String>,
+    /// Lowercased `output`. Unicode lowercasing never adds or removes line
+    /// breaks, so `output.lines()` and `output_lowercase.lines()` stay in
+    /// step and hits can report original-case line text.
+    pub output_lowercase: Option<String>,
+}
+
+impl CachedBlockSearchZone {
+    /// Normalize one zone at cache-build time: a blank command counts as
+    /// none (background zone), and the lowercase copies are precomputed.
+    pub fn new(zone_id: u64, command: Option<&str>, output: Option<String>) -> Self {
+        let command = command
+            .filter(|command| !command.trim().is_empty())
+            .map(str::to_string);
+        let command_lowercase = command.as_deref().map(str::to_lowercase);
+        let output_lowercase = output.as_deref().map(str::to_lowercase);
+        Self {
+            zone_id,
+            command,
+            command_lowercase,
+            output,
+            output_lowercase,
+        }
+    }
+}
+
+/// A finished block search: hits (newest zones first) plus whether the
+/// [`BLOCK_SEARCH_HIT_CAP`] stopped the scan with matches unreported.
+pub struct BlockSearchResults {
+    pub hits: Vec<BlockSearchHit>,
+    pub capped: bool,
+}
+
+/// Clip `text` to `max_chars` characters, marking the cut with an ellipsis.
+fn clipped(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut short: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        short.push('…');
+        short
+    }
+}
+
+/// Case-insensitive substring search across every cached zone's command
+/// line and output lines. `cache` comes oldest-first (the zone deque's
+/// order); hits are emitted newest zones first, a zone's command hit before
+/// its output hits, output hits in line order. Matching runs entirely
+/// against the precomputed lowercase copies (ember's per-open cache design)
+/// — beyond the lowercased needle, allocations happen only for hits. A
+/// blank query matches nothing — an empty picker, not the whole history.
+pub fn search_blocks(cache: &[CachedBlockSearchZone], query: &str) -> BlockSearchResults {
+    let needle = query.trim().to_lowercase();
+    let mut results = BlockSearchResults {
+        hits: Vec::new(),
+        capped: false,
+    };
+    if needle.is_empty() {
+        return results;
+    }
+    'zones: for zone in cache.iter().rev() {
+        // Shared by the zone's hits; computed only when one exists.
+        let mut command_preview: Option<String> = None;
+        let mut preview = |command: Option<&str>| -> String {
+            command_preview
+                .get_or_insert_with(|| {
+                    clipped(command.unwrap_or_default(), BLOCK_SEARCH_COMMAND_CHARS)
+                })
+                .clone()
+        };
+        let command_hit = zone
+            .command_lowercase
+            .as_deref()
+            .filter(|lowercase| lowercase.contains(&needle))
+            .and(zone.command.as_deref())
+            .map(|command| (false, 0usize, command));
+        let output_lines = zone.output.as_deref().into_iter().flat_map(str::lines);
+        let lowercase_lines = zone
+            .output_lowercase
+            .as_deref()
+            .into_iter()
+            .flat_map(str::lines);
+        let output_hits = output_lines
+            .zip(lowercase_lines)
+            .enumerate()
+            .filter(|(_, (_, lowercase))| lowercase.contains(&needle))
+            .map(|(index, (line, _))| (true, index + 1, line));
+        for (is_output_line, line_no, line) in command_hit.into_iter().chain(output_hits) {
+            if results.hits.len() >= BLOCK_SEARCH_HIT_CAP {
+                results.capped = true;
+                break 'zones;
+            }
+            let command_preview = preview(zone.command.as_deref());
+            results.hits.push(BlockSearchHit {
+                zone_id: zone.zone_id,
+                is_output_line,
+                line_no,
+                line_text: clipped(line, BLOCK_SEARCH_LINE_CHARS),
+                command_preview,
+            });
+        }
+    }
+    results
+}
+
 /// Scrollbar-track fractions (0.0 = top of the buffer, approaching 1.0 at the
 /// bottom) for failed-zone markers: each zone's first absolute row over the
 /// total buffer rows (scrollback + grid). Zones are absolute rows so this is
@@ -661,6 +844,147 @@ mod tests {
         // No zones at all: nothing to select.
         assert_eq!(select_neighbor(&[], None, true), None);
         assert_eq!(select_neighbor(&[], Some(1), false), None);
+    }
+
+    #[test]
+    fn select_failed_neighbor_steps_only_over_failures() {
+        // Oldest-first: 10 ok, 20 FAILED, 30 ok, 40 FAILED, 50 ok.
+        let zones = [
+            (10, false),
+            (20, true),
+            (30, false),
+            (40, true),
+            (50, false),
+        ];
+        // No selection (or a dangling id): both directions pick the NEWEST
+        // failed zone.
+        assert_eq!(select_failed_neighbor(&zones, None, true), Some(40));
+        assert_eq!(select_failed_neighbor(&zones, None, false), Some(40));
+        assert_eq!(select_failed_neighbor(&zones, Some(999), true), Some(40));
+        // From a failed selection: the nearest failed strictly beyond it.
+        assert_eq!(select_failed_neighbor(&zones, Some(40), true), Some(20));
+        assert_eq!(select_failed_neighbor(&zones, Some(20), false), Some(40));
+        // From a NON-failed selection: same rule, skipping non-failures.
+        assert_eq!(select_failed_neighbor(&zones, Some(30), true), Some(20));
+        assert_eq!(select_failed_neighbor(&zones, Some(30), false), Some(40));
+        assert_eq!(select_failed_neighbor(&zones, Some(50), true), Some(40));
+        // Ends clamp silently: nothing further in that direction.
+        assert_eq!(select_failed_neighbor(&zones, Some(20), true), None);
+        assert_eq!(select_failed_neighbor(&zones, Some(40), false), None);
+        assert_eq!(select_failed_neighbor(&zones, Some(50), false), None);
+        // No zones, or no failures at all: nothing to land on.
+        assert_eq!(select_failed_neighbor(&[], None, true), None);
+        assert_eq!(
+            select_failed_neighbor(&[(1, false), (2, false)], None, false),
+            None
+        );
+        assert_eq!(
+            select_failed_neighbor(&[(1, false), (2, false)], Some(1), false),
+            None
+        );
+    }
+
+    fn source(zone_id: u64, command: Option<&str>, output: Option<&str>) -> CachedBlockSearchZone {
+        CachedBlockSearchZone::new(zone_id, command, output.map(str::to_string))
+    }
+
+    #[test]
+    fn cache_build_precomputes_lowercase_and_drops_blank_commands() {
+        let zone = CachedBlockSearchZone::new(7, Some("Grep ERROR log"), Some("OK\nDone".into()));
+        assert_eq!(zone.command.as_deref(), Some("Grep ERROR log"));
+        assert_eq!(zone.command_lowercase.as_deref(), Some("grep error log"));
+        assert_eq!(zone.output.as_deref(), Some("OK\nDone"));
+        assert_eq!(zone.output_lowercase.as_deref(), Some("ok\ndone"));
+        // A blank command normalizes to none (background zone), and a zone
+        // without output caches none.
+        let background = CachedBlockSearchZone::new(8, Some("  \t"), None);
+        assert_eq!(background.command, None);
+        assert_eq!(background.command_lowercase, None);
+        assert_eq!(background.output, None);
+        assert_eq!(background.output_lowercase, None);
+    }
+
+    #[test]
+    fn search_blocks_matches_commands_and_output_lines_case_insensitively() {
+        let sources = [
+            source(1, Some("make test"), Some("ok\nError: boom\ndone")),
+            source(2, Some("grep ERROR log"), Some("nothing here")),
+        ];
+        let results = search_blocks(&sources, "error");
+        assert!(!results.capped);
+        // Newest zone first; a zone's command hit precedes its output hits;
+        // output line numbers are 1-based.
+        assert_eq!(results.hits.len(), 2);
+        assert_eq!(results.hits[0].zone_id, 2);
+        assert!(!results.hits[0].is_output_line);
+        assert_eq!(results.hits[0].line_no, 0);
+        assert_eq!(results.hits[0].line_text, "grep ERROR log");
+        assert_eq!(results.hits[0].command_preview, "grep ERROR log");
+        assert_eq!(results.hits[1].zone_id, 1);
+        assert!(results.hits[1].is_output_line);
+        assert_eq!(results.hits[1].line_no, 2);
+        assert_eq!(results.hits[1].line_text, "Error: boom");
+        assert_eq!(results.hits[1].command_preview, "make test");
+        // The query is folded too, and background zones search their output.
+        let background = [source(7, None, Some("Worker READY"))];
+        let hit = &search_blocks(&background, "ReAdY").hits[0];
+        assert!(hit.is_output_line);
+        assert_eq!(hit.line_no, 1);
+        assert_eq!(hit.command_preview, "");
+    }
+
+    #[test]
+    fn search_blocks_blank_query_matches_nothing() {
+        let sources = [source(1, Some("ls"), Some("file"))];
+        assert!(search_blocks(&sources, "").hits.is_empty());
+        assert!(search_blocks(&sources, "   ").hits.is_empty());
+        assert!(search_blocks(&sources, "absent").hits.is_empty());
+    }
+
+    #[test]
+    fn search_blocks_caps_at_500_hits_and_stops_early() {
+        // One zone with 600 matching lines: the scan stops at the cap.
+        let output = "match\n".repeat(600);
+        let sources = [
+            source(1, Some("old zone"), Some("match here too")),
+            source(2, None, Some(&output)),
+        ];
+        let results = search_blocks(&sources, "match");
+        assert_eq!(results.hits.len(), BLOCK_SEARCH_HIT_CAP);
+        assert!(results.capped);
+        // Newest-first means the capped scan never reached the older zone.
+        assert!(results.hits.iter().all(|hit| hit.zone_id == 2));
+        // Exactly at the cap: no false "capped" flag.
+        let exact = "match\n".repeat(BLOCK_SEARCH_HIT_CAP);
+        let sources = [source(3, None, Some(&exact))];
+        let results = search_blocks(&sources, "match");
+        assert_eq!(results.hits.len(), BLOCK_SEARCH_HIT_CAP);
+        assert!(!results.capped);
+    }
+
+    #[test]
+    fn search_blocks_clips_previews_with_an_ellipsis() {
+        let long_line = format!("needle {}", "x".repeat(300));
+        let long_command = format!("needle {}", "c".repeat(300));
+        let sources = [source(1, Some(&long_command), Some(&long_line))];
+        let results = search_blocks(&sources, "needle");
+        let command_hit = &results.hits[0];
+        assert_eq!(
+            command_hit.line_text.chars().count(),
+            BLOCK_SEARCH_LINE_CHARS
+        );
+        assert!(command_hit.line_text.ends_with('…'));
+        assert_eq!(
+            command_hit.command_preview.chars().count(),
+            BLOCK_SEARCH_COMMAND_CHARS
+        );
+        assert!(command_hit.command_preview.ends_with('…'));
+        let output_hit = &results.hits[1];
+        assert_eq!(
+            output_hit.line_text.chars().count(),
+            BLOCK_SEARCH_LINE_CHARS
+        );
+        assert!(output_hit.line_text.ends_with('…'));
     }
 
     #[test]

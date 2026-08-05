@@ -123,6 +123,10 @@ static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
 static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));
+static BLOCK_SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-input"));
+static BLOCK_SEARCH_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-list"));
 static TAB_RENAME_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-rename-input"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -292,6 +296,69 @@ struct TabSwitcherState {
     query: String,
     /// Highlighted row in the filtered list.
     selected: usize,
+}
+
+/// State for the `block:search` cross-block search picker (Ctrl+Alt+F): a
+/// case-insensitive substring query over every completed zone's command and
+/// output (captured-snapshot-first, so trimmed-away zones still match).
+///
+/// Zone text is extracted ONCE per picker-open into `cache` (ember's
+/// per-open cache design); each keystroke then only rescans those cached
+/// strings. The state carries no session identity ON PURPOSE: zone ids
+/// restart at 0 per session, so instead of tagging hits, the picker is
+/// CLOSED (fully reset) whenever the active session changes or any session
+/// closes while it is open — a closed picker cannot hold stale hits.
+/// Accepted staleness within one session: blocks that finish while the
+/// picker is open are not seen until it is reopened.
+#[derive(Default)]
+struct BlockSearchState {
+    query: String,
+    /// Highlighted row among `hits` (all hits are drawn and navigable, in a
+    /// scrollable list).
+    selected: usize,
+    hits: Vec<block_mode::BlockSearchHit>,
+    /// The 500-hit matching cap stopped the scan early (older zones were
+    /// left unscanned).
+    capped: bool,
+    /// Per-open extraction cache the hits are computed from, oldest zone
+    /// first (the zone deque's order). Built at open, never per keystroke.
+    cache: Vec<block_mode::CachedBlockSearchZone>,
+}
+
+impl BlockSearchState {
+    fn select_next(&mut self) {
+        let len = self.hits.len();
+        self.selected = if len == 0 {
+            0
+        } else {
+            (self.selected + 1) % len
+        };
+    }
+
+    fn select_prev(&mut self) {
+        let len = self.hits.len();
+        self.selected = if len == 0 {
+            0
+        } else if self.selected == 0 {
+            len - 1
+        } else {
+            self.selected - 1
+        };
+    }
+
+    /// Result-count line: `"N matches"` (`"1 match"`), plus ember's
+    /// `" · older blocks not searched"` when the run stopped at the hit cap
+    /// — which is what `capped` actually means, not that more matches
+    /// necessarily exist.
+    fn count_label(&self) -> String {
+        let count = self.hits.len();
+        let noun = if count == 1 { "match" } else { "matches" };
+        let mut label = format!("{count} {noun}");
+        if self.capped {
+            label.push_str(" · older blocks not searched");
+        }
+        label
+    }
 }
 
 /// Which content the left sidebar dock currently shows.
@@ -882,6 +949,12 @@ enum Message {
     HistoryPickerClose,
     /// Type the clicked command into the active pane's prompt (and close).
     HistoryPickerAccept(String),
+    /// Query text changed in the block search picker.
+    BlockSearchInput(String),
+    /// Cancel the block search picker overlay.
+    BlockSearchClose,
+    /// Select and reveal the clicked hit's zone (and close the picker).
+    BlockSearchAccept(u64),
     /// User confirmed closing a tab with a running foreground process.
     TabCloseConfirmYes,
     /// User cancelled the close-confirmation overlay.
@@ -1512,6 +1585,8 @@ struct Frost {
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
+    /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
+    block_search: Option<BlockSearchState>,
     /// Close-confirmation overlay for a pane or tab with a running foreground
     /// process. Holds `(target_id, process_name, what_to_close)`.
     tab_close_confirm: Option<(usize, String, PendingClose)>,
@@ -1659,6 +1734,7 @@ impl Frost {
             tab_switcher: None,
             remote_picker: None,
             history_picker: None,
+            block_search: None,
             tab_close_confirm: None,
             last_notification_at: None,
             history_reflow_sessions: std::collections::HashSet::new(),
@@ -1950,6 +2026,7 @@ impl Frost {
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
             && self.history_picker.is_none()
+            && self.block_search.is_none()
             && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
     }
@@ -1965,6 +2042,7 @@ impl Frost {
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
             && self.history_picker.is_none()
+            && self.block_search.is_none()
             && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
     }
@@ -2396,6 +2474,13 @@ impl Frost {
         if index >= self.sessions.len() {
             return Task::none();
         }
+        // ANY session close (user close, close_tab, an async `PtyExited`)
+        // invalidates the block search picker: session indices shift and the
+        // close may hand `active` to a different session whose zone ids —
+        // they restart at 0 per session — would silently resolve a held
+        // hit against the wrong session. Close it; see
+        // `close_block_search_on_session_change`.
+        self.close_block_search_on_session_change();
         // Closing the last session quits the app.
         if self.sessions.len() == 1 {
             self.save_session_snapshot();
@@ -2819,6 +2904,12 @@ impl Frost {
     /// Move keyboard focus to a pane of the *active* tab. Also records the
     /// choice on the tab, so returning to it restores the same pane.
     fn set_focus(&mut self, session: usize) {
+        if session != self.active {
+            // Every pane/tab focus switch funnels through here (pane clicks,
+            // Alt+arrows, `focus_session`, the tab switcher): the block
+            // search picker must not survive the active session changing.
+            self.close_block_search_on_session_change();
+        }
         self.active = session;
         let idx = self.active_tab.min(self.tabs.len() - 1);
         self.tabs[idx].focus = session;
@@ -2880,6 +2971,11 @@ impl Frost {
         }
         self.active_tab = tab;
         self.tabs[tab].repair_focus();
+        if self.tabs[tab].focus != self.active {
+            // Tab activation bypasses `set_focus`; same rule — the block
+            // search picker must not survive the active session changing.
+            self.close_block_search_on_session_change();
+        }
         self.active = self.tabs[tab].focus;
         self.pane_zoomed = false;
         self.hovered_divider = None;
@@ -2969,6 +3065,11 @@ impl Frost {
 
     /// Open `session` in a brand new tab placed after the active one.
     fn open_tab_with(&mut self, session: usize) {
+        if session != self.active {
+            // New-tab activation bypasses `set_focus`; the block search
+            // picker must not survive the active session changing.
+            self.close_block_search_on_session_change();
+        }
         let at = (self.active_tab + 1).min(self.tabs.len());
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -3454,6 +3555,8 @@ impl Frost {
             }
             C::TerminalCopyLastOutput => self.copy_last_output_task(),
             C::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            C::BlockJumpPrevFailed => self.block_jump_failed_step(true),
+            C::BlockJumpNextFailed => self.block_jump_failed_step(false),
             C::BlockCopyCommand => self.block_copy_command_task(),
             C::BlockCopyOutput => self.block_copy_output_task(),
             C::BlockRecallCommand => self.block_recall_command_task(),
@@ -3461,6 +3564,7 @@ impl Frost {
             C::BlockSelectNext => self.block_select_step(false),
             C::BlockCopyBlock => self.block_copy_block_task(),
             C::BlockCopyMarkdown => self.block_copy_markdown_task(),
+            C::BlockSearch => self.toggle_block_search(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(cmd, C::TerminalPromptPrev) {
@@ -3822,6 +3926,151 @@ impl Frost {
         iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
     }
 
+    /// Toggle the cross-block search picker (`block:search`). While it is
+    /// open its own key handler owns the chord, so dispatch normally only
+    /// sees the closed state — the guard here covers the palette entry.
+    /// Opening runs the ONE extraction pass over the active session's zones
+    /// (command + output through the captured-snapshot-first path, so
+    /// trimmed-away zones still match); per-keystroke searches then only
+    /// rescan that cache and never touch the terminal.
+    fn toggle_block_search(&mut self) -> Task<Message> {
+        if self.block_search.is_some() {
+            self.block_search = None;
+            return Task::none();
+        }
+        let cache: Vec<block_mode::CachedBlockSearchZone> = self
+            .sessions
+            .get(self.active)
+            .map(|sess| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| {
+                        block_mode::CachedBlockSearchZone::new(
+                            zone.id,
+                            zone.command.as_deref(),
+                            sess.terminal.zone_output_text(zone.id),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.block_search = Some(BlockSearchState {
+            cache,
+            ..BlockSearchState::default()
+        });
+        self.block_search_recompute();
+        iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone())
+    }
+
+    /// Close the block search picker because the session landscape changed
+    /// under it: the active session switched (tab/pane focus) or a session
+    /// closed. Its hits and cache were computed against ONE session, zone
+    /// ids restart at 0 per session, and session indices shift on close —
+    /// resolving a held hit afterwards could silently select a block of the
+    /// WRONG session. Dropping the whole state (query, hits, cache) is the
+    /// reset; a closed picker cannot hold stale hits.
+    fn close_block_search_on_session_change(&mut self) {
+        self.block_search = None;
+    }
+
+    /// Re-run the block search over the per-open cache with the current
+    /// query. Never re-extracts terminal output: at most 256 cached zones
+    /// are rescanned, and matching allocates nothing beyond the lowercased
+    /// needle and the hits.
+    fn block_search_recompute(&mut self) {
+        let Some(state) = self.block_search.as_mut() else {
+            return;
+        };
+        let results = block_mode::search_blocks(&state.cache, &state.query);
+        state.hits = results.hits;
+        state.capped = results.capped;
+        state.selected = 0;
+    }
+
+    /// Keep the highlighted hit visible in the picker's scrollable list.
+    /// Rows are uniform, so snapping to `selected / (len - 1)` places the
+    /// selected row at that same fraction of the viewport — always inside
+    /// it, top row at the top, bottom row at the bottom.
+    fn block_search_snap_task(&self) -> Task<Message> {
+        let Some(state) = self.block_search.as_ref() else {
+            return Task::none();
+        };
+        let y = match state.hits.len() {
+            0 | 1 => 0.0,
+            len => state.selected as f32 / (len - 1) as f32,
+        };
+        iced::widget::operation::snap_to(
+            BLOCK_SEARCH_LIST_ID.clone(),
+            iced::widget::operation::RelativeOffset { x: 0.0, y },
+        )
+    }
+
+    /// Block search picker key handling, mirroring
+    /// [`Self::handle_history_picker_key`]: typed text edits the query,
+    /// arrows move the selection, Enter selects and reveals the highlighted
+    /// hit's zone, Esc (or the block:search chord) dismisses. Runs BEFORE the
+    /// keybinding/`encode_key` layers, which is what keeps the picker's own
+    /// keystrokes from reaching the PTY and clearing `selected_block`.
+    fn handle_block_search_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        // The (configurable) toggle chord closes the picker from inside.
+        if key_to_binding_string(key, mods)
+            .and_then(|binding| self.keybindings.get_command(&binding))
+            == Some(keybindings::Command::BlockSearch)
+        {
+            self.block_search = None;
+            return Some(Task::none());
+        }
+        let state = self.block_search.as_mut()?;
+        match key {
+            Key::Named(Named::Escape) => {
+                self.block_search = None;
+                return Some(Task::none());
+            }
+            Key::Named(Named::Enter) => {
+                let target = state.hits.get(state.selected).map(|hit| hit.zone_id);
+                self.block_search = None;
+                if let Some(id) = target {
+                    self.select_and_reveal_block(id);
+                }
+                return Some(Task::none());
+            }
+            Key::Named(Named::ArrowDown) => {
+                state.select_next();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::ArrowUp) => {
+                state.select_prev();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::Backspace) => {
+                state.query.pop();
+                self.block_search_recompute();
+                return Some(self.block_search_snap_task());
+            }
+            _ => {}
+        }
+        if !mods.control() && !mods.alt() {
+            if let Some(t) = text {
+                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
+                if !printable.is_empty() {
+                    state.query.push_str(&printable);
+                    self.block_search_recompute();
+                    return Some(self.block_search_snap_task());
+                }
+            }
+        }
+        // Swallow all other keys while the overlay owns the keyboard.
+        Some(Task::none())
+    }
+
     /// Paste-to-prompt: queue `text` into the active pane with the same framing,
     /// input-queue bounds and rejection toast as a clipboard paste, and never
     /// append Enter — the user still submits explicitly. The text is appended
@@ -3974,13 +4223,15 @@ impl Frost {
             .running_zone_start()
             .or(terminal.live_prompt_row())
             .unwrap_or(total);
-        let starts: Vec<usize> = terminal
+        // Rows-evicted zones own no rows, so the gutter can never hit them
+        // (and their clamped prompt_start must not skew the spans).
+        let zones: Vec<&terminal::CommandZone> = terminal
             .command_zones
             .iter()
-            .map(|zone| zone.prompt_start)
+            .filter(|zone| !zone.rows_evicted)
             .collect();
-        let hit = terminal
-            .command_zones
+        let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
+        let hit = zones
             .iter()
             .zip(block_mode::spans(&starts, live_boundary))
             .find(|(_, (span_start, span_end))| abs_row >= *span_start && abs_row < *span_end)
@@ -4725,6 +4976,8 @@ impl Frost {
             }
             PaletteAction::CopyLastOutput => self.copy_last_output_task(),
             PaletteAction::BlockJumpFirstFailed => self.block_jump_first_failed(),
+            PaletteAction::BlockJumpPrevFailed => self.block_jump_failed_step(true),
+            PaletteAction::BlockJumpNextFailed => self.block_jump_failed_step(false),
             PaletteAction::BlockCopyCommand => self.block_copy_command_task(),
             PaletteAction::BlockCopyOutput => self.block_copy_output_task(),
             PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
@@ -4732,6 +4985,7 @@ impl Frost {
             PaletteAction::BlockSelectNext => self.block_select_step(false),
             PaletteAction::BlockCopyBlock => self.block_copy_block_task(),
             PaletteAction::BlockCopyMarkdown => self.block_copy_markdown_task(),
+            PaletteAction::BlockSearch => self.toggle_block_search(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
@@ -4784,28 +5038,96 @@ impl Frost {
         }
     }
 
+    /// Select zone `id` in the active session and reveal its first row — the
+    /// shared tail of every "jump the selection somewhere" action (select
+    /// step, failed jumps, the block search picker). A zone whose rows were
+    /// trimmed out of scrollback is still selected (its metadata actions all
+    /// work) but cannot be scrolled to: it toasts instead, with ember's
+    /// wording. A vanished id — evicted by the 256-zone cap while (say) the
+    /// search picker held the hit — toasts too, with the same wording the
+    /// other block actions use for a gone zone, instead of silently doing
+    /// nothing.
+    fn select_and_reveal_block(&mut self, id: u64) {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return;
+        };
+        let Some((prompt_row, rows_evicted)) = sess
+            .terminal
+            .zone_by_id(id)
+            .map(|zone| (zone.prompt_start, zone.rows_evicted))
+        else {
+            self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(self.active) {
+            sess.selected_block = Some(id);
+            if !rows_evicted {
+                sess.terminal.reveal_buffer_row(prompt_row);
+            }
+            sess.refresh();
+        }
+        if rows_evicted {
+            self.push_toast(
+                "Command position is no longer in scrollback".to_string(),
+                ToastKind::Info,
+            );
+        }
+    }
+
     /// Select and reveal the oldest block whose command failed (exit reported
     /// and nonzero). Shared by the keybinding and the command palette; works
     /// even while block-mode rendering is disabled.
     fn block_jump_first_failed(&mut self) -> Task<Message> {
-        let target = self.sessions.get(self.active).and_then(|sess| {
-            sess.terminal
-                .first_failed_zone()
-                .map(|zone| (zone.id, zone.prompt_start))
-        });
+        let target = self
+            .sessions
+            .get(self.active)
+            .and_then(|sess| sess.terminal.first_failed_zone().map(|zone| zone.id));
         match target {
-            Some((id, prompt_row)) => {
-                if let Some(sess) = self.sessions.get_mut(self.active) {
-                    sess.selected_block = Some(id);
-                    sess.terminal.reveal_buffer_row(prompt_row);
-                    sess.refresh();
-                }
-            }
+            Some(id) => self.select_and_reveal_block(id),
             None => self.push_toast(
                 "No failed command block (needs OSC 133 shell integration)".to_string(),
                 ToastKind::Info,
             ),
         }
+        Task::none()
+    }
+
+    /// Step the block selection across FAILED zones only (`older` = toward
+    /// the top) — the failed-only counterpart of [`Self::block_select_step`],
+    /// classified exactly like the scrollbar's failure markers. No (or a
+    /// dangling) selection starts at the newest failed zone in either
+    /// direction; none further in the requested direction is a silent no-op;
+    /// zero failed zones toasts (jump-first-failed's wording).
+    fn block_jump_failed_step(&mut self, older: bool) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let zones: Vec<(u64, bool)> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| {
+                (
+                    zone.id,
+                    matches!(
+                        block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                        block_mode::BlockOutcome::Failed(_)
+                    ),
+                )
+            })
+            .collect();
+        if !zones.iter().any(|&(_, failed)| failed) {
+            self.push_toast(
+                "No failed command block (needs OSC 133 shell integration)".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let current = sess.selected_block;
+        let Some(target) = block_mode::select_failed_neighbor(&zones, current, older) else {
+            return Task::none();
+        };
+        self.select_and_reveal_block(target);
         Task::none()
     }
 
@@ -4963,15 +5285,7 @@ impl Frost {
         let Some(target) = block_mode::select_neighbor(&ids, current, older) else {
             return Task::none();
         };
-        sess.selected_block = Some(target);
-        if let Some(row) = sess
-            .terminal
-            .zone_by_id(target)
-            .map(|zone| zone.prompt_start)
-        {
-            sess.terminal.reveal_buffer_row(row);
-        }
-        sess.refresh();
+        self.select_and_reveal_block(target);
         Task::none()
     }
 
@@ -5693,6 +6007,19 @@ impl Frost {
                     if self.history_picker.is_some() {
                         if let Some(task) =
                             self.handle_history_picker_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
+                    // The block search picker owns the keyboard the same way
+                    // (Enter selects and reveals the hit's zone, Esc/
+                    // Ctrl+Alt+F dismiss). It MUST consume keys before the
+                    // encode_key path below: PTY-bound input clears
+                    // `selected_block`, and the picker's own keystrokes must
+                    // never do that.
+                    if self.block_search.is_some() {
+                        if let Some(task) =
+                            self.handle_block_search_key(&key, modifiers, text.as_deref())
                         {
                             return task;
                         }
@@ -6586,6 +6913,20 @@ impl Frost {
                 }
             }
             Message::HistoryPickerClose => self.history_picker = None,
+            Message::BlockSearchClose => self.block_search = None,
+            Message::BlockSearchInput(query) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.query = query;
+                }
+                self.block_search_recompute();
+                // The result set changed and the highlight reset to the top:
+                // bring the list back to the top with it.
+                return self.block_search_snap_task();
+            }
+            Message::BlockSearchAccept(id) => {
+                self.block_search = None;
+                self.select_and_reveal_block(id);
+            }
             Message::HistoryPickerInput(q) => {
                 if let Some(s) = self.history_picker.as_mut() {
                     s.query = q;
@@ -7585,6 +7926,94 @@ impl Frost {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
+    /// Ctrl+Alt+F cross-block search picker overlay (palette-style). Enter or
+    /// a click selects the hit's zone and reveals it; nothing executes.
+    fn block_search_view(&self, state: &BlockSearchState) -> Element<'_, Message> {
+        let query: Element<'_, Message> = text_input("Search command blocks…", &state.query)
+            .id(BLOCK_SEARCH_INPUT_ID.clone())
+            .on_input(Message::BlockSearchInput)
+            .size(14)
+            .into();
+        let query_line = row![text("⌕").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        // The count line stays outside the scrollable so it is always
+        // visible; EVERY hit is drawn inside it (ember renders the full hit
+        // list in a scroll area) and keyboard navigation wraps across all of
+        // them, `block_search_snap_task` keeping the highlight in view.
+        let mut body = column![query_line].spacing(8);
+        if state.query.trim().is_empty() {
+            body = body.push(
+                text("Type to search every block's command and output")
+                    .size(13)
+                    .style(text::secondary),
+            );
+        } else if state.hits.is_empty() {
+            body = body.push(text("No matches").size(13).style(text::secondary));
+        } else {
+            body = body.push(text(state.count_label()).size(12).style(text::secondary));
+            let mut list = column![].spacing(2);
+            for (pos, hit) in state.hits.iter().enumerate() {
+                let selected = pos == state.selected;
+                let mut info = row![text(hit.line_text.clone()).size(13)]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center);
+                info = info.push(Space::new().width(Length::Fill));
+                let context = if hit.command_preview.is_empty() {
+                    "(no command)".to_string()
+                } else {
+                    hit.command_preview.clone()
+                };
+                let context = if hit.is_output_line {
+                    format!("{context} · L{}", hit.line_no)
+                } else {
+                    format!("{context} · command")
+                };
+                info = info.push(text(context).size(12).style(text::secondary));
+                let accent = self.c_accent();
+                let row_body = container(info).width(Length::Fill).padding([3, 8]).style(
+                    move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let row_btn =
+                    mouse_area(row_body).on_press(Message::BlockSearchAccept(hit.zone_id));
+                list = list.push(row_btn);
+            }
+            body = body.push(
+                scrollable(list)
+                    .id(BLOCK_SEARCH_LIST_ID.clone())
+                    .height(Length::Shrink),
+            );
+        }
+
+        let panel = container(body)
+            .width(Length::Fixed(640.0))
+            .max_height(480.0)
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::BlockSearchClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
     /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
     /// left; last-command status, grid size, and tab count on the right.
     fn status_bar(&self) -> Element<'_, Message> {
@@ -7696,17 +8125,20 @@ impl Frost {
         let live_prompt = terminal.live_prompt_row();
         let live_boundary = running.or(live_prompt).unwrap_or(total);
 
-        let starts: Vec<usize> = terminal
+        // Zones whose rows were trimmed away have no rows to paint (their
+        // clamped prompt_start would corrupt the span arithmetic).
+        let zones: Vec<&terminal::CommandZone> = terminal
             .command_zones
             .iter()
-            .map(|zone| zone.prompt_start)
+            .filter(|zone| !zone.rows_evicted)
             .collect();
+        let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
         let spans = block_mode::spans(&starts, live_boundary);
         let muted = Theme::rgb_to_color32(self.theme.ui.text_disabled);
         let accent = self.theme.cursor_color();
         let mut paint = vec![terminal_view::BlockPaintRow::default(); rows];
 
-        for (zone, &(zone_start, zone_end)) in terminal.command_zones.iter().zip(&spans) {
+        for (zone, &(zone_start, zone_end)) in zones.iter().copied().zip(&spans) {
             if zone_end <= start || zone_start >= end {
                 continue;
             }
@@ -7793,10 +8225,12 @@ impl Frost {
             .command_zones
             .iter()
             .filter(|zone| {
-                matches!(
-                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
-                    block_mode::BlockOutcome::Failed(_)
-                )
+                // Rows-evicted zones have no track position to mark.
+                !zone.rows_evicted
+                    && matches!(
+                        block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                        block_mode::BlockOutcome::Failed(_)
+                    )
             })
             .map(|zone| zone.prompt_start)
             .collect();
@@ -8618,6 +9052,11 @@ impl Frost {
         };
         let root: Element<'_, Message> = if let Some(s) = &self.history_picker {
             stack![root, self.history_picker_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(s) = &self.block_search {
+            stack![root, self.block_search_view(s)].into()
         } else {
             root
         };
@@ -9528,6 +9967,7 @@ impl Frost {
             kb("Shift+End", "Scroll to bottom (live)"),
             kb("Ctrl+Shift+Up / Down", "Previous / next prompt (OSC 133)"),
             kb("Ctrl+Shift+F", "Find"),
+            kb("Ctrl+Alt+F", "Search command blocks (OSC 133)"),
             kb(
                 "Ctrl+Alt+R",
                 "Find & replace in selection (clipboard / prompt)"
@@ -11904,5 +12344,53 @@ mod tests {
             },
         );
         assert_eq!(numpad_in_keypad_mode.as_deref(), Some(&b"\x1bOM"[..]));
+    }
+
+    fn block_search_hit(zone_id: u64) -> block_mode::BlockSearchHit {
+        block_mode::BlockSearchHit {
+            zone_id,
+            is_output_line: false,
+            line_no: 0,
+            line_text: String::new(),
+            command_preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn block_search_selection_wraps_over_all_hits() {
+        // Every hit is drawn (in a scrollable) and navigable — the selection
+        // wraps across the FULL hit list, not a visible-rows prefix.
+        let mut state = BlockSearchState {
+            hits: (0..40).map(block_search_hit).collect(),
+            ..BlockSearchState::default()
+        };
+        state.select_prev();
+        assert_eq!(state.selected, 39);
+        state.select_next();
+        assert_eq!(state.selected, 0);
+        for _ in 0..39 {
+            state.select_next();
+        }
+        assert_eq!(state.selected, 39);
+        // Empty hits pin the selection at 0 in both directions.
+        let mut empty = BlockSearchState::default();
+        empty.select_next();
+        empty.select_prev();
+        assert_eq!(empty.selected, 0);
+    }
+
+    #[test]
+    fn block_search_count_label_reports_all_hits_and_the_cap() {
+        let mut state = BlockSearchState {
+            hits: vec![block_search_hit(1)],
+            ..BlockSearchState::default()
+        };
+        assert_eq!(state.count_label(), "1 match");
+        state.hits.push(block_search_hit(2));
+        assert_eq!(state.count_label(), "2 matches");
+        // The hit cap uses ember's wording: it means older blocks went
+        // unscanned, not that more matches necessarily exist.
+        state.capped = true;
+        assert_eq!(state.count_label(), "2 matches · older blocks not searched");
     }
 }

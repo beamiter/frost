@@ -44,12 +44,17 @@ pub enum Command {
     TerminalCopyLastOutput,
 
     // === 命令块（OSC 133 block mode）===
-    // Unbound by default: ctrl+shift+x (the anvil/4 chord for jump-first-
-    // failed) already means pane:swap in this repo's defaults, and
+    // Mostly unbound by default: ctrl+shift+x (the anvil/4 chord for jump-
+    // first-failed) already means pane:swap in this repo's defaults,
     // ctrl+alt+up/down (the natural select-prev/next chords) are
-    // pane:focus_up/down here. All block commands are palette-only until the
-    // user binds them.
+    // pane:focus_up/down here, and ctrl+alt+left/right (the natural
+    // jump-prev/next-failed chords) are pane:focus_left/right. Only
+    // block:search ships bound (ctrl+alt+f — ctrl+shift+g, its ember-side
+    // analogue, is terminal:copy_last_output here); everything else is
+    // palette-only until the user binds it.
     BlockJumpFirstFailed,
+    BlockJumpPrevFailed,
+    BlockJumpNextFailed,
     BlockCopyCommand,
     BlockCopyOutput,
     BlockRecallCommand,
@@ -57,6 +62,7 @@ pub enum Command {
     BlockSelectNext,
     BlockCopyBlock,
     BlockCopyMarkdown,
+    BlockSearch,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -122,6 +128,8 @@ impl std::fmt::Display for Command {
             Command::TerminalPromptNext => write!(f, "terminal:prompt_next"),
             Command::TerminalCopyLastOutput => write!(f, "terminal:copy_last_output"),
             Command::BlockJumpFirstFailed => write!(f, "block:jump_first_failed"),
+            Command::BlockJumpPrevFailed => write!(f, "block:jump_prev_failed"),
+            Command::BlockJumpNextFailed => write!(f, "block:jump_next_failed"),
             Command::BlockCopyCommand => write!(f, "block:copy_command"),
             Command::BlockCopyOutput => write!(f, "block:copy_output"),
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
@@ -129,6 +137,7 @@ impl std::fmt::Display for Command {
             Command::BlockSelectNext => write!(f, "block:select_next"),
             Command::BlockCopyBlock => write!(f, "block:copy_block"),
             Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
+            Command::BlockSearch => write!(f, "block:search"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -187,6 +196,8 @@ impl std::str::FromStr for Command {
             "terminal:prompt_next" => Ok(Command::TerminalPromptNext),
             "terminal:copy_last_output" => Ok(Command::TerminalCopyLastOutput),
             "block:jump_first_failed" => Ok(Command::BlockJumpFirstFailed),
+            "block:jump_prev_failed" => Ok(Command::BlockJumpPrevFailed),
+            "block:jump_next_failed" => Ok(Command::BlockJumpNextFailed),
             "block:copy_command" => Ok(Command::BlockCopyCommand),
             "block:copy_output" => Ok(Command::BlockCopyOutput),
             "block:recall_command" => Ok(Command::BlockRecallCommand),
@@ -194,6 +205,7 @@ impl std::str::FromStr for Command {
             "block:select_next" => Ok(Command::BlockSelectNext),
             "block:copy_block" => Ok(Command::BlockCopyBlock),
             "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
+            "block:search" => Ok(Command::BlockSearch),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -381,6 +393,12 @@ impl KeyBindings {
             "ctrl+alt+r".to_string(),
             "search:replace:toggle".to_string(),
         );
+        // Cross-block search picker. ctrl+shift+g (ember's chord) is
+        // terminal:copy_last_output in this repo, so the free ctrl+alt letter
+        // family carries it instead (like ctrl+alt+r above).
+        bindings
+            .bindings
+            .insert("ctrl+alt+f".to_string(), "block:search".to_string());
 
         // 配置操作
         bindings
@@ -748,9 +766,11 @@ mod tests {
     }
 
     #[test]
-    fn block_commands_parse_but_ship_unbound() {
+    fn block_commands_parse_and_only_search_ships_bound() {
         for (name, expected) in [
             ("block:jump_first_failed", Command::BlockJumpFirstFailed),
+            ("block:jump_prev_failed", Command::BlockJumpPrevFailed),
+            ("block:jump_next_failed", Command::BlockJumpNextFailed),
             ("block:copy_command", Command::BlockCopyCommand),
             ("block:copy_output", Command::BlockCopyOutput),
             ("block:recall_command", Command::BlockRecallCommand),
@@ -758,13 +778,15 @@ mod tests {
             ("block:select_next", Command::BlockSelectNext),
             ("block:copy_block", Command::BlockCopyBlock),
             ("block:copy_markdown", Command::BlockCopyMarkdown),
+            ("block:search", Command::BlockSearch),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
         }
         // anvil/4 bind jump-first-failed to ctrl+shift+x, but that chord is
-        // pane:swap here — and ctrl+alt+up/down (select-prev/next elsewhere)
-        // are pane focus here — so the block commands have no default chord.
+        // pane:swap here; ctrl+alt+up/down (select-prev/next elsewhere) and
+        // ctrl+alt+left/right (the natural jump-prev/next-failed chords) are
+        // pane focus here — so those block commands have no default chord.
         let bindings = KeyBindings::default_bindings();
         assert_eq!(
             bindings.get_command("ctrl+shift+x"),
@@ -778,10 +800,27 @@ mod tests {
             bindings.get_command("ctrl+alt+down"),
             Some(Command::PaneFocusDown)
         );
-        assert!(!bindings
+        assert_eq!(
+            bindings.get_command("ctrl+alt+left"),
+            Some(Command::PaneFocusLeft)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+alt+right"),
+            Some(Command::PaneFocusRight)
+        );
+        // block:search is the one bound block command: ctrl+alt+f (free in
+        // the default table and the chrome layer; ember's ctrl+shift+g is
+        // terminal:copy_last_output here).
+        assert_eq!(
+            bindings.get_command("ctrl+alt+f"),
+            Some(Command::BlockSearch)
+        );
+        let bound_block_commands: Vec<&String> = bindings
             .bindings
             .values()
-            .any(|command| command.starts_with("block:")));
+            .filter(|command| command.starts_with("block:"))
+            .collect();
+        assert_eq!(bound_block_commands, vec!["block:search"]);
     }
 
     #[test]

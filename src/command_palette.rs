@@ -42,6 +42,8 @@ pub enum PaletteAction {
     PromptJumpNext,
     CopyLastOutput,
     BlockJumpFirstFailed,
+    BlockJumpPrevFailed,
+    BlockJumpNextFailed,
     BlockCopyCommand,
     BlockCopyOutput,
     BlockRecallCommand,
@@ -49,6 +51,7 @@ pub enum PaletteAction {
     BlockSelectNext,
     BlockCopyBlock,
     BlockCopyMarkdown,
+    BlockSearch,
     CommandHistory,
     ClearScreen,
     InstallJsh,
@@ -310,6 +313,18 @@ impl PaletteState {
                 action: PaletteAction::BlockJumpFirstFailed,
             },
             PaletteItem {
+                name: "Jump to Previous Failed Block",
+                description: "Select and reveal the nearest older failed command block",
+                shortcut: "",
+                action: PaletteAction::BlockJumpPrevFailed,
+            },
+            PaletteItem {
+                name: "Jump to Next Failed Block",
+                description: "Select and reveal the nearest newer failed command block",
+                shortcut: "",
+                action: PaletteAction::BlockJumpNextFailed,
+            },
+            PaletteItem {
                 name: "Copy Block Command",
                 description: "Copy the selected (or latest) command block's command line",
                 shortcut: "",
@@ -350,6 +365,12 @@ impl PaletteState {
                 description: "Copy the selected (or latest) block as a Markdown snippet",
                 shortcut: "",
                 action: PaletteAction::BlockCopyMarkdown,
+            },
+            PaletteItem {
+                name: "Search Blocks",
+                description: "Search every command block's command and output",
+                shortcut: "Ctrl+Alt+F",
+                action: PaletteAction::BlockSearch,
             },
             PaletteItem {
                 name: "Command History",
@@ -515,6 +536,7 @@ mod tests {
             (PaletteAction::CopyLastOutput, "Ctrl+Shift+G"),
             (PaletteAction::CommandHistory, "Ctrl+Shift+H"),
             (PaletteAction::OpenSearchReplace, "Ctrl+Alt+R"),
+            (PaletteAction::BlockSearch, "Ctrl+Alt+F"),
         ];
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");

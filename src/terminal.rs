@@ -829,6 +829,20 @@ pub struct CommandZone {
     /// Working directory the command ran in: the shell's OSC 133 `cwd`/
     /// `cwd_url` param when one arrived, else the OSC 7 cwd at `D`.
     pub cwd: Option<String>,
+    /// Output text snapshotted at finalization (`D`, or the stale-lifecycle
+    /// close at the next `A`), with the same extraction and 1 MiB cap as the
+    /// live path; the flag is "rows were dropped by the cap". `Some` only for
+    /// non-blank output. This is what keeps copy/Markdown working after the
+    /// zone's rows fall out of scrollback (ember's captured-output rule);
+    /// `None` once the [`TerminalState::MAX_CAPTURED_OUTPUT_BYTES`] budget
+    /// evicted it, in which case live extraction is the fallback.
+    pub captured_output: Option<(String, bool)>,
+    /// The zone's rows were trimmed out of scrollback. The entry stays (id,
+    /// metadata, snapshot — v2 dropped the whole zone here) but all row
+    /// fields are meaningless: `prompt_start` is clamped to 0 and the
+    /// `Option` rows are `None`. Row consumers (stripes, gutter, markers,
+    /// prompt jumps, reveal) must skip such zones.
+    pub rows_evicted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1135,6 +1149,10 @@ pub struct TerminalState {
     /// The shell flagged the current command line as truncated
     /// (`cmd_truncated=`); carried into the zone at `D`.
     current_command_truncated: bool,
+    /// Total bytes of all zones' [`CommandZone::captured_output`] snapshots,
+    /// kept under [`Self::MAX_CAPTURED_OUTPUT_BYTES`] by
+    /// [`Self::enforce_captured_output_budget`].
+    captured_output_bytes: usize,
 }
 
 /// One OSC 133 command lifecycle captured for the AI agent: the typed
@@ -1328,6 +1346,7 @@ impl TerminalState {
             current_command_started_at: None,
             current_command_cwd: None,
             current_command_truncated: false,
+            captured_output_bytes: 0,
         }
     }
 
@@ -1717,6 +1736,15 @@ impl TerminalState {
         }
         match mark {
             'A' => {
+                // A fresh prompt while a command was still mid-output (`C`
+                // seen, `D` lost in an alt-screen detour or crashed shell
+                // integration) finalizes that zone instead of silently
+                // discarding it — otherwise the pending state would paint
+                // the accent "running" stripe forever (ember's rule). A
+                // pending `PromptStarted`/`CommandStarted` is NOT finalized:
+                // that is just an idle prompt being redrawn (ctrl+l, resize)
+                // re-emitting its embedded `A`/`B` marks.
+                self.finalize_stale_zone(absolute_row);
                 // Prompt start. Any leftover execution timestamp belongs to a
                 // command that never reported `D`; drop it so it cannot leak
                 // into a later command's duration.
@@ -1836,16 +1864,7 @@ impl TerminalState {
                 } else {
                     self.current_command_cwd.take()
                 }
-                .or_else(|| {
-                    // OSC 7 only rejects NUL (a path with, say, a newline is
-                    // still openable), but a zone cwd feeds line-oriented
-                    // consumers (the Markdown export's `- Cwd:` line), so it
-                    // gets the same control-free guarantee as the OSC 133
-                    // params.
-                    self.current_working_dir
-                        .clone()
-                        .filter(|cwd| !cwd.chars().any(char::is_control))
-                });
+                .or_else(|| self.control_free_osc7_cwd());
                 match self.current_zone_state {
                     ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
                         let zone = CommandZone {
@@ -1860,6 +1879,8 @@ impl TerminalState {
                             finished_at_ms: Self::wall_clock_ms(),
                             command_truncated,
                             cwd: cwd.clone(),
+                            captured_output: self.capture_zone_output(out_start, absolute_row),
+                            rows_evicted: false,
                         };
                         self.push_command_zone(zone);
                         self.record_completed_command(
@@ -1890,6 +1911,9 @@ impl TerminalState {
                             finished_at_ms: Self::wall_clock_ms(),
                             command_truncated,
                             cwd,
+                            // No `C` means no output range to snapshot.
+                            captured_output: None,
+                            rows_evicted: false,
                         };
                         self.push_command_zone(zone);
                         // Same rule for the agent record: shell-reported
@@ -1920,14 +1944,127 @@ impl TerminalState {
         }
     }
 
-    /// Append a finished zone, assigning its stable id and enforcing the cap.
+    /// Global cap on the bytes held across all zones'
+    /// [`CommandZone::captured_output`] snapshots. When exceeded, the OLDEST
+    /// zones lose their snapshot (the zone entry stays); a zone whose rows
+    /// are still in scrollback then falls back to live extraction.
+    pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Byte cap of one zone's extracted output text (shared by the live
+    /// extraction and the snapshot taken at finalization).
+    const ZONE_OUTPUT_CAP_BYTES: usize = 1 << 20;
+
+    /// Append a finished zone, assigning its stable id and enforcing both the
+    /// 256-entry cap and the captured-snapshot byte budget.
     fn push_command_zone(&mut self, mut zone: CommandZone) {
         zone.id = self.next_zone_id;
         self.next_zone_id += 1;
+        self.captured_output_bytes = self.captured_output_bytes.saturating_add(
+            zone.captured_output
+                .as_ref()
+                .map_or(0, |(text, _)| text.len()),
+        );
         self.command_zones.push_back(zone);
         if self.command_zones.len() > 256 {
-            self.command_zones.pop_front();
+            if let Some(evicted) = self.command_zones.pop_front() {
+                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
+                    evicted
+                        .captured_output
+                        .as_ref()
+                        .map_or(0, |(text, _)| text.len()),
+                );
+            }
         }
+        self.enforce_captured_output_budget(Self::MAX_CAPTURED_OUTPUT_BYTES);
+    }
+
+    /// Drop the OLDEST zones' snapshots (never the entries themselves) until
+    /// the total fits `budget`. The newest zone's snapshot is exempt: one
+    /// snapshot is at most [`Self::ZONE_OUTPUT_CAP_BYTES`], well under the
+    /// real budget, so evicting older ones always suffices — the exemption
+    /// only matters for the tiny budgets tests drive this with.
+    fn enforce_captured_output_budget(&mut self, budget: usize) {
+        let newest = self.command_zones.back().map(|zone| zone.id);
+        while self.captured_output_bytes > budget {
+            let Some(zone) = self
+                .command_zones
+                .iter_mut()
+                .find(|zone| zone.captured_output.is_some() && Some(zone.id) != newest)
+            else {
+                break;
+            };
+            if let Some((text, _)) = zone.captured_output.take() {
+                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(text.len());
+            }
+        }
+    }
+
+    /// Snapshot one zone's output rows for [`CommandZone::captured_output`]:
+    /// the exact live extraction (same trimming, same 1 MiB cap, same
+    /// whole-rows-only truncation flag), blank output collapsing to `None`.
+    fn capture_zone_output(&self, start: usize, end: usize) -> Option<(String, bool)> {
+        let (out, capped) = self.rows_text(start, end, Self::ZONE_OUTPUT_CAP_BYTES);
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some((out, capped))
+        }
+    }
+
+    /// The OSC 7 cwd, refused if it carries control characters: a zone cwd
+    /// feeds line-oriented consumers (the Markdown export's `- Cwd:` line),
+    /// so it gets the same control-free guarantee as the OSC 133 params
+    /// (OSC 7 itself only rejects NUL — a path with, say, a newline is still
+    /// openable).
+    fn control_free_osc7_cwd(&self) -> Option<String> {
+        self.current_working_dir
+            .clone()
+            .filter(|cwd| !cwd.chars().any(char::is_control))
+    }
+
+    /// Close out a lifecycle whose command really ran (`C` fired) but whose
+    /// `D` never arrived (lost in an alt-screen detour, crashed shell
+    /// integration) when the next `A` shows up (ember's stale-record rule).
+    /// ONLY an un-finalized `OutputStarted` finalizes: `CommandStarted` is
+    /// the RESTING state of an idle prompt (`B` fires at prompt-end, `C`
+    /// only at execution), and shells re-emit `A`/`B` on every prompt
+    /// repaint — readline's ctrl+l, fish re-running `fish_prompt` on
+    /// SIGWINCH — so finalizing it would mint one junk zone per redraw.
+    /// Pending `PromptStarted`/`CommandStarted` states are silently
+    /// discarded, exactly as before the stale-finalize rule existed.
+    ///
+    /// The finalized zone ends where the new prompt begins, keeps whatever
+    /// the shell did report (command text captured at `C`, cwd,
+    /// `cmd_truncated`) and invents nothing: no exit code (⇒ the existing
+    /// Unknown `?` badge), no duration, no finish timestamp. Deliberately
+    /// NOT queued to `record_completed_command`: that queue feeds command
+    /// history/journal/notifications, which all treat an entry as an
+    /// observed completion.
+    fn finalize_stale_zone(&mut self, boundary_row: usize) {
+        let ZoneState::OutputStarted(prompt_start, cmd_start, out_start) = self.current_zone_state
+        else {
+            return;
+        };
+        let cwd = self
+            .current_command_cwd
+            .take()
+            .or_else(|| self.control_free_osc7_cwd());
+        let zone = CommandZone {
+            id: 0, // assigned by push_command_zone
+            prompt_start,
+            command_start: Some(cmd_start),
+            output_start: Some(out_start),
+            output_end: Some(boundary_row),
+            exit_code: None,
+            command: self.zone_command_text(),
+            duration_ms: None,
+            finished_at_ms: None,
+            command_truncated: self.current_command_truncated,
+            cwd,
+            captured_output: self.capture_zone_output(out_start, boundary_row),
+            rows_evicted: false,
+        };
+        self.push_command_zone(zone);
     }
 
     /// Command line for a finished zone: the exact text captured at `C`
@@ -1953,15 +2090,26 @@ impl TerminalState {
 
     /// Keep OSC 133 bookkeeping aligned with the buffer after `count` rows
     /// fell off the top of scrollback. Completed zones anchored in the
-    /// trimmed region are dropped; the in-progress zone clamps to row zero
-    /// so a still-running command keeps producing a usable zone.
+    /// trimmed region KEEP their entry (id, metadata, captured snapshot) but
+    /// lose their rows — v2 dropped the whole zone here, silently emptying
+    /// copy/Markdown for old zones; the snapshot taken at finalization is
+    /// what makes retention meaningful. The in-progress zone clamps to row
+    /// zero so a still-running command keeps producing a usable zone.
     fn on_scrollback_rows_trimmed(&mut self, count: usize) {
         if count == 0 {
             return;
         }
-        self.command_zones.retain_mut(|zone| {
+        for zone in &mut self.command_zones {
+            if zone.rows_evicted {
+                continue;
+            }
             if zone.prompt_start < count {
-                return false;
+                zone.rows_evicted = true;
+                zone.prompt_start = 0;
+                zone.command_start = None;
+                zone.output_start = None;
+                zone.output_end = None;
+                continue;
             }
             zone.prompt_start -= count;
             for row in [
@@ -1974,8 +2122,7 @@ impl TerminalState {
             {
                 *row = row.saturating_sub(count);
             }
-            true
-        });
+        }
         self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
             ZoneState::Idle => ZoneState::Idle,
             ZoneState::PromptStarted(p) => ZoneState::PromptStarted(p.saturating_sub(count)),
@@ -2004,6 +2151,7 @@ impl TerminalState {
         };
         self.command_zones
             .iter()
+            .filter(|zone| !zone.rows_evicted)
             .map(|zone| zone.prompt_start)
             .chain(active)
     }
@@ -2012,22 +2160,16 @@ impl TerminalState {
     /// soft-wrapped rows joined and per-line trailing padding trimmed.
     /// Returns None when no zone recorded any output or the output is blank.
     /// Capped at 1 MiB so a huge scrollback range cannot balloon a clipboard
-    /// write.
+    /// write. Reads through the same captured-snapshot-first path as
+    /// [`Self::zone_output_text`], so it keeps answering after the zone's
+    /// rows fell out of scrollback.
     pub fn last_command_output_text(&self) -> Option<String> {
-        const MAX_BYTES: usize = 1 << 20;
         let zone = self
             .command_zones
             .iter()
             .rev()
-            .find(|zone| zone.output_start.is_some())?;
-        let start = zone.output_start?;
-        let end = zone.output_end.unwrap_or(start);
-        let (out, _) = self.rows_text(start, end, MAX_BYTES);
-        if out.trim().is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+            .find(|zone| zone.captured_output.is_some() || zone.output_start.is_some())?;
+        self.zone_output_text(zone.id)
     }
 
     /// Look up a completed zone by its stable id. `None` when the zone has
@@ -2047,12 +2189,20 @@ impl TerminalState {
     /// 1 MiB cap cut whole output rows off the end (the Markdown export
     /// reports it as `- Note: output truncated`). The extraction never cuts
     /// mid-row, so the flag is exact: it is set only when rows were skipped.
+    ///
+    /// The snapshot captured at finalization wins over live extraction when
+    /// both exist (ember's captured-first rule — one consistent answer, and
+    /// it survives scrollback trimming). Live extraction only serves zones
+    /// whose snapshot was evicted by the byte budget while their rows are
+    /// still present.
     pub fn zone_output_text_capped(&self, id: u64) -> Option<(String, bool)> {
-        const MAX_BYTES: usize = 1 << 20;
         let zone = self.zone_by_id(id)?;
+        if let Some((text, truncated)) = &zone.captured_output {
+            return Some((text.clone(), *truncated));
+        }
         let start = zone.output_start?;
         let end = zone.output_end.unwrap_or(start);
-        let (out, capped) = self.rows_text(start, end, MAX_BYTES);
+        let (out, capped) = self.rows_text(start, end, Self::ZONE_OUTPUT_CAP_BYTES);
         if out.trim().is_empty() {
             None
         } else {
@@ -4479,6 +4629,7 @@ impl TerminalState {
         // colors, keyboard-protocol state, selection, and any open hyperlink.
         self.scrollback.clear();
         self.command_zones.clear();
+        self.captured_output_bytes = 0;
         self.current_zone_state = ZoneState::default();
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
@@ -5786,6 +5937,7 @@ impl TerminalState {
         // than leaving selections/zones pointing at unrelated text.
         self.selection = None;
         self.command_zones.clear();
+        self.captured_output_bytes = 0;
         self.current_zone_state = ZoneState::default();
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
@@ -6065,9 +6217,11 @@ mod tests {
 
     #[test]
     fn osc_133_d_during_alt_screen_is_dropped_and_the_next_prompt_starts_clean() {
-        // Accepted degradation, documented: a `D` that arrives WHILE the alt
-        // screen is active is dropped, so that zone is lost — but nothing is
-        // corrupted, and the next primary-screen lifecycle records cleanly.
+        // A `D` that arrives WHILE the alt screen is active is still dropped
+        // (its row would be computed against the alt grid), so the exit code
+        // is lost — but the zone itself no longer is: the next primary-screen
+        // `A` finalizes the pending lifecycle as Unknown (v3's stale-Running
+        // rule) instead of v2's silent discard.
         let mut terminal = super::TerminalState::new(40, 8);
         terminal.process_input(b"\x1b]133;A\x07$ ");
         terminal.process_input(b"\x1b]133;B\x07vim notes\r\n");
@@ -6077,15 +6231,23 @@ mod tests {
         assert!(terminal.command_zones.is_empty());
         assert!(terminal.take_completed_commands().is_empty());
 
-        // Back on the primary screen, the next `A` resets every per-command
-        // field; the lost zone must not resurface as a phantom.
+        // Back on the primary screen, the next `A` closes the stale zone
+        // (exit honestly unreported) and resets every per-command field; the
+        // next lifecycle records cleanly beside it.
         terminal.process_input(b"\x1b[?1049l");
         terminal.process_input(b"\x1b]133;A\x07$ ");
+        assert_eq!(terminal.command_zones.len(), 1);
+        assert_eq!(
+            terminal.command_zones[0].command.as_deref(),
+            Some("vim notes")
+        );
+        assert_eq!(terminal.command_zones[0].exit_code, None);
+        assert!(!terminal.is_command_running());
         terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
         terminal.process_input(b"\x1b]133;C\x07hi\r\n");
         terminal.process_input(b"\x1b]133;D;0\x07");
-        assert_eq!(terminal.command_zones.len(), 1);
-        let zone = &terminal.command_zones[0];
+        assert_eq!(terminal.command_zones.len(), 2);
+        let zone = &terminal.command_zones[1];
         assert_eq!(zone.command.as_deref(), Some("echo hi"));
         assert_eq!(zone.exit_code, Some(0));
         let completed = terminal.take_completed_commands();
@@ -7677,7 +7839,10 @@ mod tests {
     }
 
     #[test]
-    fn command_zones_shift_and_drop_as_scrollback_trims() {
+    fn command_zones_shift_and_lose_rows_as_scrollback_trims() {
+        // DELIBERATE v3 semantic change: v2 dropped a zone once its prompt
+        // row was trimmed; with output snapshotted at `D` the entry now
+        // outlives its rows as a rows-evicted zone (id, metadata, snapshot).
         const MAX: usize = 8;
         let mut terminal = TerminalState::new(20, 4);
         terminal.set_max_scrollback(MAX);
@@ -7694,21 +7859,37 @@ mod tests {
         for _ in 0..fills {
             terminal.process_input(b"fill\r\n");
         }
-        assert_eq!(terminal.command_zones.len(), 1);
-        // The surviving zone must still anchor the second command's prompt.
-        let shifted = terminal.command_zones[0].prompt_start;
+        assert_eq!(terminal.command_zones.len(), 2);
+        let evicted = &terminal.command_zones[0];
+        assert!(evicted.rows_evicted);
+        assert_eq!(evicted.output_start, None);
+        assert_eq!(evicted.output_end, None);
+        // …but its snapshot still answers the copy/Markdown paths.
+        assert_eq!(
+            terminal
+                .zone_output_text(terminal.command_zones[0].id)
+                .as_deref(),
+            Some("out\nout\nout")
+        );
+        // The in-range zone still anchors the second command's prompt.
+        let shifted = terminal.command_zones[1].prompt_start;
+        assert!(!terminal.command_zones[1].rows_evicted);
         assert!(
             buffer_row_text(&terminal, shifted).starts_with("$ cmd1"),
             "zone anchors {:?}",
             buffer_row_text(&terminal, shifted)
         );
+        // Evicted zones stop contributing rows to prompt navigation.
+        assert_eq!(terminal.prompt_rows().count(), 1);
 
-        // Trim past the second prompt as well: no zones may remain.
-        let fills = terminal.command_zones[0].prompt_start + 1;
+        // Trim past the second prompt as well: both entries survive, evicted.
+        let fills = terminal.command_zones[1].prompt_start + 1;
         for _ in 0..fills {
             terminal.process_input(b"fill\r\n");
         }
-        assert!(terminal.command_zones.is_empty());
+        assert_eq!(terminal.command_zones.len(), 2);
+        assert!(terminal.command_zones.iter().all(|zone| zone.rows_evicted));
+        assert_eq!(terminal.prompt_rows().count(), 0);
     }
 
     #[test]
@@ -7804,17 +7985,26 @@ mod tests {
         for _ in 0..fills {
             terminal.process_input(b"fill\r\n");
         }
-        assert_eq!(terminal.command_zones.len(), 1);
-        let shifted = &terminal.command_zones[0];
+        // DELIBERATE v3 semantic change: the trimmed zone keeps its entry
+        // (v2 dropped it and this test pinned `zone_by_id(0).is_none()`).
+        assert_eq!(terminal.command_zones.len(), 2);
+        let shifted = &terminal.command_zones[1];
         // Identity and metadata are untouched; only the rows moved.
         assert_eq!(shifted.id, survivor.id);
         assert_eq!(shifted.command, survivor.command);
         assert_eq!(shifted.duration_ms, survivor.duration_ms);
         assert_eq!(shifted.finished_at_ms, survivor.finished_at_ms);
         assert!(shifted.prompt_start < survivor.prompt_start);
-        // Id-keyed lookups survive the index shift; the dropped id is gone.
+        assert!(!shifted.rows_evicted);
+        // Id-keyed lookups survive the index shift; the trimmed id resolves
+        // to a rows-evicted entry that still knows what it was.
         assert!(terminal.zone_by_id(survivor.id).is_some());
-        assert!(terminal.zone_by_id(0).is_none());
+        let evicted = terminal.zone_by_id(0).expect("evicted entry retained");
+        assert!(evicted.rows_evicted);
+        assert!(evicted
+            .command
+            .as_deref()
+            .is_some_and(|command| command.contains("cmd0")));
     }
 
     #[test]
@@ -7848,6 +8038,157 @@ mod tests {
             Some(("out\nout\nout".to_string(), false))
         );
         assert_eq!(terminal.zone_output_text_capped(999), None);
+    }
+
+    #[test]
+    fn zone_output_snapshot_is_taken_at_d() {
+        let mut terminal = TerminalState::new(20, 6);
+        emit_zone(&mut terminal, 0);
+        assert_eq!(
+            terminal.command_zones[0].captured_output,
+            Some(("out\nout\nout".to_string(), false))
+        );
+        assert_eq!(terminal.captured_output_bytes, "out\nout\nout".len());
+        // A no-`C` zone records no output range, so no snapshot either.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones[1].captured_output, None);
+        assert_eq!(terminal.captured_output_bytes, "out\nout\nout".len());
+    }
+
+    #[test]
+    fn snapshot_budget_evicts_oldest_snapshots_but_keeps_zone_entries() {
+        let mut terminal = TerminalState::new(20, 6);
+        for i in 0..3 {
+            emit_zone(&mut terminal, i);
+        }
+        let per_zone = "out\nout\nout".len();
+        assert_eq!(terminal.captured_output_bytes, 3 * per_zone);
+        let ids: Vec<u64> = terminal.command_zones.iter().map(|zone| zone.id).collect();
+
+        // Force a budget that fits one snapshot: the two OLDEST lose theirs
+        // (entries retained), the newest keeps its own.
+        terminal.enforce_captured_output_budget(per_zone);
+        assert_eq!(terminal.command_zones.len(), 3);
+        assert!(terminal.command_zones[0].captured_output.is_none());
+        assert!(terminal.command_zones[1].captured_output.is_none());
+        assert!(terminal.command_zones[2].captured_output.is_some());
+        assert_eq!(terminal.captured_output_bytes, per_zone);
+
+        // A zone that lost its snapshot but still has rows in scrollback
+        // falls back to live extraction.
+        assert_eq!(
+            terminal.zone_output_text(ids[0]).as_deref(),
+            Some("out\nout\nout")
+        );
+
+        // The newest zone's snapshot survives even an impossible budget (a
+        // fresh snapshot always fits the real 8 MiB budget: one snapshot is
+        // capped at 1 MiB).
+        terminal.enforce_captured_output_budget(0);
+        assert!(terminal.command_zones[2].captured_output.is_some());
+    }
+
+    #[test]
+    fn zone_cap_eviction_releases_snapshot_bytes() {
+        let mut terminal = TerminalState::new(20, 4);
+        let per_zone = "out\nout\nout".len();
+        for i in 0..257 {
+            emit_zone(&mut terminal, i);
+        }
+        // The 256-entry deque cap evicted the oldest zone WITH its snapshot
+        // bytes — the budget counter must not leak.
+        assert_eq!(terminal.command_zones.len(), 256);
+        let with_snapshot = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| zone.captured_output.is_some())
+            .count();
+        assert_eq!(terminal.captured_output_bytes, with_snapshot * per_zone);
+    }
+
+    #[test]
+    fn a_new_prompt_finalizes_a_running_zone_whose_d_never_arrived() {
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n");
+        terminal.process_input(b"\x1b]133;C\x07building\r\n");
+        assert!(terminal.is_command_running());
+
+        // `D` is lost (killed shell integration, alt-screen exit): the next
+        // prompt closes the zone as honestly Unknown instead of leaving the
+        // accent "running" stripe pinned forever.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        assert!(!terminal.is_command_running());
+        assert_eq!(terminal.command_zones.len(), 1);
+        let zone = &terminal.command_zones[0];
+        assert_eq!(zone.command.as_deref(), Some("make"));
+        assert_eq!(zone.exit_code, None);
+        // Nothing is invented: no fake duration, no fake finish instant.
+        assert_eq!(zone.duration_ms, None);
+        assert_eq!(zone.finished_at_ms, None);
+        // The Unknown badge (`?`) is exactly what an unreported exit shows.
+        assert_eq!(
+            crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
+            crate::block_mode::BlockOutcome::Unknown
+        );
+        // Its output up to the new prompt row was still snapshotted.
+        assert_eq!(zone.captured_output, Some(("building".to_string(), false)));
+        // Deliberately NOT queued as a completed command: that queue feeds
+        // history/journal/notifications, which treat entries as observed
+        // completions.
+        assert!(terminal.take_completed_commands().is_empty());
+
+        // The new lifecycle records cleanly after the forced close.
+        terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 2);
+        assert_eq!(
+            terminal.command_zones[1].command.as_deref(),
+            Some("echo hi")
+        );
+        assert_eq!(terminal.command_zones[1].exit_code, Some(0));
+        assert_eq!(terminal.take_completed_commands().len(), 1);
+    }
+
+    #[test]
+    fn a_new_prompt_discards_a_half_typed_prompt_without_a_zone() {
+        // `B` seen but no `C`: the command never ran — `CommandStarted` is
+        // the RESTING state of every idle prompt (B fires at prompt-end),
+        // so it must be silently discarded, never finalized into a zone.
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07half-typed");
+        terminal.process_input(b"\r\n\x1b]133;A\x07$ ");
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
+        // A bare abandoned prompt (`A` with no `B`) spawns nothing either.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        assert!(terminal.command_zones.is_empty());
+    }
+
+    #[test]
+    fn idle_prompt_redraws_mint_no_zones() {
+        // readline's ctrl+l (or fish re-running fish_prompt on SIGWINCH)
+        // re-emits the prompt's embedded `A`/`B` marks on every repaint —
+        // often after a \x1b[2J\x1b[H clear, so the marks land on rows at or
+        // BEFORE earlier ones. None of these repaints ran a command; none
+        // may mint a zone (empirically pre-fix: 5 redraws → 5 junk zones,
+        // with non-monotonic prompt_start rows breaking spans' sorted
+        // assumption).
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        for _ in 0..5 {
+            terminal.process_input(b"\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07");
+        }
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
+        assert!(!terminal.is_command_running());
+        // The prompt is still live for the next real command.
+        terminal.process_input(b"echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+        assert_eq!(
+            terminal.command_zones[0].command.as_deref(),
+            Some("echo hi")
+        );
+        assert_eq!(terminal.command_zones[0].exit_code, Some(0));
     }
 
     #[test]
@@ -7892,14 +8233,22 @@ mod tests {
     }
 
     #[test]
-    fn last_command_output_survives_scrollback_trim_or_disappears() {
+    fn last_command_output_survives_scrollback_trim_via_snapshot() {
+        // DELIBERATE v3 semantic change: v2 pinned that a trimmed zone's
+        // output disappears; the snapshot taken at `D` now keeps answering.
         let mut terminal = TerminalState::new(20, 4);
         terminal.set_max_scrollback(6);
         emit_zone(&mut terminal, 0);
-        // Trim until the zone's output is gone along with its rows.
         for _ in 0..30 {
             terminal.process_input(b"fill\r\n");
         }
+        assert!(terminal.command_zones[0].rows_evicted);
+        assert_eq!(
+            terminal.last_command_output_text().as_deref(),
+            Some("out\nout\nout")
+        );
+        // Once the budget also evicts the snapshot, nothing is left to read.
+        terminal.command_zones[0].captured_output = None;
         assert_eq!(terminal.last_command_output_text(), None);
     }
 
