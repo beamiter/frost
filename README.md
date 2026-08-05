@@ -270,6 +270,12 @@ docker = true
 deploy = "persist"
 ```
 
+These two are also what a config file with no `remote_hosts` key starts with:
+the two mistakes the grammar cannot forgive are invisible in an empty list —
+the port belongs in `ssh_args`, never as `host = "box:22"`, and the login
+belongs in `user`, never as `host = "root@box"`. An explicit list wins,
+`remote_hosts = []` included, so hosts deleted in the panel stay deleted.
+
 The settings panel (Ctrl+Shift+O) has a Remote hosts section that adds,
 edits and removes these entries in place; changes auto-save into the same
 `[[remote_hosts]]` tables.

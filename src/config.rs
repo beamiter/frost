@@ -120,8 +120,10 @@ pub struct Config {
 
     /// Remote destinations for the host picker (Ctrl+Shift+S). Grammar,
     /// validation and the argv a tab runs are the family-shared
-    /// `jterm_core::jsh_remote::RemoteHostConfig`.
-    #[serde(default)]
+    /// `jterm_core::jsh_remote::RemoteHostConfig`. A file with no key at all
+    /// gets [`default_remote_hosts`] — two worked entries to copy; an explicit
+    /// list, `[]` included, is taken as written.
+    #[serde(default = "default_remote_hosts")]
     pub remote_hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
 
     /// AI provider: "anthropic", "openai-compatible", or "ollama".
@@ -325,6 +327,46 @@ fn default_agent_max_turns() -> u32 {
     20
 }
 
+/// Two worked entries a new destination can be copied from: one ssh target and
+/// one running container. They exist because the two mistakes the grammar
+/// cannot forgive are invisible in an empty list — the port belongs in
+/// `ssh_args`, never as `host:port`, and the login belongs in `user`, never as
+/// a `user@host` string that ssh would take literally as a hostname.
+///
+/// Only consulted when the file has no `remote_hosts` key at all. An explicit
+/// list — including `remote_hosts = []` — always wins, so hosts deleted in the
+/// settings panel (which writes the key back) stay deleted.
+pub fn default_remote_hosts() -> Vec<jterm_core::jsh_remote::RemoteHostConfig> {
+    vec![
+        jterm_core::jsh_remote::RemoteHostConfig {
+            name: "dev-60".to_string(),
+            host: "10.68.18.60".to_string(),
+            user: Some("root".to_string()),
+            docker: false,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            // 22 is ssh's default and could be omitted; it is spelled out so a
+            // copied entry has the flag to change rather than one to remember.
+            ssh_args: vec!["-p".to_string(), "22".to_string()],
+            deploy: "persist".to_string(),
+            deploy_artifact: None,
+        },
+        jterm_core::jsh_remote::RemoteHostConfig {
+            name: "myubuntu".to_string(),
+            host: "myubuntu".to_string(),
+            // The container user is `docker exec -u`; unset means the image's.
+            user: None,
+            docker: true,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            // Meaningless for docker, and the launcher ignores them.
+            ssh_args: Vec::new(),
+            deploy: "persist".to_string(),
+            deploy_artifact: None,
+        },
+    ]
+}
+
 fn default_font_size() -> f32 {
     14.0
 }
@@ -517,7 +559,7 @@ impl Default for Config {
         Config {
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
-            remote_hosts: Vec::new(),
+            remote_hosts: default_remote_hosts(),
             ai_provider: default_ai_provider(),
             ai_base_url: default_ai_base_url(),
             ai_model: default_ai_model(),
@@ -1286,5 +1328,30 @@ deploy = "incognito"
         assert_eq!(config.remote_hosts.len(), 1);
         assert!(config.remote_hosts[0].validate().is_ok());
         assert_eq!(config.remote_hosts[0].display_name(), "build");
+
+        // No key at all means the worked examples; an explicit empty list is
+        // taken as written, so a host deleted in the panel stays deleted.
+        let config = Config::from_toml("").expect("parse empty");
+        assert_eq!(config.remote_hosts, default_remote_hosts());
+        let config = Config::from_toml("remote_hosts = []").expect("parse empty list");
+        assert!(config.remote_hosts.is_empty());
+    }
+
+    /// The defaults are what a user copies, so they have to be spelled the way
+    /// the family type accepts: the port as an `ssh_args` flag and the login in
+    /// `user`, never folded into `host` as `root@10.68.18.60:22`.
+    #[test]
+    fn default_remote_hosts_are_valid_and_correctly_shaped() {
+        let hosts = default_remote_hosts();
+        let names: Vec<&str> = hosts.iter().map(|h| h.display_name()).collect();
+        assert_eq!(names, ["dev-60", "myubuntu"]);
+        for host in &hosts {
+            assert!(host.validate().is_ok(), "{:?}", host.validate());
+        }
+        assert_eq!(hosts[0].host, "10.68.18.60");
+        assert_eq!(hosts[0].user.as_deref(), Some("root"));
+        assert_eq!(hosts[0].ssh_args, ["-p", "22"]);
+        assert!(!hosts[0].docker);
+        assert!(hosts[1].docker);
     }
 }
