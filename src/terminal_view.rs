@@ -220,7 +220,7 @@ pub struct TermWidget<'a, Message> {
     blink_on: bool,
     /// Window background opacity (0.05..=1.0). Below 1.0 the widget's own
     /// default-background fill is skipped so the translucent app background
-    /// shows through; non-default cell backgrounds stay opaque, like jterm2.
+    /// shows through; non-default cell backgrounds stay opaque, like ember.
     opacity: f32,
     /// Whether the terminal application currently has mouse reporting
     /// enabled. While it does (and Shift is not held — the same predicate the

@@ -515,7 +515,7 @@ fn absolutize_file_path(path: PathBuf, cwd: Option<&Path>) -> PathBuf {
 
 /// Resolve a link exactly as displayed first. If that path does not exist,
 /// retry after removing a trailing source location. Relative paths are scoped
-/// to the focused terminal's cwd instead of jterm3's launcher directory.
+/// to the focused terminal's cwd instead of frost's launcher directory.
 fn resolve_existing_file_path(
     path: &str,
     cwd: Option<&Path>,
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn source_locations_resolve_against_the_terminal_cwd() {
         let unique = format!(
-            "jterm3-link-test-{}-{}",
+            "frost-link-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

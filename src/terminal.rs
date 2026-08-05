@@ -818,7 +818,7 @@ pub struct CommandZone {
     /// Wall-clock run time from OSC 133 `C` to `D`; `None` without a `C`.
     pub duration_ms: Option<u64>,
     /// Unix wall-clock milliseconds when `D` arrived. Captured now so restored
-    /// or future UI (jterm4 shows a block timestamp) has real data; nothing
+    /// or future UI (forge shows a block timestamp) has real data; nothing
     /// renders it yet.
     #[allow(dead_code)]
     pub finished_at_ms: Option<u64>,
@@ -2265,7 +2265,7 @@ impl TerminalState {
     /// the file-tree sidebar and the cwd a split inherits, so without it a shell
     /// on the far side of ssh could point the sidebar at any local directory it
     /// named — and the session snapshot would restore the next launch there.
-    /// Ported from jterm2 `src/terminal/state.rs::decode_osc7_cwd`.
+    /// Ported from ember `src/terminal/state.rs::decode_osc7_cwd`.
     fn decode_osc7_cwd(value: &str) -> Option<String> {
         let path_part = if let Some(rest) = value.strip_prefix("file://") {
             let slash = rest.find('/')?;
@@ -2386,7 +2386,7 @@ impl TerminalState {
         match op {
             // Report window state: normal/non-iconified.
             11 => self.output_buffer.extend_from_slice(b"\x1b[1t"),
-            // Report window position. jterm3 does not track compositor position,
+            // Report window position. frost does not track compositor position,
             // so report a stable origin like VTE-compatible terminals commonly do
             // when the window manager will not expose coordinates.
             13 => self.output_buffer.extend_from_slice(b"\x1b[3;0;0t"),
@@ -3355,7 +3355,7 @@ impl TerminalState {
                                         } else if command == "9" {
                                             // Desktop notification (iTerm2/ConEmu)
                                             if self.pending_notifications.len() < 8 {
-                                                let title = "jterm3".to_string();
+                                                let title = "frost".to_string();
                                                 let body = value.chars().take(256).collect();
                                                 self.pending_notifications.push((title, body));
                                             }

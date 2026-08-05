@@ -1,4 +1,4 @@
-//! Pure logic for Warp-style command blocks (jterm1/jterm4 design contract):
+//! Pure logic for Warp-style command blocks (anvil/forge design contract):
 //! outcome classification, badge text, row-span math, and badge fitting.
 //! Everything here is renderer-agnostic so it can be unit tested; the paint
 //! code in `terminal_view` and the per-frame builder in `main` stay thin.
@@ -30,7 +30,7 @@ pub fn classify(command: Option<&str>, exit_code: Option<i32>) -> BlockOutcome {
     }
 }
 
-/// Human duration for the block badge (family contract, same as jterm4).
+/// Human duration for the block badge (family contract, same as forge).
 /// Minute-plus durations keep their seconds ("1m32s") — a bare "2m" can't
 /// distinguish a 61s build from a 179s one, which is exactly the range users
 /// compare across runs.

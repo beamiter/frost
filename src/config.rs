@@ -277,19 +277,19 @@ pub struct Config {
 
     /// Draw Warp-style command-block chrome over OSC 133 zones: an outcome
     /// stripe in the left gutter, a separator per prompt, and a first-row
-    /// exit/duration badge. Same `block_mode` key and default as jterm1/4.
+    /// exit/duration badge. Same `block_mode` key and default as anvil/4.
     #[serde(default = "default_block_mode")]
     pub block_mode: bool,
 
     /// Append each OSC 133 completed command to the family-shared JSONL
-    /// history index (same keys and file format as jterm1/jterm4), so the
+    /// history index (same keys and file format as anvil/forge), so the
     /// Ctrl+Shift+H picker can recall commands across restarts. Only the
     /// command line, cwd, exit code, and end time are stored — never output.
     #[serde(default = "default_command_history_enabled")]
     pub command_history_enabled: bool,
 
     /// History index location. Defaults to the XDG state directory
-    /// (`~/.local/state/jterm3/history.jsonl`); point siblings at one file to
+    /// (`~/.local/state/frost/history.jsonl`); point siblings at one file to
     /// share history between them.
     #[serde(default)]
     pub command_history_path: Option<PathBuf>,
@@ -667,7 +667,7 @@ impl Config {
         self.jsh_update_check = jterm_core::jsh_install::UpdateCheck::parse(&self.jsh_update_check)
             .as_str()
             .to_string();
-        // Same retention bounds as jterm1/jterm4 apply to their shared index.
+        // Same retention bounds as anvil/forge apply to their shared index.
         self.command_history_max_entries = self.command_history_max_entries.clamp(100, 1_000_000);
         self
     }
@@ -676,7 +676,7 @@ impl Config {
         let config_path = match Self::config_path() {
             Ok(path) => path,
             Err(error) => {
-                let diagnostic = format!("Cannot locate the jterm3 config directory: {error}");
+                let diagnostic = format!("Cannot locate the frost config directory: {error}");
                 eprintln!("[Config] {diagnostic}");
                 return ConfigLoad {
                     config: Self::default(),
@@ -807,7 +807,7 @@ impl Config {
 
     pub fn session_history_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
-        let default = config_dir.join("jterm3").join("session_history.json");
+        let default = config_dir.join("frost").join("session_history.json");
         let Some(path) = self.session_history_file.as_ref() else {
             return Ok(default);
         };
@@ -819,7 +819,7 @@ impl Config {
                 return Ok(home.join(rest));
             }
         }
-        Ok(config_dir.join("jterm3").join(path))
+        Ok(config_dir.join("frost").join(path))
     }
 
     /// Where the shared command-history index lives, or `None` while history
@@ -832,7 +832,7 @@ impl Config {
         }
         let state_dir = dirs::state_dir()
             .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))?
-            .join("jterm3");
+            .join("frost");
         let Some(path) = self.command_history_path.as_ref() else {
             return Some(state_dir.join("history.jsonl"));
         };
@@ -849,7 +849,7 @@ impl Config {
 
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Failed to determine config directory")?;
-        Ok(config_dir.join("jterm3").join("config.toml"))
+        Ok(config_dir.join("frost").join("config.toml"))
     }
 
     pub fn config_revision() -> Result<FileRevision, String> {
@@ -972,7 +972,7 @@ mod tests {
     impl ScratchDir {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir()
-                .join(format!("jterm3-config-{label}-{}", uuid::Uuid::new_v4()));
+                .join(format!("frost-config-{label}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&path).expect("create config scratch directory");
             Self(path)
         }
@@ -1172,7 +1172,7 @@ mod tests {
         let path = config
             .resolved_command_history_path()
             .expect("enabled history resolves a path");
-        assert!(path.ends_with("jterm3/history.jsonl"), "{}", path.display());
+        assert!(path.ends_with("frost/history.jsonl"), "{}", path.display());
     }
 
     #[test]

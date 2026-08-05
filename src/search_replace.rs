@@ -34,7 +34,7 @@ impl SearchAndReplaceEngine {
         }
     }
 
-    /// 文字替换。逐字符扫描（语义与 jterm2 引擎一致）：大小写折叠按字符比较
+    /// 文字替换。逐字符扫描（语义与 ember 引擎一致）：大小写折叠按字符比较
     /// （`match_len_at`），全词由 `is_whole_word` 判定；替换后从匹配末尾继续，
     /// 已替换文本绝不重扫（替换串仍含 pattern 时不会死循环）。
     fn literal_replace(

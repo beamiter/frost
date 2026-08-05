@@ -33,7 +33,7 @@ strict policy.
 
 The 1 MiB file cap is still followed by ordinary Serde construction before
 session, tab, tree-depth, cwd, field, and cumulative limits apply. Implement
-schema-aware bounded visitors — jterm1's `src/session.rs` now has a worked
+schema-aware bounded visitors — anvil's `src/session.rs` now has a worked
 example for the same shape — and add adversarial wide-array, deep-tree, and
 cumulative-text tests.
 

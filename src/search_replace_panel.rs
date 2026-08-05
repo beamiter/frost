@@ -1,6 +1,6 @@
 //! 查找替换面板状态（Ctrl+Alt+R 打开；引擎逻辑见 search_replace.rs）。
 //!
-//! 语义与 jterm2 的同名面板一致：终端 scrollback 是只读程序输出，原地替换
+//! 语义与 ember 的同名面板一致：终端 scrollback 是只读程序输出，原地替换
 //! 无意义。面板对「当前选中文本」做查找替换，默认把结果复制到剪贴板；也可
 //! 显式回填到活动 pane 的提示符（不带回车，避免误执行）。iced 视图与按键
 //! 路由在 main.rs（`search_replace_panel` / `handle_search_replace_key`），

@@ -2,7 +2,7 @@
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
-/// 面板可分发的动作，每一项都 1:1 对应一个已有的 jterm3 操作。
+/// 面板可分发的动作，每一项都 1:1 对应一个已有的 frost 操作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     NewTab,

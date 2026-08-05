@@ -44,13 +44,13 @@ use terminal_view::{KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
 use theme::Theme;
 
 /// Must stay equal to the installed entry's basename
-/// (`data/io.github.beamiter.jterm3.desktop`): the desktop shell pairs a window
+/// (`data/io.github.beamiter.frost.desktop`): the desktop shell pairs a window
 /// with its launcher entry through this id.
-const WINDOW_APP_ID: &str = "io.github.beamiter.jterm3";
+const WINDOW_APP_ID: &str = "io.github.beamiter.frost";
 
 /// The same artwork the installer puts in the icon theme, embedded so a window
 /// carries its icon even when the .desktop entry is not installed.
-const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.jterm3-128.png");
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../data/io.github.beamiter.frost-128.png");
 
 /// Height reserved for the tab bar at the top of the window.
 const TAB_BAR_H: f32 = 30.0;
@@ -245,7 +245,7 @@ impl RestoredTab {
 }
 
 /// Stable-partition `tabs` so pinned ones lead, and report where the tab at
-/// `active` ended up. Mirrors jterm1's `reorder_pinned_first`: relative order
+/// `active` ended up. Mirrors anvil's `reorder_pinned_first`: relative order
 /// inside the pinned and unpinned groups is preserved, and the active tab
 /// stays active — pinning a tab must never switch which session is on screen.
 fn sort_pinned_first(tabs: &mut [Tab], active: usize) -> usize {
@@ -330,7 +330,7 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
         'p' => Some(ChromeShortcut::CommandPalette),
         '/' | '?' => Some(ChromeShortcut::Help),
         'l' => Some(ChromeShortcut::TabSwitcher),
-        // Same chord as jterm4's history palette (Ctrl+R stays with readline).
+        // Same chord as forge's history palette (Ctrl+R stays with readline).
         'h' => Some(ChromeShortcut::HistoryPicker),
         // Same chord as the rest of the family's remote host picker.
         's' => Some(ChromeShortcut::RemoteHosts),
@@ -606,8 +606,8 @@ fn main() -> iced::Result {
     // Shared jterm_core modules brand themselves per app (env prefixes,
     // prompt strings) from this identity.
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
-        app_name: "jterm3",
-        app_id: "io.github.beamiter.jterm3",
+        app_name: "frost",
+        app_id: "io.github.beamiter.frost",
         // From the app crate, not jterm_core's: a shell that pairs
         // TERM_PROGRAM with TERM_PROGRAM_VERSION must read this binary's
         // version, not the shared library's.
@@ -654,28 +654,28 @@ fn main() -> iced::Result {
         // offer no server-side decorations, so winit falls back to drawing one
         // with `sctk-adwaita`, whose renderer maps the whole title through a
         // single system font with no fallback chain — every CJK codepoint came
-        // out as .notdef. jterm3's own chrome uses the configured CJK fallback
+        // out as .notdef. frost's own chrome uses the configured CJK fallback
         // font, so the title renders like the rest of the UI. See
-        // `Jterm::top_bar_with_close` and `Jterm::window_resize_edges`.
+        // `Frost::top_bar_with_close` and `Frost::window_resize_edges`.
         decorations: false,
         ..Default::default()
     };
     iced::application(
         move || {
-            Jterm::new(
+            Frost::new(
                 config.clone(),
                 config_diagnostic.clone(),
                 config_revision.clone(),
             )
         },
-        Jterm::update,
-        Jterm::view,
+        Frost::update,
+        Frost::view,
     )
-    .title(Jterm::title)
-    .subscription(Jterm::subscription)
-    .theme(Jterm::iced_theme)
-    .style(Jterm::app_style)
-    .scale_factor(Jterm::scale_factor)
+    .title(Frost::title)
+    .subscription(Frost::subscription)
+    .theme(Frost::iced_theme)
+    .style(Frost::app_style)
+    .scale_factor(Frost::scale_factor)
     // MSAA forces wgpu down the multisample path; on Intel/Mesa that triggers
     // the "manual shader clears for srgb textures" path, which flashes the whole
     // surface on heavy redraws (e.g. multi-line `ls` output). Glyph and quad
@@ -754,7 +754,7 @@ enum Message {
     PromptInsert(usize, String),
     /// A command recalled from history onto the prompt. Unlike `PromptInsert`
     /// it kills the pending line first: a recall that merely appends is glued
-    /// to whatever the user had half-typed (the failure mode jterm4 shipped),
+    /// to whatever the user had half-typed (the failure mode forge shipped),
     /// and the mangled line is one Enter away from running.
     PromptRecall(usize, String),
     /// System clipboard contents read in response to an OSC 52 query from the
@@ -1369,7 +1369,7 @@ impl Session {
 /// the clamped source-crop rectangle the placement shows.
 type KittyHandleKey = (usize, u32, kitty_graphics::Crop);
 
-struct Jterm {
+struct Frost {
     config: Config,
     theme: Theme,
     metrics: Metrics,
@@ -1529,7 +1529,7 @@ struct Jterm {
     is_first_instance: bool,
 }
 
-impl Jterm {
+impl Frost {
     fn new(
         config: Config,
         config_diagnostic: Option<String>,
@@ -1585,7 +1585,7 @@ impl Jterm {
         };
         let sidebar_open = side_tabs;
 
-        let mut app = Jterm {
+        let mut app = Frost {
             config,
             theme,
             metrics,
@@ -1670,7 +1670,7 @@ impl Jterm {
         // external input, so every index is validated before use.
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
         app.relayout();
-        // jterm3 prefers jsh as its shell, so it is worth noticing when the
+        // frost prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. Nothing is installed without an
         // explicit click.
         let jsh_check = Self::jsh_update_check_task(&app.config.jsh_update_check);
@@ -1681,12 +1681,12 @@ impl Jterm {
         self.sessions
             .get(self.active)
             .map(|s| s.label())
-            .unwrap_or_else(|| "jterm3".to_string())
+            .unwrap_or_else(|| "frost".to_string())
     }
 
     fn iced_theme(&self) -> iced::Theme {
         iced::Theme::custom(
-            "jterm3".to_string(),
+            "frost".to_string(),
             iced::theme::Palette {
                 background: self.theme.terminal_background(),
                 text: self.theme.terminal_foreground(),
@@ -4419,7 +4419,7 @@ impl Jterm {
     }
 
     /// Run the Find & Replace panel against the active pane's selection and
-    /// route the result. Mirrors jterm2's semantics: the scrollback is
+    /// route the result. Mirrors ember's semantics: the scrollback is
     /// read-only program output and is never mutated — the transformed text
     /// goes to the clipboard, or to the prompt via the paste path (bracketed
     /// framing, bounded input queue, no trailing newline).
@@ -4980,7 +4980,7 @@ impl Jterm {
 
                 // Desktop notification when a long-running command finishes
                 // (duration measured by the OSC 133 bookkeeping). Mirrors the
-                // block-view gating in jterm1: an opt-out config flag plus a
+                // block-view gating in anvil: an opt-out config flag plus a
                 // duration threshold, with iced window focus standing in for
                 // its background-block check — a command the user is actively
                 // watching (focused window, active pane) never toasts.
@@ -5000,7 +5000,7 @@ impl Jterm {
 
                 // A finished command may have changed branch/dirty state;
                 // re-probe the pane's git meta now instead of waiting for the
-                // next periodic tick (same immediate refresh jterm1 does).
+                // next periodic tick (same immediate refresh anvil does).
                 // Both the pane-header strip and the bottom bar read the cache.
                 if !completed_commands.is_empty()
                     && (self.config.show_repo_strip || self.config.bottom_bar)
@@ -5124,7 +5124,7 @@ impl Jterm {
                 }
 
                 // Persist each finished command into the family-shared JSONL
-                // history index (jterm1/jterm4 file format) so the
+                // history index (anvil/forge file format) so the
                 // Ctrl+Shift+H picker recalls it across restarts. Writes go
                 // through jterm_core's bounded background writer; unsafe
                 // reconstructions (multiline heredoc text) are skipped rather
@@ -5181,7 +5181,7 @@ impl Jterm {
                     // Some other binary named jsh, earlier on PATH. Installing
                     // does not fix PATH order, so the installer explains it in
                     // the session; here it is only worth a log line.
-                    log::warn!("PATH resolves jsh to {other}, which jterm3 does not manage");
+                    log::warn!("PATH resolves jsh to {other}, which frost does not manage");
                 }
                 self.jsh_prompt = jterm_core::jsh_install::prompt_for(&status);
                 if let Some(prompt) = &self.jsh_prompt {
@@ -5387,7 +5387,7 @@ impl Jterm {
                         ToastKind::Warning,
                     );
                 } else {
-                    // Same write target rule as jterm4: the configured path,
+                    // Same write target rule as forge: the configured path,
                     // otherwise the per-app default. The environment override
                     // stays read-only and is never chosen as a write target.
                     let path = self
@@ -6851,7 +6851,7 @@ impl Jterm {
         // In Side mode the tab labels live in the dock, so the title is the
         // only place the active session is named and there is room for it. In
         // Top mode the active tab already shows the very same string
-        // (`Jterm::title` is the active session's label), so repeating it here
+        // (`Frost::title` is the active session's label), so repeating it here
         // would only steal width from the strip.
         if self.config.tab_position == config::TabPosition::Side {
             bar = bar.push(
@@ -6885,7 +6885,7 @@ impl Jterm {
             .into()
     }
 
-    /// Floating tab context menu, the same item set jterm1/jterm4 put on their
+    /// Floating tab context menu, the same item set anvil/forge put on their
     /// sidebar tabs: New Tab, Duplicate, Rename, Mark, Pin, the close family,
     /// and one entry per configured `[[remote_hosts]]` destination.
     ///
@@ -7134,7 +7134,7 @@ impl Jterm {
     /// visible until the user fixes the underlying file (or explicitly resets
     /// the main config), so a fallback can never look like a successful load.
     fn diagnostics_overlay(&self) -> Element<'_, Message> {
-        let mut content = column![text("jterm3 needs attention").size(13)]
+        let mut content = column![text("frost needs attention").size(13)]
             .spacing(4)
             .width(Length::Fill);
         if let Some(error) = &self.config_diagnostic {
@@ -9012,7 +9012,7 @@ impl Jterm {
             compact,
             "Key file",
             text_input(
-                "~/.config/jterm3/ai.key (chmod 600)",
+                "~/.config/frost/ai.key (chmod 600)",
                 self.config.ai_api_key_file.as_deref().unwrap_or(""),
             )
             .on_input(Message::SetAiKeyFile)
@@ -10122,7 +10122,7 @@ fn enqueue_desktop_notification(title: String, body: String) {
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Notification>(8);
         let _ = std::thread::Builder::new()
-            .name("jterm3-notifications".to_string())
+            .name("frost-notifications".to_string())
             .spawn(move || {
                 while let Ok((title, body)) = receiver.recv() {
                     let _ = std::process::Command::new("notify-send")
@@ -10233,7 +10233,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
             };
             let reader_fd = key.reader_fd;
             let spawn_result = std::thread::Builder::new()
-                .name(format!("jterm3-pty-{id}"))
+                .name(format!("frost-pty-{id}"))
                 .spawn(move || {
                     let reader_raw = reader_fd.as_raw_fd();
                     let shutdown_raw = shutdown_r.as_raw_fd();
@@ -10428,7 +10428,7 @@ fn encode_key(
     let alt = mods.alt();
 
     // Enhanced keyboard protocols (Kitty / xterm modifyOtherKeys) take
-    // precedence when an app has enabled them. Unlike jterm2/egui, iced puts
+    // precedence when an app has enabled them. Unlike ember/egui, iced puts
     // committed text on this same key event; there is no second text event to
     // suppress. Skipping an alphanumeric key here would therefore violate
     // Kitty's report-all-keys mode and send plain text instead.
@@ -11225,11 +11225,11 @@ mod tests {
             String::from_utf8_lossy(&paste.bytes)
         );
         assert!(paste.risk.had_embedded_paste_marker);
-        // jterm3 sends every line of an unbracketed multiline paste, unchanged.
+        // frost sends every line of an unbracketed multiline paste, unchanged.
         assert_eq!(paste.echo_text, "docs\nrm -rf ~\n");
     }
 
-    /// jterm3 keeps `SendVerbatim`: a multiline paste into a shell that never
+    /// frost keeps `SendVerbatim`: a multiline paste into a shell that never
     /// advertised DECSET 2004 is still sent whole, framing omitted.
     #[test]
     fn unbracketed_multiline_paste_stays_verbatim() {
@@ -11261,7 +11261,7 @@ mod tests {
         );
         assert_eq!(untrusted.echo_text, "printf '[31m'");
 
-        // jterm3's pinned core has no visual-risk confirmation UI, so a pure
+        // frost's pinned core has no visual-risk confirmation UI, so a pure
         // clipboard paste containing hidden formatting must fail closed too.
         assert!(matches!(
             crate::review_text::sanitize_prompt_payload(

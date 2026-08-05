@@ -1,10 +1,10 @@
 [package]
-name = "jterm3"
+name = "frost"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, GPU-rendered Linux terminal emulator built with Rust and iced"
-repository = "https://github.com/beamiter/jterm3"
-homepage = "https://github.com/beamiter/jterm3"
+repository = "https://github.com/beamiter/frost"
+homepage = "https://github.com/beamiter/frost"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["terminal", "terminal-emulator", "iced", "gpu", "linux"]

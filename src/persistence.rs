@@ -2,7 +2,7 @@
 //!
 //! Revisions retain the exact bytes that were loaded. Writers take a sibling
 //! advisory lock, compare that exact revision, then use this module's private,
-//! durable atomic replacement. This prevents two jterm3 processes from
+//! durable atomic replacement. This prevents two frost processes from
 //! silently overwriting one another while keeping failed writes off the live
 //! destination path.
 
@@ -1035,7 +1035,7 @@ mod tests {
     impl Scratch {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "jterm3-persistence-{label}-{}",
+                "frost-persistence-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir(&path).unwrap();

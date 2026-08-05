@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Remove jterm3 and its Linux desktop integration.
+# Remove frost and its Linux desktop integration.
 
 set -Eeuo pipefail
 
-APP_ID="io.github.beamiter.jterm3"
+APP_ID="io.github.beamiter.frost"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
@@ -26,7 +26,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm3 uninstall: %s\n' "$*" >&2
+    printf 'frost uninstall: %s\n' "$*" >&2
     exit 1
 }
 
@@ -100,12 +100,18 @@ if [[ -n "${DESTDIR}" ]]; then
 fi
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
-remove_file "${DESTDIR}${BIN_DIR}/jterm3"
+remove_file "${DESTDIR}${BIN_DIR}/frost"
 remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
 remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
 remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
 remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
 remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+# Desktop integration from before the jterm3 -> frost rename.
+remove_file "${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
+remove_file "${SHARE_DIR}/metainfo/io.github.beamiter.jterm3.metainfo.xml"
+remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/io.github.beamiter.jterm3.svg"
+remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/io.github.beamiter.jterm3.png"
+remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/io.github.beamiter.jterm3.png"
 
 # Without this the launcher keeps offering a dead entry and a cached icon.
 if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
@@ -121,6 +127,6 @@ if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
     fi
 fi
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/jterm3"
-printf 'Removed jterm3 from %s\n' "${BIN_DIR}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/frost"
+printf 'Removed frost from %s\n' "${BIN_DIR}"
 printf 'Preserved configuration and history under %s\n' "${CONFIG_DIR}"

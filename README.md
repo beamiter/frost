@@ -1,6 +1,6 @@
-# jterm3
+# frost
 
-jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wgpu 构建。它把多标签、分屏、完整回滚搜索、会话恢复和 GPU 渲染放进一个轻量桌面应用，同时默认收紧远程终端可触达的宿主能力。
+frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wgpu 构建。它把多标签、分屏、完整回滚搜索、会话恢复和 GPU 渲染放进一个轻量桌面应用，同时默认收紧远程终端可触达的宿主能力。
 
 ## 主要能力
 
@@ -8,13 +8,13 @@ jterm3 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 w
 - 搜索当前屏幕与全部 scrollback，支持大小写匹配、正则和自动滚动定位
 - 查找替换面板（`Ctrl+Alt+R`）：scrollback 是只读输出，替换作用于当前选中文本——结果复制到剪贴板，或不带回车回填到提示符；支持字面/正则、大小写、全词与全部替换
 - UTF-8、中文宽字符、True Color、256 色、鼠标报告、括号粘贴和扩展键盘协议
-- Kitty 图像直接传输（`f=100` PNG、`f=24` RGB、`f=32` RGBA），协议的结构层与 jterm1/2/4 共用 `jterm_core::kitty_graphics`；带传输、像素、解压内存和放置数量上限，并对带 `i=`/`I=` 的命令回送 `OK` / `EINVAL` / `ENOTSUP` / `ENOENT` 应答
+- Kitty 图像直接传输（`f=100` PNG、`f=24` RGB、`f=32` RGBA），协议的结构层与 anvil/2/4 共用 `jterm_core::kitty_graphics`；带传输、像素、解压内存和放置数量上限，并对带 `i=`/`I=` 的命令回送 `OK` / `EINVAL` / `ENOTSUP` / `ENOENT` 应答
 - 文件侧栏、路径插入、链接识别、命令面板、主题编辑和实时设置
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 shell 集成：沿命令提示符逐条跳转（`Ctrl+Shift+↑/↓`）、一键复制上一条命令输出（`Ctrl+Shift+G`），历史修剪时命令区保持对齐
-- 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 jterm1/jterm4 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
+- 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
@@ -39,7 +39,7 @@ sudo apt-get install pkg-config libfontconfig1-dev libwayland-dev \
 ```bash
 rustup toolchain install stable --profile minimal --component rustfmt --component clippy
 cargo build --release --locked
-./target/release/jterm3
+./target/release/frost
 ```
 
 ## 安装（含桌面集成）
@@ -55,34 +55,34 @@ cargo build --release --locked
 
 | 内容 | 位置 |
 | --- | --- |
-| 二进制 | `~/.local/bin/jterm3` |
-| 启动器条目 | `~/.local/share/applications/io.github.beamiter.jterm3.desktop` |
-| 图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.jterm3.*` |
-| AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.jterm3.metainfo.xml` |
+| 二进制 | `~/.local/bin/frost` |
+| 启动器条目 | `~/.local/share/applications/io.github.beamiter.frost.desktop` |
+| 图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.frost.*` |
+| AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.frost.metainfo.xml` |
 
-这套桌面集成才让 jterm3 出现在 GNOME/KDE 的应用列表里，可搜索、可点击启动、可固定到
+这套桌面集成才让 frost 出现在 GNOME/KDE 的应用列表里，可搜索、可点击启动、可固定到
 dock。有三个细节决定它到底显不显示，安装脚本都已处理：
 
 - `Exec=` / `TryExec=` 会被改写成二进制的绝对路径（`/usr` 这类系统 prefix 保留相对
   形式以便重定位）。桌面会话的 `PATH` 在登录时就固定了，若 `~/.local/bin` 不在其中，
-  `TryExec=jterm3` 会失败并让条目**整个从应用列表消失**。
+  `TryExec=frost` 会失败并让条目**整个从应用列表消失**。
 - 安装与卸载后都会刷新 `update-desktop-database` 和 `gtk-update-icon-cache`；陈旧的
   图标缓存会盖住刚装进去的图标。`DESTDIR` 打包时跳过，交给包管理器处理。
-- `StartupWMClass` 为 `io.github.beamiter.jterm3`，与窗口真实的 `WM_CLASS` 一致。
+- `StartupWMClass` 为 `io.github.beamiter.frost`，与窗口真实的 `WM_CLASS` 一致。
   iced 把 `window::Settings` 里的 `platform_specific.application_id` 同时用作 X11
   `WM_CLASS` 与 Wayland app_id；不设置时两者都是空字符串，桌面环境无法把窗口关联到
   条目，dock 里只会出现一个没有图标、无法固定的窗口。
 
-窗口本身也带图标：`data/io.github.beamiter.jterm3-128.png` 内嵌进二进制并在启动时交给
+窗口本身也带图标：`data/io.github.beamiter.frost-128.png` 内嵌进二进制并在启动时交给
 winit，因此即便直接 `cargo run`、或条目还没安装，`_NET_WM_ICON` 也是设好的——启动器条目
 只能覆盖桌面环境能关联上的窗口。
 
-可用 `desktop-file-validate <条目>` 与 `gtk-launch io.github.beamiter.jterm3` 自检。
+可用 `desktop-file-validate <条目>` 与 `gtk-launch io.github.beamiter.frost` 自检。
 
 也可以只手动安装二进制：
 
 ```bash
-install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
+install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 ```
 
 默认字体会优先使用 SauceCodePro Nerd Font；未安装时 iced/Fontconfig 会回退到系统字体。可以在设置面板中选择任意已安装的等宽字体。
@@ -112,11 +112,11 @@ install -Dm755 target/release/jterm3 "$HOME/.local/bin/jterm3"
 | 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | 窗口透明度增 / 减 | `Ctrl+Alt+=` / `Ctrl+Alt+-`（写回配置 `opacity`，设置面板也有滑块） |
 
-快捷键从 `$XDG_CONFIG_HOME/jterm3/keybindings.toml`（通常是 `~/.config/jterm3/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
+快捷键从 `$XDG_CONFIG_HOME/frost/keybindings.toml`（通常是 `~/.config/frost/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
 
 ## 配置
 
-主配置位于 `$XDG_CONFIG_HOME/jterm3/config.toml`。设置面板中的修改会自动保存，外部编辑也会热重载。示例：
+主配置位于 `$XDG_CONFIG_HOME/frost/config.toml`。设置面板中的修改会自动保存，外部编辑也会热重载。示例：
 
 ```toml
 font_family = "JetBrains Mono Nerd Font"
@@ -148,10 +148,10 @@ notify_long_block_threshold_ms = 10000
 # 分屏 pane 标题栏中的 git 分支/脏状态
 show_repo_strip = true
 
-# 持久化命令历史（与 jterm1/jterm4 同名键、同 JSONL 格式，可指向同一文件共享）
-# 默认写入 ~/.local/state/jterm3/history.jsonl，只记录命令、目录、退出码与时间
+# 持久化命令历史（与 anvil/forge 同名键、同 JSONL 格式，可指向同一文件共享）
+# 默认写入 ~/.local/state/frost/history.jsonl，只记录命令、目录、退出码与时间
 command_history_enabled = true
-# command_history_path = "~/.local/state/jterm3/history.jsonl"
+# command_history_path = "~/.local/state/frost/history.jsonl"
 command_history_max_entries = 10000
 
 # AI / Agent（默认关闭；不开启则没有任何数据离开本机）
@@ -162,20 +162,20 @@ ai_model = "claude-sonnet-4-6"
 # 关闭则退回整段阻塞请求；两种方式记录到会话里的内容完全一致。
 ai_stream = true
 # API key 文件：一行 key、权限 600。未设置时在设置面板粘贴 key 即可，
-# 会自动写入 ~/.config/jterm3/ai.key。环境变量 JTERM3_AI_API_KEY_FILE
-# 优先于此项（与 jterm4 一致），且不会被写回配置文件。
-# ai_api_key_file = "~/.config/jterm3/ai.key"
+# 会自动写入 ~/.config/frost/ai.key。环境变量 FROST_AI_API_KEY_FILE
+# 优先于此项（与 forge 一致），且不会被写回配置文件。
+# ai_api_key_file = "~/.config/frost/ai.key"
 ```
 
 `Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
 
-如果 `config.toml` 或 `keybindings.toml` 编辑出错，jterm3 会保留最后一次可用配置并在窗口内显示诊断。主配置有错误时自动保存会暂停，避免默认值覆盖原文件；修正文件后会自动恢复热重载。
+如果 `config.toml` 或 `keybindings.toml` 编辑出错，frost 会保留最后一次可用配置并在窗口内显示诊断。主配置有错误时自动保存会暂停，避免默认值覆盖原文件；修正文件后会自动恢复热重载。
 
-内置主题包括 Dark、Light、Monokai、Dracula、Nord、Gruvbox Dark、Tokyo Night、One Dark、Catppuccin Mocha 和 Solarized Light。自定义主题保存在 `~/.config/jterm3/themes/`。
+内置主题包括 Dark、Light、Monokai、Dracula、Nord、Gruvbox Dark、Tokyo Night、One Dark、Catppuccin Mocha 和 Solarized Light。自定义主题保存在 `~/.config/frost/themes/`。
 
 ## 安装与更新 jsh
 
-jterm3 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不到才退回 bash。
+frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不到才退回 bash。
 命令面板中的 **Install or update jsh** 会在独立会话里运行安装脚本：会话本身就是进度界面，
 可以 Ctrl+C 中断，脚本结束后等待 Enter 再关闭，失败原因不会一闪而过。
 
@@ -191,13 +191,13 @@ jterm3 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找�
 ## Kitty 图像协议
 
 协议的结构层——控制数据解析、`m=1` 分块重组、base64 解码、原始格式长度校验、PNG 的 IHDR 嗅探
-和全部容量上限——现在来自 jterm1/2/3/4 共用的 `jterm_core::kitty_graphics`（预算取 `Caps::SCREEN`：
+和全部容量上限——现在来自 anvil/2/3/4 共用的 `jterm_core::kitty_graphics`（预算取 `Caps::SCREEN`：
 64 MiB 编码 / 64 MiB 解码 / 16384 像素边长 / 16 KiB 控制段 / 64 MiB 全部在途分块）。图像仓库、
-放置、删除和协议应答仍留在 jterm3，因为它们需要解码器给出的尺寸和错误文本。
+放置、删除和协议应答仍留在 frost，因为它们需要解码器给出的尺寸和错误文本。
 
 **升级后可见的行为变化：**
 
-- **`x=` / `y=` 改回协议语义，图像位置会移动。** 以前 jterm3 把 `x=`/`y=` 当成屏幕列/行，
+- **`x=` / `y=` 改回协议语义，图像位置会移动。** 以前 frost 把 `x=`/`y=` 当成屏幕列/行，
   于是不带这两个键的图像一律画在左上角 `(0,0)`。它们在协议里是**源图裁剪偏移**（像素），
   屏幕位置由命令抵达时的**光标格**决定。现在 `a=T` / `a=p` 都锚定在光标处，`x=`/`y=`/`w=`/`h=`
   只裁剪源图。**先前渲染在左上角的图像会改到光标位置显示**，用 `x=`/`y=` 手工摆位的脚本需要改用光标定位。
@@ -211,9 +211,9 @@ jterm3 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找�
   现在只有 `ESC _ G …` 才路由过去。
 - **`f=` 缺省值从 PNG 变成 RGBA。** 这是协议默认值。不写 `f=` 的命令现在表示原始 RGBA，
   必须同时给出 `s=` 和 `v=`。
-- **`f=` 只接受 `100` / `32` / `24`。** jterm3 私有的 `png` / `jpeg` / `jpg` / `webp` / `rgb` / `rgba`
+- **`f=` 只接受 `100` / `32` / `24`。** frost 私有的 `png` / `jpeg` / `jpg` / `webp` / `rgb` / `rgba`
   别名已移除，随之**不再支持 JPEG 与 WebP 传输**（`f=100` 只解码 PNG）。
-- **分号分隔的旧语法已移除。** `a=t;i=1;s=100;v=100;f=png` 这种 jterm3 私有写法不再被识别，
+- **分号分隔的旧语法已移除。** `a=t;i=1;s=100;v=100;f=png` 这种 frost 私有写法不再被识别，
   只接受标准的 `G<控制对逗号分隔>;<base64>`。
 - **原始像素长度必须精确匹配** `s*v*通道数`，以前允许多余尾字节。
 - **`i=` 与 `I=` 互斥**，同时给出会被拒绝。
@@ -226,7 +226,7 @@ jterm3 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找�
 
 ## 安全说明
 
-终端控制序列来自本地或远程程序，不能天然视为可信输入。jterm3 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。剪贴板写入仍按主流终端兼容行为允许。Kitty 图像和通知均有资源或频率限制。
+终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。剪贴板写入仍按主流终端兼容行为允许。Kitty 图像和通知均有资源或频率限制。
 
 ## 开发验证
 
@@ -239,11 +239,11 @@ cargo build --release --all-features --locked
 
 CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛。
 
-调试构建可设置 `JTERM3_DEBUG=1` 输出有界的协议字节预览。
+调试构建可设置 `FROST_DEBUG=1` 输出有界的协议字节预览。
 
 ## 许可证
 
-jterm3 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；完整文本见
+frost 以 **MIT OR Apache-2.0** 双许可证发布，使用者可任选其一；完整文本见
 [`LICENSE-MIT`](LICENSE-MIT) 与 [`LICENSE-APACHE`](LICENSE-APACHE)。向本仓库提交
 贡献即表示贡献者同意按相同的双许可证条款授权该贡献。
 

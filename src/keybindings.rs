@@ -44,7 +44,7 @@ pub enum Command {
     TerminalCopyLastOutput,
 
     // === 命令块（OSC 133 block mode）===
-    // Unbound by default: ctrl+shift+x (the jterm1/4 chord for jump-first-
+    // Unbound by default: ctrl+shift+x (the anvil/4 chord for jump-first-
     // failed) already means pane:swap in this repo's defaults.
     BlockJumpFirstFailed,
     BlockCopyCommand,
@@ -222,8 +222,8 @@ impl std::str::FromStr for Command {
 }
 
 /// 快捷键字符串归一化。chord 的解析/序列化本体在家族共享的
-/// `jterm_core::keybindings`（jterm1..4 共用一套语法）；这里只保留
-/// jterm3 的入口名。
+/// `jterm_core::keybindings`（anvil..4 共用一套语法）；这里只保留
+/// frost 的入口名。
 pub struct KeyBinding;
 
 impl KeyBinding {
@@ -360,7 +360,7 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+f".to_string(), "search:open".to_string());
-        // Same chord as jterm2's Find & Replace panel; Ctrl+Alt is otherwise
+        // Same chord as ember's Find & Replace panel; Ctrl+Alt is otherwise
         // only used for pane focus (arrow keys), so the letter chord is free.
         bindings.bindings.insert(
             "ctrl+alt+r".to_string(),
@@ -409,7 +409,7 @@ impl KeyBindings {
             .bindings
             .insert("ctrl+0".to_string(), "font:zoom_reset".to_string());
 
-        // 窗口透明度实时调节，与 jterm1/jterm4 相同的键位。
+        // 窗口透明度实时调节，与 anvil/forge 相同的键位。
         bindings
             .bindings
             .insert("ctrl+alt+=".to_string(), "opacity:increase".to_string());
@@ -549,7 +549,7 @@ impl KeyBindings {
     /// 获取配置文件路径
     pub fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("Could not determine config directory")?;
-        Ok(config_dir.join("jterm3/keybindings.toml"))
+        Ok(config_dir.join("frost/keybindings.toml"))
     }
 
     pub fn config_revision() -> Result<FileRevision, String> {
@@ -584,7 +584,7 @@ mod tests {
     impl ScratchDir {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "jterm3-keybindings-{label}-{}",
+                "frost-keybindings-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
             std::fs::create_dir(&path).unwrap();
@@ -623,7 +623,7 @@ mod tests {
             ("ctrl+alt+arrowleft", "ctrl+alt+left"),
             ("ctrl+page_up", "ctrl+pageup"),
             ("ctrl+\\", "ctrl+backslash"),
-            // Plus-as-key: jterm3 alone used to reject these; the family
+            // Plus-as-key: frost alone used to reject these; the family
             // grammar accepts them (canonical form keeps the literal '+').
             ("ctrl++", "ctrl++"),
             ("ctrl+shift++", "ctrl+shift++"),
@@ -645,7 +645,7 @@ mod tests {
         }
     }
 
-    /// jterm3's command for each family-contract action. `None` rows are
+    /// frost's command for each family-contract action. `None` rows are
     /// handled by the fixed app-chrome layer (`chrome_shortcut` in main.rs)
     /// rather than the configurable map.
     fn common_action_command(action: CommonAction) -> Option<Command> {
@@ -682,8 +682,8 @@ mod tests {
         })
     }
 
-    /// The family ergonomic contract, driven by core's table so jterm3 can't
-    /// silently drift from jterm1/2/4: every `DEFAULT_CHORDS` row is either
+    /// The family ergonomic contract, driven by core's table so frost can't
+    /// silently drift from anvil/2/4: every `DEFAULT_CHORDS` row is either
     /// bound to the mapped command or deliberately owned by the chrome layer
     /// (in which case the configurable map must leave the chord free).
     #[test]
@@ -707,11 +707,11 @@ mod tests {
     }
 
     #[test]
-    fn jterm3_chords_beyond_the_family_contract() {
+    fn frost_chords_beyond_the_family_contract() {
         let bindings = KeyBindings::default_bindings();
         let cases = [
-            // Excluded from DEFAULT_CHORDS by design (jterm1/4 bind it to
-            // SelectAllBlocks); jterm3 keeps its lineage meaning.
+            // Excluded from DEFAULT_CHORDS by design (anvil/4 bind it to
+            // SelectAllBlocks); frost keeps its lineage meaning.
             ("ctrl+shift+a", Command::AgentToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+x", Command::PaneSwap),
@@ -743,7 +743,7 @@ mod tests {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
         }
-        // jterm1/4 bind jump-first-failed to ctrl+shift+x, but that chord is
+        // anvil/4 bind jump-first-failed to ctrl+shift+x, but that chord is
         // pane:swap here; the block commands therefore have no default chord.
         let bindings = KeyBindings::default_bindings();
         assert_eq!(

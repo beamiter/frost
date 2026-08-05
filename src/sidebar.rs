@@ -226,7 +226,7 @@ mod tests {
     use super::*;
 
     fn temp_tree() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("jterm3-sidebar-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("frost-sidebar-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("nested").join("deep")).expect("create test tree");
         for index in 0..32 {
             std::fs::write(root.join(format!("file-{index:02}.txt")), b"x")

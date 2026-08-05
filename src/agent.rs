@@ -1,7 +1,7 @@
 //! Agent mode state — a multi-turn LLM that proposes shell commands, watches
 //! their output, and iterates. The protocol state machine, provider client,
-//! transport, and redaction live in `jterm_core` (shared with jterm1/2/4);
-//! this module holds jterm3's UI-facing session driver. The iced view and
+//! transport, and redaction live in `jterm_core` (shared with anvil/2/4);
+//! this module holds frost's UI-facing session driver. The iced view and
 //! message routing live in `main.rs`, mirroring `command_palette.rs`.
 //!
 //! ## Safety model (immutable, by design)
@@ -30,7 +30,7 @@ const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 fn snapshot_path() -> Option<std::path::PathBuf> {
     Some(
         dirs::config_dir()?
-            .join("jterm3")
+            .join("frost")
             .join("agent_session.json"),
     )
 }
@@ -65,7 +65,7 @@ fn claim_snapshot_session(path: &Path) -> Option<AgentSession> {
     }
 }
 
-/// Read an Agent snapshot through jterm3's descriptor-validated, bounded
+/// Read an Agent snapshot through frost's descriptor-validated, bounded
 /// persistence path. Any unsafe, corrupt, or missing entry simply falls back
 /// to a fresh session. Production restores go through [`claim_snapshot_session`],
 /// which claims the file before reading it.
@@ -858,7 +858,7 @@ mod tests {
     }
 
     fn private_test_dir(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("jterm3-{label}-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("frost-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
         {
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn local_snapshot_io_round_trips_and_enforces_the_exact_budget() {
         let root =
-            std::env::temp_dir().join(format!("jterm3-agent-snapshot-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("frost-agent-snapshot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
         {
@@ -962,7 +962,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let root = std::env::temp_dir().join(format!(
-            "jterm3-agent-snapshot-unsafe-{}",
+            "frost-agent-snapshot-unsafe-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&root).unwrap();

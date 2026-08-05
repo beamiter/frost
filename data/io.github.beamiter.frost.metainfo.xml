@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.beamiter.jterm3</id>
+  <id>io.github.beamiter.frost</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>jterm3</name>
+  <name>frost</name>
   <summary>Fast, GPU-rendered Linux terminal emulator built with Rust and iced</summary>
   <description>
     <p>
-      jterm3 draws its terminal grid with iced on top of wgpu, including its own
+      frost draws its terminal grid with iced on top of wgpu, including its own
       title bar so window decorations render with the same font fallback chain
       as the rest of the interface.
     </p>
@@ -17,14 +17,14 @@
       <li>A companion jsh shell that the palette can install or update</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.beamiter.jterm3.desktop</launchable>
+  <launchable type="desktop-id">io.github.beamiter.frost.desktop</launchable>
   <developer id="io.github.beamiter">
     <name>beamiter</name>
   </developer>
-  <url type="homepage">https://github.com/beamiter/jterm3</url>
-  <url type="bugtracker">https://github.com/beamiter/jterm3/issues</url>
+  <url type="homepage">https://github.com/beamiter/frost</url>
+  <url type="bugtracker">https://github.com/beamiter/frost/issues</url>
   <provides>
-    <binary>jterm3</binary>
+    <binary>frost</binary>
   </provides>
   <recommends>
     <control>keyboard</control>

@@ -1,4 +1,4 @@
-//! Local compatibility with the current review-input contract while jterm3
+//! Local compatibility with the current review-input contract while frost
 //! remains exact-pinned to an older published `jterm_core`/`jagent` pair.
 
 use std::fmt;

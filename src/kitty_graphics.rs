@@ -1,7 +1,7 @@
 //! Kitty 图像协议：图像仓库、放置、删除与协议应答。
 //!
 //! 协议的结构部分——控制数据解析、`m=1` 分块重组、base64 解码、原始格式长度
-//! 校验以及 PNG IHDR 嗅探——住在 [`jterm_core::kitty_graphics`]（jterm1/2/3/4
+//! 校验以及 PNG IHDR 嗅探——住在 [`jterm_core::kitty_graphics`]（anvil/2/3/4
 //! 共用一份）。本模块只保留必须依赖解码器或终端状态的东西：图像仓库、放置、
 //! 删除，以及把 `jterm_core` 的类型化错误翻译成线上应答的 responder。
 //!

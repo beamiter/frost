@@ -1,13 +1,13 @@
 //! 历史命令选择器：跨重启持久化命令的模糊搜索浮层（Ctrl+Shift+H 打开）。
 //!
 //! 记录与检索都建立在家族共享的 `jterm_core::command_history` JSONL 索引上
-//! （与 jterm1/jterm4 同名配置键、同文件格式），因此几个兄弟终端可以指向同
+//! （与 anvil/forge 同名配置键、同文件格式），因此几个兄弟终端可以指向同
 //! 一份历史文件。Enter 只把选中的命令回填到活动 pane 的提示符，从不执行。
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use jterm_core::command_history::{self, CommandHistoryRecord};
 
-/// 打开选择器时加载的最大条数。与 jterm4 的历史面板一致：交互检索只需要
+/// 打开选择器时加载的最大条数。与 forge 的历史面板一致：交互检索只需要
 /// 一个近期工作集，`read_recent` 本身也把读取限制在有界的文件尾部。
 pub const PICKER_MAX_ENTRIES: usize = 2_000;
 
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn load_reads_a_bounded_newest_first_slice() {
         let root =
-            std::env::temp_dir().join(format!("jterm3-history-picker-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("frost-history-picker-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).expect("create private history fixture directory");
         #[cfg(unix)]
         {
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn load_of_a_missing_file_yields_an_empty_picker() {
         let root = std::env::temp_dir().join(format!(
-            "jterm3-history-picker-missing-{}",
+            "frost-history-picker-missing-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&root).expect("create private history fixture directory");

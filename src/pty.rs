@@ -345,11 +345,11 @@ mod unix_pty {
         std::env::var_os("PATH")
     }
 
-    /// jterm3 prefers its companion shell `jsh`, but a PATH hit on that name is
+    /// frost prefers its companion shell `jsh`, but a PATH hit on that name is
     /// not proof: the name can be taken by an unrelated binary or point
     /// elsewhere through a symlink. Exec'ing such a program as the login shell
     /// only prints a usage line and exits, which closes the sole tab and quits
-    /// jterm3 the instant it starts. Accept a PATH hit only when it still
+    /// frost the instant it starts. Accept a PATH hit only when it still
     /// resolves to a binary named `jsh` and identifies itself by banner.
     ///
     /// (The shell was called `rsh` until 0.3, when the name really did collide
@@ -368,7 +368,7 @@ mod unix_pty {
                     return Some(candidate);
                 }
                 eprintln!(
-                    "[PTY] '{candidate}' is not jterm3's jsh shell (it does not identify \
+                    "[PTY] '{candidate}' is not frost's jsh shell (it does not identify \
                      itself as one), falling back to the login shell"
                 );
                 None
@@ -504,12 +504,12 @@ mod unix_pty {
             .map(|path| path.to_string_lossy().into_owned())
     }
 
-    /// jterm3's child-environment policy. A function rather than a literal at
+    /// frost's child-environment policy. A function rather than a literal at
     /// the fork site so the flags can be asserted on without forking.
     pub(crate) fn child_env_options() -> jterm_core::child_env::ChildEnv<'static> {
         jterm_core::child_env::ChildEnv {
             // This crate's version, not jterm_core's: a tool that pairs
-            // TERM_PROGRAM with TERM_PROGRAM_VERSION must read jterm3's.
+            // TERM_PROGRAM with TERM_PROGRAM_VERSION must read frost's.
             app_version: TERM_PROGRAM_VERSION,
             vte_version: Some(jterm_core::child_env::EMULATED_VTE_VERSION),
             // LESS=FR, not the default FRX: -X disables the alternate screen,
@@ -518,7 +518,7 @@ mod unix_pty {
             // Match mainstream terminal defaults for colour-capable file
             // listings (LS_COLORS for GNU ls, CLICOLOR for BSD `ls -G`).
             color_defaults: true,
-            // jterm3 draws UTF-8 whatever the locale says, so a deliberate LANG
+            // frost draws UTF-8 whatever the locale says, so a deliberate LANG
             // is not ours to rewrite.
             normalize_locale: false,
         }
@@ -541,7 +541,7 @@ mod unix_pty {
             eprintln!("[PTY] Configured shell '{token}' is not executable, falling back");
         }
 
-        // Priority 2: jsh is jterm3's preferred shell. It gets a session id
+        // Priority 2: jsh is frost's preferred shell. It gets a session id
         // argv below when one is available, while still letting users override
         // it through config.shell.
         if let Some(jsh_path) = find_jterm_jsh() {
@@ -855,7 +855,7 @@ mod unix_pty {
                     libc::close(startup_read);
                     libc::close(master);
 
-                    // 父进程死亡信号：父进程(jterm3)退出时此进程收到 SIGTERM，
+                    // 父进程死亡信号：父进程(frost)退出时此进程收到 SIGTERM，
                     // 作为 SIGKILL/panic 情况下避免孤儿进程的最后一道防线。
                     #[cfg(target_os = "linux")]
                     {
@@ -1338,7 +1338,7 @@ mod tests {
     fn ssh_masquerading_as_jsh_is_not_taken_for_the_jterm_shell() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("jterm3-jsh-probe-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("frost-jsh-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create probe dir");
 
         // A `jsh` on PATH that is really ssh: right name, wrong binary.
@@ -1395,7 +1395,7 @@ mod tests {
         assert!(options.color_defaults);
         assert!(
             !options.normalize_locale,
-            "jterm3 draws UTF-8 regardless; a deliberate LANG is not ours to rewrite"
+            "frost draws UTF-8 regardless; a deliberate LANG is not ours to rewrite"
         );
         assert_eq!(options.app_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
@@ -1450,9 +1450,9 @@ mod tests {
 
         // A configured shell that does not exist falls through to the rest of the
         // chain instead of being handed to execve as-is.
-        let fallback = super::unix_pty::choose_shell(Some("/nonexistent/jterm3-shell"), Some("/"))
+        let fallback = super::unix_pty::choose_shell(Some("/nonexistent/frost-shell"), Some("/"))
             .expect("some shell must be found");
-        assert_ne!(fallback, "/nonexistent/jterm3-shell");
+        assert_ne!(fallback, "/nonexistent/frost-shell");
         assert!(std::path::Path::new(&fallback).is_absolute(), "{fallback}");
     }
 
@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn invalid_cwd_is_rejected_before_spawning() {
         let missing = std::env::temp_dir().join(format!(
-            "jterm3-missing-cwd-{}-{}",
+            "frost-missing-cwd-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1496,14 +1496,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let script = std::env::temp_dir().join(format!(
-            "jterm3-invalid-exec-{}-{}",
+            "frost-invalid-exec-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock should be after Unix epoch")
                 .as_nanos()
         ));
-        std::fs::write(&script, b"#!/definitely/missing/jterm3-interpreter\n")
+        std::fs::write(&script, b"#!/definitely/missing/frost-interpreter\n")
             .expect("write invalid executable");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("make test script executable");

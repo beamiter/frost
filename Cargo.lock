@@ -1246,6 +1246,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
+name = "frost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "dirs",
+ "env_logger",
+ "fuzzy-matcher",
+ "iced",
+ "image",
+ "jterm_core",
+ "libc",
+ "log",
+ "lru 0.18.1",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tokio",
+ "toml",
+ "unicode-normalization",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1964,33 +1991,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jterm3"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "dirs",
- "env_logger",
- "fuzzy-matcher",
- "iced",
- "image",
- "jterm_core",
- "libc",
- "log",
- "lru 0.18.1",
- "once_cell",
- "regex",
- "serde",
- "serde_json",
- "smallvec",
- "tokio",
- "toml",
- "unicode-normalization",
- "unicode-width",
- "uuid",
 ]
 
 [[package]]

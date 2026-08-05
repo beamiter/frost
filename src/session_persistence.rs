@@ -1,5 +1,5 @@
 //! 会话持久化：记录每个标签页的工作目录与活动索引，在重启后恢复。
-//! 端口自 jterm2 `session_persistence.rs`，精简为 jterm3 实际需要的字段。
+//! 端口自 ember `session_persistence.rs`，精简为 frost 实际需要的字段。
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -32,7 +32,7 @@ pub enum SnapshotLoad {
     Unreadable(String),
 }
 
-/// 单个会话快照（jterm3 仅需要 cwd 来重新 spawn）。
+/// 单个会话快照（frost 仅需要 cwd 来重新 spawn）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     #[serde(default)]
@@ -327,9 +327,9 @@ fn sanitize_tree_shape(tree: &mut PaneTreeSnapshot) -> bool {
 }
 
 /// 尝试获取单实例锁。成功返回持锁的 `File`（需在进程生命周期内持有），
-/// 失败（已有实例运行）返回 `None`。端口自 jterm2 `try_acquire_instance_lock`。
+/// 失败（已有实例运行）返回 `None`。端口自 ember `try_acquire_instance_lock`。
 pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
-    let lock_path = dirs::config_dir()?.join("jterm3").join("instance.lock");
+    let lock_path = dirs::config_dir()?.join("frost").join("instance.lock");
     try_acquire_instance_lock_at(&lock_path)
 }
 
@@ -379,7 +379,7 @@ mod tests {
 
     fn scratch(label: &str) -> std::path::PathBuf {
         let root =
-            std::env::temp_dir().join(format!("jterm3-snapshot-{label}-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("frost-snapshot-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         #[cfg(unix)]
         {
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn legacy_flat_split_field_still_deserializes() {
-        // Old jterm3 snapshots stored a single-axis `split` and no `tree`. Both
+        // Old frost snapshots stored a single-axis `split` and no `tree`. Both
         // fields must round-trip so the restore path can fall back to `split`.
         let legacy = r#"{"version":1,"sessions":[{"cwd":null},{"cwd":null}],
             "active_index":0,
