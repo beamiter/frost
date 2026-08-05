@@ -45,11 +45,18 @@ pub enum Command {
 
     // === 命令块（OSC 133 block mode）===
     // Unbound by default: ctrl+shift+x (the anvil/4 chord for jump-first-
-    // failed) already means pane:swap in this repo's defaults.
+    // failed) already means pane:swap in this repo's defaults, and
+    // ctrl+alt+up/down (the natural select-prev/next chords) are
+    // pane:focus_up/down here. All block commands are palette-only until the
+    // user binds them.
     BlockJumpFirstFailed,
     BlockCopyCommand,
     BlockCopyOutput,
     BlockRecallCommand,
+    BlockSelectPrev,
+    BlockSelectNext,
+    BlockCopyBlock,
+    BlockCopyMarkdown,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -118,6 +125,10 @@ impl std::fmt::Display for Command {
             Command::BlockCopyCommand => write!(f, "block:copy_command"),
             Command::BlockCopyOutput => write!(f, "block:copy_output"),
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
+            Command::BlockSelectPrev => write!(f, "block:select_prev"),
+            Command::BlockSelectNext => write!(f, "block:select_next"),
+            Command::BlockCopyBlock => write!(f, "block:copy_block"),
+            Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -179,6 +190,10 @@ impl std::str::FromStr for Command {
             "block:copy_command" => Ok(Command::BlockCopyCommand),
             "block:copy_output" => Ok(Command::BlockCopyOutput),
             "block:recall_command" => Ok(Command::BlockRecallCommand),
+            "block:select_prev" => Ok(Command::BlockSelectPrev),
+            "block:select_next" => Ok(Command::BlockSelectNext),
+            "block:copy_block" => Ok(Command::BlockCopyBlock),
+            "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -739,16 +754,29 @@ mod tests {
             ("block:copy_command", Command::BlockCopyCommand),
             ("block:copy_output", Command::BlockCopyOutput),
             ("block:recall_command", Command::BlockRecallCommand),
+            ("block:select_prev", Command::BlockSelectPrev),
+            ("block:select_next", Command::BlockSelectNext),
+            ("block:copy_block", Command::BlockCopyBlock),
+            ("block:copy_markdown", Command::BlockCopyMarkdown),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
         }
         // anvil/4 bind jump-first-failed to ctrl+shift+x, but that chord is
-        // pane:swap here; the block commands therefore have no default chord.
+        // pane:swap here — and ctrl+alt+up/down (select-prev/next elsewhere)
+        // are pane focus here — so the block commands have no default chord.
         let bindings = KeyBindings::default_bindings();
         assert_eq!(
             bindings.get_command("ctrl+shift+x"),
             Some(Command::PaneSwap)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+alt+up"),
+            Some(Command::PaneFocusUp)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+alt+down"),
+            Some(Command::PaneFocusDown)
         );
         assert!(!bindings
             .bindings

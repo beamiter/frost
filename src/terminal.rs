@@ -815,13 +815,20 @@ pub struct CommandZone {
     pub exit_code: Option<i32>,
     /// The executed command line; `None` for background zones (empty prompt).
     pub command: Option<String>,
-    /// Wall-clock run time from OSC 133 `C` to `D`; `None` without a `C`.
+    /// Wall-clock run time: the shell-reported `duration`/`duration_ms` param
+    /// when `D` carried one (shell-measured beats locally measured — family
+    /// rule), else the locally timed `C`→`D` span; `None` without either.
     pub duration_ms: Option<u64>,
-    /// Unix wall-clock milliseconds when `D` arrived. Captured now so restored
-    /// or future UI (forge shows a block timestamp) has real data; nothing
-    /// renders it yet.
-    #[allow(dead_code)]
+    /// Unix wall-clock milliseconds when `D` arrived. Rendered on the
+    /// selected block's badge and in the Markdown export.
     pub finished_at_ms: Option<u64>,
+    /// The shell reported (`cmd_truncated=`) that [`Self::command`] was cut
+    /// short. A truncated command line is not safe to re-run, so recall must
+    /// refuse it; copying is still fine.
+    pub command_truncated: bool,
+    /// Working directory the command ran in: the shell's OSC 133 `cwd`/
+    /// `cwd_url` param when one arrived, else the OSC 7 cwd at `D`.
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1122,6 +1129,12 @@ pub struct TerminalState {
     /// When the currently executing command began (OSC 133 `C`), so the
     /// finished record can carry a wall-clock duration.
     current_command_started_at: Option<std::time::Instant>,
+    /// Working directory reported by an OSC 133 `cwd`/`cwd_url` param during
+    /// the current prompt lifecycle (reset at `A`, consumed at `D`).
+    current_command_cwd: Option<String>,
+    /// The shell flagged the current command line as truncated
+    /// (`cmd_truncated=`); carried into the zone at `D`.
+    current_command_truncated: bool,
 }
 
 /// One OSC 133 command lifecycle captured for the AI agent: the typed
@@ -1313,6 +1326,8 @@ impl TerminalState {
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
             current_command_started_at: None,
+            current_command_cwd: None,
+            current_command_truncated: false,
         }
     }
 
@@ -1649,10 +1664,22 @@ impl TerminalState {
     fn handle_osc_133(&mut self, value: &str) {
         const MAX_EXECUTION_ID_BYTES: usize = 192;
         const MAX_COMMAND_METADATA_BYTES: usize = 16 * 1024;
+        // OSC 133 while the alternate screen is active is dropped entirely
+        // (ember's rule): `absolute_row` would be computed against the alt
+        // grid's cursor, and any zone it produced would corrupt the
+        // primary-screen history. A command that flips to the alt screen
+        // mid-lifecycle (vim) keeps its pending [`ZoneState`] and finalizes
+        // normally when its `D` arrives back on the primary screen.
+        if self.use_alt_buffer {
+            return;
+        }
         let absolute_row = self.scrollback.len() + self.cursor_row;
         let mark = value.chars().next().unwrap_or('\0');
         let mut mark_id = None;
         let mut metadata_command = None;
+        let mut metadata_cwd = None;
+        let mut metadata_duration_ms = None;
+        let mut metadata_truncated = false;
         // jsh correlation metadata rides on C/D as percent-encoded key/value
         // params. Parse it per mark instead of leaving an id in global state
         // where an unrelated later D could inherit it.
@@ -1670,6 +1697,21 @@ impl TerminalState {
                     && !id.chars().any(char::is_control)
                 {
                     metadata_command = Some(id.to_string());
+                } else if matches!(key, "cwd" | "cwd_url") {
+                    // Both spellings are percent-decoded, so a literal `%`
+                    // in a plain `cwd` path is mangled. Family-consistent:
+                    // ember decodes the bare key the same way, and shells
+                    // that send `cwd` unencoded with a literal `%` are the
+                    // ones off-contract.
+                    metadata_cwd = Self::decode_osc_metadata(id, MAX_COMMAND_METADATA_BYTES)
+                        .filter(|cwd| !cwd.chars().any(char::is_control));
+                } else if matches!(key, "duration" | "duration_ms") {
+                    metadata_duration_ms = id.trim().parse::<u64>().ok();
+                } else if matches!(key, "cmd_truncated" | "command_truncated") {
+                    metadata_truncated = matches!(
+                        id.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    );
                 }
             }
         }
@@ -1684,6 +1726,8 @@ impl TerminalState {
                 self.current_command_extent_row = None;
                 self.current_command_text = None;
                 self.current_command_id = mark_id;
+                self.current_command_cwd = metadata_cwd;
+                self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
                 self.armed_agent_execution = None;
                 self.active_agent_execution = None;
@@ -1697,6 +1741,9 @@ impl TerminalState {
                     self.current_command_text = None;
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
+                    }
+                    if metadata_cwd.is_some() {
+                        self.current_command_cwd = metadata_cwd;
                     }
                     self.agent_prompt_input_tainted = false;
                     self.agent_prompt_generation = self.agent_prompt_generation.wrapping_add(1);
@@ -1714,6 +1761,12 @@ impl TerminalState {
                     self.current_command_text = Some(captured_command.clone());
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
+                    }
+                    if metadata_cwd.is_some() {
+                        self.current_command_cwd = metadata_cwd;
+                    }
+                    if metadata_truncated {
+                        self.current_command_truncated = true;
                     }
 
                     let matching_generation = self
@@ -1769,10 +1822,30 @@ impl TerminalState {
                     .active_agent_execution
                     .take()
                     .map(|active| active.generation);
-                let duration_ms = self
+                // A shell-measured `duration=`/`duration_ms=` param wins over
+                // the locally timed `C`→`D` span (family rule: the shell saw
+                // the whole execution, the terminal only saw the marks).
+                let local_duration_ms = self
                     .current_command_started_at
                     .take()
                     .map(|started| started.elapsed().as_millis() as u64);
+                let duration_ms = metadata_duration_ms.or(local_duration_ms);
+                let command_truncated = self.current_command_truncated || metadata_truncated;
+                let cwd = if metadata_cwd.is_some() {
+                    metadata_cwd
+                } else {
+                    self.current_command_cwd.take()
+                }
+                .or_else(|| {
+                    // OSC 7 only rejects NUL (a path with, say, a newline is
+                    // still openable), but a zone cwd feeds line-oriented
+                    // consumers (the Markdown export's `- Cwd:` line), so it
+                    // gets the same control-free guarantee as the OSC 133
+                    // params.
+                    self.current_working_dir
+                        .clone()
+                        .filter(|cwd| !cwd.chars().any(char::is_control))
+                });
                 match self.current_zone_state {
                     ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
                         let zone = CommandZone {
@@ -1785,6 +1858,8 @@ impl TerminalState {
                             command: self.zone_command_text(),
                             duration_ms,
                             finished_at_ms: Self::wall_clock_ms(),
+                            command_truncated,
+                            cwd: cwd.clone(),
                         };
                         self.push_command_zone(zone);
                         self.record_completed_command(
@@ -1808,20 +1883,24 @@ impl TerminalState {
                             output_end: Some(absolute_row),
                             exit_code,
                             command: self.zone_command_text(),
-                            // No `C` means no execution phase: see below.
-                            duration_ms: None,
+                            // Without a `C` there was no locally observed
+                            // execution phase, so only a shell-reported
+                            // duration param is meaningful here.
+                            duration_ms: metadata_duration_ms,
                             finished_at_ms: Self::wall_clock_ms(),
+                            command_truncated,
+                            cwd,
                         };
                         self.push_command_zone(zone);
-                        // Without a `C` the command never reported an execution
-                        // phase, so there is no meaningful duration.
+                        // Same rule for the agent record: shell-reported
+                        // duration or nothing.
                         self.record_completed_command(
                             cmd_start,
                             absolute_row,
                             None,
                             CompletedCommandMetadata {
                                 exit_code,
-                                duration_ms: None,
+                                duration_ms: metadata_duration_ms,
                                 execution_id: finished_id,
                                 agent_generation,
                             },
@@ -1833,6 +1912,8 @@ impl TerminalState {
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
                 self.current_command_text = None;
+                self.current_command_cwd = None;
+                self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
             }
             _ => {}
@@ -1941,7 +2022,7 @@ impl TerminalState {
             .find(|zone| zone.output_start.is_some())?;
         let start = zone.output_start?;
         let end = zone.output_end.unwrap_or(start);
-        let out = self.rows_text(start, end, MAX_BYTES);
+        let (out, _) = self.rows_text(start, end, MAX_BYTES);
         if out.trim().is_empty() {
             None
         } else {
@@ -1959,15 +2040,23 @@ impl TerminalState {
     /// [`Self::last_command_output_text`]). `None` when the zone is gone,
     /// recorded no output range, or the output is blank.
     pub fn zone_output_text(&self, id: u64) -> Option<String> {
+        self.zone_output_text_capped(id).map(|(text, _)| text)
+    }
+
+    /// [`Self::zone_output_text`] plus a truncation flag: `true` when the
+    /// 1 MiB cap cut whole output rows off the end (the Markdown export
+    /// reports it as `- Note: output truncated`). The extraction never cuts
+    /// mid-row, so the flag is exact: it is set only when rows were skipped.
+    pub fn zone_output_text_capped(&self, id: u64) -> Option<(String, bool)> {
         const MAX_BYTES: usize = 1 << 20;
         let zone = self.zone_by_id(id)?;
         let start = zone.output_start?;
         let end = zone.output_end.unwrap_or(start);
-        let out = self.rows_text(start, end, MAX_BYTES);
+        let (out, capped) = self.rows_text(start, end, MAX_BYTES);
         if out.trim().is_empty() {
             None
         } else {
-            Some(out)
+            Some((out, capped))
         }
     }
 
@@ -2014,6 +2103,7 @@ impl TerminalState {
         const MAX_PENDING_COMPLETED: usize = 32;
         let command = self.current_command_text.take().unwrap_or_else(|| {
             self.rows_text(cmd_start, cmd_end, MAX_COMMAND_BYTES)
+                .0
                 .trim()
                 .to_string()
         });
@@ -2022,7 +2112,7 @@ impl TerminalState {
         }
         let output_available = output.is_some();
         let output = output
-            .map(|(start, end)| self.rows_text(start, end, MAX_OUTPUT_BYTES))
+            .map(|(start, end)| self.rows_text(start, end, MAX_OUTPUT_BYTES).0)
             .unwrap_or_default();
         if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED {
             self.pending_completed_commands.pop_front();
@@ -2055,14 +2145,17 @@ impl TerminalState {
 
     /// Plain text of the absolute buffer rows `start..end` (scrollback plus
     /// live grid), soft-wrapped rows joined, per-line trailing padding
-    /// trimmed, and the total capped at `max_bytes`.
-    fn rows_text(&self, start: usize, end: usize, max_bytes: usize) -> String {
+    /// trimmed, and the total capped at `max_bytes`. The second return is
+    /// `true` when the cap dropped remaining rows (rows are never cut
+    /// mid-segment, so text is only ever lost whole rows at a time).
+    fn rows_text(&self, start: usize, end: usize, max_bytes: usize) -> (String, bool) {
         let scrollback_len = self.scrollback.len();
         let end = end.min(scrollback_len + self.grid.rows());
         if end <= start {
-            return String::new();
+            return (String::new(), false);
         }
         let mut out = String::new();
+        let mut capped = false;
         for abs_row in start..end {
             let (mut segment, wrapped) = if abs_row < scrollback_len {
                 let line = &self.scrollback[abs_row];
@@ -2091,13 +2184,15 @@ impl TerminalState {
             }
             out.push_str(&segment);
             if out.len() >= max_bytes {
+                // Truncated only if the break actually skips content.
+                capped = abs_row + 1 < end;
                 break;
             }
             if !wrapped && abs_row + 1 < end {
                 out.push('\n');
             }
         }
-        out
+        (out, capped)
     }
 
     /// Scroll so the closest prompt above the current view lands at the top
@@ -5904,6 +5999,220 @@ mod tests {
     }
 
     #[test]
+    fn osc_133_inside_the_alt_screen_creates_no_zone() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(terminal.is_alt_buffer_active());
+        // A full lifecycle emitted while a full-screen app owns the grid is
+        // dropped entirely (ember's semantic): no zone, no agent record.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07make\r\n");
+        terminal.process_input(b"\x1b]133;C\x07building\r\n");
+        terminal.process_input(b"\x1b]133;D;1\x07");
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
+        assert!(!terminal.is_command_running());
+
+        // Back on the primary screen, a fresh lifecycle records normally.
+        terminal.process_input(b"\x1b[?1049l");
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(b"\x1b]133;C\x07hi\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+        assert_eq!(
+            terminal.command_zones[0].command.as_deref(),
+            Some("echo hi")
+        );
+        assert_eq!(terminal.command_zones[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn osc_133_zone_survives_a_mid_lifecycle_alt_screen_detour() {
+        // The guard's promise: a zone opened on the primary screen keeps its
+        // pending ZoneState across an alt-screen detour (vim mid-command) and
+        // finalizes normally when `D` arrives back on the primary screen.
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07vim notes\r\n");
+        terminal.process_input(b"\x1b]133;C\x07");
+        assert!(terminal.is_command_running());
+
+        // The app takes over the alt screen and paints freely; none of it
+        // may disturb the pending primary-screen zone.
+        terminal.process_input(b"\x1b[?1049h");
+        assert!(terminal.is_alt_buffer_active());
+        terminal.process_input(b"~ full screen ui\r\nmore ui\r\n");
+
+        terminal.process_input(b"\x1b[?1049l");
+        assert!(!terminal.is_alt_buffer_active());
+        terminal.process_input(b"\x1b]133;D;0\x07");
+
+        assert_eq!(terminal.command_zones.len(), 1);
+        let zone = &terminal.command_zones[0];
+        assert_eq!(zone.command.as_deref(), Some("vim notes"));
+        assert_eq!(zone.exit_code, Some(0));
+        // Rows were all captured on the primary screen: prompt row 0,
+        // command row 0 (typed on the prompt line), output from row 1, and
+        // the closing row wherever the primary cursor was restored to.
+        assert_eq!(zone.prompt_start, 0);
+        assert_eq!(zone.command_start, Some(0));
+        assert_eq!(zone.output_start, Some(1));
+        assert!(zone.output_end.is_some());
+        assert!(zone.output_end >= zone.output_start);
+        assert!(!terminal.is_command_running());
+    }
+
+    #[test]
+    fn osc_133_d_during_alt_screen_is_dropped_and_the_next_prompt_starts_clean() {
+        // Accepted degradation, documented: a `D` that arrives WHILE the alt
+        // screen is active is dropped, so that zone is lost — but nothing is
+        // corrupted, and the next primary-screen lifecycle records cleanly.
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07vim notes\r\n");
+        terminal.process_input(b"\x1b]133;C\x07");
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b]133;D;1\x07"); // dropped: alt is active
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        // Back on the primary screen, the next `A` resets every per-command
+        // field; the lost zone must not resurface as a phantom.
+        terminal.process_input(b"\x1b[?1049l");
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(b"\x1b]133;C\x07hi\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+        let zone = &terminal.command_zones[0];
+        assert_eq!(zone.command.as_deref(), Some("echo hi"));
+        assert_eq!(zone.exit_code, Some(0));
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "echo hi");
+        assert!(!terminal.is_command_running());
+    }
+
+    #[test]
+    fn osc_133_shell_reported_duration_beats_local_timing() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07make\r\n");
+        terminal.process_input(b"\x1b]133;C\x07building\r\n");
+        terminal.process_input(b"\x1b]133;D;0;duration_ms=4200\x07");
+        assert_eq!(terminal.command_zones[0].duration_ms, Some(4_200));
+        assert_eq!(
+            terminal.take_completed_commands()[0].duration_ms,
+            Some(4_200)
+        );
+
+        // Even without a `C` (no locally observed execution phase), an
+        // explicit shell-measured duration is trusted.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;D;exit=0;duration=7\x07");
+        assert_eq!(terminal.command_zones[1].duration_ms, Some(7));
+
+        // Local timing remains the fallback when no param arrives.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert!(terminal.command_zones[2].duration_ms.is_some());
+    }
+
+    #[test]
+    fn osc_133_cmd_truncated_param_marks_the_zone() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C;cmd_truncated=1\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert!(terminal.command_zones[0].command_truncated);
+
+        // The flag does not leak into the next lifecycle, and only truthy
+        // spellings set it.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C;cmd_truncated=0\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert!(!terminal.command_zones[1].command_truncated);
+
+        // The alternate spelling on `D` is honored too.
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0;command_truncated=true\x07");
+        assert!(terminal.command_zones[2].command_truncated);
+    }
+
+    #[test]
+    fn osc_133_cwd_param_is_decoded_capped_and_control_checked() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C;cwd_url=%2Ftmp%2Fmy%20dir\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(
+            terminal.command_zones[0].cwd.as_deref(),
+            Some("/tmp/my dir")
+        );
+
+        // A control character in the decoded value rejects the whole param
+        // (falling back to the OSC 7 cwd — none here).
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C;cwd=%2Ftmp%0Aevil\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones[1].cwd, None);
+
+        // An over-cap (16 KiB) value is rejected rather than half-decoded.
+        let oversized = format!("C;cwd={}", "a".repeat(16 * 1024 + 1));
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.handle_osc_133(&oversized);
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones[2].cwd, None);
+
+        // Without any OSC 133 cwd param, the OSC 7 cwd fills in.
+        terminal.process_input(b"\x1b]7;file://localhost/srv\x07");
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones[3].cwd.as_deref(), Some("/srv"));
+
+        // An OSC 7 path smuggling a control character (OSC 7 itself only
+        // rejects NUL) is refused at zone finalization: every zone cwd is
+        // control-free, whatever its source.
+        terminal.process_input(b"\x1b]7;file://localhost/tmp%0Aevil\x07");
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;B\x07ls\r\n");
+        terminal.process_input(b"\x1b]133;C\x07f\r\n");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones[4].cwd, None);
+    }
+
+    #[test]
+    fn rows_text_flags_only_real_row_dropping_truncation() {
+        let mut terminal = super::TerminalState::new(10, 4);
+        terminal.process_input(b"aaaa\r\nbbbb\r\ncccc\r\n");
+        // A cap that cannot hold every row drops whole rows and says so.
+        let (text, capped) = terminal.rows_text(0, 3, 4);
+        assert_eq!(text, "aaaa");
+        assert!(capped);
+        // A roomy cap is not truncation…
+        let (text, capped) = terminal.rows_text(0, 3, 1024);
+        assert_eq!(text, "aaaa\nbbbb\ncccc");
+        assert!(!capped);
+        // …and neither is a cap reached exactly on the final row.
+        let (text, capped) = terminal.rows_text(0, 3, 14);
+        assert_eq!(text, "aaaa\nbbbb\ncccc");
+        assert!(!capped);
+    }
+
+    #[test]
     fn agent_prompt_requires_idle_fresh_and_empty_osc_133_input() {
         use super::AgentPromptStatus;
 
@@ -7532,6 +7841,13 @@ mod tests {
             Some("out\nout\nout")
         );
         assert_eq!(terminal.zone_output_text(999), None);
+        // The capped variant reports the same text plus an (unset here)
+        // truncation flag; the flag's mechanics are pinned on `rows_text`.
+        assert_eq!(
+            terminal.zone_output_text_capped(first_id),
+            Some(("out\nout\nout".to_string(), false))
+        );
+        assert_eq!(terminal.zone_output_text_capped(999), None);
     }
 
     #[test]

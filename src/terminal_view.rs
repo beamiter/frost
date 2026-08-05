@@ -196,6 +196,9 @@ pub struct TermWidget<'a, Message> {
     /// Per visible row block chrome (stripes, separators, badges), aligned
     /// with the grid rows exactly like `selection`. Empty = no block mode.
     blocks: Vec<BlockPaintRow>,
+    /// Scrollbar-track fractions (0 = buffer top) of failed blocks; each gets
+    /// a small red marker on the track. Empty = no block mode / no failures.
+    block_markers: Vec<f32>,
     /// Search matches in visible-grid coordinates (line = grid row index).
     search_matches: Vec<SearchMatch>,
     /// Identity `(line, col_start)` of the active match, highlighted distinctly.
@@ -271,6 +274,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             scroll_offset,
             scrollback_len,
             blocks: Vec::new(),
+            block_markers: Vec::new(),
             search_matches: Vec::new(),
             current_match: None,
             shift: false,
@@ -370,6 +374,13 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// Supply per-visible-row block chrome (empty disables block painting).
     pub fn blocks(mut self, blocks: Vec<BlockPaintRow>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    /// Supply failed-block positions as fractions along the scrollbar track
+    /// (block mode); empty draws no markers.
+    pub fn block_markers(mut self, markers: Vec<f32>) -> Self {
+        self.block_markers = markers;
         self
     }
 
@@ -1528,6 +1539,29 @@ where
                 },
                 Background::Color(thumb),
             );
+            // Failed-block markers (block mode): a short stripe at each
+            // failed zone's exact position in the buffer, the same red as
+            // its gutter stripe. Painted after the thumb so a failure under
+            // the thumb stays visible.
+            if !self.block_markers.is_empty() {
+                const MARKER_HEIGHT: f32 = 3.0;
+                let red = self.theme.ansi_color(1);
+                // Family formula (ember): the fraction spans the track MINUS
+                // the marker height, so fraction 1.0 puts the marker's bottom
+                // edge exactly at the track's bottom instead of overshooting.
+                let span = (track_h - MARKER_HEIGHT).max(0.0);
+                for &fraction in &self.block_markers {
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x: sb_x,
+                            y: track_top + fraction.clamp(0.0, 1.0) * span,
+                            width: SCROLLBAR_WIDTH,
+                            height: MARKER_HEIGHT,
+                        }),
+                        Background::Color(Color { a: 0.9, ..red }),
+                    );
+                }
+            }
         }
     }
 

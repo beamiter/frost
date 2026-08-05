@@ -3457,6 +3457,10 @@ impl Frost {
             C::BlockCopyCommand => self.block_copy_command_task(),
             C::BlockCopyOutput => self.block_copy_output_task(),
             C::BlockRecallCommand => self.block_recall_command_task(),
+            C::BlockSelectPrev => self.block_select_step(true),
+            C::BlockSelectNext => self.block_select_step(false),
+            C::BlockCopyBlock => self.block_copy_block_task(),
+            C::BlockCopyMarkdown => self.block_copy_markdown_task(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(cmd, C::TerminalPromptPrev) {
@@ -4724,6 +4728,10 @@ impl Frost {
             PaletteAction::BlockCopyCommand => self.block_copy_command_task(),
             PaletteAction::BlockCopyOutput => self.block_copy_output_task(),
             PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
+            PaletteAction::BlockSelectPrev => self.block_select_step(true),
+            PaletteAction::BlockSelectNext => self.block_select_step(false),
+            PaletteAction::BlockCopyBlock => self.block_copy_block_task(),
+            PaletteAction::BlockCopyMarkdown => self.block_copy_markdown_task(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
@@ -4810,22 +4818,22 @@ impl Frost {
         self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
     }
 
-    /// The command line a block copy/recall action should act on. With a
-    /// block selected, only THAT block may supply it: a vanished zone clears
-    /// the selection, a command-less zone toasts — never a silent
-    /// substitution of a different block. Only when no block is selected does
-    /// this fall back to the newest completed block with a command. `None`
-    /// means "do nothing" and a toast was already pushed (`verb` names the
-    /// action in the no-fallback message).
-    fn block_action_command(&mut self, verb: &str) -> Option<String> {
+    /// The command line a block copy/recall action should act on, paired with
+    /// its shell-reported `cmd_truncated` flag. With a block selected, only
+    /// THAT block may supply it: a vanished zone clears the selection, a
+    /// command-less zone toasts — never a silent substitution of a different
+    /// block. Only when no block is selected does this fall back to the
+    /// newest completed block with a command. `None` means "do nothing" and a
+    /// toast was already pushed (`verb` names the action in the no-fallback
+    /// message).
+    fn block_action_command(&mut self, verb: &str) -> Option<(String, bool)> {
         let sess = self.sessions.get(self.active)?;
         let Some(id) = sess.selected_block else {
-            let fallback = sess
-                .terminal
-                .command_zones
-                .iter()
-                .rev()
-                .find_map(|zone| zone.command.clone());
+            let fallback = sess.terminal.command_zones.iter().rev().find_map(|zone| {
+                zone.command
+                    .clone()
+                    .map(|command| (command, zone.command_truncated))
+            });
             if fallback.is_none() {
                 self.push_toast(
                     format!("No block command to {verb} (needs OSC 133 shell integration)"),
@@ -4838,7 +4846,10 @@ impl Frost {
             self.clear_stale_block_selection();
             return None;
         };
-        let command = zone.command.clone();
+        let command = zone
+            .command
+            .clone()
+            .map(|command| (command, zone.command_truncated));
         if command.is_none() {
             self.push_toast("Selected block has no command".to_string(), ToastKind::Info);
         }
@@ -4846,10 +4857,11 @@ impl Frost {
     }
 
     /// Copy the selected block's command line to the clipboard (the newest
-    /// block's only when nothing is selected).
+    /// block's only when nothing is selected). A truncated command may still
+    /// be copied — only re-running it is unsafe.
     fn block_copy_command_task(&mut self) -> Task<Message> {
         match self.block_action_command("copy") {
-            Some(text) => {
+            Some((text, _)) => {
                 self.push_toast("Copied block command", ToastKind::Success);
                 iced::clipboard::write(text)
             }
@@ -4918,9 +4930,139 @@ impl Frost {
             return Task::none();
         }
         match self.block_action_command("recall") {
-            Some(command) => self.recall_into_active_pane(command),
+            // A command line the shell reported as truncated is not the
+            // command that ran; typing it back could execute something else.
+            Some((_, true)) => {
+                self.push_toast(
+                    "Command not recalled: the shell truncated it".to_string(),
+                    ToastKind::Warning,
+                );
+                Task::none()
+            }
+            Some((command, false)) => self.recall_into_active_pane(command),
             None => Task::none(),
         }
+    }
+
+    /// Move the block selection to a neighbouring completed zone (`older` =
+    /// toward the top) and reveal its first row, exactly the row
+    /// [`Self::block_jump_first_failed`] scrolls to. With no selection — or a
+    /// selection whose zone was trimmed away — both directions reset to the
+    /// newest completed zone; at either end the step is a silent no-op.
+    fn block_select_step(&mut self, older: bool) -> Task<Message> {
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let ids: Vec<u64> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        let current = sess.selected_block.filter(|id| ids.contains(id));
+        let Some(target) = block_mode::select_neighbor(&ids, current, older) else {
+            return Task::none();
+        };
+        sess.selected_block = Some(target);
+        if let Some(row) = sess
+            .terminal
+            .zone_by_id(target)
+            .map(|zone| zone.prompt_start)
+        {
+            sess.terminal.reveal_buffer_row(row);
+        }
+        sess.refresh();
+        Task::none()
+    }
+
+    /// The completed zone a whole-block action (copy block / copy Markdown)
+    /// should act on: the selected zone — a vanished selection toasts and
+    /// cancels (never a silent substitution) — else the newest completed
+    /// zone. `None` means a toast was already pushed.
+    fn block_target_zone_id(&mut self, verb: &str) -> Option<u64> {
+        let sess = self.sessions.get(self.active)?;
+        match sess.selected_block {
+            Some(id) => {
+                if sess.terminal.zone_by_id(id).is_none() {
+                    self.clear_stale_block_selection();
+                    return None;
+                }
+                Some(id)
+            }
+            None => {
+                let newest = sess.terminal.command_zones.back().map(|zone| zone.id);
+                if newest.is_none() {
+                    self.push_toast(
+                        format!("No block to {verb} (needs OSC 133 shell integration)"),
+                        ToastKind::Info,
+                    );
+                }
+                newest
+            }
+        }
+    }
+
+    /// Copy the selected block (newest when nothing is selected) as plain
+    /// text via [`block_mode::block_copy_text`] (anvil's clipboard rule):
+    /// command + newline + output, a blank output copying the bare command
+    /// with no trailing newline, and background zones (no command) copying
+    /// their output alone.
+    fn block_copy_block_task(&mut self) -> Task<Message> {
+        let Some(id) = self.block_target_zone_id("copy") else {
+            return Task::none();
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            return Task::none();
+        };
+        let output = sess.terminal.zone_output_text(id);
+        let Some(text) = block_mode::block_copy_text(zone.command.as_deref(), output.as_deref())
+        else {
+            self.push_toast("Block is empty".to_string(), ToastKind::Info);
+            return Task::none();
+        };
+        self.push_toast("Copied block", ToastKind::Success);
+        iced::clipboard::write(text)
+    }
+
+    /// Copy the selected block (newest when nothing is selected) as the
+    /// family's shared Markdown snippet (`block_mode::markdown_export`).
+    fn block_copy_markdown_task(&mut self) -> Task<Message> {
+        let Some(id) = self.block_target_zone_id("copy") else {
+            return Task::none();
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            return Task::none();
+        };
+        let (output, output_truncated) = sess.terminal.zone_output_text_capped(id).unzip();
+        let output = output.unwrap_or_default();
+        // Local offset resolved AT the finish instant (not "now"), so a
+        // block that finished across a DST change renders its own offset.
+        let tz_offset_secs = block_mode::local_offset_secs(zone.finished_at_ms.map_or_else(
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs() as i64)
+            },
+            |ms| (ms / 1000) as i64,
+        ));
+        let markdown = block_mode::markdown_export(&block_mode::MarkdownBlock {
+            command: zone.command.as_deref(),
+            output: &output,
+            output_truncated: output_truncated.unwrap_or(false),
+            exit_code: zone.exit_code,
+            duration_ms: zone.duration_ms,
+            finished_at_ms: zone.finished_at_ms,
+            tz_offset_secs,
+            cwd: zone.cwd.as_deref(),
+        });
+        self.push_toast("Copied block as Markdown", ToastKind::Success);
+        iced::clipboard::write(markdown)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -7587,19 +7729,30 @@ impl Frost {
                 let row = &mut paint[zone_start - start];
                 row.separator = true;
                 row.outline_top = selected;
-                if let Some(badge) = block_mode::badge_text(outcome, zone.duration_ms) {
+                if let Some(plain) = block_mode::badge_text(outcome, zone.duration_ms) {
+                    // The selected block's badge appends its LOCAL finish
+                    // time. Two-stage fit (ember's rule): if the suffixed
+                    // badge no longer fits, fall back to the plain badge
+                    // before skipping the badge entirely.
+                    let suffixed = zone.finished_at_ms.filter(|_| selected).map(|ms| {
+                        let offset = block_mode::local_offset_secs((ms / 1000) as i64);
+                        format!("{plain} · {}", block_mode::clock_at_offset(ms, offset))
+                    });
                     // The badge also spans its inset from the scrollbar gutter
                     // and its background padding; all of it must be blank.
                     let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0)
                         / self.metrics.cell_w.max(1.0))
                     .ceil() as usize;
-                    let needed = badge.chars().count() + inset;
                     let chars: Vec<char> = sess.grid[zone_start - start]
                         .iter()
                         .map(|cell| cell.character)
                         .collect();
-                    if block_mode::badge_fits(&chars, needed) {
-                        row.badge = Some((badge, color));
+                    for badge in suffixed.into_iter().chain(std::iter::once(plain)) {
+                        let needed = badge.chars().count() + inset;
+                        if block_mode::badge_fits(&chars, needed) {
+                            row.badge = Some((badge, color));
+                            break;
+                        }
                     }
                 }
             }
@@ -7623,6 +7776,31 @@ impl Frost {
             }
         }
         paint
+    }
+
+    /// Scrollbar-track fractions of each FAILED zone's first row, for the red
+    /// failure markers painted along the scrollbar. Same gates as
+    /// [`Self::block_paint_rows`] (feature off / alt screen → empty), and the
+    /// same red as the Failed stripe. The 256-zone cap keeps this scan
+    /// trivial.
+    fn block_marker_fractions(&self, sess: &Session) -> Vec<f32> {
+        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            return Vec::new();
+        }
+        let terminal = &sess.terminal;
+        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let failed: Vec<usize> = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| {
+                matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                )
+            })
+            .map(|zone| zone.prompt_start)
+            .collect();
+        block_mode::marker_fractions(&failed, total)
     }
 
     /// Build the terminal widget for the pane showing `sess_idx`.
@@ -7701,6 +7879,7 @@ impl Frost {
         ))
         .search(search_matches, current)
         .blocks(blocks)
+        .block_markers(self.block_marker_fractions(sess))
         .app_mouse(sess.terminal.is_mouse_enabled())
         .links(links)
         .dynamic_palette(&sess.terminal.dynamic_palette)
