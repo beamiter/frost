@@ -18,6 +18,19 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Whether a cell is styled the way shells paint an inline suggestion.
+///
+/// There is no protocol for "this text is a preview", only a convention, and
+/// the convention is a muted grey: `jsh` prints its suggestion in ANSI colour 8
+/// (`ESC[38;5;8m`), zsh-autosuggestions defaults to the same colour, and `dim`
+/// (SGR 2) is the other spelling. Being wrong in the permissive direction
+/// accepts text the user never typed, so a cell that merely *might* be a
+/// suggestion is treated as one — the cost is that a click cannot place the
+/// cursor inside genuinely grey text, which is a click that does nothing.
+fn is_inline_suggestion_cell(cell: &TerminalCell) -> bool {
+    cell.flags.dim() || matches!(cell.foreground, Color::Indexed(8) | Color::BrightBlack)
+}
+
 fn is_whitespace_char(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\0'
 }
@@ -5184,18 +5197,51 @@ impl TerminalState {
             last += 1;
         }
 
-        let mut end = click_cursor::Cell::new(first as i64, 0);
-        'scan: for row in (first..=last).rev() {
-            for col in (0..cols).rev() {
-                let cell = self.grid.get(row, col);
-                // A wide character's continuation cell holds a blank but is
-                // still occupied, so trailing CJK must not be trimmed away.
-                if cell.flags.wide_continuation()
-                    || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
-                {
-                    end = click_cursor::Cell::new(row as i64, col as i64 + 1);
-                    break 'scan;
+        let occupied = |row: usize, col: usize| {
+            let cell = self.grid.get(row, col);
+            // A wide character's continuation cell holds a blank but is
+            // still occupied, so trailing CJK must not be trimmed away.
+            cell.flags.wide_continuation() || !matches!(cell.character, ' ' | '\0' | '\u{a0}')
+        };
+        // One past the last occupied cell, looking only at columns before
+        // `col_bound` on `row_bound` itself.
+        let scan_back = |row_bound: usize, col_bound: usize| {
+            let mut end = click_cursor::Cell::new(first as i64, 0);
+            'scan: for row in (first..=row_bound).rev() {
+                let cols_here = if row == row_bound { col_bound } else { cols };
+                for col in (0..cols_here).rev() {
+                    if occupied(row, col) {
+                        end = click_cursor::Cell::new(row as i64, col as i64 + 1);
+                        break 'scan;
+                    }
                 }
+            }
+            end
+        };
+        let mut end = scan_back(last, cols);
+
+        // A right-aligned decoration — jsh and fish paint the previous
+        // command's duration flush with the right edge of the input row — is
+        // on the row but not in the buffer. Its shape gives it away: a
+        // trailing run that reaches the right edge, parted from everything
+        // before it by a wide blank gap, entirely right of the cursor. Clip
+        // it, or a click in the gap overshoots the buffer end — and past-end
+        // `Right`s are how jsh accepts an inline suggestion, even one that is
+        // not on screen at the moment.
+        if end.col + 1 >= cols as i64 && end.col > 0 {
+            let end_row = end.row as usize;
+            let mut run_start = end.col as usize;
+            while run_start > 0 && occupied(end_row, run_start - 1) {
+                run_start -= 1;
+            }
+            let mut gap_start = run_start;
+            while gap_start > 0 && !occupied(end_row, gap_start - 1) {
+                gap_start -= 1;
+            }
+            if run_start - gap_start >= 3
+                && (end_row as i64, run_start as i64) > (cursor_row as i64, self.cursor_col as i64)
+            {
+                end = scan_back(end_row, gap_start);
             }
         }
 
@@ -5207,10 +5253,49 @@ impl TerminalState {
             end = cursor;
         }
 
+        // A fish-style shell paints its inline suggestion past the cursor and
+        // then parks the cursor back at the end of what was typed. Those cells
+        // are a preview, not buffer — the backwards scan above cannot tell them
+        // from typed text, and every `Right` spent on them is the shell
+        // *accepting* the suggestion. Cut the span at the first one.
+        if let Some(ghost) = self.inline_suggestion_start(cursor, end) {
+            end = ghost;
+        }
+
         Some(click_cursor::InputSpan {
             start: click_cursor::Cell::new(first as i64, 0),
             end,
         })
+    }
+
+    /// Where inline-suggestion ("ghost") text begins between `from` and `end`,
+    /// if it begins at all.
+    ///
+    /// The scan runs forward from the cursor because that is where a suggestion
+    /// starts: shells only offer one when the caret is at the end of the
+    /// buffer, so the first suggestion-styled cell at or after the cursor is
+    /// where the real input stops.
+    fn inline_suggestion_start(
+        &self,
+        from: click_cursor::Cell,
+        end: click_cursor::Cell,
+    ) -> Option<click_cursor::Cell> {
+        let rows = self.grid.rows();
+        let cols = self.grid.cols();
+        let mut row = from.row.max(0) as usize;
+        let mut col = from.col.max(0) as usize;
+        while row < rows && (row as i64, col as i64) < (end.row, end.col) {
+            if col >= cols {
+                row += 1;
+                col = 0;
+                continue;
+            }
+            if is_inline_suggestion_cell(self.grid.get(row, col)) {
+                return Some(click_cursor::Cell::new(row as i64, col as i64));
+            }
+            col += 1;
+        }
+        None
     }
 
     /// Arrow-key bytes that walk the shell's line editor to a clicked cell, or
@@ -8326,6 +8411,116 @@ mod tests {
         terminal.process_input(b"\x1b[D\x1b[D\x1b[D");
         assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 6));
         assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(3));
+    }
+
+    /// A prompt with `typed` at it and `ghost` painted past the cursor the way
+    /// a fish-style shell previews a completion.
+    ///
+    /// The byte shape is jsh's own, captured from the running shell: the
+    /// suggestion in ANSI colour 8, then the cursor parked back at the end of
+    /// the typed text with CHA.
+    fn terminal_with_suggestion(
+        cols: usize,
+        rows: usize,
+        typed: &str,
+        ghost: &str,
+    ) -> super::TerminalState {
+        let mut terminal = terminal_at_prompt(cols, rows, typed);
+        let col = terminal.cursor_col;
+        terminal.process_input(format!("\x1b[38;5;8m{ghost}\x1b[0m\x1b[{}G", col + 1).as_bytes());
+        terminal
+    }
+
+    #[test]
+    fn an_inline_suggestion_is_not_part_of_the_input() {
+        // The whole reason the span has to end where the *buffer* ends: those
+        // grey cells are a preview, and every `Right` spent on them is jsh
+        // accepting a command the user never typed.
+        let terminal = terminal_with_suggestion(32, 4, "echo he", "llo world");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 9));
+
+        assert!(
+            terminal.click_cursor_move(0, 30, true).is_empty(),
+            "clicking the empty space past the suggestion must not accept it"
+        );
+        assert!(
+            terminal.click_cursor_move(0, 12, true).is_empty(),
+            "nor may clicking the suggestion itself, which is not a place to edit"
+        );
+        assert_eq!(
+            terminal.click_cursor_move(0, 5, true),
+            b"\x1b[D".repeat(4),
+            "moving back into what was really typed still works"
+        );
+    }
+
+    /// A prompt with `typed` at it, a right-aligned decoration painted flush
+    /// with the terminal's right edge (the way jsh and fish show the previous
+    /// command's duration), and the cursor back at the end of the typed text.
+    fn terminal_with_rprompt(
+        cols: usize,
+        rows: usize,
+        typed: &str,
+        rprompt: &str,
+    ) -> super::TerminalState {
+        let mut terminal = terminal_at_prompt(cols, rows, typed);
+        let col = terminal.cursor_col;
+        terminal.process_input(
+            format!(
+                "\x1b[{}G\x1b[33m{rprompt}\x1b[0m\x1b[{}G",
+                cols - rprompt.chars().count() + 1,
+                col + 1
+            )
+            .as_bytes(),
+        );
+        terminal
+    }
+
+    #[test]
+    fn a_right_aligned_duration_is_not_part_of_the_input() {
+        // jsh keeps its last suggestion even while the cursor sits mid-buffer
+        // — it just stops drawing it. Arrows sent past the buffer end would
+        // accept that invisible text, so the span must stop at the typed
+        // command, not at the duration display parked against the right edge.
+        let mut terminal = terminal_with_rprompt(32, 4, "echo hello", "2.3s");
+        terminal.process_input(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 7));
+
+        assert_eq!(
+            terminal.click_cursor_move(0, 30, true),
+            b"\x1b[C".repeat(5),
+            "a click on the duration walks to the end of the command and stops"
+        );
+        assert_eq!(
+            terminal.click_cursor_move(0, 20, true),
+            b"\x1b[C".repeat(5),
+            "so does a click in the gap before it"
+        );
+    }
+
+    #[test]
+    fn an_interior_gap_away_from_the_edge_stays_reachable() {
+        // The decoration rule must not eat genuine input: a wide run of
+        // spaces inside a command whose tail stops short of the right edge is
+        // buffer.
+        let mut terminal = terminal_at_prompt(40, 4, "echo 'a          b'");
+        terminal.process_input(b"\x1b[D".repeat(15).as_slice());
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 6));
+        assert_eq!(
+            terminal.click_cursor_move(0, 38, true),
+            b"\x1b[C".repeat(15),
+            "clicking past the command still reaches its real end"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_past_the_cursor_is_still_reachable() {
+        // The mirror image: text right of the cursor that is *not* suggestion-
+        // styled belongs to the buffer, so a click must still travel to it.
+        let mut terminal = terminal_at_prompt(32, 4, "echo hello");
+        terminal.process_input(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 7));
+        assert_eq!(terminal.click_cursor_move(0, 30, true), b"\x1b[C".repeat(5));
     }
 
     #[test]
