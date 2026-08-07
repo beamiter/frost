@@ -99,6 +99,17 @@ const BLOCK_STRIPE_SELECTED_WIDTH: f32 = 5.0;
 /// the stripe unclickable there.
 const BLOCK_GUTTER_MIN_HIT_WIDTH: f32 = 8.0;
 
+fn is_block_gutter_press(
+    button: MouseButton,
+    has_blocks: bool,
+    app_mouse: bool,
+    shift: bool,
+    press_x: f32,
+    gutter_right: f32,
+) -> bool {
+    button == MouseButton::Left && has_blocks && (shift || !app_mouse) && press_x < gutter_right
+}
+
 /// Block-mode chrome for one visible grid row, precomputed by the app the
 /// same way the per-row `selection` spans are. `Default` (all off) rows cost
 /// nothing to draw.
@@ -556,9 +567,31 @@ fn solid_quad(bounds: Rectangle) -> Quad {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        glyph_shaping, should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
-        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
+        glyph_shaping, is_block_gutter_press, should_use_cjk_fallback_font,
+        should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
+        should_use_symbol_fallback_font, terminal_glyph_font, MouseButton,
     };
+
+    #[test]
+    fn block_gutter_press_respects_application_mouse_ownership() {
+        let inside = |button, has_blocks, app_mouse, shift| {
+            is_block_gutter_press(button, has_blocks, app_mouse, shift, 7.0, 8.0)
+        };
+
+        assert!(inside(MouseButton::Left, true, false, false));
+        assert!(!inside(MouseButton::Left, true, true, false));
+        assert!(inside(MouseButton::Left, true, true, true));
+        assert!(!inside(MouseButton::Middle, true, false, false));
+        assert!(!inside(MouseButton::Left, false, false, false));
+        assert!(!is_block_gutter_press(
+            MouseButton::Left,
+            true,
+            false,
+            false,
+            8.0,
+            8.0,
+        ));
+    }
 
     #[test]
     fn non_ascii_glyphs_use_advanced_shaping_for_font_fallback() {
@@ -787,10 +820,14 @@ where
                 // gutter presses are consumed for block selection and arm no
                 // drag pipeline, so they must never swallow a press that the
                 // app or text selection needs.
-                let gutter = button == MouseButton::Left
-                    && !self.blocks.is_empty()
-                    && !(self.app_mouse && !shift)
-                    && pos.x < bounds.x + self.metrics.padding.max(BLOCK_GUTTER_MIN_HIT_WIDTH);
+                let gutter = is_block_gutter_press(
+                    button,
+                    !self.blocks.is_empty(),
+                    self.app_mouse,
+                    shift,
+                    pos.x,
+                    bounds.x + self.metrics.padding.max(BLOCK_GUTTER_MIN_HIT_WIDTH),
+                );
                 if button == MouseButton::Left && !gutter {
                     state.dragging = true;
                     let now = Instant::now();
