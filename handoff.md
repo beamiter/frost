@@ -32,6 +32,14 @@ strict policy.
   runtime launcher paths inside staged packages. A temporary-HOME dry-run suite
   covers default reinstall/uninstall, explicit overrides, and staged paths, and
   CI checks the scripts with Bash and ShellCheck.
+- Completed block outcomes now delegate to
+  `jterm_core::block_contract::classify_completed` using the command text already
+  resolved and stored on each completed zone. Frost keeps its renderer enum and
+  serialized zone shape, while failed navigation, stepping, paint, and scrollbar
+  markers share the same four-way result. A commandless zone with a raw non-zero
+  status remains background, and a command without a reported status remains
+  unknown. `jterm_core` is pinned to
+  `9e79a5bf0d905575863def4d0e77f74a1f533638` with jagent unchanged transitively.
 
 ## Remaining boundaries
 

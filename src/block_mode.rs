@@ -19,14 +19,13 @@ pub enum BlockOutcome {
 /// Classify a completed zone. Background (no/blank command) trumps the exit
 /// code; otherwise only an explicit `Some(0)` may read as success.
 pub fn classify(command: Option<&str>, exit_code: Option<i32>) -> BlockOutcome {
-    match command {
-        None => BlockOutcome::Background,
-        Some(command) if command.trim().is_empty() => BlockOutcome::Background,
-        Some(_) => match exit_code {
-            Some(0) => BlockOutcome::Success,
-            Some(code) => BlockOutcome::Failed(code),
-            None => BlockOutcome::Unknown,
-        },
+    use jterm_core::block_contract::CompletedBlockOutcome;
+
+    match jterm_core::block_contract::classify_completed(command, exit_code) {
+        CompletedBlockOutcome::Background => BlockOutcome::Background,
+        CompletedBlockOutcome::Success => BlockOutcome::Success,
+        CompletedBlockOutcome::Failed(code) => BlockOutcome::Failed(code),
+        CompletedBlockOutcome::Unknown => BlockOutcome::Unknown,
     }
 }
 
@@ -532,6 +531,11 @@ mod tests {
         assert_eq!(classify(None, Some(0)), BlockOutcome::Background);
         assert_eq!(classify(Some(""), Some(1)), BlockOutcome::Background);
         assert_eq!(classify(Some("   "), None), BlockOutcome::Background);
+        assert_eq!(
+            classify(None, Some(127)),
+            BlockOutcome::Background,
+            "a raw non-zero status cannot turn background output into a failure"
+        );
     }
 
     #[test]

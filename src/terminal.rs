@@ -2226,9 +2226,12 @@ impl TerminalState {
     /// The OLDEST completed zone that failed (exit reported and nonzero) —
     /// "jump to first failed" starts at the earliest failure still in scope.
     pub fn first_failed_zone(&self) -> Option<&CommandZone> {
-        self.command_zones
-            .iter()
-            .find(|zone| zone.exit_code.is_some_and(|code| code != 0))
+        self.command_zones.iter().find(|zone| {
+            matches!(
+                crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                crate::block_mode::BlockOutcome::Failed(_)
+            )
+        })
     }
 
     /// Absolute prompt row of a command currently executing (`C` seen, `D`
@@ -8095,6 +8098,9 @@ mod tests {
     #[test]
     fn first_failed_zone_picks_the_oldest_failure() {
         let mut terminal = TerminalState::new(40, 8);
+        // A D mark without a C mark is background output even if it carries a
+        // raw non-zero status; failed navigation must skip it.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;D;9\x07");
         for exit in ["0", "2", "130", "0"] {
             terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n");
             terminal
@@ -8102,7 +8108,7 @@ mod tests {
         }
         let failed = terminal.first_failed_zone().expect("two failures exist");
         assert_eq!(failed.exit_code, Some(2));
-        assert_eq!(failed.id, 1);
+        assert_eq!(failed.id, 2);
     }
 
     #[test]

@@ -1032,15 +1032,15 @@ enum Message {
     JshInstall,
     /// Close the remote host picker overlay.
     RemotePickerClose,
-    /// Open the picked [[remote_hosts]] entry in a new session.
+    /// Open the picked `[[remote_hosts]]` entry in a new session.
     RemotePickerConnect(usize),
-    /// Per-field edits of the indexed [[remote_hosts]] entry from Settings.
+    /// Per-field edits of the indexed `[[remote_hosts]]` entry from Settings.
     RemoteHostName(usize, String),
     RemoteHostHost(usize, String),
     RemoteHostUser(usize, String),
     RemoteHostDocker(usize, bool),
     RemoteHostDeploy(usize, String),
-    /// Append a template [[remote_hosts]] entry for in-place editing.
+    /// Append a template `[[remote_hosts]]` entry for in-place editing.
     RemoteHostAdd,
     RemoteHostRemove(usize),
     /// Hide the jsh notice until the next launch.
