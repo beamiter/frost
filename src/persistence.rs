@@ -511,10 +511,238 @@ pub fn write_snapshot_atomic(path: &Path, contents: &[u8], max_bytes: u64) -> io
     atomic_replace_with_parent(path, contents, &directory)
 }
 
-fn open_snapshot_parent(parent: &Path) -> io::Result<fs::File> {
+/// Create one new owner-private file without ever replacing an existing path.
+///
+/// Session exports use timestamped names and may be requested concurrently by
+/// multiple frost windows. Bytes first land in an owner-only staging inode in
+/// the destination directory; only after `fsync` does an atomic, no-replace
+/// hard-link publish the final name. A crash can therefore leave a hidden
+/// staging file, but never a visible truncated export. On Unix every staging,
+/// publish, and cleanup operation is relative to the already validated parent
+/// descriptor, so replacing the parent pathname cannot redirect the write.
+pub fn write_new_private_file(path: &Path, contents: &[u8], max_bytes: u64) -> io::Result<()> {
+    if contents.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    if !parent.as_os_str().is_empty() {
+        match fs::symlink_metadata(parent) {
+            Ok(_) => drop(open_snapshot_parent(parent)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                create_private_snapshot_parent(parent)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let directory = open_snapshot_parent(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })?;
+    let destination = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        )
+    })?;
+    publish_new_private_file(&directory, parent, destination, contents)
+}
+
+#[cfg(unix)]
+fn publish_new_private_file(
+    directory: &fs::File,
+    _parent: &Path,
+    destination: &std::ffi::OsStr,
+    contents: &[u8],
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn component(name: &std::ffi::OsStr) -> io::Result<CString> {
+        if name.as_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file name must be one path component",
+            ));
+        }
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file name contains a NUL byte",
+            )
+        })
+    }
+
+    fn unlink_at(directory: &fs::File, name: &CString) -> io::Result<()> {
+        // SAFETY: `directory` remains open for this call and `name` is a
+        // NUL-terminated single path component owned by this function.
+        let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    let destination = component(destination)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // Descriptor-relative preflight avoids rewriting a potentially large
+    // staging file for an ordinary timestamp collision. It is only an
+    // optimization: `linkat` below remains the authoritative atomic check.
+    // SAFETY: the directory fd/name are valid and `metadata` points to enough
+    // writable storage for `fstatat`.
+    let exists = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if exists == 0 {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    let lookup_error = io::Error::last_os_error();
+    if lookup_error.kind() != io::ErrorKind::NotFound {
+        return Err(lookup_error);
+    }
+
+    let mut opened = None;
+    for _ in 0..128 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let staging_name = CString::new(format!(".frost-export.tmp.{}.{}", std::process::id(), id))
+            .expect("generated staging name has no NUL");
+        // SAFETY: the directory fd and CString are valid for the call. The
+        // returned fd is uniquely owned and converted into `File` exactly once.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                staging_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `openat` returned a fresh owned descriptor on success.
+            opened = Some((unsafe { fs::File::from_raw_fd(fd) }, staging_name));
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let (mut staging, staging_name) = opened.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique export staging file",
+        )
+    })?;
+
+    if let Err(error) = staging.write_all(contents).and_then(|_| staging.sync_all()) {
+        drop(staging);
+        let _ = unlink_at(directory, &staging_name);
+        return Err(error);
+    }
+    drop(staging);
+
+    // `linkat` is an atomic no-replace publish: an existing regular file,
+    // symlink, FIFO, or racing peer all produce EEXIST and remain untouched.
+    // SAFETY: both names are valid C strings and both directory fds stay open.
+    let published = unsafe {
+        libc::linkat(
+            directory.as_raw_fd(),
+            staging_name.as_ptr(),
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if published != 0 {
+        let error = io::Error::last_os_error();
+        let _ = unlink_at(directory, &staging_name);
+        return Err(error);
+    }
+
+    let _ = unlink_at(directory, &staging_name);
+    if let Err(error) = directory.sync_all() {
+        // The visible name is complete (it was linked only after the staging
+        // inode's fsync), but the directory entry is not durably committed.
+        // Best-effort rollback keeps an ordinary error from masquerading as a
+        // successful export that merely chose a different collision suffix.
+        let _ = unlink_at(directory, &destination);
+        let _ = directory.sync_all();
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn publish_new_private_file(
+    directory: &fs::File,
+    parent: &Path,
+    destination: &std::ffi::OsStr,
+    contents: &[u8],
+) -> io::Result<()> {
+    let path = parent.join(destination);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let (mut staging, staging_path) = create_unique_temp(&path)?;
+    let mut cleanup = TempFileGuard {
+        path: staging_path.clone(),
+        committed: false,
+    };
+    staging.write_all(contents)?;
+    staging.sync_all()?;
+    drop(staging);
+    fs::hard_link(&staging_path, &path)?;
+    fs::remove_file(&staging_path)?;
+    cleanup.committed = true;
+    directory.sync_all()
+}
+
+/// Create or tighten one application-owned directory to owner-only access.
+/// The final path is opened without following symlinks and must be owned by
+/// the current user; callers should use this only for product-managed paths,
+/// never for a user-selected parent such as `$HOME` itself.
+pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            // This is the one caller allowed to repair an application-owned
+            // directory that is currently too permissive. Open/ownership
+            // checks happen on the descriptor before chmod; ordinary
+            // persistence callers continue to reject writable parents.
+            let directory = open_owned_directory(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+            directory.sync_all()
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_private_snapshot_parent(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_owned_directory(parent: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let directory = fs::OpenOptions::new()
             .read(true)
@@ -534,12 +762,6 @@ fn open_snapshot_parent(parent: &Path) -> io::Result<fs::File> {
                 format!("{} is not owned by the current user", parent.display()),
             ));
         }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} must not be group- or world-writable", parent.display()),
-            ));
-        }
         Ok(directory)
     }
     #[cfg(not(unix))]
@@ -553,6 +775,22 @@ fn open_snapshot_parent(parent: &Path) -> io::Result<fs::File> {
             ))
         }
     }
+}
+
+fn open_snapshot_parent(parent: &Path) -> io::Result<fs::File> {
+    let directory = open_owned_directory(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if directory.metadata()?.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} must not be group- or world-writable", parent.display()),
+            ));
+        }
+    }
+    Ok(directory)
 }
 
 fn create_private_snapshot_parent(parent: &Path) -> io::Result<()> {

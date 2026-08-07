@@ -14,7 +14,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
-- OSC 133 shell 集成：沿命令提示符逐条跳转（`Ctrl+Shift+↑/↓`）、一键复制上一条命令输出（`Ctrl+Shift+G`），历史修剪时命令区保持对齐
+- OSC 133 Block mode：命令按成功/失败绘制条纹与耗时徽标，运行中块实时显示已用时间；支持块选择、失败跳转、复制/回填、单块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
 - 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
@@ -110,6 +110,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 查找替换（选中文本） | `Ctrl+Alt+R`（替换结果进剪贴板或回填提示符，从不改写 scrollback） |
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
+| 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；Enter 定位块） |
 | 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
@@ -124,6 +125,12 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 设置 | `Ctrl+Shift+O` |
 | 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | 窗口透明度增 / 减 | `Ctrl+Alt+=` / `Ctrl+Alt+-`（写回配置 `opacity`，设置面板也有滑块） |
+
+命令面板中的 **Export Session Blocks as Markdown/JSON** 会把当前 pane 仍保留的
+已定型块（最多 256 条，也包括缺失结束标记后由下一提示符收束的记录）写入
+`$XDG_DATA_HOME/frost/exports/`（通常是 `~/.local/share/frost/exports/`）。JSON 和
+Markdown 都会明确标记命令截断、输出已淘汰或未观察到完成；文件按本地时间命名，
+同秒多次导出不覆盖，先私密暂存并原子发布，目录与文件权限分别为 `0700` / `0600`。
 
 快捷键从 `$XDG_CONFIG_HOME/frost/keybindings.toml`（通常是 `~/.config/frost/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
 

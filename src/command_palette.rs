@@ -51,6 +51,8 @@ pub enum PaletteAction {
     BlockSelectNext,
     BlockCopyBlock,
     BlockCopyMarkdown,
+    BlockExportSessionMarkdown,
+    BlockExportSessionJson,
     BlockSearch,
     CommandHistory,
     ClearScreen,
@@ -365,6 +367,18 @@ impl PaletteState {
                 description: "Copy the selected (or latest) block as a Markdown snippet",
                 shortcut: "",
                 action: PaletteAction::BlockCopyMarkdown,
+            },
+            PaletteItem {
+                name: "Export Session Blocks as Markdown",
+                description: "Write retained finalized blocks to a private Markdown file",
+                shortcut: "",
+                action: PaletteAction::BlockExportSessionMarkdown,
+            },
+            PaletteItem {
+                name: "Export Session Blocks as JSON",
+                description: "Write retained finalized blocks to a private JSON file",
+                shortcut: "",
+                action: PaletteAction::BlockExportSessionJson,
             },
             PaletteItem {
                 name: "Search Blocks",

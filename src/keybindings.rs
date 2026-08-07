@@ -62,6 +62,8 @@ pub enum Command {
     BlockSelectNext,
     BlockCopyBlock,
     BlockCopyMarkdown,
+    BlockExportSessionMarkdown,
+    BlockExportSessionJson,
     BlockSearch,
 
     // === 分屏操作 ===
@@ -137,6 +139,10 @@ impl std::fmt::Display for Command {
             Command::BlockSelectNext => write!(f, "block:select_next"),
             Command::BlockCopyBlock => write!(f, "block:copy_block"),
             Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
+            Command::BlockExportSessionMarkdown => {
+                write!(f, "block:export_session_markdown")
+            }
+            Command::BlockExportSessionJson => write!(f, "block:export_session_json"),
             Command::BlockSearch => write!(f, "block:search"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
@@ -205,6 +211,8 @@ impl std::str::FromStr for Command {
             "block:select_next" => Ok(Command::BlockSelectNext),
             "block:copy_block" => Ok(Command::BlockCopyBlock),
             "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
+            "block:export_session_markdown" => Ok(Command::BlockExportSessionMarkdown),
+            "block:export_session_json" => Ok(Command::BlockExportSessionJson),
             "block:search" => Ok(Command::BlockSearch),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
@@ -778,6 +786,11 @@ mod tests {
             ("block:select_next", Command::BlockSelectNext),
             ("block:copy_block", Command::BlockCopyBlock),
             ("block:copy_markdown", Command::BlockCopyMarkdown),
+            (
+                "block:export_session_markdown",
+                Command::BlockExportSessionMarkdown,
+            ),
+            ("block:export_session_json", Command::BlockExportSessionJson),
             ("block:search", Command::BlockSearch),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");

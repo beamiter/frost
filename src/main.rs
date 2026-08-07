@@ -7,6 +7,7 @@ use jterm_core::pane_layout::{
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
+mod block_export;
 mod block_mode;
 mod color;
 mod command_palette;
@@ -1180,6 +1181,8 @@ enum Message {
     ConfigReset,
     ConfigTick,
     BlinkTick,
+    /// Redraw the compact elapsed-time badge on a visible running block.
+    BlockElapsedTick,
     PtyWriteTick,
     SearchRefreshTick,
     HistoryReflowTick,
@@ -1220,6 +1223,11 @@ enum Message {
     BlockSearchClose,
     /// Select and reveal the clicked hit's zone (and close the picker).
     BlockSearchAccept(u64),
+    /// Background whole-session export completed.
+    BlockExportFinished(
+        block_export::SessionExportFormat,
+        Result<std::path::PathBuf, String>,
+    ),
     /// User confirmed closing a tab with a running foreground process.
     TabCloseConfirmYes,
     /// User cancelled the close-confirmation overlay.
@@ -1734,6 +1742,10 @@ struct Frost {
     /// the clipboard or the prompt — the scrollback itself is never mutated.
     search_replace: search_replace_panel::SearchReplacePanelState,
     palette: command_palette::PaletteState,
+    /// Whole-session exports can retain a bounded multi-megabyte snapshot and
+    /// serialized buffer. Keep only one worker in flight across the window so
+    /// a repeated shortcut cannot queue unbounded copies of terminal output.
+    block_export_in_flight: bool,
     agent: agent::AgentUi,
     keybindings: keybindings::KeyBindings,
     config_panel_open: bool,
@@ -1955,6 +1967,7 @@ impl Frost {
             search_dirty: false,
             search_replace: search_replace_panel::SearchReplacePanelState::new(),
             palette: command_palette::PaletteState::new(),
+            block_export_in_flight: false,
             agent: agent::AgentUi::new(),
             keybindings: keybindings_load.bindings,
             config_panel_open: false,
@@ -3963,6 +3976,12 @@ impl Frost {
             C::BlockSelectNext => self.block_select_step(false),
             C::BlockCopyBlock => self.block_copy_block_task(),
             C::BlockCopyMarkdown => self.block_copy_markdown_task(),
+            C::BlockExportSessionMarkdown => {
+                self.block_export_session_task(block_export::SessionExportFormat::Markdown)
+            }
+            C::BlockExportSessionJson => {
+                self.block_export_session_task(block_export::SessionExportFormat::Json)
+            }
             C::BlockSearch => self.toggle_block_search(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
@@ -5384,6 +5403,12 @@ impl Frost {
             PaletteAction::BlockSelectNext => self.block_select_step(false),
             PaletteAction::BlockCopyBlock => self.block_copy_block_task(),
             PaletteAction::BlockCopyMarkdown => self.block_copy_markdown_task(),
+            PaletteAction::BlockExportSessionMarkdown => {
+                self.block_export_session_task(block_export::SessionExportFormat::Markdown)
+            }
+            PaletteAction::BlockExportSessionJson => {
+                self.block_export_session_task(block_export::SessionExportFormat::Json)
+            }
             PaletteAction::BlockSearch => self.toggle_block_search(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
@@ -5614,11 +5639,24 @@ impl Frost {
                     self.clear_stale_block_selection();
                     return Task::none();
                 }
-                let output = sess.terminal.zone_output_text(id);
-                if output.is_none() {
-                    self.push_toast("Selected block has no output".to_string(), ToastKind::Info);
+                match sess.terminal.zone_output_export_capped(id) {
+                    Some(terminal::ZoneOutputExport::Available { text, .. }) => Some(text),
+                    Some(terminal::ZoneOutputExport::Empty) => {
+                        self.push_toast(
+                            "Selected block has no output".to_string(),
+                            ToastKind::Info,
+                        );
+                        None
+                    }
+                    Some(terminal::ZoneOutputExport::Unavailable) => {
+                        self.push_toast(
+                            "Selected block output is no longer retained".to_string(),
+                            ToastKind::Warning,
+                        );
+                        None
+                    }
+                    None => None,
                 }
-                output
             }
         };
         match text {
@@ -5730,7 +5768,18 @@ impl Frost {
         let Some(zone) = sess.terminal.zone_by_id(id) else {
             return Task::none();
         };
-        let output = sess.terminal.zone_output_text(id);
+        let output = match sess.terminal.zone_output_export_capped(id) {
+            Some(terminal::ZoneOutputExport::Available { text, .. }) => Some(text),
+            Some(terminal::ZoneOutputExport::Empty) => None,
+            Some(terminal::ZoneOutputExport::Unavailable) => {
+                self.push_toast(
+                    "Block output is no longer retained; copy the command separately".to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            None => return Task::none(),
+        };
         let Some(text) = block_mode::block_copy_text(zone.command.as_deref(), output.as_deref())
         else {
             self.push_toast("Block is empty".to_string(), ToastKind::Info);
@@ -5741,7 +5790,8 @@ impl Frost {
     }
 
     /// Copy the selected block (newest when nothing is selected) as the
-    /// family's shared Markdown snippet (`block_mode::markdown_export`).
+    /// family's shared Markdown snippet, including retained lifecycle/capture
+    /// notes when the available data is incomplete.
     fn block_copy_markdown_task(&mut self) -> Task<Message> {
         let Some(id) = self.block_target_zone_id("copy") else {
             return Task::none();
@@ -5752,8 +5802,15 @@ impl Frost {
         let Some(zone) = sess.terminal.zone_by_id(id) else {
             return Task::none();
         };
-        let (output, output_truncated) = sess.terminal.zone_output_text_capped(id).unzip();
-        let output = output.unwrap_or_default();
+        let (output, output_truncated, output_unavailable) =
+            match sess.terminal.zone_output_export_capped(id) {
+                Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                    (text, truncated, false)
+                }
+                Some(terminal::ZoneOutputExport::Empty) => (String::new(), false, false),
+                Some(terminal::ZoneOutputExport::Unavailable) => (String::new(), false, true),
+                None => return Task::none(),
+            };
         // Local offset resolved AT the finish instant (not "now"), so a
         // block that finished across a DST change renders its own offset.
         let tz_offset_secs = block_mode::local_offset_secs(zone.finished_at_ms.map_or_else(
@@ -5764,18 +5821,77 @@ impl Frost {
             },
             |ms| (ms / 1000) as i64,
         ));
-        let markdown = block_mode::markdown_export(&block_mode::MarkdownBlock {
-            command: zone.command.as_deref(),
-            output: &output,
-            output_truncated: output_truncated.unwrap_or(false),
-            exit_code: zone.exit_code,
-            duration_ms: zone.duration_ms,
-            finished_at_ms: zone.finished_at_ms,
-            tz_offset_secs,
-            cwd: zone.cwd.as_deref(),
-        });
+        let markdown = block_mode::markdown_export_with_state(
+            &block_mode::MarkdownBlock {
+                command: zone.command.as_deref(),
+                output: &output,
+                output_truncated,
+                exit_code: zone.exit_code,
+                duration_ms: zone.duration_ms,
+                finished_at_ms: zone.finished_at_ms,
+                tz_offset_secs,
+                cwd: zone.cwd.as_deref(),
+            },
+            zone.command_truncated,
+            output_unavailable,
+            zone.completion_observed,
+        );
         self.push_toast("Copied block as Markdown", ToastKind::Success);
         iced::clipboard::write(markdown)
+    }
+
+    /// Snapshot every retained finalized block in the active pane, then serialize and
+    /// durably write it off the UI thread. The snapshot is bounded before the
+    /// task starts, and the worker owns it, so later output/session churn cannot
+    /// change the document halfway through an export.
+    fn block_export_session_task(
+        &mut self,
+        format: block_export::SessionExportFormat,
+    ) -> Task<Message> {
+        if self.block_export_in_flight {
+            self.push_toast(
+                "A session export is already in progress".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.command_zones.is_empty() {
+            self.push_toast(
+                "No retained command blocks to export (needs OSC 133 shell integration)"
+                    .to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let blocks = match block_export::snapshot_session(&sess.terminal) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                self.push_toast(
+                    format!("Could not prepare session export: {error}"),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        self.block_export_in_flight = true;
+        self.push_toast(
+            format!("Exporting {} session blocks…", format.label()),
+            ToastKind::Info,
+        );
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    block_export::export_session_to_file(&blocks, format)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("export worker failed: {error}")))
+            },
+            move |result| Message::BlockExportFinished(format, result),
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -6999,6 +7115,7 @@ impl Frost {
             Message::BlinkTick => {
                 self.blink_on = !self.blink_on;
             }
+            Message::BlockElapsedTick => {}
             Message::PtyWriteTick => {
                 let mut failed = false;
                 for session in &mut self.sessions {
@@ -7428,6 +7545,19 @@ impl Frost {
             Message::BlockSearchAccept(id) => {
                 self.block_search = None;
                 self.select_and_reveal_block(id);
+            }
+            Message::BlockExportFinished(format, result) => {
+                self.block_export_in_flight = false;
+                match result {
+                    Ok(path) => self.push_toast(
+                        format!("Exported {} session to {}", format.label(), path.display()),
+                        ToastKind::Success,
+                    ),
+                    Err(error) => self.push_toast(
+                        format!("Could not export {} session: {error}", format.label()),
+                        ToastKind::Warning,
+                    ),
+                }
             }
             Message::HistoryPickerInput(q) => {
                 if let Some(s) = self.history_picker.as_mut() {
@@ -8623,6 +8753,23 @@ impl Frost {
         )
     }
 
+    /// The live block badge when it fits over blank cells on `viewport_row`,
+    /// paired with the elapsed time that produced it. Paint and subscription
+    /// gating share this check so a hidden badge never owns a redraw timer.
+    fn fitting_running_badge(&self, sess: &Session, viewport_row: usize) -> Option<(String, u64)> {
+        let elapsed_ms = sess.terminal.running_duration_ms()?;
+        let badge = block_mode::running_badge_text(elapsed_ms);
+        let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0)).ceil()
+            as usize;
+        let chars: Vec<char> = sess
+            .grid
+            .get(viewport_row)?
+            .iter()
+            .map(|cell| cell.character)
+            .collect();
+        block_mode::badge_fits(&chars, badge.chars().count() + inset).then_some((badge, elapsed_ms))
+    }
+
     /// Block-mode chrome for each of `sess`'s visible rows: outcome stripes,
     /// per-prompt separators, first-row badges, and the selected-block
     /// outline. Absolute zone rows translate to viewport rows with the same
@@ -8715,13 +8862,18 @@ impl Frost {
         }
 
         // The in-flight execution paints an accent stripe from its prompt row
-        // to the bottom; a live prompt being edited gets only the separator.
+        // to the bottom and, like forge's running header, keeps its elapsed
+        // time visible. A live prompt being edited gets only the separator.
         if let Some(run_start) = running {
             for abs_row in run_start.max(start)..end.min(total) {
                 paint[abs_row - start].stripe = Some(accent);
             }
             if run_start >= start && run_start < end {
-                paint[run_start - start].separator = true;
+                let row = &mut paint[run_start - start];
+                row.separator = true;
+                if let Some((badge, _)) = self.fitting_running_badge(sess, run_start - start) {
+                    row.badge = Some((badge, accent));
+                }
             }
         } else if let Some(prompt_row) = live_prompt {
             if prompt_row >= start && prompt_row < end {
@@ -11288,6 +11440,45 @@ impl Frost {
                 iced::time::every(std::time::Duration::from_millis(530))
                     .map(|_| Message::BlinkTick),
             );
+        }
+        // Running output can be quiet for minutes (sleep, a remote build, a
+        // network wait), so PTY reads alone cannot animate its elapsed badge.
+        // Keep the timer scoped to visible panes while block chrome is on;
+        // the normal idle terminal still has no extra redraw subscription.
+        let pane_running_badge_interval = |index: usize| {
+            self.sessions.get(index).and_then(|session| {
+                let terminal = &session.terminal;
+                if terminal.is_alt_buffer_active() {
+                    return None;
+                }
+                let row = terminal.running_zone_start()?;
+                let viewport_start = terminal.viewport_absolute_start();
+                if row < viewport_start || row >= viewport_start + terminal.grid.rows() {
+                    return None;
+                }
+                let (_, elapsed_ms) = self.fitting_running_badge(session, row - viewport_start)?;
+                Some(if elapsed_ms < 3_600_000 {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    // The family duration formatter drops seconds at one
+                    // hour, so its visible text changes once per minute.
+                    std::time::Duration::from_secs(60)
+                })
+            })
+        };
+        let running_badge_interval = if !self.config.block_mode {
+            None
+        } else if self.is_split() && self.pane_zoomed {
+            pane_running_badge_interval(self.active)
+        } else {
+            self.layout()
+                .leaves()
+                .iter()
+                .filter_map(|&idx| pane_running_badge_interval(idx))
+                .min()
+        };
+        if let Some(interval) = running_badge_interval {
+            subs.push(iced::time::every(interval).map(|_| Message::BlockElapsedTick));
         }
         if self.sessions.iter().any(Session::has_pending_write) {
             subs.push(

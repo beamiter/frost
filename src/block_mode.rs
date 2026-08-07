@@ -83,6 +83,15 @@ pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<Str
     }
 }
 
+/// Compact live badge for an OSC 133 command whose `C` arrived but whose
+/// `D` has not. Forge keeps an elapsed running header visible while a command
+/// executes; frost uses the same feedback in the command's prompt row, where
+/// space is much tighter. The arrow is deliberately distinct from the final
+/// success/failure glyphs so an in-flight command can never look completed.
+pub fn running_badge_text(elapsed_ms: u64) -> String {
+    format!("▶ {}", format_duration(elapsed_ms))
+}
+
 /// Row span (start inclusive, end exclusive, absolute buffer rows) of each
 /// completed block, oldest first. Block `i` runs from its own prompt row to
 /// the next block's prompt row; the newest block is closed by
@@ -190,6 +199,14 @@ pub fn timestamp_at_offset(unix_ms: u64, offset_secs: i32) -> String {
     )
 }
 
+/// Filename-safe local timestamp used by whole-session exports. Kept beside
+/// [`timestamp_at_offset`] so export names and Markdown metadata share the
+/// exact same civil-time and UTC-offset arithmetic.
+pub fn compact_timestamp_at_offset(unix_ms: u64, offset_secs: i32) -> String {
+    let (year, month, day, hour, minute, second) = civil_from_unix_ms(unix_ms, offset_secs);
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
 /// Bare `HH:MM:SS` for a unix-epoch millisecond timestamp at a fixed UTC
 /// offset — the selected block's badge suffix (family contract: local time,
 /// no offset marker on the badge).
@@ -238,7 +255,21 @@ pub struct MarkdownBlock<'a> {
 /// truncation note), but frost never emits it: frost commands come only from
 /// OSC 133 metadata / prompt extraction at `C`, never from a screen-scrape
 /// reconstruction — that line is ember-only.
-pub fn markdown_export(block: &MarkdownBlock<'_>) -> String {
+#[cfg(test)]
+fn markdown_export(block: &MarkdownBlock<'_>) -> String {
+    markdown_export_with_state(block, false, false, true)
+}
+
+/// Markdown export with lifecycle/capture facts that are stored beside the
+/// family's shared block fields. These notes keep a retained-but-incomplete
+/// OSC 133 lifecycle, a shell-truncated command, or output lost to both
+/// retention budgets from looking like complete data.
+pub fn markdown_export_with_state(
+    block: &MarkdownBlock<'_>,
+    command_truncated: bool,
+    output_unavailable: bool,
+    completion_observed: bool,
+) -> String {
     let background = matches!(
         classify(block.command, block.exit_code),
         BlockOutcome::Background
@@ -276,8 +307,16 @@ pub fn markdown_export(block: &MarkdownBlock<'_>) -> String {
         );
         meta.push_str(&format!("- Cwd: {cwd}\n"));
     }
-    if block.output_truncated {
+    if output_unavailable {
+        meta.push_str("- Note: output unavailable (snapshot and scrollback evicted)\n");
+    } else if block.output_truncated {
         meta.push_str("- Note: output truncated\n");
+    }
+    if command_truncated {
+        meta.push_str("- Note: command truncated by shell\n");
+    }
+    if !completion_observed {
+        meta.push_str("- Note: command completion not observed\n");
     }
     if !meta.is_empty() {
         out.push('\n');
@@ -578,6 +617,15 @@ mod tests {
     }
 
     #[test]
+    fn running_badge_is_compact_and_never_looks_completed() {
+        assert_eq!(running_badge_text(0), "▶ 0ms");
+        assert_eq!(running_badge_text(1_250), "▶ 1.2s");
+        assert_eq!(running_badge_text(92_000), "▶ 1m32s");
+        assert!(!running_badge_text(1_250).contains('✓'));
+        assert!(!running_badge_text(1_250).contains('✗'));
+    }
+
+    #[test]
     fn spans_end_at_the_next_prompt_and_the_live_boundary() {
         assert_eq!(spans(&[10, 20, 35], 50), vec![(10, 20), (20, 35), (35, 50)]);
         // A single block is closed by the live boundary alone.
@@ -652,6 +700,15 @@ mod tests {
         assert_eq!(
             timestamp_at_offset(0, 8 * 3600),
             "1970-01-01 08:00:00 +08:00"
+        );
+    }
+
+    #[test]
+    fn compact_timestamp_is_filename_safe_and_uses_the_same_offset() {
+        assert_eq!(compact_timestamp_at_offset(0, 8 * 3600), "19700101-080000");
+        assert_eq!(
+            compact_timestamp_at_offset(0, -5 * 3600 - 30 * 60),
+            "19691231-183000"
         );
     }
 
@@ -765,6 +822,25 @@ mod tests {
         assert!(markdown.contains("- Cwd: /srv\n- Note: output truncated\n\nCommand:"));
         // The note is absent when nothing was cut.
         assert!(!markdown_export(&block(false)).contains("- Note: output truncated"));
+    }
+
+    #[test]
+    fn markdown_export_states_retention_and_lifecycle_gaps() {
+        let block = MarkdownBlock {
+            command: Some("very-long-command"),
+            output: "",
+            output_truncated: false,
+            exit_code: None,
+            duration_ms: None,
+            finished_at_ms: None,
+            tz_offset_secs: 0,
+            cwd: None,
+        };
+        let markdown = markdown_export_with_state(&block, true, true, false);
+        assert!(markdown.contains("- Note: output unavailable (snapshot and scrollback evicted)\n"));
+        assert!(markdown.contains("- Note: command truncated by shell\n"));
+        assert!(markdown.contains("- Note: command completion not observed\n"));
+        assert!(!markdown.contains("- Note: output truncated\n"));
     }
 
     #[test]

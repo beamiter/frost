@@ -850,12 +850,32 @@ pub struct CommandZone {
     /// `None` once the [`TerminalState::MAX_CAPTURED_OUTPUT_BYTES`] budget
     /// evicted it, in which case live extraction is the fallback.
     pub captured_output: Option<(String, bool)>,
+    /// A non-blank [`Self::captured_output`] snapshot was actually discarded
+    /// by the aggregate byte budget. Scrollback trimming does not set this:
+    /// retained snapshots remain authoritative after their live rows vanish.
+    pub(crate) captured_output_evicted: bool,
+    /// `true` when OSC 133 `D` reported this completion. A zone finalized at
+    /// the next prompt because `D` was missing remains useful block history,
+    /// but is not an observed completion.
+    pub(crate) completion_observed: bool,
     /// The zone's rows were trimmed out of scrollback. The entry stays (id,
     /// metadata, snapshot — v2 dropped the whole zone here) but all row
     /// fields are meaningless: `prompt_start` is clamped to 0 and the
     /// `Option` rows are `None`. Row consumers (stripes, gutter, markers,
     /// prompt jumps, reveal) must skip such zones.
     pub rows_evicted: bool,
+}
+
+/// Export-facing output state for one retained command zone.
+///
+/// Unlike [`TerminalState::zone_output_text_capped`], this preserves the
+/// distinction between genuinely blank output and non-blank output whose
+/// captured snapshot was budget-evicted after its live rows disappeared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ZoneOutputExport {
+    Available { text: String, truncated: bool },
+    Empty,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1893,6 +1913,8 @@ impl TerminalState {
                             command_truncated,
                             cwd: cwd.clone(),
                             captured_output: self.capture_zone_output(out_start, absolute_row),
+                            captured_output_evicted: false,
+                            completion_observed: true,
                             rows_evicted: false,
                         };
                         self.push_command_zone(zone);
@@ -1926,6 +1948,8 @@ impl TerminalState {
                             cwd,
                             // No `C` means no output range to snapshot.
                             captured_output: None,
+                            captured_output_evicted: false,
+                            completion_observed: true,
                             rows_evicted: false,
                         };
                         self.push_command_zone(zone);
@@ -2008,6 +2032,7 @@ impl TerminalState {
             };
             if let Some((text, _)) = zone.captured_output.take() {
                 self.captured_output_bytes = self.captured_output_bytes.saturating_sub(text.len());
+                zone.captured_output_evicted = true;
             }
         }
     }
@@ -2075,6 +2100,8 @@ impl TerminalState {
             command_truncated: self.current_command_truncated,
             cwd,
             captured_output: self.capture_zone_output(out_start, boundary_row),
+            captured_output_evicted: false,
+            completion_observed: false,
             rows_evicted: false,
         };
         self.push_command_zone(zone);
@@ -2185,8 +2212,10 @@ impl TerminalState {
         self.zone_output_text(zone.id)
     }
 
-    /// Look up a completed zone by its stable id. `None` when the zone has
-    /// been trimmed away with old scrollback (a stale block selection).
+    /// Look up a retained finalized zone by its stable id. This includes a
+    /// lifecycle closed at the next prompt after `D` was lost; consult
+    /// [`CommandZone::completion_observed`] when that distinction matters.
+    /// `None` means the bounded zone deque no longer retains the id.
     pub fn zone_by_id(&self, id: u64) -> Option<&CommandZone> {
         self.command_zones.iter().find(|zone| zone.id == id)
     }
@@ -2220,6 +2249,20 @@ impl TerminalState {
             None
         } else {
             Some((out, capped))
+        }
+    }
+
+    /// Export-oriented form of [`Self::zone_output_text_capped`]. `None`
+    /// means the zone id itself is no longer retained. [`ZoneOutputExport::Empty`]
+    /// means the retained zone never had non-blank output; `Unavailable`
+    /// means a non-blank snapshot was budget-evicted and live rows can no
+    /// longer supply it.
+    pub(crate) fn zone_output_export_capped(&self, id: u64) -> Option<ZoneOutputExport> {
+        let zone = self.zone_by_id(id)?;
+        match self.zone_output_text_capped(id) {
+            Some((text, truncated)) => Some(ZoneOutputExport::Available { text, truncated }),
+            None if zone.captured_output_evicted => Some(ZoneOutputExport::Unavailable),
+            None => Some(ZoneOutputExport::Empty),
         }
     }
 
@@ -2307,6 +2350,14 @@ impl TerminalState {
     /// the bottom bar's "running" state.
     pub fn is_command_running(&self) -> bool {
         self.current_command_started_at.is_some()
+    }
+
+    /// Elapsed wall time for the live OSC 133 command. This is renderer-only
+    /// state: the completed zone still prefers a shell-reported duration at
+    /// `D`, while the live block badge uses this local monotonic clock.
+    pub fn running_duration_ms(&self) -> Option<u64> {
+        self.current_command_started_at
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Plain text of the absolute buffer rows `start..end` (scrollback plus
@@ -6569,7 +6620,7 @@ mod tests {
 
     use super::{
         ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell, TerminalState,
-        MAX_TERMINAL_TITLE_CHARS,
+        ZoneOutputExport, MAX_TERMINAL_TITLE_CHARS,
     };
 
     #[test]
@@ -7997,10 +8048,12 @@ mod tests {
         terminal.process_input(b"\x1b]133;C\x07");
         assert_eq!(terminal.live_prompt_row(), None);
         assert_eq!(terminal.running_zone_start(), Some(prompt));
+        assert!(terminal.running_duration_ms().is_some());
 
         terminal.process_input(b"\x1b]133;D;0\x07");
         assert_eq!(terminal.running_zone_start(), None);
         assert_eq!(terminal.live_prompt_row(), None);
+        assert_eq!(terminal.running_duration_ms(), None);
     }
 
     #[test]
@@ -8020,6 +8073,8 @@ mod tests {
         assert!(full.duration_ms.is_some());
         assert!(full.finished_at_ms.is_some());
         assert_eq!(full.exit_code, Some(0));
+        assert!(full.completion_observed);
+        assert!(!full.captured_output_evicted);
 
         let short = &terminal.command_zones[1];
         assert_eq!(short.id, 1);
@@ -8034,6 +8089,8 @@ mod tests {
         assert_eq!(short.duration_ms, None);
         assert!(short.finished_at_ms.is_some());
         assert_eq!(short.exit_code, Some(1));
+        assert!(short.completion_observed);
+        assert!(!short.captured_output_evicted);
     }
 
     #[test]
@@ -8163,6 +8220,9 @@ mod tests {
         assert!(terminal.command_zones[0].captured_output.is_none());
         assert!(terminal.command_zones[1].captured_output.is_none());
         assert!(terminal.command_zones[2].captured_output.is_some());
+        assert!(terminal.command_zones[0].captured_output_evicted);
+        assert!(terminal.command_zones[1].captured_output_evicted);
+        assert!(!terminal.command_zones[2].captured_output_evicted);
         assert_eq!(terminal.captured_output_bytes, per_zone);
 
         // A zone that lost its snapshot but still has rows in scrollback
@@ -8171,12 +8231,67 @@ mod tests {
             terminal.zone_output_text(ids[0]).as_deref(),
             Some("out\nout\nout")
         );
+        assert_eq!(
+            terminal.zone_output_export_capped(ids[0]),
+            Some(ZoneOutputExport::Available {
+                text: "out\nout\nout".to_string(),
+                truncated: false,
+            })
+        );
 
         // The newest zone's snapshot survives even an impossible budget (a
         // fresh snapshot always fits the real 8 MiB budget: one snapshot is
         // capped at 1 MiB).
         terminal.enforce_captured_output_budget(0);
         assert!(terminal.command_zones[2].captured_output.is_some());
+    }
+
+    #[test]
+    fn export_output_distinguishes_empty_from_evicted_and_unavailable() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.set_max_scrollback(6);
+
+        emit_zone(&mut terminal, 0);
+        let output_id = terminal.command_zones[0].id;
+
+        // A full C/D lifecycle with no bytes between the marks is genuinely
+        // empty: there was never a non-blank snapshot to lose.
+        terminal.process_input(b"\x1b]133;A\x07\x1b]133;B\x07");
+        terminal.process_input(b"$ true\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        let empty_id = terminal.command_zones[1].id;
+        assert_eq!(terminal.command_zones[1].captured_output, None);
+        assert!(!terminal.command_zones[1].captured_output_evicted);
+        assert_eq!(
+            terminal.zone_output_export_capped(empty_id),
+            Some(ZoneOutputExport::Empty)
+        );
+
+        // Row trimming alone does not claim snapshot eviction, and the
+        // retained snapshot remains available after all live rows vanish.
+        for _ in 0..30 {
+            terminal.process_input(b"fill\r\n");
+        }
+        assert!(terminal.command_zones[0].rows_evicted);
+        assert!(!terminal.command_zones[0].captured_output_evicted);
+        assert!(matches!(
+            terminal.zone_output_export_capped(output_id),
+            Some(ZoneOutputExport::Available { .. })
+        ));
+
+        // Only an actual budget eviction flips the bit. With both the
+        // snapshot and live rows gone, export can now report Unavailable
+        // without confusing it with the truly empty zone above.
+        terminal.enforce_captured_output_budget(0);
+        assert!(terminal.command_zones[0].captured_output_evicted);
+        assert_eq!(
+            terminal.zone_output_export_capped(output_id),
+            Some(ZoneOutputExport::Unavailable)
+        );
+        assert_eq!(
+            terminal.zone_output_export_capped(empty_id),
+            Some(ZoneOutputExport::Empty)
+        );
+        assert_eq!(terminal.zone_output_export_capped(u64::MAX), None);
     }
 
     #[test]
@@ -8216,6 +8331,7 @@ mod tests {
         // Nothing is invented: no fake duration, no fake finish instant.
         assert_eq!(zone.duration_ms, None);
         assert_eq!(zone.finished_at_ms, None);
+        assert!(!zone.completion_observed);
         // The Unknown badge (`?`) is exactly what an unreported exit shows.
         assert_eq!(
             crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
