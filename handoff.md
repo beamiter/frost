@@ -4,16 +4,17 @@ Updated: 2026-08-08
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, configuration, terminal parsing, history, keybindings, and session
-persistence. Agent snapshots are now claimed atomically, execution identities are
+persistence. Agent snapshots are now claimed before restore, execution identities are
 checked, the jsh identity probe owns its process group, and link opening has one
 strict policy.
 
 ## Completed since the previous handoff
 
 - `src/persistence.rs` gained `claim_exclusive`, a no-clobber hard-link/unlink
-  claim, and `src/agent.rs` restores through it. Exactly one opener ever
-  observes the snapshot, and evidence that cannot become a session is left at
-  the claim path instead of being deleted.
+  claim, and `src/agent.rs` restores through it. Evidence that cannot become a
+  session is left at the claim path instead of being deleted. An empty or
+  rejected local session leaves the public path alone, so one process exiting
+  cannot delete a newer checkpoint published by another.
 - Execution generations use `checked_add`; exhaustion seals the session rather
   than reusing an identity a late completion could bind to.
 - `jsh_version_banner` now starts the probe in its own process group, drains a
