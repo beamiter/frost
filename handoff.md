@@ -17,6 +17,15 @@ strict policy.
   private claim path. An empty or rejected local session still leaves the
   public path alone, so one process exiting cannot delete a newer checkpoint
   published by another.
+- Session restore now uses a schema-aware bounded decoder rather than deriving
+  an owned Serde tree before sanitizing it. The v1/v2 envelope and every nested
+  child are borrowed as `RawValue`; parsers are dropped before recursion, and
+  sessions, tabs, pane children, ratios, tree nodes/depth, and cumulative text
+  are capped before ownership. Invalid tabs decode transactionally without
+  losing valid neighbours, active-tab identity is remapped by original index,
+  and invalid optional tabs/tree/split layouts warn and follow the existing
+  tabs → tree → split fallback. Required known fields remain strict while
+  unknown fields, including long future keys, stay forward-compatible.
 - Execution generations use `checked_add`; exhaustion seals the session rather
   than reusing an identity a late completion could bind to.
 - Model requests carry `{session epoch, request generation}` through both
@@ -49,14 +58,6 @@ strict policy.
   `3aece307766ca8f3ca33ed0376d2a271cc2322b3`).
 
 ## Remaining boundaries
-
-### Decode session trees while enforcing budgets
-
-The 1 MiB file cap is still followed by ordinary Serde construction before
-session, tab, tree-depth, cwd, field, and cumulative limits apply. Implement
-schema-aware bounded visitors — anvil's `src/session.rs` now has a worked
-example for the same shape — and add adversarial wide-array, deep-tree, and
-cumulative-text tests.
 
 ### Own the remaining app-owned helpers
 
