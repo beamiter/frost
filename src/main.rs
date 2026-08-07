@@ -82,6 +82,13 @@ fn chrome_height(bottom_bar: bool) -> f32 {
 const PANE_HEADER_H: f32 = 20.0;
 /// Maximum total leaves (panes) across the whole layout tree; a PTY guard.
 const MAX_PANES: usize = 12;
+/// Fraction of a pane reserved for directional tab-to-split drop zones.
+/// Keeping a generous dead zone in the middle makes an accidental drop a
+/// harmless cancel instead of unexpectedly rearranging a running workspace.
+const SPLIT_DROP_EDGE_FRACTION: f32 = 0.28;
+/// Hovering another tab for this long during a drag previews its page. A quick
+/// pass across the strip remains a pure reorder gesture.
+const TAB_DRAG_HOVER_SWITCH_MS: u64 = 450;
 const SPLIT_RATIO_KEY_STEP: f32 = 0.05;
 /// Two presses on the same divider within this window count as a double-click
 /// (equalizes every pane).
@@ -159,9 +166,55 @@ struct Toast {
 #[derive(Debug, Clone)]
 struct PaneDrag {
     session_id: usize,
-    /// Session index the pointer is currently over, when it differs from the
-    /// source. `None` means releasing now would do nothing.
+    /// Stable session id the pointer is currently over, when it differs from
+    /// the source. `None` means releasing in the pane area would do nothing.
     target: Option<usize>,
+}
+
+/// A validated directional target shown while an ordinary tab is dragged over
+/// the visible pane tree. Both identities survive session-vector reindexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabSplitDrop {
+    target_session_id: usize,
+    direction: PaneDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabDragReleaseAction {
+    Activate(usize),
+    Reorder { from: usize, to: usize },
+    RestoreOrigin,
+}
+
+fn tab_drag_release_action(
+    source: Option<usize>,
+    target: Option<usize>,
+    moved: bool,
+) -> TabDragReleaseAction {
+    match (source, target) {
+        (Some(from), Some(to)) if from != to => TabDragReleaseAction::Reorder { from, to },
+        (Some(tab), Some(_)) if !moved => TabDragReleaseAction::Activate(tab),
+        _ => TabDragReleaseAction::RestoreOrigin,
+    }
+}
+
+fn tab_drag_hover_left_source(source: Option<usize>, hovered: Option<usize>) -> bool {
+    source.is_some_and(|source| hovered != Some(source))
+}
+
+fn tab_split_commit_allowed(
+    source_tab: Option<usize>,
+    source_is_plain: bool,
+    active_tab: usize,
+    target_tab: Option<usize>,
+    target_pane_count: usize,
+    zoomed: bool,
+) -> bool {
+    source_is_plain
+        && source_tab.is_some_and(|source| source != active_tab)
+        && target_tab == Some(active_tab)
+        && target_pane_count < MAX_PANES
+        && !zoomed
 }
 
 /// A tab and the panes it owns.
@@ -258,6 +311,46 @@ fn sort_pinned_first(tabs: &mut [Tab], active: usize) -> usize {
     active_id
         .and_then(|id| tabs.iter().position(|tab| tab.id == id))
         .unwrap_or(active)
+}
+
+/// Reorder one tab without ever crossing the pinned/unpinned boundary. `to`
+/// keeps the existing strip semantics (dropping on a later tab places the
+/// source after it), while the returned index follows the previously active
+/// tab by identity.
+fn reorder_tabs_preserving_pinned_prefix(
+    tabs: &mut Vec<Tab>,
+    active: usize,
+    from: usize,
+    to: usize,
+) -> Option<usize> {
+    if from >= tabs.len() || to >= tabs.len() || from == to {
+        return None;
+    }
+    let moved = tabs.remove(from);
+    let pinned_boundary = tabs.iter().take_while(|tab| tab.pinned).count();
+    let requested = to.min(tabs.len());
+    let insert_at = if moved.pinned {
+        requested.min(pinned_boundary)
+    } else {
+        requested.max(pinned_boundary)
+    };
+    tabs.insert(insert_at, moved);
+    Some(match active {
+        index if index == from => insert_at,
+        index if from < insert_at && index > from && index <= insert_at => index - 1,
+        index if insert_at < from && index >= insert_at && index < from => index + 1,
+        index => index,
+    })
+}
+
+/// New tabs are unpinned and therefore belong after the complete pinned
+/// prefix, even when the active tab sits inside that prefix.
+fn new_unpinned_tab_index(tabs: &[Tab], active: usize) -> usize {
+    let first_unpinned = tabs
+        .iter()
+        .position(|tab| !tab.pinned)
+        .unwrap_or(tabs.len());
+    active.saturating_add(1).max(first_unpinned).min(tabs.len())
 }
 
 /// What a confirmed close should actually tear down. Closing a tab takes every
@@ -635,6 +728,166 @@ fn valid_restored_layout(tree: &PaneTree, session_count: usize) -> bool {
     distinct == n
 }
 
+/// Resolve the directional split edge under `point`. The center of a pane is
+/// deliberately a dead zone: a release there cancels instead of guessing.
+fn split_drop_direction(rect: pane_layout::Rect, point: iced::Point) -> Option<PaneDirection> {
+    if !rect.x.is_finite()
+        || !rect.y.is_finite()
+        || !rect.width.is_finite()
+        || !rect.height.is_finite()
+        || !point.x.is_finite()
+        || !point.y.is_finite()
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+        || point.x < rect.x
+        || point.x >= rect.x + rect.width
+        || point.y < rect.y
+        || point.y >= rect.y + rect.height
+    {
+        return None;
+    }
+
+    let distances = [
+        ((point.x - rect.x) / rect.width, PaneDirection::Left),
+        (
+            (rect.x + rect.width - point.x) / rect.width,
+            PaneDirection::Right,
+        ),
+        ((point.y - rect.y) / rect.height, PaneDirection::Up),
+        (
+            (rect.y + rect.height - point.y) / rect.height,
+            PaneDirection::Down,
+        ),
+    ];
+    distances
+        .into_iter()
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .filter(|(distance, _)| *distance <= SPLIT_DROP_EDGE_FRACTION)
+        .map(|(_, direction)| direction)
+}
+
+fn tab_drag_hover_ready(
+    source_tab: Option<usize>,
+    source_is_plain: bool,
+    active_tab: Option<usize>,
+    hovered_tab: Option<usize>,
+    pending_target: usize,
+    elapsed: std::time::Duration,
+) -> bool {
+    source_is_plain
+        && source_tab.is_some_and(|source| source != pending_target)
+        && active_tab != Some(pending_target)
+        && hovered_tab == Some(pending_target)
+        && elapsed >= std::time::Duration::from_millis(TAB_DRAG_HOVER_SWITCH_MS)
+}
+
+/// Move a one-pane tab into a directional edge of another tab's pane tree.
+///
+/// All fallible checks and tree construction happen before the source tab is
+/// removed. The session itself is never cloned or reindexed: only its single
+/// layout leaf changes owner.
+fn move_plain_tab_into_split(
+    tabs: &mut Vec<Tab>,
+    source_tab_id: usize,
+    target_session: usize,
+    direction: PaneDirection,
+) -> Option<(usize, usize)> {
+    let source_index = tabs.iter().position(|tab| tab.id == source_tab_id)?;
+    let source_session = match tabs.get(source_index)?.tree {
+        PaneTree::Leaf(session) => session,
+        PaneTree::Split { .. } => return None,
+    };
+    if source_session == target_session {
+        return None;
+    }
+
+    // Reject corrupt/ambiguous ownership rather than turning one bad leaf into
+    // a duplicated live PTY in two visible locations.
+    let source_claims = tabs
+        .iter()
+        .flat_map(Tab::sessions)
+        .filter(|session| *session == source_session)
+        .count();
+    let target_claims = tabs
+        .iter()
+        .flat_map(Tab::sessions)
+        .filter(|session| *session == target_session)
+        .count();
+    if source_claims != 1 || target_claims != 1 {
+        return None;
+    }
+
+    let target_index = tabs.iter().position(|tab| tab.contains(target_session))?;
+    if source_index == target_index || tabs[target_index].tree.leaf_count() >= MAX_PANES {
+        return None;
+    }
+    let mut next_tree = tabs[target_index].tree.clone();
+    if !next_tree.split_leaf(target_session, direction.axis(), source_session) {
+        return None;
+    }
+    if !direction.forward() {
+        swap_sessions_in_tree(&mut next_tree, target_session, source_session);
+    }
+
+    // Commit. All identities used below were proven unique above.
+    tabs.remove(source_index);
+    let target_index = target_index - usize::from(source_index < target_index);
+    tabs[target_index].tree = next_tree;
+    tabs[target_index].focus = source_session;
+    Some((target_index, source_session))
+}
+
+/// Detach one leaf from a split and promote it to a new ordinary tab. The
+/// source tree is cloned and collapsed before either live collection changes,
+/// making every invalid/stale drop a true no-op.
+fn promote_split_pane_to_tab(
+    tabs: &mut Vec<Tab>,
+    next_tab_id: &mut usize,
+    source_session: usize,
+    after_tab_id: Option<usize>,
+) -> Option<(usize, usize)> {
+    if tabs
+        .iter()
+        .flat_map(Tab::sessions)
+        .filter(|session| *session == source_session)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let owner_index = tabs.iter().position(|tab| tab.contains(source_session))?;
+    if tabs[owner_index].tree.is_leaf() {
+        return None;
+    }
+    let anchor_index = match after_tab_id {
+        Some(id) => tabs.iter().position(|tab| tab.id == id)?,
+        None => owner_index,
+    };
+    let id = *next_tab_id;
+    let next_id = id.checked_add(1)?;
+    if tabs.iter().any(|tab| tab.id == id) {
+        return None;
+    }
+
+    let mut source_tree = tabs[owner_index].tree.clone();
+    if !source_tree.remove_leaf(source_session) || source_tree.contains_session(source_session) {
+        return None;
+    }
+
+    // Commit. New tabs are unpinned, so never insert one inside the leading
+    // pinned block even if the pointer was released over a pinned tab.
+    tabs[owner_index].tree = source_tree;
+    tabs[owner_index].repair_focus();
+    let first_unpinned = tabs
+        .iter()
+        .position(|tab| !tab.pinned)
+        .unwrap_or(tabs.len());
+    let insert_at = (anchor_index + 1).max(first_unpinned).min(tabs.len());
+    tabs.insert(insert_at, Tab::new(id, source_session));
+    *next_tab_id = next_id;
+    Some((insert_at, source_session))
+}
+
 /// Linear blend between two colors (t=0 → a, t=1 → b); result is fully opaque.
 fn blend(a: Color, b: Color, t: f32) -> Color {
     Color {
@@ -845,10 +1098,18 @@ enum Message {
     WindowMinimize,
     WindowToggleMaximize,
     TabHover(Option<usize>),
-    /// User pressed the mouse over a tab — start tracking its stable session id.
+    /// User pressed the mouse over a tab — start tracking its stable tab id.
     TabDragStart(usize),
-    /// User released the mouse over a tab. Both endpoints are stable session ids.
+    /// User released the mouse over a tab. Both endpoints are stable tab ids.
     TabDragEnd(usize),
+    /// Pointer movement over the pane area while an ordinary tab is held.
+    TabDragMove(iced::Point),
+    /// Pointer left the pane area; clear its directional preview, not the drag.
+    TabDragLeavePaneArea,
+    /// Short-lived timer that opens a tab only after a deliberate drag hover.
+    TabDragHoverTick,
+    /// Release over a highlighted pane edge commits the tab-to-split move.
+    TabSplitDrop,
     /// Global mouse-up: clear `dragging_tab` if a drag was started but the
     /// release happened outside any tab.
     TabDragCancel,
@@ -868,11 +1129,15 @@ enum Message {
     DividerDragMove(iced::Point),
     DividerDragEnd,
     DividerHover(Option<DividerId>),
-    /// Press on a pane's header strip: focuses it, and may become a drag that
-    /// swaps it with whichever pane the pointer is released over.
+    /// Press on a pane's header strip, identified by stable session id: focuses
+    /// it, and may become a drag that swaps it with the release target.
     PaneDragStart(usize),
     PaneDragMove(iced::Point),
+    /// Pointer left the pane area for the tab strip; preserve the source drag.
+    PaneDragLeavePaneArea,
     PaneDragEnd,
+    /// Release a split pane on tab chrome, optionally after a specific tab.
+    PanePromoteToTab(Option<usize>),
     SearchToggleRegex,
     SearchToggleCase,
     SearchInput(String),
@@ -1549,12 +1814,21 @@ struct Frost {
     pane_zoomed: bool,
     /// In-flight header drag that will swap two panes on release.
     pane_drag: Option<PaneDrag>,
+    /// Directional pane edge currently armed for a tab-to-split drop.
+    tab_split_drop: Option<TabSplitDrop>,
     /// Stable id of the tab the pointer is hovering (drives close-button reveal).
     hovered_tab: Option<usize>,
     /// Source-tab id recorded on mouse press over a tab. Cleared on mouse
     /// release (anywhere) by the global mouse-up listener; in between, it
     /// drives tab-drag visual feedback and the reorder-on-release.
     dragging_tab: Option<usize>,
+    /// Tab that was active before drag-hover previews began, restored on cancel.
+    tab_drag_origin: Option<usize>,
+    /// Whether the pointer actually left the pressed tab during this gesture.
+    /// Distinguishes a click-to-activate from a drag that returned to source.
+    tab_drag_moved: bool,
+    /// Stable tab id and timestamp for a pending delayed hover preview.
+    tab_drag_hover_since: Option<(usize, std::time::Instant)>,
     /// Right-click context menu state: stable id of its target tab, or None.
     /// Rendered as a centered floating panel (Esc / click-outside dismiss).
     tab_menu: Option<usize>,
@@ -1722,8 +1996,12 @@ impl Frost {
             last_divider_press: None,
             pane_zoomed: false,
             pane_drag: None,
+            tab_split_drop: None,
             hovered_tab: None,
             dragging_tab: None,
+            tab_drag_origin: None,
+            tab_drag_moved: false,
+            tab_drag_hover_since: None,
             tab_menu: None,
             tab_rename: None,
             tab_pointer: iced::Point::ORIGIN,
@@ -2474,6 +2752,10 @@ impl Frost {
         if index >= self.sessions.len() {
             return Task::none();
         }
+        // Session removal can invalidate a tab/pane drag source or target and
+        // reindex every remaining leaf. Cancel while all stable identities are
+        // still resolvable, then perform the close from a clean UI state.
+        self.cancel_layout_drags();
         // ANY session close (user close, close_tab, an async `PtyExited`)
         // invalidates the block search picker: session indices shift and the
         // close may hand `active` to a different session whose zone ids —
@@ -2874,20 +3156,127 @@ impl Frost {
     /// another one, which is exactly what reordering the session vector did
     /// back when a tab *was* a session.
     fn reorder_tab(&mut self, from: usize, to: usize) {
-        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+        let Some(active_tab) =
+            reorder_tabs_preserving_pinned_prefix(&mut self.tabs, self.active_tab, from, to)
+        else {
             return;
-        }
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        self.active_tab = match self.active_tab {
-            a if a == from => to,
-            a if from < to && a > from && a <= to => a - 1,
-            a if to < from && a >= to && a < from => a + 1,
-            a => a,
         };
+        self.active_tab = active_tab;
         self.session_dirty = true;
         self.refresh_active_context();
         self.save_session_snapshot();
+    }
+
+    /// Commit the currently previewed ordinary-tab → split-pane drop.
+    fn finish_tab_split_drop(&mut self) {
+        // The pointer may arm an edge and then switch/zoom the visible page
+        // without moving again. Re-resolve every final topology condition here
+        // so a stale overlay cannot graft the source into a hidden old target.
+        let request =
+            self.dragging_tab
+                .zip(self.tab_split_drop)
+                .and_then(|(source_tab_id, drop)| {
+                    let source_tab = self.tab_index_by_id(source_tab_id);
+                    let source_is_plain = source_tab
+                        .and_then(|tab| self.tabs.get(tab))
+                        .is_some_and(|tab| tab.tree.is_leaf());
+                    let target_session = self.session_index_by_id(drop.target_session_id)?;
+                    let target_tab = self.tab_of_session(target_session);
+                    tab_split_commit_allowed(
+                        source_tab,
+                        source_is_plain,
+                        self.active_tab,
+                        target_tab,
+                        self.layout().leaf_count(),
+                        self.pane_zoomed,
+                    )
+                    .then_some((source_tab_id, target_session, drop.direction))
+                });
+        let result = request.and_then(|(source_tab_id, target_session, direction)| {
+            move_plain_tab_into_split(&mut self.tabs, source_tab_id, target_session, direction)
+        });
+        let origin = self.tab_drag_origin.take();
+        self.dragging_tab = None;
+        self.tab_split_drop = None;
+        self.tab_drag_moved = false;
+        self.tab_drag_hover_since = None;
+        let Some((target_tab, focused_session)) = result else {
+            self.restore_tab_drag_origin(origin);
+            return;
+        };
+
+        if focused_session != self.active {
+            self.close_block_search_on_session_change();
+        }
+        self.active_tab = target_tab;
+        self.active = focused_session;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+        self.session_dirty = true;
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast("Tab moved into split".to_string(), ToastKind::Success);
+    }
+
+    fn restore_tab_drag_origin(&mut self, origin: Option<usize>) {
+        let Some(tab) = origin.and_then(|id| self.tab_index_by_id(id)) else {
+            return;
+        };
+        if tab != self.active_tab {
+            self.activate_tab(tab);
+        }
+    }
+
+    fn cancel_tab_drag(&mut self) {
+        let origin = self.tab_drag_origin.take();
+        self.dragging_tab = None;
+        self.tab_split_drop = None;
+        self.tab_drag_moved = false;
+        self.tab_drag_hover_since = None;
+        self.restore_tab_drag_origin(origin);
+    }
+
+    fn cancel_layout_drags(&mut self) {
+        self.cancel_tab_drag();
+        self.pane_drag = None;
+        self.dragging_divider = None;
+        self.hovered_divider = None;
+        self.dragging_sidebar = false;
+    }
+
+    /// Commit the current split-pane → ordinary-tab drop. `after_tab_id` is
+    /// stable across tab reordering; `None` means immediately after its owner.
+    fn finish_pane_promotion(&mut self, after_tab_id: Option<usize>) {
+        let Some(drag) = self.pane_drag.take() else {
+            return;
+        };
+        let Some(source_session) = self.session_index_by_id(drag.session_id) else {
+            return;
+        };
+        let Some((new_tab, focused_session)) = promote_split_pane_to_tab(
+            &mut self.tabs,
+            &mut self.next_tab_id,
+            source_session,
+            after_tab_id,
+        ) else {
+            return;
+        };
+
+        if focused_session != self.active {
+            self.close_block_search_on_session_change();
+        }
+        self.active_tab = new_tab;
+        self.active = focused_session;
+        self.pane_zoomed = false;
+        self.hovered_divider = None;
+        self.dragging_divider = None;
+        self.session_dirty = true;
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast("Pane moved to a new tab".to_string(), ToastKind::Success);
     }
 
     /// The active tab's pane tree. Every split/focus/divider operation goes
@@ -3063,14 +3452,15 @@ impl Frost {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
-    /// Open `session` in a brand new tab placed after the active one.
+    /// Open `session` in a brand new unpinned tab after the active one without
+    /// ever splitting the leading pinned partition.
     fn open_tab_with(&mut self, session: usize) {
         if session != self.active {
             // New-tab activation bypasses `set_focus`; the block search
             // picker must not survive the active session changing.
             self.close_block_search_on_session_change();
         }
-        let at = (self.active_tab + 1).min(self.tabs.len());
+        let at = new_unpinned_tab_index(&self.tabs, self.active_tab);
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.insert(at, Tab::new(id, session));
@@ -3103,6 +3493,15 @@ impl Frost {
     /// Whether the active tab is currently split (more than one pane).
     fn is_split(&self) -> bool {
         !self.layout().is_leaf()
+    }
+
+    fn tab_split_drag_eligible(&self) -> bool {
+        self.dragging_tab.and_then(|source_id| {
+            let source = self.tab_index_by_id(source_id)?;
+            matches!(self.tabs[source].tree, PaneTree::Leaf(_)).then_some(source != self.active_tab)
+        }) == Some(true)
+            && !self.pane_zoomed
+            && self.layout().leaf_count() < MAX_PANES
     }
 
     /// The whole terminal-area rectangle the pane tree is laid out within.
@@ -6202,6 +6601,10 @@ impl Frost {
                 }
             }
             Message::Focus(f) => {
+                if !f {
+                    self.cancel_layout_drags();
+                    self.hovered_tab = None;
+                }
                 self.focused = f;
                 // The blink tick stops while unfocused; leave the cursor solid so
                 // it can't get stuck in the "off" half of a blink.
@@ -6243,29 +6646,116 @@ impl Frost {
             Message::WindowToggleMaximize => {
                 return iced::window::latest().and_then(iced::window::toggle_maximize);
             }
-            Message::TabHover(id) => self.hovered_tab = id,
+            Message::TabHover(id) => {
+                self.hovered_tab = id;
+                if tab_drag_hover_left_source(self.dragging_tab, id) {
+                    self.tab_drag_moved = true;
+                }
+                let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+                self.tab_drag_hover_since = match (self.dragging_tab, id) {
+                    (Some(source), Some(target))
+                        if source != target && active_id != Some(target) =>
+                    {
+                        Some((target, std::time::Instant::now()))
+                    }
+                    _ => None,
+                };
+            }
             Message::TabDragStart(id) => {
                 if self.tab_index_by_id(id).is_some() {
+                    self.pane_drag = None;
+                    self.tab_split_drop = None;
+                    self.tab_drag_origin = self.tabs.get(self.active_tab).map(|tab| tab.id);
+                    self.tab_drag_moved = false;
+                    self.tab_drag_hover_since = None;
                     self.dragging_tab = Some(id);
                 }
             }
             Message::TabDragEnd(target_id) => {
-                if let Some(source_id) = self.dragging_tab.take() {
+                if self.pane_drag.is_some() {
+                    self.finish_pane_promotion(Some(target_id));
+                } else if let Some(source_id) = self.dragging_tab.take() {
+                    let origin = self.tab_drag_origin.take();
+                    let moved = std::mem::take(&mut self.tab_drag_moved);
+                    self.tab_drag_hover_since = None;
                     let source = self.tab_index_by_id(source_id);
                     let target = self.tab_index_by_id(target_id);
-                    if let (Some(from), Some(to)) = (source, target) {
-                        if from == to {
-                            self.activate_tab(to);
-                        } else {
+                    match tab_drag_release_action(source, target, moved) {
+                        TabDragReleaseAction::Activate(tab) => self.activate_tab(tab),
+                        TabDragReleaseAction::Reorder { from, to } => {
                             // Reordering moves tabs only; the session vector
                             // and every tab's panes stay as they are.
                             self.reorder_tab(from, to);
+                            self.restore_tab_drag_origin(origin);
+                            // `reorder_tab` saved before the hover-preview
+                            // origin was restored; persist the final focus too.
+                            self.save_session_snapshot();
+                        }
+                        TabDragReleaseAction::RestoreOrigin => {
+                            self.restore_tab_drag_origin(origin);
                         }
                     }
                 }
+                self.tab_drag_origin = None;
+                self.tab_drag_moved = false;
+                self.tab_drag_hover_since = None;
+                self.tab_split_drop = None;
+            }
+            Message::TabDragMove(point) => {
+                self.tab_drag_moved = true;
+                self.tab_split_drop = self
+                    .tab_split_drag_eligible()
+                    .then(|| {
+                        self.pane_rects().into_iter().find_map(|pane| {
+                            let direction = split_drop_direction(pane.rect, point)?;
+                            let target_session_id = self.sessions.get(pane.session)?.id;
+                            Some(TabSplitDrop {
+                                target_session_id,
+                                direction,
+                            })
+                        })
+                    })
+                    .flatten();
+            }
+            Message::TabDragLeavePaneArea => self.tab_split_drop = None,
+            Message::TabDragHoverTick => {
+                let source_is_plain = self
+                    .dragging_tab
+                    .and_then(|id| self.tab_index_by_id(id))
+                    .is_some_and(|tab| self.tabs[tab].tree.is_leaf());
+                let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+                let ready = self.tab_drag_hover_since.is_some_and(|(target, since)| {
+                    tab_drag_hover_ready(
+                        self.dragging_tab,
+                        source_is_plain,
+                        active_id,
+                        self.hovered_tab,
+                        target,
+                        since.elapsed(),
+                    )
+                });
+                if !source_is_plain
+                    || self
+                        .tab_drag_hover_since
+                        .is_some_and(|(target, _)| active_id == Some(target))
+                {
+                    self.tab_drag_hover_since = None;
+                }
+                if ready {
+                    let target = self
+                        .tab_drag_hover_since
+                        .take()
+                        .and_then(|(id, _)| self.tab_index_by_id(id));
+                    if let Some(target) = target {
+                        self.activate_tab(target);
+                    }
+                }
+            }
+            Message::TabSplitDrop => {
+                self.finish_tab_split_drop();
             }
             Message::TabDragCancel => {
-                self.dragging_tab = None;
+                self.cancel_layout_drags();
             }
             Message::DividerDragStart(divider) => {
                 let now = std::time::Instant::now();
@@ -6318,18 +6808,20 @@ impl Frost {
                     }
                 }
             }
-            Message::PaneDragStart(session) => {
+            Message::PaneDragStart(session_id) => {
                 // A press on the header focuses its pane, exactly like a click
                 // in the terminal below it. The swap only happens if the
                 // pointer is released somewhere else.
-                if self.layout().contains_session(session) {
+                if let Some(session) = self.session_index_by_id(session_id) {
+                    if !self.layout().contains_session(session) {
+                        return Task::none();
+                    }
                     self.set_focus(session);
                     self.session_dirty = true;
                     self.refresh_active_context();
-                }
-                if let Some(sess) = self.sessions.get(session) {
+                    self.cancel_tab_drag();
                     self.pane_drag = Some(PaneDrag {
-                        session_id: sess.id,
+                        session_id,
                         target: None,
                     });
                 }
@@ -6350,19 +6842,29 @@ impl Frost {
                         })
                         .map(|pane| pane.session)
                         .filter(|hit| *hit != source)
+                        .and_then(|hit| self.sessions.get(hit).map(|session| session.id))
                 });
                 if let Some(drag) = self.pane_drag.as_mut() {
                     drag.target = target;
                 }
             }
+            Message::PaneDragLeavePaneArea => {
+                if let Some(drag) = self.pane_drag.as_mut() {
+                    drag.target = None;
+                }
+            }
             Message::PaneDragEnd => {
                 if let Some(drag) = self.pane_drag.take() {
-                    if let (Some(source), Some(target)) =
-                        (self.session_index_by_id(drag.session_id), drag.target)
-                    {
+                    if let (Some(source), Some(target)) = (
+                        self.session_index_by_id(drag.session_id),
+                        drag.target.and_then(|id| self.session_index_by_id(id)),
+                    ) {
                         self.swap_pane_sessions(source, target);
                     }
                 }
+            }
+            Message::PanePromoteToTab(after_tab_id) => {
+                self.finish_pane_promotion(after_tab_id);
             }
             Message::SidebarDragStart => self.dragging_sidebar = true,
             Message::SidebarDragEnd => self.dragging_sidebar = false,
@@ -7242,6 +7744,13 @@ impl Frost {
                     .padding([3, 8])
                     .style(self.ghost_btn_style()),
             );
+            if self.pane_drag.is_some() {
+                tabs = tabs.push(self.pane_to_tab_drop_hint(false));
+                let tabs = mouse_area(tabs.width(Length::Fill))
+                    .on_release(Message::PanePromoteToTab(None))
+                    .interaction(iced::mouse::Interaction::Grabbing);
+                return self.top_bar_with_close(tabs.into());
+            }
             return self.top_bar_with_close(tabs.into());
         }
         // Dock the tab strip into the left sidebar (vertical tab list).
@@ -7307,12 +7816,24 @@ impl Frost {
                 .padding([3, 8])
                 .style(self.ghost_btn_style()),
         );
-        let scroller = scrollable(tabs)
+        if self.pane_drag.is_some() {
+            tabs = tabs.push(self.pane_to_tab_drop_hint(false));
+        }
+        let scroller: Element<'_, Message> = scrollable(tabs)
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::new().width(0).scroller_width(0),
             ))
-            .width(Length::Fill);
-        self.top_bar_with_close(scroller.into())
+            .width(Length::Fill)
+            .into();
+        let scroller = if self.pane_drag.is_some() {
+            mouse_area(scroller)
+                .on_release(Message::PanePromoteToTab(None))
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else {
+            scroller
+        };
+        self.top_bar_with_close(scroller)
     }
 
     /// The top bar doubles as the window's title bar: the window is
@@ -8604,7 +9125,30 @@ impl Frost {
         .center_x(Length::Fill)
         .padding([4, 0]);
         list = list.push(new_tab);
-        scrollable(list).height(Length::Fill).into()
+        if self.pane_drag.is_some() {
+            list = list.push(self.pane_to_tab_drop_hint(true));
+        }
+        let list: Element<'_, Message> = scrollable(list).height(Length::Fill).into();
+        if self.pane_drag.is_some() {
+            mouse_area(list)
+                .on_release(Message::PanePromoteToTab(None))
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else {
+            list
+        }
+    }
+
+    fn pane_to_tab_drop_hint(&self, compact: bool) -> Element<'_, Message> {
+        let label = if compact {
+            "↓ Drop pane as tab"
+        } else {
+            "Drop pane here → new tab"
+        };
+        container(text(label).size(11).color(self.c_text()))
+            .padding(if compact { [5, 8] } else { [3, 9] })
+            .style(self.split_drop_zone_style())
+            .into()
     }
 
     /// Recursively flatten a file-tree node (and expanded descendants) into rows.
@@ -8720,11 +9264,21 @@ impl Frost {
                 } else {
                     self.pane_view(*session)
                 };
-                container(body)
+                let framed: Element<'_, Message> = container(body)
                     .style(self.pane_frame_style(focused))
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .into()
+                    .into();
+                let direction = self.sessions.get(*session).and_then(|session| {
+                    self.tab_split_drop
+                        .filter(|drop| drop.target_session_id == session.id)
+                        .map(|drop| drop.direction)
+                });
+                if let Some(direction) = direction {
+                    stack![framed, self.split_drop_overlay(direction)].into()
+                } else {
+                    framed
+                }
             }
             PaneTree::Split {
                 axis,
@@ -8798,11 +9352,11 @@ impl Frost {
         let drag_source = self
             .pane_drag
             .as_ref()
-            .is_some_and(|drag| drag.target.is_some() && drag.session_id == sess.id);
+            .is_some_and(|drag| drag.session_id == sess.id);
         let drop_target = self
             .pane_drag
             .as_ref()
-            .is_some_and(|drag| drag.target == Some(session));
+            .is_some_and(|drag| drag.target == Some(sess.id));
 
         let mut line = row![
             text(format!("{}", position + 1))
@@ -8852,7 +9406,7 @@ impl Frost {
             .style(self.pane_header_style(focused, drag_source, drop_target));
 
         mouse_area(strip)
-            .on_press(Message::PaneDragStart(session))
+            .on_press(Message::PaneDragStart(sess.id))
             .interaction(iced::mouse::Interaction::Grab)
             .into()
     }
@@ -8913,6 +9467,96 @@ impl Frost {
         }
     }
 
+    /// Directional overlay shown only after the pointer enters a pane edge's
+    /// armed zone. The untouched center remains visible as a safe cancel area.
+    fn split_drop_overlay(&self, direction: PaneDirection) -> Element<'_, Message> {
+        let label = match direction {
+            PaneDirection::Left => "← Split left",
+            PaneDirection::Right => "Split right →",
+            PaneDirection::Up => "↑ Split above",
+            PaneDirection::Down => "Split below ↓",
+        };
+        let zone = container(text(label).size(13).color(self.c_text()))
+            .center(Length::Fill)
+            .style(self.split_drop_zone_style());
+        let overlay: Element<'_, Message> = match direction {
+            PaneDirection::Left => row![
+                container(zone).width(Length::FillPortion(28)),
+                Space::new().width(Length::FillPortion(72)),
+            ]
+            .height(Length::Fill)
+            .into(),
+            PaneDirection::Right => row![
+                Space::new().width(Length::FillPortion(72)),
+                container(zone).width(Length::FillPortion(28)),
+            ]
+            .height(Length::Fill)
+            .into(),
+            PaneDirection::Up => column![
+                container(zone).height(Length::FillPortion(28)),
+                Space::new().height(Length::FillPortion(72)),
+            ]
+            .width(Length::Fill)
+            .into(),
+            PaneDirection::Down => column![
+                Space::new().height(Length::FillPortion(72)),
+                container(zone).height(Length::FillPortion(28)),
+            ]
+            .width(Length::Fill)
+            .into(),
+        };
+        container(overlay)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn split_drop_zone_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let base = Theme::rgb_to_color32(self.theme.tabbar.bg);
+        let accent = self.c_accent();
+        move |_| {
+            let mut background = blend(base, accent, 0.48);
+            background.a = 0.88;
+            container::Style {
+                background: Some(background.into()),
+                border: iced::Border {
+                    color: accent,
+                    width: 2.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    fn tab_to_split_instruction(&self) -> Element<'_, Message> {
+        let mut background = blend(
+            Theme::rgb_to_color32(self.theme.tabbar.bg),
+            self.c_accent(),
+            0.28,
+        );
+        background.a = 0.92;
+        let accent = self.c_accent();
+        let foreground = self.c_text();
+        let chip = container(text("Drop near a pane edge to split · center cancels").size(11))
+            .padding([5, 10])
+            .style(move |_| container::Style {
+                text_color: Some(foreground),
+                background: Some(background.into()),
+                border: iced::Border {
+                    color: accent,
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..Default::default()
+            });
+        container(chip)
+            .center_x(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(8)
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         if self.sessions.is_empty() {
             let message = self
@@ -8950,6 +9594,11 @@ impl Frost {
             // of siblings. Integer FillPortions approximate the float shares.
             self.render_tree(self.layout(), &[])
         };
+        let panes_body: Element<'_, Message> = if self.tab_split_drag_eligible() {
+            stack![panes_body, self.tab_to_split_instruction()].into()
+        } else {
+            panes_body
+        };
         // While dragging the divider, wrap the panes in a mouse_area so pointer
         // moves drive the resize and release ends it. The handler is attached
         // only during a drag to avoid emitting a message on every idle move.
@@ -8961,11 +9610,21 @@ impl Frost {
                 .into()
         } else if self.pane_drag.is_some() {
             // Same pattern as the divider drag: pointer moves track which pane
-            // is under the cursor and release commits the swap.
+            // is under the cursor and release commits the swap. Leaving the
+            // pane area preserves the source so the tab strip can promote it.
             mouse_area(panes_body)
                 .on_move(Message::PaneDragMove)
                 .on_release(Message::PaneDragEnd)
-                .on_exit(Message::PaneDragEnd)
+                .on_exit(Message::PaneDragLeavePaneArea)
+                .interaction(iced::mouse::Interaction::Grabbing)
+                .into()
+        } else if self.dragging_tab.is_some() {
+            // An ordinary tab can be moved into any edge of the visible page.
+            // Movement arms one explicit edge; release in the center cancels.
+            mouse_area(panes_body)
+                .on_move(Message::TabDragMove)
+                .on_release(Message::TabSplitDrop)
+                .on_exit(Message::TabDragLeavePaneArea)
                 .interaction(iced::mouse::Interaction::Grabbing)
                 .into()
         } else {
@@ -10581,6 +11240,9 @@ impl Frost {
             iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
                 Some(Message::TabDragCancel)
             }
+            iced::Event::Touch(
+                iced::touch::Event::FingerLifted { .. } | iced::touch::Event::FingerLost { .. },
+            ) => Some(Message::TabDragCancel),
             _ => None,
         });
         subs.push(events);
@@ -10598,6 +11260,12 @@ impl Frost {
                     _ => None,
                 },
             ));
+        }
+        if self.tab_drag_hover_since.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50))
+                    .map(|_| Message::TabDragHoverTick),
+            );
         }
         subs.push(
             iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
@@ -11583,6 +12251,311 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tab_split_drop_zones_choose_the_nearest_edge_and_keep_a_dead_center() {
+        let rect = pane_layout::Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(11.0, 60.0)),
+            Some(PaneDirection::Left)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(109.0, 60.0)),
+            Some(PaneDirection::Right)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(60.0, 21.0)),
+            Some(PaneDirection::Up)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(60.0, 99.0)),
+            Some(PaneDirection::Down)
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(60.0, 60.0)),
+            None
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(110.0, 60.0)),
+            None
+        );
+        assert_eq!(
+            split_drop_direction(rect, iced::Point::new(f32::NAN, 60.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_split_commit_revalidates_visible_target_zoom_and_capacity() {
+        assert!(tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(1),
+            2,
+            false
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(2),
+            2,
+            false
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(1),
+            2,
+            true
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            true,
+            1,
+            Some(1),
+            MAX_PANES,
+            false
+        ));
+        assert!(!tab_split_commit_allowed(
+            Some(0),
+            false,
+            1,
+            Some(1),
+            2,
+            false
+        ));
+    }
+
+    #[test]
+    fn drag_hover_switch_requires_the_same_target_for_the_full_delay() {
+        let almost = std::time::Duration::from_millis(TAB_DRAG_HOVER_SWITCH_MS - 1);
+        let ready = std::time::Duration::from_millis(TAB_DRAG_HOVER_SWITCH_MS);
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(3),
+            Some(2),
+            2,
+            almost
+        ));
+        assert!(tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(3),
+            Some(4),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            Some(2),
+            true,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            None,
+            true,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            false,
+            Some(3),
+            Some(2),
+            2,
+            ready
+        ));
+        // Hovering the page that is already active must not invoke
+        // `activate_tab` and unexpectedly clear that page's zoom state.
+        assert!(!tab_drag_hover_ready(
+            Some(1),
+            true,
+            Some(2),
+            Some(2),
+            2,
+            ready
+        ));
+    }
+
+    #[test]
+    fn a_drag_returning_to_its_source_restores_origin_but_a_click_activates() {
+        assert!(tab_drag_hover_left_source(Some(2), None));
+        assert!(tab_drag_hover_left_source(Some(2), Some(3)));
+        assert!(!tab_drag_hover_left_source(Some(2), Some(2)));
+        assert_eq!(
+            tab_drag_release_action(Some(2), Some(2), false),
+            TabDragReleaseAction::Activate(2)
+        );
+        assert_eq!(
+            tab_drag_release_action(Some(2), Some(2), true),
+            TabDragReleaseAction::RestoreOrigin
+        );
+        assert_eq!(
+            tab_drag_release_action(Some(2), Some(3), true),
+            TabDragReleaseAction::Reorder { from: 2, to: 3 }
+        );
+        assert_eq!(
+            tab_drag_release_action(None, Some(3), true),
+            TabDragReleaseAction::RestoreOrigin
+        );
+    }
+
+    #[test]
+    fn ordinary_tab_moves_to_each_direction_without_duplicating_its_session() {
+        let cases = [
+            (PaneDirection::Left, Axis::Vertical, vec![0, 1]),
+            (PaneDirection::Right, Axis::Vertical, vec![1, 0]),
+            (PaneDirection::Up, Axis::Horizontal, vec![0, 1]),
+            (PaneDirection::Down, Axis::Horizontal, vec![1, 0]),
+        ];
+        for (direction, expected_axis, expected_leaves) in cases {
+            let mut tabs = vec![Tab::new(10, 0), Tab::new(20, 1)];
+            let result = move_plain_tab_into_split(&mut tabs, 10, 1, direction);
+
+            assert_eq!(result, Some((0, 0)), "{direction:?}");
+            assert_eq!(tabs.len(), 1, "{direction:?}");
+            assert_eq!(tabs[0].sessions(), expected_leaves, "{direction:?}");
+            assert_eq!(tabs[0].focus, 0, "{direction:?}");
+            let PaneTree::Split { axis, .. } = &tabs[0].tree else {
+                panic!("directional drop did not create a split")
+            };
+            assert_eq!(*axis, expected_axis, "{direction:?}");
+            let all = tabs.iter().flat_map(Tab::sessions).collect::<Vec<_>>();
+            assert_eq!(all.iter().filter(|session| **session == 0).count(), 1);
+        }
+    }
+
+    #[test]
+    fn invalid_tab_to_split_drops_are_transactional_no_ops() {
+        let mut split_source = vec![split_tab(10, &[0, 1]), Tab::new(20, 2)];
+        let before = split_source
+            .iter()
+            .map(|tab| (tab.id, tab.sessions(), tab.focus))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            move_plain_tab_into_split(&mut split_source, 10, 2, PaneDirection::Left),
+            None
+        );
+        assert_eq!(
+            split_source
+                .iter()
+                .map(|tab| (tab.id, tab.sessions(), tab.focus))
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        let target_sessions = (1..=MAX_PANES).collect::<Vec<_>>();
+        let mut full_target = vec![Tab::new(10, 0), split_tab(20, &target_sessions)];
+        let before = full_target
+            .iter()
+            .map(|tab| (tab.id, tab.sessions(), tab.focus))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            move_plain_tab_into_split(&mut full_target, 10, 1, PaneDirection::Right),
+            None
+        );
+        assert_eq!(
+            full_target
+                .iter()
+                .map(|tab| (tab.id, tab.sessions(), tab.focus))
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        let mut same_tab = vec![Tab::new(10, 0), Tab::new(20, 1)];
+        assert_eq!(
+            move_plain_tab_into_split(&mut same_tab, 10, 0, PaneDirection::Down),
+            None
+        );
+        assert_eq!(same_tab[0].sessions(), vec![0]);
+    }
+
+    #[test]
+    fn nested_split_pane_promotes_to_one_new_tab_and_collapses_its_source() {
+        let mut tabs = vec![
+            Tab {
+                id: 7,
+                tree: PaneTree::Split {
+                    axis: Axis::Vertical,
+                    children: vec![
+                        PaneTree::Leaf(0),
+                        PaneTree::Split {
+                            axis: Axis::Horizontal,
+                            children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                            ratios: vec![0.5, 0.5],
+                        },
+                    ],
+                    ratios: vec![0.4, 0.6],
+                },
+                focus: 1,
+                title: None,
+                pinned: false,
+                marked: false,
+            },
+            Tab::new(8, 3),
+        ];
+        let mut next_id = 9;
+
+        let promoted = promote_split_pane_to_tab(&mut tabs, &mut next_id, 1, Some(8));
+
+        assert_eq!(promoted, Some((2, 1)));
+        assert_eq!(next_id, 10);
+        assert_eq!(tabs[0].sessions(), vec![0, 2]);
+        assert_eq!(tabs[0].focus, 0);
+        assert_eq!(tabs[2].id, 9);
+        assert_eq!(tabs[2].sessions(), vec![1]);
+        let mut all = tabs.iter().flat_map(Tab::sessions).collect::<Vec<_>>();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn invalid_pane_promotions_leave_layout_and_id_counter_untouched() {
+        let mut tabs = vec![split_tab(1, &[0, 1]), Tab::new(2, 2)];
+        let before = tabs
+            .iter()
+            .map(|tab| (tab.id, tab.sessions(), tab.focus))
+            .collect::<Vec<_>>();
+        let mut next_id = 3;
+        assert_eq!(
+            promote_split_pane_to_tab(&mut tabs, &mut next_id, 1, Some(999)),
+            None
+        );
+        assert_eq!(next_id, 3);
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| (tab.id, tab.sessions(), tab.focus))
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        assert_eq!(
+            promote_split_pane_to_tab(&mut tabs, &mut next_id, 2, None),
+            None
+        );
+        assert_eq!(next_id, 3);
+    }
+
     /// The headline rule: a tab owns its panes, so closing it takes every
     /// session in it and leaves the neighbouring tabs pointing where they were.
     #[test]
@@ -11757,6 +12730,57 @@ mod tests {
             vec![2, 0, 1, 3]
         );
         assert_eq!(tabs[active].id, 1);
+    }
+
+    #[test]
+    fn drag_reorder_clamps_both_sides_of_the_pinned_boundary() {
+        let mut tabs = vec![
+            Tab::new(0, 0),
+            Tab::new(1, 1),
+            Tab::new(2, 2),
+            Tab::new(3, 3),
+        ];
+        tabs[0].pinned = true;
+        tabs[1].pinned = true;
+
+        // An unpinned tab dropped on the first pinned tab lands immediately
+        // after the pinned prefix; the formerly active id 2 remains active.
+        let active = reorder_tabs_preserving_pinned_prefix(&mut tabs, 2, 3, 0).unwrap();
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![0, 1, 3, 2]
+        );
+        assert_eq!(tabs[active].id, 2);
+        assert!(tabs[..2].iter().all(|tab| tab.pinned));
+        assert!(tabs[2..].iter().all(|tab| !tab.pinned));
+
+        // A pinned tab dropped on an unpinned tab stays at the other side of
+        // the same boundary instead of persisting an invalid mixed prefix.
+        let active = reorder_tabs_preserving_pinned_prefix(&mut tabs, active, 0, 3).unwrap();
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![1, 0, 3, 2]
+        );
+        assert_eq!(tabs[active].id, 2);
+        assert!(tabs[..2].iter().all(|tab| tab.pinned));
+        assert!(tabs[2..].iter().all(|tab| !tab.pinned));
+    }
+
+    #[test]
+    fn a_new_unpinned_tab_never_splits_the_pinned_prefix() {
+        let mut tabs = vec![
+            Tab::new(0, 0),
+            Tab::new(1, 1),
+            Tab::new(2, 2),
+            Tab::new(3, 3),
+        ];
+        tabs[0].pinned = true;
+        tabs[1].pinned = true;
+        tabs[2].pinned = true;
+
+        assert_eq!(new_unpinned_tab_index(&tabs, 0), 3);
+        assert_eq!(new_unpinned_tab_index(&tabs, 2), 3);
+        assert_eq!(new_unpinned_tab_index(&tabs, 3), 4);
     }
 
     #[test]

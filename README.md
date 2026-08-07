@@ -5,6 +5,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 ## 主要能力
 
 - 多标签、拖动排序、快速标签切换，以及 tmux 风格的树状分屏（任意 pane 可再沿任一方向嵌套拆分）
+- 拖动普通单-pane tab 到目标 pane 的四边即可无损并入分屏；拖动分屏标题栏回 tab 栏即可恢复为普通 tab。拖动悬停标签约半秒会预览目标页，中心释放安全取消，现有 PTY 不会重启或复制
 - 搜索当前屏幕与全部 scrollback，支持大小写匹配、正则和自动滚动定位
 - 查找替换面板（`Ctrl+Alt+R`）：scrollback 是只读输出，替换作用于当前选中文本——结果复制到剪贴板，或不带回车回填到提示符；支持字面/正则、大小写、全词与全部替换
 - UTF-8、中文宽字符、True Color、256 色、鼠标报告、括号粘贴和扩展键盘协议
@@ -295,4 +296,3 @@ The grammar, validation and argv are shared with the whole jterm family
 (`jterm_core::jsh_remote::RemoteHostConfig`); typing `ssh host` or
 `docker exec -it name bash` into a jsh prompt reaches the same machinery with
 no configuration at all.
-
