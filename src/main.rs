@@ -764,10 +764,10 @@ enum Message {
     AgentEditCancel,
     AgentReject(jterm_core::agent::ProposalId),
     /// One streamed fragment of the in-flight model reply for the given
-    /// request generation (stale ones dropped).
-    AgentModelDelta(u64, String),
-    /// One model reply for the given request generation (stale ones dropped).
-    AgentModelReply(u64, Result<String, String>),
+    /// request task epoch/generation (stale ones dropped).
+    AgentModelDelta(agent::ModelRequestIdentity, String),
+    /// One model reply for the given request identity (stale ones dropped).
+    AgentModelReply(agent::ModelRequestIdentity, Result<String, String>),
     AgentContinueTask,
     AgentNewTask,
     AgentClearContext,
@@ -5769,11 +5769,11 @@ impl Frost {
                     return task;
                 }
             }
-            Message::AgentModelDelta(generation, fragment) => {
-                self.agent.model_delta(generation, &fragment);
+            Message::AgentModelDelta(identity, fragment) => {
+                self.agent.model_delta(identity, &fragment);
             }
-            Message::AgentModelReply(generation, result) => {
-                self.agent.model_reply(generation, result);
+            Message::AgentModelReply(identity, result) => {
+                self.agent.model_reply(identity, result);
                 if let Some(task) = self.agent_drive_task() {
                     return task;
                 }
@@ -10101,7 +10101,7 @@ impl Frost {
             .agent
             .next_model_request(&self.config, cwd.as_deref())?;
         let agent::ModelRequest {
-            generation,
+            identity,
             client,
             system,
             user,
@@ -10123,13 +10123,13 @@ impl Frost {
             let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
             std::thread::spawn(move || {
                 let mut on_delta = |fragment: &str| {
-                    let _ = tx
-                        .unbounded_send(Message::AgentModelDelta(generation, fragment.to_string()));
+                    let _ =
+                        tx.unbounded_send(Message::AgentModelDelta(identity, fragment.to_string()));
                 };
                 let result = client
                     .send_turns_streaming_cancellable(Some(&system), &turns, &token, &mut on_delta)
                     .map_err(|error| error.to_string());
-                let _ = tx.unbounded_send(Message::AgentModelReply(generation, result));
+                let _ = tx.unbounded_send(Message::AgentModelReply(identity, result));
             });
             return Some(Task::stream(rx));
         }
@@ -10146,7 +10146,7 @@ impl Frost {
                     Err(error) => Err(format!("AI worker task failed: {error}")),
                 }
             },
-            move |result| Message::AgentModelReply(generation, result),
+            move |result| Message::AgentModelReply(identity, result),
         ))
     }
 

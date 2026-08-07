@@ -971,8 +971,8 @@ mod tests {
 
     impl ScratchDir {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("frost-config-{label}-{}", uuid::Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("frost-config-{label}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&path).expect("create config scratch directory");
             Self(path)
         }

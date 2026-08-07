@@ -19,8 +19,8 @@
 use crate::config::Config;
 use crate::terminal::CompletedCommand;
 use jterm_core::agent::{
-    AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ModelOutcome, ProposalId,
-    ProposalStatus, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    AgentSession, AgentSessionEpoch, AgentSessionSnapshot, AgentSnapshotError, AgentState,
+    ModelOutcome, ProposalId, ProposalStatus, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
 use jterm_core::ai::{AiCancellationToken, AiClient, BlockContext, Provider};
 use std::path::Path;
@@ -28,11 +28,7 @@ use std::path::Path;
 const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join("frost")
-            .join("agent_session.json"),
-    )
+    Some(dirs::config_dir()?.join("frost").join("agent_session.json"))
 }
 
 /// Atomically claim the persisted snapshot and consume it into a session.
@@ -221,8 +217,14 @@ pub fn client_from_config(config: &Config) -> Result<AiClient, String> {
 
 /// Everything the update loop needs to launch one model request on a
 /// background task.
-pub struct ModelRequest {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelRequestIdentity {
+    pub epoch: AgentSessionEpoch,
     pub generation: u64,
+}
+
+pub struct ModelRequest {
+    pub identity: ModelRequestIdentity,
     pub client: AiClient,
     pub system: String,
     pub user: String,
@@ -373,6 +375,11 @@ struct PendingAgentExecution {
     generation: u64,
 }
 
+struct InFlightModelRequest {
+    identity: ModelRequestIdentity,
+    token: AiCancellationToken,
+}
+
 pub struct AgentUi {
     pub is_open: bool,
     pub session: Option<AgentSession>,
@@ -391,12 +398,12 @@ pub struct AgentUi {
     pub loading: bool,
     pub status: String,
     pub provider_label: String,
-    /// Monotonic id for in-flight model requests; replies carrying a stale
-    /// generation (from a closed/replaced session) are dropped.
+    /// Checked monotonic half of an in-flight model request identity. The
+    /// other half is the task epoch stored in [`InFlightModelRequest`].
     generation: u64,
     /// Monotonic one-shot identity for approved shell executions.
     execution_generation: u64,
-    in_flight: Option<AiCancellationToken>,
+    in_flight: Option<InFlightModelRequest>,
     /// Raw streamed reply text accumulated for the current generation. Only
     /// a live preview: the transcript records the complete returned text via
     /// `accept_model_reply`, so streaming and blocking store identical
@@ -488,8 +495,8 @@ impl AgentUi {
     }
 
     fn close_session(&mut self) {
-        if let Some(token) = self.in_flight.take() {
-            token.cancel();
+        if let Some(request) = self.in_flight.take() {
+            request.token.cancel();
         }
         if let Some(session) = self.session.as_mut() {
             session.cancel();
@@ -501,8 +508,43 @@ impl AgentUi {
         self.loading = false;
         self.edit = None;
         self.stream_raw.clear();
-        // Invalidate any reply still in flight.
-        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn seal_model_request_identities(&mut self) {
+        if let Some(request) = self.in_flight.take() {
+            request.token.cancel();
+        }
+        self.loading = false;
+        if let Some(session) = self.session.as_mut() {
+            session.cancel();
+        }
+        self.status = "Agent model request identities are exhausted".to_string();
+    }
+
+    fn accepts_model_callback(&mut self, identity: ModelRequestIdentity) -> bool {
+        if !self
+            .in_flight
+            .as_ref()
+            .is_some_and(|request| request.identity == identity)
+        {
+            return false;
+        }
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_current_epoch(identity.epoch))
+        {
+            // This is not an older callback racing a newer request: it is the
+            // currently tracked request after its task epoch was replaced.
+            // Retire it without feeding an error into the replacement session.
+            if let Some(request) = self.in_flight.take() {
+                request.token.cancel();
+            }
+            self.loading = false;
+            self.stream_raw.clear();
+            return false;
+        }
+        self.loading
     }
 
     pub fn submit_input(&mut self) {
@@ -529,10 +571,17 @@ impl AgentUi {
         config: &Config,
         cwd: Option<&str>,
     ) -> Option<ModelRequest> {
-        let session = self.session.as_ref()?;
-        if self.loading || session.state() != AgentState::AwaitingModel {
+        let epoch = {
+            let session = self.session.as_ref()?;
+            if self.loading || session.state() != AgentState::AwaitingModel {
+                return None;
+            }
+            session.epoch()
+        };
+        let Some(generation) = self.generation.checked_add(1) else {
+            self.seal_model_request_identities();
             return None;
-        }
+        };
         let client = match client_from_config(config) {
             Ok(client) => client,
             Err(error) => {
@@ -544,6 +593,7 @@ impl AgentUi {
             }
         };
         self.provider_label = client.display_name();
+        let session = self.session.as_ref()?;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
         // Cached repo probe with a bounded UI wait; None outside a repo.
         let git = cwd.and_then(|cwd| jterm_core::git_meta::read(std::path::Path::new(cwd)));
@@ -556,13 +606,17 @@ impl AgentUi {
             self.last_manual_completed.as_ref(),
         );
         let token = AiCancellationToken::new();
-        self.in_flight = Some(token.clone());
+        let identity = ModelRequestIdentity { epoch, generation };
+        self.in_flight = Some(InFlightModelRequest {
+            identity,
+            token: token.clone(),
+        });
         self.loading = true;
         self.status.clear();
         self.stream_raw.clear();
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = generation;
         Some(ModelRequest {
-            generation: self.generation,
+            identity,
             client,
             system: jterm_core::ai::build_agent_system_prompt(),
             user,
@@ -571,22 +625,26 @@ impl AgentUi {
     }
 
     /// Append one streamed fragment of the in-flight reply. Fragments from a
-    /// stale generation (a cancelled or replaced request) are dropped, as are
-    /// fragments arriving after the final reply.
-    pub fn model_delta(&mut self, generation: u64, fragment: &str) {
-        if generation != self.generation || !self.loading {
+    /// stale identity (a cancelled or replaced task epoch/request generation)
+    /// are dropped, as are fragments arriving after the final reply.
+    pub fn model_delta(&mut self, identity: ModelRequestIdentity, fragment: &str) {
+        if !self.accepts_model_callback(identity) {
             return;
         }
         if self.stream_raw.len().saturating_add(fragment.len()) > MAX_AGENT_MODEL_REPLY_BYTES {
-            if let Some(token) = self.in_flight.as_ref() {
-                token.cancel();
+            if let Some(request) = self.in_flight.as_ref() {
+                request.token.cancel();
             }
             self.in_flight = None;
             self.loading = false;
             // Invalidate the worker immediately. Relying on a later final
             // callback after cancellation could leave the UI permanently
             // loading if a transport exits without delivering it.
-            self.generation = self.generation.wrapping_add(1);
+            let Some(generation) = self.generation.checked_add(1) else {
+                self.seal_model_request_identities();
+                return;
+            };
+            self.generation = generation;
             let message = format!("AI reply exceeded the {MAX_AGENT_MODEL_REPLY_BYTES}-byte limit");
             if let Some(session) = self.session.as_mut() {
                 if let Err(error) = session.model_failed(message.clone()) {
@@ -620,8 +678,8 @@ impl AgentUi {
     /// (an older, cancelled request) are ignored. On success the complete
     /// returned text — the single source of truth — replaces the streamed
     /// preview; on failure the preview is kept alongside the recorded error.
-    pub fn model_reply(&mut self, generation: u64, result: Result<String, String>) {
-        if generation != self.generation || !self.loading {
+    pub fn model_reply(&mut self, identity: ModelRequestIdentity, result: Result<String, String>) {
+        if !self.accepts_model_callback(identity) {
             return;
         }
         self.in_flight = None;
@@ -1093,9 +1151,17 @@ mod tests {
     #[test]
     fn streamed_command_preview_escapes_visual_spoofing() {
         let mut agent = AgentUi::new();
-        agent.loading = true;
-        agent.generation = 7;
-        agent.model_delta(7, r#"{"action":"run","command":"printf safe\u202ehidden"}"#);
+        agent.open(&ai_config(), 1);
+        agent.input = "show a command".into();
+        agent.submit_input();
+        let identity = agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("request should start")
+            .identity;
+        agent.model_delta(
+            identity,
+            r#"{"action":"run","command":"printf safe\u202ehidden"}"#,
+        );
         assert_eq!(
             agent.reply_preview().and_then(|preview| preview.command),
             Some("printf safe\\u{202E}hidden".to_string())
@@ -1262,13 +1328,120 @@ mod tests {
             .expect("request should start");
         assert!(agent.loading);
 
-        // Reopening invalidates the generation; the late reply is ignored.
+        // Reopening installs a new session epoch; the late reply is ignored.
         agent.open(&ai_config(), 2);
         agent.model_reply(
-            request.generation,
+            request.identity,
             Ok("{\"action\":\"say\",\"message\":\"hi\"}".into()),
         );
         assert_eq!(agent.session.as_ref().unwrap().transcript().len(), 0);
+    }
+
+    #[test]
+    fn restored_session_epoch_rejects_an_old_in_flight_callback() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 1);
+        agent.input = "hello".into();
+        agent.submit_input();
+        let request = agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("request should start");
+        let cancellation = request.token.clone();
+        agent.model_delta(
+            request.identity,
+            r#"{"action":"say","message":"old preview""#,
+        );
+        assert!(agent.reply_preview().is_some());
+        let snapshot = agent
+            .session
+            .as_ref()
+            .and_then(AgentSession::snapshot)
+            .expect("in-flight session should snapshot");
+        let restored = restore_snapshot_session(snapshot).expect("snapshot should restore");
+        assert!(!restored.is_current_epoch(request.identity.epoch));
+        agent.session = Some(restored);
+        let transcript = agent.session.as_ref().unwrap().transcript().to_vec();
+
+        agent.model_reply(
+            request.identity,
+            Ok(r#"{"action":"say","message":"stale"}"#.into()),
+        );
+
+        assert!(!agent.loading);
+        assert!(agent.in_flight.is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(agent.reply_preview().is_none());
+        assert_eq!(agent.session.as_ref().unwrap().transcript(), transcript);
+    }
+
+    #[test]
+    fn stale_model_callbacks_are_dropped_after_new_task() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 1);
+        agent.input = "first task".into();
+        agent.submit_input();
+        let stale_identity = agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("first request should start")
+            .identity;
+        agent.model_reply(
+            stale_identity,
+            Ok(r#"{"action":"done","message":"finished"}"#.into()),
+        );
+        assert_eq!(
+            agent.session.as_ref().unwrap().state(),
+            AgentState::Completed
+        );
+
+        agent.new_task();
+        assert_eq!(agent.session.as_ref().unwrap().state(), AgentState::Ready);
+        assert!(!agent
+            .session
+            .as_ref()
+            .unwrap()
+            .is_current_epoch(stale_identity.epoch));
+        agent.input = "second task".into();
+        agent.submit_input();
+        let current_identity = agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .expect("second request should start")
+            .identity;
+        let transcript = agent.session.as_ref().unwrap().transcript().to_vec();
+
+        agent.model_delta(stale_identity, r#"{"action":"say","message":"stale""#);
+        agent.model_reply(
+            stale_identity,
+            Ok(r#"{"action":"say","message":"stale"}"#.into()),
+        );
+
+        assert!(agent.loading);
+        assert!(agent.reply_preview().is_none());
+        assert_eq!(agent.session.as_ref().unwrap().transcript(), transcript);
+        agent.model_reply(
+            current_identity,
+            Ok(r#"{"action":"say","message":"current"}"#.into()),
+        );
+        assert!(!agent.loading);
+    }
+
+    #[test]
+    fn model_request_generation_exhaustion_cancels_the_session() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 1);
+        agent.input = "hello".into();
+        agent.submit_input();
+        agent.generation = u64::MAX;
+
+        assert!(agent
+            .next_model_request(&ai_config(), Some("/tmp"))
+            .is_none());
+        assert!(!agent.loading);
+        assert!(agent.in_flight.is_none());
+        assert_eq!(
+            agent.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+        assert!(agent.status.contains("identities are exhausted"));
     }
 
     #[test]
@@ -1323,14 +1496,14 @@ mod tests {
         agent.open(&ai_config(), 1);
         agent.input = "hello".into();
         agent.submit_input();
-        let generation = agent
+        let identity = agent
             .next_model_request(&ai_config(), Some("/tmp"))
             .expect("request should start")
-            .generation;
+            .identity;
 
-        agent.model_delta(generation, r#"{"action":"say","#);
+        agent.model_delta(identity, r#"{"action":"say","#);
         assert!(agent.reply_preview().is_none());
-        agent.model_delta(generation, r#""message":"Hi the"#);
+        agent.model_delta(identity, r#""message":"Hi the"#);
         assert_eq!(
             agent
                 .reply_preview()
@@ -1339,8 +1512,12 @@ mod tests {
                 .as_deref(),
             Some("Hi the")
         );
-        // Stale generations never touch the preview.
-        agent.model_delta(generation.wrapping_add(1), "garbage");
+        // Stale identities never touch the preview.
+        let stale_identity = ModelRequestIdentity {
+            generation: identity.generation + 1,
+            ..identity
+        };
+        agent.model_delta(stale_identity, "garbage");
         assert_eq!(
             agent
                 .reply_preview()
@@ -1353,7 +1530,7 @@ mod tests {
         // The final complete text replaces the preview and is the only thing
         // recorded — the transcript matches the blocking path exactly.
         let raw = r#"{"action":"say","message":"Hi there"}"#;
-        agent.model_reply(generation, Ok(raw.into()));
+        agent.model_reply(identity, Ok(raw.into()));
         assert!(agent.reply_preview().is_none());
         assert!(!agent.loading);
 
@@ -1361,18 +1538,18 @@ mod tests {
         blocking.open(&ai_config(), 1);
         blocking.input = "hello".into();
         blocking.submit_input();
-        let generation = blocking
+        let blocking_identity = blocking
             .next_model_request(&ai_config(), Some("/tmp"))
             .expect("request should start")
-            .generation;
-        blocking.model_reply(generation, Ok(raw.into()));
+            .identity;
+        blocking.model_reply(blocking_identity, Ok(raw.into()));
         assert_eq!(
             agent.session.as_ref().unwrap().transcript(),
             blocking.session.as_ref().unwrap().transcript(),
         );
 
         let transcript = agent.session.as_ref().unwrap().transcript().to_vec();
-        agent.model_reply(generation, Ok(raw.into()));
+        agent.model_reply(identity, Ok(raw.into()));
         assert_eq!(agent.session.as_ref().unwrap().transcript(), transcript);
     }
 
@@ -1382,12 +1559,12 @@ mod tests {
         agent.open(&ai_config(), 1);
         agent.input = "hello".into();
         agent.submit_input();
-        let generation = agent
+        let identity = agent
             .next_model_request(&ai_config(), Some("/tmp"))
             .expect("request should start")
-            .generation;
+            .identity;
 
-        agent.model_delta(generation, &"x".repeat(MAX_AGENT_MODEL_REPLY_BYTES + 1));
+        agent.model_delta(identity, &"x".repeat(MAX_AGENT_MODEL_REPLY_BYTES + 1));
         assert!(agent.stream_raw.is_empty());
         assert!(agent.status.contains("exceeded"));
         assert!(!agent.loading);
@@ -1395,7 +1572,7 @@ mod tests {
 
         // The cancelled worker's eventual final callback is stale and cannot
         // add a second failure or revive the request.
-        agent.model_reply(generation, Ok("x".repeat(MAX_AGENT_MODEL_REPLY_BYTES + 1)));
+        agent.model_reply(identity, Ok("x".repeat(MAX_AGENT_MODEL_REPLY_BYTES + 1)));
         assert_eq!(agent.session.as_ref().unwrap().transcript(), transcript);
         assert!(matches!(
             agent.session.as_ref().unwrap().transcript().last(),
@@ -1409,13 +1586,13 @@ mod tests {
         agent.open(&ai_config(), 1);
         agent.input = "hello".into();
         agent.submit_input();
-        let generation = agent
+        let identity = agent
             .next_model_request(&ai_config(), Some("/tmp"))
             .expect("request should start")
-            .generation;
-        agent.model_delta(generation, r#"{"action":"say","message":"partial ans"#);
+            .identity;
+        agent.model_delta(identity, r#"{"action":"say","message":"partial ans"#);
 
-        agent.model_reply(generation, Err("connection reset".into()));
+        agent.model_reply(identity, Err("connection reset".into()));
         assert!(!agent.loading);
         // Partial text stays visible next to the recorded protocol error.
         assert_eq!(
