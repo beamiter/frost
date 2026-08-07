@@ -17,6 +17,9 @@ strict policy.
   cannot delete a newer checkpoint published by another.
 - Execution generations use `checked_add`; exhaustion seals the session rather
   than reusing an identity a late completion could bind to.
+- Model requests carry `{session epoch, request generation}` through both
+  blocking and streaming callbacks. New Task, restore, reopen, and cancellation
+  replace that identity before any late reply can mutate the current transcript.
 - `jsh_version_banner` now starts the probe in its own process group, drains a
   byte-bounded banner on a concurrent reader, enforces one deadline, and
   signals and reaps the whole group. A shell that daemonises a descendant
@@ -59,14 +62,6 @@ cumulative-text tests.
 `PATH` and read unbounded output without a deadline. Give them the same
 treatment: a trusted absolute program, a process group, concurrent bounded
 drains of stdout and stderr, one deadline, and a reaped group.
-
-### Bind Agent callbacks to the session epoch
-
-Approve/edit/reject resolve against the live session in the same frame, and the
-execution generation is now checked, so a stale *execution* completion is
-already rejected. A model completion still relies on the cancellation token;
-carry `AgentSessionEpoch` into the in-flight request so a reply for a previous
-task cannot be accepted after New Task or a restore.
 
 ### Connect OSC 8 to clicking, or keep it inert deliberately
 
