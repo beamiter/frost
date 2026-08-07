@@ -10,11 +10,13 @@ strict policy.
 
 ## Completed since the previous handoff
 
-- `src/persistence.rs` gained `claim_exclusive`, a no-clobber hard-link/unlink
-  claim, and `src/agent.rs` restores through it. Evidence that cannot become a
-  session is left at the claim path instead of being deleted. An empty or
-  rejected local session leaves the public path alone, so one process exiting
-  cannot delete a newer checkpoint published by another.
+- Agent restore now consumes `jterm_core::agent::SessionClaim`, backed by one
+  atomic no-replace rename rather than the former local hard-link/unlink pair.
+  Exactly one concurrent opener restores a valid snapshot; malformed, future,
+  oversized, and semantically invalid evidence remains byte-identical at its
+  private claim path. An empty or rejected local session still leaves the
+  public path alone, so one process exiting cannot delete a newer checkpoint
+  published by another.
 - Execution generations use `checked_add`; exhaustion seals the session rather
   than reusing an identity a late completion could bind to.
 - Model requests carry `{session epoch, request generation}` through both
@@ -43,7 +45,8 @@ strict policy.
   markers share the same four-way result. A commandless zone with a raw non-zero
   status remains background, and a command without a reported status remains
   unknown. `jterm_core` is pinned to
-  `9e79a5bf0d905575863def4d0e77f74a1f533638` with jagent unchanged transitively.
+  `fd25f905aadab9d8ca111a67b9b6422a22ef2d6c` (transitively jagent
+  `3aece307766ca8f3ca33ed0376d2a271cc2322b3`).
 
 ## Remaining boundaries
 
