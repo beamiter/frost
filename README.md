@@ -61,6 +61,18 @@ cargo build --release --locked
 | 图标 | `~/.local/share/icons/hicolor/{scalable,128x128,256x256}/apps/io.github.beamiter.frost.*` |
 | AppStream 元数据 | `~/.local/share/metainfo/io.github.beamiter.frost.metainfo.xml` |
 
+安装与卸载脚本都从同一组运行时路径推导目标：二进制默认为 `PREFIX/bin/frost`，
+桌面文件和图标位于 `PREFIX/share`。再次运行安装脚本会更新同一目标。`--bin-dir`
+只覆盖二进制目录；之后卸载时也应传入同一个 `--bin-dir`。`DESTDIR` 只在这些
+运行时绝对路径前追加打包根目录，desktop 文件中的 `Exec=` 仍指向不含
+`DESTDIR` 的运行时路径。
+
+旧版源码安装脚本曾错误地把无参数安装写到 `~/.cargo/bin/frost`。新脚本不会
+自动删除那个可能由用户显式管理的文件；若升级后 `command -v frost` 仍指向旧
+位置，可先核对它确实是旧副本，再执行
+`rm -f -- "$HOME/.cargo/bin/frost"`。卸载脚本总会同时移除所选 prefix 下的桌面
+集成，因此不应仅为清理旧二进制而运行它。
+
 这套桌面集成才让 frost 出现在 GNOME/KDE 的应用列表里，可搜索、可点击启动、可固定到
 dock。有三个细节决定它到底显不显示，安装脚本都已处理：
 

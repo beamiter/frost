@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 Agent review, configuration, terminal parsing, history, keybindings, and session
@@ -26,6 +26,12 @@ strict policy.
   visually ambiguous characters. Links open through a non-user-writable
   absolute opener — the Windows `cmd /C start` path is gone — file operands
   follow `--`, and the opener process is reaped.
+- `scripts/install.sh` and `scripts/uninstall.sh` now derive the default binary
+  from the same `PREFIX/bin` contract (`~/.local/bin` by default). Explicit
+  `--prefix`, `--bin-dir`, and `DESTDIR` keep their existing meanings, including
+  runtime launcher paths inside staged packages. A temporary-HOME dry-run suite
+  covers default reinstall/uninstall, explicit overrides, and staged paths, and
+  CI checks the scripts with Bash and ShellCheck.
 
 ## Remaining boundaries
 
@@ -65,4 +71,7 @@ and id fields before interning them.
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
+bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+bash scripts/test-install-paths.sh
 ```
