@@ -87,7 +87,7 @@ pub const SCROLLBAR_WIDTH: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 /// Width of the block-outcome stripe at the widget's left edge, in pixels.
 const BLOCK_STRIPE_WIDTH: f32 = 3.0;
-/// Width of the stripe while its block is selected (full opacity too).
+/// Width of the stripe on the active edge of a block selection (full opacity too).
 const BLOCK_STRIPE_SELECTED_WIDTH: f32 = 5.0;
 /// Minimum width of the gutter hit band used for block selection. Ties to the
 /// stripe widths above: it must cover the widest stripe
@@ -117,7 +117,7 @@ fn is_block_gutter_press(
 pub struct BlockPaintRow {
     /// Gutter stripe color for this row; `None` draws no stripe.
     pub stripe: Option<Color>,
-    /// Draw the stripe wider and at full opacity (selected block).
+    /// Draw the stripe wider and at full opacity (active selection edge).
     pub stripe_strong: bool,
     /// 1px separator line across the top edge of this row.
     pub separator: bool,

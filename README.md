@@ -111,6 +111,8 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
 | 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；Enter 定位块） |
+| 全选命令块 | `Ctrl+Shift+A` |
+| 回填所选命令 | `Ctrl+Shift+I`（只回填，不执行） |
 | 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
@@ -122,9 +124,17 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 交换相邻 Pane | `Ctrl+Shift+X` |
 | 关闭聚焦 Pane / 当前标签 | `Ctrl+Shift+W`（分屏时其余 pane 保持） |
 | 文件/标签侧栏 | `Ctrl+\` |
+| Shell Agent | `Ctrl+Alt+G` |
 | 设置 | `Ctrl+Shift+O` |
 | 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | 窗口透明度增 / 减 | `Ctrl+Alt+=` / `Ctrl+Alt+-`（写回配置 `opacity`，设置面板也有滑块） |
+
+Block mode 的左侧条纹支持普通点击单选、`Ctrl+点击` 切换单块、`Shift+点击`
+选择连续范围。无选区时 `Ctrl+↑` 从最新块开始选择；已有选区后普通 `↑/↓`
+折叠到相邻块，`Shift+↑/↓` 扩缩连续范围。选区存在且提示符空闲时，`Enter`
+与 `Ctrl+Shift+I` 都会按终端顺序回填所选命令但不会执行；命令运行中 `Enter`
+仍原样交给前台程序。多命令只在 shell 开启 bracketed paste 时作为可编辑多行
+文本保留，否则安全地只回填第一个逻辑行，后续换行绝不会触发执行。
 
 命令面板中的 **Export Session Blocks as Markdown/JSON** 会把当前 pane 仍保留的
 已定型块（最多 256 条，也包括缺失结束标记后由下一提示符收束的记录）写入

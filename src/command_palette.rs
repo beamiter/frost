@@ -47,8 +47,10 @@ pub enum PaletteAction {
     BlockCopyCommand,
     BlockCopyOutput,
     BlockRecallCommand,
+    BlockSelectAll,
     BlockSelectPrev,
     BlockSelectNext,
+    BlockReinputSelectedCommands,
     BlockCopyBlock,
     BlockCopyMarkdown,
     BlockExportSessionMarkdown,
@@ -227,7 +229,7 @@ impl PaletteState {
             PaletteItem {
                 name: "Toggle AI Agent",
                 description: "Open or close the AI agent panel (per-command approval)",
-                shortcut: "Ctrl+Shift+A",
+                shortcut: "Ctrl+Alt+G",
                 action: PaletteAction::ToggleAgent,
             },
             PaletteItem {
@@ -345,6 +347,12 @@ impl PaletteState {
                 action: PaletteAction::BlockRecallCommand,
             },
             PaletteItem {
+                name: "Select All Blocks",
+                description: "Select every retained finished block in the current pane",
+                shortcut: "Ctrl+Shift+A",
+                action: PaletteAction::BlockSelectAll,
+            },
+            PaletteItem {
                 name: "Select Previous Block",
                 description: "Select the previous (older) command block and reveal it",
                 shortcut: "",
@@ -355,6 +363,12 @@ impl PaletteState {
                 description: "Select the next (newer) command block and reveal it",
                 shortcut: "",
                 action: PaletteAction::BlockSelectNext,
+            },
+            PaletteItem {
+                name: "Reinput Selected Commands",
+                description: "Type selected block commands into the prompt without running them",
+                shortcut: "Ctrl+Shift+I",
+                action: PaletteAction::BlockReinputSelectedCommands,
             },
             PaletteItem {
                 name: "Copy Block",
@@ -543,6 +557,7 @@ mod tests {
             (PaletteAction::ResizePaneLeft, "Ctrl+Alt+Shift+Left"),
             (PaletteAction::ResizePaneDown, "Ctrl+Alt+Shift+Down"),
             (PaletteAction::ToggleSidebar, "Ctrl+\\"),
+            (PaletteAction::ToggleAgent, "Ctrl+Alt+G"),
             (PaletteAction::QuickTabSwitch, "Ctrl+Shift+L"),
             (PaletteAction::ZoomIn, "Ctrl+="),
             (PaletteAction::PromptJumpPrev, "Ctrl+Shift+Up"),
@@ -551,6 +566,8 @@ mod tests {
             (PaletteAction::CommandHistory, "Ctrl+Shift+H"),
             (PaletteAction::OpenSearchReplace, "Ctrl+Alt+R"),
             (PaletteAction::BlockSearch, "Ctrl+Alt+F"),
+            (PaletteAction::BlockSelectAll, "Ctrl+Shift+A"),
+            (PaletteAction::BlockReinputSelectedCommands, "Ctrl+Shift+I"),
         ];
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");

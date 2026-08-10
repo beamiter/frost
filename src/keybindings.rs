@@ -48,18 +48,20 @@ pub enum Command {
     // first-failed) already means pane:swap in this repo's defaults,
     // ctrl+alt+up/down (the natural select-prev/next chords) are
     // pane:focus_up/down here, and ctrl+alt+left/right (the natural
-    // jump-prev/next-failed chords) are pane:focus_left/right. Only
-    // block:search ships bound (ctrl+alt+f — ctrl+shift+g, its ember-side
-    // analogue, is terminal:copy_last_output here); everything else is
-    // palette-only until the user binds it.
+    // jump-prev/next-failed chords) are pane:focus_left/right. The P0 batch
+    // actions keep the family chords (Ctrl+Shift+A/I), and block:search uses
+    // Ctrl+Alt+F because Ctrl+Shift+G is terminal:copy_last_output here;
+    // remaining block commands stay palette-only until the user binds them.
     BlockJumpFirstFailed,
     BlockJumpPrevFailed,
     BlockJumpNextFailed,
     BlockCopyCommand,
     BlockCopyOutput,
     BlockRecallCommand,
+    BlockSelectAll,
     BlockSelectPrev,
     BlockSelectNext,
+    BlockReinputSelectedCommands,
     BlockCopyBlock,
     BlockCopyMarkdown,
     BlockExportSessionMarkdown,
@@ -135,8 +137,12 @@ impl std::fmt::Display for Command {
             Command::BlockCopyCommand => write!(f, "block:copy_command"),
             Command::BlockCopyOutput => write!(f, "block:copy_output"),
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
+            Command::BlockSelectAll => write!(f, "block:select_all"),
             Command::BlockSelectPrev => write!(f, "block:select_prev"),
             Command::BlockSelectNext => write!(f, "block:select_next"),
+            Command::BlockReinputSelectedCommands => {
+                write!(f, "block:reinput_selected_commands")
+            }
             Command::BlockCopyBlock => write!(f, "block:copy_block"),
             Command::BlockCopyMarkdown => write!(f, "block:copy_markdown"),
             Command::BlockExportSessionMarkdown => {
@@ -207,8 +213,10 @@ impl std::str::FromStr for Command {
             "block:copy_command" => Ok(Command::BlockCopyCommand),
             "block:copy_output" => Ok(Command::BlockCopyOutput),
             "block:recall_command" => Ok(Command::BlockRecallCommand),
+            "block:select_all" => Ok(Command::BlockSelectAll),
             "block:select_prev" => Ok(Command::BlockSelectPrev),
             "block:select_next" => Ok(Command::BlockSelectNext),
+            "block:reinput_selected_commands" => Ok(Command::BlockReinputSelectedCommands),
             "block:copy_block" => Ok(Command::BlockCopyBlock),
             "block:copy_markdown" => Ok(Command::BlockCopyMarkdown),
             "block:export_session_markdown" => Ok(Command::BlockExportSessionMarkdown),
@@ -407,6 +415,13 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+alt+f".to_string(), "block:search".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+a".to_string(), "block:select_all".to_string());
+        bindings.bindings.insert(
+            "ctrl+shift+i".to_string(),
+            "block:reinput_selected_commands".to_string(),
+        );
 
         // 配置操作
         bindings
@@ -417,7 +432,7 @@ impl KeyBindings {
             .insert("ctrl+backslash".to_string(), "sidebar:toggle".to_string());
         bindings
             .bindings
-            .insert("ctrl+shift+a".to_string(), "agent:toggle".to_string());
+            .insert("ctrl+alt+g".to_string(), "agent:toggle".to_string());
 
         // 终端操作
         bindings
@@ -751,9 +766,9 @@ mod tests {
     fn frost_chords_beyond_the_family_contract() {
         let bindings = KeyBindings::default_bindings();
         let cases = [
-            // Excluded from DEFAULT_CHORDS by design (anvil/4 bind it to
-            // SelectAllBlocks); frost keeps its lineage meaning.
-            ("ctrl+shift+a", Command::AgentToggle),
+            ("ctrl+shift+a", Command::BlockSelectAll),
+            ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
+            ("ctrl+alt+g", Command::AgentToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+x", Command::PaneSwap),
             ("ctrl+d", Command::TerminalSendEof),
@@ -774,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn block_commands_parse_and_only_search_ships_bound() {
+    fn block_commands_parse_and_p0_batch_actions_ship_bound() {
         for (name, expected) in [
             ("block:jump_first_failed", Command::BlockJumpFirstFailed),
             ("block:jump_prev_failed", Command::BlockJumpPrevFailed),
@@ -782,8 +797,13 @@ mod tests {
             ("block:copy_command", Command::BlockCopyCommand),
             ("block:copy_output", Command::BlockCopyOutput),
             ("block:recall_command", Command::BlockRecallCommand),
+            ("block:select_all", Command::BlockSelectAll),
             ("block:select_prev", Command::BlockSelectPrev),
             ("block:select_next", Command::BlockSelectNext),
+            (
+                "block:reinput_selected_commands",
+                Command::BlockReinputSelectedCommands,
+            ),
             ("block:copy_block", Command::BlockCopyBlock),
             ("block:copy_markdown", Command::BlockCopyMarkdown),
             (
@@ -821,19 +841,35 @@ mod tests {
             bindings.get_command("ctrl+alt+right"),
             Some(Command::PaneFocusRight)
         );
-        // block:search is the one bound block command: ctrl+alt+f (free in
-        // the default table and the chrome layer; ember's ctrl+shift+g is
-        // terminal:copy_last_output here).
+        // Search keeps frost's free ctrl+alt chord; the P0 batch actions use
+        // the same family chords as anvil/forge.
         assert_eq!(
             bindings.get_command("ctrl+alt+f"),
             Some(Command::BlockSearch)
         );
-        let bound_block_commands: Vec<&String> = bindings
+        assert_eq!(
+            bindings.get_command("ctrl+shift+a"),
+            Some(Command::BlockSelectAll)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+i"),
+            Some(Command::BlockReinputSelectedCommands)
+        );
+        let mut bound_block_commands: Vec<&str> = bindings
             .bindings
             .values()
             .filter(|command| command.starts_with("block:"))
+            .map(String::as_str)
             .collect();
-        assert_eq!(bound_block_commands, vec!["block:search"]);
+        bound_block_commands.sort_unstable();
+        assert_eq!(
+            bound_block_commands,
+            vec![
+                "block:reinput_selected_commands",
+                "block:search",
+                "block:select_all",
+            ]
+        );
     }
 
     #[test]

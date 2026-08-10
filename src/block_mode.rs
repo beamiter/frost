@@ -3,6 +3,249 @@
 //! Everything here is renderer-agnostic so it can be unit tested; the paint
 //! code in `terminal_view` and the per-frame builder in `main` stay thin.
 
+use std::collections::HashSet;
+
+/// Pane-local Warp-style finished-block selection.
+///
+/// `active` is the moving edge used by keyboard navigation and `anchor` is
+/// the fixed edge used by Shift+click / Shift+Up/Down. Keeping the set here,
+/// rather than as three loosely-related fields on the UI session, makes every
+/// transition preserve the same invariants: active/anchor always name a
+/// selected block, and an empty set has neither.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockSelection {
+    selected: HashSet<u64>,
+    active: Option<u64>,
+    anchor: Option<u64>,
+}
+
+impl BlockSelection {
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.selected.len()
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.selected.contains(&id)
+    }
+
+    pub fn active(&self) -> Option<u64> {
+        self.active
+    }
+
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.active = None;
+        self.anchor = None;
+    }
+
+    /// Replace the selection with one active block (or clear it).
+    pub fn replace(&mut self, id: Option<u64>) {
+        self.clear();
+        if let Some(id) = id {
+            self.selected.insert(id);
+            self.active = Some(id);
+            self.anchor = Some(id);
+        }
+    }
+
+    /// Select the entire oldest-first block list. The newest block is the
+    /// active edge and the oldest is the fixed range anchor, matching
+    /// anvil/forge.
+    pub fn select_all(&mut self, ids: &[u64]) {
+        self.clear();
+        let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
+            return;
+        };
+        self.selected.extend(ids.iter().copied());
+        self.anchor = Some(first);
+        self.active = Some(last);
+    }
+
+    /// Apply a gutter click. Plain click replaces, Ctrl toggles, and Shift
+    /// selects the inclusive range from the fixed anchor to `target`.
+    pub fn click(&mut self, ids: &[u64], target: u64, ctrl: bool, shift: bool) {
+        if shift {
+            let anchor = self.anchor.or(self.active).unwrap_or(target);
+            self.select_range(ids, anchor, target);
+        } else if ctrl {
+            self.toggle(ids, target);
+        } else {
+            self.replace(Some(target));
+        }
+    }
+
+    /// Extend/contract the active edge by one item while retaining the fixed
+    /// anchor. Returns the new active id, or `None` at the requested edge.
+    pub fn extend_step(&mut self, ids: &[u64], older: bool) -> Option<u64> {
+        let active = self.active?;
+        let position = ids.iter().position(|&id| id == active)?;
+        let target_index = if older {
+            position.checked_sub(1)?
+        } else if position + 1 < ids.len() {
+            position + 1
+        } else {
+            return None;
+        };
+        let target = ids[target_index];
+        let anchor = self.anchor.unwrap_or(active);
+        self.select_range(ids, anchor, target);
+        Some(target)
+    }
+
+    /// Remove ids no longer retained by the terminal's bounded zone history
+    /// and report whether a live selection remains.
+    pub fn retain(&mut self, ids: &[u64]) -> bool {
+        self.selected.retain(|id| ids.contains(id));
+        if self.selected.is_empty() {
+            self.clear();
+            return false;
+        }
+        if self.active.is_none_or(|id| !self.selected.contains(&id)) {
+            self.active = ids
+                .iter()
+                .rev()
+                .find(|&&id| self.selected.contains(&id))
+                .copied();
+        }
+        if self.anchor.is_none_or(|id| !self.selected.contains(&id)) {
+            self.anchor = self.active;
+        }
+        true
+    }
+
+    fn select_range(&mut self, ids: &[u64], anchor: u64, target: u64) {
+        let Some(anchor_index) = ids.iter().position(|&id| id == anchor) else {
+            self.replace(Some(target));
+            return;
+        };
+        let Some(target_index) = ids.iter().position(|&id| id == target) else {
+            self.replace(Some(target));
+            return;
+        };
+        let (start, end) = if anchor_index <= target_index {
+            (anchor_index, target_index)
+        } else {
+            (target_index, anchor_index)
+        };
+        self.selected.clear();
+        self.selected.extend(ids[start..=end].iter().copied());
+        self.active = Some(target);
+        self.anchor = Some(anchor);
+    }
+
+    fn toggle(&mut self, ids: &[u64], target: u64) {
+        if self.selected.remove(&target) {
+            if self.selected.is_empty() {
+                self.clear();
+                return;
+            }
+            if self.active == Some(target)
+                || self
+                    .active
+                    .is_none_or(|id| !self.selected.contains(&id) || !ids.contains(&id))
+            {
+                self.active = ids
+                    .iter()
+                    .rev()
+                    .find(|&&id| self.selected.contains(&id))
+                    .copied();
+                // A stale-only remainder is not a usable selection. Preserve
+                // the type invariant instead of leaving an invisible non-empty
+                // set that still owns keyboard input.
+                if self.active.is_none() {
+                    self.clear();
+                    return;
+                }
+            }
+            if self.anchor == Some(target)
+                || self
+                    .anchor
+                    .is_none_or(|id| !self.selected.contains(&id) || !ids.contains(&id))
+            {
+                self.anchor = self.active;
+            }
+        } else {
+            self.selected.insert(target);
+            self.active = Some(target);
+            self.anchor = Some(target);
+        }
+    }
+}
+
+/// Why a multi-block command reinput could not be built atomically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedCommandsError {
+    Empty,
+    Truncated,
+    TooLarge,
+}
+
+/// Sanitization-ready selected command text plus the number of command-bearing
+/// blocks that contributed to it. The count deliberately excludes selected
+/// background/blank blocks so success UI describes what will actually be
+/// inserted rather than the size of the visual selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedCommands {
+    pub text: String,
+    pub block_count: usize,
+}
+
+/// Collect selected commands in terminal order. Background blocks are
+/// skipped. A shell-truncated command or aggregate beyond `max_bytes` rejects
+/// the whole operation: returning a partial command set could have different
+/// shell semantics from what the user reviewed.
+pub fn selected_commands<'a, I>(
+    zones: I,
+    selection: &BlockSelection,
+    max_bytes: usize,
+) -> Result<SelectedCommands, SelectedCommandsError>
+where
+    I: IntoIterator<Item = (u64, Option<&'a str>, bool)>,
+{
+    let mut output = String::new();
+    let mut block_count = 0usize;
+    for (id, command, truncated) in zones {
+        if !selection.contains(id) {
+            continue;
+        }
+        let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
+            continue;
+        };
+        if truncated {
+            return Err(SelectedCommandsError::Truncated);
+        }
+        let separator = usize::from(!output.is_empty());
+        let Some(next_len) = output
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(command.len()))
+        else {
+            return Err(SelectedCommandsError::TooLarge);
+        };
+        if next_len > max_bytes {
+            return Err(SelectedCommandsError::TooLarge);
+        }
+        if separator != 0 {
+            output.push('\n');
+        }
+        output.push_str(command);
+        block_count += 1;
+    }
+    if output.is_empty() {
+        Err(SelectedCommandsError::Empty)
+    } else {
+        Ok(SelectedCommands {
+            text: output,
+            block_count,
+        })
+    }
+}
+
 /// How a completed command block ended. `Unknown` is deliberately distinct
 /// from `Success`: an OSC 133 `D` without an exit code reports *nothing*, and
 /// rendering it as a green check would be a success this terminal never
@@ -332,30 +575,47 @@ pub fn markdown_export_with_state(
 }
 
 /// Keyboard block navigation over completed zones (`ids` oldest-first, the
-/// same set the gutter click selects). No current selection — or a selection
-/// whose zone is gone — resets to the NEWEST zone in either direction;
-/// otherwise `older` steps toward the front and `!older` toward the back.
-/// `None` means "do nothing": no zones at all, or the selection is already at
-/// the requested end (a silent clamp).
-pub fn select_neighbor(ids: &[u64], current: Option<u64>, older: bool) -> Option<u64> {
-    let newest = *ids.last()?;
+/// same set the gutter click selects). Up with no live selection enters at the
+/// newest block; Down passes through. Up clamps (and remains owned) at the
+/// oldest block, while Down past the newest clears selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionNavigation {
+    /// Block navigation does not own this key; retain ordinary terminal scroll.
+    Passthrough,
+    /// Replace the selection with this block and consume the key.
+    Select(u64),
+    /// Clear the selection and consume the key.
+    Clear,
+}
+
+pub fn selection_navigation(ids: &[u64], current: Option<u64>, older: bool) -> SelectionNavigation {
+    let Some(&newest) = ids.last() else {
+        return SelectionNavigation::Passthrough;
+    };
     let Some(position) = current.and_then(|id| ids.iter().position(|&zone| zone == id)) else {
-        return Some(newest);
+        return if older {
+            SelectionNavigation::Select(newest)
+        } else {
+            SelectionNavigation::Passthrough
+        };
     };
-    let target = if older {
-        position.checked_sub(1)?
+    if older {
+        // The oldest block clamps and still consumes the key; falling through
+        // here would unexpectedly scroll while block selection is active.
+        SelectionNavigation::Select(ids[position.saturating_sub(1)])
     } else if position + 1 < ids.len() {
-        position + 1
+        SelectionNavigation::Select(ids[position + 1])
     } else {
-        return None;
-    };
-    Some(ids[target])
+        // Moving down past the newest block exits selection mode, matching the
+        // anvil/forge history-canvas contract.
+        SelectionNavigation::Clear
+    }
 }
 
 /// Step the block selection across FAILED zones only (`zones` oldest-first as
 /// `(id, is_failed)` — the same [`classify`]-based predicate the scrollbar
 /// markers use). No selection, or a dangling one, lands on the NEWEST failed
-/// zone in either direction (mirroring [`select_neighbor`]'s reset rule);
+/// zone in either direction (mirroring block navigation's Up reset rule);
 /// from a live selection — failed or not — the step goes to the nearest
 /// failed zone strictly older (`older`) or strictly newer. `None` means "do
 /// nothing": no failed zone exists in the requested direction. This function
@@ -908,22 +1168,162 @@ mod tests {
     }
 
     #[test]
-    fn select_neighbor_orders_clamps_and_resets() {
+    fn selection_navigation_orders_clamps_clears_and_passes_through() {
+        use SelectionNavigation::{Clear, Passthrough, Select};
+
         let ids = [10, 20, 30];
-        // No selection (or a stale id): both directions pick the newest.
-        assert_eq!(select_neighbor(&ids, None, true), Some(30));
-        assert_eq!(select_neighbor(&ids, None, false), Some(30));
-        assert_eq!(select_neighbor(&ids, Some(999), true), Some(30));
+        // Ctrl+Up enters selection at the newest block; Ctrl+Down retains its
+        // ordinary scroll behavior until a live selection exists.
+        assert_eq!(selection_navigation(&ids, None, true), Select(30));
+        assert_eq!(selection_navigation(&ids, None, false), Passthrough);
+        assert_eq!(selection_navigation(&ids, Some(999), true), Select(30));
+        assert_eq!(selection_navigation(&ids, Some(999), false), Passthrough);
         // Stepping moves one zone at a time.
-        assert_eq!(select_neighbor(&ids, Some(30), true), Some(20));
-        assert_eq!(select_neighbor(&ids, Some(20), true), Some(10));
-        assert_eq!(select_neighbor(&ids, Some(10), false), Some(20));
-        // Ends clamp silently.
-        assert_eq!(select_neighbor(&ids, Some(10), true), None);
-        assert_eq!(select_neighbor(&ids, Some(30), false), None);
+        assert_eq!(selection_navigation(&ids, Some(30), true), Select(20));
+        assert_eq!(selection_navigation(&ids, Some(20), true), Select(10));
+        assert_eq!(selection_navigation(&ids, Some(10), false), Select(20));
+        // Up clamps and consumes at the oldest edge; Down past newest clears.
+        assert_eq!(selection_navigation(&ids, Some(10), true), Select(10));
+        assert_eq!(selection_navigation(&ids, Some(30), false), Clear);
         // No zones at all: nothing to select.
-        assert_eq!(select_neighbor(&[], None, true), None);
-        assert_eq!(select_neighbor(&[], Some(1), false), None);
+        assert_eq!(selection_navigation(&[], None, true), Passthrough);
+        assert_eq!(selection_navigation(&[], Some(1), false), Passthrough);
+    }
+
+    #[test]
+    fn block_selection_clicks_toggle_and_select_inclusive_ranges() {
+        let ids = [10, 20, 30, 40];
+        let mut selection = BlockSelection::default();
+
+        selection.click(&ids, 20, false, false);
+        assert_eq!(selection.active(), Some(20));
+        assert!(selection.contains(20));
+        assert_eq!(selection.len(), 1);
+
+        selection.click(&ids, 40, true, false);
+        assert_eq!(selection.active(), Some(40));
+        assert!(selection.contains(20));
+        assert!(selection.contains(40));
+        assert_eq!(selection.len(), 2);
+
+        // Ctrl toggling the active edge off falls back to the newest selected
+        // id still present in terminal order.
+        selection.click(&ids, 40, true, false);
+        assert_eq!(selection.active(), Some(20));
+        assert_eq!(selection.len(), 1);
+
+        // A fresh plain click fixes the anchor; Shift selects both endpoints
+        // and everything between, in either direction.
+        selection.click(&ids, 40, false, false);
+        selection.click(&ids, 20, false, true);
+        assert_eq!(selection.active(), Some(20));
+        assert!(selection.contains(20));
+        assert!(selection.contains(30));
+        assert!(selection.contains(40));
+        assert_eq!(selection.len(), 3);
+
+        // Frost deliberately gives Shift range precedence when both modifiers
+        // are held; unlike forge, Ctrl+Shift is not a toggle gesture here.
+        selection.click(&ids, 10, false, false);
+        selection.click(&ids, 30, true, true);
+        assert_eq!(selection.active(), Some(30));
+        assert!(selection.contains(10));
+        assert!(selection.contains(20));
+        assert!(selection.contains(30));
+        assert_eq!(selection.len(), 3);
+    }
+
+    #[test]
+    fn ctrl_toggle_clears_a_stale_only_remainder() {
+        let mut selection = BlockSelection::default();
+        selection.click(&[10, 20], 10, false, false);
+
+        // Simulate a missed reconciliation after 10 was evicted, then add and
+        // remove a live id. The stale id must not leave an invisible selection.
+        selection.click(&[20, 30], 30, true, false);
+        selection.click(&[20, 30], 30, true, false);
+        assert!(selection.is_empty());
+        assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn select_all_and_shift_steps_preserve_anchor_while_contracting() {
+        let ids = [10, 20, 30, 40];
+        let mut selection = BlockSelection::default();
+        selection.select_all(&ids);
+        assert_eq!(selection.active(), Some(40));
+        assert_eq!(selection.len(), 4);
+
+        assert_eq!(selection.extend_step(&ids, true), Some(30));
+        assert_eq!(selection.active(), Some(30));
+        assert_eq!(selection.len(), 3);
+        assert!(!selection.contains(40));
+
+        assert_eq!(selection.extend_step(&ids, false), Some(40));
+        assert_eq!(selection.len(), 4);
+        assert_eq!(selection.extend_step(&ids, false), None);
+    }
+
+    #[test]
+    fn retaining_live_ids_repairs_or_clears_selection_edges() {
+        let ids = [10, 20, 30];
+        let mut selection = BlockSelection::default();
+        selection.select_all(&ids);
+        assert!(selection.retain(&[10, 20]));
+        assert_eq!(selection.active(), Some(20));
+        assert_eq!(selection.len(), 2);
+
+        // Callers deciding whether block mode owns the next key can use the
+        // return value directly; an asynchronously evicted stale-only
+        // selection must look empty before key routing.
+        assert!(!selection.retain(&[]));
+        assert!(selection.is_empty());
+        assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn selected_commands_are_ordered_bounded_and_atomic() {
+        let ids = [1, 2, 3, 4];
+        let mut selection = BlockSelection::default();
+        selection.select_all(&ids);
+        let zones = [
+            (1, Some("first"), false),
+            (2, None, false),
+            (3, Some("third"), false),
+            (4, Some("  "), false),
+        ];
+        assert_eq!(
+            selected_commands(zones, &selection, 256),
+            Ok(SelectedCommands {
+                text: "first\nthird".to_string(),
+                // The selected background and whitespace-only blocks do not
+                // contribute to either the payload or its success count.
+                block_count: 2,
+            })
+        );
+
+        assert_eq!(
+            selected_commands(
+                [(1, Some("first"), false), (3, Some("third"), true)],
+                &selection,
+                256
+            ),
+            Err(SelectedCommandsError::Truncated)
+        );
+        assert_eq!(
+            selected_commands(
+                [(1, Some("first"), false), (3, Some("third"), false)],
+                &selection,
+                8
+            ),
+            Err(SelectedCommandsError::TooLarge)
+        );
+
+        selection.clear();
+        assert_eq!(
+            selected_commands(zones, &selection, 256),
+            Err(SelectedCommandsError::Empty)
+        );
     }
 
     #[test]

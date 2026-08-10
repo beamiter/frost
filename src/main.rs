@@ -77,6 +77,58 @@ const RESIZE_CORNER: f32 = 12.0;
 fn chrome_height(bottom_bar: bool) -> f32 {
     TAB_BAR_H + if bottom_bar { STATUS_BAR_H } else { 0.0 }
 }
+
+/// Whether an existing block selection may consume plain navigation/Enter.
+/// Running and alternate-screen applications always retain their keyboard.
+fn block_selection_owns_keys(
+    block_mode: bool,
+    has_selection: bool,
+    alt_screen: bool,
+    command_running: bool,
+) -> bool {
+    block_mode && has_selection && !alt_screen && !command_running
+}
+
+/// Resolve contextual Ctrl+Up/Down block navigation. `Passthrough` means the
+/// caller must retain ordinary scrolling; `Select`/`Clear` own the key even at
+/// the selection boundary.
+fn ctrl_scroll_block_navigation(
+    block_mode: bool,
+    older: bool,
+    alt_screen: bool,
+    command_running: bool,
+    ids: &[u64],
+    current: Option<u64>,
+) -> block_mode::SelectionNavigation {
+    if !block_mode || alt_screen || command_running || (!older && current.is_none()) {
+        return block_mode::SelectionNavigation::Passthrough;
+    }
+    block_mode::selection_navigation(ids, current, older)
+}
+
+fn block_escape_owns_key(
+    block_mode: bool,
+    has_selection: bool,
+    alt_screen: bool,
+    command_running: bool,
+    no_modifier: bool,
+) -> bool {
+    no_modifier && block_selection_owns_keys(block_mode, has_selection, alt_screen, command_running)
+}
+
+fn block_enter_reinputs_selection(
+    selection_owns_keys: bool,
+    prompt_status: terminal::AgentPromptStatus,
+) -> bool {
+    selection_owns_keys && prompt_status.is_ready()
+}
+
+/// Captured command history is untrusted terminal input. Keep controls
+/// stripped and, crucially, never send embedded newlines without bracketed
+/// paste: the first-line fallback prevents later selected commands executing.
+fn block_reinput_policy() -> PastePolicy {
+    PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly)
+}
 /// Height of the status strip above each pane while split. A single pane has
 /// no strip: the tab bar and status bar already name it, and the row would
 /// only cost a terminal line.
@@ -1319,10 +1371,11 @@ struct Session {
     /// Wall-clock duration of that command, when the shell reported an
     /// execution phase.
     last_duration_ms: Option<u64>,
-    /// Block-mode selection, keyed by [`terminal::CommandZone::id`] so it
-    /// survives scrollback trimming (a trimmed-away zone simply stops
-    /// resolving). Cleared by any non-gutter press or PTY-bound keystroke.
-    selected_block: Option<u64>,
+    /// Warp-style block-mode multi-selection, keyed by stable command-zone id.
+    /// It survives scrollback row trimming; the terminal's bounded zone cap is
+    /// reconciled before actions. Any non-gutter press or PTY-bound input
+    /// clears the whole selection.
+    block_selection: block_mode::BlockSelection,
     /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
     /// short-lived timer drain it without ever stalling iced's UI thread.
     write_queue: std::collections::VecDeque<PtyWriteChunk>,
@@ -1402,7 +1455,7 @@ impl Session {
             git_meta_cache: None,
             last_exit: None,
             last_duration_ms: None,
-            selected_block: None,
+            block_selection: block_mode::BlockSelection::default(),
             write_queue: std::collections::VecDeque::new(),
             write_queue_offset: 0,
             queued_write_bytes: 0,
@@ -3824,7 +3877,7 @@ impl Frost {
         let mut send = |bytes: &[u8]| {
             if let Some(sess) = self.sessions.get_mut(self.active) {
                 // A PTY-bound keystroke dismisses the block selection.
-                sess.selected_block = None;
+                sess.block_selection.clear();
                 sess.terminal.scroll_to_bottom();
                 sess.write_pty(bytes);
                 sess.refresh();
@@ -3953,12 +4006,43 @@ impl Frost {
                 Task::none()
             }
             C::TerminalScrollUp | C::TerminalScrollDown => {
+                let older = matches!(cmd, C::TerminalScrollUp);
+                let block_navigation = self.sessions.get_mut(self.active).map_or(
+                    block_mode::SelectionNavigation::Passthrough,
+                    |sess| {
+                        let ids: Vec<u64> = sess
+                            .terminal
+                            .command_zones
+                            .iter()
+                            .map(|zone| zone.id)
+                            .collect();
+                        sess.block_selection.retain(&ids);
+                        ctrl_scroll_block_navigation(
+                            self.config.block_mode,
+                            older,
+                            sess.terminal.is_alt_buffer_active(),
+                            sess.terminal.is_command_running(),
+                            &ids,
+                            sess.block_selection.active(),
+                        )
+                    },
+                );
+                match block_navigation {
+                    block_mode::SelectionNavigation::Select(target) => {
+                        self.select_and_reveal_block(target);
+                        return Some(Task::none());
+                    }
+                    block_mode::SelectionNavigation::Clear => {
+                        if let Some(sess) = self.sessions.get_mut(self.active) {
+                            sess.block_selection.clear();
+                            sess.refresh();
+                        }
+                        return Some(Task::none());
+                    }
+                    block_mode::SelectionNavigation::Passthrough => {}
+                }
                 let speed = self.config.scroll_speed.max(1) as isize;
-                let delta = if matches!(cmd, C::TerminalScrollUp) {
-                    speed
-                } else {
-                    -speed
-                };
+                let delta = if older { speed } else { -speed };
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     sess.terminal.scroll(delta);
                     sess.refresh();
@@ -3972,8 +4056,10 @@ impl Frost {
             C::BlockCopyCommand => self.block_copy_command_task(),
             C::BlockCopyOutput => self.block_copy_output_task(),
             C::BlockRecallCommand => self.block_recall_command_task(),
+            C::BlockSelectAll => self.block_select_all(),
             C::BlockSelectPrev => self.block_select_step(true),
             C::BlockSelectNext => self.block_select_step(false),
+            C::BlockReinputSelectedCommands => self.block_reinput_selected_commands_task(),
             C::BlockCopyBlock => self.block_copy_block_task(),
             C::BlockCopyMarkdown => self.block_copy_markdown_task(),
             C::BlockExportSessionMarkdown => {
@@ -4429,7 +4515,7 @@ impl Frost {
     /// arrows move the selection, Enter selects and reveals the highlighted
     /// hit's zone, Esc (or the block:search chord) dismisses. Runs BEFORE the
     /// keybinding/`encode_key` layers, which is what keeps the picker's own
-    /// keystrokes from reaching the PTY and clearing `selected_block`.
+    /// keystrokes from reaching the PTY and clearing the block selection.
     fn handle_block_search_key(
         &mut self,
         key: &keyboard::Key,
@@ -4528,8 +4614,9 @@ impl Frost {
         text: &str,
         policy: PastePolicy,
         clear_line_first: bool,
-    ) {
+    ) -> bool {
         let mut rejected = false;
+        let mut written = false;
         if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
             let modes = PasteModes {
                 bracketed: sess.terminal.is_bracketed_paste_enabled(),
@@ -4538,7 +4625,7 @@ impl Frost {
             // A clipboard that was nothing but paste markers normalizes away
             // entirely; writing zero bytes would toast about a full queue.
             if paste.is_empty() {
-                return;
+                return false;
             }
             // Size-check the *encoded* bytes: framing and control stripping have
             // already changed the length the queue must accept.
@@ -4548,9 +4635,10 @@ impl Frost {
                 // PTY-bound input dismisses the block selection, same as
                 // `encode_key` and IME commit. Covers every paste flavor
                 // (clipboard, middle-click primary, prompt insert/recall).
-                sess.selected_block = None;
+                sess.block_selection.clear();
                 sess.terminal.scroll_to_bottom();
-                rejected = !sess.write_pty(&paste.bytes);
+                written = sess.write_pty(&paste.bytes);
+                rejected = !written;
                 sess.refresh();
             }
         }
@@ -4560,6 +4648,7 @@ impl Frost {
                 ToastKind::Warning,
             );
         }
+        written
     }
 
     /// History picker key handling. Mirrors `handle_tab_switcher_key`: typed
@@ -4628,6 +4717,8 @@ impl Frost {
         if !self.config.block_mode {
             return false;
         }
+        let ctrl = self.modifiers.control();
+        let shift = self.modifiers.shift();
         let Some(sess) = self.sessions.get_mut(self.active) else {
             return false;
         };
@@ -4656,7 +4747,12 @@ impl Frost {
             .map(|(zone, _)| zone.id);
         match hit {
             Some(id) => {
-                sess.selected_block = Some(id);
+                let ids: Vec<u64> = terminal.command_zones.iter().map(|zone| zone.id).collect();
+                // Zone history is bounded and may have evicted ids since the
+                // previous interaction. Reconcile before applying modifiers so
+                // Ctrl-toggle cannot preserve an invisible stale selection.
+                sess.block_selection.retain(&ids);
+                sess.block_selection.click(&ids, id, ctrl, shift);
                 true
             }
             None => false,
@@ -4699,7 +4795,7 @@ impl Frost {
                 let hit = self.select_block_at_viewport_row(row);
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     if !hit {
-                        sess.selected_block = None;
+                        sess.block_selection.clear();
                     }
                     // The press is consumed, so drop any live text selection:
                     // the old highlight must not linger, and it must never be
@@ -4712,7 +4808,7 @@ impl Frost {
                 return Task::none();
             }
             if let Some(sess) = self.sessions.get_mut(self.active) {
-                sess.selected_block = None;
+                sess.block_selection.clear();
             }
         }
         // Click-to-place-cursor acts on release, so that a drag which happens
@@ -5399,8 +5495,12 @@ impl Frost {
             PaletteAction::BlockCopyCommand => self.block_copy_command_task(),
             PaletteAction::BlockCopyOutput => self.block_copy_output_task(),
             PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
+            PaletteAction::BlockSelectAll => self.block_select_all(),
             PaletteAction::BlockSelectPrev => self.block_select_step(true),
             PaletteAction::BlockSelectNext => self.block_select_step(false),
+            PaletteAction::BlockReinputSelectedCommands => {
+                self.block_reinput_selected_commands_task()
+            }
             PaletteAction::BlockCopyBlock => self.block_copy_block_task(),
             PaletteAction::BlockCopyMarkdown => self.block_copy_markdown_task(),
             PaletteAction::BlockExportSessionMarkdown => {
@@ -5484,7 +5584,7 @@ impl Frost {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(self.active) {
-            sess.selected_block = Some(id);
+            sess.block_selection.replace(Some(id));
             if !rows_evicted {
                 sess.terminal.reveal_buffer_row(prompt_row);
             }
@@ -5547,7 +5647,7 @@ impl Frost {
             );
             return Task::none();
         }
-        let current = sess.selected_block;
+        let current = sess.block_selection.active();
         let Some(target) = block_mode::select_failed_neighbor(&zones, current, older) else {
             return Task::none();
         };
@@ -5559,7 +5659,7 @@ impl Frost {
     /// old scrollback) and tell the user why nothing was copied or recalled.
     fn clear_stale_block_selection(&mut self) {
         if let Some(sess) = self.sessions.get_mut(self.active) {
-            sess.selected_block = None;
+            sess.block_selection.clear();
         }
         self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
     }
@@ -5574,7 +5674,7 @@ impl Frost {
     /// message).
     fn block_action_command(&mut self, verb: &str) -> Option<(String, bool)> {
         let sess = self.sessions.get(self.active)?;
-        let Some(id) = sess.selected_block else {
+        let Some(id) = sess.block_selection.active() else {
             let fallback = sess.terminal.command_zones.iter().rev().find_map(|zone| {
                 zone.command
                     .clone()
@@ -5623,7 +5723,7 @@ impl Frost {
         let Some(sess) = self.sessions.get(self.active) else {
             return Task::none();
         };
-        let text = match sess.selected_block {
+        let text = match sess.block_selection.active() {
             None => {
                 let fallback = sess.terminal.last_command_output_text();
                 if fallback.is_none() {
@@ -5703,12 +5803,45 @@ impl Frost {
         }
     }
 
-    /// Move the block selection to a neighbouring completed zone (`older` =
-    /// toward the top) and reveal its first row, exactly the row
-    /// [`Self::block_jump_first_failed`] scrolls to. With no selection — or a
-    /// selection whose zone was trimmed away — both directions reset to the
-    /// newest completed zone; at either end the step is a silent no-op.
-    fn block_select_step(&mut self, older: bool) -> Task<Message> {
+    /// Select every retained finalized block in the active pane. The oldest
+    /// block becomes the fixed range anchor and the newest the active edge.
+    fn block_select_all(&mut self) -> Task<Message> {
+        if !self.config.block_mode {
+            self.push_toast("Block mode is disabled".to_string(), ToastKind::Info);
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.is_alt_buffer_active() {
+            self.push_toast(
+                "Cannot select blocks while a full-screen program is active".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let ids: Vec<u64> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        if ids.is_empty() {
+            self.push_toast(
+                "No command blocks to select (needs OSC 133 shell integration)".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        sess.block_selection.select_all(&ids);
+        sess.refresh();
+        Task::none()
+    }
+
+    /// Expand or contract the selected range by moving its active edge one
+    /// completed block. Used by Shift+Up/Down while a block selection owns
+    /// keyboard navigation.
+    fn block_extend_selection_step(&mut self, older: bool) -> Task<Message> {
         let Some(sess) = self.sessions.get_mut(self.active) else {
             return Task::none();
         };
@@ -5718,11 +5851,162 @@ impl Frost {
             .iter()
             .map(|zone| zone.id)
             .collect();
-        let current = sess.selected_block.filter(|id| ids.contains(id));
-        let Some(target) = block_mode::select_neighbor(&ids, current, older) else {
+        sess.block_selection.retain(&ids);
+        let Some(target) = sess.block_selection.extend_step(&ids, older) else {
             return Task::none();
         };
-        self.select_and_reveal_block(target);
+        if let Some(prompt_start) = sess
+            .terminal
+            .zone_by_id(target)
+            .filter(|zone| !zone.rows_evicted)
+            .map(|zone| zone.prompt_start)
+        {
+            sess.terminal.reveal_buffer_row(prompt_start);
+        }
+        sess.refresh();
+        Task::none()
+    }
+
+    /// Reinput every selected command in terminal order without submitting
+    /// it. A multi-command selection is one editable bracketed-paste buffer;
+    /// without DECSET 2004 the shared safe policy keeps only the first logical
+    /// line, so later selected commands cannot execute as embedded newlines.
+    fn block_reinput_selected_commands_task(&mut self) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        if sess.block_selection.is_empty() {
+            self.push_toast("No command blocks selected".to_string(), ToastKind::Info);
+            return Task::none();
+        }
+        if sess.terminal.is_command_running() || sess.terminal.is_alt_buffer_active() {
+            self.push_toast(
+                "Commands not reinput: the terminal is busy".to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+
+        let (session_id, bracketed, commands) = {
+            let sess = &mut self.sessions[self.active];
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            let commands = block_mode::selected_commands(
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| (zone.id, zone.command.as_deref(), zone.command_truncated)),
+                &sess.block_selection,
+                crate::review_text::MAX_PROMPT_INSERT_BYTES,
+            );
+            (
+                sess.id,
+                sess.terminal.is_bracketed_paste_enabled(),
+                commands,
+            )
+        };
+        let selected_commands = match commands {
+            Ok(commands) => commands,
+            Err(block_mode::SelectedCommandsError::Empty) => {
+                self.push_toast(
+                    "Selected blocks have no commands to reinput".to_string(),
+                    ToastKind::Info,
+                );
+                return Task::none();
+            }
+            Err(block_mode::SelectedCommandsError::Truncated) => {
+                self.push_toast(
+                    "Commands not reinput: a selected command was truncated by the shell"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            Err(block_mode::SelectedCommandsError::TooLarge) => {
+                self.push_toast(
+                    "Commands not reinput: the selected commands are too large".to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        let command_count = selected_commands.block_count;
+        let commands = selected_commands.text;
+        let commands = match crate::review_text::sanitize_prompt_payload(
+            &commands,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        ) {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.push_toast(format!("Commands not reinput: {error}"), ToastKind::Warning);
+                return Task::none();
+            }
+        };
+        if commands.trim().is_empty() {
+            self.push_toast(
+                "Selected blocks have no safe command text to reinput".to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        let multiline_fallback = !bracketed && commands.contains('\n');
+        if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true) {
+            if multiline_fallback {
+                self.push_toast(
+                    "Reinput only the first logical line because bracketed paste is disabled"
+                        .to_string(),
+                    ToastKind::Info,
+                );
+            } else {
+                self.push_toast(
+                    format!(
+                        "Reinput {command_count} selected block{} (not run)",
+                        if command_count == 1 { "" } else { "s" }
+                    ),
+                    ToastKind::Success,
+                );
+            }
+        }
+        Task::none()
+    }
+
+    /// Move the block selection to a neighbouring completed zone (`older` =
+    /// toward the top) and reveal its first row, exactly the row
+    /// [`Self::block_jump_first_failed`] scrolls to. With no selection — or a
+    /// selection whose zone was trimmed away — Up resets to the newest completed
+    /// zone while Down remains unowned. Up clamps at the oldest block; Down past
+    /// the newest clears selection, matching anvil/forge.
+    fn block_select_step(&mut self, older: bool) -> Task<Message> {
+        let navigation = {
+            let Some(sess) = self.sessions.get_mut(self.active) else {
+                return Task::none();
+            };
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            block_mode::selection_navigation(&ids, sess.block_selection.active(), older)
+        };
+        match navigation {
+            block_mode::SelectionNavigation::Select(target) => {
+                self.select_and_reveal_block(target);
+            }
+            block_mode::SelectionNavigation::Clear => {
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.block_selection.clear();
+                    sess.refresh();
+                }
+            }
+            block_mode::SelectionNavigation::Passthrough => {}
+        }
         Task::none()
     }
 
@@ -5732,7 +6016,7 @@ impl Frost {
     /// zone. `None` means a toast was already pushed.
     fn block_target_zone_id(&mut self, verb: &str) -> Option<u64> {
         let sess = self.sessions.get(self.active)?;
-        match sess.selected_block {
+        match sess.block_selection.active() {
             Some(id) => {
                 if sess.terminal.zone_by_id(id).is_none() {
                     self.clear_stale_block_selection();
@@ -6530,7 +6814,7 @@ impl Frost {
                     // (Enter selects and reveals the hit's zone, Esc/
                     // Ctrl+Alt+F dismiss). It MUST consume keys before the
                     // encode_key path below: PTY-bound input clears
-                    // `selected_block`, and the picker's own keystrokes must
+                    // the block selection, and the picker's own keystrokes must
                     // never do that.
                     if self.block_search.is_some() {
                         if let Some(task) =
@@ -6566,6 +6850,115 @@ impl Frost {
                     if self.handle_search_key(&key, modifiers, text.as_deref()) {
                         return Task::none();
                     }
+                    // Escape dismisses a visible block selection locally. It
+                    // must not also reach the PTY: that would both clear the
+                    // UI state and send an unrelated cancel key to the child.
+                    let no_modifier = !modifiers.shift()
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo();
+                    // Zone metadata is bounded independently of the UI state.
+                    // Reconcile a non-empty selection before deciding whether
+                    // block mode owns this key, so an asynchronously evicted
+                    // stale-only selection cannot swallow one Enter/Down.
+                    let block_key_context = self.sessions.get_mut(self.active).map(|sess| {
+                        let has_selection = if sess.block_selection.is_empty() {
+                            false
+                        } else {
+                            let ids: Vec<u64> = sess
+                                .terminal
+                                .command_zones
+                                .iter()
+                                .map(|zone| zone.id)
+                                .collect();
+                            sess.block_selection.retain(&ids)
+                        };
+                        (
+                            has_selection,
+                            sess.terminal.is_alt_buffer_active(),
+                            sess.terminal.is_command_running(),
+                        )
+                    });
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        && block_key_context.is_some_and(
+                            |(has_selection, alt_screen, command_running)| {
+                                block_escape_owns_key(
+                                    self.config.block_mode,
+                                    has_selection,
+                                    alt_screen,
+                                    command_running,
+                                    no_modifier,
+                                )
+                            },
+                        )
+                    {
+                        if let Some(sess) = self.sessions.get_mut(self.active) {
+                            sess.block_selection.clear();
+                            sess.refresh();
+                        }
+                        return Task::none();
+                    }
+                    // Warp-style block selection owns the unmodified arrows
+                    // only once a selection exists: Up/Down collapses it to
+                    // one neighboring block, Shift+Up/Down moves the active
+                    // range edge, and Enter reinputs the selected commands.
+                    // A running/full-screen program keeps every key, including
+                    // Enter, so block chrome can never steal its stdin.
+                    let shift_only = modifiers.shift()
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo();
+                    let selection_owns_keys = block_key_context.is_some_and(
+                        |(has_selection, alt_screen, command_running)| {
+                            block_selection_owns_keys(
+                                self.config.block_mode,
+                                has_selection,
+                                alt_screen,
+                                command_running,
+                            )
+                        },
+                    );
+                    if selection_owns_keys {
+                        match &key {
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if no_modifier => {
+                                return self.block_select_step(true);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                                if no_modifier =>
+                            {
+                                return self.block_select_step(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if shift_only => {
+                                return self.block_extend_selection_step(true);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if shift_only => {
+                                return self.block_extend_selection_step(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::Enter) if no_modifier => {
+                                // A selection can be created after the user has
+                                // already typed at the live prompt. Only an OSC
+                                // 133-confirmed empty prompt owned by the shell
+                                // may be replaced with recalled commands.
+                                let prompt_status = self
+                                    .sessions
+                                    .get_mut(self.active)
+                                    .map(Session::agent_prompt_status);
+                                if prompt_status.is_some_and(|status| {
+                                    block_enter_reinputs_selection(selection_owns_keys, status)
+                                }) {
+                                    return self.block_reinput_selected_commands_task();
+                                }
+                                // Dirty/untrusted prompt state: exit block
+                                // selection and let Enter follow the ordinary
+                                // keybinding/PTY path, preserving visible input.
+                                if let Some(sess) = self.sessions.get_mut(self.active) {
+                                    sess.block_selection.clear();
+                                    sess.refresh();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     if let Some(task) = self.handle_keybinding(&key, modifiers) {
                         return task;
                     }
@@ -6591,7 +6984,7 @@ impl Frost {
                     {
                         // Typing into the shell dismisses the block selection
                         // (any PTY-bound key, not Escape specifically).
-                        sess.selected_block = None;
+                        sess.block_selection.clear();
                         sess.terminal.scroll_to_bottom();
                         sess.write_pty(&bytes);
                         sess.refresh();
@@ -6623,7 +7016,7 @@ impl Frost {
                         sess.terminal.clear_preedit();
                         // PTY-bound input dismisses the block selection, same
                         // as `encode_key` and the paste paths.
-                        sess.selected_block = None;
+                        sess.block_selection.clear();
                         sess.terminal.scroll_to_bottom();
                         sess.write_pty(text.as_bytes());
                         sess.refresh();
@@ -6654,12 +7047,14 @@ impl Frost {
                     &text,
                     MAX_PTY_WRITE_QUEUE_BYTES,
                 ) {
-                    Ok(text) => self.write_paste_to_session(
-                        id,
-                        &text,
-                        PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
-                        false,
-                    ),
+                    Ok(text) => {
+                        self.write_paste_to_session(
+                            id,
+                            &text,
+                            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                            false,
+                        );
+                    }
                     Err(error) => self.push_toast(
                         format!(
                             "Paste rejected: this build has no safe Unicode-risk confirmation ({error})"
@@ -6674,12 +7069,14 @@ impl Frost {
                     &text,
                     crate::review_text::MAX_PROMPT_INSERT_BYTES,
                 ) {
-                    Ok(text) => self.write_paste_to_session(
-                        id,
-                        &text,
-                        PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
-                        false,
-                    ),
+                    Ok(text) => {
+                        self.write_paste_to_session(
+                            id,
+                            &text,
+                            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                            false,
+                        );
+                    }
                     Err(error) => self.push_toast(
                         format!("Prompt insertion rejected: {error}"),
                         ToastKind::Warning,
@@ -6691,12 +7088,14 @@ impl Frost {
                     &command,
                     crate::review_text::MAX_HISTORY_COMMAND_BYTES,
                 ) {
-                    Ok(command) => self.write_paste_to_session(
-                        id,
-                        &command,
-                        PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
-                        true,
-                    ),
+                    Ok(command) => {
+                        self.write_paste_to_session(
+                            id,
+                            &command,
+                            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                            true,
+                        );
+                    }
                     Err(error) => self.push_toast(
                         format!("History recall rejected: {error}"),
                         ToastKind::Warning,
@@ -8772,7 +9171,8 @@ impl Frost {
 
     /// Block-mode chrome for each of `sess`'s visible rows: outcome stripes,
     /// per-prompt separators, first-row badges, and the selected-block
-    /// outline. Absolute zone rows translate to viewport rows with the same
+    /// outlines (with a stronger stripe on the active edge). Absolute zone
+    /// rows translate to viewport rows with the same
     /// arithmetic (and the same reflow approximation) as search matches.
     /// Empty when the feature is off or a full-screen app owns the grid.
     fn block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
@@ -8816,13 +9216,16 @@ impl Frost {
                 BlockOutcome::Failed(_) => self.theme.ansi_color(1),
                 BlockOutcome::Background | BlockOutcome::Unknown => muted,
             };
-            let selected = sess.selected_block == Some(zone.id);
+            let selected = sess.block_selection.contains(zone.id);
+            let active = sess.block_selection.active() == Some(zone.id);
             for abs_row in zone_start.max(start)..zone_end.min(end) {
                 let row = &mut paint[abs_row - start];
                 row.stripe = Some(color);
                 if selected {
-                    row.stripe_strong = true;
                     row.outline_sides = true;
+                }
+                if active {
+                    row.stripe_strong = true;
                 }
             }
             if zone_start >= start {
@@ -8834,7 +9237,7 @@ impl Frost {
                     // time. Two-stage fit (ember's rule): if the suffixed
                     // badge no longer fits, fall back to the plain badge
                     // before skipping the badge entirely.
-                    let suffixed = zone.finished_at_ms.filter(|_| selected).map(|ms| {
+                    let suffixed = zone.finished_at_ms.filter(|_| active).map(|ms| {
                         let offset = block_mode::local_offset_secs((ms / 1000) as i64);
                         format!("{plain} · {}", block_mode::clock_at_offset(ms, offset))
                     });
@@ -12233,6 +12636,109 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn block_key_ownership_preserves_running_program_input() {
+        assert!(block_selection_owns_keys(true, true, false, false));
+        assert!(!block_selection_owns_keys(true, true, false, true));
+        assert!(!block_selection_owns_keys(true, true, true, false));
+        assert!(!block_selection_owns_keys(false, true, false, false));
+
+        // Escape is local only while an idle primary-screen block selection is
+        // visible; running and alternate-screen programs retain ESC.
+        assert!(block_escape_owns_key(true, true, false, false, true));
+        assert!(!block_escape_owns_key(true, false, false, false, true));
+        assert!(!block_escape_owns_key(true, true, false, false, false));
+        assert!(!block_escape_owns_key(true, true, false, true, true));
+        assert!(!block_escape_owns_key(true, true, true, false, true));
+    }
+
+    #[test]
+    fn enter_reinput_requires_a_trusted_empty_prompt() {
+        use terminal::AgentPromptStatus;
+
+        assert!(block_enter_reinputs_selection(
+            true,
+            AgentPromptStatus::Ready
+        ));
+        for status in [
+            AgentPromptStatus::Busy,
+            AgentPromptStatus::InputNotEmpty,
+            AgentPromptStatus::UnsafeCommand,
+            AgentPromptStatus::ShellIntegrationUnavailable,
+        ] {
+            assert!(!block_enter_reinputs_selection(true, status));
+        }
+        assert!(!block_enter_reinputs_selection(
+            false,
+            AgentPromptStatus::Ready
+        ));
+    }
+
+    #[test]
+    fn ctrl_arrows_preserve_scroll_and_own_selection_edges() {
+        use block_mode::SelectionNavigation::{Clear, Passthrough, Select};
+
+        let ids = [10, 20, 30];
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, false, &ids, None),
+            Select(30)
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, None),
+            Passthrough
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(20)),
+            Select(30)
+        );
+        // Selection edges are owned: Up clamps, Down exits selection mode.
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, false, &ids, Some(10)),
+            Select(10)
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(30)),
+            Clear
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, false, &[], None),
+            Passthrough
+        );
+        // Running/full-screen programs retain Ctrl+Up too.
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, false, true, &ids, None),
+            Passthrough
+        );
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, true, true, false, &ids, None),
+            Passthrough
+        );
+    }
+
+    #[test]
+    fn selected_command_reinput_never_executes_unbracketed_later_lines() {
+        let bracketed = pty_input::encode_prompt_insert(
+            "first\nsecond",
+            PasteModes { bracketed: true },
+            block_reinput_policy(),
+            true,
+        );
+        assert_eq!(bracketed.bytes, b"\x15\x1b[200~first\nsecond\x1b[201~");
+        assert!(!bracketed.bytes.ends_with(b"\r"));
+
+        let plain = pty_input::encode_prompt_insert(
+            "first\nsecond",
+            PasteModes { bracketed: false },
+            block_reinput_policy(),
+            true,
+        );
+        assert_eq!(plain.bytes, b"\x15first");
+        assert_eq!(plain.echo_text, "first");
+        assert!(plain.risk.truncated_to_first_line);
+        assert!(!plain.bytes.contains(&b'\n'));
+        assert!(!plain.bytes.contains(&b'\r'));
+    }
 
     #[test]
     fn agent_prompt_requires_the_shell_to_own_the_foreground_pty() {
