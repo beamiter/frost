@@ -22,6 +22,7 @@ pub enum Command {
 
     // === 编辑操作 ===
     EditCopy,
+    EditCopyBlockOutput,
     EditPaste,
 
     // === 搜索操作 ===
@@ -49,7 +50,7 @@ pub enum Command {
     // ctrl+alt+up/down (the natural select-prev/next chords) are
     // pane:focus_up/down here, and ctrl+alt+left/right (the natural
     // jump-prev/next-failed chords) are pane:focus_left/right. The P0 batch
-    // actions keep the family chords (Ctrl+Shift+A/I), and block:search uses
+    // actions keep the family chords (Ctrl+Shift+A/I/K), and block:search uses
     // Ctrl+Alt+F because Ctrl+Shift+G is terminal:copy_last_output here;
     // remaining block commands stay palette-only until the user binds them.
     BlockJumpFirstFailed,
@@ -59,6 +60,7 @@ pub enum Command {
     BlockCopyOutput,
     BlockRecallCommand,
     BlockSelectAll,
+    BlockClear,
     BlockSelectPrev,
     BlockSelectNext,
     BlockReinputSelectedCommands,
@@ -115,6 +117,7 @@ impl std::fmt::Display for Command {
             Command::SessionJump(n) => write!(f, "session:jump:{}", n),
             Command::SessionLast => write!(f, "session:last"),
             Command::EditCopy => write!(f, "edit:copy"),
+            Command::EditCopyBlockOutput => write!(f, "edit:copy_block_output"),
             Command::EditPaste => write!(f, "edit:paste"),
             Command::SearchOpen => write!(f, "search:open"),
             Command::SearchClose => write!(f, "search:close"),
@@ -138,6 +141,7 @@ impl std::fmt::Display for Command {
             Command::BlockCopyOutput => write!(f, "block:copy_output"),
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
             Command::BlockSelectAll => write!(f, "block:select_all"),
+            Command::BlockClear => write!(f, "block:clear"),
             Command::BlockSelectPrev => write!(f, "block:select_prev"),
             Command::BlockSelectNext => write!(f, "block:select_next"),
             Command::BlockReinputSelectedCommands => {
@@ -191,6 +195,7 @@ impl std::str::FromStr for Command {
             "session:prev" => Ok(Command::SessionPrev),
             "session:last" => Ok(Command::SessionLast),
             "edit:copy" => Ok(Command::EditCopy),
+            "edit:copy_block_output" => Ok(Command::EditCopyBlockOutput),
             "edit:paste" => Ok(Command::EditPaste),
             "search:open" => Ok(Command::SearchOpen),
             "search:close" => Ok(Command::SearchClose),
@@ -214,6 +219,7 @@ impl std::str::FromStr for Command {
             "block:copy_output" => Ok(Command::BlockCopyOutput),
             "block:recall_command" => Ok(Command::BlockRecallCommand),
             "block:select_all" => Ok(Command::BlockSelectAll),
+            "block:clear" => Ok(Command::BlockClear),
             "block:select_prev" => Ok(Command::BlockSelectPrev),
             "block:select_next" => Ok(Command::BlockSelectNext),
             "block:reinput_selected_commands" => Ok(Command::BlockReinputSelectedCommands),
@@ -355,6 +361,10 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+c".to_string(), "edit:copy".to_string());
+        bindings.bindings.insert(
+            "ctrl+shift+alt+c".to_string(),
+            "edit:copy_block_output".to_string(),
+        );
         bindings
             .bindings
             .insert("ctrl+shift+v".to_string(), "edit:paste".to_string());
@@ -418,6 +428,9 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+shift+a".to_string(), "block:select_all".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+shift+k".to_string(), "block:clear".to_string());
         bindings.bindings.insert(
             "ctrl+shift+i".to_string(),
             "block:reinput_selected_commands".to_string(),
@@ -664,6 +677,10 @@ mod tests {
 
         let cmd: Command = "sidebar:toggle".parse().unwrap();
         assert_eq!(cmd, Command::SidebarToggle);
+
+        let cmd: Command = "edit:copy_block_output".parse().unwrap();
+        assert_eq!(cmd, Command::EditCopyBlockOutput);
+        assert_eq!(cmd.to_string(), "edit:copy_block_output");
     }
 
     #[test]
@@ -766,7 +783,9 @@ mod tests {
     fn frost_chords_beyond_the_family_contract() {
         let bindings = KeyBindings::default_bindings();
         let cases = [
+            ("ctrl+alt+shift+c", Command::EditCopyBlockOutput),
             ("ctrl+shift+a", Command::BlockSelectAll),
+            ("ctrl+shift+k", Command::BlockClear),
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+alt+g", Command::AgentToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
@@ -798,6 +817,7 @@ mod tests {
             ("block:copy_output", Command::BlockCopyOutput),
             ("block:recall_command", Command::BlockRecallCommand),
             ("block:select_all", Command::BlockSelectAll),
+            ("block:clear", Command::BlockClear),
             ("block:select_prev", Command::BlockSelectPrev),
             ("block:select_next", Command::BlockSelectNext),
             (
@@ -855,6 +875,10 @@ mod tests {
             bindings.get_command("ctrl+shift+i"),
             Some(Command::BlockReinputSelectedCommands)
         );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+k"),
+            Some(Command::BlockClear)
+        );
         let mut bound_block_commands: Vec<&str> = bindings
             .bindings
             .values()
@@ -865,6 +889,7 @@ mod tests {
         assert_eq!(
             bound_block_commands,
             vec![
+                "block:clear",
                 "block:reinput_selected_commands",
                 "block:search",
                 "block:select_all",

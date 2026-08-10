@@ -398,6 +398,113 @@ pub fn block_copy_text(command: Option<&str>, output: Option<&str>) -> Option<St
     }
 }
 
+/// Same aggregate clipboard ceiling as Forge. Although captured block output
+/// is already bounded per zone, a 256-block selection must not turn one copy
+/// gesture into an unexpectedly large UI allocation.
+pub const SELECTED_CLIPBOARD_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedClipboardMode {
+    Commands,
+    Outputs,
+    Blocks,
+}
+
+/// Output state supplied to [`selected_clipboard_text`]. `Unavailable` is
+/// distinct from `Empty`: silently omitting evicted output would make a
+/// multi-block clipboard look complete when it is not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardOutput {
+    Available(String),
+    Empty,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectedClipboardError {
+    Empty,
+    OutputUnavailable,
+    TooLarge,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedClipboard {
+    pub text: String,
+    pub block_count: usize,
+}
+
+/// Aggregate one whole-block selection in terminal order. Commands use one
+/// newline (the family's editable command-list form); output and full blocks
+/// use one blank line between contributing blocks, matching their visual card
+/// grouping. Output-dependent modes fail atomically when any selected block's
+/// previously non-blank output is no longer retained or the byte cap would be
+/// exceeded.
+pub fn selected_clipboard_text<'a, I>(
+    blocks: I,
+    selection: &BlockSelection,
+    mode: SelectedClipboardMode,
+    max_bytes: usize,
+) -> Result<SelectedClipboard, SelectedClipboardError>
+where
+    I: IntoIterator<Item = (u64, Option<&'a str>, ClipboardOutput)>,
+{
+    let mut text = String::new();
+    let mut block_count = 0usize;
+    for (id, command, output) in blocks {
+        if !selection.contains(id) {
+            continue;
+        }
+        let part = match mode {
+            SelectedClipboardMode::Commands => command
+                .filter(|command| !command.trim().is_empty())
+                .map(str::to_string),
+            SelectedClipboardMode::Outputs => match output {
+                ClipboardOutput::Available(output) if !output.trim().is_empty() => Some(output),
+                ClipboardOutput::Available(_) | ClipboardOutput::Empty => None,
+                ClipboardOutput::Unavailable => {
+                    return Err(SelectedClipboardError::OutputUnavailable);
+                }
+            },
+            SelectedClipboardMode::Blocks => {
+                let output = match output {
+                    ClipboardOutput::Available(output) => Some(output),
+                    ClipboardOutput::Empty => None,
+                    ClipboardOutput::Unavailable => {
+                        return Err(SelectedClipboardError::OutputUnavailable);
+                    }
+                };
+                block_copy_text(command, output.as_deref())
+            }
+        };
+        let Some(part) = part else {
+            continue;
+        };
+        let separator = if text.is_empty() {
+            ""
+        } else if mode == SelectedClipboardMode::Commands {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let next_len = text
+            .len()
+            .checked_add(separator.len())
+            .and_then(|length| length.checked_add(part.len()))
+            .ok_or(SelectedClipboardError::TooLarge)?;
+        if next_len > max_bytes {
+            return Err(SelectedClipboardError::TooLarge);
+        }
+        text.push_str(separator);
+        text.push_str(&part);
+        block_count += 1;
+    }
+    if text.is_empty() {
+        Err(SelectedClipboardError::Empty)
+    } else {
+        Ok(SelectedClipboard { text, block_count })
+    }
+}
+
 /// Proleptic-Gregorian civil date/time for a unix-epoch millisecond
 /// timestamp shifted by `offset_secs` (a fixed UTC offset), via Howard
 /// Hinnant's `civil_from_days`. Hand-rolled because this crate deliberately
@@ -614,36 +721,45 @@ pub fn selection_navigation(ids: &[u64], current: Option<u64>, older: bool) -> S
 
 /// Step the block selection across FAILED zones only (`zones` oldest-first as
 /// `(id, is_failed)` — the same [`classify`]-based predicate the scrollbar
-/// markers use). No selection, or a dangling one, lands on the NEWEST failed
-/// zone in either direction (mirroring block navigation's Up reset rule);
-/// from a live selection — failed or not — the step goes to the nearest
-/// failed zone strictly older (`older`) or strictly newer. `None` means "do
-/// nothing": no failed zone exists in the requested direction. This function
-/// is silent about WHY it returned `None`; a caller wanting a "no failed
-/// blocks at all" toast must check for failures itself.
+/// markers use). No selection, or a dangling one, enters from the edge in the
+/// requested direction (newest for `older`, oldest for newer). From a live
+/// selection — failed or not — the step goes to the nearest failed zone
+/// strictly older/newer, wrapping to the far edge. `None` therefore means
+/// there are no failed zones at all. This matches anvil/forge's shared marked-
+/// block navigation contract.
 pub fn select_failed_neighbor(
     zones: &[(u64, bool)],
     current: Option<u64>,
     older: bool,
 ) -> Option<u64> {
-    let newest_failed = |slice: &[(u64, bool)]| {
-        slice
+    let oldest_failed = || zones.iter().find(|&&(_, failed)| failed).map(|&(id, _)| id);
+    let newest_failed = || {
+        zones
             .iter()
             .rev()
             .find(|&&(_, failed)| failed)
             .map(|&(id, _)| id)
     };
-    let Some(position) = current.and_then(|id| zones.iter().position(|&(zone, _)| zone == id))
-    else {
-        return newest_failed(zones);
-    };
+    let position = current.and_then(|id| zones.iter().position(|&(zone, _)| zone == id));
     if older {
-        newest_failed(&zones[..position])
+        position
+            .and_then(|position| {
+                zones[..position]
+                    .iter()
+                    .rev()
+                    .find(|&&(_, failed)| failed)
+                    .map(|&(id, _)| id)
+            })
+            .or_else(newest_failed)
     } else {
-        zones[position + 1..]
-            .iter()
-            .find(|&&(_, failed)| failed)
-            .map(|&(id, _)| id)
+        position
+            .and_then(|position| {
+                zones[position + 1..]
+                    .iter()
+                    .find(|&&(_, failed)| failed)
+                    .map(|&(id, _)| id)
+            })
+            .or_else(oldest_failed)
     }
 }
 
@@ -926,6 +1042,82 @@ mod tests {
         // Nothing on either side: nothing to copy (caller toasts).
         assert_eq!(block_copy_text(None, None), None);
         assert_eq!(block_copy_text(Some("  "), Some("\n")), None);
+    }
+
+    #[test]
+    fn selected_clipboard_copy_is_ordered_grouped_and_background_aware() {
+        use ClipboardOutput::{Available, Empty};
+        use SelectedClipboardMode::{Blocks, Commands, Outputs};
+
+        let ids = [1, 2, 3, 4];
+        let mut selection = BlockSelection::default();
+        selection.select_all(&ids);
+        let source = || {
+            [
+                (1, Some("first"), Available("one".to_string())),
+                (2, None, Available("background".to_string())),
+                (3, Some("third"), Empty),
+                (4, Some("  "), Empty),
+            ]
+        };
+
+        assert_eq!(
+            selected_clipboard_text(source(), &selection, Commands, 1024),
+            Ok(SelectedClipboard {
+                text: "first\nthird".to_string(),
+                block_count: 2,
+            })
+        );
+        assert_eq!(
+            selected_clipboard_text(source(), &selection, Outputs, 1024),
+            Ok(SelectedClipboard {
+                text: "one\n\nbackground".to_string(),
+                block_count: 2,
+            })
+        );
+        assert_eq!(
+            selected_clipboard_text(source(), &selection, Blocks, 1024),
+            Ok(SelectedClipboard {
+                text: "first\none\n\nbackground\n\nthird".to_string(),
+                block_count: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn selected_clipboard_copy_is_bounded_and_output_atomic() {
+        use ClipboardOutput::{Available, Unavailable};
+        use SelectedClipboardError::{OutputUnavailable, TooLarge};
+        use SelectedClipboardMode::{Blocks, Commands, Outputs};
+
+        let mut selection = BlockSelection::default();
+        selection.select_all(&[1, 2]);
+        let unavailable = || {
+            [
+                (1, Some("first"), Available("one".to_string())),
+                (2, Some("second"), Unavailable),
+            ]
+        };
+        assert_eq!(
+            selected_clipboard_text(unavailable(), &selection, Outputs, 1024),
+            Err(OutputUnavailable)
+        );
+        assert_eq!(
+            selected_clipboard_text(unavailable(), &selection, Blocks, 1024),
+            Err(OutputUnavailable)
+        );
+        // Copying commands does not depend on retained output.
+        assert_eq!(
+            selected_clipboard_text(unavailable(), &selection, Commands, 12),
+            Ok(SelectedClipboard {
+                text: "first\nsecond".to_string(),
+                block_count: 2,
+            })
+        );
+        assert_eq!(
+            selected_clipboard_text(unavailable(), &selection, Commands, 11),
+            Err(TooLarge)
+        );
     }
 
     #[test]
@@ -1336,11 +1528,11 @@ mod tests {
             (40, true),
             (50, false),
         ];
-        // No selection (or a dangling id): both directions pick the NEWEST
-        // failed zone.
+        // No selection (or a dangling id) enters from the requested edge.
         assert_eq!(select_failed_neighbor(&zones, None, true), Some(40));
-        assert_eq!(select_failed_neighbor(&zones, None, false), Some(40));
+        assert_eq!(select_failed_neighbor(&zones, None, false), Some(20));
         assert_eq!(select_failed_neighbor(&zones, Some(999), true), Some(40));
+        assert_eq!(select_failed_neighbor(&zones, Some(999), false), Some(20));
         // From a failed selection: the nearest failed strictly beyond it.
         assert_eq!(select_failed_neighbor(&zones, Some(40), true), Some(20));
         assert_eq!(select_failed_neighbor(&zones, Some(20), false), Some(40));
@@ -1348,10 +1540,11 @@ mod tests {
         assert_eq!(select_failed_neighbor(&zones, Some(30), true), Some(20));
         assert_eq!(select_failed_neighbor(&zones, Some(30), false), Some(40));
         assert_eq!(select_failed_neighbor(&zones, Some(50), true), Some(40));
-        // Ends clamp silently: nothing further in that direction.
-        assert_eq!(select_failed_neighbor(&zones, Some(20), true), None);
-        assert_eq!(select_failed_neighbor(&zones, Some(40), false), None);
-        assert_eq!(select_failed_neighbor(&zones, Some(50), false), None);
+        // Ends wrap to the far failed block; a non-failed selection beyond the
+        // last failure wraps in the newer direction as well.
+        assert_eq!(select_failed_neighbor(&zones, Some(20), true), Some(40));
+        assert_eq!(select_failed_neighbor(&zones, Some(40), false), Some(20));
+        assert_eq!(select_failed_neighbor(&zones, Some(50), false), Some(20));
         // No zones, or no failures at all: nothing to land on.
         assert_eq!(select_failed_neighbor(&[], None, true), None);
         assert_eq!(

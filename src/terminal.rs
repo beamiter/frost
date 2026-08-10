@@ -2139,6 +2139,7 @@ impl TerminalState {
         if count == 0 {
             return;
         }
+        self.kitty_graphics.on_buffer_rows_trimmed(count);
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
                 continue;
@@ -2218,6 +2219,68 @@ impl TerminalState {
     /// `None` means the bounded zone deque no longer retains the id.
     pub fn zone_by_id(&self, id: u64) -> Option<&CommandZone> {
         self.command_zones.iter().find(|zone| zone.id == id)
+    }
+
+    /// Remove every finalized OSC 133 block while leaving the live prompt (or
+    /// the command currently running) intact. This is the terminal-state half
+    /// of Warp's "Clear Blocks" action.
+    ///
+    /// Sending form-feed or ED 2 to the PTY is deliberately not involved: a
+    /// foreground program may own stdin, and ED 2 archives the visible screen
+    /// in this emulator. Instead, discard only buffer rows older than the live
+    /// OSC 133 lifecycle, blank completed rows that still occupy the grid, and
+    /// rebase the lifecycle's absolute row anchors by the removed scrollback.
+    /// The zone id counter remains monotonic so a stale UI id can never target
+    /// a block created after the clear.
+    pub fn clear_completed_blocks(&mut self) -> usize {
+        let cleared = self.command_zones.len();
+        if cleared == 0 {
+            return 0;
+        }
+
+        let old_scrollback_len = self.scrollback.len();
+        let live_start = match self.current_zone_state {
+            ZoneState::PromptStarted(prompt_start)
+            | ZoneState::CommandStarted(prompt_start, _)
+            | ZoneState::OutputStarted(prompt_start, _, _) => Some(prompt_start),
+            ZoneState::Idle => None,
+        };
+
+        // Retain the live lifecycle's tail if it has itself scrolled above the
+        // grid. With no live lifecycle, every displayed row belongs to history.
+        let retained_scrollback_start = live_start
+            .map(|start| start.min(old_scrollback_len))
+            .unwrap_or(old_scrollback_len);
+        self.kitty_graphics
+            .retain_placements_from_buffer_row(live_start);
+        self.scrollback.drain(..retained_scrollback_start);
+
+        self.command_zones.clear();
+        self.captured_output_bytes = 0;
+        self.on_scrollback_rows_trimmed(retained_scrollback_start);
+
+        let completed_grid_rows = live_start
+            .map(|start| start.saturating_sub(old_scrollback_len))
+            .unwrap_or(self.grid.rows())
+            .min(self.grid.rows());
+        if completed_grid_rows > 0 {
+            let blank = TerminalCell::default();
+            for row in 0..completed_grid_rows {
+                self.grid[row].fill(blank);
+                self.grid.row_wrapped[row] = false;
+            }
+            self.mark_rows_dirty(0, completed_grid_rows - 1);
+        } else {
+            // Scrollback-only deletion still changes the visible buffer.
+            self.grid_version = self.grid_version.wrapping_add(1);
+            self.visible_cells_cache = None;
+        }
+
+        self.selection = None;
+        self.scroll_offset = 0;
+        self.last_archived_screen_snapshot.clear();
+        self.last_synced_primary_screen_snapshot.clear();
+        cleared
     }
 
     /// Plain text of one zone's output (same trimming and 1 MiB cap as
@@ -3382,9 +3445,10 @@ impl TerminalState {
     fn handle_kitty_graphics_apc(&mut self, payload: &[u8]) {
         let cursor_col = self.cursor_col as u32;
         let cursor_row = self.cursor_row as u32;
+        let buffer_row = self.scrollback.len().saturating_add(self.cursor_row);
         if let Err(_error) = self
             .kitty_graphics
-            .parse_graphics_payload_at(payload, cursor_col, cursor_row)
+            .parse_graphics_payload_at_buffer_row(payload, cursor_col, cursor_row, buffer_row)
         {
             crate::debug_log!("[APC] Kitty graphics error: {}", _error);
         }
@@ -4146,8 +4210,13 @@ impl TerminalState {
                     }
                     3 => {
                         // Clear scrollback (xterm extension)
+                        let trimmed = self.scrollback.len();
                         self.scrollback.clear();
+                        self.on_scrollback_rows_trimmed(trimmed);
+                        self.selection = None;
                         self.scroll_offset = 0;
+                        self.grid_version = self.grid_version.wrapping_add(1);
+                        self.visible_cells_cache = None;
                     }
                     _ => {}
                 }
@@ -4719,10 +4788,9 @@ impl TerminalState {
         self.alt_keyboard_enhancement_stack.clear();
         self.selection = None;
         self.current_hyperlink = None;
-        // A half-finished Kitty upload must not survive into the reset screen.
-        // There is no wall clock behind this: RIS plus the shared aggregate
-        // in-flight cap replace the old 10-second pending-transfer expiry.
-        self.kitty_graphics.reset_transfers();
+        // RIS resets the graphics namespace with the text screen: neither a
+        // visible placement nor a half-finished upload may survive it.
+        self.kitty_graphics.clear();
         self.clear_screen();
     }
 
@@ -6058,9 +6126,28 @@ impl TerminalState {
     /// Normalize retained history after a burst of width changes. This is kept
     /// separate from `on_resize` so window/divider drags can debounce the O(n)
     /// decompress/reflow/recompress pass instead of freezing every pointer step.
-    pub fn normalize_scrollback_width(&mut self) {
+    /// Returns `false` when a live lifecycle already entered scrollback and
+    /// the caller must retry after it closes; `true` when normalization is
+    /// complete (including an empty history).
+    pub fn normalize_scrollback_width(&mut self) -> bool {
         if self.scrollback.is_empty() {
-            return;
+            return true;
+        }
+        let old_scrollback_len = self.scrollback.len();
+        let live_start = match self.current_zone_state {
+            ZoneState::PromptStarted(prompt_start)
+            | ZoneState::CommandStarted(prompt_start, _)
+            | ZoneState::OutputStarted(prompt_start, _, _) => Some(prompt_start),
+            ZoneState::Idle => None,
+        };
+        // Once a long-running block's prompt has entered scrollback, changing
+        // physical wrapping would require mapping anchors inside a logical
+        // line. Defer that optional history cleanup instead of severing the
+        // running lifecycle (and Agent execution correlation) mid-command.
+        if live_start.is_some_and(|start| start < old_scrollback_len) {
+            self.selection = None;
+            self.scroll_offset = 0;
+            return false;
         }
         let cols = self.grid.row_len().max(1);
         // Historical padding must stay neutral even when a live application has
@@ -6071,23 +6158,63 @@ impl TerminalState {
         while self.scrollback.len() > self.max_scrollback {
             self.scrollback.pop_front();
         }
+        let new_scrollback_len = self.scrollback.len();
+        self.kitty_graphics
+            .on_scrollback_reflow(old_scrollback_len, new_scrollback_len);
+        let translate_grid_row =
+            |row: usize| new_scrollback_len.saturating_add(row.saturating_sub(old_scrollback_len));
         self.scroll_offset = 0;
-        // These structures use absolute physical rows. Discarding them is safer
-        // than leaving selections/zones pointing at unrelated text.
+        // Selection endpoints cannot be mapped through arbitrary reflow. Block
+        // metadata can: zones whose prompt was in reflowed history lose only
+        // their row anchors while keeping identity/metadata/output snapshots;
+        // zones and a live lifecycle still in the unchanged grid shift by the
+        // new scrollback prefix length.
         self.selection = None;
-        self.command_zones.clear();
-        self.captured_output_bytes = 0;
-        self.current_zone_state = ZoneState::default();
-        self.current_command_start_col = None;
-        self.current_command_extent_row = None;
-        self.agent_prompt_input_tainted = false;
-        self.armed_agent_execution = None;
-        self.active_agent_execution = None;
-        self.current_command_text = None;
-        self.current_command_id = None;
-        self.current_command_started_at = None;
+        for zone in &mut self.command_zones {
+            if zone.rows_evicted {
+                continue;
+            }
+            if zone.prompt_start < old_scrollback_len {
+                zone.rows_evicted = true;
+                zone.prompt_start = 0;
+                zone.command_start = None;
+                zone.output_start = None;
+                zone.output_end = None;
+            } else {
+                zone.prompt_start = translate_grid_row(zone.prompt_start);
+                for row in [
+                    zone.command_start.as_mut(),
+                    zone.output_start.as_mut(),
+                    zone.output_end.as_mut(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    *row = translate_grid_row(*row);
+                }
+            }
+        }
+        self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
+            ZoneState::Idle => ZoneState::Idle,
+            ZoneState::PromptStarted(prompt_start) => {
+                ZoneState::PromptStarted(translate_grid_row(prompt_start))
+            }
+            ZoneState::CommandStarted(prompt_start, command_start) => ZoneState::CommandStarted(
+                translate_grid_row(prompt_start),
+                translate_grid_row(command_start),
+            ),
+            ZoneState::OutputStarted(prompt_start, command_start, output_start) => {
+                ZoneState::OutputStarted(
+                    translate_grid_row(prompt_start),
+                    translate_grid_row(command_start),
+                    translate_grid_row(output_start),
+                )
+            }
+        };
+        self.current_command_extent_row = self.current_command_extent_row.map(translate_grid_row);
         self.grid_version = self.grid_version.wrapping_add(1);
         self.visible_cells_cache = None;
+        true
     }
 
     pub fn on_resize(&mut self, cols: usize, rows: usize) {
@@ -6619,8 +6746,8 @@ mod tests {
     }
 
     use super::{
-        ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell, TerminalState,
-        ZoneOutputExport, MAX_TERMINAL_TITLE_CHARS,
+        AgentPromptStatus, ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell,
+        TerminalState, ZoneOutputExport, MAX_TERMINAL_TITLE_CHARS,
     };
 
     #[test]
@@ -6939,10 +7066,118 @@ mod tests {
         assert_eq!(visible[0][4].background, Color::Default);
 
         terminal.scroll_to_bottom();
-        terminal.normalize_scrollback_width();
+        assert!(terminal.normalize_scrollback_width());
         let history = terminal.scrollback[0].decompress();
         assert_eq!(history.len(), 5);
         assert_eq!(history[4].background, Color::Default);
+    }
+
+    #[test]
+    fn history_reflow_preserves_blocks_live_prompt_and_agent_correlation() {
+        let mut terminal = TerminalState::new(24, 7);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        let ids: Vec<u64> = terminal.command_zones.iter().map(|zone| zone.id).collect();
+        let captured_before = terminal.captured_output_bytes;
+        assert!(terminal.scrollback_len() > 0);
+        assert_eq!(terminal.take_completed_commands().len(), 2);
+
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Ready);
+        terminal
+            .arm_agent_execution(77, "echo live")
+            .expect("trusted empty prompt");
+        terminal.process_input(b"echo live\r\n\x1b]133;C;id=run-1\x07");
+        let old_scrollback_len = terminal.scrollback_len();
+        let old_running_start = terminal.running_zone_start().expect("running block");
+        assert!(old_running_start >= old_scrollback_len);
+
+        terminal.on_resize(11, 7);
+        assert!(terminal.normalize_scrollback_width());
+
+        assert_eq!(
+            terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(terminal.captured_output_bytes, captured_before);
+        assert_eq!(
+            terminal.zone_output_text(ids[0]).as_deref(),
+            Some("out\nout\nout")
+        );
+        assert!(terminal.is_command_running());
+        assert_eq!(
+            terminal.running_zone_start(),
+            Some(
+                terminal
+                    .scrollback_len()
+                    .saturating_add(old_running_start - old_scrollback_len)
+            )
+        );
+
+        terminal.process_input(b"done\r\n\x1b]133;D;0;id=run-1\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "echo live");
+        assert_eq!(completed[0].agent_generation, Some(77));
+        assert_eq!(
+            terminal
+                .command_zones
+                .back()
+                .and_then(|zone| zone.command.as_deref()),
+            Some("echo live")
+        );
+    }
+
+    #[test]
+    fn history_reflow_defers_while_live_block_has_entered_scrollback() {
+        let mut terminal = TerminalState::new(20, 4);
+        emit_zone(&mut terminal, 0);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07long job\r\n\x1b]133;C\x07one\r\ntwo\r\nthree\r\nfour\r\n",
+        );
+        let running_start = terminal.running_zone_start().expect("running block");
+        let history_len = terminal.scrollback_len();
+        assert!(running_start < history_len);
+        let old_width = terminal
+            .scrollback
+            .front()
+            .expect("history")
+            .decompress()
+            .len();
+
+        terminal.on_resize(9, 4);
+        assert!(!terminal.normalize_scrollback_width());
+
+        assert_eq!(terminal.scrollback_len(), history_len);
+        assert_eq!(terminal.running_zone_start(), Some(running_start));
+        assert_eq!(
+            terminal
+                .scrollback
+                .front()
+                .expect("history")
+                .decompress()
+                .len(),
+            old_width,
+            "the unsafe reflow is deferred until the live lifecycle closes"
+        );
+        terminal.process_input(b"done\r\n\x1b]133;D;0\x07");
+        assert!(!terminal.is_command_running());
+        assert_eq!(
+            terminal
+                .command_zones
+                .back()
+                .and_then(|zone| zone.command.as_deref()),
+            Some("long job")
+        );
+        assert!(terminal.normalize_scrollback_width());
+        assert!(terminal
+            .scrollback
+            .iter()
+            .all(|line| line.decompress().len() == 9));
     }
 
     #[test]
@@ -7811,6 +8046,39 @@ mod tests {
     }
 
     #[test]
+    fn erase_scrollback_rebases_live_and_completed_block_rows() {
+        let mut terminal = TerminalState::new(20, 4);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07draft");
+        let old_scrollback = terminal.scrollback_len();
+        let old_prompt = terminal.live_prompt_row().expect("live prompt");
+        let old_zone_rows: Vec<usize> = terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.prompt_start)
+            .collect();
+        assert!(old_scrollback > 0);
+
+        terminal.process_input(b"\x1b[3J");
+
+        assert_eq!(terminal.scrollback_len(), 0);
+        assert_eq!(
+            terminal.live_prompt_row(),
+            Some(old_prompt.saturating_sub(old_scrollback))
+        );
+        for (zone, old_row) in terminal.command_zones.iter().zip(old_zone_rows) {
+            if old_row < old_scrollback {
+                assert!(zone.rows_evicted);
+                assert_eq!(zone.output_start, None);
+            } else {
+                assert!(!zone.rows_evicted);
+                assert_eq!(zone.prompt_start, old_row - old_scrollback);
+            }
+        }
+    }
+
+    #[test]
     fn entering_alt_buffer_does_not_archive_primary_screen() {
         let mut terminal = TerminalState::new(4, 3);
         terminal.process_input(b"main");
@@ -8054,6 +8322,138 @@ mod tests {
         assert_eq!(terminal.running_zone_start(), None);
         assert_eq!(terminal.live_prompt_row(), None);
         assert_eq!(terminal.running_duration_ms(), None);
+    }
+
+    #[test]
+    fn clear_completed_blocks_preserves_idle_prompt_and_monotonic_ids() {
+        let mut terminal = TerminalState::new(40, 6);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07draft");
+        let next_id = terminal.next_zone_id;
+        let prompt_before = terminal.live_prompt_row().expect("live prompt");
+        let scrollback_before = terminal.scrollback_len();
+        assert_eq!(terminal.command_zones.len(), 2);
+        assert!(terminal.captured_output_bytes > 0);
+
+        assert_eq!(terminal.clear_completed_blocks(), 2);
+
+        assert!(terminal.command_zones.is_empty());
+        assert_eq!(terminal.captured_output_bytes, 0);
+        assert_eq!(terminal.scroll_offset, 0);
+        assert_eq!(terminal.next_zone_id, next_id);
+        assert_eq!(
+            terminal.live_prompt_row(),
+            Some(prompt_before.saturating_sub(prompt_before.min(scrollback_before)))
+        );
+        let retained: String = terminal
+            .search_lines()
+            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .collect();
+        assert!(
+            retained.contains("$ draft"),
+            "retained buffer: {retained:?}"
+        );
+        assert!(!retained.contains("cmd0"), "retained buffer: {retained:?}");
+        assert!(!retained.contains("cmd1"), "retained buffer: {retained:?}");
+
+        // The still-live editor completes normally, and a stale pre-clear id
+        // cannot alias the newly created zone.
+        terminal.process_input(b"\r\n\x1b]133;C\x07new output\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+        assert_eq!(terminal.command_zones[0].id, next_id);
+        assert_eq!(terminal.command_zones[0].command.as_deref(), Some("draft"));
+    }
+
+    #[test]
+    fn clear_completed_blocks_keeps_a_running_block_that_reached_scrollback() {
+        let mut terminal = TerminalState::new(32, 4);
+        emit_zone(&mut terminal, 0);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 5\r\n\x1b]133;C\x07start\r\nline2\r\nline3\r\nline4\r\n",
+        );
+        let start_before = terminal.running_zone_start().expect("running block");
+        assert!(start_before < terminal.scrollback_len());
+
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+
+        assert!(terminal.is_command_running());
+        assert_eq!(terminal.running_zone_start(), Some(0));
+        let retained: String = terminal
+            .search_lines()
+            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .collect();
+        assert!(
+            retained.contains("sleep 5"),
+            "retained buffer: {retained:?}"
+        );
+        assert!(retained.contains("line4"), "retained buffer: {retained:?}");
+        assert!(!retained.contains("cmd0"), "retained buffer: {retained:?}");
+
+        terminal.process_input(b"done\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+        assert_eq!(
+            terminal.command_zones[0].command.as_deref(),
+            Some("sleep 5")
+        );
+        assert_eq!(
+            terminal
+                .zone_output_text(terminal.command_zones[0].id)
+                .as_deref(),
+            Some("start\nline2\nline3\nline4\ndone")
+        );
+    }
+
+    #[test]
+    fn clear_completed_blocks_removes_finished_graphics_and_keeps_live_graphics() {
+        let mut terminal = TerminalState::new(30, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07image old\r\n\x1b]133;C\x07\x1b_Gf=32,s=1,v=1,a=T,i=51;AQIDBA==\x1b\\\r\n\x1b]133;D;0\x07",
+        );
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07image live\r\n\x1b]133;C\x07\x1b_Gf=32,s=1,v=1,a=T,i=52;BQYHCA==\x1b\\",
+        );
+        assert!(terminal.is_command_running());
+        assert_eq!(terminal.kitty_graphics.get_placements().len(), 2);
+        assert!(terminal.kitty_graphics.get_image(51).is_some());
+        assert!(terminal.kitty_graphics.get_image(52).is_some());
+
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+
+        let placements = terminal.kitty_graphics.get_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].image_id, 52);
+        assert!(terminal.kitty_graphics.get_image(51).is_none());
+        assert!(terminal.kitty_graphics.get_image(52).is_some());
+        assert_eq!(terminal.kitty_graphics.image_count(), 1);
+        assert!(terminal.is_command_running());
+
+        terminal.process_input(b"\r\n\x1b]133;D;0\x07");
+        assert_eq!(
+            terminal
+                .command_zones
+                .back()
+                .and_then(|zone| zone.command.as_deref()),
+            Some("image live")
+        );
+    }
+
+    #[test]
+    fn clear_completed_blocks_is_a_noop_without_finished_zones() {
+        let mut terminal = TerminalState::new(20, 3);
+        terminal.process_input(b"plain text");
+        let before: String = terminal
+            .search_lines()
+            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .collect();
+
+        assert_eq!(terminal.clear_completed_blocks(), 0);
+
+        let after: String = terminal
+            .search_lines()
+            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .collect();
+        assert_eq!(after, before);
     }
 
     #[test]

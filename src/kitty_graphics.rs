@@ -51,6 +51,10 @@ pub struct KittyPlacement {
     pub col: u32,
     /// 左上角所在的屏幕行（命令抵达时的光标行）。
     pub row: u32,
+    /// Placement anchor in the terminal's absolute buffer coordinates. The
+    /// renderer still consumes `row`; block/history lifecycle operations use
+    /// this stable coordinate to remove or rebase images with their text.
+    pub buffer_row: usize,
     /// 占用的单元格列数（`c=`）。
     pub cols: u32,
     /// 占用的单元格行数（`r=`）。
@@ -248,6 +252,7 @@ struct PlacementRequest {
     placement_id: Option<u32>,
     col: u32,
     row: u32,
+    buffer_row: usize,
     cols: u32,
     rows: u32,
     src_x: u32,
@@ -262,12 +267,14 @@ impl PlacementRequest {
         command: &Command<'_>,
         cursor_col: u32,
         cursor_row: u32,
+        buffer_row: usize,
     ) -> Result<Self, Failure> {
         Ok(Self {
             placement_id: command.placement,
             // 屏幕位置来自光标，不是 x=/y=。
             col: cursor_col,
             row: cursor_row,
+            buffer_row,
             cols: command.u32_value("c")?.unwrap_or(1).max(1),
             rows: command.u32_value("r")?.unwrap_or(1).max(1),
             src_x: command.u32_value("x")?.unwrap_or(0),
@@ -351,13 +358,32 @@ impl KittyGraphicsState {
     ///
     /// 失败时会（在客户端允许的前提下）排入一条错误应答，然后把同一段文本作为
     /// `Err` 返回给调用方记日志。
+    #[cfg(test)]
     pub fn parse_graphics_payload_at(
         &mut self,
         payload: &[u8],
         cursor_col: u32,
         cursor_row: u32,
     ) -> Result<(), String> {
-        let result = match self.dispatch(payload, cursor_col, cursor_row) {
+        self.parse_graphics_payload_at_buffer_row(
+            payload,
+            cursor_col,
+            cursor_row,
+            cursor_row as usize,
+        )
+    }
+
+    /// Terminal-owned entry point that records both the grid row needed by
+    /// today's renderer and the absolute buffer row needed by block clearing,
+    /// scrollback trimming and width normalization.
+    pub(crate) fn parse_graphics_payload_at_buffer_row(
+        &mut self,
+        payload: &[u8],
+        cursor_col: u32,
+        cursor_row: u32,
+        buffer_row: usize,
+    ) -> Result<(), String> {
+        let result = match self.dispatch(payload, cursor_col, cursor_row, buffer_row) {
             Ok(Reply::Silent) => Ok(()),
             Ok(Reply::Ok(target)) => {
                 self.answer(target, None);
@@ -383,6 +409,7 @@ impl KittyGraphicsState {
         payload: &[u8],
         cursor_col: u32,
         cursor_row: u32,
+        buffer_row: usize,
     ) -> Result<Reply, Failure> {
         if !protocol::is_graphics_payload(payload) {
             return Ok(Reply::Silent);
@@ -394,7 +421,7 @@ impl KittyGraphicsState {
             if command.action.is_transmit() && !command.is_continuation() {
                 let request = match command.action {
                     Action::Display => Some(PlacementRequest::from_command(
-                        &command, cursor_col, cursor_row,
+                        &command, cursor_col, cursor_row, buffer_row,
                     )?),
                     _ => None,
                 };
@@ -443,7 +470,7 @@ impl KittyGraphicsState {
                         Ok(Reply::Ok(target))
                     }
                     Action::Placement => {
-                        self.handle_placement(&command, cursor_col, cursor_row)?;
+                        self.handle_placement(&command, cursor_col, cursor_row, buffer_row)?;
                         Ok(Reply::Ok(target))
                     }
                     Action::Delete => {
@@ -557,6 +584,7 @@ impl KittyGraphicsState {
         command: &Command<'_>,
         cursor_col: u32,
         cursor_row: u32,
+        buffer_row: usize,
     ) -> Result<(), Failure> {
         let image_id = command
             .id
@@ -566,7 +594,7 @@ impl KittyGraphicsState {
                 "kitty image {image_id} does not exist"
             )));
         }
-        let request = PlacementRequest::from_command(command, cursor_col, cursor_row)?;
+        let request = PlacementRequest::from_command(command, cursor_col, cursor_row, buffer_row)?;
         self.add_placement(image_id, request);
         Ok(())
     }
@@ -583,6 +611,7 @@ impl KittyGraphicsState {
             placement_id,
             col: placement.col,
             row: placement.row,
+            buffer_row: placement.buffer_row,
             cols: placement.cols,
             rows: placement.rows,
             src_x: placement.src_x,
@@ -700,6 +729,92 @@ impl KittyGraphicsState {
         &self.placements
     }
 
+    fn prune_unreferenced_images(&mut self, candidates: &std::collections::HashSet<u32>) {
+        for &image_id in candidates {
+            if self
+                .placements
+                .iter()
+                .any(|placement| placement.image_id == image_id)
+                || self.pending_placements.contains_key(&image_id)
+            {
+                continue;
+            }
+            if let Some(image) = self.images.remove(&image_id) {
+                self.total_image_memory = self
+                    .total_image_memory
+                    .saturating_sub(image.data.len() as u64);
+            }
+            self.access_order.retain(|&id| id != image_id);
+        }
+    }
+
+    /// Remove placements belonging to finalized history while preserving any
+    /// placement anchored at or after the current live OSC 133 lifecycle.
+    /// `None` means there is no live lifecycle, so every placement is history.
+    /// Images that became orphaned solely because of this removal are released.
+    pub fn retain_placements_from_buffer_row(&mut self, live_start: Option<usize>) -> usize {
+        let mut removed_images = std::collections::HashSet::new();
+        let before = self.placements.len();
+        self.placements.retain(|placement| {
+            let keep = live_start.is_some_and(|start| placement.buffer_row >= start);
+            if !keep {
+                removed_images.insert(placement.image_id);
+            }
+            keep
+        });
+        self.prune_unreferenced_images(&removed_images);
+        before - self.placements.len()
+    }
+
+    /// Keep placement buffer anchors aligned when physical rows fall off the
+    /// top of scrollback. Placements whose own anchor disappeared are removed;
+    /// surviving grid/history placements shift with the text.
+    pub fn on_buffer_rows_trimmed(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut removed_images = std::collections::HashSet::new();
+        self.placements.retain_mut(|placement| {
+            if placement.buffer_row < count {
+                removed_images.insert(placement.image_id);
+                false
+            } else {
+                placement.buffer_row -= count;
+                true
+            }
+        });
+        for request in self.pending_placements.values_mut() {
+            request.buffer_row = request.buffer_row.saturating_sub(count);
+        }
+        self.prune_unreferenced_images(&removed_images);
+    }
+
+    /// Rebase placements that remained in the unchanged grid after scrollback
+    /// width reflow. Placements inside the reflowed prefix have no trustworthy
+    /// physical-row mapping and are discarded with the corresponding block row
+    /// anchors; their unreferenced image data is released.
+    pub fn on_scrollback_reflow(&mut self, old_rows: usize, new_rows: usize) {
+        let mut removed_images = std::collections::HashSet::new();
+        self.placements.retain_mut(|placement| {
+            if placement.buffer_row < old_rows {
+                removed_images.insert(placement.image_id);
+                false
+            } else {
+                placement.buffer_row =
+                    new_rows.saturating_add(placement.buffer_row.saturating_sub(old_rows));
+                true
+            }
+        });
+        for request in self.pending_placements.values_mut() {
+            request.buffer_row = if request.buffer_row < old_rows {
+                0
+            } else {
+                new_rows.saturating_add(request.buffer_row - old_rows)
+            };
+        }
+        self.prune_unreferenced_images(&removed_images);
+    }
+
     /// 获取图像
     pub fn get_image(&self, id: u32) -> Option<&KittyImage> {
         self.images.get(&id)
@@ -725,7 +840,6 @@ impl KittyGraphicsState {
     }
 
     /// 清除所有数据
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.images.clear();
         self.placements.clear();

@@ -123,6 +123,24 @@ fn block_enter_reinputs_selection(
     selection_owns_keys && prompt_status.is_ready()
 }
 
+/// Shared refusal reason for block actions that replace the shell's editable
+/// command line. A stopped command is not enough evidence: OSC 133 must also
+/// identify an empty prompt and the shell must still own the foreground PTY.
+fn block_prompt_replace_blocker(
+    prompt_status: terminal::AgentPromptStatus,
+) -> Option<&'static str> {
+    use terminal::AgentPromptStatus;
+    match prompt_status {
+        AgentPromptStatus::Ready => None,
+        AgentPromptStatus::Busy => Some("the terminal is busy"),
+        AgentPromptStatus::InputNotEmpty => Some("the prompt already contains input"),
+        AgentPromptStatus::UnsafeCommand => Some("the prompt state is unsafe"),
+        AgentPromptStatus::ShellIntegrationUnavailable => {
+            Some("waiting for an empty OSC 133 shell prompt")
+        }
+    }
+}
+
 /// Captured command history is untrusted terminal input. Keep controls
 /// stripped and, crucially, never send embedded newlines without bracketed
 /// paste: the first-line fallback prevents later selected commands executing.
@@ -3863,8 +3881,7 @@ impl Frost {
         key: &keyboard::Key,
         mods: keyboard::Modifiers,
     ) -> Option<Task<Message>> {
-        let binding = key_to_binding_string(key, mods)?;
-        let cmd = self.keybindings.get_command(&binding)?;
+        let cmd = resolve_keybinding_command(&self.keybindings, key, mods)?;
         self.dispatch_command(cmd)
     }
 
@@ -3910,23 +3927,8 @@ impl Frost {
                 }
                 Task::none()
             }
-            C::EditCopy => {
-                let text = self
-                    .sessions
-                    .get(self.active)
-                    .and_then(|s| s.terminal.copy_selection())
-                    .filter(|t| !t.is_empty());
-                match text {
-                    Some(text) => {
-                        let n = text.chars().count();
-                        self.push_toast(
-                            format!("Copied {} char{}", n, if n == 1 { "" } else { "s" }),
-                            ToastKind::Success,
-                        );
-                        iced::clipboard::write(text)
-                    }
-                    None => Task::none(),
-                }
+            C::EditCopy | C::EditCopyBlockOutput => {
+                self.edit_copy_task(matches!(cmd, C::EditCopyBlockOutput))
             }
             C::EditPaste => {
                 let id = self.sessions.get(self.active)?.id;
@@ -4057,6 +4059,7 @@ impl Frost {
             C::BlockCopyOutput => self.block_copy_output_task(),
             C::BlockRecallCommand => self.block_recall_command_task(),
             C::BlockSelectAll => self.block_select_all(),
+            C::BlockClear => self.block_clear(),
             C::BlockSelectPrev => self.block_select_step(true),
             C::BlockSelectNext => self.block_select_step(false),
             C::BlockReinputSelectedCommands => self.block_reinput_selected_commands_task(),
@@ -4070,6 +4073,9 @@ impl Frost {
             }
             C::BlockSearch => self.toggle_block_search(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
+                if !self.ensure_block_action_available("Prompt navigation") {
+                    return Some(Task::none());
+                }
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(cmd, C::TerminalPromptPrev) {
                         sess.terminal.jump_to_prev_prompt()
@@ -4430,6 +4436,31 @@ impl Frost {
         iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
     }
 
+    /// One gate for commands that act on block history. Block chrome is hidden
+    /// in the alternate screen, so neither keybindings nor palette actions may
+    /// mutate or read an invisible selection there.
+    fn ensure_block_action_available(&mut self, action: &str) -> bool {
+        if !self.config.block_mode {
+            self.push_toast(
+                format!("{action} unavailable: block mode is disabled"),
+                ToastKind::Info,
+            );
+            return false;
+        }
+        if self
+            .sessions
+            .get(self.active)
+            .is_some_and(|sess| sess.terminal.is_alt_buffer_active())
+        {
+            self.push_toast(
+                format!("{action} unavailable while a full-screen program is active"),
+                ToastKind::Info,
+            );
+            return false;
+        }
+        true
+    }
+
     /// Toggle the cross-block search picker (`block:search`). While it is
     /// open its own key handler owns the chord, so dispatch normally only
     /// sees the closed state — the guard here covers the palette entry.
@@ -4440,6 +4471,9 @@ impl Frost {
     fn toggle_block_search(&mut self) -> Task<Message> {
         if self.block_search.is_some() {
             self.block_search = None;
+            return Task::none();
+        }
+        if !self.ensure_block_action_available("Block search") {
             return Task::none();
         }
         let cache: Vec<block_mode::CachedBlockSearchZone> = self
@@ -4524,6 +4558,18 @@ impl Frost {
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
+        if !self.config.block_mode
+            || self
+                .sessions
+                .get(self.active)
+                .is_some_and(|sess| sess.terminal.is_alt_buffer_active())
+        {
+            // The overlay may have been open when asynchronous PTY output
+            // entered the alternate screen. Drop it and let this very key
+            // continue to the foreground application.
+            self.block_search = None;
+            return None;
+        }
         // The (configurable) toggle chord closes the picker from inside.
         if key_to_binding_string(key, mods)
             .and_then(|binding| self.keybindings.get_command(&binding))
@@ -4594,6 +4640,25 @@ impl Frost {
             return Task::none();
         };
         Task::done(Message::PromptRecall(id, command))
+    }
+
+    /// Re-check prompt ownership at the final PTY-write boundary. A recall is
+    /// delivered through `Task::done`, so the prompt that was safe when the
+    /// task was created may have received input or entered a foreground app by
+    /// the next update.
+    fn session_prompt_replace_ready(&mut self, id: usize) -> Result<(), &'static str> {
+        let sess = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or("the terminal session is no longer available")?;
+        if sess.terminal.is_alt_buffer_active() {
+            return Err("a full-screen program is active");
+        }
+        match block_prompt_replace_blocker(sess.agent_prompt_status()) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     /// Encode one payload for session `id` and queue it on that PTY.
@@ -5315,6 +5380,32 @@ impl Frost {
         Some(Task::none())
     }
 
+    /// Common Copy behavior for both configurable keybindings and the command
+    /// palette: a visible terminal text selection wins, otherwise a whole-block
+    /// selection is copied in terminal order (`output_only` is Alt+Copy).
+    fn edit_copy_task(&mut self, output_only: bool) -> Task<Message> {
+        let text = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| session.terminal.copy_selection())
+            .filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            let count = text.chars().count();
+            self.push_toast(
+                format!("Copied {} char{}", count, if count == 1 { "" } else { "s" }),
+                ToastKind::Success,
+            );
+            return iced::clipboard::write(text);
+        }
+        let mode = if output_only {
+            block_mode::SelectedClipboardMode::Outputs
+        } else {
+            block_mode::SelectedClipboardMode::Blocks
+        };
+        self.block_copy_selected_task(mode)
+            .unwrap_or_else(Task::none)
+    }
+
     /// Dispatch a palette action to the matching existing operation.
     fn execute_palette_action(&mut self, action: command_palette::PaletteAction) -> Task<Message> {
         use command_palette::PaletteAction;
@@ -5337,23 +5428,7 @@ impl Frost {
                 self.prev_session();
                 Task::none()
             }
-            PaletteAction::Copy => {
-                if let Some(text) = self
-                    .sessions
-                    .get(self.active)
-                    .and_then(|s| s.terminal.copy_selection())
-                    .filter(|t| !t.is_empty())
-                {
-                    let n = text.chars().count();
-                    self.push_toast(
-                        format!("Copied {} char{}", n, if n == 1 { "" } else { "s" }),
-                        ToastKind::Success,
-                    );
-                    iced::clipboard::write(text)
-                } else {
-                    Task::none()
-                }
-            }
+            PaletteAction::Copy => self.edit_copy_task(false),
             PaletteAction::Paste => {
                 let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
                     return Task::none();
@@ -5496,6 +5571,7 @@ impl Frost {
             PaletteAction::BlockCopyOutput => self.block_copy_output_task(),
             PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
             PaletteAction::BlockSelectAll => self.block_select_all(),
+            PaletteAction::BlockClear => self.block_clear(),
             PaletteAction::BlockSelectPrev => self.block_select_step(true),
             PaletteAction::BlockSelectNext => self.block_select_step(false),
             PaletteAction::BlockReinputSelectedCommands => {
@@ -5512,6 +5588,9 @@ impl Frost {
             PaletteAction::BlockSearch => self.toggle_block_search(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
+                if !self.ensure_block_action_available("Prompt navigation") {
+                    return Task::none();
+                }
                 if let Some(sess) = self.sessions.get_mut(self.active) {
                     let moved = if matches!(action, PaletteAction::PromptJumpPrev) {
                         sess.terminal.jump_to_prev_prompt()
@@ -5539,6 +5618,9 @@ impl Frost {
     /// Copy the previous command's output (OSC 133 zones) to the clipboard,
     /// shared by the Ctrl+Shift+G binding and the command palette.
     fn copy_last_output_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Last block output copy") {
+            return Task::none();
+        }
         let text = self
             .sessions
             .get(self.active)
@@ -5602,6 +5684,9 @@ impl Frost {
     /// and nonzero). Shared by the keybinding and the command palette; works
     /// even while block-mode rendering is disabled.
     fn block_jump_first_failed(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Failed-block navigation") {
+            return Task::none();
+        }
         let target = self
             .sessions
             .get(self.active)
@@ -5619,10 +5704,13 @@ impl Frost {
     /// Step the block selection across FAILED zones only (`older` = toward
     /// the top) — the failed-only counterpart of [`Self::block_select_step`],
     /// classified exactly like the scrollbar's failure markers. No (or a
-    /// dangling) selection starts at the newest failed zone in either
-    /// direction; none further in the requested direction is a silent no-op;
-    /// zero failed zones toasts (jump-first-failed's wording).
+    /// dangling) selection enters at the newest failure when moving older and
+    /// the oldest when moving newer; stepping past an edge wraps. Zero failed
+    /// zones toasts (jump-first-failed's wording).
     fn block_jump_failed_step(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Failed-block navigation") {
+            return Task::none();
+        }
         let Some(sess) = self.sessions.get(self.active) else {
             return Task::none();
         };
@@ -5662,6 +5750,109 @@ impl Frost {
             sess.block_selection.clear();
         }
         self.push_toast("Block no longer available".to_string(), ToastKind::Warning);
+    }
+
+    /// Copy a live whole-block selection in terminal order. `None` means no
+    /// block selection exists and lets ordinary copy/fallback behavior proceed;
+    /// `Some` means block selection owned the request, including an error toast.
+    fn block_copy_selected_task(
+        &mut self,
+        mode: block_mode::SelectedClipboardMode,
+    ) -> Option<Task<Message>> {
+        let result = {
+            let sess = self.sessions.get_mut(self.active)?;
+            if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+                return None;
+            }
+            if sess.block_selection.is_empty() {
+                return None;
+            }
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            if !sess.block_selection.retain(&ids) {
+                Err(block_mode::SelectedClipboardError::Empty)
+            } else {
+                block_mode::selected_clipboard_text(
+                    sess.terminal
+                        .command_zones
+                        .iter()
+                        .filter(|zone| sess.block_selection.contains(zone.id))
+                        .map(|zone| {
+                            let output = if mode == block_mode::SelectedClipboardMode::Commands {
+                                block_mode::ClipboardOutput::Empty
+                            } else {
+                                match sess.terminal.zone_output_export_capped(zone.id) {
+                                    Some(terminal::ZoneOutputExport::Available {
+                                        text, ..
+                                    }) => block_mode::ClipboardOutput::Available(text),
+                                    Some(terminal::ZoneOutputExport::Empty) => {
+                                        block_mode::ClipboardOutput::Empty
+                                    }
+                                    Some(terminal::ZoneOutputExport::Unavailable) | None => {
+                                        block_mode::ClipboardOutput::Unavailable
+                                    }
+                                }
+                            };
+                            (zone.id, zone.command.as_deref(), output)
+                        }),
+                    &sess.block_selection,
+                    mode,
+                    block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+                )
+            }
+        };
+
+        match result {
+            Ok(copied) => {
+                let noun = match mode {
+                    block_mode::SelectedClipboardMode::Commands => "command",
+                    block_mode::SelectedClipboardMode::Outputs => "output",
+                    block_mode::SelectedClipboardMode::Blocks => "block",
+                };
+                self.push_toast(
+                    format!(
+                        "Copied {} selected block {noun}{}",
+                        copied.block_count,
+                        if copied.block_count == 1 { "" } else { "s" }
+                    ),
+                    ToastKind::Success,
+                );
+                Some(iced::clipboard::write(copied.text))
+            }
+            Err(block_mode::SelectedClipboardError::Empty) => {
+                let message = match mode {
+                    block_mode::SelectedClipboardMode::Commands => {
+                        "Selected blocks have no commands to copy"
+                    }
+                    block_mode::SelectedClipboardMode::Outputs => {
+                        "Selected blocks have no output to copy"
+                    }
+                    block_mode::SelectedClipboardMode::Blocks => {
+                        "Selected blocks have no content to copy"
+                    }
+                };
+                self.push_toast(message.to_string(), ToastKind::Info);
+                Some(Task::none())
+            }
+            Err(block_mode::SelectedClipboardError::OutputUnavailable) => {
+                self.push_toast(
+                    "Selected block output is no longer retained; nothing was copied".to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+            Err(block_mode::SelectedClipboardError::TooLarge) => {
+                self.push_toast(
+                    "Selected block content is too large to copy".to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+        }
     }
 
     /// The command line a block copy/recall action should act on, paired with
@@ -5706,6 +5897,14 @@ impl Frost {
     /// block's only when nothing is selected). A truncated command may still
     /// be copied — only re-running it is unsafe.
     fn block_copy_command_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block command copy") {
+            return Task::none();
+        }
+        if let Some(task) =
+            self.block_copy_selected_task(block_mode::SelectedClipboardMode::Commands)
+        {
+            return task;
+        }
         match self.block_action_command("copy") {
             Some((text, _)) => {
                 self.push_toast("Copied block command", ToastKind::Success);
@@ -5720,6 +5919,14 @@ impl Frost {
     /// selected; a selected block with no output (or a vanished zone) toasts
     /// instead of substituting another block's output.
     fn block_copy_output_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block output copy") {
+            return Task::none();
+        }
+        if let Some(task) =
+            self.block_copy_selected_task(block_mode::SelectedClipboardMode::Outputs)
+        {
+            return task;
+        }
         let Some(sess) = self.sessions.get(self.active) else {
             return Task::none();
         };
@@ -5774,16 +5981,20 @@ impl Frost {
 
     /// Type (never execute) the selected block's command into the prompt
     /// (the newest block's only when nothing is selected), through the same
-    /// sanitized recall path as the history picker. Refused while a command
-    /// is running — the bytes would reach whatever program owns the PTY, not
-    /// a shell prompt.
+    /// sanitized recall path as the history picker. Refused unless OSC 133
+    /// reports a trusted empty prompt owned by the foreground shell — merely
+    /// observing that no command is running would still overwrite typed input.
     fn block_recall_command_task(&mut self) -> Task<Message> {
-        let Some(sess) = self.sessions.get(self.active) else {
+        if !self.ensure_block_action_available("Block command recall") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
             return Task::none();
         };
-        if sess.terminal.is_command_running() {
+        let prompt_status = sess.agent_prompt_status();
+        if let Some(reason) = block_prompt_replace_blocker(prompt_status) {
             self.push_toast(
-                "Command not recalled: the terminal is busy".to_string(),
+                format!("Command not recalled: {reason}"),
                 ToastKind::Warning,
             );
             return Task::none();
@@ -5806,20 +6017,12 @@ impl Frost {
     /// Select every retained finalized block in the active pane. The oldest
     /// block becomes the fixed range anchor and the newest the active edge.
     fn block_select_all(&mut self) -> Task<Message> {
-        if !self.config.block_mode {
-            self.push_toast("Block mode is disabled".to_string(), ToastKind::Info);
+        if !self.ensure_block_action_available("Block selection") {
             return Task::none();
         }
         let Some(sess) = self.sessions.get_mut(self.active) else {
             return Task::none();
         };
-        if sess.terminal.is_alt_buffer_active() {
-            self.push_toast(
-                "Cannot select blocks while a full-screen program is active".to_string(),
-                ToastKind::Info,
-            );
-            return Task::none();
-        }
         let ids: Vec<u64> = sess
             .terminal
             .command_zones
@@ -5838,10 +6041,52 @@ impl Frost {
         Task::none()
     }
 
+    /// Remove every finalized block in the active pane without sending bytes
+    /// to the child. The terminal keeps the current prompt or running command,
+    /// while app-owned selection/search state is discarded atomically with the
+    /// zone history so no stale zone id remains actionable.
+    fn block_clear(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Clear Blocks") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+
+        let cleared = sess.terminal.clear_completed_blocks();
+        sess.block_selection.clear();
+        sess.terminal.selection = None;
+        sess.refresh();
+
+        self.block_search = None;
+        self.search.close();
+        self.search.matches.clear();
+        self.search.current_match_index = 0;
+        self.search.error_message = None;
+        self.search_dirty = false;
+        self.links_cache_key = None;
+        self.links.clear();
+        self.refresh_kitty_handles();
+        if cleared == 0 {
+            return Task::none();
+        }
+        self.push_toast(
+            format!(
+                "Cleared {cleared} command block{}",
+                if cleared == 1 { "" } else { "s" }
+            ),
+            ToastKind::Success,
+        );
+        Task::none()
+    }
+
     /// Expand or contract the selected range by moving its active edge one
     /// completed block. Used by Shift+Up/Down while a block selection owns
     /// keyboard navigation.
     fn block_extend_selection_step(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Block selection") {
+            return Task::none();
+        }
         let Some(sess) = self.sessions.get_mut(self.active) else {
             return Task::none();
         };
@@ -5872,16 +6117,20 @@ impl Frost {
     /// without DECSET 2004 the shared safe policy keeps only the first logical
     /// line, so later selected commands cannot execute as embedded newlines.
     fn block_reinput_selected_commands_task(&mut self) -> Task<Message> {
-        let Some(sess) = self.sessions.get(self.active) else {
+        if !self.ensure_block_action_available("Block command reinput") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
             return Task::none();
         };
         if sess.block_selection.is_empty() {
             self.push_toast("No command blocks selected".to_string(), ToastKind::Info);
             return Task::none();
         }
-        if sess.terminal.is_command_running() || sess.terminal.is_alt_buffer_active() {
+        let prompt_status = sess.agent_prompt_status();
+        if let Some(reason) = block_prompt_replace_blocker(prompt_status) {
             self.push_toast(
-                "Commands not reinput: the terminal is busy".to_string(),
+                format!("Commands not reinput: {reason}"),
                 ToastKind::Warning,
             );
             return Task::none();
@@ -5955,6 +6204,13 @@ impl Frost {
             return Task::none();
         }
         let multiline_fallback = !bracketed && commands.contains('\n');
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            self.push_toast(
+                format!("Commands not reinput: {reason}"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
         if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true) {
             if multiline_fallback {
                 self.push_toast(
@@ -5982,6 +6238,9 @@ impl Frost {
     /// zone while Down remains unowned. Up clamps at the oldest block; Down past
     /// the newest clears selection, matching anvil/forge.
     fn block_select_step(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Block selection") {
+            return Task::none();
+        }
         let navigation = {
             let Some(sess) = self.sessions.get_mut(self.active) else {
                 return Task::none();
@@ -6043,6 +6302,13 @@ impl Frost {
     /// with no trailing newline, and background zones (no command) copying
     /// their output alone.
     fn block_copy_block_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block copy") {
+            return Task::none();
+        }
+        if let Some(task) = self.block_copy_selected_task(block_mode::SelectedClipboardMode::Blocks)
+        {
+            return task;
+        }
         let Some(id) = self.block_target_zone_id("copy") else {
             return Task::none();
         };
@@ -6077,6 +6343,9 @@ impl Frost {
     /// family's shared Markdown snippet, including retained lifecycle/capture
     /// notes when the available data is incomplete.
     fn block_copy_markdown_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block Markdown copy") {
+            return Task::none();
+        }
         let Some(id) = self.block_target_zone_id("copy") else {
             return Task::none();
         };
@@ -6132,6 +6401,9 @@ impl Frost {
         &mut self,
         format: block_export::SessionExportFormat,
     ) -> Task<Message> {
+        if !self.ensure_block_action_available("Block session export") {
+            return Task::none();
+        }
         if self.block_export_in_flight {
             self.push_toast(
                 "A session export is already in progress".to_string(),
@@ -6214,6 +6486,14 @@ impl Frost {
                 }
                 self.last_ingest_us = t0.elapsed().as_micros();
                 self.last_ingest_bytes = data.len();
+                if is_active_output
+                    && self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|session| session.terminal.is_alt_buffer_active())
+                {
+                    self.block_search = None;
+                }
                 // Output may have moved the shell's cwd; let the next periodic
                 // tick reconcile the session snapshot.
                 self.session_dirty = true;
@@ -7089,6 +7369,13 @@ impl Frost {
                     crate::review_text::MAX_HISTORY_COMMAND_BYTES,
                 ) {
                     Ok(command) => {
+                        if let Err(reason) = self.session_prompt_replace_ready(id) {
+                            self.push_toast(
+                                format!("History recall rejected: {reason}"),
+                                ToastKind::Warning,
+                            );
+                            return Task::none();
+                        }
                         self.write_paste_to_session(
                             id,
                             &command,
@@ -7541,14 +7828,27 @@ impl Frost {
                     .is_some_and(|due| std::time::Instant::now() >= due)
                 {
                     let pending = std::mem::take(&mut self.history_reflow_sessions);
+                    let mut normalized_any = false;
                     for session in &mut self.sessions {
                         if pending.contains(&session.id) {
-                            session.terminal.normalize_scrollback_width();
+                            if session.terminal.normalize_scrollback_width() {
+                                normalized_any = true;
+                            } else {
+                                self.history_reflow_sessions.insert(session.id);
+                            }
                             session.refresh();
                         }
                     }
-                    self.history_reflow_due = None;
-                    if self.search.is_open {
+                    self.history_reflow_due = (!self.history_reflow_sessions.is_empty())
+                        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(500));
+                    let active_reflow_pending = self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|session| self.history_reflow_sessions.contains(&session.id));
+                    if self.search.is_open
+                        && !active_reflow_pending
+                        && (normalized_any || self.search_dirty)
+                    {
                         self.recompute_search();
                         self.reveal_current_search_match();
                     }
@@ -7943,7 +8243,9 @@ impl Frost {
             }
             Message::BlockSearchAccept(id) => {
                 self.block_search = None;
-                self.select_and_reveal_block(id);
+                if self.ensure_block_action_available("Block search") {
+                    self.select_and_reveal_block(id);
+                }
             }
             Message::BlockExportFinished(format, result) => {
                 self.block_export_in_flight = false;
@@ -12282,6 +12584,31 @@ fn key_to_binding_string(key: &keyboard::Key, mods: keyboard::Modifiers) -> Opti
     Some(chord.canonical())
 }
 
+/// Resolve a configured chord, then apply Anvil's output-only copy modifier:
+/// when an Alt chord has no explicit binding but the same chord without Alt is
+/// the configured Copy action, treat it as Copy Block Output. Exact bindings
+/// always win, so users can deliberately override Alt+their-copy shortcut.
+fn resolve_keybinding_command(
+    bindings: &keybindings::KeyBindings,
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+) -> Option<keybindings::Command> {
+    let binding = key_to_binding_string(key, mods)?;
+    if let Some(command) = bindings.get_command(&binding) {
+        return Some(command);
+    }
+    if !mods.alt() {
+        return None;
+    }
+    let without_alt = mods & !keyboard::Modifiers::ALT;
+    let base = key_to_binding_string(key, without_alt)?;
+    matches!(
+        bindings.get_command(&base),
+        Some(keybindings::Command::EditCopy)
+    )
+    .then_some(keybindings::Command::EditCopyBlockOutput)
+}
+
 /// Flags describing which enhanced-keyboard protocols an application has
 /// enabled, sampled from the focused terminal before encoding a key press.
 #[derive(Clone, Copy, Default)]
@@ -12741,6 +13068,25 @@ mod tests {
     }
 
     #[test]
+    fn block_prompt_replacement_requires_a_trusted_empty_shell_prompt() {
+        use terminal::AgentPromptStatus;
+
+        assert_eq!(block_prompt_replace_blocker(AgentPromptStatus::Ready), None);
+        assert_eq!(
+            block_prompt_replace_blocker(AgentPromptStatus::Busy),
+            Some("the terminal is busy")
+        );
+        assert_eq!(
+            block_prompt_replace_blocker(AgentPromptStatus::InputNotEmpty),
+            Some("the prompt already contains input")
+        );
+        assert_eq!(
+            block_prompt_replace_blocker(AgentPromptStatus::ShellIntegrationUnavailable),
+            Some("waiting for an empty OSC 133 shell prompt")
+        );
+    }
+
+    #[test]
     fn agent_prompt_requires_the_shell_to_own_the_foreground_pty() {
         use terminal::AgentPromptStatus;
 
@@ -12908,6 +13254,32 @@ mod tests {
         assert_eq!(
             loaded.bindings.get_command(&binding),
             Some(keybindings::Command::SessionNew)
+        );
+    }
+
+    #[test]
+    fn alt_derives_output_copy_from_a_remapped_copy_unless_explicitly_overridden() {
+        let key = keyboard::Key::Character("x".into());
+        let alt_copy_mods =
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT;
+        let remapped = keybindings::KeyBindings::from_toml_with_diagnostics(
+            "\"ctrl+shift+x\" = \"edit:copy\"\n",
+        )
+        .expect("valid remap")
+        .bindings;
+        assert_eq!(
+            resolve_keybinding_command(&remapped, &key, alt_copy_mods),
+            Some(keybindings::Command::EditCopyBlockOutput)
+        );
+
+        let overridden = keybindings::KeyBindings::from_toml_with_diagnostics(
+            "\"ctrl+shift+x\" = \"edit:copy\"\n\"ctrl+alt+shift+x\" = \"terminal:send_eof\"\n",
+        )
+        .expect("valid explicit override")
+        .bindings;
+        assert_eq!(
+            resolve_keybinding_command(&overridden, &key, alt_copy_mods),
+            Some(keybindings::Command::TerminalSendEof)
         );
     }
 

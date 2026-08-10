@@ -48,6 +48,7 @@ pub enum PaletteAction {
     BlockCopyOutput,
     BlockRecallCommand,
     BlockSelectAll,
+    BlockClear,
     BlockSelectPrev,
     BlockSelectNext,
     BlockReinputSelectedCommands,
@@ -353,6 +354,12 @@ impl PaletteState {
                 action: PaletteAction::BlockSelectAll,
             },
             PaletteItem {
+                name: "Clear Blocks",
+                description: "Remove every retained finished block from the current pane",
+                shortcut: "Ctrl+Shift+K",
+                action: PaletteAction::BlockClear,
+            },
+            PaletteItem {
                 name: "Select Previous Block",
                 description: "Select the previous (older) command block and reveal it",
                 shortcut: "",
@@ -567,6 +574,7 @@ mod tests {
             (PaletteAction::OpenSearchReplace, "Ctrl+Alt+R"),
             (PaletteAction::BlockSearch, "Ctrl+Alt+F"),
             (PaletteAction::BlockSelectAll, "Ctrl+Shift+A"),
+            (PaletteAction::BlockClear, "Ctrl+Shift+K"),
             (PaletteAction::BlockReinputSelectedCommands, "Ctrl+Shift+I"),
         ];
         for (action, expected) in cases {

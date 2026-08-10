@@ -106,12 +106,14 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | --- | --- |
 | 新建标签 | `Ctrl+Shift+T` |
 | 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| 仅复制所选命令块的输出 | `Alt+复制快捷键`（默认 `Ctrl+Alt+Shift+C`；显式绑定优先；可见终端文本选区优先） |
 | 搜索全部回滚 | `Ctrl+Shift+F` |
 | 查找替换（选中文本） | `Ctrl+Alt+R`（替换结果进剪贴板或回填提示符，从不改写 scrollback） |
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
 | 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；Enter 定位块） |
 | 全选命令块 | `Ctrl+Shift+A` |
+| 清空已完成命令块 | `Ctrl+Shift+K`（保留当前提示符或运行中命令） |
 | 回填所选命令 | `Ctrl+Shift+I`（只回填，不执行） |
 | 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
 | 命令面板 | `Ctrl+Shift+P` |
