@@ -52,6 +52,7 @@ pub enum Command {
     // jump-prev/next-failed chords) are pane:focus_left/right. The P0 batch
     // actions keep the family chords (Ctrl+Shift+A/I/K), and block:search uses
     // Ctrl+Alt+F because Ctrl+Shift+G is terminal:copy_last_output here;
+    // Bookmark toggling uses the free Ctrl+Shift+B chord; navigation and the
     // remaining block commands stay palette-only until the user binds them.
     BlockJumpFirstFailed,
     BlockJumpPrevFailed,
@@ -69,6 +70,9 @@ pub enum Command {
     BlockExportSessionMarkdown,
     BlockExportSessionJson,
     BlockSearch,
+    BlockToggleBookmark,
+    BlockJumpPrevBookmark,
+    BlockJumpNextBookmark,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -154,6 +158,9 @@ impl std::fmt::Display for Command {
             }
             Command::BlockExportSessionJson => write!(f, "block:export_session_json"),
             Command::BlockSearch => write!(f, "block:search"),
+            Command::BlockToggleBookmark => write!(f, "block:toggle_bookmark"),
+            Command::BlockJumpPrevBookmark => write!(f, "block:jump_prev_bookmark"),
+            Command::BlockJumpNextBookmark => write!(f, "block:jump_next_bookmark"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -228,6 +235,9 @@ impl std::str::FromStr for Command {
             "block:export_session_markdown" => Ok(Command::BlockExportSessionMarkdown),
             "block:export_session_json" => Ok(Command::BlockExportSessionJson),
             "block:search" => Ok(Command::BlockSearch),
+            "block:toggle_bookmark" => Ok(Command::BlockToggleBookmark),
+            "block:jump_prev_bookmark" => Ok(Command::BlockJumpPrevBookmark),
+            "block:jump_next_bookmark" => Ok(Command::BlockJumpNextBookmark),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -434,6 +444,10 @@ impl KeyBindings {
         bindings.bindings.insert(
             "ctrl+shift+i".to_string(),
             "block:reinput_selected_commands".to_string(),
+        );
+        bindings.bindings.insert(
+            "ctrl+shift+b".to_string(),
+            "block:toggle_bookmark".to_string(),
         );
 
         // 配置操作
@@ -832,6 +846,9 @@ mod tests {
             ),
             ("block:export_session_json", Command::BlockExportSessionJson),
             ("block:search", Command::BlockSearch),
+            ("block:toggle_bookmark", Command::BlockToggleBookmark),
+            ("block:jump_prev_bookmark", Command::BlockJumpPrevBookmark),
+            ("block:jump_next_bookmark", Command::BlockJumpNextBookmark),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
@@ -879,6 +896,12 @@ mod tests {
             bindings.get_command("ctrl+shift+k"),
             Some(Command::BlockClear)
         );
+        assert_eq!(
+            bindings.get_command("ctrl+shift+b"),
+            Some(Command::BlockToggleBookmark)
+        );
+        assert_eq!(bindings.get_command("ctrl+,"), None);
+        assert_eq!(bindings.get_command("ctrl+."), None);
         let mut bound_block_commands: Vec<&str> = bindings
             .bindings
             .values()
@@ -893,6 +916,7 @@ mod tests {
                 "block:reinput_selected_commands",
                 "block:search",
                 "block:select_all",
+                "block:toggle_bookmark",
             ]
         );
     }

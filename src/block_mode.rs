@@ -5,6 +5,99 @@
 
 use std::collections::HashSet;
 
+/// Pane-local bookmarks for retained command blocks.
+///
+/// Bookmarks key on stable zone ids, just like [`BlockSelection`], but carry
+/// no active edge or range semantics. The terminal owns a bounded zone deque,
+/// so callers reconcile this set against its oldest-first live id list before
+/// displaying or acting on bookmarks. [`Self::neighbor`] performs that
+/// reconciliation itself so a stale id can never become a navigation target.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockBookmarks {
+    bookmarked: HashSet<u64>,
+}
+
+impl BlockBookmarks {
+    pub fn contains(&self, id: u64) -> bool {
+        self.bookmarked.contains(&id)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.bookmarked.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.bookmarked.is_empty()
+    }
+
+    /// Toggle one stable zone id and return whether it is bookmarked now.
+    pub fn toggle(&mut self, id: u64) -> bool {
+        if self.bookmarked.remove(&id) {
+            false
+        } else {
+            self.bookmarked.insert(id);
+            true
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.bookmarked.clear();
+    }
+
+    /// Drop ids no longer retained by the terminal and report whether any
+    /// live bookmarks remain.
+    pub fn retain(&mut self, ids: &[u64]) -> bool {
+        self.bookmarked.retain(|id| ids.contains(id));
+        !self.bookmarked.is_empty()
+    }
+
+    /// Find the nearest bookmarked block strictly older/newer than `current`,
+    /// wrapping to the opposite edge. `ids` is terminal order, oldest first.
+    /// With no live current id, navigation enters at the requested edge:
+    /// newest for `older`, oldest for newer. A sole bookmark therefore wraps
+    /// to itself. Stale bookmark ids are removed before searching.
+    pub fn neighbor(&mut self, ids: &[u64], current: Option<u64>, older: bool) -> Option<u64> {
+        if !self.retain(ids) {
+            return None;
+        }
+
+        let oldest = || {
+            ids.iter()
+                .find(|&&id| self.bookmarked.contains(&id))
+                .copied()
+        };
+        let newest = || {
+            ids.iter()
+                .rev()
+                .find(|&&id| self.bookmarked.contains(&id))
+                .copied()
+        };
+        let position = current.and_then(|id| ids.iter().position(|&live| live == id));
+        if older {
+            position
+                .and_then(|position| {
+                    ids[..position]
+                        .iter()
+                        .rev()
+                        .find(|&&id| self.bookmarked.contains(&id))
+                        .copied()
+                })
+                .or_else(newest)
+        } else {
+            position
+                .and_then(|position| {
+                    ids[position + 1..]
+                        .iter()
+                        .find(|&&id| self.bookmarked.contains(&id))
+                        .copied()
+                })
+                .or_else(oldest)
+        }
+    }
+}
+
 /// Pane-local Warp-style finished-block selection.
 ///
 /// `active` is the moving edge used by keyboard navigation and `anchor` is
@@ -382,6 +475,33 @@ fn fenced(body: &str) -> String {
     }
 }
 
+/// Render untrusted single-line metadata as an inert Markdown code span.
+/// OSC-provided cwd values may contain link/image/HTML syntax; a delimiter
+/// longer than every backtick run keeps that syntax data-only. Visual-spoof
+/// controls are omitted entirely so exported review text cannot reorder or
+/// hide the path around it.
+fn markdown_meta_code(value: &str) -> String {
+    if crate::review_text::contains_visual_spoofing(value) {
+        return "`[unsafe path omitted]`".to_string();
+    }
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for character in value.chars() {
+        if character == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    let fence = "`".repeat(longest.saturating_add(1).max(1));
+    if longest > 0 || value.starts_with(' ') || value.ends_with(' ') {
+        format!("{fence} {value} {fence}")
+    } else {
+        format!("{fence}{value}{fence}")
+    }
+}
+
 /// Text copied for a whole block (anvil's `block_clipboard_text` family
 /// rule): command, newline, output — but a blank/absent output copies the
 /// bare command with NO trailing newline, and a background block (no
@@ -693,7 +813,7 @@ pub fn markdown_export_with_state(
             !cwd.chars().any(char::is_control),
             "zone cwd must be control-free (ingest guarantees it)"
         );
-        meta.push_str(&format!("- Cwd: {cwd}\n"));
+        meta.push_str(&format!("- Cwd: {}\n", markdown_meta_code(cwd)));
     }
     if output_unavailable {
         meta.push_str("- Note: output unavailable (snapshot and scrollback evicted)\n");
@@ -701,7 +821,7 @@ pub fn markdown_export_with_state(
         meta.push_str("- Note: output truncated\n");
     }
     if command_truncated {
-        meta.push_str("- Note: command truncated by shell\n");
+        meta.push_str("- Note: command truncated or unavailable\n");
     }
     // Background output was never a command lifecycle, so there is no command
     // completion marker to be missing. Keep this note for incomplete command
@@ -808,6 +928,16 @@ pub fn select_failed_neighbor(
 /// it is reached (the query can always be refined).
 pub const BLOCK_SEARCH_HIT_CAP: usize = 500;
 
+/// Maximum original-case command/output payload retained while a block-search
+/// index is prepared. Sources are collected newest-first, so hitting this cap
+/// drops older zones before they can accumulate unbounded live-row fallbacks.
+pub const BLOCK_SEARCH_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum heap resident bytes of a completed block-search cache. This counts
+/// every original/lowercase String allocation plus the cache Vec allocation;
+/// query scans therefore have a stable upper bound independent of scrollback.
+pub const BLOCK_SEARCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Character cap of a hit's matching-line preview.
 pub const BLOCK_SEARCH_LINE_CHARS: usize = 200;
 
@@ -823,11 +953,70 @@ pub struct BlockSearchHit {
     /// 1-based output line number of the match; 0 for command-line hits
     /// (`is_output_line` is the discriminator).
     pub line_no: usize,
+    /// Character range of the first match in the complete, unclipped logical
+    /// line. The range is 0-based, end-exclusive, and counts Unicode scalar
+    /// values from the original-case text (not bytes in its lowercase cache).
+    /// Filter-only browse rows carry `None` because no query was matched.
+    pub match_span: Option<std::ops::Range<usize>>,
     /// The matching line, clipped to [`BLOCK_SEARCH_LINE_CHARS`].
     pub line_text: String,
     /// The zone's command line, clipped to [`BLOCK_SEARCH_COMMAND_CHARS`]
     /// (empty for background zones).
     pub command_preview: String,
+}
+
+/// Owned, original-case input to the background block-search cache builder.
+/// The UI thread extracts only a bounded newest-first set; lowercasing happens
+/// after this value has moved to a worker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockSearchSource {
+    pub zone_id: u64,
+    pub command: Option<String>,
+    pub output: Option<String>,
+}
+
+impl BlockSearchSource {
+    pub fn new(zone_id: u64, command: Option<String>, output: Option<String>) -> Self {
+        Self {
+            zone_id,
+            command,
+            output,
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.command.as_ref().map_or(0, String::capacity)
+            + self.output.as_ref().map_or(0, String::capacity)
+    }
+}
+
+/// Bounded source snapshot, stored newest-first so both source and cache
+/// budgets always preserve the most recent command blocks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockSearchSourceSnapshot {
+    pub sources: Vec<BlockSearchSource>,
+    pub older_not_indexed: bool,
+    pub resident_bytes: usize,
+}
+
+/// Consume a lazy newest-first source stream until its heap payload budget is
+/// full. Laziness matters: callers may extract a zone from live terminal rows,
+/// and older zones beyond the budget must never be extracted speculatively.
+pub fn bounded_block_search_sources(
+    sources_newest_first: impl IntoIterator<Item = BlockSearchSource>,
+    max_bytes: usize,
+) -> BlockSearchSourceSnapshot {
+    let mut snapshot = BlockSearchSourceSnapshot::default();
+    for source in sources_newest_first {
+        let bytes = source.resident_bytes();
+        if snapshot.resident_bytes.saturating_add(bytes) > max_bytes {
+            snapshot.older_not_indexed = true;
+            break;
+        }
+        snapshot.resident_bytes += bytes;
+        snapshot.sources.push(source);
+    }
+    snapshot
 }
 
 /// One zone's precomputed text for [`search_blocks`] (ember's
@@ -857,20 +1046,79 @@ pub struct CachedBlockSearchZone {
 impl CachedBlockSearchZone {
     /// Normalize one zone at cache-build time: a blank command counts as
     /// none (background zone), and the lowercase copies are precomputed.
+    #[cfg(test)]
     pub fn new(zone_id: u64, command: Option<&str>, output: Option<String>) -> Self {
-        let command = command
-            .filter(|command| !command.trim().is_empty())
-            .map(str::to_string);
-        let command_lowercase = command.as_deref().map(str::to_lowercase);
-        let output_lowercase = output.as_deref().map(str::to_lowercase);
-        Self {
+        Self::from_source(BlockSearchSource::new(
             zone_id,
+            command.map(str::to_string),
+            output,
+        ))
+    }
+
+    fn from_source(source: BlockSearchSource) -> Self {
+        let command = source.command.filter(|command| !command.trim().is_empty());
+        let command_lowercase = command.as_deref().map(str::to_lowercase);
+        let output_lowercase = source.output.as_deref().map(str::to_lowercase);
+        Self {
+            zone_id: source.zone_id,
             command,
             command_lowercase,
-            output,
+            output: source.output,
             output_lowercase,
         }
     }
+
+    fn resident_bytes(&self) -> usize {
+        self.command.as_ref().map_or(0, String::capacity)
+            + self.command_lowercase.as_ref().map_or(0, String::capacity)
+            + self.output.as_ref().map_or(0, String::capacity)
+            + self.output_lowercase.as_ref().map_or(0, String::capacity)
+    }
+}
+
+/// Result installed after the background lowercasing pass. `zones` retains
+/// the search engine's historical oldest-first order even though both budgets
+/// preferentially keep newest sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockSearchCacheBuild {
+    pub zones: Vec<CachedBlockSearchZone>,
+    pub older_not_indexed: bool,
+    pub resident_bytes: usize,
+}
+
+/// Build the lowercase cache under an exact retained-heap budget. This is a
+/// pure CPU pass intended for `spawn_blocking`; original Strings move into the
+/// cache instead of being cloned a second time.
+pub fn build_block_search_cache(
+    snapshot: BlockSearchSourceSnapshot,
+    max_bytes: usize,
+) -> BlockSearchCacheBuild {
+    let zones = Vec::with_capacity(snapshot.sources.len());
+    let vec_bytes = zones
+        .capacity()
+        .saturating_mul(std::mem::size_of::<CachedBlockSearchZone>());
+    let mut build = BlockSearchCacheBuild {
+        older_not_indexed: snapshot.older_not_indexed,
+        resident_bytes: vec_bytes,
+        zones,
+    };
+    if vec_bytes > max_bytes {
+        build.older_not_indexed |= !snapshot.sources.is_empty();
+        return build;
+    }
+
+    for source in snapshot.sources {
+        let zone = CachedBlockSearchZone::from_source(source);
+        let bytes = zone.resident_bytes();
+        if build.resident_bytes.saturating_add(bytes) > max_bytes {
+            build.older_not_indexed = true;
+            break;
+        }
+        build.resident_bytes += bytes;
+        build.zones.push(zone);
+    }
+    build.zones.reverse();
+    build
 }
 
 /// A finished block search: hits (newest zones first) plus whether the
@@ -891,6 +1139,87 @@ fn clipped(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Map one match in a cached lowercase line back to a character range in the
+/// original line. Unicode lowercasing may expand one scalar (`İ` ->
+/// `i̇`), so byte or character offsets in `lowercase` cannot be copied
+/// directly into `text`.
+fn original_match_span(
+    text: &str,
+    lowercase: &str,
+    needle: &str,
+) -> Option<std::ops::Range<usize>> {
+    let lower_start = lowercase.find(needle)?;
+    let lower_end = lower_start.checked_add(needle.len())?;
+    let mut lower_cursor = 0usize;
+    let mut original_start = None;
+    let mut original_end = 0usize;
+
+    for (index, character) in text.chars().enumerate() {
+        let expanded_bytes: usize = character.to_lowercase().map(char::len_utf8).sum();
+        let next = lower_cursor.saturating_add(expanded_bytes);
+        if next > lower_start && lower_cursor < lower_end {
+            original_start.get_or_insert(index);
+            original_end = index + 1;
+        }
+        lower_cursor = next;
+        if lower_cursor >= lower_end && original_start.is_some() {
+            break;
+        }
+    }
+
+    original_start.map(|start| start..original_end)
+}
+
+/// Clip a matching line around the match instead of blindly keeping its
+/// prefix. This guarantees a long-line result actually shows why it matched.
+fn clipped_around_match(
+    text: &str,
+    match_span: &std::ops::Range<usize>,
+    max_chars: usize,
+) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars <= 2 {
+        return "…".to_string();
+    }
+    let inner = max_chars - 2;
+    let match_start = match_span.start.min(total);
+    let match_end = match_span.end.max(match_start).min(total);
+    let visible_match = match_end.saturating_sub(match_start).min(inner);
+    let context = inner.saturating_sub(visible_match);
+    let mut start = match_start
+        .saturating_sub(context / 3)
+        .min(total.saturating_sub(inner));
+    let mut end = start.saturating_add(inner).min(total);
+    // A long needle may consume the whole preview. Prefer its beginning, but
+    // never let an otherwise-short match fall outside the chosen window.
+    if visible_match < inner && end < match_end {
+        end = match_end;
+        start = end.saturating_sub(inner);
+    }
+    // Spend the second ellipsis' character budget on content when the window
+    // naturally reaches either edge of the line.
+    if start == 0 {
+        end = end.saturating_add(1).min(total);
+    } else if end == total {
+        start = start.saturating_sub(1);
+    }
+    let mut clipped = String::new();
+    if start > 0 {
+        clipped.push('…');
+    }
+    clipped.extend(text.chars().skip(start).take(end - start));
+    if end < total {
+        clipped.push('…');
+    }
+    clipped
+}
+
 /// Case-insensitive substring search across every cached zone's command
 /// line and output lines. `cache` comes oldest-first (the zone deque's
 /// order); hits are emitted newest zones first, a zone's command hit before
@@ -899,6 +1228,17 @@ fn clipped(text: &str, max_chars: usize) -> String {
 /// — beyond the lowercased needle, allocations happen only for hits. A
 /// blank query matches nothing — an empty picker, not the whole history.
 pub fn search_blocks(cache: &[CachedBlockSearchZone], query: &str) -> BlockSearchResults {
+    search_blocks_filtered(cache, query, |_| true)
+}
+
+/// [`search_blocks`] with a zero-allocation zone predicate. The UI uses this
+/// for outcome/slow/bookmark filters without cloning cached multi-megabyte
+/// output strings or letting excluded newer zones consume the hit cap.
+pub fn search_blocks_filtered(
+    cache: &[CachedBlockSearchZone],
+    query: &str,
+    mut include_zone: impl FnMut(u64) -> bool,
+) -> BlockSearchResults {
     let needle = query.trim().to_lowercase();
     let mut results = BlockSearchResults {
         hits: Vec::new(),
@@ -908,6 +1248,9 @@ pub fn search_blocks(cache: &[CachedBlockSearchZone], query: &str) -> BlockSearc
         return results;
     }
     'zones: for zone in cache.iter().rev() {
+        if !include_zone(zone.zone_id) {
+            continue;
+        }
         // Shared by the zone's hits; computed only when one exists.
         let mut command_preview: Option<String> = None;
         let mut preview = |command: Option<&str>| -> String {
@@ -920,21 +1263,25 @@ pub fn search_blocks(cache: &[CachedBlockSearchZone], query: &str) -> BlockSearc
         let command_hit = zone
             .command_lowercase
             .as_deref()
-            .filter(|lowercase| lowercase.contains(&needle))
-            .and(zone.command.as_deref())
-            .map(|command| (false, 0usize, command));
+            .zip(zone.command.as_deref())
+            .into_iter()
+            .filter_map(|(lowercase, command)| {
+                original_match_span(command, lowercase, &needle)
+                    .map(|span| (false, 0usize, command, span))
+            });
         let output_lines = zone.output.as_deref().into_iter().flat_map(str::lines);
         let lowercase_lines = zone
             .output_lowercase
             .as_deref()
             .into_iter()
             .flat_map(str::lines);
-        let output_hits = output_lines
-            .zip(lowercase_lines)
-            .enumerate()
-            .filter(|(_, (_, lowercase))| lowercase.contains(&needle))
-            .map(|(index, (line, _))| (true, index + 1, line));
-        for (is_output_line, line_no, line) in command_hit.into_iter().chain(output_hits) {
+        let output_hits = output_lines.zip(lowercase_lines).enumerate().filter_map(
+            |(index, (line, lowercase))| {
+                original_match_span(line, lowercase, &needle)
+                    .map(|span| (true, index + 1, line, span))
+            },
+        );
+        for (is_output_line, line_no, line, match_span) in command_hit.chain(output_hits) {
             if results.hits.len() >= BLOCK_SEARCH_HIT_CAP {
                 results.capped = true;
                 break 'zones;
@@ -944,7 +1291,8 @@ pub fn search_blocks(cache: &[CachedBlockSearchZone], query: &str) -> BlockSearc
                 zone_id: zone.zone_id,
                 is_output_line,
                 line_no,
-                line_text: clipped(line, BLOCK_SEARCH_LINE_CHARS),
+                line_text: clipped_around_match(line, &match_span, BLOCK_SEARCH_LINE_CHARS),
+                match_span: Some(match_span),
                 command_preview,
             });
         }
@@ -1256,7 +1604,7 @@ mod tests {
              - Exit: 130 SIGINT\n\
              - Duration: 2.3s\n\
              - Finished: 2009-02-14 07:31:30 +08:00\n\
-             - Cwd: /home/user/project\n\
+             - Cwd: `/home/user/project`\n\
              \n\
              Command:\n\
              \n\
@@ -1344,9 +1692,40 @@ mod tests {
             cwd: Some("/srv"),
         };
         let markdown = markdown_export(&block(true));
-        assert!(markdown.contains("- Cwd: /srv\n- Note: output truncated\n\nCommand:"));
+        assert!(markdown.contains("- Cwd: `/srv`\n- Note: output truncated\n\nCommand:"));
         // The note is absent when nothing was cut.
         assert!(!markdown_export(&block(false)).contains("- Note: output truncated"));
+    }
+
+    #[test]
+    fn markdown_export_keeps_untrusted_cwd_syntax_inert_and_omits_bidi() {
+        let render = |cwd| {
+            markdown_export(&MarkdownBlock {
+                command: Some("pwd"),
+                output: "",
+                output_truncated: false,
+                exit_code: Some(0),
+                duration_ms: None,
+                finished_at_ms: None,
+                tz_offset_secs: 0,
+                cwd: Some(cwd),
+            })
+        };
+
+        let html = render("<img src=https://example.invalid/pixel>");
+        assert!(html.contains("- Cwd: `<img src=https://example.invalid/pixel>`\n"));
+        assert!(!html.contains("- Cwd: <img"));
+
+        let image = render("![](https://example.invalid/pixel)");
+        assert!(image.contains("- Cwd: `![](https://example.invalid/pixel)`\n"));
+        assert!(!image.contains("- Cwd: ![]("));
+
+        let backticks = render("/tmp/`project`");
+        assert!(backticks.contains("- Cwd: `` /tmp/`project` ``\n"));
+
+        let bidi = render("/safe/\u{202e}gpj.exe");
+        assert!(bidi.contains("- Cwd: `[unsafe path omitted]`\n"));
+        assert!(!bidi.contains('\u{202e}'));
     }
 
     #[test]
@@ -1363,7 +1742,7 @@ mod tests {
         };
         let markdown = markdown_export_with_state(&block, true, true, false);
         assert!(markdown.contains("- Note: output unavailable (snapshot and scrollback evicted)\n"));
-        assert!(markdown.contains("- Note: command truncated by shell\n"));
+        assert!(markdown.contains("- Note: command truncated or unavailable\n"));
         assert!(markdown.contains("- Note: command completion not observed\n"));
         assert!(!markdown.contains("- Note: output truncated\n"));
     }
@@ -1458,6 +1837,71 @@ mod tests {
         // No zones at all: nothing to select.
         assert_eq!(selection_navigation(&[], None, true), Passthrough);
         assert_eq!(selection_navigation(&[], Some(1), false), Passthrough);
+    }
+
+    #[test]
+    fn block_bookmarks_toggle_clear_and_retain_only_live_ids() {
+        let mut bookmarks = BlockBookmarks::default();
+        assert!(bookmarks.is_empty());
+        assert_eq!(bookmarks.len(), 0);
+
+        assert!(bookmarks.toggle(10));
+        assert!(bookmarks.toggle(20));
+        assert!(bookmarks.contains(10));
+        assert!(bookmarks.contains(20));
+        assert_eq!(bookmarks.len(), 2);
+
+        assert!(!bookmarks.toggle(20));
+        assert!(!bookmarks.contains(20));
+        assert_eq!(bookmarks.len(), 1);
+
+        assert!(bookmarks.toggle(999));
+        assert!(bookmarks.retain(&[10, 20, 30]));
+        assert!(bookmarks.contains(10));
+        assert!(!bookmarks.contains(999));
+        assert_eq!(bookmarks.len(), 1);
+
+        assert!(!bookmarks.retain(&[]));
+        assert!(bookmarks.is_empty());
+        assert!(bookmarks.toggle(30));
+        bookmarks.clear();
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn block_bookmark_neighbors_step_wrap_and_remove_stale_ids() {
+        let ids = [10, 20, 30, 40, 50];
+        let mut bookmarks = BlockBookmarks::default();
+        assert!(bookmarks.toggle(20));
+        assert!(bookmarks.toggle(40));
+        assert!(bookmarks.toggle(999));
+
+        // No current block (or a dangling one) enters from the requested edge.
+        assert_eq!(bookmarks.neighbor(&ids, None, true), Some(40));
+        assert!(!bookmarks.contains(999));
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks.neighbor(&ids, None, false), Some(20));
+        assert_eq!(bookmarks.neighbor(&ids, Some(999), true), Some(40));
+        assert_eq!(bookmarks.neighbor(&ids, Some(999), false), Some(20));
+
+        // A bookmarked or ordinary current block steps to the nearest mark.
+        assert_eq!(bookmarks.neighbor(&ids, Some(40), true), Some(20));
+        assert_eq!(bookmarks.neighbor(&ids, Some(20), false), Some(40));
+        assert_eq!(bookmarks.neighbor(&ids, Some(30), true), Some(20));
+        assert_eq!(bookmarks.neighbor(&ids, Some(30), false), Some(40));
+
+        // Both ends wrap to the far bookmark.
+        assert_eq!(bookmarks.neighbor(&ids, Some(20), true), Some(40));
+        assert_eq!(bookmarks.neighbor(&ids, Some(40), false), Some(20));
+        assert_eq!(bookmarks.neighbor(&ids, Some(10), true), Some(40));
+        assert_eq!(bookmarks.neighbor(&ids, Some(50), false), Some(20));
+
+        // One bookmark loops to itself; no live bookmarks produce no target.
+        assert!(!bookmarks.toggle(40));
+        assert_eq!(bookmarks.neighbor(&ids, Some(20), true), Some(20));
+        assert_eq!(bookmarks.neighbor(&ids, Some(20), false), Some(20));
+        assert_eq!(bookmarks.neighbor(&[], Some(20), true), None);
+        assert!(bookmarks.is_empty());
     }
 
     #[test]
@@ -1656,6 +2100,87 @@ mod tests {
     }
 
     #[test]
+    fn source_snapshot_is_lazy_bounded_and_keeps_newest_zones() {
+        let extracted = std::cell::Cell::new(0usize);
+        let chunk = 1 << 20;
+        let sources = (1..=9u64).rev().map(|zone_id| {
+            extracted.set(extracted.get() + 1);
+            BlockSearchSource::new(zone_id, None, Some("x".repeat(chunk)))
+        });
+        let snapshot = bounded_block_search_sources(sources, BLOCK_SEARCH_SOURCE_MAX_BYTES);
+
+        assert_eq!(snapshot.sources.len(), 8);
+        assert_eq!(snapshot.sources[0].zone_id, 9);
+        assert_eq!(snapshot.sources[7].zone_id, 2);
+        assert_eq!(snapshot.resident_bytes, BLOCK_SEARCH_SOURCE_MAX_BYTES);
+        assert!(snapshot.older_not_indexed);
+        // The first over-budget zone is the only discarded source extracted;
+        // an arbitrarily long iterator is never drained after the cap.
+        assert_eq!(extracted.get(), 9);
+    }
+
+    #[test]
+    fn cache_builder_counts_lowercase_residency_and_drops_older_zones() {
+        let sources = vec![
+            BlockSearchSource::new(3, Some("NEWEST İ".into()), Some("RESULT İ".into())),
+            BlockSearchSource::new(2, Some("middle".into()), Some("middle output".into())),
+            BlockSearchSource::new(1, Some("oldest".into()), Some("old output".into())),
+        ];
+        let snapshot = BlockSearchSourceSnapshot {
+            resident_bytes: sources.iter().map(BlockSearchSource::resident_bytes).sum(),
+            sources,
+            older_not_indexed: false,
+        };
+        let newest = CachedBlockSearchZone::from_source(snapshot.sources[0].clone());
+        let vec_bytes = snapshot.sources.len() * std::mem::size_of::<CachedBlockSearchZone>();
+        let budget = vec_bytes + newest.resident_bytes();
+        let build = build_block_search_cache(snapshot, budget);
+
+        assert_eq!(build.zones.len(), 1);
+        assert_eq!(build.zones[0].zone_id, 3);
+        assert!(build.older_not_indexed);
+        assert!(build.resident_bytes <= budget);
+        assert_eq!(
+            build.resident_bytes,
+            build.zones.capacity() * std::mem::size_of::<CachedBlockSearchZone>()
+                + build
+                    .zones
+                    .iter()
+                    .map(CachedBlockSearchZone::resident_bytes)
+                    .sum::<usize>()
+        );
+        assert_eq!(
+            build.zones[0].command_lowercase.as_deref(),
+            Some("newest i̇")
+        );
+    }
+
+    #[test]
+    fn cache_builder_restores_oldest_first_search_order() {
+        let sources = vec![
+            BlockSearchSource::new(3, Some("three".into()), None),
+            BlockSearchSource::new(2, Some("two".into()), None),
+            BlockSearchSource::new(1, Some("one".into()), None),
+        ];
+        let snapshot = BlockSearchSourceSnapshot {
+            resident_bytes: sources.iter().map(BlockSearchSource::resident_bytes).sum(),
+            sources,
+            older_not_indexed: false,
+        };
+        let build = build_block_search_cache(snapshot, BLOCK_SEARCH_CACHE_MAX_BYTES);
+        assert_eq!(
+            build
+                .zones
+                .iter()
+                .map(|zone| zone.zone_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(!build.older_not_indexed);
+        assert!(build.resident_bytes <= BLOCK_SEARCH_CACHE_MAX_BYTES);
+    }
+
+    #[test]
     fn search_blocks_matches_commands_and_output_lines_case_insensitively() {
         let sources = [
             source(1, Some("make test"), Some("ok\nError: boom\ndone")),
@@ -1669,11 +2194,13 @@ mod tests {
         assert_eq!(results.hits[0].zone_id, 2);
         assert!(!results.hits[0].is_output_line);
         assert_eq!(results.hits[0].line_no, 0);
+        assert_eq!(results.hits[0].match_span, Some(5..10));
         assert_eq!(results.hits[0].line_text, "grep ERROR log");
         assert_eq!(results.hits[0].command_preview, "grep ERROR log");
         assert_eq!(results.hits[1].zone_id, 1);
         assert!(results.hits[1].is_output_line);
         assert_eq!(results.hits[1].line_no, 2);
+        assert_eq!(results.hits[1].match_span, Some(0..5));
         assert_eq!(results.hits[1].line_text, "Error: boom");
         assert_eq!(results.hits[1].command_preview, "make test");
         // The query is folded too, and background zones search their output.
@@ -1681,6 +2208,7 @@ mod tests {
         let hit = &search_blocks(&background, "ReAdY").hits[0];
         assert!(hit.is_output_line);
         assert_eq!(hit.line_no, 1);
+        assert_eq!(hit.match_span, Some(7..12));
         assert_eq!(hit.command_preview, "");
     }
 
@@ -1714,6 +2242,17 @@ mod tests {
     }
 
     #[test]
+    fn filtered_search_excludes_zones_before_the_hit_cap_is_counted() {
+        let cache: Vec<_> = (0..=BLOCK_SEARCH_HIT_CAP as u64)
+            .map(|zone_id| CachedBlockSearchZone::new(zone_id, Some("match"), None))
+            .collect();
+        let results = search_blocks_filtered(&cache, "match", |zone_id| zone_id == 0);
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].zone_id, 0);
+        assert!(!results.capped);
+    }
+
+    #[test]
     fn search_blocks_clips_previews_with_an_ellipsis() {
         let long_line = format!("needle {}", "x".repeat(300));
         let long_command = format!("needle {}", "c".repeat(300));
@@ -1736,6 +2275,38 @@ mod tests {
             BLOCK_SEARCH_LINE_CHARS
         );
         assert!(output_hit.line_text.ends_with('…'));
+    }
+
+    #[test]
+    fn search_preview_centers_a_match_beyond_the_long_line_prefix() {
+        let line = format!("{}VISIBLE-NEEDLE{}", "x".repeat(300), "y".repeat(300));
+        let cache = [CachedBlockSearchZone::new(7, None, Some(line))];
+        let results = search_blocks(&cache, "visible-needle");
+        let hit = &results.hits[0];
+        assert_eq!(hit.match_span, Some(300..314));
+        let preview = &hit.line_text;
+        assert!(preview.contains("VISIBLE-NEEDLE"));
+        assert!(preview.starts_with('…'));
+        assert!(preview.ends_with('…'));
+        assert!(preview.chars().count() <= BLOCK_SEARCH_LINE_CHARS);
+    }
+
+    #[test]
+    fn search_match_span_maps_lowercase_expansion_back_to_original_chars() {
+        // U+0130 lowercases to two scalars (`i` + combining dot). The cached
+        // lowercase byte/char offsets therefore differ from the original, and
+        // the multibyte prefix makes a raw byte offset wrong as well.
+        let line = "界界İY tail";
+        let cache = [CachedBlockSearchZone::new(9, None, Some(line.into()))];
+
+        let expanded = search_blocks(&cache, "İY");
+        assert_eq!(expanded.hits[0].match_span, Some(2..4));
+        assert_eq!(expanded.hits[0].line_text, line);
+
+        // A query matching only the first scalar of that expansion still
+        // points at the one original character which produced it.
+        let partial = search_blocks(&cache, "i");
+        assert_eq!(partial.hits[0].match_span, Some(2..3));
     }
 
     #[test]

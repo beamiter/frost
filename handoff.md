@@ -1,14 +1,64 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-10
 
-This baseline exact-pins the hardened shared core and jagent revisions and upgrades
-Agent review, configuration, terminal parsing, history, keybindings, and session
-persistence. Agent snapshots are now claimed before restore, execution identities are
-checked, the jsh identity probe owns its process group, and link opening has one
-strict policy.
+This baseline exact-pins the hardened shared core and jagent revisions and now carries
+the Block Mode hardening/discoverability pass on top of the prior Agent review,
+configuration, terminal parsing, history, keybindings, and session-persistence work.
+Block lifecycle identities and cell boundaries are checked, finalized rows own a real
+gutter, stale UI targets fail closed, and the jsh/link policies from the prior baseline
+remain intact.
 
 ## Completed since the previous handoff
+
+- Block interaction now has a layout-reserved 8px gutter rather than a hit target that
+  overlaps column zero. Only rows belonging to finalized selectable blocks own it;
+  running/live-prompt rows remain ordinary terminal input. Left click keeps single,
+  toggle, and range selection, while right click opens a stable pane/zone action panel
+  for copy, recall/reinput, bookmark, top/bottom reveal, search, and session export.
+  Mouse gesture ownership is frozen at press time, so Shift or application mouse-mode
+  changes cannot produce an orphan press/release; running/full-screen and disabled
+  Block Mode keybindings fall through to the PTY.
+- Pane-local block bookmarks have bounded-history reconciliation, wrapped previous/next
+  navigation, gutter and scrollbar markers, a default toggle chord (`Ctrl+Shift+B`),
+  command-palette navigation, and search integration. Clear Blocks removes bookmarks;
+  disabling/re-enabling Block Mode clears hidden selection/search/menu state without
+  resurrecting it.
+- Cross-block search adds All/Failed/Slow/Bookmarked/Background filters, blank-query
+  browsing, responsive fixed-height results, palette autoscroll, and session-bound hit
+  acceptance. Hits retain Unicode-safe match spans, long previews stay centered on the
+  match, and retained output resolves through soft wraps to the actual physical row.
+  Trimmed/reflowed mismatches degrade through logical-line start to the block header
+  rather than targeting another pane's same numeric zone id.
+- Search indexing now takes a lazy newest-first source snapshot capped at 8 MiB and
+  performs lowercasing on a blocking worker under a 16 MiB resident-cache budget.
+  Window-monotonic epochs reject late close/reopen results, finalized-zone versions
+  refresh the picker for ordinary completion, missing-D recovery, Background output,
+  and bounded-history eviction, and partial indexes are disclosed separately from the
+  500-hit scan cap.
+- Clear Blocks is no longer an immediate destructive shortcut. Keybindings, palette,
+  and the block menu share one counted confirmation bound to the stable pane and newest
+  zone id; history churn requires a fresh confirmation, and the modal states that block
+  records, bookmarks, and captured output are permanently removed while a live prompt
+  or running command is retained.
+- OSC 133 parsing now requires an exact A/B/C/D marker field and correlates ordinary C/D
+  ids before consuming state. Output capture preserves no-trailing-newline and same-row
+  CR/BS/CUP writes, ignores alternate-screen paint, and clamps/rebases its row/column
+  extent across trimming and resize. Completion truncation uses the extractor's exact
+  flag, zone-id exhaustion seals history instead of reusing an identity, and Markdown
+  cwd metadata is emitted as inert code with visual-spoof controls omitted.
+- Command capture is bounded to a UTF-8-safe 16 KiB prefix across visible rows and OSC
+  metadata. Oversized or unavailable commands remain explicit non-Background zones,
+  are marked truncated, and cannot enter Recall/Reinput, Agent, completion-history, or
+  other executable-looking consumers.
+- Session export now writes a versioned `frost.block-session` v1 JSON envelope carrying
+  pane identity, capture time/offset, block ordering, and retention/truncation counts;
+  Markdown carries the same pane/time context. The previous unversioned bare JSON array
+  is no longer the compatibility boundary.
+- Tests now bridge real `TerminalState` OSC 133 lifecycles into session export and cover
+  completed, Background, missing-D recovery, shell command truncation, exact markers,
+  mismatched ids, same-row output, resize/alternate-screen boundaries, logical output
+  row mapping, bookmark navigation, filtered search caps, and row-specific gutter hits.
 
 - Agent restore now consumes `jterm_core::agent::SessionClaim`, backed by one
   atomic no-replace rename rather than the former local hard-link/unlink pair.

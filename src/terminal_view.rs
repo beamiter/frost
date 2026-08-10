@@ -37,6 +37,7 @@ pub enum MouseInput {
         button: MouseButton,
         shift: bool,
         alt: bool,
+        ctrl: bool,
         count: u32,
         /// The press landed in the left-padding gutter band (block stripes),
         /// before any cell math. Used for block selection.
@@ -57,6 +58,7 @@ pub enum MouseInput {
         row: usize,
         up: bool,
         ctrl: bool,
+        shift: bool,
         /// Number of whole lines this event scrolls (≥1).
         lines: usize,
     },
@@ -97,17 +99,22 @@ const BLOCK_STRIPE_SELECTED_WIDTH: f32 = 5.0;
 /// `RESIZE_EDGE` grip (5px): on a pane flush with the window's left border the
 /// grip overlay swallows presses in its band, so anything narrower would leave
 /// the stripe unclickable there.
-const BLOCK_GUTTER_MIN_HIT_WIDTH: f32 = 8.0;
+/// Layout-owned space to the left of column zero while Block Mode is enabled.
+/// Paint and hit testing stay inside this reservation and never cover glyphs.
+const BLOCK_GUTTER_WIDTH: f32 = 8.0;
 
 fn is_block_gutter_press(
     button: MouseButton,
-    has_blocks: bool,
+    row_has_selectable_block: bool,
     app_mouse: bool,
     shift: bool,
     press_x: f32,
     gutter_right: f32,
 ) -> bool {
-    button == MouseButton::Left && has_blocks && (shift || !app_mouse) && press_x < gutter_right
+    matches!(button, MouseButton::Left | MouseButton::Right)
+        && row_has_selectable_block
+        && (shift || !app_mouse)
+        && press_x < gutter_right
 }
 
 /// Block-mode chrome for one visible grid row, precomputed by the app the
@@ -115,6 +122,14 @@ fn is_block_gutter_press(
 /// nothing to draw.
 #[derive(Clone, Debug, Default)]
 pub struct BlockPaintRow {
+    /// This row belongs to a finalized block and may be selected from the
+    /// gutter. Running/live-prompt chrome deliberately leaves this false so
+    /// an empty stripe-band press remains an ordinary terminal click.
+    pub selectable: bool,
+    /// First row of a user-bookmarked block. Drawn as a small amber notch in
+    /// the gutter so bookmark state does not rely on badge space or color of
+    /// the command outcome stripe.
+    pub bookmarked: bool,
     /// Gutter stripe color for this row; `None` draws no stripe.
     pub stripe: Option<Color>,
     /// Draw the stripe wider and at full opacity (active selection edge).
@@ -139,6 +154,9 @@ fn hovered_link_color() -> Color {
 struct State {
     dragging: bool,
     scrollbar_dragging: bool,
+    /// Gutter presses are complete one-shot gestures. Remember their button
+    /// so a later release cannot leak to a newly mouse-reporting application.
+    consumed_gutter: Option<MouseButton>,
     last_click: Option<(Instant, usize, usize)>,
     click_count: u32,
     /// Fractional wheel lines not yet consumed, so sub-line trackpad pixel
@@ -156,10 +174,11 @@ pub struct Metrics {
     pub cell_w: f32,
     pub cell_h: f32,
     pub padding: f32,
+    pub block_gutter: bool,
 }
 
 impl Metrics {
-    pub fn new(font_size: f32, line_spacing: f32, padding: f32) -> Self {
+    pub fn new(font_size: f32, line_spacing: f32, padding: f32, block_gutter: bool) -> Self {
         let cell_w = (font_size * 0.6).max(1.0);
         let cell_h = (font_size * 1.2 * line_spacing).max(1.0);
         Metrics {
@@ -167,12 +186,21 @@ impl Metrics {
             cell_w,
             cell_h,
             padding,
+            block_gutter,
+        }
+    }
+
+    fn block_gutter_width(&self) -> f32 {
+        if self.block_gutter {
+            BLOCK_GUTTER_WIDTH
+        } else {
+            0.0
         }
     }
 
     /// Compute (cols, rows) that fit into the given pixel area.
     pub fn grid_size(&self, width: f32, height: f32) -> (usize, usize) {
-        let usable_w = (width - self.padding * 2.0).max(0.0);
+        let usable_w = (width - self.padding * 2.0 - self.block_gutter_width()).max(0.0);
         let usable_h = (height - self.padding * 2.0).max(0.0);
         let cols = (usable_w / self.cell_w).floor() as usize;
         let rows = (usable_h / self.cell_h).floor() as usize;
@@ -210,6 +238,9 @@ pub struct TermWidget<'a, Message> {
     /// Scrollbar-track fractions (0 = buffer top) of failed blocks; each gets
     /// a small red marker on the track. Empty = no block mode / no failures.
     block_markers: Vec<f32>,
+    /// Scrollbar positions of bookmarked blocks, painted amber beside failure
+    /// markers so off-screen bookmarks remain visible and navigable.
+    block_bookmark_markers: Vec<f32>,
     /// Search matches in visible-grid coordinates (line = grid row index).
     search_matches: Vec<SearchMatch>,
     /// Identity `(line, col_start)` of the active match, highlighted distinctly.
@@ -286,6 +317,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             scrollback_len,
             blocks: Vec::new(),
             block_markers: Vec::new(),
+            block_bookmark_markers: Vec::new(),
             search_matches: Vec::new(),
             current_match: None,
             shift: false,
@@ -395,6 +427,11 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    pub fn block_bookmark_markers(mut self, markers: Vec<f32>) -> Self {
+        self.block_bookmark_markers = markers;
+        self
+    }
+
     /// Scrollbar track + thumb geometry, or `None` when there is nothing to
     /// scroll. Returns `(track_top, track_h, x, thumb_y, thumb_h)`.
     fn scrollbar_geometry(&self, bounds: Rectangle) -> Option<(f32, f32, f32, f32, f32)> {
@@ -455,7 +492,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         let pad = self.metrics.padding;
         let cw = self.metrics.cell_w.max(1.0);
         let ch = self.metrics.cell_h.max(1.0);
-        let rel_x = (pos.x - bounds.x - pad).max(0.0);
+        let rel_x = (pos.x - bounds.x - pad - self.metrics.block_gutter_width()).max(0.0);
         let rel_y = (pos.y - bounds.y - pad).max(0.0);
         let max_row = self.grid.len().saturating_sub(1);
         let max_col = self
@@ -569,19 +606,24 @@ mod tests {
     use super::{
         glyph_shaping, is_block_gutter_press, should_use_cjk_fallback_font,
         should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
-        should_use_symbol_fallback_font, terminal_glyph_font, MouseButton,
+        should_use_symbol_fallback_font, terminal_glyph_font, Metrics, MouseButton,
+        BLOCK_GUTTER_WIDTH,
     };
 
     #[test]
     fn block_gutter_press_respects_application_mouse_ownership() {
-        let inside = |button, has_blocks, app_mouse, shift| {
-            is_block_gutter_press(button, has_blocks, app_mouse, shift, 7.0, 8.0)
+        let inside = |button, row_has_block, app_mouse, shift| {
+            is_block_gutter_press(button, row_has_block, app_mouse, shift, 7.0, 8.0)
         };
 
         assert!(inside(MouseButton::Left, true, false, false));
+        assert!(inside(MouseButton::Right, true, false, false));
         assert!(!inside(MouseButton::Left, true, true, false));
+        assert!(!inside(MouseButton::Right, true, true, false));
         assert!(inside(MouseButton::Left, true, true, true));
         assert!(!inside(MouseButton::Middle, true, false, false));
+        // A painted vector is not enough: only rows belonging to finalized
+        // blocks own the hit band. Live prompts/running rows remain ordinary.
         assert!(!inside(MouseButton::Left, false, false, false));
         assert!(!is_block_gutter_press(
             MouseButton::Left,
@@ -591,6 +633,19 @@ mod tests {
             8.0,
             8.0,
         ));
+    }
+
+    #[test]
+    fn block_gutter_is_reserved_before_column_zero() {
+        let with_gutter = Metrics::new(10.0, 1.0, 2.0, true);
+        let without_gutter = Metrics::new(10.0, 1.0, 2.0, false);
+        assert_eq!(with_gutter.block_gutter_width(), BLOCK_GUTTER_WIDTH);
+        assert_eq!(without_gutter.block_gutter_width(), 0.0);
+
+        // 72px = 4px padding + 8px gutter + ten 6px cells. Turning the
+        // gutter off recovers exactly one additional cell without overlap.
+        assert_eq!(with_gutter.grid_size(72.0, 20.0).0, 10);
+        assert_eq!(without_gutter.grid_size(72.0, 20.0).0, 11);
     }
 
     #[test]
@@ -758,7 +813,10 @@ where
                 let (row, col) = self.cursor;
                 let cursor_rect = Rectangle::new(
                     Point::new(
-                        bounds.x + pad + col as f32 * self.metrics.cell_w,
+                        bounds.x
+                            + pad
+                            + self.metrics.block_gutter_width()
+                            + col as f32 * self.metrics.cell_w,
                         bounds.y + pad + row as f32 * self.metrics.cell_h,
                     ),
                     Size::new(self.metrics.cell_w, self.metrics.cell_h),
@@ -796,7 +854,7 @@ where
                     mouse::Button::Right => MouseButton::Right,
                     _ => return,
                 };
-                let (shift, alt) = (self.shift, self.alt);
+                let (shift, alt, ctrl) = (self.shift, self.alt, self.ctrl);
                 // Grabbing the scrollbar gutter starts a scroll drag, not a
                 // text selection.
                 if button == MouseButton::Left {
@@ -811,10 +869,9 @@ where
                     }
                 }
                 // The raw pixel decides gutter membership; `cell_at` above has
-                // already clamped a padding press into column 0. The hit band
-                // spans at least `BLOCK_GUTTER_MIN_HIT_WIDTH` so the visible
-                // stripe (3px, 5px selected) is always clickable even with a
-                // narrower padding. A press only counts as a gutter press
+                // already clamped a gutter press into column 0. The fixed hit
+                // band is layout-owned space before column zero, so it cannot
+                // steal the first cell. A press only counts as a gutter press
                 // when block chrome is painted and the press would not be
                 // reported to the app (`app_mouse` mirrors `report_to_app`):
                 // gutter presses are consumed for block selection and arm no
@@ -822,12 +879,15 @@ where
                 // app or text selection needs.
                 let gutter = is_block_gutter_press(
                     button,
-                    !self.blocks.is_empty(),
+                    self.blocks.get(row).is_some_and(|block| block.selectable),
                     self.app_mouse,
                     shift,
                     pos.x,
-                    bounds.x + self.metrics.padding.max(BLOCK_GUTTER_MIN_HIT_WIDTH),
+                    bounds.x + self.metrics.padding + self.metrics.block_gutter_width(),
                 );
+                if gutter {
+                    state.consumed_gutter = Some(button);
+                }
                 if button == MouseButton::Left && !gutter {
                     state.dragging = true;
                     let now = Instant::now();
@@ -850,6 +910,7 @@ where
                     button,
                     shift,
                     alt,
+                    ctrl,
                     count: state.click_count,
                     gutter,
                 }));
@@ -873,6 +934,17 @@ where
                 }));
             }
             Event::Mouse(mouse::Event::ButtonReleased(btn)) => {
+                let button = match btn {
+                    mouse::Button::Left => MouseButton::Left,
+                    mouse::Button::Middle => MouseButton::Middle,
+                    mouse::Button::Right => MouseButton::Right,
+                    _ => return,
+                };
+                if state.consumed_gutter == Some(button) {
+                    state.consumed_gutter = None;
+                    shell.capture_event();
+                    return;
+                }
                 // Only the pane that owns the interaction (was dragging) or has
                 // the cursor over it should process the release; otherwise every
                 // split pane emits a release for the same physical click.
@@ -882,12 +954,6 @@ where
                 {
                     return;
                 }
-                let button = match btn {
-                    mouse::Button::Left => MouseButton::Left,
-                    mouse::Button::Middle => MouseButton::Middle,
-                    mouse::Button::Right => MouseButton::Right,
-                    _ => return,
-                };
                 if button == MouseButton::Left {
                     if state.scrollbar_dragging {
                         state.scrollbar_dragging = false;
@@ -939,6 +1005,7 @@ where
                     row,
                     up: whole > 0.0,
                     ctrl: self.ctrl,
+                    shift: self.shift,
                     lines: whole.abs() as usize,
                 }));
                 shell.capture_event();
@@ -968,7 +1035,7 @@ where
         let pad = self.metrics.padding;
         let cw = self.metrics.cell_w;
         let ch = self.metrics.cell_h;
-        let ox = bounds.x + pad;
+        let ox = bounds.x + pad + self.metrics.block_gutter_width();
         let oy = bounds.y + pad;
         let default_fg = self
             .dynamic_fg
@@ -1049,6 +1116,44 @@ where
                             height: ch,
                         }),
                         Background::Color(bg),
+                    );
+                }
+            }
+
+            // Block selection fill and separators are structural backgrounds:
+            // paint them before text/images so they never wash out glyphs.
+            if let Some(block) = self.blocks.get(row_idx) {
+                let text_right = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
+                if block.outline_sides {
+                    let accent = self
+                        .dynamic_cursor
+                        .map(|(r, g, b)| Color::from_rgb8(r, g, b))
+                        .unwrap_or_else(|| self.theme.cursor_color());
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x: ox,
+                            y,
+                            width: (text_right - ox).max(0.0),
+                            height: ch,
+                        }),
+                        Background::Color(Color {
+                            a: if self.focused { 0.07 } else { 0.04 },
+                            ..accent
+                        }),
+                    );
+                }
+                if block.separator {
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x: ox,
+                            y,
+                            width: (text_right - ox).max(0.0),
+                            height: 1.0,
+                        }),
+                        Background::Color(Color {
+                            a: 0.15,
+                            ..self.theme.terminal_foreground()
+                        }),
                     );
                 }
             }
@@ -1303,27 +1408,34 @@ where
             );
         }
 
-        // Block-mode chrome (per-row, precomputed by the app). All quads land
-        // under the glyph pass; the badge only occupies cells verified blank,
-        // so its text never collides with grid text.
+        // Kitty graphics: paint each placement (already z-sorted) as a texture
+        // stretched into its cell span. Block UI chrome and the cursor follow,
+        // so images cannot hide selection/bookmark affordances or the caret.
+        for im in &self.images {
+            let x = ox + im.col as f32 * cw;
+            let y = oy + im.row as f32 * ch;
+            let w = im.cols as f32 * cw;
+            let h = im.rows as f32 * ch;
+            let rect = Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            renderer.draw_image(
+                iced::advanced::image::Image::new(im.handle.clone()),
+                rect,
+                clip,
+            );
+        }
+
+        // Block-mode UI chrome (per-row, precomputed by the app) sits above
+        // glyphs/images. The badge only occupies cells verified blank, so its
+        // text never collides with terminal text.
         for (row_idx, block) in self.blocks.iter().enumerate() {
             let y = oy + row_idx as f32 * ch;
             let text_right = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
 
-            if block.separator {
-                renderer.fill_quad(
-                    solid_quad(Rectangle {
-                        x: ox,
-                        y,
-                        width: (text_right - ox).max(0.0),
-                        height: 1.0,
-                    }),
-                    Background::Color(Color {
-                        a: 0.15,
-                        ..self.theme.terminal_foreground()
-                    }),
-                );
-            }
             if let Some(color) = block.stripe {
                 let (width, alpha) = if block.stripe_strong {
                     (BLOCK_STRIPE_SELECTED_WIDTH, 1.0)
@@ -1343,6 +1455,30 @@ where
                     }),
                 );
             }
+            if block.bookmarked {
+                let marker = self.theme.ansi_color(3);
+                let size = ch
+                    .min((self.metrics.block_gutter_width() - 2.0).max(1.0))
+                    .clamp(1.0, 7.0);
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle {
+                            x: bounds.x + 1.0,
+                            y: y + (ch - size) / 2.0,
+                            width: size,
+                            height: size,
+                        },
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 1.5.into(),
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(Color { a: 0.95, ..marker }),
+                );
+            }
             // Selected-block outline: 1px stroke assembled from thin quads.
             if block.outline_top || block.outline_bottom || block.outline_sides {
                 let accent = self
@@ -1350,7 +1486,7 @@ where
                     .map(|(r, g, b)| Color::from_rgb8(r, g, b))
                     .unwrap_or_else(|| self.theme.cursor_color());
                 let stroke = Background::Color(Color { a: 0.8, ..accent });
-                let left = bounds.x + BLOCK_STRIPE_SELECTED_WIDTH + 1.0;
+                let left = ox;
                 let width = (text_right - left).max(0.0);
                 if block.outline_top {
                     renderer.fill_quad(
@@ -1523,26 +1659,6 @@ where
             }
         }
 
-        // Kitty graphics: paint each placement (already z-sorted) as a texture
-        // stretched into its cell span.
-        for im in &self.images {
-            let x = ox + im.col as f32 * cw;
-            let y = oy + im.row as f32 * ch;
-            let w = im.cols as f32 * cw;
-            let h = im.rows as f32 * ch;
-            let rect = Rectangle {
-                x,
-                y,
-                width: w,
-                height: h,
-            };
-            renderer.draw_image(
-                iced::advanced::image::Image::new(im.handle.clone()),
-                rect,
-                clip,
-            );
-        }
-
         // Scrollbar (only when scrollback exists).
         if let Some((track_top, track_h, sb_x, thumb_y, thumb_h)) = self.scrollbar_geometry(bounds)
         {
@@ -1599,6 +1715,22 @@ where
                     );
                 }
             }
+            if !self.block_bookmark_markers.is_empty() {
+                const MARKER_HEIGHT: f32 = 3.0;
+                let amber = self.theme.ansi_color(3);
+                let span = (track_h - MARKER_HEIGHT).max(0.0);
+                for &fraction in &self.block_bookmark_markers {
+                    renderer.fill_quad(
+                        solid_quad(Rectangle {
+                            x: sb_x + SCROLLBAR_WIDTH / 2.0,
+                            y: track_top + fraction.clamp(0.0, 1.0) * span,
+                            width: SCROLLBAR_WIDTH / 2.0,
+                            height: MARKER_HEIGHT,
+                        }),
+                        Background::Color(Color { a: 0.95, ..amber }),
+                    );
+                }
+            }
         }
     }
 
@@ -1612,6 +1744,14 @@ where
     ) -> mouse::Interaction {
         if let Some(p) = cursor.position_over(layout.bounds()) {
             let (c, r) = self.cell_at(p, layout.bounds());
+            let gutter_right =
+                layout.bounds().x + self.metrics.padding + self.metrics.block_gutter_width();
+            if p.x < gutter_right
+                && self.blocks.get(r).is_some_and(|block| block.selectable)
+                && (self.shift || !self.app_mouse)
+            {
+                return mouse::Interaction::Pointer;
+            }
             if self.link_at(c, r).is_some() {
                 return mouse::Interaction::Pointer;
             }

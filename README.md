@@ -14,7 +14,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
-- OSC 133 Block mode：命令按成功/失败绘制条纹与耗时徽标，空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间；支持块选择、失败跳转、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
+- OSC 133 Block mode：命令按成功/失败绘制条纹与耗时徽标，空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
 - 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
@@ -111,9 +111,10 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 查找替换（选中文本） | `Ctrl+Alt+R`（替换结果进剪贴板或回填提示符，从不改写 scrollback） |
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
-| 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；Enter 定位块） |
+| 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；可筛选失败/慢命令/书签/Background；Enter 定位匹配输出行） |
+| 添加/移除块书签 | `Ctrl+Shift+B`（作用于当前选择，否则作用于最新块；前后书签导航在命令面板） |
 | 全选命令块 | `Ctrl+Shift+A` |
-| 清空已完成命令块 | `Ctrl+Shift+K`（保留当前提示符或运行中命令） |
+| 清空已完成命令块 | `Ctrl+Shift+K`（显示块数并要求确认；不可撤销；保留当前提示符或运行中命令） |
 | 回填所选命令 | `Ctrl+Shift+I`（只回填，不执行） |
 | 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
 | 命令面板 | `Ctrl+Shift+P` |
@@ -132,17 +133,40 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 窗口透明度增 / 减 | `Ctrl+Alt+=` / `Ctrl+Alt+-`（写回配置 `opacity`，设置面板也有滑块） |
 
 Block mode 的左侧条纹支持普通点击单选、`Ctrl+点击` 切换单块、`Shift+点击`
-选择连续范围。无选区时 `Ctrl+↑` 从最新块开始选择；已有选区后普通 `↑/↓`
+选择连续范围；右键条纹打开固定目标的块动作面板，可复制、回填、书签、跳转和导出。
+书签以琥珀标记同时显示在 gutter 与滚动条上，块被历史保留策略淘汰或执行
+“清空已完成块”时自动移除。清空会统一经过确认框，明确当前 pane 将删除的块数，
+并永久移除这些块记录、书签和已捕获输出；此操作不可撤销，但不会影响当前提示符或
+正在运行的命令。无选区时 `Ctrl+↑` 从最新块开始选择；已有选区后普通 `↑/↓`
 折叠到相邻块，`Shift+↑/↓` 扩缩连续范围。选区存在且提示符空闲时，`Enter`
 与 `Ctrl+Shift+I` 都会按终端顺序回填所选命令但不会执行；命令运行中 `Enter`
 仍原样交给前台程序。多命令只在 shell 开启 bracketed paste 时作为可编辑多行
 文本保留，否则安全地只回填第一个逻辑行，后续换行绝不会触发执行。
+
+块搜索支持 `All / Failed / Slow / Bookmarked / Background` 五种视图；空查询时可直接
+浏览筛选结果。文本查询保存完整逻辑行中的 Unicode 字符跨度，因此长行预览会围绕
+关键词截取，并能定位到 soft-wrap 后实际包含命中的物理行。若 scrollback 已淘汰但有
+捕获快照，搜索与复制仍可用，定位会安全降级到逻辑行首或块首。Block Mode 关闭、命令运行中
+或全屏程序占用 alternate screen 时，物理 Block 快捷键会透传给前台程序，不会只弹
+提示后吞键；命令面板和右键菜单仍是明确的鼠标操作入口。
+
+搜索索引优先保留最新块：UI 线程最多提取 8 MiB 源文本，lowercase 在后台构建且常驻
+索引最多 16 MiB。索引期间可继续输入筛选条件；新命令完成、缺失 `D` 后由下一提示符
+收束或产生 Background 块时会自动刷新。若预算省略了更老块，结果区会明确显示
+`older blocks not indexed`，不会把部分索引伪装成完整历史。
+
+命令文本捕获有 16 KiB 上限；超过上限时保留 UTF-8 安全前缀并明确标为截断，复制与
+导出仍可使用，但 Recall/Reinput、Agent 和持久化历史不会把不完整命令当成可执行文本。
+若 OSC 133 已进入命令生命周期却无法恢复命令内容，会显示不可用占位而不会误归类为
+Background。
 
 命令面板中的 **Export Session Blocks as Markdown/JSON** 会把当前 pane 仍保留的
 已定型块（最多 256 条，也包括缺失结束标记后由下一提示符收束的记录）写入
 `$XDG_DATA_HOME/frost/exports/`（通常是 `~/.local/share/frost/exports/`）。JSON 和
 Markdown 都会明确标记命令截断、输出已淘汰或未观察到完成；文件按本地时间命名，
 同秒多次导出不覆盖，先私密暂存并原子发布，目录与文件权限分别为 `0700` / `0600`。
+JSON 使用版本化的 `frost.block-session` v1 envelope，记录 pane session、捕获时间、
+块顺序和截断/淘汰汇总，后续字段演进不再依赖无版本裸数组。
 
 快捷键从 `$XDG_CONFIG_HOME/frost/keybindings.toml`（通常是 `~/.config/frost/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
 
@@ -163,6 +187,7 @@ theme = "tokyo-night"
 tab_position = "top"
 restore_session = true
 disable_alt_screen = false
+block_mode = true     # OSC 133 命令块、gutter、搜索与右键动作
 
 # 可选：明确指定 shell
 shell = "/bin/bash"

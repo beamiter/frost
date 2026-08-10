@@ -57,6 +57,9 @@ pub enum PaletteAction {
     BlockExportSessionMarkdown,
     BlockExportSessionJson,
     BlockSearch,
+    BlockToggleBookmark,
+    BlockJumpPrevBookmark,
+    BlockJumpNextBookmark,
     CommandHistory,
     ClearScreen,
     InstallJsh,
@@ -408,6 +411,24 @@ impl PaletteState {
                 action: PaletteAction::BlockSearch,
             },
             PaletteItem {
+                name: "Toggle Block Bookmark",
+                description: "Bookmark or unbookmark the selected (or latest) block",
+                shortcut: "Ctrl+Shift+B",
+                action: PaletteAction::BlockToggleBookmark,
+            },
+            PaletteItem {
+                name: "Jump to Previous Block Bookmark",
+                description: "Select and reveal the nearest older bookmarked block",
+                shortcut: "",
+                action: PaletteAction::BlockJumpPrevBookmark,
+            },
+            PaletteItem {
+                name: "Jump to Next Block Bookmark",
+                description: "Select and reveal the nearest newer bookmarked block",
+                shortcut: "",
+                action: PaletteAction::BlockJumpNextBookmark,
+            },
+            PaletteItem {
                 name: "Command History",
                 description: "Fuzzy-search persisted commands and type one into the prompt",
                 shortcut: "Ctrl+Shift+H",
@@ -576,6 +597,7 @@ mod tests {
             (PaletteAction::BlockSelectAll, "Ctrl+Shift+A"),
             (PaletteAction::BlockClear, "Ctrl+Shift+K"),
             (PaletteAction::BlockReinputSelectedCommands, "Ctrl+Shift+I"),
+            (PaletteAction::BlockToggleBookmark, "Ctrl+Shift+B"),
         ];
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");

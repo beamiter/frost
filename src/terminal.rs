@@ -838,9 +838,10 @@ pub struct CommandZone {
     /// Unix wall-clock milliseconds when `D` arrived. Rendered on the
     /// selected block's badge and in the Markdown export.
     pub finished_at_ms: Option<u64>,
-    /// The shell reported (`cmd_truncated=`) that [`Self::command`] was cut
-    /// short. A truncated command line is not safe to re-run, so recall must
-    /// refuse it; copying is still fine.
+    /// [`Self::command`] is incomplete: either the shell reported
+    /// `cmd_truncated=`, or Frost's bounded capture retained only a safe prefix
+    /// (including the fail-closed unavailable placeholder). It is not safe to
+    /// re-run; copying is still fine.
     pub command_truncated: bool,
     /// Working directory the command ran in: the shell's OSC 133 `cwd`/
     /// `cwd_url` param when one arrived, else the OSC 7 cwd at `D`.
@@ -888,6 +889,65 @@ enum ZoneState {
     PromptStarted(usize),
     CommandStarted(usize, usize),
     OutputStarted(usize, usize, usize),
+}
+
+const MAX_CAPTURED_COMMAND_BYTES: usize = 16 * 1024;
+const UNAVAILABLE_COMMAND_TEXT: &str = "<command unavailable>";
+
+/// Bounded command text reconstructed at OSC 133 `C`.
+///
+/// `truncated` covers both a real byte-cap cut and the fail-closed placeholder
+/// used when a `C` lifecycle exists but neither metadata nor retained rows can
+/// supply its command. In both cases recall must refuse the stored text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CommandCapture {
+    text: String,
+    truncated: bool,
+}
+
+impl CommandCapture {
+    fn from_text(text: &str) -> Self {
+        if text.len() <= MAX_CAPTURED_COMMAND_BYTES {
+            return Self {
+                text: text.to_string(),
+                truncated: false,
+            };
+        }
+        let mut end = MAX_CAPTURED_COMMAND_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            text: text[..end].to_string(),
+            truncated: true,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            text: UNAVAILABLE_COMMAND_TEXT.to_string(),
+            truncated: true,
+        }
+    }
+
+    /// Preserve a real non-blank prefix. A truncated all-whitespace prefix
+    /// cannot identify a command and would still classify as Background, so
+    /// make the uncertainty explicit and non-executable instead.
+    fn ensure_command_identity(mut self) -> Self {
+        if self.truncated && self.text.trim().is_empty() {
+            self.text = UNAVAILABLE_COMMAND_TEXT.to_string();
+        }
+        self
+    }
+
+    fn push_char(&mut self, character: char) -> bool {
+        if self.text.len().saturating_add(character.len_utf8()) > MAX_CAPTURED_COMMAND_BYTES {
+            self.truncated = true;
+            return false;
+        }
+        self.text.push(character);
+        true
+    }
 }
 
 /// Visible asynchronous output observed after OSC 133 `B` while the prompt
@@ -1347,6 +1407,14 @@ pub struct TerminalState {
     /// Furthest row on which command-line echo wrote a character after `B`.
     /// This catches text to the right of a cursor moved backwards by readline.
     current_command_extent_row: Option<usize>,
+    /// First captured column on the OSC 133 `C` row. Initialized from the
+    /// cursor at `C`, then lowered when output moves left and paints there.
+    current_output_start_col: Option<usize>,
+    /// Furthest absolute row on which output wrote a character after `C`.
+    /// The `D`/next-`A` cursor row alone is not enough: output without a final
+    /// newline leaves the cursor on the last output row, which must be included
+    /// in the otherwise end-exclusive captured range.
+    current_output_extent_row: Option<usize>,
     /// Once local input is accepted for this prompt, approval stays blocked
     /// until a fresh `B`. This closes the write-before-echo race.
     agent_prompt_input_tainted: bool,
@@ -1372,7 +1440,9 @@ pub struct TerminalState {
     armed_agent_execution: Option<ArmedAgentExecution>,
     /// Reviewed command whose exact `C` was accepted and whose `D` is pending.
     active_agent_execution: Option<ActiveAgentExecution>,
-    /// Exact command captured at `C`, preferring jsh's `cmdline_url` metadata.
+    /// Bounded command captured at `C`, preferring jsh's `cmdline_url`
+    /// metadata. A real lifecycle always stores a non-blank identity here
+    /// unless the command itself was exactly blank.
     current_command_text: Option<String>,
 
     // OSC 10/11/12 dynamic colors
@@ -1389,14 +1459,18 @@ pub struct TerminalState {
     pub pending_completed_commands: std::collections::VecDeque<CompletedCommand>,
     /// jsh execution id announced by the most recent OSC 133 params.
     current_command_id: Option<String>,
+    /// Execution id carried specifically by OSC 133 `C`. Kept separate from
+    /// [`Self::current_command_id`], which may have been announced earlier on
+    /// `A`/`B`, so only an actual C/D disagreement rejects completion.
+    current_command_start_id: Option<String>,
     /// When the currently executing command began (OSC 133 `C`), so the
     /// finished record can carry a wall-clock duration.
     current_command_started_at: Option<std::time::Instant>,
     /// Working directory reported by an OSC 133 `cwd`/`cwd_url` param during
     /// the current prompt lifecycle (reset at `A`, consumed at `D`).
     current_command_cwd: Option<String>,
-    /// The shell flagged the current command line as truncated
-    /// (`cmd_truncated=`); carried into the zone at `D`.
+    /// The current command line is incomplete: shell `cmd_truncated=` or the
+    /// terminal's bounded/unavailable capture. Carried into the zone at `D`.
     current_command_truncated: bool,
     /// Total bytes of all zones' [`CommandZone::captured_output`] snapshots,
     /// kept under [`Self::MAX_CAPTURED_OUTPUT_BYTES`] by
@@ -1580,6 +1654,8 @@ impl TerminalState {
             current_zone_state: ZoneState::default(),
             current_command_start_col: None,
             current_command_extent_row: None,
+            current_output_start_col: None,
+            current_output_extent_row: None,
             agent_prompt_input_tainted: false,
             prompt_submission_pending: false,
             prompt_cancel_pending: false,
@@ -1597,6 +1673,7 @@ impl TerminalState {
             pending_notifications: Vec::new(),
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
+            current_command_start_id: None,
             current_command_started_at: None,
             current_command_cwd: None,
             current_command_truncated: false,
@@ -1796,9 +1873,53 @@ impl TerminalState {
         String::from_utf8(decoded).ok()
     }
 
+    /// Percent-decode command metadata into a UTF-8-safe bounded prefix.
+    /// Parsing stops once the retained prefix is full, so a large OSC cannot
+    /// force a second unbounded allocation. Malformed/control-bearing retained
+    /// text is rejected and the visible prompt capture remains the fallback.
+    fn decode_osc_command_metadata(value: &str) -> Option<CommandCapture> {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len().min(MAX_CAPTURED_COMMAND_BYTES));
+        let mut index = 0usize;
+        let mut truncated = false;
+        while index < bytes.len() {
+            if decoded.len() >= MAX_CAPTURED_COMMAND_BYTES {
+                truncated = true;
+                break;
+            }
+            if bytes[index] == b'%' {
+                let high = *bytes.get(index + 1)?;
+                let low = *bytes.get(index + 2)?;
+                let nibble = |byte: u8| match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    b'A'..=b'F' => Some(byte - b'A' + 10),
+                    _ => None,
+                };
+                decoded.push((nibble(high)? << 4) | nibble(low)?);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        truncated |= index < bytes.len();
+
+        let valid_len = match std::str::from_utf8(&decoded) {
+            Ok(_) => decoded.len(),
+            Err(error) if truncated && error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => return None,
+        };
+        decoded.truncate(valid_len);
+        let text = String::from_utf8(decoded).ok()?;
+        if text.chars().any(char::is_control) {
+            return None;
+        }
+        Some(CommandCapture { text, truncated })
+    }
+
     /// Exact visible command input after OSC 133 `B`, excluding the prompt.
-    fn current_prompt_command_text(&self) -> Option<String> {
-        const MAX_COMMAND_BYTES: usize = 16 * 1024;
+    fn current_prompt_command_capture(&self) -> Option<CommandCapture> {
         let ZoneState::CommandStarted(_, start_row) = self.current_zone_state else {
             return None;
         };
@@ -1812,47 +1933,57 @@ impl TerminalState {
             return None;
         }
         let last_row = last_row.min(total_rows.saturating_sub(1));
-        let mut out = String::new();
+        let mut capture = CommandCapture::default();
 
         for absolute_row in start_row..=last_row {
-            let append_cells = |out: &mut String, cells: &[TerminalCell], wrapped: bool| {
+            let append_cells = |capture: &mut CommandCapture,
+                                cells: &[TerminalCell],
+                                wrapped: bool| {
                 let first_col = if absolute_row == start_row {
                     start_col.min(cells.len())
                 } else {
                     0
                 };
-                let mut segment: String = cells[first_col..]
-                    .iter()
-                    .filter(|cell| !cell.flags.wide_continuation())
-                    .map(|cell| cell.character)
-                    .collect();
-                if !wrapped {
-                    segment.truncate(segment.trim_end_matches(' ').len());
+                let cells = &cells[first_col..];
+                let end = if wrapped {
+                    cells.len()
+                } else {
+                    cells
+                        .iter()
+                        .rposition(|cell| !cell.flags.wide_continuation() && cell.character != ' ')
+                        .map_or(0, |index| index + 1)
+                };
+                for cell in &cells[..end] {
+                    if !cell.flags.wide_continuation() && !capture.push_char(cell.character) {
+                        return false;
+                    }
                 }
-                out.push_str(&segment);
-                wrapped
+                true
             };
 
-            let wrapped = if absolute_row < self.scrollback.len() {
+            let (appended, wrapped) = if absolute_row < self.scrollback.len() {
                 let line = &self.scrollback[absolute_row];
                 let cells = line.decompress();
-                append_cells(&mut out, &cells, line.is_wrapped)
+                (
+                    append_cells(&mut capture, &cells, line.is_wrapped),
+                    line.is_wrapped,
+                )
             } else {
                 let grid_row = absolute_row - self.scrollback.len();
-                append_cells(
-                    &mut out,
-                    &self.grid[grid_row],
-                    self.grid.row_wrapped[grid_row],
+                let wrapped = self.grid.row_wrapped[grid_row];
+                (
+                    append_cells(&mut capture, &self.grid[grid_row], wrapped),
+                    wrapped,
                 )
             };
-            if out.len() >= MAX_COMMAND_BYTES {
-                return None;
+            if !appended {
+                return Some(capture.ensure_command_identity());
             }
-            if !wrapped && absolute_row < last_row {
-                out.push('\n');
+            if !wrapped && absolute_row < last_row && !capture.push_char('\n') {
+                return Some(capture.ensure_command_identity());
             }
         }
-        Some(out)
+        Some(capture)
     }
 
     pub fn agent_prompt_status(&self) -> AgentPromptStatus {
@@ -1860,8 +1991,8 @@ impl TerminalState {
             ZoneState::CommandStarted(_, _) => {
                 if self.agent_prompt_input_tainted
                     || self
-                        .current_prompt_command_text()
-                        .is_none_or(|command| !command.is_empty())
+                        .current_prompt_command_capture()
+                        .is_none_or(|capture| !capture.text.is_empty())
                 {
                     AgentPromptStatus::InputNotEmpty
                 } else {
@@ -1968,14 +2099,40 @@ impl TerminalState {
         }
     }
 
-    fn mark_command_echo_extent(&mut self) {
-        if matches!(self.current_zone_state, ZoneState::CommandStarted(_, _)) {
-            let absolute_row = self.scrollback.len() + self.cursor_row;
-            self.current_command_extent_row = Some(
-                self.current_command_extent_row
-                    .unwrap_or(absolute_row)
-                    .max(absolute_row),
-            );
+    fn mark_command_echo_extent(&mut self, write_col: usize) {
+        // A primary-screen lifecycle deliberately survives an alternate-screen
+        // detour, but the detour's cells and cursor coordinates never belong to
+        // that lifecycle's command/output rows.
+        if self.use_alt_buffer {
+            return;
+        }
+        let absolute_row = self.scrollback.len() + self.cursor_row;
+        match self.current_zone_state {
+            ZoneState::CommandStarted(_, _) => {
+                self.current_command_extent_row = Some(
+                    self.current_command_extent_row
+                        .unwrap_or(absolute_row)
+                        .max(absolute_row),
+                );
+            }
+            ZoneState::OutputStarted(_, _, output_start) => {
+                self.current_output_extent_row = Some(
+                    self.current_output_extent_row
+                        .unwrap_or(absolute_row)
+                        .max(absolute_row),
+                );
+                // Output may move left on its first physical row before
+                // painting (CR, BS, CUP, progress redraws). The cursor column
+                // at C is therefore only the initial lower bound.
+                if absolute_row == output_start {
+                    self.current_output_start_col = Some(
+                        self.current_output_start_col
+                            .unwrap_or(write_col)
+                            .min(write_col),
+                    );
+                }
+            }
+            ZoneState::Idle | ZoneState::PromptStarted(_) => {}
         }
     }
 
@@ -2038,29 +2195,32 @@ impl TerminalState {
             return;
         }
         let absolute_row = self.scrollback.len() + self.cursor_row;
-        let mark = value.chars().next().unwrap_or('\0');
+        let mut parts = value.split(';');
+        let mark = match parts.next() {
+            Some("A") => 'A',
+            Some("B") => 'B',
+            Some("C") => 'C',
+            Some("D") => 'D',
+            _ => return,
+        };
         let mut mark_id = None;
-        let mut metadata_command = None;
+        let mut metadata_command: Option<CommandCapture> = None;
         let mut metadata_cwd = None;
         let mut metadata_duration_ms = None;
         let mut metadata_truncated = false;
         // jsh correlation metadata rides on C/D as percent-encoded key/value
         // params. Parse it per mark instead of leaving an id in global state
         // where an unrelated later D could inherit it.
-        for part in value.split(';').skip(1) {
+        for part in parts {
             if let Some((key, id)) = part.split_once('=') {
                 if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id") && !id.is_empty()
                 {
                     mark_id = Self::decode_osc_metadata(id, MAX_EXECUTION_ID_BYTES)
                         .filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
                 } else if key == "cmdline_url" {
-                    metadata_command = Self::decode_osc_metadata(id, MAX_COMMAND_METADATA_BYTES)
-                        .filter(|command| !command.chars().any(char::is_control));
-                } else if key == "command"
-                    && id.len() <= MAX_COMMAND_METADATA_BYTES
-                    && !id.chars().any(char::is_control)
-                {
-                    metadata_command = Some(id.to_string());
+                    metadata_command = Self::decode_osc_command_metadata(id);
+                } else if key == "command" && !id.chars().any(char::is_control) {
+                    metadata_command = Some(CommandCapture::from_text(id));
                 } else if matches!(key, "cwd" | "cwd_url") {
                     // Both spellings are percent-decoded, so a literal `%`
                     // in a plain `cwd` path is mangled. Family-consistent:
@@ -2106,8 +2266,11 @@ impl TerminalState {
                 self.current_command_started_at = None;
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
+                self.current_output_start_col = None;
+                self.current_output_extent_row = None;
                 self.current_command_text = None;
                 self.current_command_id = mark_id;
+                self.current_command_start_id = None;
                 self.current_command_cwd = metadata_cwd;
                 self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
@@ -2123,6 +2286,8 @@ impl TerminalState {
                     self.current_zone_state = ZoneState::CommandStarted(prompt_start, absolute_row);
                     self.current_command_start_col = Some(self.cursor_col);
                     self.current_command_extent_row = Some(absolute_row);
+                    self.current_output_start_col = None;
+                    self.current_output_extent_row = None;
                     self.current_command_text = None;
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
@@ -2152,25 +2317,29 @@ impl TerminalState {
                     self.idle_background_output = None;
                     self.prompt_submission_pending = false;
                     self.prompt_cancel_pending = false;
-                    let captured_command = metadata_command
-                        .or_else(|| self.current_prompt_command_text())
-                        .unwrap_or_default();
+                    let capture = metadata_command
+                        .filter(|capture| capture.truncated || !capture.text.trim().is_empty())
+                        .or_else(|| self.current_prompt_command_capture())
+                        .unwrap_or_else(CommandCapture::unavailable)
+                        .ensure_command_identity();
+                    let captured_command = capture.text;
+                    self.current_command_truncated |= capture.truncated || metadata_truncated;
                     self.current_command_text = Some(captured_command.clone());
+                    self.current_output_start_col = Some(self.cursor_col);
+                    self.current_output_extent_row = None;
+                    self.current_command_start_id.clone_from(&mark_id);
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
                     }
                     if metadata_cwd.is_some() {
                         self.current_command_cwd = metadata_cwd;
                     }
-                    if metadata_truncated {
-                        self.current_command_truncated = true;
-                    }
-
                     let matching_generation = self
                         .armed_agent_execution
                         .as_ref()
                         .filter(|armed| {
                             !self.agent_prompt_input_tainted
+                                && !self.current_command_truncated
                                 && armed.prompt_generation == self.agent_prompt_generation
                                 && armed.command == captured_command
                         })
@@ -2211,8 +2380,17 @@ impl TerminalState {
                             None => part.trim().parse::<i32>().ok(),
                         });
                 let d_mark_id = mark_id.clone();
-                let started_id = self.current_command_id.take();
-                let finished_id = mark_id.or(started_id);
+                // Correlate ordinary command lifecycles too, not only Agent
+                // executions. A stale/spoofed D must not close the live block
+                // or consume ids needed by the later matching completion.
+                if self
+                    .current_command_start_id
+                    .as_ref()
+                    .zip(d_mark_id.as_ref())
+                    .is_some_and(|(started, finished)| started != finished)
+                {
+                    return;
+                }
                 // Once an approved command started with a real jsh execution
                 // id, only the D carrying that same id may consume it. A fake
                 // or stale D is ignored and cannot steal the approval.
@@ -2224,6 +2402,8 @@ impl TerminalState {
                 }) {
                     return;
                 }
+                let started_id = self.current_command_id.take();
+                let finished_id = mark_id.or(started_id);
                 let agent_generation = self
                     .active_agent_execution
                     .take()
@@ -2243,20 +2423,26 @@ impl TerminalState {
                     self.current_command_cwd.take()
                 }
                 .or_else(|| self.control_free_osc7_cwd());
+                let output_start_col = self.current_output_start_col.unwrap_or(0);
+                let output_end = self.live_output_end_row(absolute_row);
                 let zone = CommandZone {
                     id: 0, // assigned by push_command_zone
                     prompt_start,
                     command_start: Some(cmd_start),
                     output_start: Some(out_start),
-                    output_start_col: 0,
-                    output_end: Some(absolute_row),
+                    output_start_col,
+                    output_end: Some(output_end),
                     exit_code,
                     command: self.zone_command_text(),
                     duration_ms,
                     finished_at_ms: Self::wall_clock_ms(),
                     command_truncated,
                     cwd,
-                    captured_output: self.capture_zone_output(out_start, absolute_row),
+                    captured_output: self.capture_zone_output(
+                        out_start,
+                        output_end,
+                        output_start_col,
+                    ),
                     captured_output_evicted: false,
                     completion_observed: true,
                     rows_evicted: false,
@@ -2265,7 +2451,7 @@ impl TerminalState {
                 self.record_completed_command(
                     cmd_start,
                     out_start,
-                    Some((out_start, absolute_row)),
+                    Some((out_start, output_end, output_start_col)),
                     CompletedCommandMetadata {
                         exit_code,
                         duration_ms,
@@ -2276,7 +2462,10 @@ impl TerminalState {
                 self.current_zone_state = ZoneState::Idle;
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
+                self.current_output_start_col = None;
+                self.current_output_extent_row = None;
                 self.current_command_text = None;
+                self.current_command_start_id = None;
                 self.current_command_cwd = None;
                 self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
@@ -2308,8 +2497,15 @@ impl TerminalState {
     /// Append a finished zone, assigning its stable id and enforcing both the
     /// 256-entry cap and the captured-snapshot byte budget.
     fn push_command_zone(&mut self, mut zone: CommandZone) {
+        let Some(next_zone_id) = self.next_zone_id.checked_add(1) else {
+            // Stable ids are UI capabilities. Once the u64 space is exhausted,
+            // seal block history instead of reusing an id that a stale menu,
+            // selection, or bookmark could still hold.
+            log::error!("OSC 133 block id space exhausted; dropping finalized block");
+            return;
+        };
         zone.id = self.next_zone_id;
-        self.next_zone_id += 1;
+        self.next_zone_id = next_zone_id;
         self.captured_output_bytes = self.captured_output_bytes.saturating_add(
             zone.captured_output
                 .as_ref()
@@ -2351,11 +2547,29 @@ impl TerminalState {
         }
     }
 
+    /// End-exclusive output row at a `D`/next-`A` boundary. If output wrote on
+    /// the boundary row, include it even though the cursor never advanced to a
+    /// following row (the common `printf foo` without a trailing newline).
+    fn live_output_end_row(&self, boundary_row: usize) -> usize {
+        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        self.current_output_extent_row
+            .map(|row| row.saturating_add(1))
+            .unwrap_or(boundary_row)
+            .max(boundary_row)
+            .min(total_rows)
+    }
+
     /// Snapshot one zone's output rows for [`CommandZone::captured_output`]:
     /// the exact live extraction (same trimming, same 1 MiB cap, same
     /// whole-rows-only truncation flag), blank output collapsing to `None`.
-    fn capture_zone_output(&self, start: usize, end: usize) -> Option<(String, bool)> {
-        let (out, capped) = self.rows_text(start, end, Self::ZONE_OUTPUT_CAP_BYTES);
+    fn capture_zone_output(
+        &self,
+        start: usize,
+        end: usize,
+        start_col: usize,
+    ) -> Option<(String, bool)> {
+        let (out, capped) =
+            self.rows_text_from_column(start, end, start_col, Self::ZONE_OUTPUT_CAP_BYTES);
         if out.trim().is_empty() {
             None
         } else {
@@ -2467,20 +2681,22 @@ impl TerminalState {
             .current_command_cwd
             .take()
             .or_else(|| self.control_free_osc7_cwd());
+        let output_start_col = self.current_output_start_col.unwrap_or(0);
+        let output_end = self.live_output_end_row(boundary_row);
         let zone = CommandZone {
             id: 0, // assigned by push_command_zone
             prompt_start,
             command_start: Some(cmd_start),
             output_start: Some(out_start),
-            output_start_col: 0,
-            output_end: Some(boundary_row),
+            output_start_col,
+            output_end: Some(output_end),
             exit_code: None,
             command: self.zone_command_text(),
             duration_ms: None,
             finished_at_ms: None,
             command_truncated: self.current_command_truncated,
             cwd,
-            captured_output: self.capture_zone_output(out_start, boundary_row),
+            captured_output: self.capture_zone_output(out_start, output_end, output_start_col),
             captured_output_evicted: false,
             completion_observed: false,
             rows_evicted: false,
@@ -2552,6 +2768,10 @@ impl TerminalState {
             | ZoneState::OutputStarted(prompt_start, _, _) => prompt_start < count,
             ZoneState::Idle => false,
         };
+        let live_output_start_trimmed = matches!(
+            self.current_zone_state,
+            ZoneState::OutputStarted(_, _, output_start) if output_start < count
+        );
         self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
             ZoneState::Idle => ZoneState::Idle,
             ZoneState::PromptStarted(p) => ZoneState::PromptStarted(p.saturating_sub(count)),
@@ -2567,6 +2787,12 @@ impl TerminalState {
         self.current_command_extent_row = self
             .current_command_extent_row
             .map(|row| row.saturating_sub(count));
+        self.current_output_extent_row = self
+            .current_output_extent_row
+            .map(|row| row.saturating_sub(count));
+        if live_output_start_trimmed {
+            self.current_output_start_col = Some(0);
+        }
         if let Some(pending) = self.idle_background_output.as_mut() {
             pending.rows_evicted |= live_prompt_trimmed || pending.start_row < count;
             if pending.start_row < count {
@@ -2741,6 +2967,150 @@ impl TerminalState {
         }
     }
 
+    /// Absolute buffer row where the requested 1-based logical output line
+    /// begins. Soft-wrapped physical rows stay in the same logical line; only
+    /// a physical row without the wrapped flag advances the line number.
+    ///
+    /// This is intentionally a live-row lookup, not a snapshot lookup: a zone
+    /// whose rows were evicted still has searchable/copyable captured text but
+    /// no buffer position that can safely be revealed.
+    pub fn zone_output_line_row(&self, id: u64, line_no: usize) -> Option<usize> {
+        if line_no == 0 {
+            return None;
+        }
+        let zone = self.zone_by_id(id)?;
+        if zone.rows_evicted {
+            return None;
+        }
+        let start = zone.output_start?;
+        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let end = zone.output_end?.min(total_rows);
+        if start >= end {
+            return None;
+        }
+        if line_no == 1 {
+            return Some(start);
+        }
+
+        let mut logical_line = 1usize;
+        for row in start..end.saturating_sub(1) {
+            let wrapped = if row < self.scrollback.len() {
+                self.scrollback[row].is_wrapped
+            } else {
+                self.grid
+                    .row_wrapped
+                    .get(row - self.scrollback.len())
+                    .copied()
+                    .unwrap_or(false)
+            };
+            if !wrapped {
+                logical_line += 1;
+                if logical_line == line_no {
+                    return Some(row + 1);
+                }
+            }
+        }
+        None
+    }
+
+    /// Absolute physical buffer row containing the start of a cached search
+    /// match within one logical output line. `line_no` is 1-based;
+    /// `match_start..match_end` is a 0-based, end-exclusive Unicode-scalar
+    /// range in the original logical line returned by output extraction.
+    ///
+    /// The walk deliberately mirrors [`Self::rows_text_from_column`]: the
+    /// first output row begins at its recorded column, wide-continuation cells
+    /// do not become characters, soft-wrapped rows concatenate, and only hard
+    /// row endings trim trailing spaces. The complete range is validated even
+    /// though only its start row is returned. Thus a captured snapshot which
+    /// outlived trimming or no longer agrees with live rows fails closed with
+    /// `None` instead of scrolling to an unrelated physical row.
+    pub fn zone_output_match_row(
+        &self,
+        id: u64,
+        line_no: usize,
+        match_start: usize,
+        match_end: usize,
+    ) -> Option<usize> {
+        if line_no == 0 || match_start >= match_end {
+            return None;
+        }
+        let (output_start, output_start_col, output_end) = {
+            let zone = self.zone_by_id(id)?;
+            if zone.rows_evicted {
+                return None;
+            }
+            (zone.output_start?, zone.output_start_col, zone.output_end?)
+        };
+        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let end = output_end.min(total_rows);
+        let line_start = self.zone_output_line_row(id, line_no)?;
+        if line_start >= end {
+            return None;
+        }
+
+        let segment_len = |cells: &[TerminalCell], first_col: usize, wrapped: bool| {
+            let mut chars = 0usize;
+            let mut through_last_non_space = 0usize;
+            for cell in cells.iter().skip(first_col.min(cells.len())) {
+                if cell.flags.wide_continuation() {
+                    continue;
+                }
+                chars += 1;
+                if cell.character != ' ' {
+                    through_last_non_space = chars;
+                }
+            }
+            if wrapped {
+                chars
+            } else {
+                through_last_non_space
+            }
+        };
+
+        let mut remaining_start = match_start;
+        let mut remaining_end = match_end;
+        let mut target_row = None;
+        for row in line_start..end {
+            let first_col = if row == output_start {
+                output_start_col
+            } else {
+                0
+            };
+            let (wrapped, chars) = if row < self.scrollback.len() {
+                let line = &self.scrollback[row];
+                let cells = line.decompress();
+                (
+                    line.is_wrapped,
+                    segment_len(&cells, first_col, line.is_wrapped),
+                )
+            } else {
+                let grid_row = row - self.scrollback.len();
+                let wrapped = *self.grid.row_wrapped.get(grid_row)?;
+                let cells = self.grid.cells.get(
+                    grid_row.saturating_mul(self.grid.row_len())
+                        ..grid_row
+                            .saturating_add(1)
+                            .saturating_mul(self.grid.row_len()),
+                )?;
+                (wrapped, segment_len(cells, first_col, wrapped))
+            };
+
+            if target_row.is_none() && remaining_start < chars {
+                target_row = Some(row);
+            }
+            if remaining_end <= chars {
+                return target_row;
+            }
+            if !wrapped {
+                return None;
+            }
+            remaining_start = remaining_start.saturating_sub(chars);
+            remaining_end = remaining_end.saturating_sub(chars);
+        }
+        None
+    }
+
     /// The OLDEST completed zone that failed (exit reported and nonzero) —
     /// "jump to first failed" starts at the earliest failure still in scope.
     pub fn first_failed_zone(&self) -> Option<&CommandZone> {
@@ -2779,29 +3149,35 @@ impl TerminalState {
         &mut self,
         cmd_start: usize,
         cmd_end: usize,
-        output: Option<(usize, usize)>,
+        output: Option<(usize, usize, usize)>,
         metadata: CompletedCommandMetadata,
     ) {
         const MAX_COMMAND_BYTES: usize = 16 * 1024;
         const MAX_OUTPUT_BYTES: usize = 256 * 1024;
         const MAX_PENDING_COMPLETED: usize = 32;
+        let command_capture_truncated = self.current_command_truncated;
         let command = self.current_command_text.take().unwrap_or_else(|| {
             self.rows_text(cmd_start, cmd_end, MAX_COMMAND_BYTES)
                 .0
                 .trim()
                 .to_string()
         });
-        if command.is_empty() {
+        // CompletedCommand has no command-truncation bit and feeds Agent,
+        // persistent history, and notifications as executable-looking text.
+        // Keep the bounded prefix on the CommandZone, but never publish it to
+        // those consumers as if it were the complete command.
+        if command.is_empty() || command_capture_truncated {
             return;
         }
         let output_available = output.is_some();
-        let output = output
-            .map(|(start, end)| self.rows_text(start, end, MAX_OUTPUT_BYTES).0)
+        let (output, truncated) = output
+            .map(|(start, end, start_col)| {
+                self.rows_text_from_column(start, end, start_col, MAX_OUTPUT_BYTES)
+            })
             .unwrap_or_default();
         if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED {
             self.pending_completed_commands.pop_front();
         }
-        let truncated = output.len() >= MAX_OUTPUT_BYTES;
         let total_bytes = output.len();
         self.pending_completed_commands.push_back(CompletedCommand {
             command,
@@ -3464,6 +3840,7 @@ impl TerminalState {
         if track_idle_output {
             self.note_idle_background_cells(self.cursor_col, !ch.is_whitespace());
         }
+        let write_col = self.cursor_col;
 
         // IRM insert mode (mode 4): make room by shifting the row right.
         if self.modes.contains(&4) {
@@ -3514,7 +3891,7 @@ impl TerminalState {
         }
         // Mark the row as dirty after writing character
         self.mark_row_dirty(self.cursor_row);
-        self.mark_command_echo_extent();
+        self.mark_command_echo_extent(write_col);
     }
 
     fn put_ascii_run(&mut self, bytes: &[u8]) {
@@ -3579,7 +3956,7 @@ impl TerminalState {
             pos += chunk_len;
 
             self.mark_row_dirty(self.cursor_row);
-            self.mark_command_echo_extent();
+            self.mark_command_echo_extent(col);
 
             if self.cursor_col >= cols {
                 self.cursor_col = cols - 1;
@@ -5222,6 +5599,8 @@ impl TerminalState {
         self.current_zone_state = ZoneState::default();
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
+        self.current_output_start_col = None;
+        self.current_output_extent_row = None;
         self.agent_prompt_input_tainted = false;
         self.prompt_submission_pending = false;
         self.prompt_cancel_pending = false;
@@ -5232,6 +5611,7 @@ impl TerminalState {
         self.active_agent_execution = None;
         self.current_command_text = None;
         self.current_command_id = None;
+        self.current_command_start_id = None;
         self.current_command_started_at = None;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
@@ -6671,6 +7051,7 @@ impl TerminalState {
             }
         };
         self.current_command_extent_row = self.current_command_extent_row.map(translate_grid_row);
+        self.current_output_extent_row = self.current_output_extent_row.map(translate_grid_row);
         if let Some(pending) = self.idle_background_output.as_mut() {
             pending.start_row = translate_grid_row(pending.start_row);
             pending.last_row = translate_grid_row(pending.last_row);
@@ -6753,6 +7134,23 @@ impl TerminalState {
         self.scroll_offset = 0;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        // Width resize mutates grid rows, but retained scrollback keeps its old
+        // width until the deferred normalization pass. Clamp a C-row column
+        // only while that row is still in the resized (possibly hidden
+        // primary) grid.
+        if matches!(
+            self.current_zone_state,
+            ZoneState::OutputStarted(_, _, output_start)
+                if output_start >= self.scrollback.len()
+        ) {
+            self.current_output_start_col = self
+                .current_output_start_col
+                .map(|col| col.min(cols.saturating_sub(1)));
+        }
+        let last_buffer_row = self.scrollback.len().saturating_add(rows).saturating_sub(1);
+        self.current_output_extent_row = self
+            .current_output_extent_row
+            .map(|row| row.min(last_buffer_row));
         self.pending_wrap = false;
         self.saved_cursor_row = self.saved_cursor_row.min(rows.saturating_sub(1));
         self.saved_cursor_col = self.saved_cursor_col.min(cols.saturating_sub(1));
@@ -6829,6 +7227,235 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn osc_133_requires_an_exact_marker_field() {
+        let mut terminal = super::TerminalState::new(40, 8);
+
+        terminal.process_input(b"\x1b]133;Attack\x07");
+        assert_eq!(terminal.live_prompt_row(), None);
+
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        terminal.process_input(b"\x1b]133;Bogus\x07");
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            super::AgentPromptStatus::ShellIntegrationUnavailable
+        );
+
+        terminal.process_input(b"\x1b]133;B\x07echo ok\r\n");
+        terminal.process_input(b"\x1b]133;Command\x07");
+        assert!(!terminal.is_command_running());
+
+        terminal.process_input(b"\x1b]133;C;id=run-1\x07ok");
+        terminal.process_input(b"\x1b]133;Danger;0;id=run-1\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.command_zones.is_empty());
+    }
+
+    #[test]
+    fn ordinary_osc_133_lifecycle_rejects_a_mismatched_d_id_without_consuming_state() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo ok\r\n\x1b]133;C;id=run-1\x07ok\r\n",
+        );
+
+        terminal.process_input(b"\x1b]133;D;0;id=spoof\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+        assert!(!terminal.is_command_running());
+        assert_eq!(terminal.command_zones.len(), 1);
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn osc_133_visible_command_capture_is_bounded_without_becoming_background() {
+        fn run(command: &str) -> super::TerminalState {
+            let mut terminal = super::TerminalState::new(40, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            terminal.process_input(command.as_bytes());
+            terminal.process_input(b"\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+            terminal
+        }
+
+        // Reaching the cap exactly is still a complete capture.
+        let exact = "x".repeat(super::MAX_CAPTURED_COMMAND_BYTES);
+        let mut terminal = run(&exact);
+        let zone = terminal.command_zones.back().expect("exact command zone");
+        assert_eq!(zone.command.as_deref(), Some(exact.as_str()));
+        assert!(!zone.command_truncated);
+        assert_eq!(terminal.take_completed_commands().len(), 1);
+
+        // One byte beyond it retains an exact safe prefix and explicitly
+        // remains a command lifecycle. The incomplete prefix is not emitted
+        // to executable-looking CompletedCommand consumers.
+        let oversized = format!("echo {}", "x".repeat(super::MAX_CAPTURED_COMMAND_BYTES));
+        let mut terminal = run(&oversized);
+        let zone = terminal
+            .command_zones
+            .back()
+            .expect("oversized command zone");
+        let command = zone.command.as_deref().expect("bounded command identity");
+        assert_eq!(command.len(), super::MAX_CAPTURED_COMMAND_BYTES);
+        assert_eq!(command, &oversized[..super::MAX_CAPTURED_COMMAND_BYTES]);
+        assert!(zone.command_truncated);
+        assert!(!matches!(
+            crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
+            crate::block_mode::BlockOutcome::Background
+        ));
+        assert!(terminal.take_completed_commands().is_empty());
+    }
+
+    #[test]
+    fn osc_133_long_command_metadata_keeps_a_utf8_safe_prefix() {
+        let prefix = "x".repeat(super::MAX_CAPTURED_COMMAND_BYTES - 1);
+        // The first byte of the encoded emoji reaches the byte cap. Capture
+        // must back up to the preceding UTF-8 boundary, not reject the whole
+        // command and silently classify the C lifecycle as Background.
+        let c_mark = format!("\x1b]133;C;cmdline_url={prefix}%F0%9F%98%80\x07");
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal.process_input(c_mark.as_bytes());
+        terminal.process_input(b"out\r\n\x1b]133;D;0\x07");
+
+        let zone = terminal
+            .command_zones
+            .back()
+            .expect("metadata command zone");
+        assert_eq!(zone.command.as_deref(), Some(prefix.as_str()));
+        assert!(zone.command_truncated);
+        assert!(!matches!(
+            crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
+            crate::block_mode::BlockOutcome::Background
+        ));
+        assert!(terminal.take_completed_commands().is_empty());
+    }
+
+    #[test]
+    fn exhausted_block_ids_seal_history_instead_of_reusing_an_identity() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.next_zone_id = u64::MAX;
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07",
+        );
+
+        assert!(terminal.command_zones.is_empty());
+        assert_eq!(terminal.next_zone_id, u64::MAX);
+        // Non-UI consumers still receive the bounded completion observation.
+        assert_eq!(terminal.take_completed_commands().len(), 1);
+    }
+
+    #[test]
+    fn osc_133_captures_output_without_a_trailing_newline_at_d_or_next_a() {
+        let mut completed = super::TerminalState::new(40, 8);
+        completed.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07printf foo\r\n\x1b]133;C\x07foo\x1b]133;D;0\x07",
+        );
+        let zone = completed.command_zones.back().expect("completed block");
+        assert_eq!(completed.zone_output_text(zone.id).as_deref(), Some("foo"));
+        assert_eq!(completed.take_completed_commands()[0].output, "foo");
+
+        let mut stale = super::TerminalState::new(40, 8);
+        stale.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07printf foo\r\n\x1b]133;C\x07foo\x1b]133;A\x07",
+        );
+        let zone = stale.command_zones.back().expect("stale block");
+        assert!(!zone.completion_observed);
+        assert_eq!(stale.zone_output_text(zone.id).as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn osc_133_first_row_output_tracks_leftward_cr_bs_and_cup_writes() {
+        let cases: [(&[u8], &str); 3] = [
+            (b"\rRESULT", "RESULT"),
+            (b"\x08Z", "Z"),
+            (b"\x1b[1;1HRESULT", "RESULT"),
+        ];
+        for (motion_and_output, expected) in cases {
+            let mut terminal = super::TerminalState::new(40, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07");
+            terminal.process_input(motion_and_output);
+            terminal.process_input(b"\x1b]133;D;0\x07");
+
+            let id = terminal.command_zones.back().expect("completed block").id;
+            assert_eq!(terminal.zone_output_text(id).as_deref(), Some(expected));
+            assert_eq!(terminal.take_completed_commands()[0].output, expected);
+        }
+
+        let mut stale = super::TerminalState::new(40, 8);
+        stale.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07\rRESULT\x1b]133;A\x07",
+        );
+        let id = stale.command_zones.back().expect("stale block").id;
+        assert_eq!(stale.zone_output_text(id).as_deref(), Some("RESULT"));
+    }
+
+    #[test]
+    fn osc_133_alt_screen_paint_never_extends_primary_output() {
+        let mut terminal = super::TerminalState::new(20, 8);
+        // A sentinel below the primary cursor makes an alt-derived end row
+        // observable as leaked command output, not merely excess blank rows.
+        terminal.process_input(b"\x1b[8;1HSECRET\x1b[1;1H");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07vim\r\n\x1b]133;C\x07");
+        let output_start = match terminal.current_zone_state {
+            super::ZoneState::OutputStarted(_, _, output_start) => output_start,
+            _ => panic!("running command"),
+        };
+
+        terminal.process_input(b"\x1b[?1049h\x1b[8;1HALT PAINT\x1b[?1049l");
+        terminal.process_input(b"\x1b]133;D;0\x07");
+
+        let zone = terminal.command_zones.back().expect("completed block");
+        assert_eq!(zone.output_end, Some(output_start));
+        assert_eq!(terminal.zone_output_text(zone.id), None);
+        assert_eq!(terminal.take_completed_commands()[0].output, "");
+    }
+
+    #[test]
+    fn resize_keeps_live_output_coordinates_inside_the_resized_buffer() {
+        let mut narrow = super::TerminalState::new(12, 4);
+        narrow.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x0712345678\x1b]133;C\x07");
+        narrow.on_resize(5, 4);
+        assert_eq!(narrow.current_output_start_col, Some(4));
+        narrow.process_input(b"Z\x1b]133;D;0\x07");
+        let id = narrow.command_zones.back().expect("completed block").id;
+        assert_eq!(narrow.zone_output_text(id).as_deref(), Some("Z"));
+
+        // Once the C row is in scrollback it still has the old width; only
+        // grid-local columns follow an immediate width resize.
+        let mut history = super::TerminalState::new(20, 2);
+        history.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x0712345678\x1b]133;C\x07Z\r\none\r\n");
+        let output_start = match history.current_zone_state {
+            super::ZoneState::OutputStarted(_, _, output_start) => output_start,
+            _ => panic!("running command"),
+        };
+        assert!(output_start < history.scrollback.len());
+        history.on_resize(5, 2);
+        assert_eq!(history.current_output_start_col, Some(10));
+        history.process_input(b"\x1b]133;D;0\x07");
+        let id = history.command_zones.back().expect("completed block").id;
+        assert_eq!(history.zone_output_text(id).as_deref(), Some("Z\none"));
+
+        let mut truncated = super::TerminalState::new(10, 4);
+        truncated.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07\x1b[4;1HOLDTAIL");
+        truncated.process_input(b"\x1b[1;1H");
+        truncated.on_resize(10, 2);
+        assert_eq!(truncated.current_output_extent_row, Some(1));
+        truncated.process_input(b"\x1b]133;D;0\x07");
+        let id = truncated.command_zones.back().expect("completed block").id;
+        assert_eq!(truncated.command_zones.back().unwrap().output_end, Some(2));
+        assert_eq!(truncated.zone_output_text(id), None);
+
+        // Growing the buffer later must not bring newly painted rows inside
+        // the finalized output range that was truncated by the shrink.
+        truncated.on_resize(10, 4);
+        truncated.process_input(b"\x1b[4;1HNEW");
+        assert_eq!(truncated.zone_output_text(id), None);
+    }
+
     #[test]
     fn osc_133_id_params_correlate_completed_commands() {
         let mut terminal = super::TerminalState::new(40, 8);
@@ -7105,6 +7732,51 @@ mod tests {
         let (text, capped) = terminal.rows_text(0, 3, 14);
         assert_eq!(text, "aaaa\nbbbb\ncccc");
         assert!(!capped);
+    }
+
+    #[test]
+    fn completed_command_uses_the_extractor_truncation_flag() {
+        const CAP: usize = 256 * 1024;
+        let metadata = || super::CompletedCommandMetadata {
+            exit_code: Some(0),
+            duration_ms: None,
+            execution_id: None,
+            agent_generation: None,
+        };
+
+        // The next whole row does not fit, so extraction is capped while the
+        // retained prefix itself remains strictly smaller than the byte cap.
+        let mut row_dropped = super::TerminalState::new(1024, 256);
+        for row in 0..256 {
+            for cell in &mut row_dropped.grid[row] {
+                cell.character = 'x';
+            }
+        }
+        let (prefix, capped) = row_dropped.rows_text(0, 256, CAP);
+        assert!(capped);
+        assert!(prefix.len() < CAP);
+        row_dropped.current_command_text = Some("cmd".to_string());
+        row_dropped.record_completed_command(0, 0, Some((0, 256, 0)), metadata());
+        assert!(row_dropped.take_completed_commands()[0].truncated);
+
+        // Conversely, a complete extraction may occupy exactly the cap. Its
+        // length alone must not turn it into a false truncation report.
+        let mut exact = super::TerminalState::new(1024, 64);
+        for row in 0..63 {
+            for cell in &mut exact.grid[row] {
+                cell.character = '\u{1f600}';
+            }
+        }
+        for col in 0..1008 {
+            exact.grid[63][col].character = '\u{1f600}';
+        }
+        exact.grid[63][1008].character = 'x';
+        let (text, capped) = exact.rows_text(0, 64, CAP);
+        assert_eq!(text.len(), CAP);
+        assert!(!capped);
+        exact.current_command_text = Some("cmd".to_string());
+        exact.record_completed_command(0, 0, Some((0, 64, 0)), metadata());
+        assert!(!exact.take_completed_commands()[0].truncated);
     }
 
     #[test]
@@ -9105,6 +9777,68 @@ mod tests {
         terminal.process_input(b"\x1b]133;A\x07");
         assert_eq!(terminal.command_zones.len(), 1);
         assert_eq!(terminal.captured_output_bytes, "out\nout\nout".len());
+    }
+
+    #[test]
+    fn zone_output_line_rows_count_hard_lines_but_not_soft_wraps() {
+        let mut terminal = TerminalState::new(5, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07abcdef\r\ngh\r\n\x1b]133;D;0\x07",
+        );
+        let zone = terminal.command_zones.back().expect("completed block");
+        let id = zone.id;
+        let output_start = zone.output_start.expect("retained output rows");
+
+        assert!(if output_start < terminal.scrollback.len() {
+            terminal.scrollback[output_start].is_wrapped
+        } else {
+            terminal.grid.row_wrapped[output_start - terminal.scrollback.len()]
+        });
+        assert_eq!(terminal.zone_output_line_row(id, 0), None);
+        assert_eq!(terminal.zone_output_line_row(id, 1), Some(output_start));
+        assert_eq!(terminal.zone_output_line_row(id, 2), Some(output_start + 2));
+        assert_eq!(terminal.zone_output_line_row(id, 3), None);
+        assert_eq!(terminal.zone_output_line_row(u64::MAX, 1), None);
+
+        // `abcdef` occupies two physical rows at width five. A match wholly
+        // in the continuation lands there; a cross-wrap match lands on the
+        // row containing its first character and is validated through row 2.
+        assert_eq!(
+            terminal.zone_output_match_row(id, 1, 5, 6),
+            Some(output_start + 1)
+        );
+        assert_eq!(
+            terminal.zone_output_match_row(id, 1, 4, 6),
+            Some(output_start)
+        );
+        assert_eq!(
+            terminal.zone_output_match_row(id, 2, 0, 2),
+            Some(output_start + 2)
+        );
+        assert_eq!(terminal.zone_output_match_row(id, 1, 5, 7), None);
+        assert_eq!(terminal.zone_output_match_row(id, 1, 6, 6), None);
+        assert_eq!(terminal.zone_output_match_row(id, 0, 0, 1), None);
+        assert_eq!(terminal.zone_output_match_row(u64::MAX, 1, 0, 1), None);
+
+        terminal.command_zones.back_mut().unwrap().rows_evicted = true;
+        assert_eq!(terminal.zone_output_line_row(id, 1), None);
+        assert_eq!(terminal.zone_output_match_row(id, 1, 0, 1), None);
+    }
+
+    #[test]
+    fn zone_output_match_row_reaches_a_match_beyond_200_characters() {
+        let mut terminal = TerminalState::new(20, 40);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07");
+        let output = format!("{}needle\r\n", "x".repeat(250));
+        terminal.process_input(output.as_bytes());
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        let zone = terminal.command_zones.back().expect("completed block");
+        let output_start = zone.output_start.expect("retained output rows");
+
+        assert_eq!(
+            terminal.zone_output_match_row(zone.id, 1, 250, 256),
+            Some(output_start + 12)
+        );
     }
 
     #[test]

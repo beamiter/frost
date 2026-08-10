@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 const MAX_SESSION_EXPORT_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 /// JSON escaping can expand source text; keep the final file bounded too.
 pub const MAX_SESSION_EXPORT_BYTES: usize = 64 * 1024 * 1024;
+pub const SESSION_EXPORT_SCHEMA: &str = "frost.block-session";
+pub const SESSION_EXPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionExportFormat {
@@ -61,6 +63,66 @@ pub struct SessionExportBlock {
     pub completion_observed: bool,
 }
 
+/// One immutable pane snapshot handed to the export worker. Keeping identity
+/// and capture time beside the blocks makes JSON exports self-describing even
+/// after their originating Frost process has exited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionExportSnapshot {
+    pub pane_session_id: usize,
+    pub captured_at_ms: u64,
+    pub captured_tz_offset_secs: i32,
+    pub blocks: Vec<SessionExportBlock>,
+}
+
+#[derive(Serialize)]
+struct SessionExportRetention {
+    retained_blocks: usize,
+    command_truncated: usize,
+    output_truncated: usize,
+    output_unavailable: usize,
+    completion_unobserved: usize,
+}
+
+#[derive(Serialize)]
+struct JsonSessionExport<'a> {
+    schema: &'static str,
+    version: u32,
+    pane_session_id: usize,
+    captured_at_ms: u64,
+    captured_tz_offset_secs: i32,
+    block_order: &'static str,
+    retention: SessionExportRetention,
+    blocks: &'a [SessionExportBlock],
+}
+
+impl SessionExportSnapshot {
+    fn retention(&self) -> SessionExportRetention {
+        SessionExportRetention {
+            retained_blocks: self.blocks.len(),
+            command_truncated: self
+                .blocks
+                .iter()
+                .filter(|block| block.command_truncated)
+                .count(),
+            output_truncated: self
+                .blocks
+                .iter()
+                .filter(|block| block.output_truncated)
+                .count(),
+            output_unavailable: self
+                .blocks
+                .iter()
+                .filter(|block| block.output_unavailable)
+                .count(),
+            completion_unobserved: self
+                .blocks
+                .iter()
+                .filter(|block| !block.completion_observed)
+                .count(),
+        }
+    }
+}
+
 impl SessionExportBlock {
     fn markdown(&self) -> String {
         block_mode::markdown_export_with_state(
@@ -94,7 +156,10 @@ fn too_large() -> io::Error {
 /// Clone the active terminal's retained finalized blocks oldest-first. Each zone's
 /// captured snapshot wins over live row extraction through the terminal's
 /// existing accessor, so records already outside scrollback still export.
-pub fn snapshot_session(terminal: &TerminalState) -> io::Result<Vec<SessionExportBlock>> {
+pub fn snapshot_session(
+    terminal: &TerminalState,
+    pane_session_id: usize,
+) -> io::Result<SessionExportSnapshot> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -142,7 +207,12 @@ pub fn snapshot_session(terminal: &TerminalState) -> io::Result<Vec<SessionExpor
             completion_observed: zone.completion_observed,
         });
     }
-    Ok(blocks)
+    Ok(SessionExportSnapshot {
+        pane_session_id,
+        captured_at_ms: now_ms,
+        captured_tz_offset_secs: block_mode::local_offset_secs((now_ms / 1000) as i64),
+        blocks,
+    })
 }
 
 struct BoundedBuffer {
@@ -180,21 +250,40 @@ impl Write for BoundedBuffer {
 }
 
 fn serialize_session(
-    blocks: &[SessionExportBlock],
+    snapshot: &SessionExportSnapshot,
     format: SessionExportFormat,
 ) -> io::Result<Vec<u8>> {
     let mut writer = BoundedBuffer::new();
     match format {
         SessionExportFormat::Json => {
-            serde_json::to_writer_pretty(&mut writer, blocks)
+            let document = JsonSessionExport {
+                schema: SESSION_EXPORT_SCHEMA,
+                version: SESSION_EXPORT_SCHEMA_VERSION,
+                pane_session_id: snapshot.pane_session_id,
+                captured_at_ms: snapshot.captured_at_ms,
+                captured_tz_offset_secs: snapshot.captured_tz_offset_secs,
+                block_order: "oldest_first",
+                retention: snapshot.retention(),
+                blocks: &snapshot.blocks,
+            };
+            serde_json::to_writer_pretty(&mut writer, &document)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             writer.write_all(b"\n")?;
         }
         SessionExportFormat::Markdown => {
             writeln!(writer, "# Terminal Session Export\n")?;
-            writeln!(writer, "Total blocks: {}\n", blocks.len())?;
+            writeln!(writer, "Pane session: {}", snapshot.pane_session_id)?;
+            writeln!(
+                writer,
+                "Captured: {}",
+                block_mode::timestamp_at_offset(
+                    snapshot.captured_at_ms,
+                    snapshot.captured_tz_offset_secs
+                )
+            )?;
+            writeln!(writer, "Total retained blocks: {}\n", snapshot.blocks.len())?;
             writeln!(writer, "---\n")?;
-            for (index, block) in blocks.iter().enumerate() {
+            for (index, block) in snapshot.blocks.iter().enumerate() {
                 writeln!(writer, "## Block #{}\n", index + 1)?;
                 writer.write_all(block.markdown().as_bytes())?;
                 writeln!(writer, "\n---\n")?;
@@ -246,10 +335,10 @@ fn export_stamp() -> String {
 /// Serialize and durably write one owned session snapshot. Intended for a
 /// blocking worker; no live terminal or renderer state is touched here.
 pub fn export_session_to_file(
-    blocks: &[SessionExportBlock],
+    snapshot: &SessionExportSnapshot,
     format: SessionExportFormat,
 ) -> io::Result<PathBuf> {
-    let contents = serialize_session(blocks, format)?;
+    let contents = serialize_session(snapshot, format)?;
     let directory = dirs::data_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no user data directory"))?
         .join("frost")
@@ -302,24 +391,113 @@ mod tests {
         }
     }
 
+    fn snapshot(blocks: Vec<SessionExportBlock>) -> SessionExportSnapshot {
+        SessionExportSnapshot {
+            pane_session_id: 42,
+            captured_at_ms: 0,
+            captured_tz_offset_secs: 0,
+            blocks,
+        }
+    }
+
+    #[test]
+    fn snapshot_session_bridges_real_osc_133_block_lifecycles() {
+        let mut terminal = TerminalState::new(80, 12);
+
+        // An ordinary observed completion keeps the shell-provided command,
+        // status, duration, and cwd alongside the captured output snapshot.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07printf done\r\n");
+        terminal.process_input(
+            b"\x1b]133;C;cmdline_url=printf%20done\x07done\r\n\x1b]133;D;exit_code=7;duration_ms=1250;cwd_url=%2Ftmp%2Fjob\x07",
+        );
+
+        // Visible asynchronous output at an untouched prompt becomes a
+        // commandless Background block when the next prompt begins.
+        terminal.process_input(
+            b"\x1b]133;A;cwd_url=%2Ftmp%2Fbackground\x07$ \x1b]133;B\x07background notice",
+        );
+        terminal.process_input(b"\r\n\x1b]133;A\x07$ ");
+
+        // A command that reached C but lost D is retained at the following A.
+        // The shell's truncation evidence must survive that recovery path.
+        terminal.process_input(b"\x1b]133;B\x07long-running-command\r\n");
+        terminal.process_input(
+            b"\x1b]133;C;cmdline_url=long-running-command;cmd_truncated=true;cwd_url=%2Fsrv%2Fwork\x07partial output\r\n",
+        );
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+
+        let snapshot = snapshot_session(&terminal, 17).expect("snapshot real block lifecycles");
+        assert_eq!(snapshot.pane_session_id, 17);
+        assert_eq!(snapshot.blocks.len(), 3);
+
+        let completed = &snapshot.blocks[0];
+        assert_eq!(completed.id, 0);
+        assert_eq!(completed.command.as_deref(), Some("printf done"));
+        assert_eq!(completed.output, "done");
+        assert!(!completed.output_truncated);
+        assert!(!completed.output_unavailable);
+        assert_eq!(completed.exit_code, Some(7));
+        assert_eq!(completed.duration_ms, Some(1_250));
+        assert!(completed.finished_at_ms.is_some());
+        assert_eq!(completed.cwd.as_deref(), Some("/tmp/job"));
+        assert!(!completed.command_truncated);
+        assert!(completed.completion_observed);
+
+        let background = &snapshot.blocks[1];
+        assert_eq!(background.id, 1);
+        assert_eq!(background.command, None);
+        assert_eq!(background.output, "background notice\n");
+        assert!(!background.output_truncated);
+        assert!(!background.output_unavailable);
+        assert_eq!(background.exit_code, None);
+        assert_eq!(background.duration_ms, None);
+        assert!(background.finished_at_ms.is_some());
+        assert_eq!(background.cwd.as_deref(), Some("/tmp/background"));
+        assert!(!background.command_truncated);
+        assert!(!background.completion_observed);
+
+        let recovered = &snapshot.blocks[2];
+        assert_eq!(recovered.id, 2);
+        assert_eq!(recovered.command.as_deref(), Some("long-running-command"));
+        assert_eq!(recovered.output, "partial output");
+        assert!(!recovered.output_truncated);
+        assert!(!recovered.output_unavailable);
+        assert_eq!(recovered.exit_code, None);
+        assert_eq!(recovered.duration_ms, None);
+        assert_eq!(recovered.finished_at_ms, None);
+        assert_eq!(recovered.cwd.as_deref(), Some("/srv/work"));
+        assert!(recovered.command_truncated);
+        assert!(!recovered.completion_observed);
+    }
+
     #[test]
     fn session_documents_keep_order_and_shared_block_metadata() {
-        let blocks = [block(7, "cargo test", "ok"), block(9, "pwd", "/tmp")];
+        let snapshot = snapshot(vec![block(7, "cargo test", "ok"), block(9, "pwd", "/tmp")]);
         let markdown =
-            String::from_utf8(serialize_session(&blocks, SessionExportFormat::Markdown).unwrap())
+            String::from_utf8(serialize_session(&snapshot, SessionExportFormat::Markdown).unwrap())
                 .unwrap();
-        assert!(markdown.starts_with("# Terminal Session Export\n\nTotal blocks: 2\n"));
+        assert!(markdown.starts_with(
+            "# Terminal Session Export\n\nPane session: 42\nCaptured: 1970-01-01 00:00:00 +00:00\nTotal retained blocks: 2\n"
+        ));
         assert!(markdown.find("cargo test").unwrap() < markdown.find("pwd").unwrap());
         assert!(markdown.contains("- Finished: 1970-01-01 00:00:00 +00:00"));
 
-        let json: serde_json::Value =
-            serde_json::from_slice(&serialize_session(&blocks, SessionExportFormat::Json).unwrap())
-                .unwrap();
-        assert_eq!(json[0]["id"], 7);
-        assert_eq!(json[1]["command"], "pwd");
-        assert_eq!(json[0]["output"], "ok");
-        assert_eq!(json[0]["output_unavailable"], false);
-        assert_eq!(json[0]["completion_observed"], true);
+        let json: serde_json::Value = serde_json::from_slice(
+            &serialize_session(&snapshot, SessionExportFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["schema"], SESSION_EXPORT_SCHEMA);
+        assert_eq!(json["version"], SESSION_EXPORT_SCHEMA_VERSION);
+        assert_eq!(json["pane_session_id"], 42);
+        assert_eq!(json["captured_at_ms"], 0);
+        assert_eq!(json["captured_tz_offset_secs"], 0);
+        assert_eq!(json["block_order"], "oldest_first");
+        assert_eq!(json["retention"]["retained_blocks"], 2);
+        assert_eq!(json["blocks"][0]["id"], 7);
+        assert_eq!(json["blocks"][1]["command"], "pwd");
+        assert_eq!(json["blocks"][0]["output"], "ok");
+        assert_eq!(json["blocks"][0]["output_unavailable"], false);
+        assert_eq!(json["blocks"][0]["completion_observed"], true);
     }
 
     #[test]
@@ -328,22 +506,28 @@ mod tests {
         retained.command_truncated = true;
         retained.output_unavailable = true;
         retained.completion_observed = false;
+        let mut clipped = block(8, "large-output", "retained prefix");
+        clipped.output_truncated = true;
 
-        let markdown = String::from_utf8(
-            serialize_session(&[retained.clone()], SessionExportFormat::Markdown).unwrap(),
-        )
-        .unwrap();
-        assert!(markdown.contains("- Note: command truncated by shell"));
+        let snapshot = snapshot(vec![retained.clone(), clipped]);
+        let markdown =
+            String::from_utf8(serialize_session(&snapshot, SessionExportFormat::Markdown).unwrap())
+                .unwrap();
+        assert!(markdown.contains("- Note: command truncated or unavailable"));
         assert!(markdown.contains("- Note: output unavailable"));
         assert!(markdown.contains("- Note: command completion not observed"));
 
         let json: serde_json::Value = serde_json::from_slice(
-            &serialize_session(&[retained], SessionExportFormat::Json).unwrap(),
+            &serialize_session(&snapshot, SessionExportFormat::Json).unwrap(),
         )
         .unwrap();
-        assert_eq!(json[0]["command_truncated"], true);
-        assert_eq!(json[0]["output_unavailable"], true);
-        assert_eq!(json[0]["completion_observed"], false);
+        assert_eq!(json["retention"]["command_truncated"], 1);
+        assert_eq!(json["retention"]["output_truncated"], 1);
+        assert_eq!(json["retention"]["output_unavailable"], 1);
+        assert_eq!(json["retention"]["completion_unobserved"], 1);
+        assert_eq!(json["blocks"][0]["command_truncated"], true);
+        assert_eq!(json["blocks"][0]["output_unavailable"], true);
+        assert_eq!(json["blocks"][0]["completion_observed"], false);
     }
 
     #[test]
