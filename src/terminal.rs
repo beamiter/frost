@@ -824,6 +824,9 @@ pub struct CommandZone {
     pub prompt_start: usize,
     pub command_start: Option<usize>,
     pub output_start: Option<usize>,
+    /// First output column on [`Self::output_start`]. Commands normally start
+    /// at column zero; idle asynchronous output may begin beside the prompt.
+    pub(crate) output_start_col: usize,
     pub output_end: Option<usize>,
     pub exit_code: Option<i32>,
     /// The executed command line; `None` for background zones (empty prompt).
@@ -885,6 +888,203 @@ enum ZoneState {
     PromptStarted(usize),
     CommandStarted(usize, usize),
     OutputStarted(usize, usize, usize),
+}
+
+/// Visible asynchronous output observed after OSC 133 `B` while the prompt
+/// was still clean. It is finalized only by the next `A`, matching
+/// Anvil/Forge; a local edit keeps the bytes already observed but prevents
+/// later echo/completion text from joining the block. Raw bytes live in a
+/// bounded ring independent of the grid, so resize and scrollback eviction
+/// cannot rewrite or erase the pending result.
+#[derive(Clone, Debug)]
+struct IdleBackgroundRawChunk {
+    bytes: Vec<u8>,
+    start: usize,
+    splittable_ascii: bool,
+}
+
+impl IdleBackgroundRawChunk {
+    fn len(&self) -> usize {
+        self.bytes.len().saturating_sub(self.start)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IdleBackgroundOutput {
+    start_row: usize,
+    start_col: usize,
+    last_row: usize,
+    anchor_started: bool,
+    rows_evicted: bool,
+    raw_chunks: VecDeque<IdleBackgroundRawChunk>,
+    raw_len: usize,
+    raw_truncated: bool,
+}
+
+impl IdleBackgroundOutput {
+    const CHUNK_BYTES: usize = 4 * 1024;
+
+    fn new(start_row: usize, start_col: usize) -> Self {
+        Self {
+            start_row,
+            start_col,
+            last_row: start_row,
+            anchor_started: false,
+            rows_evicted: false,
+            raw_chunks: VecDeque::new(),
+            raw_len: 0,
+            raw_truncated: false,
+        }
+    }
+
+    /// Append one token emitted by the live parser. Whole-token chunk
+    /// eviction prevents the ring head from landing inside CSI/UTF-8, while
+    /// omitting terminal control strings ensures their private payload can
+    /// never become visible merely because older bytes were evicted.
+    fn append(&mut self, input: &[u8], limit: usize) {
+        if input.is_empty() {
+            return;
+        }
+
+        if input.starts_with(b"\x1b")
+            && matches!(input.get(1), Some(b']' | b'P' | b'X' | b'^' | b'_'))
+        {
+            return;
+        }
+
+        if limit == 0 {
+            self.raw_truncated = true;
+            self.raw_chunks.clear();
+            self.raw_len = 0;
+            return;
+        }
+
+        let splittable_ascii = input.iter().all(|byte| (0x20..=0x7e).contains(byte));
+        if input.len() > limit {
+            self.raw_truncated = true;
+            self.raw_chunks.clear();
+            self.raw_len = 0;
+            // Only plain printable ASCII is safe to split within a parser
+            // token. An oversized escape token is discarded atomically.
+            if splittable_ascii {
+                for piece in input[input.len() - limit..].chunks(Self::CHUNK_BYTES) {
+                    self.append_chunk(piece, true, limit);
+                }
+            }
+            return;
+        }
+
+        if splittable_ascii {
+            for piece in input.chunks(Self::CHUNK_BYTES) {
+                self.append_chunk(piece, true, limit);
+            }
+        } else {
+            self.append_chunk(input, false, limit);
+        }
+    }
+
+    fn append_chunk(&mut self, input: &[u8], splittable_ascii: bool, limit: usize) {
+        while self.raw_len.saturating_add(input.len()) > limit {
+            let overflow = self.raw_len + input.len() - limit;
+            let Some(front) = self.raw_chunks.front_mut() else {
+                break;
+            };
+            let front_len = front.len();
+            if front.splittable_ascii && overflow < front_len {
+                front.start += overflow;
+                self.raw_len -= overflow;
+                self.raw_truncated = true;
+                break;
+            }
+            self.raw_chunks.pop_front();
+            self.raw_len = self.raw_len.saturating_sub(front_len);
+            self.raw_truncated = true;
+        }
+
+        let append_to_back = self
+            .raw_chunks
+            .back()
+            .is_some_and(|back| back.bytes.len().saturating_add(input.len()) <= Self::CHUNK_BYTES);
+        if append_to_back {
+            let back = self
+                .raw_chunks
+                .back_mut()
+                .expect("back chunk was just observed");
+            back.bytes.extend_from_slice(input);
+            // A mixed-token chunk remains safe to evict atomically from its
+            // parser-token boundary, but only an all-printable-ASCII chunk is
+            // safe to trim at an arbitrary byte offset.
+            back.splittable_ascii &= splittable_ascii;
+        } else {
+            self.raw_chunks.push_back(IdleBackgroundRawChunk {
+                bytes: input.to_vec().into_boxed_slice().into_vec(),
+                start: 0,
+                splittable_ascii,
+            });
+        }
+        self.raw_len += input.len();
+    }
+
+    fn raw_bytes(&self) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(self.raw_len);
+        for chunk in &self.raw_chunks {
+            raw.extend_from_slice(&chunk.bytes[chunk.start..]);
+        }
+        raw
+    }
+}
+
+/// Decode retained terminal bytes without inventing U+FFFD glyphs that the
+/// live decoder never painted. Valid scalars survive (including a genuine
+/// encoded U+FFFD); malformed and incomplete byte runs are dropped and mark
+/// the snapshot truncated.
+fn decode_utf8_without_replacement(input: &[u8]) -> (String, bool) {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    let mut invalid = false;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                output.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                output.push_str(
+                    std::str::from_utf8(&remaining[..valid])
+                        .expect("Utf8Error::valid_up_to prefix must be valid"),
+                );
+                // Do not simply delete malformed bytes: bytes on either side
+                // could then join into an ANSI/OSC introducer that never
+                // existed in the live stream. NUL is ignored by both the live
+                // terminal and our plain renderer, but safely breaks such a
+                // sequence (for example ESC, invalid, "[2J").
+                output.push('\0');
+                invalid = true;
+                let skipped = error
+                    .error_len()
+                    .unwrap_or_else(|| remaining.len().saturating_sub(valid));
+                remaining = &remaining[valid.saturating_add(skipped)..];
+            }
+        }
+    }
+    (output, invalid)
+}
+
+fn has_effective_typeahead(input: &[u8]) -> bool {
+    input.iter().any(|byte| !matches!(byte, 0x03 | 0x04))
+}
+
+fn has_input_after_submission(input: &[u8]) -> bool {
+    let Some(first) = input.iter().position(|byte| matches!(byte, b'\r' | b'\n')) else {
+        return false;
+    };
+    let mut next = first + 1;
+    if next < input.len() && matches!((input[first], input[next]), (b'\r', b'\n') | (b'\n', b'\r'))
+    {
+        next += 1;
+    }
+    has_effective_typeahead(&input[next..])
 }
 
 /// Whether Agent is allowed to submit a reviewed command to this terminal.
@@ -1150,6 +1350,22 @@ pub struct TerminalState {
     /// Once local input is accepted for this prompt, approval stays blocked
     /// until a fresh `B`. This closes the write-before-echo race.
     agent_prompt_input_tainted: bool,
+    /// A CR/LF was already admitted for the current editable prompt, but OSC
+    /// 133 C has not arrived yet. A later write in this window is typeahead
+    /// for a future prompt rather than another ordinary edit.
+    prompt_submission_pending: bool,
+    /// Ctrl-C was admitted while editing the current prompt. Unlike a redraw,
+    /// the next A/B then represents a deliberate cancellation and may start
+    /// clean unless effective bytes followed the interrupt as typeahead.
+    prompt_cancel_pending: bool,
+    /// Independent prompt-edit gate for idle asynchronous output. Agent input
+    /// deliberately does not taint Agent identity, but its echo still must not
+    /// become a commandless background block.
+    idle_prompt_input_dirty: bool,
+    /// Input accepted outside the editable B..C window may survive as shell
+    /// typeahead. Carry the conservative taint into the next `B`.
+    pending_prompt_typeahead: bool,
+    idle_background_output: Option<IdleBackgroundOutput>,
     /// Monotonic identity of the current OSC 133 prompt.
     agent_prompt_generation: u64,
     /// Reviewed command waiting for the next exact OSC 133 `C` transition.
@@ -1365,6 +1581,11 @@ impl TerminalState {
             current_command_start_col: None,
             current_command_extent_row: None,
             agent_prompt_input_tainted: false,
+            prompt_submission_pending: false,
+            prompt_cancel_pending: false,
+            idle_prompt_input_dirty: false,
+            pending_prompt_typeahead: false,
+            idle_background_output: None,
             agent_prompt_generation: 0,
             armed_agent_execution: None,
             active_agent_execution: None,
@@ -1658,8 +1879,47 @@ impl TerminalState {
     /// Clearing/editing that line does not re-authorize Agent: a new OSC 133
     /// prompt is the unambiguous reset boundary.
     pub fn note_user_input(&mut self, input: &[u8]) {
-        if !input.is_empty() && matches!(self.current_zone_state, ZoneState::CommandStarted(_, _)) {
+        if input.is_empty() {
+            return;
+        }
+        if matches!(self.current_zone_state, ZoneState::CommandStarted(_, _)) {
+            if ((self.prompt_submission_pending || self.prompt_cancel_pending)
+                && has_effective_typeahead(input))
+                || has_input_after_submission(input)
+            {
+                self.pending_prompt_typeahead = true;
+            }
+            if let Some(interrupt) = input.iter().position(|byte| *byte == 0x03) {
+                if has_effective_typeahead(&input[interrupt + 1..]) {
+                    self.pending_prompt_typeahead = true;
+                }
+                self.prompt_cancel_pending = true;
+            }
+            self.prompt_submission_pending |=
+                input.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
             self.agent_prompt_input_tainted = true;
+            self.idle_prompt_input_dirty = true;
+        } else if has_effective_typeahead(input) {
+            // Input sent to a running command may be readline typeahead. Do
+            // not let the next B immediately classify its delayed echo as
+            // asynchronous output or authorize an Agent replacement.
+            self.pending_prompt_typeahead = true;
+        }
+    }
+
+    /// Record a terminal-generated protocol reply once it has been admitted
+    /// to the PTY write queue. A shell/readline can echo or otherwise consume
+    /// these bytes just like typeahead, so they must never authorize Agent or
+    /// seed a commandless Background block.
+    pub(crate) fn note_protocol_response(&mut self) {
+        if matches!(self.current_zone_state, ZoneState::CommandStarted(_, _)) {
+            if self.prompt_submission_pending || self.prompt_cancel_pending {
+                self.pending_prompt_typeahead = true;
+            }
+            self.agent_prompt_input_tainted = true;
+            self.idle_prompt_input_dirty = true;
+        } else {
+            self.pending_prompt_typeahead = true;
         }
     }
 
@@ -1689,6 +1949,11 @@ impl TerminalState {
             prompt_generation: self.agent_prompt_generation,
             command: command.to_string(),
         });
+        // Approved Agent payloads submit the line outside bracketed-paste
+        // framing. Until C confirms execution, any ordinary write admitted
+        // afterward may survive as typeahead for the next prompt.
+        self.prompt_submission_pending = true;
+        self.idle_prompt_input_dirty = true;
         Ok(())
     }
 
@@ -1699,6 +1964,7 @@ impl TerminalState {
             .is_some_and(|armed| armed.generation == generation)
         {
             self.armed_agent_execution = None;
+            self.prompt_submission_pending = false;
         }
     }
 
@@ -1710,6 +1976,52 @@ impl TerminalState {
                     .unwrap_or(absolute_row)
                     .max(absolute_row),
             );
+        }
+    }
+
+    /// Record a direct printable-cell write while the shell is resting after
+    /// OSC 133 `B`. Control-only redraws never call this hook, whitespace can
+    /// update an existing candidate but cannot start one, and alt-screen bytes
+    /// are deliberately excluded.
+    fn note_idle_background_cells(&mut self, col: usize, has_visible_text: bool) {
+        if self.use_alt_buffer
+            || self.idle_prompt_input_dirty
+            || !matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
+        {
+            return;
+        }
+        let row = self.scrollback.len().saturating_add(self.cursor_row);
+        let Some(pending) = self.idle_background_output.as_mut() else {
+            return;
+        };
+        if !pending.anchor_started {
+            if has_visible_text {
+                pending.start_row = row;
+                pending.start_col = col;
+                pending.last_row = row;
+                pending.anchor_started = true;
+            }
+            return;
+        }
+        if row < pending.start_row {
+            pending.start_row = row;
+            pending.start_col = col;
+        } else if row == pending.start_row {
+            pending.start_col = pending.start_col.min(col);
+        }
+        pending.last_row = pending.last_row.max(row);
+    }
+
+    fn idle_background_capture_active(&self) -> bool {
+        !self.use_alt_buffer
+            && !self.idle_prompt_input_dirty
+            && matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
+            && self.idle_background_output.is_some()
+    }
+
+    fn append_idle_background_bytes(&mut self, input: &[u8]) {
+        if let Some(pending) = self.idle_background_output.as_mut() {
+            pending.append(input, Self::IDLE_BACKGROUND_CAPTURE_BYTES);
         }
     }
 
@@ -1777,7 +2089,16 @@ impl TerminalState {
                 // pending `PromptStarted`/`CommandStarted` is NOT finalized:
                 // that is just an idle prompt being redrawn (ctrl+l, resize)
                 // re-emitting its embedded `A`/`B` marks.
+                let carry_dirty_edit =
+                    matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
+                        && self.idle_prompt_input_dirty
+                        && !self.prompt_submission_pending
+                        && !self.prompt_cancel_pending;
+                if carry_dirty_edit {
+                    self.pending_prompt_typeahead = true;
+                }
                 self.finalize_stale_zone(absolute_row);
+                self.finalize_idle_background_output();
                 // Prompt start. Any leftover execution timestamp belongs to a
                 // command that never reported `D`; drop it so it cannot leak
                 // into a later command's duration.
@@ -1790,6 +2111,9 @@ impl TerminalState {
                 self.current_command_cwd = metadata_cwd;
                 self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
+                self.prompt_submission_pending = false;
+                self.prompt_cancel_pending = false;
+                self.idle_prompt_input_dirty = false;
                 self.armed_agent_execution = None;
                 self.active_agent_execution = None;
             }
@@ -1806,7 +2130,13 @@ impl TerminalState {
                     if metadata_cwd.is_some() {
                         self.current_command_cwd = metadata_cwd;
                     }
-                    self.agent_prompt_input_tainted = false;
+                    let typeahead = std::mem::take(&mut self.pending_prompt_typeahead);
+                    self.agent_prompt_input_tainted = typeahead;
+                    self.idle_prompt_input_dirty = typeahead;
+                    self.idle_background_output =
+                        Some(IdleBackgroundOutput::new(absolute_row, self.cursor_col));
+                    self.prompt_submission_pending = false;
+                    self.prompt_cancel_pending = false;
                     self.agent_prompt_generation = self.agent_prompt_generation.wrapping_add(1);
                     self.armed_agent_execution = None;
                     self.active_agent_execution = None;
@@ -1816,6 +2146,12 @@ impl TerminalState {
                 // Command executed (output begins)
                 if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state
                 {
+                    // Anything printed while the prompt was idle stays inline
+                    // when a command starts before the next A; Anvil/Forge do
+                    // not splice it into the command's output block.
+                    self.idle_background_output = None;
+                    self.prompt_submission_pending = false;
+                    self.prompt_cancel_pending = false;
                     let captured_command = metadata_command
                         .or_else(|| self.current_prompt_command_text())
                         .unwrap_or_default();
@@ -1852,6 +2188,15 @@ impl TerminalState {
                 }
             }
             'D' => {
+                // D closes only a lifecycle that actually reached C. Some
+                // integrations emit D on an empty Enter; accepting it here
+                // would mint an empty background card and could steal pending
+                // asynchronous output that belongs at the next A boundary.
+                let ZoneState::OutputStarted(prompt_start, cmd_start, out_start) =
+                    self.current_zone_state
+                else {
+                    return;
+                };
                 // Command finished. Exit code arrives positionally (`D;0`) or
                 // as an jsh-style `exit=`/`exit_code=` param.
                 let exit_code =
@@ -1898,77 +2243,36 @@ impl TerminalState {
                     self.current_command_cwd.take()
                 }
                 .or_else(|| self.control_free_osc7_cwd());
-                match self.current_zone_state {
-                    ZoneState::OutputStarted(prompt_start, cmd_start, out_start) => {
-                        let zone = CommandZone {
-                            id: 0, // assigned by push_command_zone
-                            prompt_start,
-                            command_start: Some(cmd_start),
-                            output_start: Some(out_start),
-                            output_end: Some(absolute_row),
-                            exit_code,
-                            command: self.zone_command_text(),
-                            duration_ms,
-                            finished_at_ms: Self::wall_clock_ms(),
-                            command_truncated,
-                            cwd: cwd.clone(),
-                            captured_output: self.capture_zone_output(out_start, absolute_row),
-                            captured_output_evicted: false,
-                            completion_observed: true,
-                            rows_evicted: false,
-                        };
-                        self.push_command_zone(zone);
-                        self.record_completed_command(
-                            cmd_start,
-                            out_start,
-                            Some((out_start, absolute_row)),
-                            CompletedCommandMetadata {
-                                exit_code,
-                                duration_ms,
-                                execution_id: finished_id.clone(),
-                                agent_generation,
-                            },
-                        );
-                    }
-                    ZoneState::CommandStarted(prompt_start, cmd_start) => {
-                        let zone = CommandZone {
-                            id: 0, // assigned by push_command_zone
-                            prompt_start,
-                            command_start: Some(cmd_start),
-                            output_start: None,
-                            output_end: Some(absolute_row),
-                            exit_code,
-                            command: self.zone_command_text(),
-                            // Without a `C` there was no locally observed
-                            // execution phase, so only a shell-reported
-                            // duration param is meaningful here.
-                            duration_ms: metadata_duration_ms,
-                            finished_at_ms: Self::wall_clock_ms(),
-                            command_truncated,
-                            cwd,
-                            // No `C` means no output range to snapshot.
-                            captured_output: None,
-                            captured_output_evicted: false,
-                            completion_observed: true,
-                            rows_evicted: false,
-                        };
-                        self.push_command_zone(zone);
-                        // Same rule for the agent record: shell-reported
-                        // duration or nothing.
-                        self.record_completed_command(
-                            cmd_start,
-                            absolute_row,
-                            None,
-                            CompletedCommandMetadata {
-                                exit_code,
-                                duration_ms: metadata_duration_ms,
-                                execution_id: finished_id,
-                                agent_generation,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
+                let zone = CommandZone {
+                    id: 0, // assigned by push_command_zone
+                    prompt_start,
+                    command_start: Some(cmd_start),
+                    output_start: Some(out_start),
+                    output_start_col: 0,
+                    output_end: Some(absolute_row),
+                    exit_code,
+                    command: self.zone_command_text(),
+                    duration_ms,
+                    finished_at_ms: Self::wall_clock_ms(),
+                    command_truncated,
+                    cwd,
+                    captured_output: self.capture_zone_output(out_start, absolute_row),
+                    captured_output_evicted: false,
+                    completion_observed: true,
+                    rows_evicted: false,
+                };
+                self.push_command_zone(zone);
+                self.record_completed_command(
+                    cmd_start,
+                    out_start,
+                    Some((out_start, absolute_row)),
+                    CompletedCommandMetadata {
+                        exit_code,
+                        duration_ms,
+                        execution_id: finished_id,
+                        agent_generation,
+                    },
+                );
                 self.current_zone_state = ZoneState::Idle;
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
@@ -1976,6 +2280,10 @@ impl TerminalState {
                 self.current_command_cwd = None;
                 self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
+                self.prompt_submission_pending = false;
+                self.prompt_cancel_pending = false;
+                self.idle_prompt_input_dirty = false;
+                self.idle_background_output = None;
             }
             _ => {}
         }
@@ -1990,6 +2298,12 @@ impl TerminalState {
     /// Byte cap of one zone's extracted output text (shared by the live
     /// extraction and the snapshot taken at finalization).
     const ZONE_OUTPUT_CAP_BYTES: usize = 1 << 20;
+
+    /// Newest raw clean-prompt bytes retained until the next OSC 133 `A`.
+    /// This matches Anvil/Forge's independent background-output ring and
+    /// prevents resize/scrollback geometry from becoming a data-retention
+    /// boundary. The finalized plain snapshot is still capped at 1 MiB.
+    const IDLE_BACKGROUND_CAPTURE_BYTES: usize = 8 << 20;
 
     /// Append a finished zone, assigning its stable id and enforcing both the
     /// 256-entry cap and the captured-snapshot byte budget.
@@ -2049,6 +2363,72 @@ impl TerminalState {
         }
     }
 
+    /// At the next prompt boundary, render clean-prompt bytes through an
+    /// isolated plain terminal model and turn meaningful output into one
+    /// commandless block. It is history/UI only: no command-completion/Agent
+    /// event is emitted.
+    fn finalize_idle_background_output(&mut self) {
+        let Some(pending) = self.idle_background_output.take() else {
+            return;
+        };
+        let ZoneState::CommandStarted(prompt_start, _) = self.current_zone_state else {
+            return;
+        };
+        if !pending.anchor_started {
+            return;
+        }
+        let raw = pending.raw_bytes();
+        let IdleBackgroundOutput {
+            start_row,
+            start_col,
+            last_row,
+            anchor_started: _,
+            rows_evicted,
+            raw_chunks: _,
+            raw_len: _,
+            raw_truncated,
+        } = pending;
+        let (raw, invalid_utf8) = decode_utf8_without_replacement(&raw);
+        let (plain, render_truncated) =
+            crate::ansi::terminal_plain_text(&raw, Self::ZONE_OUTPUT_CAP_BYTES);
+        if !plain
+            .chars()
+            .any(|character| !character.is_whitespace() && !character.is_control())
+        {
+            return;
+        }
+        let captured_output = (plain, raw_truncated || invalid_utf8 || render_truncated);
+        let cwd = self
+            .current_command_cwd
+            .clone()
+            .or_else(|| self.control_free_osc7_cwd());
+        let total_rows = self.scrollback.len().saturating_add(self.grid.rows());
+        let output_end = last_row.saturating_add(1).min(total_rows);
+        let (prompt_start, output_start, output_start_col, output_end) = if rows_evicted {
+            (0, None, 0, None)
+        } else {
+            (prompt_start, Some(start_row), start_col, Some(output_end))
+        };
+        self.push_command_zone(CommandZone {
+            id: 0,
+            prompt_start,
+            command_start: None,
+            output_start,
+            output_start_col,
+            output_end,
+            exit_code: None,
+            command: None,
+            duration_ms: None,
+            finished_at_ms: Self::wall_clock_ms(),
+            command_truncated: false,
+            cwd,
+            captured_output: Some(captured_output),
+            captured_output_evicted: false,
+            completion_observed: false,
+            rows_evicted,
+        });
+    }
+
     /// The OSC 7 cwd, refused if it carries control characters: a zone cwd
     /// feeds line-oriented consumers (the Markdown export's `- Cwd:` line),
     /// so it gets the same control-free guarantee as the OSC 133 params
@@ -2092,6 +2472,7 @@ impl TerminalState {
             prompt_start,
             command_start: Some(cmd_start),
             output_start: Some(out_start),
+            output_start_col: 0,
             output_end: Some(boundary_row),
             exit_code: None,
             command: self.zone_command_text(),
@@ -2149,6 +2530,7 @@ impl TerminalState {
                 zone.prompt_start = 0;
                 zone.command_start = None;
                 zone.output_start = None;
+                zone.output_start_col = 0;
                 zone.output_end = None;
                 continue;
             }
@@ -2164,6 +2546,12 @@ impl TerminalState {
                 *row = row.saturating_sub(count);
             }
         }
+        let live_prompt_trimmed = match self.current_zone_state {
+            ZoneState::PromptStarted(prompt_start)
+            | ZoneState::CommandStarted(prompt_start, _)
+            | ZoneState::OutputStarted(prompt_start, _, _) => prompt_start < count,
+            ZoneState::Idle => false,
+        };
         self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
             ZoneState::Idle => ZoneState::Idle,
             ZoneState::PromptStarted(p) => ZoneState::PromptStarted(p.saturating_sub(count)),
@@ -2179,6 +2567,20 @@ impl TerminalState {
         self.current_command_extent_row = self
             .current_command_extent_row
             .map(|row| row.saturating_sub(count));
+        if let Some(pending) = self.idle_background_output.as_mut() {
+            pending.rows_evicted |= live_prompt_trimmed || pending.start_row < count;
+            if pending.start_row < count {
+                pending.start_row = 0;
+                pending.start_col = 0;
+            } else {
+                pending.start_row -= count;
+            }
+            if pending.last_row < count {
+                pending.last_row = 0;
+            } else {
+                pending.last_row -= count;
+            }
+        }
     }
 
     /// Absolute buffer row of every known shell prompt (OSC 133), oldest
@@ -2297,17 +2699,27 @@ impl TerminalState {
     ///
     /// The snapshot captured at finalization wins over live extraction when
     /// both exist (ember's captured-first rule — one consistent answer, and
-    /// it survives scrollback trimming). Live extraction only serves zones
-    /// whose snapshot was evicted by the byte budget while their rows are
-    /// still present.
+    /// it survives scrollback trimming). Live extraction only serves command
+    /// zones whose snapshot was evicted by the byte budget while their rows
+    /// are still present. A commandless background block never falls back to
+    /// the grid because its isolated raw-byte reconstruction is authoritative
+    /// (cursor repainting can leave different stale cells in the live grid).
     pub fn zone_output_text_capped(&self, id: u64) -> Option<(String, bool)> {
         let zone = self.zone_by_id(id)?;
         if let Some((text, truncated)) = &zone.captured_output {
             return Some((text.clone(), *truncated));
         }
+        if zone.command.is_none() && zone.captured_output_evicted {
+            return None;
+        }
         let start = zone.output_start?;
         let end = zone.output_end.unwrap_or(start);
-        let (out, capped) = self.rows_text(start, end, Self::ZONE_OUTPUT_CAP_BYTES);
+        let (out, capped) = self.rows_text_from_column(
+            start,
+            end,
+            zone.output_start_col,
+            Self::ZONE_OUTPUT_CAP_BYTES,
+        );
         if out.trim().is_empty() {
             None
         } else {
@@ -2429,6 +2841,19 @@ impl TerminalState {
     /// `true` when the cap dropped remaining rows (rows are never cut
     /// mid-segment, so text is only ever lost whole rows at a time).
     fn rows_text(&self, start: usize, end: usize, max_bytes: usize) -> (String, bool) {
+        self.rows_text_from_column(start, end, 0, max_bytes)
+    }
+
+    /// [`Self::rows_text`] with an exact first-row column. Background output
+    /// may begin beside a still-visible prompt, so starting at column zero
+    /// would leak prompt furniture into copy/search/export.
+    fn rows_text_from_column(
+        &self,
+        start: usize,
+        end: usize,
+        start_col: usize,
+        max_bytes: usize,
+    ) -> (String, bool) {
         let scrollback_len = self.scrollback.len();
         let end = end.min(scrollback_len + self.grid.rows());
         if end <= start {
@@ -2439,9 +2864,14 @@ impl TerminalState {
         for abs_row in start..end {
             let (mut segment, wrapped) = if abs_row < scrollback_len {
                 let line = &self.scrollback[abs_row];
-                let text: String = line
-                    .decompress()
+                let cells = line.decompress();
+                let text: String = cells
                     .iter()
+                    .skip(if abs_row == start {
+                        start_col.min(cells.len())
+                    } else {
+                        0
+                    })
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
                     .collect();
@@ -2451,7 +2881,12 @@ impl TerminalState {
                 if grid_row >= self.grid.rows() {
                     break;
                 }
-                let text: String = (0..self.grid.row_len())
+                let first_col = if abs_row == start {
+                    start_col.min(self.grid.row_len())
+                } else {
+                    0
+                };
+                let text: String = (first_col..self.grid.row_len())
                     .map(|col| self.grid.get(grid_row, col))
                     .filter(|cell| !cell.flags.wide_continuation())
                     .map(|cell| cell.character)
@@ -2462,13 +2897,16 @@ impl TerminalState {
                 // Hard line end: trailing cell padding is not real output.
                 segment.truncate(segment.trim_end_matches(' ').len());
             }
-            out.push_str(&segment);
-            if out.len() >= max_bytes {
-                // Truncated only if the break actually skips content.
-                capped = abs_row + 1 < end;
+            if out.len().saturating_add(segment.len()) > max_bytes {
+                capped = true;
                 break;
             }
+            out.push_str(&segment);
             if !wrapped && abs_row + 1 < end {
+                if out.len() == max_bytes {
+                    capped = true;
+                    break;
+                }
                 out.push('\n');
             }
         }
@@ -2993,7 +3431,7 @@ impl TerminalState {
         }
     }
 
-    fn put_char(&mut self, ch: char) {
+    fn put_char(&mut self, ch: char, track_idle_output: bool) {
         let ch = self.translate_char(ch);
         let width = crate::char_width::cached_char_width(ch);
         if width == 0 {
@@ -3021,6 +3459,10 @@ impl TerminalState {
                 // Autowrap disabled: clamp cursor to last column instead of wrapping
                 self.cursor_col = cols.saturating_sub(width);
             }
+        }
+
+        if track_idle_output {
+            self.note_idle_background_cells(self.cursor_col, !ch.is_whitespace());
         }
 
         // IRM insert mode (mode 4): make room by shifting the row right.
@@ -3103,6 +3545,12 @@ impl TerminalState {
             flags.set_wide_continuation(false);
             let col = self.cursor_col;
             let end = col + chunk_len;
+            self.note_idle_background_cells(
+                col,
+                bytes[pos..pos + chunk_len]
+                    .iter()
+                    .any(|byte| !byte.is_ascii_whitespace()),
+            );
             let blank = self.create_blank_cell();
             // Preserve the wide-cell pair invariant at both edges of the bulk
             // overwrite. The interior is fully replaced below, but a CJK body or
@@ -3528,6 +3976,8 @@ impl TerminalState {
         let mut i = 0;
 
         while i < data_slice.len() {
+            let token_start = i;
+            let capture_idle_background = self.idle_background_capture_active();
             let byte = data_slice[i];
 
             match byte {
@@ -3943,7 +4393,7 @@ impl TerminalState {
                         }
                         self.put_ascii_run(&data_slice[run_start..i]);
                     } else {
-                        self.put_char(byte as char);
+                        self.put_char(byte as char, true);
                         i += 1;
                     }
                 }
@@ -3954,7 +4404,7 @@ impl TerminalState {
                         let buf = [byte, data_slice[i + 1], 0, 0];
                         if let Ok(s) = std::str::from_utf8(&buf[..2]) {
                             if let Some(ch) = s.chars().next() {
-                                self.put_char(ch);
+                                self.put_char(ch, true);
                             }
                         }
                         i += 2;
@@ -3974,7 +4424,7 @@ impl TerminalState {
                         let buf = [byte, data_slice[i + 1], data_slice[i + 2], 0];
                         if let Ok(s) = std::str::from_utf8(&buf[..3]) {
                             if let Some(ch) = s.chars().next() {
-                                self.put_char(ch);
+                                self.put_char(ch, true);
                             }
                         }
                         i += 3;
@@ -4000,7 +4450,7 @@ impl TerminalState {
                         ];
                         if let Ok(s) = std::str::from_utf8(&buf[..4]) {
                             if let Some(ch) = s.chars().next() {
-                                self.put_char(ch);
+                                self.put_char(ch, true);
                             }
                         }
                         i += 4;
@@ -4020,7 +4470,7 @@ impl TerminalState {
                                 std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize])
                             {
                                 if let Some(ch) = s.chars().next() {
-                                    self.put_char(ch);
+                                    self.put_char(ch, true);
                                 }
                             }
                             self.utf8_len = 0;
@@ -4030,6 +4480,9 @@ impl TerminalState {
                     }
                     i += 1;
                 }
+            }
+            if capture_idle_background && self.idle_background_capture_active() && i > token_start {
+                self.append_idle_background_bytes(&data_slice[token_start..i]);
             }
         }
     }
@@ -4133,7 +4586,7 @@ impl TerminalState {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 if let Some(ch) = self.last_printed_char {
                     for _ in 0..n {
-                        self.put_char(ch);
+                        self.put_char(ch, false);
                     }
                 }
             }
@@ -4770,6 +5223,11 @@ impl TerminalState {
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
         self.agent_prompt_input_tainted = false;
+        self.prompt_submission_pending = false;
+        self.prompt_cancel_pending = false;
+        self.idle_prompt_input_dirty = false;
+        self.pending_prompt_typeahead = false;
+        self.idle_background_output = None;
         self.armed_agent_execution = None;
         self.active_agent_execution = None;
         self.current_command_text = None;
@@ -6179,6 +6637,7 @@ impl TerminalState {
                 zone.prompt_start = 0;
                 zone.command_start = None;
                 zone.output_start = None;
+                zone.output_start_col = 0;
                 zone.output_end = None;
             } else {
                 zone.prompt_start = translate_grid_row(zone.prompt_start);
@@ -6212,6 +6671,10 @@ impl TerminalState {
             }
         };
         self.current_command_extent_row = self.current_command_extent_row.map(translate_grid_row);
+        if let Some(pending) = self.idle_background_output.as_mut() {
+            pending.start_row = translate_grid_row(pending.start_row);
+            pending.last_row = translate_grid_row(pending.last_row);
+        }
         self.grid_version = self.grid_version.wrapping_add(1);
         self.visible_cells_cache = None;
         true
@@ -6223,7 +6686,6 @@ impl TerminalState {
         }
 
         let (cols, rows) = clamp_terminal_dimensions(cols, rows);
-
         let old_rows = self.grid.rows();
         let had_full_screen_region = old_rows == 0
             || (self.scroll_region_top == 0 && self.scroll_region_bottom + 1 >= old_rows);
@@ -6385,7 +6847,9 @@ mod tests {
 
         // The id is consumed with its command; the next one must not inherit it.
         terminal.process_input(b"\x1b]133;A\x07$ ");
-        terminal.process_input(b"\x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;B\x07");
+        terminal.note_user_input(b"true\r");
+        terminal.process_input(b"true\r\n");
         terminal.process_input(b"\x1b]133;C\x07");
         terminal.process_input(b"\x1b]133;D;exit_code=1\x07");
         let completed = terminal.take_completed_commands();
@@ -6406,14 +6870,15 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert!(completed[0].duration_ms.is_some());
 
-        // Without a `C` there is no execution phase, so no duration — and the
-        // previous command's start must not leak into this record.
+        // Without a `C` there is no execution lifecycle at all: D is ignored
+        // and cannot mint an empty record or inherit the previous duration.
         terminal.process_input(b"\x1b]133;A\x07$ ");
-        terminal.process_input(b"\x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;B\x07");
+        terminal.note_user_input(b"true\r");
+        terminal.process_input(b"true\r\n");
         terminal.process_input(b"\x1b]133;D;0\x07");
-        let completed = terminal.take_completed_commands();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].duration_ms, None);
+        assert!(terminal.take_completed_commands().is_empty());
+        assert_eq!(terminal.command_zones.len(), 1);
     }
 
     #[test]
@@ -6535,19 +7000,21 @@ mod tests {
             Some(4_200)
         );
 
-        // Even without a `C` (no locally observed execution phase), an
-        // explicit shell-measured duration is trusted.
+        // A D without C is not a command lifecycle, even if it carries a
+        // duration-looking parameter.
         terminal.process_input(b"\x1b]133;A\x07$ ");
-        terminal.process_input(b"\x1b]133;B\x07true\r\n");
+        terminal.process_input(b"\x1b]133;B\x07");
+        terminal.note_user_input(b"true\r");
+        terminal.process_input(b"true\r\n");
         terminal.process_input(b"\x1b]133;D;exit=0;duration=7\x07");
-        assert_eq!(terminal.command_zones[1].duration_ms, Some(7));
+        assert_eq!(terminal.command_zones.len(), 1);
 
         // Local timing remains the fallback when no param arrives.
         terminal.process_input(b"\x1b]133;A\x07$ ");
         terminal.process_input(b"\x1b]133;B\x07ls\r\n");
         terminal.process_input(b"\x1b]133;C\x07f\r\n");
         terminal.process_input(b"\x1b]133;D;0\x07");
-        assert!(terminal.command_zones[2].duration_ms.is_some());
+        assert!(terminal.command_zones[1].duration_ms.is_some());
     }
 
     #[test]
@@ -6672,6 +7139,27 @@ mod tests {
     }
 
     #[test]
+    fn protocol_replies_taint_current_or_next_prompt_before_echo() {
+        use super::AgentPromptStatus;
+
+        let mut idle = super::TerminalState::new(40, 8);
+        idle.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        idle.note_protocol_response();
+        assert_eq!(idle.agent_prompt_status(), AgentPromptStatus::InputNotEmpty);
+        idle.process_input(b"reply\x1b]133;A\x07");
+        assert!(idle.command_zones.is_empty());
+
+        let mut running = super::TerminalState::new(40, 8);
+        running.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07out\r\n");
+        running.note_protocol_response();
+        running.process_input(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            running.agent_prompt_status(),
+            AgentPromptStatus::InputNotEmpty
+        );
+    }
+
+    #[test]
     fn agent_arm_rejects_visual_spoofing_at_the_terminal_boundary() {
         use super::AgentPromptStatus;
 
@@ -6745,9 +7233,28 @@ mod tests {
         assert_eq!(completed[0].agent_generation, None);
     }
 
+    #[test]
+    fn input_after_agent_submit_taints_the_following_prompt() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal
+            .arm_agent_execution(9, "ls -la")
+            .expect("fresh prompt is ready");
+        terminal.note_user_input(b"queued");
+        terminal.process_input(b"ls -la\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            super::AgentPromptStatus::InputNotEmpty
+        );
+        terminal.process_input(b"queued\r\n\x1b]133;A\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+    }
+
     use super::{
-        AgentPromptStatus, ClipboardReadKind, Color, CursorShape, ScrollbackLine, TerminalCell,
-        TerminalState, ZoneOutputExport, MAX_TERMINAL_TITLE_CHARS,
+        AgentPromptStatus, ClipboardReadKind, Color, CursorShape, IdleBackgroundOutput,
+        ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_TERMINAL_TITLE_CHARS,
     };
 
     #[test]
@@ -8462,9 +8969,9 @@ mod tests {
         // Full lifecycle (A/B/C/D): command captured, duration measured.
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
         terminal.process_input(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
-        // No `C` (empty prompt submit): no output range, no duration.
-        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n");
-        terminal.process_input(b"\x1b]133;D;1\x07");
+        // Clean-prompt asynchronous output finalizes at the next A.
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\nworker done\r\n");
+        terminal.process_input(b"\x1b]133;A\x07");
 
         assert_eq!(terminal.command_zones.len(), 2);
         let full = &terminal.command_zones[0];
@@ -8476,40 +8983,36 @@ mod tests {
         assert!(full.completion_observed);
         assert!(!full.captured_output_evicted);
 
-        let short = &terminal.command_zones[1];
-        assert_eq!(short.id, 1);
-        // Without a `C` the command was never captured; scraping the rows
-        // would swallow the rendered prompt, so the zone carries no command
-        // and classifies as Background regardless of the exit code.
-        assert_eq!(short.command, None);
+        let background = &terminal.command_zones[1];
+        assert_eq!(background.id, 1);
+        assert_eq!(background.command, None);
         assert_eq!(
-            crate::block_mode::classify(short.command.as_deref(), short.exit_code),
+            crate::block_mode::classify(background.command.as_deref(), background.exit_code),
             crate::block_mode::BlockOutcome::Background
         );
-        assert_eq!(short.duration_ms, None);
-        assert!(short.finished_at_ms.is_some());
-        assert_eq!(short.exit_code, Some(1));
-        assert!(short.completion_observed);
-        assert!(!short.captured_output_evicted);
+        assert_eq!(background.duration_ms, None);
+        assert!(background.finished_at_ms.is_some());
+        assert_eq!(background.exit_code, None);
+        assert!(!background.completion_observed);
+        assert_eq!(
+            background.captured_output.as_ref().map(|v| v.0.as_str()),
+            Some("\nworker done\n")
+        );
+        assert!(!background.captured_output_evicted);
     }
 
     #[test]
-    fn empty_prompt_enter_without_c_is_background_not_a_failed_prompt_scrape() {
+    fn empty_prompt_enter_and_d_without_c_mint_no_zone() {
         // bash-preexec-style integrations emit `D` from precmd without a `C`
         // on every empty-prompt Enter. The rendered prompt must not be
         // scraped as the zone's command, and the zone must not surface as a
         // Failed block even when the previous command left a nonzero status.
         let mut terminal = TerminalState::new(40, 8);
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;D;1\x07");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
 
-        assert_eq!(terminal.command_zones.len(), 1);
-        let zone = &terminal.command_zones[0];
-        assert_eq!(zone.command, None);
-        assert_eq!(zone.exit_code, Some(1));
-        assert_eq!(
-            crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
-            crate::block_mode::BlockOutcome::Background
-        );
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
     }
 
     #[test]
@@ -8565,7 +9068,7 @@ mod tests {
         }
         let failed = terminal.first_failed_zone().expect("two failures exist");
         assert_eq!(failed.exit_code, Some(2));
-        assert_eq!(failed.id, 2);
+        assert_eq!(failed.id, 1);
     }
 
     #[test]
@@ -8597,9 +9100,10 @@ mod tests {
             Some(("out\nout\nout".to_string(), false))
         );
         assert_eq!(terminal.captured_output_bytes, "out\nout\nout".len());
-        // A no-`C` zone records no output range, so no snapshot either.
+        // D without C is ignored and therefore records no zone or snapshot.
         terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;D;0\x07");
-        assert_eq!(terminal.command_zones[1].captured_output, None);
+        terminal.process_input(b"\x1b]133;A\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
         assert_eq!(terminal.captured_output_bytes, "out\nout\nout".len());
     }
 
@@ -8762,13 +9266,342 @@ mod tests {
         // the RESTING state of every idle prompt (B fires at prompt-end),
         // so it must be silently discarded, never finalized into a zone.
         let mut terminal = TerminalState::new(40, 8);
-        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07half-typed");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal.note_user_input(b"half-typed");
+        terminal.process_input(b"half-typed");
         terminal.process_input(b"\r\n\x1b]133;A\x07$ ");
         assert!(terminal.command_zones.is_empty());
         assert!(terminal.take_completed_commands().is_empty());
         // A bare abandoned prompt (`A` with no `B`) spawns nothing either.
         terminal.process_input(b"\x1b]133;A\x07$ ");
         assert!(terminal.command_zones.is_empty());
+    }
+
+    #[test]
+    fn clean_prompt_async_output_becomes_one_background_zone_at_next_a() {
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07notice");
+        // A D without C is ignored and must neither consume the pending text
+        // nor lend its status to the eventual background block.
+        terminal.process_input(b"\x1b]133;D;17\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+
+        assert_eq!(terminal.command_zones.len(), 1);
+        let zone = &terminal.command_zones[0];
+        assert_eq!(zone.command, None);
+        assert_eq!(zone.exit_code, None);
+        assert_eq!(zone.duration_ms, None);
+        assert!(!zone.completion_observed);
+        assert_eq!(zone.output_start_col, 2);
+        assert_eq!(
+            terminal.zone_output_text(zone.id).as_deref(),
+            Some("notice")
+        );
+        assert!(terminal.take_completed_commands().is_empty());
+    }
+
+    #[test]
+    fn background_snapshot_preserves_real_indentation_and_trailing_line() {
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07  indented\r\n");
+        terminal.process_input(b"\x1b]133;A\x07");
+
+        let zone = terminal.command_zones.back().expect("background block");
+        assert_eq!(
+            zone.captured_output.as_ref().map(|entry| entry.0.as_str()),
+            Some("  indented\n")
+        );
+        assert_eq!(
+            terminal.zone_output_text(zone.id).as_deref(),
+            Some("  indented\n")
+        );
+    }
+
+    #[test]
+    fn background_capture_tracks_carriage_return_before_its_first_column() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07foo\rbar");
+        terminal.process_input(b"\x1b]133;A\x07");
+
+        let zone = &terminal.command_zones[0];
+        assert_eq!(zone.output_start_col, 0);
+        assert_eq!(terminal.zone_output_text(zone.id).as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn evicted_background_snapshot_never_falls_back_to_stale_grid_cells() {
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07foo\rbar");
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo ok\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07",
+        );
+
+        let background_id = terminal.command_zones[0].id;
+        assert_eq!(
+            terminal.zone_output_text(background_id).as_deref(),
+            Some("bar")
+        );
+        assert!(!terminal.command_zones[0].rows_evicted);
+
+        // The newest command snapshot is exempt, so a zero test budget
+        // evicts the older background snapshot while its grid rows remain.
+        terminal.enforce_captured_output_budget(0);
+        assert!(terminal.command_zones[0].captured_output_evicted);
+        assert_eq!(terminal.zone_output_text_capped(background_id), None);
+        assert_eq!(
+            terminal.zone_output_export_capped(background_id),
+            Some(ZoneOutputExport::Unavailable)
+        );
+    }
+
+    #[test]
+    fn local_input_freezes_prior_async_output_and_excludes_later_echo() {
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\nasync one\r\n");
+        terminal.note_user_input(b"typed");
+        terminal.process_input(b"typed\r\ncompletion text\r\n\x1b]133;A\x07");
+
+        assert_eq!(terminal.command_zones.len(), 1);
+        let zone = &terminal.command_zones[0];
+        assert_eq!(
+            terminal.zone_output_text(zone.id).as_deref(),
+            Some("\nasync one\n")
+        );
+
+        // If the editor was already dirty before output arrived, none of it
+        // is split away from the live prompt.
+        terminal.process_input(b"$ \x1b]133;B\x07");
+        terminal.note_user_input(b"x");
+        terminal.process_input(b"x\r\nnot background\r\n\x1b]133;A\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+    }
+
+    #[test]
+    fn blank_control_redraw_and_alt_screen_output_mint_no_background_zone() {
+        let mut terminal = TerminalState::new(30, 6);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n   \r\n\x1b[0m\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07",
+        );
+        assert!(terminal.command_zones.is_empty());
+
+        terminal.process_input(b"\x1b[?1049hvisible only in alt\x1b[?1049l\x1b]133;A\x07");
+        assert!(terminal.command_zones.is_empty());
+
+        terminal.process_input(b"$ \x1b]133;B\x07\x1bPsecret\x07LEAK\x1b\\\x1b]133;A\x07");
+        assert!(terminal.command_zones.is_empty());
+    }
+
+    #[test]
+    fn erased_or_invalid_idle_bytes_do_not_invent_visible_background_text() {
+        let mut terminal = TerminalState::new(30, 6);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\x1b[1K\x1b]133;A\x07");
+        assert!(terminal.command_zones.is_empty());
+
+        terminal.process_input(b"$ \x1b]133;B\x07ok");
+        terminal.process_input(b"\xff");
+        terminal.process_input(b"\x1b]133;A\x07");
+        let zone = terminal.command_zones.back().expect("visible ok block");
+        assert_eq!(
+            zone.captured_output.as_ref().map(|entry| entry.0.as_str()),
+            Some("ok")
+        );
+        assert!(zone.captured_output.as_ref().is_some_and(|entry| entry.1));
+
+        terminal.process_input(b"$ \x1b]133;B\x07ok\x1b\xff[2Jevil\x1b]133;A\x07");
+        let zone = terminal.command_zones.back().expect("literal suffix block");
+        assert_eq!(
+            zone.captured_output.as_ref().map(|entry| entry.0.as_str()),
+            Some("ok[2Jevil")
+        );
+        assert!(zone.captured_output.as_ref().is_some_and(|entry| entry.1));
+
+        terminal.process_input(b"$ \x1b]133;B\x07ok\xe2\x80\xae\x1b]133;A\x07");
+        let zone = terminal.command_zones.back().expect("visible safe block");
+        assert_eq!(
+            zone.captured_output.as_ref().map(|entry| entry.0.as_str()),
+            Some("ok")
+        );
+        let zone_count = terminal.command_zones.len();
+        terminal.process_input(b"$ \x1b]133;B\x07\xe2\x80\xae\x1b]133;A\x07");
+        assert_eq!(terminal.command_zones.len(), zone_count);
+    }
+
+    #[test]
+    fn background_output_survives_scrollback_trim_as_a_bounded_snapshot() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.set_max_scrollback(3);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        for index in 0..12 {
+            terminal.process_input(format!("\r\nline-{index:02}").as_bytes());
+        }
+        terminal.process_input(b"\r\n\x1b]133;A\x07");
+
+        let zone = &terminal.command_zones[0];
+        let (output, truncated) = terminal.zone_output_text_capped(zone.id).unwrap();
+        assert!(!truncated, "raw capture is independent from scrollback");
+        assert!(zone.rows_evicted);
+        assert!(output.contains("line-00"), "retained head: {output:?}");
+        assert!(output.contains("line-11"), "retained tail: {output:?}");
+        assert!(output.len() <= TerminalState::ZONE_OUTPUT_CAP_BYTES);
+    }
+
+    #[test]
+    fn control_only_scrolling_cannot_erase_pending_background_output() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.set_max_scrollback(2);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07visible");
+        for _ in 0..12 {
+            terminal.process_input(b"\r\n");
+        }
+        terminal.process_input(b"\x1b]133;A\x07");
+
+        let zone = &terminal.command_zones[0];
+        assert!(zone.rows_evicted);
+        let expected = format!("visible{}", "\n".repeat(12));
+        assert_eq!(
+            terminal.zone_output_text(zone.id).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn background_snapshot_survives_resize_before_prompt_boundary() {
+        let mut terminal = TerminalState::new(24, 4);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\nresize-safe output");
+        terminal.on_resize(12, 4);
+        assert!(terminal.normalize_scrollback_width());
+        terminal.process_input(b"\r\nafter resize");
+        terminal.process_input(b"\r\n\x1b]133;A\x07");
+
+        let zone = &terminal.command_zones[0];
+        let output = terminal.zone_output_text(zone.id).unwrap();
+        assert!(
+            output.contains("resize-safe output"),
+            "resized background output: {output:?}"
+        );
+        assert!(
+            output.contains("after resize"),
+            "continued output: {output:?}"
+        );
+    }
+
+    #[test]
+    fn idle_background_raw_ring_retains_only_the_newest_eight_mib() {
+        let limit = TerminalState::IDLE_BACKGROUND_CAPTURE_BYTES;
+        let mut pending = IdleBackgroundOutput::new(0, 0);
+        pending.append(&vec![b'a'; limit], limit);
+        pending.append(b"tail", limit);
+
+        let raw = pending.raw_bytes();
+        assert_eq!(pending.raw_len, limit);
+        assert_eq!(raw.len(), limit);
+        assert!(pending.raw_truncated);
+        assert_eq!(&raw[limit - 4..], b"tail");
+        assert!(raw[..limit - 4].iter().all(|byte| *byte == b'a'));
+    }
+
+    #[test]
+    fn idle_background_ring_excludes_private_control_string_payloads() {
+        let mut pending = IdleBackgroundOutput::new(0, 0);
+        pending.append(b"visible", 32);
+        pending.append(b"\x1b_Gsecret-base64\x1b\\", 32);
+        pending.append(b" tail", 32);
+
+        assert_eq!(pending.raw_bytes(), b"visible tail");
+        assert!(!pending.raw_truncated);
+    }
+
+    #[test]
+    fn idle_background_ring_bounds_chunk_metadata_for_mixed_tokens() {
+        let limit = 64 * 1024;
+        let mut pending = IdleBackgroundOutput::new(0, 0);
+        for _ in 0..limit / 2 {
+            pending.append(b"a", limit);
+            pending.append(b"\r", limit);
+        }
+
+        assert_eq!(pending.raw_len, limit);
+        assert!(pending.raw_chunks.len() <= limit.div_ceil(IdleBackgroundOutput::CHUNK_BYTES));
+        assert_eq!(pending.raw_bytes().len(), limit);
+    }
+
+    #[test]
+    fn typeahead_before_the_next_b_keeps_that_prompt_dirty() {
+        let mut terminal = TerminalState::new(40, 6);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07running\r\n");
+        terminal.note_user_input(b"queued");
+        terminal.process_input(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            AgentPromptStatus::InputNotEmpty
+        );
+
+        terminal.process_input(b"queued\r\nlate echo\r\n\x1b]133;A\x07");
+        assert_eq!(
+            terminal.command_zones.len(),
+            1,
+            "only the real command block"
+        );
+    }
+
+    #[test]
+    fn same_write_submit_tail_taints_next_prompt_but_plain_enter_does_not() {
+        let mut terminal = TerminalState::new(40, 6);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal.note_user_input(b"cmd\rqueued");
+        terminal.process_input(b"cmd\rqueued\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            terminal.agent_prompt_status(),
+            AgentPromptStatus::InputNotEmpty
+        );
+        terminal.process_input(b"queued\r\n\x1b]133;A\x07");
+        assert_eq!(terminal.command_zones.len(), 1);
+
+        let mut plain_enter = TerminalState::new(40, 6);
+        plain_enter.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        plain_enter.note_user_input(b"cmd\r");
+        plain_enter.process_input(b"cmd\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        plain_enter.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(plain_enter.agent_prompt_status(), AgentPromptStatus::Ready);
+    }
+
+    #[test]
+    fn prompt_redraw_carries_dirty_edit_but_ctrl_c_starts_clean() {
+        let mut redraw = TerminalState::new(40, 6);
+        redraw.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        redraw.note_user_input(b"x");
+        redraw.process_input(b"x");
+        redraw.process_input(b"\x1b[2J\x1b[H\x1b]133;A\x07$ \x1b]133;B\x07x");
+        assert_eq!(
+            redraw.agent_prompt_status(),
+            AgentPromptStatus::InputNotEmpty
+        );
+        redraw.process_input(b"\x1b]133;A\x07");
+        assert!(redraw.command_zones.is_empty());
+
+        let mut cancelled = TerminalState::new(40, 6);
+        cancelled.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        cancelled.note_user_input(b"x");
+        cancelled.process_input(b"x");
+        cancelled.note_user_input(b"\x03");
+        cancelled.process_input(b"^C\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(cancelled.agent_prompt_status(), AgentPromptStatus::Ready);
+        assert!(cancelled.command_zones.is_empty());
+    }
+
+    #[test]
+    fn one_background_snapshot_never_exceeds_the_one_mib_cap() {
+        let mut terminal = TerminalState::new(1024, 4);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let output = vec![b'x'; TerminalState::ZONE_OUTPUT_CAP_BYTES + 2048];
+        terminal.process_input(&output);
+        terminal.process_input(b"\x1b]133;A\x07");
+
+        let zone = &terminal.command_zones[0];
+        let (captured, truncated) = zone.captured_output.as_ref().unwrap();
+        assert!(truncated);
+        assert!(captured.len() <= TerminalState::ZONE_OUTPUT_CAP_BYTES);
+        assert_eq!(terminal.captured_output_bytes, captured.len());
     }
 
     #[test]

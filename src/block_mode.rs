@@ -505,6 +505,44 @@ where
     }
 }
 
+/// Join already-rendered Markdown snippets for a whole-block selection in
+/// terminal order. A thematic break separates blocks, matching anvil/forge.
+/// The aggregation is atomic: exceeding the clipboard cap returns an error
+/// instead of copying a misleading prefix of the selection.
+pub fn selected_markdown_text<I>(
+    blocks: I,
+    selection: &BlockSelection,
+    max_bytes: usize,
+) -> Result<SelectedClipboard, SelectedClipboardError>
+where
+    I: IntoIterator<Item = (u64, String)>,
+{
+    let mut text = String::new();
+    let mut block_count = 0usize;
+    for (id, part) in blocks {
+        if !selection.contains(id) {
+            continue;
+        }
+        let separator = if text.is_empty() { "" } else { "\n---\n\n" };
+        let next_len = text
+            .len()
+            .checked_add(separator.len())
+            .and_then(|length| length.checked_add(part.len()))
+            .ok_or(SelectedClipboardError::TooLarge)?;
+        if next_len > max_bytes {
+            return Err(SelectedClipboardError::TooLarge);
+        }
+        text.push_str(separator);
+        text.push_str(&part);
+        block_count += 1;
+    }
+    if text.is_empty() {
+        Err(SelectedClipboardError::Empty)
+    } else {
+        Ok(SelectedClipboard { text, block_count })
+    }
+}
+
 /// Proleptic-Gregorian civil date/time for a unix-epoch millisecond
 /// timestamp shifted by `offset_secs` (a fixed UTC offset), via Howard
 /// Hinnant's `civil_from_days`. Hand-rolled because this crate deliberately
@@ -665,7 +703,10 @@ pub fn markdown_export_with_state(
     if command_truncated {
         meta.push_str("- Note: command truncated by shell\n");
     }
-    if !completion_observed {
+    // Background output was never a command lifecycle, so there is no command
+    // completion marker to be missing. Keep this note for incomplete command
+    // zones only.
+    if !background && !completion_observed {
         meta.push_str("- Note: command completion not observed\n");
     }
     if !meta.is_empty() {
@@ -1121,6 +1162,38 @@ mod tests {
     }
 
     #[test]
+    fn selected_markdown_copy_is_ordered_separated_and_bounded() {
+        let mut selection = BlockSelection::default();
+        // Deliberately select out of insertion order: source/terminal order wins.
+        selection.click(&[1, 2, 3], 2, true, false);
+        selection.click(&[1, 2, 3], 1, true, false);
+        let source = || {
+            [
+                (1, "## Command Block\n\nfirst\n".to_string()),
+                (2, "## Command Block\n\nsecond\n".to_string()),
+                (3, "ignored".to_string()),
+            ]
+        };
+
+        assert_eq!(
+            selected_markdown_text(source(), &selection, 1024),
+            Ok(SelectedClipboard {
+                text: "## Command Block\n\nfirst\n\n---\n\n## Command Block\n\nsecond\n"
+                    .to_string(),
+                block_count: 2,
+            })
+        );
+        assert_eq!(
+            selected_markdown_text(source(), &selection, 40),
+            Err(SelectedClipboardError::TooLarge)
+        );
+        assert_eq!(
+            selected_markdown_text(source(), &BlockSelection::default(), 1024),
+            Err(SelectedClipboardError::Empty)
+        );
+    }
+
+    #[test]
     fn timestamps_pin_fixed_offsets_including_day_rollover() {
         // date -u -d @1234567890 => Fri Feb 13 23:31:30 UTC 2009
         const EPOCH_MS: u64 = 1_234_567_890_123;
@@ -1316,16 +1389,21 @@ mod tests {
 
     #[test]
     fn markdown_export_background_zone_has_no_command_section_or_exit_line() {
-        let markdown = markdown_export(&MarkdownBlock {
-            command: None,
-            output: "stray output",
-            output_truncated: false,
-            exit_code: Some(1),
-            duration_ms: Some(500),
-            finished_at_ms: None,
-            tz_offset_secs: 0,
-            cwd: None,
-        });
+        let markdown = markdown_export_with_state(
+            &MarkdownBlock {
+                command: None,
+                output: "stray output",
+                output_truncated: false,
+                exit_code: Some(1),
+                duration_ms: Some(500),
+                finished_at_ms: None,
+                tz_offset_secs: 0,
+                cwd: None,
+            },
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             markdown,
             "## Command Block\n\

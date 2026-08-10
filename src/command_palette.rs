@@ -384,8 +384,8 @@ impl PaletteState {
                 action: PaletteAction::BlockCopyBlock,
             },
             PaletteItem {
-                name: "Copy Block as Markdown",
-                description: "Copy the selected (or latest) block as a Markdown snippet",
+                name: "Copy Blocks as Markdown",
+                description: "Copy selected blocks (or latest block) as Markdown snippets",
                 shortcut: "",
                 action: PaletteAction::BlockCopyMarkdown,
             },

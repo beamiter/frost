@@ -7,6 +7,7 @@ use jterm_core::pane_layout::{
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
+mod ansi;
 mod block_export;
 mod block_mode;
 mod color;
@@ -1676,6 +1677,7 @@ impl Session {
         }
         self.queued_response_bytes += out.len();
         Self::push_queue_owned(&mut self.write_queue, out, true);
+        self.terminal.note_protocol_response();
         let _ = self.flush_write_queue();
     }
 
@@ -6339,33 +6341,18 @@ impl Frost {
         iced::clipboard::write(text)
     }
 
-    /// Copy the selected block (newest when nothing is selected) as the
-    /// family's shared Markdown snippet, including retained lifecycle/capture
-    /// notes when the available data is incomplete.
-    fn block_copy_markdown_task(&mut self) -> Task<Message> {
-        if !self.ensure_block_action_available("Block Markdown copy") {
-            return Task::none();
-        }
-        let Some(id) = self.block_target_zone_id("copy") else {
-            return Task::none();
+    fn block_markdown(terminal: &terminal::TerminalState, zone: &terminal::CommandZone) -> String {
+        let (output, output_truncated, output_unavailable) = match terminal
+            .zone_output_export_capped(zone.id)
+        {
+            Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                (text, truncated, false)
+            }
+            Some(terminal::ZoneOutputExport::Empty) => (String::new(), false, false),
+            Some(terminal::ZoneOutputExport::Unavailable) | None => (String::new(), false, true),
         };
-        let Some(sess) = self.sessions.get(self.active) else {
-            return Task::none();
-        };
-        let Some(zone) = sess.terminal.zone_by_id(id) else {
-            return Task::none();
-        };
-        let (output, output_truncated, output_unavailable) =
-            match sess.terminal.zone_output_export_capped(id) {
-                Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
-                    (text, truncated, false)
-                }
-                Some(terminal::ZoneOutputExport::Empty) => (String::new(), false, false),
-                Some(terminal::ZoneOutputExport::Unavailable) => (String::new(), false, true),
-                None => return Task::none(),
-            };
-        // Local offset resolved AT the finish instant (not "now"), so a
-        // block that finished across a DST change renders its own offset.
+        // Resolve the offset at the finish instant, not at copy time, so a
+        // block that crossed a DST change keeps the correct local timestamp.
         let tz_offset_secs = block_mode::local_offset_secs(zone.finished_at_ms.map_or_else(
             || {
                 std::time::SystemTime::now()
@@ -6374,7 +6361,7 @@ impl Frost {
             },
             |ms| (ms / 1000) as i64,
         ));
-        let markdown = block_mode::markdown_export_with_state(
+        block_mode::markdown_export_with_state(
             &block_mode::MarkdownBlock {
                 command: zone.command.as_deref(),
                 output: &output,
@@ -6388,7 +6375,91 @@ impl Frost {
             zone.command_truncated,
             output_unavailable,
             zone.completion_observed,
-        );
+        )
+    }
+
+    /// Copy every selected block as Markdown in terminal order. Rendering is
+    /// lazy and aggregation is bounded, so an oversized selection fails
+    /// atomically instead of placing a partial history on the clipboard.
+    fn block_copy_selected_markdown_task(&mut self) -> Option<Task<Message>> {
+        let result = {
+            let sess = self.sessions.get_mut(self.active)?;
+            if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+                return None;
+            }
+            if sess.block_selection.is_empty() {
+                return None;
+            }
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            if !sess.block_selection.retain(&ids) {
+                Err(block_mode::SelectedClipboardError::Empty)
+            } else {
+                block_mode::selected_markdown_text(
+                    sess.terminal
+                        .command_zones
+                        .iter()
+                        .filter(|zone| sess.block_selection.contains(zone.id))
+                        .map(|zone| (zone.id, Self::block_markdown(&sess.terminal, zone))),
+                    &sess.block_selection,
+                    block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+                )
+            }
+        };
+
+        match result {
+            Ok(copied) => {
+                self.push_toast(
+                    format!(
+                        "Copied {} selected block{} as Markdown",
+                        copied.block_count,
+                        if copied.block_count == 1 { "" } else { "s" }
+                    ),
+                    ToastKind::Success,
+                );
+                Some(iced::clipboard::write(copied.text))
+            }
+            Err(block_mode::SelectedClipboardError::Empty) => {
+                self.push_toast("Selected blocks are no longer available", ToastKind::Info);
+                Some(Task::none())
+            }
+            Err(
+                block_mode::SelectedClipboardError::TooLarge
+                | block_mode::SelectedClipboardError::OutputUnavailable,
+            ) => {
+                self.push_toast(
+                    "Selected block Markdown is too large to copy",
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// Copy the selected block(s), or newest block when nothing is selected,
+    /// as the family's shared Markdown snippet, including retained
+    /// lifecycle/capture notes when the available data is incomplete.
+    fn block_copy_markdown_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Block Markdown copy") {
+            return Task::none();
+        }
+        if let Some(task) = self.block_copy_selected_markdown_task() {
+            return task;
+        }
+        let Some(id) = self.block_target_zone_id("copy") else {
+            return Task::none();
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            return Task::none();
+        };
+        let markdown = Self::block_markdown(&sess.terminal, zone);
         self.push_toast("Copied block as Markdown", ToastKind::Success);
         iced::clipboard::write(markdown)
     }
