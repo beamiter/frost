@@ -1428,6 +1428,7 @@ enum Message {
     SetAllowClipboardRead(bool),
     SetNotifyLongBlocks(bool),
     SetBlockMode(bool),
+    SetBlockCompact(bool),
     SetShowRepoStrip(bool),
     SetBottomBar(bool),
     ThemeEditOpen,
@@ -8851,6 +8852,12 @@ impl Frost {
                 self.config_dirty = true;
                 self.apply_config();
             }
+            Message::SetBlockCompact(compact) => {
+                // Paint-only in Frost's continuous grid: current nested panes
+                // update immediately without a PTY resize or history reflow.
+                self.config.block_compact = compact;
+                self.config_dirty = true;
+            }
             Message::SetShowRepoStrip(show) => {
                 self.config.show_repo_strip = show;
                 // Hide immediately; the periodic tick would otherwise show a
@@ -10695,6 +10702,16 @@ impl Frost {
     /// The live block badge when it fits over blank cells on `viewport_row`,
     /// paired with the elapsed time that produced it. Paint and subscription
     /// gating share this check so a hidden badge never owns a redraw timer.
+    fn block_badge_cell_char(cell: &terminal::TerminalCell) -> char {
+        if cell.flags.wide_continuation() {
+            // A continuation cell carries no standalone character, but it is
+            // still occupied by the wide glyph immediately to its left.
+            '\u{fffd}'
+        } else {
+            cell.character
+        }
+    }
+
     fn fitting_running_badge(&self, sess: &Session, viewport_row: usize) -> Option<(String, u64)> {
         let elapsed_ms = sess.terminal.running_duration_ms()?;
         let badge = block_mode::running_badge_text(elapsed_ms);
@@ -10704,15 +10721,14 @@ impl Frost {
             .grid
             .get(viewport_row)?
             .iter()
-            .map(|cell| cell.character)
+            .map(Self::block_badge_cell_char)
             .collect();
         block_mode::badge_fits(&chars, badge.chars().count() + inset).then_some((badge, elapsed_ms))
     }
 
-    /// Block-mode chrome for each of `sess`'s visible rows: outcome stripes,
-    /// per-prompt separators, first-row badges, and the selected-block
-    /// outlines (with a stronger stripe on the active edge). Absolute zone
-    /// rows translate to viewport rows with the same
+    /// Block-mode metadata for each of `sess`'s visible rows: card grouping,
+    /// real (not viewport-clipped) edges, state/tint, outcome stripes and
+    /// first-row badges. Absolute zone rows translate to viewport rows with the same
     /// arithmetic (and the same reflow approximation) as search matches.
     /// Empty when the feature is off or a full-screen app owns the grid.
     fn block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
@@ -10742,11 +10758,14 @@ impl Frost {
             .collect();
         let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
         let spans = block_mode::spans(&starts, live_boundary);
-        let muted = Theme::rgb_to_color32(self.theme.ui.text_disabled);
-        let accent = self.theme.cursor_color();
+        // UI/navigation accent stays independent of OSC 12 cursor overrides,
+        // matching the semantic Block palette in Anvil/Forge.
+        let accent = self.c_accent();
         let mut paint = vec![terminal_view::BlockPaintRow::default(); rows];
 
-        for (zone, &(zone_start, zone_end)) in zones.iter().copied().zip(&spans) {
+        for (zone_index, (zone, &(zone_start, zone_end))) in
+            zones.iter().copied().zip(&spans).enumerate()
+        {
             if zone_end <= start || zone_start >= end {
                 continue;
             }
@@ -10754,7 +10773,14 @@ impl Frost {
             let color = match outcome {
                 BlockOutcome::Success => self.theme.ansi_color(2),
                 BlockOutcome::Failed(_) => self.theme.ansi_color(1),
-                BlockOutcome::Background | BlockOutcome::Unknown => muted,
+                BlockOutcome::Unknown => self.theme.ansi_color(3),
+                BlockOutcome::Background => accent,
+            };
+            let card_kind = match outcome {
+                BlockOutcome::Success => terminal_view::BlockCardKind::Finished,
+                BlockOutcome::Failed(_) => terminal_view::BlockCardKind::Failed,
+                BlockOutcome::Unknown => terminal_view::BlockCardKind::Unknown,
+                BlockOutcome::Background => terminal_view::BlockCardKind::Background,
             };
             let selected = sess.block_selection.contains(zone.id);
             let active = sess.block_selection.active() == Some(zone.id);
@@ -10762,18 +10788,21 @@ impl Frost {
                 let row = &mut paint[abs_row - start];
                 row.selectable = true;
                 row.stripe = Some(color);
-                if selected {
-                    row.outline_sides = true;
-                }
-                if active {
-                    row.stripe_strong = true;
-                }
+                row.stripe_strong = active;
+                // Zero is reserved for the live/input card below. The value is
+                // viewport-local; stable interactions continue to key on the
+                // terminal zone id rather than this paint grouping.
+                row.card_group = Some(zone_index + 1);
+                row.card_kind = card_kind;
+                row.card_top = abs_row == zone_start;
+                row.card_bottom = abs_row.saturating_add(1) == zone_end;
+                row.card_selected = selected;
+                row.card_selection_active = active;
             }
             if zone_start >= start {
                 let row = &mut paint[zone_start - start];
                 row.separator = true;
                 row.bookmarked = sess.block_bookmarks.contains(zone.id);
-                row.outline_top = selected;
                 if let Some(plain) = block_mode::badge_text(outcome, zone.duration_ms) {
                     // The selected block's badge appends its LOCAL finish
                     // time. Two-stage fit (ember's rule): if the suffixed
@@ -10790,7 +10819,7 @@ impl Frost {
                     .ceil() as usize;
                     let chars: Vec<char> = sess.grid[zone_start - start]
                         .iter()
-                        .map(|cell| cell.character)
+                        .map(Self::block_badge_cell_char)
                         .collect();
                     for badge in suffixed.into_iter().chain(std::iter::once(plain)) {
                         let needed = badge.chars().count() + inset;
@@ -10801,28 +10830,41 @@ impl Frost {
                     }
                 }
             }
-            if selected && zone_end > zone_start && zone_end <= end && zone_end > start {
-                paint[zone_end - 1 - start].outline_bottom = true;
-            }
         }
 
-        // The in-flight execution paints an accent stripe from its prompt row
-        // to the bottom and, like forge's running header, keeps its elapsed
-        // time visible. A live prompt being edited gets only the separator.
-        if let Some(run_start) = running {
-            for abs_row in run_start.max(start)..end.min(total) {
-                paint[abs_row - start].stripe = Some(accent);
-            }
-            if run_start >= start && run_start < end {
-                let row = &mut paint[run_start - start];
-                row.separator = true;
-                if let Some((badge, _)) = self.fitting_running_badge(sess, run_start - start) {
-                    row.badge = Some((badge, accent));
+        // Running output and the editable prompt are one native iced active
+        // card. Match the family's six-row input minimum and grow only through
+        // the current output/cursor row, without changing Frost's PTY or cell
+        // geometry.
+        if let Some(active_start) = running.or(live_prompt) {
+            let cursor_absolute_row = terminal
+                .scrollback_len()
+                .saturating_add(terminal.get_cursor_pos().0);
+            if let Some(span) = block_mode::visible_active_span(
+                active_start,
+                cursor_absolute_row,
+                total,
+                start,
+                end,
+            ) {
+                for abs_row in span.start..span.end {
+                    let row = &mut paint[abs_row - start];
+                    row.stripe = Some(accent);
+                    row.card_group = Some(0);
+                    row.card_kind = terminal_view::BlockCardKind::Active;
+                    row.card_top = span.real_top && abs_row == span.start;
+                    row.card_bottom = span.real_bottom && abs_row.saturating_add(1) == span.end;
                 }
             }
-        } else if let Some(prompt_row) = live_prompt {
-            if prompt_row >= start && prompt_row < end {
-                paint[prompt_row - start].separator = true;
+            if active_start >= start && active_start < end {
+                let row = &mut paint[active_start - start];
+                row.separator = true;
+                if running.is_some() {
+                    if let Some((badge, _)) = self.fitting_running_badge(sess, active_start - start)
+                    {
+                        row.badge = Some((badge, accent));
+                    }
+                }
             }
         }
         paint
@@ -10946,6 +10988,7 @@ impl Frost {
         ))
         .search(search_matches, current)
         .blocks(blocks)
+        .block_compact(self.config.block_compact)
         .block_markers(self.block_marker_fractions(sess))
         .block_bookmark_markers(self.block_bookmark_marker_fractions(sess))
         .app_mouse(sess.terminal.is_mouse_enabled())
@@ -12353,9 +12396,19 @@ impl Frost {
             compact,
             "Blocks",
             checkbox(self.config.block_mode)
-                .label("Command blocks (OSC 133 stripes and exit badges)")
+                .label("Command cards (OSC 133)")
                 .text_size(13)
                 .on_toggle(Message::SetBlockMode)
+                .into(),
+        );
+
+        let block_compact_row = responsive_control_row(
+            compact,
+            "Block spacing",
+            checkbox(self.config.block_compact)
+                .label("Compact Block Spacing")
+                .text_size(13)
+                .on_toggle(Message::SetBlockCompact)
                 .into(),
         );
 
@@ -12603,6 +12656,7 @@ impl Frost {
             repo_strip_row,
             bottom_bar_row,
             block_mode_row,
+            block_compact_row,
             ai_header,
             ai_enable_row,
             ai_provider_row,
@@ -14262,6 +14316,21 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn block_badge_treats_wide_continuations_as_occupied() {
+        let mut continuation = terminal::TerminalCell {
+            character: '\0',
+            ..terminal::TerminalCell::default()
+        };
+        continuation.flags.set_wide_continuation(true);
+        let chars = [' ', Frost::block_badge_cell_char(&continuation)];
+        assert!(!block_mode::badge_fits(&chars, 1));
+
+        continuation.flags.set_wide_continuation(false);
+        let chars = [' ', Frost::block_badge_cell_char(&continuation)];
+        assert!(block_mode::badge_fits(&chars, 1));
+    }
 
     #[test]
     fn block_key_ownership_preserves_running_program_input() {

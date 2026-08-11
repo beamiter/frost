@@ -14,7 +14,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
-- OSC 133 Block mode：命令按成功/失败绘制条纹与耗时徽标，空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
+- OSC 133 Block mode：完成命令、Background 输出和当前输入/运行区以主题相对卡片呈现（状态条、轻染色、圆角、状态/耗时徽标，支持普通与 Compact Block Spacing），空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
 - 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
@@ -188,6 +188,7 @@ tab_position = "top"
 restore_session = true
 disable_alt_screen = false
 block_mode = true     # OSC 133 命令块、gutter、搜索与右键动作
+block_compact = false # Compact Block Spacing；仅收紧卡片内缩/圆角，不改变终端行列
 
 # 可选：明确指定 shell
 shell = "/bin/bash"
@@ -225,6 +226,8 @@ ai_stream = true
 ```
 
 `Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
+
+设置中的 **Compact Block Spacing** 与 `block_compact` 是同一开关，并会立即更新所有当前 pane。它只收紧卡片内缩与圆角，不改变连续终端 grid 的行列、OSC 133 区域坐标或 PTY 大小。
 
 如果 `config.toml` 或 `keybindings.toml` 编辑出错，frost 会保留最后一次可用配置并在窗口内显示诊断。主配置有错误时自动保存会暂停，避免默认值覆盖原文件；修正文件后会自动恢复热重载。
 

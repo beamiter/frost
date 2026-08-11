@@ -275,11 +275,17 @@ pub struct Config {
     #[serde(default = "default_click_moves_cursor")]
     pub click_moves_cursor: bool,
 
-    /// Draw Warp-style command-block chrome over OSC 133 zones: an outcome
-    /// stripe in the left gutter, a separator per prompt, and a first-row
-    /// exit/duration badge. Same `block_mode` key and default as anvil/4.
+    /// Draw theme-relative command cards over OSC 133 zones: rounded/tinted
+    /// surfaces, outcome stripes, selection outlines and first-row status /
+    /// duration badges. Same `block_mode` key and default as the family.
     #[serde(default = "default_block_mode")]
     pub block_mode: bool,
+
+    /// Paint the same Block cards with the family's compact 4px inset / 6px
+    /// radius. Frost's continuous terminal grid does not change dimensions;
+    /// this is a presentation-only density switch.
+    #[serde(default)]
+    pub block_compact: bool,
 
     /// Append each OSC 133 completed command to the family-shared JSONL
     /// history index (same keys and file format as anvil/forge), so the
@@ -601,6 +607,7 @@ impl Default for Config {
             bottom_bar: default_bottom_bar(),
             click_moves_cursor: default_click_moves_cursor(),
             block_mode: default_block_mode(),
+            block_compact: false,
             command_history_enabled: default_command_history_enabled(),
             command_history_path: None,
             command_history_max_entries: default_command_history_max_entries(),
@@ -1102,6 +1109,15 @@ mod tests {
 
         let config = Config::from_toml("block_mode = false\n").expect("override parses");
         assert!(!config.block_mode);
+    }
+
+    #[test]
+    fn block_compact_defaults_off_and_can_be_enabled() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(!config.block_compact);
+
+        let config = Config::from_toml("block_compact = true\n").expect("override parses");
+        assert!(config.block_compact);
     }
 
     #[test]

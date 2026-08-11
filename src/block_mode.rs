@@ -393,14 +393,14 @@ pub fn format_duration(dur_ms: u64) -> String {
     }
 }
 
-/// First-row badge text, or `None` when the block gets no badge (background
-/// blocks, and running blocks which never reach this function). An unknown
-/// exit shows a bare `?` — there is no number to show, so none is invented.
+/// First-row card badge text (running blocks have their own live badge).
+/// Background output and unknown completions stay explicit rather than looking
+/// like ordinary successful commands.
 /// Failed blocks name the killing signal right after the code (the
 /// `jterm_core::bottom_bar` convention), with the duration last.
 pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<String> {
     match outcome {
-        BlockOutcome::Background => None,
+        BlockOutcome::Background => Some("↻ Background".to_string()),
         BlockOutcome::Success => Some(match duration_ms {
             Some(ms) => format!("✓ {}", format_duration(ms)),
             None => "✓".to_string(),
@@ -415,7 +415,7 @@ pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<Str
             }
             Some(text)
         }
-        BlockOutcome::Unknown => Some("?".to_string()),
+        BlockOutcome::Unknown => Some("? exit:?".to_string()),
     }
 }
 
@@ -442,6 +442,46 @@ pub fn spans(starts: &[usize], live_boundary: usize) -> Vec<(usize, usize)> {
             (start, end.max(start))
         })
         .collect()
+}
+
+/// Family minimum for the live input/running-command surface. Frost maps this
+/// to paint metadata only; it never inserts terminal rows or resizes the PTY.
+pub const MIN_INPUT_ROWS: usize = 6;
+
+/// Visible slice of the live input/running card in absolute buffer rows.
+/// `real_top`/`real_bottom` say whether the corresponding target edge is
+/// actually visible, rather than manufactured by viewport clipping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibleActiveSpan {
+    pub start: usize,
+    pub end: usize,
+    pub real_top: bool,
+    pub real_bottom: bool,
+}
+
+/// Project the family-sized live card into one viewport. Its target end grows
+/// with output/cursor movement but stays at least [`MIN_INPUT_ROWS`] below the
+/// prompt. The terminal/grid end remains a hard limit because this is visual
+/// chrome over Frost's existing continuous grid.
+pub fn visible_active_span(
+    active_start: usize,
+    cursor_absolute_row: usize,
+    terminal_end: usize,
+    viewport_start: usize,
+    viewport_end: usize,
+) -> Option<VisibleActiveSpan> {
+    let target_end = active_start
+        .saturating_add(MIN_INPUT_ROWS)
+        .max(cursor_absolute_row.saturating_add(1))
+        .min(terminal_end);
+    let start = active_start.max(viewport_start);
+    let end = target_end.min(viewport_end);
+    (start < end).then_some(VisibleActiveSpan {
+        start,
+        end,
+        real_top: start == active_start,
+        real_bottom: end == target_end,
+    })
 }
 
 /// Fence for one Markdown code block: `max(3, longest consecutive-backtick
@@ -1376,9 +1416,12 @@ mod tests {
         // Unknown shows no exit number at all — nothing was reported.
         assert_eq!(
             badge_text(BlockOutcome::Unknown, Some(500)).as_deref(),
-            Some("?")
+            Some("? exit:?")
         );
-        assert_eq!(badge_text(BlockOutcome::Background, Some(500)), None);
+        assert_eq!(
+            badge_text(BlockOutcome::Background, Some(500)).as_deref(),
+            Some("↻ Background")
+        );
     }
 
     #[test]
@@ -1398,6 +1441,61 @@ mod tests {
         assert_eq!(spans(&[], 9), Vec::<(usize, usize)>::new());
         // A boundary that never precedes its start (clamped, not panicking).
         assert_eq!(spans(&[5], 3), vec![(5, 5)]);
+    }
+
+    #[test]
+    fn active_span_is_six_rows_grows_with_cursor_and_preserves_clip_edges() {
+        assert_eq!(
+            visible_active_span(10, 10, 100, 0, 30),
+            Some(VisibleActiveSpan {
+                start: 10,
+                end: 16,
+                real_top: true,
+                real_bottom: true,
+            })
+        );
+        assert_eq!(
+            visible_active_span(10, 20, 100, 0, 30),
+            Some(VisibleActiveSpan {
+                start: 10,
+                end: 21,
+                real_top: true,
+                real_bottom: true,
+            })
+        );
+
+        // Neither viewport boundary is allowed to masquerade as a card edge.
+        assert_eq!(
+            visible_active_span(10, 10, 100, 12, 15),
+            Some(VisibleActiveSpan {
+                start: 12,
+                end: 15,
+                real_top: false,
+                real_bottom: false,
+            })
+        );
+        assert_eq!(
+            visible_active_span(10, 10, 100, 12, 30),
+            Some(VisibleActiveSpan {
+                start: 12,
+                end: 16,
+                real_top: false,
+                real_bottom: true,
+            })
+        );
+
+        // Near the terminal bottom the existing grid is the hard limit; no
+        // synthetic rows are introduced to satisfy the visual minimum.
+        assert_eq!(
+            visible_active_span(97, 97, 100, 90, 100),
+            Some(VisibleActiveSpan {
+                start: 97,
+                end: 100,
+                real_top: true,
+                real_bottom: true,
+            })
+        );
+        assert_eq!(visible_active_span(10, 10, 100, 30, 40), None);
     }
 
     #[test]

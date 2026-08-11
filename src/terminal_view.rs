@@ -16,7 +16,8 @@ use iced::advanced::widget::{tree, Tree, Widget};
 use iced::advanced::{Clipboard, Shell};
 use iced::mouse;
 use iced::{
-    Background, Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Shadow, Size,
+    border, Background, Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Shadow,
+    Size, Vector,
 };
 
 /// Which mouse button a [`MouseInput`] refers to.
@@ -91,6 +92,16 @@ const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const BLOCK_STRIPE_WIDTH: f32 = 3.0;
 /// Width of the stripe on the active edge of a block selection (full opacity too).
 const BLOCK_STRIPE_SELECTED_WIDTH: f32 = 5.0;
+/// Finished/live cards use the same horizontal inset as the normal
+/// Anvil/Forge Block surface. Compact mode halves it without moving column 0:
+/// the inset is paint-only and therefore never changes PTY geometry.
+const BLOCK_CARD_INSET: f32 = 8.0;
+const BLOCK_CARD_COMPACT_INSET: f32 = 4.0;
+const BLOCK_CARD_RADIUS: f32 = 10.0;
+const BLOCK_CARD_COMPACT_RADIUS: f32 = 6.0;
+/// A one-pixel breathing gap at real card edges gives adjacent single-grid
+/// blocks separation without inserting synthetic terminal rows.
+const BLOCK_CARD_EDGE_GAP: f32 = 1.0;
 /// Minimum width of the gutter hit band used for block selection. Ties to the
 /// stripe widths above: it must cover the widest stripe
 /// (`BLOCK_STRIPE_SELECTED_WIDTH` = 5px, plus 1px slack) so a press anywhere
@@ -102,6 +113,19 @@ const BLOCK_STRIPE_SELECTED_WIDTH: f32 = 5.0;
 /// Layout-owned space to the left of column zero while Block Mode is enabled.
 /// Paint and hit testing stay inside this reservation and never cover glyphs.
 const BLOCK_GUTTER_WIDTH: f32 = 8.0;
+
+/// Visual role of one card. This is intentionally renderer-owned: Frost keeps
+/// a single terminal grid while Anvil/Forge use separate VTE widgets, but the
+/// user-visible state and theme-relative treatment remain the same.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockCardKind {
+    #[default]
+    Finished,
+    Failed,
+    Unknown,
+    Background,
+    Active,
+}
 
 fn is_block_gutter_press(
     button: MouseButton,
@@ -134,15 +158,280 @@ pub struct BlockPaintRow {
     pub stripe: Option<Color>,
     /// Draw the stripe wider and at full opacity (active selection edge).
     pub stripe_strong: bool,
-    /// 1px separator line across the top edge of this row.
+    /// Viewport-local identity shared by every visible row of one card. This
+    /// lets the renderer batch a card into one backdrop and one border rather
+    /// than repainting a full rectangle once per terminal row.
+    pub card_group: Option<usize>,
+    pub card_kind: BlockCardKind,
+    /// These name real terminal/card edges, not merely viewport clipping.
+    /// A long card entering from above therefore gets no fake rounded top, and
+    /// one leaving below gets no fake bottom edge.
+    pub card_top: bool,
+    pub card_bottom: bool,
+    pub card_selected: bool,
+    pub card_selection_active: bool,
+    /// Legacy/fallback 1px prompt separator. Cards use their real top border;
+    /// non-card rows may still opt into this line.
     pub separator: bool,
     /// Right-aligned first-row badge (text, color). Only set when the cells
     /// it covers are blank — the app checks before asking for it.
     pub badge: Option<(String, Color)>,
-    /// Selected-block outline edges crossing this row.
-    pub outline_top: bool,
-    pub outline_bottom: bool,
-    pub outline_sides: bool,
+}
+
+/// One contiguous visible slice of a card. `real_top`/`real_bottom` survive
+/// viewport clipping so geometry never invents a rounded edge in the middle of
+/// a long command's output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockCardSegment {
+    group: usize,
+    start_row: usize,
+    end_row: usize,
+    kind: BlockCardKind,
+    real_top: bool,
+    real_bottom: bool,
+    selected: bool,
+    selection_active: bool,
+    stripe: Option<Color>,
+    stripe_strong: bool,
+}
+
+/// Collect visible cards in O(visible rows). The app has already mapped block
+/// zones to rows; draw/hover code must never rescan scrollback or zone history.
+fn block_card_segments(rows: &[BlockPaintRow]) -> Vec<BlockCardSegment> {
+    let mut segments = Vec::with_capacity(rows.len().min(32));
+    let mut start = 0usize;
+    while start < rows.len() {
+        let Some(group) = rows[start].card_group else {
+            start += 1;
+            continue;
+        };
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].card_group == Some(group) {
+            end += 1;
+        }
+        let first = &rows[start];
+        let last = &rows[end - 1];
+        segments.push(BlockCardSegment {
+            group,
+            start_row: start,
+            end_row: end,
+            kind: first.card_kind,
+            real_top: first.card_top,
+            real_bottom: last.card_bottom,
+            selected: first.card_selected,
+            selection_active: first.card_selection_active,
+            stripe: first.stripe,
+            stripe_strong: first.stripe_strong,
+        });
+        start = end;
+    }
+    segments
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockCardGeometry {
+    body: Rectangle,
+    radius: border::Radius,
+}
+
+/// Paint-only card geometry. Terminal `Metrics`, column count and row count do
+/// not depend on this function, which is the key invariant for a native iced
+/// mapping of the multi-widget Anvil/Forge design.
+fn block_card_geometry(
+    bounds: Rectangle,
+    content_right: f32,
+    grid_origin_y: f32,
+    cell_height: f32,
+    segment: BlockCardSegment,
+    compact: bool,
+) -> BlockCardGeometry {
+    let inset = if compact {
+        BLOCK_CARD_COMPACT_INSET
+    } else {
+        BLOCK_CARD_INSET
+    };
+    let corner = if compact {
+        BLOCK_CARD_COMPACT_RADIUS
+    } else {
+        BLOCK_CARD_RADIUS
+    };
+    let mut top = grid_origin_y + segment.start_row as f32 * cell_height;
+    let mut bottom = grid_origin_y + segment.end_row as f32 * cell_height;
+    if segment.real_top {
+        top += BLOCK_CARD_EDGE_GAP;
+    }
+    if segment.real_bottom {
+        bottom -= BLOCK_CARD_EDGE_GAP;
+    }
+    bottom = bottom.max(top);
+    let left = bounds.x + inset;
+    let right = (content_right - inset).max(left);
+    let body = Rectangle {
+        x: left,
+        y: top,
+        // Keep the global history scrollbar outside every card, like the
+        // Anvil/Forge outer block scroller. `content_right` is its track's
+        // left edge, already accounting for configured terminal padding.
+        width: right - left,
+        height: bottom - top,
+    };
+    BlockCardGeometry {
+        body,
+        radius: border::Radius {
+            top_left: if segment.real_top { corner } else { 0.0 },
+            top_right: if segment.real_top { corner } else { 0.0 },
+            bottom_right: if segment.real_bottom { corner } else { 0.0 },
+            bottom_left: if segment.real_bottom { corner } else { 0.0 },
+        },
+    }
+}
+
+fn block_card_stripe_bounds(
+    widget_bounds: Rectangle,
+    body: Rectangle,
+    requested_width: f32,
+    glyph_origin_x: f32,
+) -> Rectangle {
+    // The window resize overlay owns the outermost 5px. Start at or inside its
+    // inner edge; a strong stripe may overlap the card body, but always keeps
+    // a visible/clickable portion inside the existing 8px Block gutter.
+    const WINDOW_RESIZE_EDGE: f32 = 5.0;
+    let x = (body.x - requested_width).max(widget_bounds.x + WINDOW_RESIZE_EDGE);
+    let width = (glyph_origin_x - x).clamp(0.0, requested_width.max(0.0));
+    Rectangle {
+        x,
+        y: body.y,
+        width,
+        height: body.height,
+    }
+}
+
+fn block_card_hover_contains(
+    widget_bounds: Rectangle,
+    body: Rectangle,
+    pointer_x: f32,
+    pointer_y: f32,
+) -> bool {
+    let left = (body.x - BLOCK_GUTTER_WIDTH).max(widget_bounds.x);
+    let right = body.x + body.width;
+    pointer_x >= left
+        && pointer_x < right
+        && pointer_y >= body.y
+        && pointer_y < body.y + body.height
+}
+
+/// Rectangular pieces for a viewport-clipped card outline. A regular iced
+/// `Quad` always paints all four border edges, so using it for a long card
+/// would manufacture a horizontal cap at the viewport clip. The continuing
+/// sides are always present; only real semantic top/bottom edges get caps.
+fn clipped_block_card_border_bounds(
+    body: Rectangle,
+    real_top: bool,
+    real_bottom: bool,
+    requested_width: f32,
+) -> [Option<Rectangle>; 4] {
+    let width = requested_width
+        .max(0.0)
+        .min(body.width * 0.5)
+        .min(body.height * 0.5);
+    if width <= 0.0 {
+        return [None; 4];
+    }
+    let left = Rectangle { width, ..body };
+    let right = Rectangle {
+        x: body.x + body.width - width,
+        width,
+        ..body
+    };
+    let top = Rectangle {
+        height: width,
+        ..body
+    };
+    let bottom = Rectangle {
+        y: body.y + body.height - width,
+        height: width,
+        ..body
+    };
+    [
+        Some(left),
+        Some(right),
+        real_top.then_some(top),
+        real_bottom.then_some(bottom),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockCardVisual {
+    background: Color,
+    border: Color,
+    border_width: f32,
+    shadow: Shadow,
+}
+
+fn alpha(color: Color, value: f32) -> Color {
+    Color {
+        a: color.a * value.clamp(0.0, 1.0),
+        ..color
+    }
+}
+
+/// Shared card-state treatment expressed using theme colors instead of fixed
+/// swatches. Alpha values mirror the Anvil/Forge CSS contract.
+fn block_card_visual(
+    segment: BlockCardSegment,
+    foreground: Color,
+    accent: Color,
+    hovered: bool,
+    opacity: f32,
+) -> BlockCardVisual {
+    let stripe = segment.stripe.unwrap_or(accent);
+    let (background, border, border_width) = if segment.selection_active {
+        (alpha(accent, 0.14), alpha(accent, 0.92), 2.0)
+    } else if segment.selected {
+        (alpha(accent, 0.08), alpha(accent, 0.48), 1.0)
+    } else if hovered {
+        (alpha(foreground, 0.05), alpha(foreground, 0.16), 1.0)
+    } else {
+        match segment.kind {
+            BlockCardKind::Failed => (alpha(stripe, 0.11), alpha(foreground, 0.08), 1.0),
+            BlockCardKind::Background => (alpha(accent, 0.07), alpha(accent, 0.24), 1.0),
+            BlockCardKind::Active => (alpha(accent, 0.035), alpha(accent, 0.32), 1.0),
+            BlockCardKind::Finished | BlockCardKind::Unknown => {
+                (alpha(foreground, 0.03), alpha(foreground, 0.08), 1.0)
+            }
+        }
+    };
+    let shadow = if segment.kind == BlockCardKind::Active {
+        Shadow {
+            color: alpha(Color::BLACK, 0.18 * opacity),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
+        }
+    } else if hovered {
+        Shadow {
+            color: alpha(Color::BLACK, 0.22 * opacity),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 14.0,
+        }
+    } else {
+        Shadow::default()
+    };
+    BlockCardVisual {
+        background: alpha(background, opacity),
+        border,
+        border_width,
+        shadow,
+    }
+}
+
+fn block_card_shadow(segment: BlockCardSegment, shadow: Shadow) -> Shadow {
+    if segment.real_top && segment.real_bottom {
+        shadow
+    } else {
+        // A shadow around a viewport-clipped rectangle would reintroduce the
+        // same false horizontal cap that selective borders avoid.
+        Shadow::default()
+    }
 }
 
 fn hovered_link_color() -> Color {
@@ -235,6 +524,9 @@ pub struct TermWidget<'a, Message> {
     /// Per visible row block chrome (stripes, separators, badges), aligned
     /// with the grid rows exactly like `selection`. Empty = no block mode.
     blocks: Vec<BlockPaintRow>,
+    /// Paint-only density switch shared with Anvil/Forge. It changes card
+    /// inset/radius but deliberately not [`Metrics`] or terminal dimensions.
+    block_compact: bool,
     /// Scrollbar-track fractions (0 = buffer top) of failed blocks; each gets
     /// a small red marker on the track. Empty = no block mode / no failures.
     block_markers: Vec<f32>,
@@ -316,6 +608,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             scroll_offset,
             scrollback_len,
             blocks: Vec::new(),
+            block_compact: false,
             block_markers: Vec::new(),
             block_bookmark_markers: Vec::new(),
             search_matches: Vec::new(),
@@ -417,6 +710,11 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// Supply per-visible-row block chrome (empty disables block painting).
     pub fn blocks(mut self, blocks: Vec<BlockPaintRow>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    pub fn block_compact(mut self, compact: bool) -> Self {
+        self.block_compact = compact;
         self
     }
 
@@ -604,11 +902,15 @@ fn solid_quad(bounds: Rectangle) -> Quad {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
+        block_card_geometry, block_card_hover_contains, block_card_segments, block_card_shadow,
+        block_card_stripe_bounds, block_card_visual, clipped_block_card_border_bounds,
         glyph_shaping, is_block_gutter_press, should_use_cjk_fallback_font,
         should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
-        should_use_symbol_fallback_font, terminal_glyph_font, Metrics, MouseButton,
-        BLOCK_GUTTER_WIDTH,
+        should_use_symbol_fallback_font, terminal_glyph_font, BlockCardKind, BlockCardSegment,
+        BlockPaintRow, Metrics, MouseButton, BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS,
+        BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
+    use iced::{Color, Rectangle};
 
     #[test]
     fn block_gutter_press_respects_application_mouse_ownership() {
@@ -646,6 +948,216 @@ mod tests {
         // gutter off recovers exactly one additional cell without overlap.
         assert_eq!(with_gutter.grid_size(72.0, 20.0).0, 10);
         assert_eq!(without_gutter.grid_size(72.0, 20.0).0, 11);
+    }
+
+    #[test]
+    fn card_segments_batch_rows_and_preserve_real_viewport_edges() {
+        let mut rows = vec![BlockPaintRow::default(); 6];
+        for row in &mut rows[..3] {
+            row.card_group = Some(4);
+            row.card_kind = BlockCardKind::Failed;
+            row.card_selected = true;
+            row.stripe = Some(Color::from_rgb8(200, 40, 30));
+        }
+        // This card entered from above, so its first visible row is not a real
+        // top. Its bottom is retained inside the viewport.
+        rows[2].card_bottom = true;
+        for row in &mut rows[4..] {
+            row.card_group = Some(9);
+            row.card_kind = BlockCardKind::Active;
+            row.stripe = Some(Color::from_rgb8(80, 180, 255));
+        }
+        rows[4].card_top = true;
+        rows[5].card_bottom = true;
+
+        let segments = block_card_segments(&rows);
+        assert_eq!(segments.len(), 2, "one draw segment per visible card");
+        assert_eq!((segments[0].start_row, segments[0].end_row), (0, 3));
+        assert!(!segments[0].real_top, "viewport clip is not a card top");
+        assert!(segments[0].real_bottom);
+        assert!(segments[0].selected);
+        assert_eq!(segments[1].kind, BlockCardKind::Active);
+        assert!(segments[1].real_top);
+        assert!(segments[1].real_bottom, "live card seals at grid bottom");
+    }
+
+    fn segment(real_top: bool, real_bottom: bool) -> BlockCardSegment {
+        BlockCardSegment {
+            group: 1,
+            start_row: 2,
+            end_row: 5,
+            kind: BlockCardKind::Finished,
+            real_top,
+            real_bottom,
+            selected: false,
+            selection_active: false,
+            stripe: Some(Color::from_rgb8(10, 200, 40)),
+            stripe_strong: false,
+        }
+    }
+
+    #[test]
+    fn card_geometry_is_paint_only_clipped_and_clear_of_scrollbar() {
+        let bounds = Rectangle {
+            x: 10.0,
+            y: 4.0,
+            width: 300.0,
+            height: 180.0,
+        };
+        // Track begins at x=288 after right padding; cards must end before it.
+        let normal = block_card_geometry(bounds, 288.0, 6.0, 10.0, segment(false, true), false);
+        assert_eq!(normal.body.x, bounds.x + BLOCK_CARD_INSET);
+        assert_eq!(normal.body.y, 26.0, "clipped top gets no synthetic gap");
+        assert_eq!(normal.body.y + normal.body.height, 55.0);
+        assert_eq!(normal.body.x + normal.body.width, 288.0 - BLOCK_CARD_INSET);
+        assert!(normal.body.x + normal.body.width <= 288.0);
+        assert_eq!(normal.radius.top_left, 0.0);
+        assert_eq!(normal.radius.top_right, 0.0);
+        assert_eq!(normal.radius.bottom_left, BLOCK_CARD_RADIUS);
+        assert_eq!(normal.radius.bottom_right, BLOCK_CARD_RADIUS);
+
+        let clipped_both =
+            block_card_geometry(bounds, 288.0, 6.0, 10.0, segment(false, false), false);
+        assert_eq!(
+            clipped_both.body.y + clipped_both.body.height,
+            56.0,
+            "clipped bottom gets no synthetic gap"
+        );
+        assert_eq!(clipped_both.radius.bottom_left, 0.0);
+        assert_eq!(clipped_both.radius.bottom_right, 0.0);
+
+        let compact = block_card_geometry(bounds, 288.0, 6.0, 10.0, segment(true, true), true);
+        assert_eq!(compact.body.x, bounds.x + BLOCK_CARD_COMPACT_INSET);
+        assert_eq!(compact.radius.top_left, BLOCK_CARD_COMPACT_RADIUS);
+        assert_eq!(compact.radius.bottom_right, BLOCK_CARD_COMPACT_RADIUS);
+
+        // Density changes card paint only; the PTY/grid calculation stays the
+        // one Metrics value used by both modes.
+        let metrics = Metrics::new(10.0, 1.0, 2.0, true);
+        assert_eq!(metrics.grid_size(300.0, 180.0), (48, 14));
+    }
+
+    #[test]
+    fn card_stripe_stays_inside_resize_safe_clickable_gutter() {
+        let widget = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 300.0,
+            height: 100.0,
+        };
+        let body = Rectangle {
+            x: BLOCK_CARD_INSET,
+            y: 1.0,
+            width: 260.0,
+            height: 40.0,
+        };
+        let normal = block_card_stripe_bounds(widget, body, 3.0, BLOCK_GUTTER_WIDTH);
+        assert_eq!(normal.x, 5.0, "stripe clears the 5px resize grip");
+        assert_eq!(normal.x + normal.width, body.x);
+        assert!(normal.x < BLOCK_GUTTER_WIDTH);
+
+        let strong = block_card_stripe_bounds(widget, body, 5.0, BLOCK_GUTTER_WIDTH + 2.0);
+        assert_eq!(strong.x, 5.0);
+        assert!(strong.x < BLOCK_GUTTER_WIDTH);
+        assert!(strong.x + strong.width > body.x);
+
+        // Zero terminal padding puts column zero exactly at the 8px gutter
+        // edge. Even the strong stripe must shrink instead of covering it.
+        let zero_padding = block_card_stripe_bounds(widget, body, 5.0, BLOCK_GUTTER_WIDTH);
+        assert_eq!(zero_padding.x + zero_padding.width, BLOCK_GUTTER_WIDTH);
+    }
+
+    #[test]
+    fn card_hover_excludes_scrollbar_and_right_inset() {
+        let widget = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 300.0,
+            height: 100.0,
+        };
+        let body = Rectangle {
+            x: 8.0,
+            y: 10.0,
+            width: 270.0,
+            height: 40.0,
+        };
+        assert!(block_card_hover_contains(widget, body, 4.0, 20.0));
+        assert!(block_card_hover_contains(widget, body, 277.0, 20.0));
+        assert!(!block_card_hover_contains(widget, body, 278.0, 20.0));
+        assert!(!block_card_hover_contains(widget, body, 290.0, 20.0));
+    }
+
+    #[test]
+    fn clipped_card_border_has_only_real_horizontal_caps() {
+        let body = Rectangle {
+            x: 8.0,
+            y: 10.0,
+            width: 120.0,
+            height: 60.0,
+        };
+        let clipped = clipped_block_card_border_bounds(body, false, true, 2.0);
+        assert!(clipped[0].is_some() && clipped[1].is_some());
+        assert!(clipped[2].is_none(), "viewport top is not a card cap");
+        assert_eq!(clipped[3].expect("real bottom").y, 68.0);
+
+        let continuing = clipped_block_card_border_bounds(body, false, false, 1.0);
+        assert!(continuing[0].is_some() && continuing[1].is_some());
+        assert!(continuing[2].is_none() && continuing[3].is_none());
+    }
+
+    #[test]
+    fn card_visuals_follow_theme_relative_state_precedence() {
+        let fg = Color::from_rgb8(220, 220, 220);
+        let accent = Color::from_rgb8(80, 180, 255);
+        let red = Color::from_rgb8(205, 49, 49);
+
+        let mut failed_segment = segment(true, true);
+        failed_segment.kind = BlockCardKind::Failed;
+        failed_segment.stripe = Some(red);
+        let failed = block_card_visual(failed_segment, fg, accent, false, 1.0);
+        assert_eq!(
+            (
+                failed.background.r,
+                failed.background.g,
+                failed.background.b
+            ),
+            (red.r, red.g, red.b)
+        );
+        assert!((failed.background.a - 0.11).abs() < f32::EPSILON);
+
+        let mut background_segment = segment(true, true);
+        background_segment.kind = BlockCardKind::Background;
+        background_segment.stripe = Some(accent);
+        let background = block_card_visual(background_segment, fg, accent, false, 1.0);
+        assert_eq!(
+            (background.background.r, background.background.g),
+            (accent.r, accent.g)
+        );
+        assert!((background.background.a - 0.07).abs() < f32::EPSILON);
+
+        let mut active_segment = segment(true, true);
+        active_segment.kind = BlockCardKind::Active;
+        active_segment.stripe = Some(accent);
+        let active = block_card_visual(active_segment, fg, accent, false, 1.0);
+        assert!((active.border.a - 0.32).abs() < f32::EPSILON);
+        assert!(active.shadow.blur_radius > 0.0);
+
+        failed_segment.selected = true;
+        failed_segment.selection_active = true;
+        let selected = block_card_visual(failed_segment, fg, accent, true, 1.0);
+        assert_eq!(selected.border_width, 2.0);
+        assert!((selected.border.a - 0.92).abs() < f32::EPSILON);
+        assert_eq!(
+            (selected.background.r, selected.background.b),
+            (accent.r, accent.b)
+        );
+
+        assert!(block_card_shadow(segment(true, true), active.shadow).blur_radius > 0.0);
+        assert_eq!(
+            block_card_shadow(segment(false, true), active.shadow).blur_radius,
+            0.0,
+            "viewport clipping must not manufacture a horizontal shadow cap"
+        );
     }
 
     #[test]
@@ -1037,6 +1549,7 @@ where
         let ch = self.metrics.cell_h;
         let ox = bounds.x + pad + self.metrics.block_gutter_width();
         let oy = bounds.y + pad;
+        let scrollbar_track_left = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
         let default_fg = self
             .dynamic_fg
             .map(|(r, g, b)| Color::from_rgb8(r, g, b))
@@ -1060,6 +1573,71 @@ where
                     a: self.opacity,
                     ..default_bg
                 }),
+            );
+        }
+
+        // The app has already projected retained zones onto visible rows.
+        // Collapse those rows once into card slices and reuse the result for
+        // background, hover and foreground chrome. This stays O(viewport rows)
+        // even when scrollback contains thousands of lines.
+        let card_segments = block_card_segments(&self.blocks);
+        let hovered_card = cursor.position_over(bounds).and_then(|position| {
+            let row = self.cell_at(position, bounds).1;
+            let group = self
+                .blocks
+                .get(row)
+                .filter(|row| row.selectable)?
+                .card_group?;
+            let segment = card_segments
+                .iter()
+                .find(|segment| segment.group == group)?;
+            let geometry = block_card_geometry(
+                bounds,
+                scrollbar_track_left,
+                oy,
+                ch,
+                *segment,
+                self.block_compact,
+            );
+            block_card_hover_contains(bounds, geometry.body, position.x, position.y)
+                .then_some(group)
+        });
+        let block_accent = Theme::rgb_to_color32(self.theme.tabbar.active_border);
+
+        // Card backdrops sit below every terminal background, glyph and Kitty
+        // image. Explicit cell backgrounds therefore keep exact terminal
+        // semantics, while default cells reveal the light theme-relative tint.
+        for segment in &card_segments {
+            let geometry = block_card_geometry(
+                bounds,
+                scrollbar_track_left,
+                oy,
+                ch,
+                *segment,
+                self.block_compact,
+            );
+            if geometry.body.width <= 0.0 || geometry.body.height <= 0.0 {
+                continue;
+            }
+            let visual = block_card_visual(
+                *segment,
+                default_fg,
+                block_accent,
+                hovered_card == Some(segment.group),
+                self.opacity,
+            );
+            renderer.fill_quad(
+                Quad {
+                    bounds: geometry.body,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: geometry.radius,
+                    },
+                    shadow: block_card_shadow(*segment, visual.shadow),
+                    snap: true,
+                },
+                Background::Color(visual.background),
             );
         }
 
@@ -1120,29 +1698,11 @@ where
                 }
             }
 
-            // Block selection fill and separators are structural backgrounds:
-            // paint them before text/images so they never wash out glyphs.
+            // A legacy separator is only needed for non-card chrome. Card
+            // boundaries are drawn once per contiguous segment below.
             if let Some(block) = self.blocks.get(row_idx) {
                 let text_right = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
-                if block.outline_sides {
-                    let accent = self
-                        .dynamic_cursor
-                        .map(|(r, g, b)| Color::from_rgb8(r, g, b))
-                        .unwrap_or_else(|| self.theme.cursor_color());
-                    renderer.fill_quad(
-                        solid_quad(Rectangle {
-                            x: ox,
-                            y,
-                            width: (text_right - ox).max(0.0),
-                            height: ch,
-                        }),
-                        Background::Color(Color {
-                            a: if self.focused { 0.07 } else { 0.04 },
-                            ..accent
-                        }),
-                    );
-                }
-                if block.separator {
+                if block.separator && block.card_group.is_none() {
                     renderer.fill_quad(
                         solid_quad(Rectangle {
                             x: ox,
@@ -1429,6 +1989,86 @@ where
             );
         }
 
+        // Borders and outcome stripes remain above images so the command-card
+        // state cannot disappear under a terminal graphic. They are still
+        // batched per visible card, not repeated for every row.
+        for segment in &card_segments {
+            let geometry = block_card_geometry(
+                bounds,
+                scrollbar_track_left,
+                oy,
+                ch,
+                *segment,
+                self.block_compact,
+            );
+            if geometry.body.width <= 0.0 || geometry.body.height <= 0.0 {
+                continue;
+            }
+            let stripe = segment.stripe.unwrap_or(block_accent);
+            let visual = block_card_visual(
+                *segment,
+                default_fg,
+                block_accent,
+                hovered_card == Some(segment.group),
+                self.opacity,
+            );
+            if segment.real_top && segment.real_bottom {
+                renderer.fill_quad(
+                    Quad {
+                        bounds: geometry.body,
+                        border: Border {
+                            color: visual.border,
+                            width: visual.border_width,
+                            radius: geometry.radius,
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(Color::TRANSPARENT),
+                );
+            } else {
+                for edge in clipped_block_card_border_bounds(
+                    geometry.body,
+                    segment.real_top,
+                    segment.real_bottom,
+                    visual.border_width,
+                )
+                .into_iter()
+                .flatten()
+                {
+                    renderer.fill_quad(solid_quad(edge), Background::Color(visual.border));
+                }
+            }
+
+            let requested_width = if segment.stripe_strong {
+                BLOCK_STRIPE_SELECTED_WIDTH
+            } else {
+                BLOCK_STRIPE_WIDTH
+            };
+            let stripe_bounds =
+                block_card_stripe_bounds(bounds, geometry.body, requested_width, ox);
+            if stripe_bounds.width > 0.0 {
+                renderer.fill_quad(
+                    Quad {
+                        bounds: stripe_bounds,
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: border::Radius {
+                                top_left: geometry.radius.top_left,
+                                top_right: 0.0,
+                                bottom_right: 0.0,
+                                bottom_left: geometry.radius.bottom_left,
+                            },
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(alpha(stripe, if segment.stripe_strong { 1.0 } else { 0.7 })),
+                );
+            }
+        }
+
         // Block-mode UI chrome (per-row, precomputed by the app) sits above
         // glyphs/images. The badge only occupies cells verified blank, so its
         // text never collides with terminal text.
@@ -1436,25 +2076,6 @@ where
             let y = oy + row_idx as f32 * ch;
             let text_right = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
 
-            if let Some(color) = block.stripe {
-                let (width, alpha) = if block.stripe_strong {
-                    (BLOCK_STRIPE_SELECTED_WIDTH, 1.0)
-                } else {
-                    (BLOCK_STRIPE_WIDTH, 0.7)
-                };
-                renderer.fill_quad(
-                    solid_quad(Rectangle {
-                        x: bounds.x,
-                        y,
-                        width,
-                        height: ch,
-                    }),
-                    Background::Color(Color {
-                        a: color.a * alpha,
-                        ..color
-                    }),
-                );
-            }
             if block.bookmarked {
                 let marker = self.theme.ansi_color(3);
                 let size = ch
@@ -1479,54 +2100,14 @@ where
                     Background::Color(Color { a: 0.95, ..marker }),
                 );
             }
-            // Selected-block outline: 1px stroke assembled from thin quads.
-            if block.outline_top || block.outline_bottom || block.outline_sides {
-                let accent = self
-                    .dynamic_cursor
-                    .map(|(r, g, b)| Color::from_rgb8(r, g, b))
-                    .unwrap_or_else(|| self.theme.cursor_color());
-                let stroke = Background::Color(Color { a: 0.8, ..accent });
-                let left = ox;
-                let width = (text_right - left).max(0.0);
-                if block.outline_top {
-                    renderer.fill_quad(
-                        solid_quad(Rectangle {
-                            x: left,
-                            y,
-                            width,
-                            height: 1.0,
-                        }),
-                        stroke,
-                    );
-                }
-                if block.outline_bottom {
-                    renderer.fill_quad(
-                        solid_quad(Rectangle {
-                            x: left,
-                            y: y + ch - 1.0,
-                            width,
-                            height: 1.0,
-                        }),
-                        stroke,
-                    );
-                }
-                if block.outline_sides {
-                    for x in [left, text_right - 1.0] {
-                        renderer.fill_quad(
-                            solid_quad(Rectangle {
-                                x,
-                                y,
-                                width: 1.0,
-                                height: ch,
-                            }),
-                            stroke,
-                        );
-                    }
-                }
-            }
             if let Some((badge, color)) = &block.badge {
                 let badge_w = badge.chars().count() as f32 * cw;
-                let right = text_right - 4.0;
+                let card_inset = if self.block_compact {
+                    BLOCK_CARD_COMPACT_INSET
+                } else {
+                    BLOCK_CARD_INSET
+                };
+                let right = text_right - card_inset - 4.0;
                 renderer.fill_quad(
                     Quad {
                         bounds: Rectangle {
