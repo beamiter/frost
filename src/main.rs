@@ -42,7 +42,7 @@ use iced::widget::{
 use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
 use pty::{Pty, ReaderPoll};
 use terminal::{TerminalCell, TerminalState};
-use terminal_view::{KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
+use terminal_view::{BlockMouseAction, KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
 use theme::Theme;
 
 /// Must stay equal to the installed entry's basename
@@ -122,6 +122,102 @@ fn block_enter_reinputs_selection(
     prompt_status: terminal::AgentPromptStatus,
 ) -> bool {
     selection_owns_keys && prompt_status.is_ready()
+}
+
+/// Keyboard bookmark toggling is deliberately selection-only. Falling back to
+/// the newest block would steal Ctrl+Shift+B from the shell with no visible
+/// target and differs from the Block family contract.
+fn active_bookmark_target(ids: &[u64], active: Option<u64>) -> Option<u64> {
+    active.filter(|id| ids.contains(id))
+}
+
+/// Finished history rows are local static cards. Application mouse reporting
+/// owns only active/live rows (or every row in alternate screen, where there
+/// are no finalized cards); Shift and link activation remain local overrides.
+fn app_owns_terminal_mouse(
+    mouse_enabled: bool,
+    shift: bool,
+    app_eligible: bool,
+    link_override: bool,
+) -> bool {
+    mouse_enabled && !shift && app_eligible && !link_override
+}
+
+fn app_owns_terminal_wheel(mouse_enabled: bool, shift: bool, app_eligible: bool) -> bool {
+    mouse_enabled && !shift && app_eligible
+}
+
+fn app_mouse_uses_full_grid(block_mode: bool, alt_screen: bool, usable_partitions: bool) -> bool {
+    !block_mode || alt_screen || !usable_partitions
+}
+
+/// Resolve the finalized card currently covering one viewport row. This is
+/// kept independent of `Frost` so stale-render tests can drive a real PTY
+/// lifecycle and change only the viewport between render and dispatch.
+fn finalized_block_at_viewport_row(
+    block_mode_enabled: bool,
+    terminal: &terminal::TerminalState,
+    row: usize,
+) -> Option<u64> {
+    if !block_mode_enabled || terminal.is_alt_buffer_active() {
+        return None;
+    }
+    let abs_row = terminal.viewport_absolute_start().checked_add(row)?;
+    let total = terminal.scrollback_len() + terminal.grid.rows();
+    let live_boundary = terminal
+        .running_zone_start()
+        .or(terminal.live_prompt_row())
+        .unwrap_or(total);
+    let zones: Vec<&terminal::CommandZone> = terminal
+        .command_zones
+        .iter()
+        .filter(|zone| !zone.rows_evicted)
+        .collect();
+    let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
+    zones
+        .iter()
+        .zip(block_mode::spans(&starts, live_boundary))
+        .find(|(_, (span_start, span_end))| abs_row >= *span_start && abs_row < *span_end)
+        .map(|(zone, _)| zone.id)
+}
+
+/// A claimed card gesture may use only the stable id painted under the press.
+/// A later viewport mapping is evidence for validation, never a replacement
+/// target: moving onto a neighbour fails closed.
+fn validated_claimed_block_target(
+    rendered_zone_id: Option<u64>,
+    current_row_zone_id: Option<u64>,
+    retained_finalized: bool,
+) -> Option<u64> {
+    let rendered_zone_id = rendered_zone_id?;
+    (retained_finalized && current_row_zone_id == Some(rendered_zone_id))
+        .then_some(rendered_zone_id)
+}
+
+fn agent_context_exit_label(exit_code: i32) -> String {
+    if exit_code == -1 {
+        "no reported exit status".to_string()
+    } else {
+        format!("exit {exit_code}")
+    }
+}
+
+const NO_REPORTED_EXIT_STATUS_NOTE: &str =
+    "[terminal] the shell reported no exit status for this command";
+
+fn bounded_ai_block_output(output: &str, no_reported_status: bool) -> (String, bool) {
+    let prepared = if no_reported_status {
+        if output.is_empty() {
+            NO_REPORTED_EXIT_STATUS_NOTE.to_string()
+        } else {
+            format!("{NO_REPORTED_EXIT_STATUS_NOTE}\n{output}")
+        }
+    } else {
+        output.to_string()
+    };
+    let bounded = jterm_core::ai::truncate_for_context(&prepared, 80);
+    let truncated = bounded != prepared;
+    (bounded, truncated)
 }
 
 /// Commands whose configured chords must fall through to the PTY whenever
@@ -633,18 +729,77 @@ fn block_search_reveal_row(
         .or_else(|| terminal.zone_output_line_row(hit.zone_id, hit.line_no))
 }
 
-/// Stable target for the block action menu opened from a gutter right-click.
+/// Place a pointer-anchored overlay inside the visible window. Prefer below
+/// the pointer; flip above when the estimated panel height would cross the
+/// bottom edge. Tiny windows keep the panel's top-left reachable.
+fn anchored_overlay_position(
+    anchor: iced::Point,
+    window: iced::Size,
+    panel: iced::Size,
+    top_floor: f32,
+) -> iced::Point {
+    const GAP: f32 = 6.0;
+    let anchor_x = if anchor.x.is_finite() { anchor.x } else { 0.0 };
+    let anchor_y = if anchor.y.is_finite() {
+        anchor.y
+    } else {
+        top_floor
+    };
+    let max_x = (window.width - panel.width - GAP).max(GAP);
+    let x = (anchor_x + GAP).clamp(GAP, max_x);
+    let max_y = (window.height - panel.height - GAP).max(top_floor);
+    let below = anchor_y + GAP;
+    let preferred_y = if below + panel.height <= window.height - GAP {
+        below
+    } else {
+        anchor_y - panel.height - GAP
+    };
+    iced::Point::new(x, preferred_y.clamp(top_floor, max_y))
+}
+
+/// Stable target for the block action menu opened from a completed card.
 /// Session identity is stored alongside the zone id because zone ids restart
 /// at zero for every pane; actions fail closed if focus changed underneath it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct BlockMenuState {
     session_id: usize,
     zone_id: u64,
+    anchor: iced::Point,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlockMenuSelectionSummary {
+    selected_count: usize,
+    has_selected_commands: bool,
+    clicked_has_command: bool,
+}
+
+fn block_menu_selection_summary<'a, I>(
+    zones: I,
+    selection: &block_mode::BlockSelection,
+    clicked_id: u64,
+) -> BlockMenuSelectionSummary
+where
+    I: IntoIterator<Item = (u64, Option<&'a str>)>,
+{
+    let mut summary = BlockMenuSelectionSummary::default();
+    for (id, command) in zones {
+        let has_command = command.is_some_and(|command| !command.trim().is_empty());
+        if id == clicked_id {
+            summary.clicked_has_command = has_command;
+        }
+        if selection.contains(id) {
+            summary.selected_count += 1;
+            summary.has_selected_commands |= has_command;
+        }
+    }
+    summary
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockMenuAction {
     CopyCommand,
+    AskAi,
     CopyOutput,
     CopyBlock,
     CopyMarkdown,
@@ -1324,7 +1479,7 @@ enum Message {
     /// and committed text.
     Ime(iced::advanced::input_method::Event),
     ModifiersChanged(keyboard::Modifiers),
-    /// A mouse interaction within the pane showing session `usize`.
+    /// A mouse interaction within the pane showing the stable session id.
     MousePane(usize, MouseInput),
     /// Clipboard result scoped to the stable session that requested the paste.
     Pasted(usize, Option<String>),
@@ -1491,7 +1646,7 @@ enum Message {
     ),
     /// Select and reveal the clicked hit's zone (and close the picker).
     BlockSearchAccept(block_mode::BlockSearchHit),
-    /// Dismiss or execute the gutter block action menu.
+    /// Dismiss or execute the completed-card action menu.
     BlockMenuClose,
     BlockMenuAction(BlockMenuAction),
     /// Confirm or cancel permanently clearing the active pane's completed
@@ -1596,7 +1751,7 @@ struct Session {
     last_duration_ms: Option<u64>,
     /// Warp-style block-mode multi-selection, keyed by stable command-zone id.
     /// It survives scrollback row trimming; the terminal's bounded zone cap is
-    /// reconciled before actions. Any non-gutter press or PTY-bound input
+    /// reconciled before actions. Native text/prompt presses or PTY-bound input
     /// clears the whole selection.
     block_selection: block_mode::BlockSelection,
     /// Pane-local bookmarks for important finalized blocks. Reconciled against
@@ -1999,11 +2154,41 @@ type KittyHandleKey = (usize, u32, kitty_graphics::Crop);
 /// Route every event in one terminal mouse gesture to the owner chosen at
 /// press time. Mouse-reporting mode and Shift may change before release; that
 /// must never synthesize a half gesture for either the app or local selection.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalMouseGesture {
     session_id: usize,
     button: MouseButton,
     report_to_app: bool,
+    /// The app layer claimed this sequence after the widget had already
+    /// published an ordinary press (for example an inactive pane whose link
+    /// cache was refreshed only after focus moved). Subsequent drag/release
+    /// messages close the slot without touching selection or the PTY.
+    consumed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayReleaseDisposition {
+    Reject,
+    ClearOnly,
+    DispatchApp,
+}
+
+fn overlay_release_disposition(
+    gesture: Option<TerminalMouseGesture>,
+    source_session_id: usize,
+    button: MouseButton,
+) -> OverlayReleaseDisposition {
+    let Some(gesture) = gesture else {
+        return OverlayReleaseDisposition::Reject;
+    };
+    if gesture.session_id != source_session_id || gesture.button != button {
+        return OverlayReleaseDisposition::Reject;
+    }
+    if gesture.consumed || !gesture.report_to_app {
+        OverlayReleaseDisposition::ClearOnly
+    } else {
+        OverlayReleaseDisposition::DispatchApp
+    }
 }
 
 struct Frost {
@@ -2020,7 +2205,7 @@ struct Frost {
     /// Tells a plain click apart from the start of a selection drag, so only
     /// the former places the shell's edit cursor.
     click_tracker: jterm_core::click_cursor::ClickTracker,
-    terminal_mouse_gesture: Option<TerminalMouseGesture>,
+    terminal_mouse_gestures: [Option<TerminalMouseGesture>; 3],
     mono: iced::Font,
     cjk_mono: Option<iced::Font>,
     symbol_mono: Option<iced::Font>,
@@ -2168,7 +2353,7 @@ struct Frost {
     /// Window-wide monotonic source for async block-search build identities.
     /// It deliberately survives picker close/reopen within the same pane.
     next_block_search_epoch: u64,
-    /// Context actions for the finalized block right-clicked in the gutter.
+    /// Context actions for the finalized block right-clicked anywhere in its card.
     block_menu: Option<BlockMenuState>,
     /// Counted destructive confirmation for clearing one stable pane's block
     /// history. Revalidated before deletion in case PTY output changed it.
@@ -2263,7 +2448,7 @@ impl Frost {
             focused: true,
             modifiers: keyboard::Modifiers::default(),
             click_tracker: jterm_core::click_cursor::ClickTracker::default(),
-            terminal_mouse_gesture: None,
+            terminal_mouse_gestures: [None; 3],
             mono,
             cjk_mono,
             symbol_mono,
@@ -4326,7 +4511,20 @@ impl Frost {
                 self.block_export_session_task(block_export::SessionExportFormat::Json)
             }
             C::BlockSearch => self.toggle_block_search(),
-            C::BlockToggleBookmark => self.block_toggle_target_bookmark(),
+            C::BlockToggleBookmark => {
+                let target = {
+                    let sess = self.sessions.get_mut(self.active)?;
+                    let ids: Vec<u64> = sess
+                        .terminal
+                        .command_zones
+                        .iter()
+                        .map(|zone| zone.id)
+                        .collect();
+                    sess.block_selection.retain(&ids);
+                    active_bookmark_target(&ids, sess.block_selection.active())
+                }?;
+                self.block_toggle_bookmark(target)
+            }
             C::BlockJumpPrevBookmark => self.block_jump_bookmark(true),
             C::BlockJumpNextBookmark => self.block_jump_bookmark(false),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
@@ -4814,7 +5012,21 @@ impl Frost {
         if !self.ensure_block_action_available("Block bookmark") {
             return Task::none();
         }
-        let Some(id) = self.block_target_zone_id("bookmark") else {
+        let target = self.sessions.get_mut(self.active).and_then(|sess| {
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            active_bookmark_target(&ids, sess.block_selection.active())
+        });
+        let Some(id) = target else {
+            self.push_toast(
+                "Select a block to toggle its bookmark".to_string(),
+                ToastKind::Info,
+            );
             return Task::none();
         };
         self.block_toggle_bookmark(id)
@@ -4863,6 +5075,7 @@ impl Frost {
         }
         match action {
             BlockMenuAction::CopyCommand => self.block_copy_command_task(),
+            BlockMenuAction::AskAi => self.block_ask_ai_task(menu.zone_id),
             BlockMenuAction::CopyOutput => self.block_copy_output_task(),
             BlockMenuAction::CopyBlock => self.block_copy_block_task(),
             BlockMenuAction::CopyMarkdown => self.block_copy_markdown_task(),
@@ -4877,14 +5090,57 @@ impl Frost {
             BlockMenuAction::JumpTop => self.block_reveal_edge(menu.zone_id, false),
             BlockMenuAction::JumpBottom => self.block_reveal_edge(menu.zone_id, true),
             BlockMenuAction::Search => self.toggle_block_search(),
-            BlockMenuAction::ExportMarkdown => {
-                self.block_export_session_task(block_export::SessionExportFormat::Markdown)
-            }
+            BlockMenuAction::ExportMarkdown => self
+                .block_export_zone_task(menu.zone_id, block_export::SessionExportFormat::Markdown),
             BlockMenuAction::ExportJson => {
-                self.block_export_session_task(block_export::SessionExportFormat::Json)
+                self.block_export_zone_task(menu.zone_id, block_export::SessionExportFormat::Json)
             }
             BlockMenuAction::Clear => self.request_block_clear(),
         }
+    }
+
+    /// Attach one stable, right-clicked block to the existing Agent panel.
+    /// Output is bounded twice: terminal export never exceeds 1 MiB, then the
+    /// shared AI helper retains only the useful head/tail line window.
+    fn block_ask_ai_task(&mut self, id: u64) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let Some(zone) = sess.terminal.zone_by_id(id) else {
+            self.push_toast("Block no longer available".to_string(), ToastKind::Info);
+            return Task::none();
+        };
+        let (output, output_truncated) = match sess.terminal.zone_output_export_capped(id) {
+            Some(terminal::ZoneOutputExport::Available { text, truncated }) => (text, truncated),
+            Some(terminal::ZoneOutputExport::Empty) => (String::new(), false),
+            Some(terminal::ZoneOutputExport::Unavailable) => (
+                "[output unavailable: retained snapshot and scrollback rows were evicted]"
+                    .to_string(),
+                true,
+            ),
+            None => {
+                self.push_toast("Block no longer available".to_string(), ToastKind::Info);
+                return Task::none();
+            }
+        };
+        let no_reported_status = zone.exit_code.is_none();
+        let (ai_output, ai_output_truncated) = bounded_ai_block_output(&output, no_reported_status);
+        let context = jterm_core::ai::BlockContext {
+            cmd: zone.command.clone().unwrap_or_default(),
+            output: ai_output,
+            cwd: zone.cwd.clone(),
+            // BlockContext currently has no Option status. -1 is the family
+            // sentinel for "the shell reported no exit status"; never turn an
+            // unknown/background lifecycle into a false success.
+            exit_code: zone.exit_code.unwrap_or(-1),
+            truncated: zone.command_truncated || output_truncated || ai_output_truncated,
+        };
+        let session_id = sess.id;
+        if !self.agent.is_open || self.agent.bound_session_id != Some(session_id) {
+            self.agent.open(&self.config, session_id);
+        }
+        self.agent.last_manual_completed = Some(context);
+        iced::widget::operation::focus(AGENT_INPUT_ID.clone())
     }
 
     /// Toggle the cross-block search picker (`block:search`). While it is
@@ -5000,7 +5256,6 @@ impl Frost {
         self.block_search = None;
         self.block_menu = None;
         self.block_clear_confirm = None;
-        self.terminal_mouse_gesture = None;
     }
 
     /// Re-run the block search over the bounded cache with the current query.
@@ -5358,214 +5613,245 @@ impl Frost {
         Some(Task::none())
     }
 
-    /// Stable id of the finalized block covering viewport `row` in the active
-    /// pane. Running/live-prompt rows deliberately have no target.
-    fn block_at_viewport_row(&self, row: usize) -> Option<u64> {
-        if !self.config.block_mode {
-            return None;
-        }
-        let sess = self.sessions.get(self.active)?;
-        let terminal = &sess.terminal;
-        if terminal.is_alt_buffer_active() {
-            return None;
-        }
-        let abs_row = terminal.viewport_absolute_start() + row;
-        let total = terminal.scrollback_len() + terminal.grid.rows();
-        let live_boundary = terminal
-            .running_zone_start()
-            .or(terminal.live_prompt_row())
-            .unwrap_or(total);
-        // Rows-evicted zones own no rows, so the gutter can never hit them
-        // (and their clamped prompt_start must not skew the spans).
-        let zones: Vec<&terminal::CommandZone> = terminal
-            .command_zones
-            .iter()
-            .filter(|zone| !zone.rows_evicted)
-            .collect();
-        let starts: Vec<usize> = zones.iter().map(|zone| zone.prompt_start).collect();
-        zones
-            .iter()
-            .zip(block_mode::spans(&starts, live_boundary))
-            .find(|(_, (span_start, span_end))| abs_row >= *span_start && abs_row < *span_end)
-            .map(|(zone, _)| zone.id)
-    }
-
-    /// Apply a modifier-snapshotted gutter selection to one block. Modifiers
-    /// come from the press event itself, not the mutable global keyboard
-    /// state, so a same-frame key release cannot change Ctrl/Shift semantics.
-    fn select_block_at_viewport_row(&mut self, row: usize, ctrl: bool, shift: bool) -> Option<u64> {
-        let id = self.block_at_viewport_row(row)?;
-        let sess = self.sessions.get_mut(self.active)?;
-        let ids: Vec<u64> = sess
-            .terminal
-            .command_zones
-            .iter()
-            .map(|zone| zone.id)
-            .collect();
-        // Zone history is bounded and may have evicted ids since the previous
-        // interaction. Reconcile before applying modifiers so Ctrl-toggle
-        // cannot preserve an invisible stale selection.
-        sess.block_selection.retain(&ids);
-        sess.block_selection.click(&ids, id, ctrl, shift);
-        Some(id)
+    /// Stable id of the finalized block covering viewport `row` in the pane
+    /// identified by `session_id`. Running/live-prompt rows deliberately have
+    /// no target. Mouse events retain this stable identity across focus moves.
+    fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
+        let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
+        finalized_block_at_viewport_row(self.config.block_mode, &sess.terminal, row)
     }
 
     /// Route a grid mouse interaction either to the running application (when it
     /// has enabled mouse reporting and Shift is not held) or to local selection
     /// and scrollback handling.
-    fn handle_mouse(&mut self, input: MouseInput) -> Task<Message> {
+    fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
         let speed = self.config.scroll_speed.max(1) as isize;
-        // Block selection first: a left/right press in the stripe gutter
-        // selects or opens actions for the completed block covering that row
-        // and consumes the press entirely (no cursor move, no text-selection
-        // anchor). The widget never arms the drag pipeline for a gutter press
-        // — no Drag/Release will follow — so a gutter press is always consumed
-        // here. Any other non-context press clears the block selection.
+
+        // Block selection first. The widget snapshots the exact family action
+        // at press time and never arms native drag/release for a claimed card
+        // gesture. Re-resolve its stable pane and row target here: a
+        // completion/trim, focus switch, or alternate-screen transition
+        // between render and update must fail closed.
         if let MouseInput::Press {
-            gutter,
+            block: Some(action),
+            block_zone_id,
             row,
             button,
-            ctrl,
-            shift: press_shift,
+            x,
+            y,
             ..
         } = input
         {
-            if gutter && matches!(button, MouseButton::Left | MouseButton::Right) {
-                self.terminal_mouse_gesture = None;
-                // The widget already refuses to classify presses as gutter
-                // while the app owns the mouse, but reporting may have been
-                // enabled between render and press. In that race, forwarding
-                // the press would send the app a press with no matching
-                // release (the widget armed no drag pipeline), so drop the
-                // click instead of hijacking or half-forwarding it.
-                let reporting = self
-                    .sessions
-                    .get(self.active)
-                    .is_some_and(|s| s.terminal.is_mouse_enabled() && !press_shift);
-                if reporting {
-                    return Task::none();
-                }
-                let target = if button == MouseButton::Left {
-                    self.select_block_at_viewport_row(row, ctrl, press_shift)
-                } else {
-                    let target = self.block_at_viewport_row(row);
-                    if let Some(id) = target {
-                        if let Some(sess) = self.sessions.get_mut(self.active) {
-                            let ids: Vec<u64> = sess
-                                .terminal
-                                .command_zones
-                                .iter()
-                                .map(|zone| zone.id)
-                                .collect();
-                            sess.block_selection.retain(&ids);
-                            if !sess.block_selection.contains(id) {
-                                sess.block_selection.replace(Some(id));
-                            }
-                            self.block_menu = Some(BlockMenuState {
-                                session_id: sess.id,
-                                zone_id: id,
-                            });
-                            self.block_search = None;
-                        }
-                    }
-                    target
-                };
-                if let Some(sess) = self.sessions.get_mut(self.active) {
-                    if target.is_none() {
-                        sess.block_selection.clear();
-                    }
-                    // The press is consumed, so drop any live text selection:
-                    // the old highlight must not linger, and it must never be
-                    // warped by a later drag or re-copied on release.
-                    if sess.terminal.selection.is_some() {
-                        sess.terminal.selection = None;
-                        sess.refresh();
-                    }
-                }
+            self.terminal_mouse_gestures[button.slot()] = None;
+            let Some(source) = self.session_index_by_id(source_session_id) else {
                 return Task::none();
+            };
+            let current_row_zone_id = self.block_at_viewport_row(source_session_id, row);
+            let retained_finalized = block_zone_id.is_some_and(|id| {
+                self.sessions[source]
+                    .terminal
+                    .zone_by_id(id)
+                    .is_some_and(|zone| !zone.rows_evicted)
+            });
+            let Some(id) = validated_claimed_block_target(
+                block_zone_id,
+                current_row_zone_id,
+                retained_finalized,
+            ) else {
+                return Task::none();
+            };
+            let Some(sess) = self.sessions.get_mut(source) else {
+                return Task::none();
+            };
+            let ids: Vec<u64> = sess
+                .terminal
+                .command_zones
+                .iter()
+                .map(|zone| zone.id)
+                .collect();
+            sess.block_selection.retain(&ids);
+            match action {
+                BlockMouseAction::Replace => sess.block_selection.click(&ids, id, false, false),
+                BlockMouseAction::Range => sess.block_selection.click(&ids, id, false, true),
+                BlockMouseAction::Toggle => sess.block_selection.click(&ids, id, true, true),
+                BlockMouseAction::Menu => {
+                    sess.block_selection.activate(&ids, id);
+                    self.block_menu = Some(BlockMenuState {
+                        session_id: sess.id,
+                        zone_id: id,
+                        anchor: iced::Point::new(x, y),
+                    });
+                    self.block_search = None;
+                }
             }
+            if action != BlockMouseAction::Menu {
+                self.block_menu = None;
+            }
+            // A claimed card gesture replaces any older native cell range.
+            // Otherwise the ordinary Copy shortcut would keep preferring a
+            // stale highlight over the block selection the user just made.
+            sess.terminal.selection = None;
+            sess.refresh();
+            return Task::none();
+        }
+
+        if let MouseInput::Press { button, .. } = input {
+            // An unclaimed left/middle press begins ordinary terminal text /
+            // paste interaction and exits historical card selection, whether
+            // it landed in completed output or the live/input surface.
             if button != MouseButton::Right {
-                if let Some(sess) = self.sessions.get_mut(self.active) {
+                if let Some(source) = self.session_index_by_id(source_session_id) {
+                    let sess = &mut self.sessions[source];
                     sess.block_selection.clear();
+                    sess.refresh();
                 }
             }
             self.block_menu = None;
         }
-        let report_to_app = match input {
+
+        // Link metadata is active-pane scoped. An inactive pane therefore
+        // cannot classify the link inside its widget; focusing it refreshes
+        // `self.links` before this handler runs. If that second, authoritative
+        // lookup claims the press, retain a consumed app-layer slot so the
+        // widget's already-armed Drag/Release sequence is swallowed whole.
+        if let MouseInput::Press {
+            col,
+            row,
+            button,
+            ctrl,
+            shift,
+            count,
+            link_eligible,
+            link: widget_claimed_link,
+            ..
+        } = input
+        {
+            let current_link =
+                terminal_view::ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
+                    .then(|| {
+                        self.links
+                            .iter()
+                            .find(|link| {
+                                link.line == row && col >= link.col_start && col < link.col_end
+                            })
+                            .cloned()
+                    })
+                    .flatten();
+            if widget_claimed_link || current_link.is_some() {
+                self.click_tracker.cancel();
+                self.terminal_mouse_gestures[button.slot()] =
+                    (!widget_claimed_link).then_some(TerminalMouseGesture {
+                        session_id: source_session_id,
+                        button,
+                        report_to_app: false,
+                        consumed: true,
+                    });
+                if let Some(link) = current_link {
+                    let cwd = self
+                        .session_index_by_id(source_session_id)
+                        .and_then(|source| self.sessions.get(source))
+                        .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()));
+                    if let Err(error) =
+                        link::open_link(&link, cwd.as_deref().map(std::path::Path::new))
+                    {
+                        self.push_toast(
+                            format!("Could not open link: {error}"),
+                            ToastKind::Warning,
+                        );
+                    }
+                }
+                return Task::none();
+            }
+        }
+
+        // Resolve each event to the stable pane chosen at press time. Focus may
+        // move (or an overlay may open) while buttons are held; neither may
+        // redirect the trailing event to the newly active PTY.
+        let (report_to_app, target_session_id) = match input {
             MouseInput::Press {
-                col,
-                row,
                 button,
                 shift,
-                ctrl,
+                app_eligible,
                 ..
             } => {
-                let link_override = button == MouseButton::Left
-                    && ctrl
-                    && self.links.iter().any(|link| {
-                        link.line == row && col >= link.col_start && col < link.col_end
-                    });
-                let Some(session) = self.sessions.get(self.active) else {
+                let Some(source) = self.session_index_by_id(source_session_id) else {
                     return Task::none();
                 };
-                let report_to_app = session.terminal.is_mouse_enabled() && !shift && !link_override;
-                self.terminal_mouse_gesture = Some(TerminalMouseGesture {
-                    session_id: session.id,
+                let report_to_app = app_owns_terminal_mouse(
+                    self.sessions[source].terminal.is_mouse_enabled(),
+                    shift,
+                    app_eligible,
+                    false,
+                );
+                self.terminal_mouse_gestures[button.slot()] = Some(TerminalMouseGesture {
+                    session_id: source_session_id,
                     button,
                     report_to_app,
+                    consumed: false,
                 });
-                report_to_app
+                (report_to_app, source_session_id)
             }
             MouseInput::Drag { .. } => {
-                let Some(gesture) = self.terminal_mouse_gesture else {
+                let Some(gesture) = self.terminal_mouse_gestures[MouseButton::Left.slot()] else {
                     return Task::none();
                 };
                 if gesture.button != MouseButton::Left
-                    || self
-                        .sessions
-                        .get(self.active)
-                        .is_none_or(|session| session.id != gesture.session_id)
+                    || gesture.session_id != source_session_id
+                    || gesture.consumed
                 {
                     return Task::none();
                 }
-                gesture.report_to_app
+                (gesture.report_to_app, gesture.session_id)
             }
             MouseInput::Release { button, .. } => {
-                let Some(gesture) = self.terminal_mouse_gesture.take() else {
+                let Some(gesture) = self.terminal_mouse_gestures[button.slot()].take() else {
                     return Task::none();
                 };
-                if gesture.button != button
-                    || self
-                        .sessions
-                        .get(self.active)
-                        .is_none_or(|session| session.id != gesture.session_id)
-                {
+                if gesture.button != button || gesture.session_id != source_session_id {
                     return Task::none();
                 }
-                gesture.report_to_app
+                if gesture.consumed {
+                    return Task::none();
+                }
+                (gesture.report_to_app, gesture.session_id)
             }
-            MouseInput::Wheel { shift, .. } => self
-                .sessions
-                .get(self.active)
-                .is_some_and(|session| session.terminal.is_mouse_enabled() && !shift),
-            MouseInput::ScrollTo { .. } => false,
+            MouseInput::Wheel {
+                shift,
+                app_eligible,
+                ..
+            } => {
+                let Some(source) = self.session_index_by_id(source_session_id) else {
+                    return Task::none();
+                };
+                (
+                    app_owns_terminal_wheel(
+                        self.sessions[source].terminal.is_mouse_enabled(),
+                        shift,
+                        app_eligible,
+                    ),
+                    source_session_id,
+                )
+            }
+            MouseInput::ScrollTo { .. } => (false, source_session_id),
         };
+
         // Click-to-place-cursor acts on release, so that a drag which happens
-        // to select nothing does not also walk the shell's cursor. The tracker
-        // is fed here, before the session borrow below.
+        // to select nothing does not also walk the shell's cursor. Only the
+        // left-button sequence may mutate this tracker; interleaved right or
+        // middle presses must not cancel an in-flight local click.
         let click_moves_cursor = self.config.click_moves_cursor;
         let clicked_cell = match input {
             MouseInput::Press {
                 col,
                 row,
-                button,
+                button: MouseButton::Left,
                 alt,
                 shift,
                 ctrl,
                 count,
                 ..
             } => {
-                let plain = button == MouseButton::Left && count == 1 && !alt && !shift && !ctrl;
+                let plain = count == 1 && !alt && !shift && !ctrl && !report_to_app;
                 self.click_tracker
                     .press(click_cursor::Cell::new(row as i64, col as i64), plain);
                 None
@@ -5579,45 +5865,17 @@ impl Frost {
                 button: MouseButton::Left,
                 ..
             } => self.click_tracker.release(),
-            _ => {
+            MouseInput::ScrollTo { .. } => {
                 self.click_tracker.cancel();
                 None
             }
+            _ => None,
         };
-        // Ctrl+Click opens a detected link, taking precedence over selection
-        // and app mouse reporting.
-        if let MouseInput::Press {
-            col,
-            row,
-            button: MouseButton::Left,
-            ctrl,
-            ..
-        } = input
-        {
-            if ctrl {
-                if let Some(link) = self
-                    .links
-                    .iter()
-                    .find(|l| l.line == row && col >= l.col_start && col < l.col_end)
-                    .cloned()
-                {
-                    let cwd = self
-                        .sessions
-                        .get(self.active)
-                        .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()));
-                    if let Err(error) =
-                        link::open_link(&link, cwd.as_deref().map(std::path::Path::new))
-                    {
-                        self.push_toast(
-                            format!("Could not open link: {error}"),
-                            ToastKind::Warning,
-                        );
-                    }
-                    return Task::none();
-                }
-            }
-        }
-        let Some(sess) = self.sessions.get_mut(self.active) else {
+
+        let Some(target) = self.session_index_by_id(target_session_id) else {
+            return Task::none();
+        };
+        let Some(sess) = self.sessions.get_mut(target) else {
             return Task::none();
         };
 
@@ -5712,6 +5970,7 @@ impl Frost {
                 ctrl,
                 shift: _,
                 lines,
+                ..
             } => {
                 if ctrl {
                     let delta = if up { 1.0 } else { -1.0 } * lines.max(1) as f32;
@@ -7276,6 +7535,63 @@ impl Frost {
         iced::clipboard::write(markdown)
     }
 
+    fn start_block_export(
+        &mut self,
+        snapshot: block_export::SessionExportSnapshot,
+        format: block_export::SessionExportFormat,
+        description: &str,
+    ) -> Task<Message> {
+        self.block_export_in_flight = true;
+        self.push_toast(
+            format!("Exporting {} {description}…", format.label()),
+            ToastKind::Info,
+        );
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    block_export::export_session_to_file(&snapshot, format)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("export worker failed: {error}")))
+            },
+            move |result| Message::BlockExportFinished(format, result),
+        )
+    }
+
+    /// Export exactly the stable card captured by a right click. The snapshot
+    /// intentionally never clones unrelated blocks from the same pane.
+    fn block_export_zone_task(
+        &mut self,
+        zone_id: u64,
+        format: block_export::SessionExportFormat,
+    ) -> Task<Message> {
+        if !self.ensure_block_action_available("Block export") {
+            return Task::none();
+        }
+        if self.block_export_in_flight {
+            self.push_toast(
+                "A block export is already in progress".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let snapshot = match block_export::snapshot_block(&sess.terminal, sess.id, zone_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.push_toast(
+                    format!("Could not prepare block export: {error}"),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        self.start_block_export(snapshot, format, "block")
+    }
+
     /// Snapshot every retained finalized block in the active pane, then serialize and
     /// durably write it off the UI thread. The snapshot is bounded before the
     /// task starts, and the worker owns it, so later output/session churn cannot
@@ -7315,22 +7631,7 @@ impl Frost {
                 return Task::none();
             }
         };
-        self.block_export_in_flight = true;
-        self.push_toast(
-            format!("Exporting {} session blocks…", format.label()),
-            ToastKind::Info,
-        );
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    block_export::export_session_to_file(&snapshot, format)
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .unwrap_or_else(|error| Err(format!("export worker failed: {error}")))
-            },
-            move |result| Message::BlockExportFinished(format, result),
-        )
+        self.start_block_export(snapshot, format, "session blocks")
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -8101,11 +8402,16 @@ impl Frost {
                     // Warp-style block selection owns the unmodified arrows
                     // only once a selection exists: Up/Down collapses it to
                     // one neighboring block, Shift+Up/Down moves the active
-                    // range edge, and Enter reinputs the selected commands.
+                    // range edge, Ctrl+Shift+Up/Down reveals that card's top /
+                    // bottom, and Enter reinputs the selected commands.
                     // A running/full-screen program keeps every key, including
                     // Enter, so block chrome can never steal its stdin.
                     let shift_only = modifiers.shift()
                         && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo();
+                    let ctrl_shift_only = modifiers.shift()
+                        && modifiers.control()
                         && !modifiers.alt()
                         && !modifiers.logo();
                     let selection_owns_keys = block_key_context.is_some_and(
@@ -8133,6 +8439,28 @@ impl Frost {
                             }
                             keyboard::Key::Named(keyboard::key::Named::ArrowDown) if shift_only => {
                                 return self.block_extend_selection_step(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                                if ctrl_shift_only =>
+                            {
+                                if let Some(id) = self
+                                    .sessions
+                                    .get(self.active)
+                                    .and_then(|sess| sess.block_selection.active())
+                                {
+                                    return self.block_reveal_edge(id, false);
+                                }
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                                if ctrl_shift_only =>
+                            {
+                                if let Some(id) = self
+                                    .sessions
+                                    .get(self.active)
+                                    .and_then(|sess| sess.block_selection.active())
+                                {
+                                    return self.block_reveal_edge(id, true);
+                                }
                             }
                             keyboard::Key::Named(keyboard::key::Named::Enter) if no_modifier => {
                                 // A selection can be created after the user has
@@ -8226,21 +8554,48 @@ impl Frost {
             Message::ModifiersChanged(mods) => {
                 self.modifiers = mods;
             }
-            Message::MousePane(session, input) => {
+            Message::MousePane(session_id, input) => {
                 if !self.terminal_mouse_active() {
-                    return Task::none();
+                    // Only an app-owned release may cross modal ownership, and
+                    // it still goes to its stable origin pane below. A local or
+                    // consumed release merely closes bookkeeping: executing a
+                    // hidden click-to-caret/copy after a context menu opened
+                    // would mutate the prompt or clipboard behind the overlay.
+                    let MouseInput::Release { button, .. } = input else {
+                        return Task::none();
+                    };
+                    let slot = button.slot();
+                    match overlay_release_disposition(
+                        self.terminal_mouse_gestures[slot],
+                        session_id,
+                        button,
+                    ) {
+                        OverlayReleaseDisposition::Reject => return Task::none(),
+                        OverlayReleaseDisposition::ClearOnly => {
+                            self.terminal_mouse_gestures[slot] = None;
+                            if button == MouseButton::Left {
+                                self.click_tracker.cancel();
+                            }
+                            return Task::none();
+                        }
+                        OverlayReleaseDisposition::DispatchApp => {}
+                    }
                 }
                 // Only a press switches the focused pane. Release/Drag aren't
                 // bounds-gated in the widget, so every pane emits them — letting
                 // those move focus would let the wrong pane steal it on release.
-                if matches!(input, MouseInput::Press { .. })
-                    && self.layout().contains_session(session)
-                {
+                if matches!(input, MouseInput::Press { .. }) {
+                    let Some(session) = self.session_index_by_id(session_id) else {
+                        return Task::none();
+                    };
+                    if !self.layout().contains_session(session) {
+                        return Task::none();
+                    }
                     self.set_focus(session);
                     self.session_dirty = true;
                     self.refresh_active_context();
                 }
-                return self.handle_mouse(input);
+                return self.handle_mouse(session_id, input);
             }
             Message::Pasted(id, Some(text)) => {
                 match crate::review_text::sanitize_prompt_payload(
@@ -8326,7 +8681,7 @@ impl Frost {
                 if !f {
                     self.cancel_layout_drags();
                     self.hovered_tab = None;
-                    self.terminal_mouse_gesture = None;
+                    self.terminal_mouse_gestures = [None; 3];
                 }
                 self.focused = f;
                 // The blink tick stops while unfocused; leave the cursor solid so
@@ -9233,11 +9588,11 @@ impl Frost {
                 self.block_export_in_flight = false;
                 match result {
                     Ok(path) => self.push_toast(
-                        format!("Exported {} session to {}", format.label(), path.display()),
+                        format!("Exported {} blocks to {}", format.label(), path.display()),
                         ToastKind::Success,
                     ),
                     Err(error) => self.push_toast(
-                        format!("Could not export {} session: {error}", format.label()),
+                        format!("Could not export {} blocks: {error}", format.label()),
                         ToastKind::Warning,
                     ),
                 }
@@ -10435,9 +10790,9 @@ impl Frost {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
-    /// Discoverable block actions opened by right-clicking a finalized
-    /// gutter stripe. Existing copy/recall/export paths remain the single
-    /// implementation of each action; this panel is only a stable-target UI.
+    /// Pointer-anchored actions opened by right-clicking any row of a finalized
+    /// card. Existing copy/recall/export paths remain the single implementation
+    /// of each action; this panel is only a stable-target UI.
     fn block_menu_view(&self, state: BlockMenuState) -> Element<'_, Message> {
         let target = self
             .sessions
@@ -10475,14 +10830,23 @@ impl Frost {
                 meta.push_str(" · ");
                 meta.push_str(cwd);
             }
-            let retention = match sess.terminal.zone_output_export_capped(zone.id) {
-                Some(terminal::ZoneOutputExport::Unavailable) => {
-                    Some("Output snapshot and rows were evicted")
-                }
-                Some(terminal::ZoneOutputExport::Available {
-                    truncated: true, ..
-                }) => Some("Output is truncated"),
-                _ => None,
+            // Metadata-only: rendering an open menu must not clone/extract up
+            // to 1 MiB of output every frame. Copy/AI actions do the bounded
+            // extraction only when clicked.
+            let retention = if zone
+                .captured_output
+                .as_ref()
+                .is_some_and(|(_, truncated)| *truncated)
+            {
+                Some("Output is truncated")
+            } else if zone.captured_output_evicted {
+                Some(if zone.rows_evicted {
+                    "Output snapshot and rows were evicted"
+                } else {
+                    "Output snapshot was evicted; live rows remain available"
+                })
+            } else {
+                None
             };
 
             body = body
@@ -10512,39 +10876,78 @@ impl Frost {
             if let Some(retention) = retention {
                 body = body.push(text(retention).size(11).style(text::warning));
             }
-            let has_command = zone
-                .command
-                .as_deref()
-                .is_some_and(|command| !command.trim().is_empty());
-            body = if has_command {
+            let selection = block_menu_selection_summary(
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| (zone.id, zone.command.as_deref())),
+                &sess.block_selection,
+                zone.id,
+            );
+            body = if selection.has_selected_commands {
                 body.push(
                     row![
-                        row_btn("Copy command(s)", BlockMenuAction::CopyCommand),
-                        row_btn("Copy output(s)", BlockMenuAction::CopyOutput),
+                        row_btn(
+                            if selection.selected_count > 1 {
+                                "Copy commands"
+                            } else {
+                                "Copy command"
+                            },
+                            BlockMenuAction::CopyCommand,
+                        ),
+                        row_btn("Ask AI about block", BlockMenuAction::AskAi),
                     ]
                     .spacing(6),
                 )
             } else {
-                body.push(row_btn(
-                    "Copy background output",
-                    BlockMenuAction::CopyOutput,
-                ))
+                body.push(row_btn("Ask AI about block", BlockMenuAction::AskAi))
             };
             body = body.push(
                 row![
-                    row_btn("Copy block(s)", BlockMenuAction::CopyBlock),
-                    row_btn("Copy Markdown", BlockMenuAction::CopyMarkdown),
+                    row_btn(
+                        if selection.selected_count > 1 {
+                            "Copy outputs"
+                        } else if selection.clicked_has_command {
+                            "Copy output"
+                        } else {
+                            "Copy background output"
+                        },
+                        BlockMenuAction::CopyOutput,
+                    ),
+                    row_btn(
+                        if selection.selected_count > 1 {
+                            "Copy blocks"
+                        } else {
+                            "Copy block"
+                        },
+                        BlockMenuAction::CopyBlock,
+                    ),
                 ]
                 .spacing(6),
             );
-            if has_command {
-                body = body.push(
-                    row![
-                        row_btn("Recall this command", BlockMenuAction::RecallCommand),
-                        row_btn("Reinput selection", BlockMenuAction::ReinputSelected),
-                    ]
-                    .spacing(6),
-                );
+            body = body.push(row_btn(
+                if selection.selected_count > 1 {
+                    "Copy blocks as Markdown"
+                } else {
+                    "Copy block as Markdown"
+                },
+                BlockMenuAction::CopyMarkdown,
+            ));
+            if selection.clicked_has_command {
+                body = body.push(row_btn(
+                    "Recall this command",
+                    BlockMenuAction::RecallCommand,
+                ));
+            }
+            if selection.has_selected_commands {
+                body = body.push(row_btn(
+                    if selection.selected_count > 1 {
+                        "Reinput selected commands"
+                    } else {
+                        "Reinput command"
+                    },
+                    BlockMenuAction::ReinputSelected,
+                ));
             }
             body = body
                 .push(
@@ -10570,8 +10973,11 @@ impl Frost {
                 )
                 .push(
                     row![
-                        row_btn("Export Markdown", BlockMenuAction::ExportMarkdown),
-                        row_btn("Export JSON", BlockMenuAction::ExportJson),
+                        row_btn(
+                            "Export this block · Markdown",
+                            BlockMenuAction::ExportMarkdown
+                        ),
+                        row_btn("Export this block · JSON", BlockMenuAction::ExportJson),
                     ]
                     .spacing(6),
                 )
@@ -10592,8 +10998,8 @@ impl Frost {
                 );
         }
 
-        let panel_width = (self.win_size.width - 32.0).clamp(280.0, 620.0);
-        let panel_height = (self.win_size.height - 32.0).clamp(160.0, 560.0);
+        let panel_width = (self.win_size.width - 12.0).clamp(1.0, 360.0);
+        let panel_height = (self.win_size.height - TAB_BAR_H - 12.0).clamp(1.0, 520.0);
         let panel = container(scrollable(body).height(Length::Shrink))
             .width(Length::Fixed(panel_width))
             .max_height(panel_height)
@@ -10605,10 +11011,17 @@ impl Frost {
                 .height(Length::Fill),
         )
         .on_press(Message::BlockMenuClose);
-        let centered = container(panel)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-        stack![Element::from(dismiss), Element::from(centered)].into()
+        let position = anchored_overlay_position(
+            state.anchor,
+            self.win_size,
+            iced::Size::new(panel_width, panel_height),
+            TAB_BAR_H,
+        );
+        let placed = container(panel)
+            .align_left(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(iced::Padding::from(0).top(position.y).left(position.x));
+        stack![Element::from(dismiss), Element::from(placed)].into()
     }
 
     /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
@@ -10787,6 +11200,16 @@ impl Frost {
             for abs_row in zone_start.max(start)..zone_end.min(end) {
                 let row = &mut paint[abs_row - start];
                 row.selectable = true;
+                row.zone_id = Some(zone.id);
+                row.header_end_col = block_mode::finished_header_end_col(
+                    zone.command
+                        .as_deref()
+                        .is_some_and(|command| !command.trim().is_empty()),
+                    zone_start,
+                    zone.output_start,
+                    zone.output_start_col,
+                    abs_row,
+                );
                 row.stripe = Some(color);
                 row.stripe_strong = active;
                 // Zero is reserved for the live/input card below. The value is
@@ -10837,18 +11260,17 @@ impl Frost {
         // the current output/cursor row, without changing Frost's PTY or cell
         // geometry.
         if let Some(active_start) = running.or(live_prompt) {
-            let cursor_absolute_row = terminal
-                .scrollback_len()
-                .saturating_add(terminal.get_cursor_pos().0);
-            if let Some(span) = block_mode::visible_active_span(
-                active_start,
-                cursor_absolute_row,
-                total,
-                start,
-                end,
-            ) {
+            let active_extent_row = terminal.active_app_extent_row().unwrap_or_else(|| {
+                terminal
+                    .scrollback_len()
+                    .saturating_add(terminal.get_cursor_pos().0)
+            });
+            if let Some(span) =
+                block_mode::visible_active_span(active_start, active_extent_row, total, start, end)
+            {
                 for abs_row in span.start..span.end {
                     let row = &mut paint[abs_row - start];
+                    row.app_eligible = true;
                     row.stripe = Some(accent);
                     row.card_group = Some(0);
                     row.card_kind = terminal_view::BlockCardKind::Active;
@@ -10917,6 +11339,7 @@ impl Frost {
     /// to the active pane; the other panes render plain.
     fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
         let sess = &self.sessions[sess_idx];
+        let session_id = sess.id;
         let is_active = sess_idx == self.active;
         // An open overlay input owns the keyboard and IME, so the terminal pane
         // renders unfocused (no blinking cursor, no competing IME request).
@@ -10960,6 +11383,11 @@ impl Frost {
             Vec::new()
         };
         let blocks = self.block_paint_rows(sess);
+        let app_mouse_full_grid = app_mouse_uses_full_grid(
+            self.config.block_mode,
+            sess.terminal.is_alt_buffer_active(),
+            sess.terminal.has_usable_block_partitions(),
+        );
         TermWidget::new(
             &sess.grid,
             sess.cursor,
@@ -10988,10 +11416,10 @@ impl Frost {
         ))
         .search(search_matches, current)
         .blocks(blocks)
+        .app_mouse_full_grid(app_mouse_full_grid)
         .block_compact(self.config.block_compact)
         .block_markers(self.block_marker_fractions(sess))
         .block_bookmark_markers(self.block_bookmark_marker_fractions(sess))
-        .app_mouse(sess.terminal.is_mouse_enabled())
         .links(links)
         .dynamic_palette(&sess.terminal.dynamic_palette)
         .dynamic_defaults(
@@ -11010,7 +11438,7 @@ impl Frost {
         })
         .blink_on(self.blink_on)
         .opacity(self.config.opacity)
-        .on_mouse(move |inp| Message::MousePane(sess_idx, inp))
+        .on_mouse(move |inp| Message::MousePane(session_id, inp))
         .into()
     }
 
@@ -12813,22 +13241,25 @@ impl Frost {
             kb("Drag", "Select text"),
             kb("Ctrl+Click", "Open link under cursor"),
             section("Command Blocks"),
-            kb("Click / Ctrl+Click", "Select / toggle a finalized block"),
-            kb("Shift+Click", "Select a contiguous block range"),
+            kb("Header click", "Select one finalized block"),
+            kb("Shift+Click", "Select a range from any card row"),
+            kb("Ctrl+Shift+Click", "Toggle a block from any card row"),
             kb(
-                "Right-click gutter",
+                "Right-click card",
                 "Open block actions without losing selection"
             ),
             kb(
                 "Ctrl+Alt+F",
                 "Search/filter blocks and reveal the matching line"
             ),
-            kb("Ctrl+Shift+B", "Toggle bookmark on selected/latest block"),
+            kb("Ctrl+Shift+B", "Toggle bookmark on selected block"),
+            kb("Ctrl+, / Ctrl+.", "Previous / next bookmark (wraps)"),
             kb(
                 "Ctrl+Shift+A / I / K",
                 "Select all / reinput / clear blocks"
             ),
-            kb("Command palette", "Previous / next bookmark, copy, export"),
+            kb("Ctrl+Shift+↑ / ↓", "Reveal selected block top / bottom"),
+            kb("Command palette", "Block copy, search, export, navigation"),
             kb("Enter / Esc", "Reinput safe selection / clear selection"),
             section("Scroll / Search"),
             kb("Shift+Home", "Scroll to top"),
@@ -13328,21 +13759,21 @@ impl Frost {
                 .into()
         };
         let context_line: Element<'_, Message> = match self.agent.last_manual_completed.as_ref() {
-            Some(context) => row![
-                text(format!(
-                    "attached context: `{}` (exit {})",
-                    context.cmd, context.exit_code
-                ))
-                .size(10)
-                .style(text::secondary),
-                button(text("✕").size(10))
-                    .style(button::secondary)
-                    .padding(2)
-                    .on_press(Message::AgentClearContext),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .into(),
+            Some(context) => {
+                let status = agent_context_exit_label(context.exit_code);
+                row![
+                    text(format!("attached context: `{}` ({status})", context.cmd))
+                        .size(10)
+                        .style(text::secondary),
+                    button(text("✕").size(10))
+                        .style(button::secondary)
+                        .padding(2)
+                        .on_press(Message::AgentClearContext),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()
+            }
             None => Space::new().into(),
         };
 
@@ -14346,6 +14777,296 @@ mod tests {
         assert!(!block_escape_owns_key(true, true, false, false, false));
         assert!(!block_escape_owns_key(true, true, false, true, true));
         assert!(!block_escape_owns_key(true, true, true, false, true));
+    }
+
+    #[test]
+    fn terminal_mouse_routing_prefers_finished_history_over_live_app_mode() {
+        // Primary-screen app reporting owns its live surface.
+        assert!(app_owns_terminal_mouse(true, false, true, false));
+        // Finished or pre-zone scrollback, padding and scrollbar strips all
+        // arrive ineligible and cannot be inferred from `!finalized`.
+        assert!(!app_owns_terminal_mouse(true, false, false, false));
+        // Shift and Ctrl+link remain local overrides on the live surface too.
+        assert!(!app_owns_terminal_mouse(true, true, true, false));
+        assert!(!app_owns_terminal_mouse(true, false, true, true));
+        assert!(!app_owns_terminal_mouse(false, false, true, false));
+
+        assert!(app_owns_terminal_wheel(true, false, true));
+        assert!(!app_owns_terminal_wheel(true, false, false));
+        assert!(!app_owns_terminal_wheel(true, true, true));
+        assert!(!app_owns_terminal_wheel(false, false, true));
+
+        assert!(!app_mouse_uses_full_grid(true, false, true));
+        assert!(app_mouse_uses_full_grid(true, false, false));
+        assert!(app_mouse_uses_full_grid(true, true, true));
+        assert!(app_mouse_uses_full_grid(false, false, true));
+    }
+
+    #[test]
+    fn claimed_block_press_does_not_retarget_after_pty_viewport_shift() {
+        let mut terminal = terminal::TerminalState::new(24, 4);
+        for index in 0..4 {
+            let lifecycle = format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07cmd{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+            );
+            terminal.process_input(lifecycle.as_bytes());
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+
+        // Find one physical viewport row that names different finalized zones
+        // at two real scroll offsets. This models the render→update race: the
+        // press carries the first id while PTY/scroll activity changes the
+        // current row mapping before dispatch.
+        let rows = terminal.get_dimensions().1;
+        let mut mappings = Vec::new();
+        for offset in 0..=terminal.scrollback_len() {
+            terminal.set_scroll_offset(offset);
+            for row in 0..rows {
+                if let Some(id) = finalized_block_at_viewport_row(true, &terminal, row) {
+                    mappings.push((offset, row, id));
+                }
+            }
+        }
+        let ((render_offset, row, rendered_id), (dispatch_offset, _, current_id)) = mappings
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(index, rendered)| {
+                mappings[index + 1..]
+                    .iter()
+                    .copied()
+                    .find(|current| current.1 == rendered.1 && current.2 != rendered.2)
+                    .map(|current| (rendered, current))
+            })
+            .expect("fixture must shift one viewport row onto a neighbouring block");
+
+        terminal.set_scroll_offset(render_offset);
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, row),
+            Some(rendered_id)
+        );
+        terminal.set_scroll_offset(dispatch_offset);
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, row),
+            Some(current_id)
+        );
+        assert!(terminal.zone_by_id(rendered_id).is_some());
+        assert_eq!(
+            validated_claimed_block_target(Some(rendered_id), Some(current_id), true),
+            None,
+            "the neighbour under the shifted viewport must never replace the painted id"
+        );
+        assert_eq!(
+            validated_claimed_block_target(Some(rendered_id), Some(rendered_id), true),
+            Some(rendered_id)
+        );
+        assert_eq!(
+            validated_claimed_block_target(Some(rendered_id), Some(rendered_id), false),
+            None,
+            "an evicted/non-finalized painted target fails closed"
+        );
+    }
+
+    #[test]
+    fn terminal_mouse_gestures_are_independent_per_button() {
+        let mut gestures = [None; 3];
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id: 7,
+                button,
+                report_to_app: true,
+                consumed: false,
+            });
+        }
+        for button in [MouseButton::Right, MouseButton::Left, MouseButton::Middle] {
+            let gesture = gestures[button.slot()].take().expect("owned release");
+            assert_eq!(gesture.button, button);
+        }
+        assert!(gestures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn overlay_only_dispatches_origin_app_release() {
+        let app_left = TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: true,
+            consumed: false,
+        };
+        let local_right = TerminalMouseGesture {
+            session_id: 8,
+            button: MouseButton::Right,
+            report_to_app: false,
+            consumed: false,
+        };
+        let consumed_middle = TerminalMouseGesture {
+            session_id: 8,
+            button: MouseButton::Middle,
+            report_to_app: false,
+            consumed: true,
+        };
+
+        assert_eq!(
+            overlay_release_disposition(Some(app_left), 7, MouseButton::Left),
+            OverlayReleaseDisposition::DispatchApp
+        );
+        assert_eq!(
+            overlay_release_disposition(Some(app_left), 8, MouseButton::Left),
+            OverlayReleaseDisposition::Reject,
+            "a focused pane cannot steal another pane's button-up"
+        );
+        assert_eq!(
+            overlay_release_disposition(Some(local_right), 8, MouseButton::Right),
+            OverlayReleaseDisposition::ClearOnly,
+            "local release behind an overlay must not copy or move the caret"
+        );
+        assert_eq!(
+            overlay_release_disposition(Some(consumed_middle), 8, MouseButton::Middle),
+            OverlayReleaseDisposition::ClearOnly
+        );
+    }
+
+    #[test]
+    fn ctrl_link_requires_an_unshifted_single_left_press() {
+        for (name, over_grid, finalized, header, expected) in [
+            ("finished header", true, true, true, false),
+            ("finished output", true, true, false, true),
+            ("active/live", true, false, false, true),
+            ("alt/non-Block", true, false, false, true),
+            ("pre-zone history", true, false, false, true),
+            ("padding/scrollbar", false, false, false, false),
+        ] {
+            assert_eq!(
+                terminal_view::link_surface_eligible(over_grid, finalized, header),
+                expected,
+                "{name}"
+            );
+        }
+
+        assert!(terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            true,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            2,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            3,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Right,
+            1,
+            true,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            false,
+            false,
+            true,
+        ));
+        assert!(!terminal_view::ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            false, // finished command/header row
+        ));
+    }
+
+    #[test]
+    fn unknown_ai_block_status_is_not_presented_as_success() {
+        assert_eq!(agent_context_exit_label(-1), "no reported exit status");
+        assert_eq!(agent_context_exit_label(0), "exit 0");
+        assert_eq!(agent_context_exit_label(7), "exit 7");
+    }
+
+    #[test]
+    fn bookmark_toggle_has_no_implicit_latest_target() {
+        let ids = [10, 20, 30];
+        assert_eq!(active_bookmark_target(&ids, Some(20)), Some(20));
+        assert_eq!(active_bookmark_target(&ids, None), None);
+        assert_eq!(active_bookmark_target(&ids, Some(99)), None);
+    }
+
+    #[test]
+    fn ai_block_output_reports_secondary_context_truncation() {
+        let short = "one\ntwo";
+        assert_eq!(
+            bounded_ai_block_output(short, false),
+            (short.to_string(), false)
+        );
+        let (unknown, truncated) = bounded_ai_block_output(short, true);
+        assert!(!truncated);
+        assert_eq!(unknown, format!("{NO_REPORTED_EXIT_STATUS_NOTE}\n{short}"));
+
+        let long = (0..200)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (bounded, truncated) = bounded_ai_block_output(&long, true);
+        assert!(truncated);
+        assert_ne!(bounded, long);
+        assert!(bounded.starts_with(NO_REPORTED_EXIT_STATUS_NOTE));
+        assert!(bounded.contains("line 0"));
+        assert!(bounded.contains("line 199"));
+    }
+
+    #[test]
+    fn pointer_anchored_block_menu_flips_and_clamps_inside_window() {
+        let window = iced::Size::new(1000.0, 700.0);
+        let panel = iced::Size::new(360.0, 500.0);
+        assert_eq!(
+            anchored_overlay_position(iced::Point::new(100.0, 80.0), window, panel, TAB_BAR_H),
+            iced::Point::new(106.0, 86.0)
+        );
+        // Bottom-right summons above the pointer and clamps away from the edge.
+        assert_eq!(
+            anchored_overlay_position(iced::Point::new(990.0, 690.0), window, panel, TAB_BAR_H),
+            iced::Point::new(634.0, 184.0)
+        );
+        // Corrupt/non-finite pointer state stays reachable instead of
+        // propagating NaNs into iced layout.
+        assert_eq!(
+            anchored_overlay_position(
+                iced::Point::new(f32::NAN, f32::NAN),
+                window,
+                panel,
+                TAB_BAR_H,
+            ),
+            iced::Point::new(6.0, 36.0)
+        );
+    }
+
+    #[test]
+    fn block_menu_batch_commands_do_not_depend_on_clicked_background() {
+        let mut selection = block_mode::BlockSelection::default();
+        selection.select_all(&[10, 20]);
+        let summary =
+            block_menu_selection_summary([(10, Some("printf ok")), (20, None)], &selection, 20);
+        assert_eq!(summary.selected_count, 2);
+        assert!(summary.has_selected_commands);
+        assert!(!summary.clicked_has_command);
     }
 
     #[test]

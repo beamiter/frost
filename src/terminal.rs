@@ -3142,6 +3142,46 @@ impl TerminalState {
         }
     }
 
+    /// Furthest absolute row still owned by the active primary-screen
+    /// lifecycle. Cursor motion may move back above text already painted by a
+    /// running command (for example CUP-based progress UIs), so application
+    /// mouse routing must retain the greater of the cursor and recorded write
+    /// extent instead of shrinking with the cursor.
+    pub fn active_app_extent_row(&self) -> Option<usize> {
+        let lifecycle_start = match self.current_zone_state {
+            ZoneState::PromptStarted(prompt_start)
+            | ZoneState::CommandStarted(prompt_start, _)
+            | ZoneState::OutputStarted(prompt_start, _, _) => prompt_start,
+            ZoneState::Idle => return None,
+        };
+        let cursor = self.scrollback.len().saturating_add(self.cursor_row);
+        let written = match self.current_zone_state {
+            ZoneState::CommandStarted(_, _) => self.current_command_extent_row,
+            ZoneState::OutputStarted(_, _, _) => self.current_output_extent_row,
+            ZoneState::PromptStarted(_) | ZoneState::Idle => None,
+        };
+        let last_row = self
+            .scrollback
+            .len()
+            .saturating_add(self.grid.rows())
+            .saturating_sub(1);
+        Some(
+            written
+                .unwrap_or(cursor)
+                .max(cursor)
+                .max(lifecycle_start)
+                .min(last_row),
+        )
+    }
+
+    /// Whether Block Mode has any retained row partition to distinguish
+    /// static history from the active application surface. Without usable OSC
+    /// 133 evidence, mouse routing falls back to the ordinary full grid.
+    pub fn has_usable_block_partitions(&self) -> bool {
+        !matches!(self.current_zone_state, ZoneState::Idle)
+            || self.command_zones.iter().any(|zone| !zone.rows_evicted)
+    }
+
     /// Capture one finished OSC 133 command for the AI agent queue. The
     /// command line spans `cmd_start..cmd_end`; `output` gives the output row
     /// range when the shell reported one.
@@ -7391,6 +7431,24 @@ mod tests {
         );
         let id = stale.command_zones.back().expect("stale block").id;
         assert_eq!(stale.zone_output_text(id).as_deref(), Some("RESULT"));
+    }
+
+    #[test]
+    fn active_app_extent_does_not_shrink_when_output_moves_cursor_up() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        assert!(!terminal.has_usable_block_partitions());
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07");
+        terminal.process_input(b"\r\none\r\ntwo");
+        let painted_extent = terminal.active_app_extent_row().expect("running extent");
+        assert!(painted_extent >= 2);
+
+        // Move above already painted output without writing there. Mouse
+        // ownership must keep the lower output row in the active surface.
+        terminal.process_input(b"\x1b[1;1H");
+        let cursor = terminal.scrollback_len() + terminal.get_cursor_pos().0;
+        assert!(cursor < painted_extent);
+        assert_eq!(terminal.active_app_extent_row(), Some(painted_extent));
+        assert!(terminal.has_usable_block_partitions());
     }
 
     #[test]

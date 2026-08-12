@@ -153,6 +153,65 @@ fn too_large() -> io::Error {
     )
 }
 
+fn snapshot_zone(
+    terminal: &TerminalState,
+    zone: &crate::terminal::CommandZone,
+    now_ms: u64,
+    source_bytes: &mut usize,
+) -> io::Result<SessionExportBlock> {
+    let (output, output_truncated, output_unavailable) =
+        match terminal.zone_output_export_capped(zone.id) {
+            Some(ZoneOutputExport::Available { text, truncated }) => (text, truncated, false),
+            Some(ZoneOutputExport::Empty) => (String::new(), false, false),
+            Some(ZoneOutputExport::Unavailable) => (String::new(), false, true),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "retained command block disappeared during export snapshot",
+                ));
+            }
+        };
+    let record_bytes = output
+        .len()
+        .saturating_add(zone.command.as_ref().map_or(0, String::len))
+        .saturating_add(zone.cwd.as_ref().map_or(0, String::len))
+        .saturating_add(128);
+    *source_bytes = source_bytes
+        .checked_add(record_bytes)
+        .ok_or_else(too_large)?;
+    if *source_bytes > MAX_SESSION_EXPORT_SOURCE_BYTES {
+        return Err(too_large());
+    }
+    let offset_at = zone.finished_at_ms.unwrap_or(now_ms);
+    Ok(SessionExportBlock {
+        id: zone.id,
+        command: zone.command.clone(),
+        output,
+        output_truncated,
+        output_unavailable,
+        exit_code: zone.exit_code,
+        duration_ms: zone.duration_ms,
+        finished_at_ms: zone.finished_at_ms,
+        tz_offset_secs: block_mode::local_offset_secs((offset_at / 1000) as i64),
+        cwd: zone.cwd.clone(),
+        command_truncated: zone.command_truncated,
+        completion_observed: zone.completion_observed,
+    })
+}
+
+fn snapshot_with_blocks(
+    pane_session_id: usize,
+    now_ms: u64,
+    blocks: Vec<SessionExportBlock>,
+) -> SessionExportSnapshot {
+    SessionExportSnapshot {
+        pane_session_id,
+        captured_at_ms: now_ms,
+        captured_tz_offset_secs: block_mode::local_offset_secs((now_ms / 1000) as i64),
+        blocks,
+    }
+}
+
 /// Clone the active terminal's retained finalized blocks oldest-first. Each zone's
 /// captured snapshot wins over live row extraction through the terminal's
 /// existing accessor, so records already outside scrollback still export.
@@ -168,51 +227,31 @@ pub fn snapshot_session(
     let mut blocks = Vec::with_capacity(terminal.command_zones.len());
 
     for zone in &terminal.command_zones {
-        let (output, output_truncated, output_unavailable) =
-            match terminal.zone_output_export_capped(zone.id) {
-                Some(ZoneOutputExport::Available { text, truncated }) => (text, truncated, false),
-                Some(ZoneOutputExport::Empty) => (String::new(), false, false),
-                Some(ZoneOutputExport::Unavailable) => (String::new(), false, true),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "retained command block disappeared during export snapshot",
-                    ));
-                }
-            };
-        let record_bytes = output
-            .len()
-            .saturating_add(zone.command.as_ref().map_or(0, String::len))
-            .saturating_add(zone.cwd.as_ref().map_or(0, String::len))
-            .saturating_add(128);
-        source_bytes = source_bytes
-            .checked_add(record_bytes)
-            .ok_or_else(too_large)?;
-        if source_bytes > MAX_SESSION_EXPORT_SOURCE_BYTES {
-            return Err(too_large());
-        }
-        let offset_at = zone.finished_at_ms.unwrap_or(now_ms);
-        blocks.push(SessionExportBlock {
-            id: zone.id,
-            command: zone.command.clone(),
-            output,
-            output_truncated,
-            output_unavailable,
-            exit_code: zone.exit_code,
-            duration_ms: zone.duration_ms,
-            finished_at_ms: zone.finished_at_ms,
-            tz_offset_secs: block_mode::local_offset_secs((offset_at / 1000) as i64),
-            cwd: zone.cwd.clone(),
-            command_truncated: zone.command_truncated,
-            completion_observed: zone.completion_observed,
-        });
+        blocks.push(snapshot_zone(terminal, zone, now_ms, &mut source_bytes)?);
     }
-    Ok(SessionExportSnapshot {
-        pane_session_id,
-        captured_at_ms: now_ms,
-        captured_tz_offset_secs: block_mode::local_offset_secs((now_ms / 1000) as i64),
-        blocks,
-    })
+    Ok(snapshot_with_blocks(pane_session_id, now_ms, blocks))
+}
+
+/// Snapshot one exact stable zone for a right-click export. Unrelated retained
+/// blocks are never cloned or allowed to make this single-block operation fail.
+pub fn snapshot_block(
+    terminal: &TerminalState,
+    pane_session_id: usize,
+    zone_id: u64,
+) -> io::Result<SessionExportSnapshot> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let zone = terminal.zone_by_id(zone_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "right-clicked command block is no longer retained",
+        )
+    })?;
+    let mut source_bytes = 0usize;
+    let block = snapshot_zone(terminal, zone, now_ms, &mut source_bytes)?;
+    Ok(snapshot_with_blocks(pane_session_id, now_ms, vec![block]))
 }
 
 struct BoundedBuffer {
@@ -468,6 +507,30 @@ mod tests {
         assert_eq!(recovered.cwd.as_deref(), Some("/srv/work"));
         assert!(recovered.command_truncated);
         assert!(!recovered.completion_observed);
+    }
+
+    #[test]
+    fn right_click_snapshot_exports_only_the_exact_block() {
+        let mut terminal = TerminalState::new(80, 12);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07alpha-command\r\n");
+        terminal.process_input(
+            b"\x1b]133;C;cmdline_url=alpha-command\x07alpha-output\r\n\x1b]133;D;exit_code=0\x07",
+        );
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07beta-command\r\n");
+        terminal.process_input(
+            b"\x1b]133;C;cmdline_url=beta-command\x07beta-output\r\n\x1b]133;D;exit_code=1\x07",
+        );
+
+        let exact = snapshot_block(&terminal, 9, 0).expect("snapshot clicked alpha block");
+        assert_eq!(exact.blocks.len(), 1);
+        assert_eq!(exact.blocks[0].id, 0);
+        for format in [SessionExportFormat::Markdown, SessionExportFormat::Json] {
+            let document = String::from_utf8(serialize_session(&exact, format).unwrap()).unwrap();
+            assert!(document.contains("alpha-command"));
+            assert!(document.contains("alpha-output"));
+            assert!(!document.contains("beta-command"));
+            assert!(!document.contains("beta-output"));
+        }
     }
 
     #[test]

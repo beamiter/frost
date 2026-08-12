@@ -52,8 +52,8 @@ pub enum Command {
     // jump-prev/next-failed chords) are pane:focus_left/right. The P0 batch
     // actions keep the family chords (Ctrl+Shift+A/I/K), and block:search uses
     // Ctrl+Alt+F because Ctrl+Shift+G is terminal:copy_last_output here;
-    // Bookmark toggling uses the free Ctrl+Shift+B chord; navigation and the
-    // remaining block commands stay palette-only until the user binds them.
+    // Bookmark toggling/navigation use the family Ctrl+Shift+B and Ctrl+,/.
+    // chords; the remaining block commands stay palette-only until bound.
     BlockJumpFirstFailed,
     BlockJumpPrevFailed,
     BlockJumpNextFailed,
@@ -449,6 +449,12 @@ impl KeyBindings {
             "ctrl+shift+b".to_string(),
             "block:toggle_bookmark".to_string(),
         );
+        bindings
+            .bindings
+            .insert("ctrl+,".to_string(), "block:jump_prev_bookmark".to_string());
+        bindings
+            .bindings
+            .insert("ctrl+.".to_string(), "block:jump_next_bookmark".to_string());
 
         // 配置操作
         bindings
@@ -808,6 +814,8 @@ mod tests {
             ("ctrl+shift+up", Command::TerminalPromptPrev),
             ("ctrl+shift+down", Command::TerminalPromptNext),
             ("ctrl+shift+g", Command::TerminalCopyLastOutput),
+            ("ctrl+,", Command::BlockJumpPrevBookmark),
+            ("ctrl+.", Command::BlockJumpNextBookmark),
         ];
         for (chord, expected) in cases {
             assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
@@ -900,8 +908,14 @@ mod tests {
             bindings.get_command("ctrl+shift+b"),
             Some(Command::BlockToggleBookmark)
         );
-        assert_eq!(bindings.get_command("ctrl+,"), None);
-        assert_eq!(bindings.get_command("ctrl+."), None);
+        assert_eq!(
+            bindings.get_command("ctrl+,"),
+            Some(Command::BlockJumpPrevBookmark)
+        );
+        assert_eq!(
+            bindings.get_command("ctrl+."),
+            Some(Command::BlockJumpNextBookmark)
+        );
         let mut bound_block_commands: Vec<&str> = bindings
             .bindings
             .values()
@@ -913,6 +927,8 @@ mod tests {
             bound_block_commands,
             vec![
                 "block:clear",
+                "block:jump_next_bookmark",
+                "block:jump_prev_bookmark",
                 "block:reinput_selected_commands",
                 "block:search",
                 "block:select_all",

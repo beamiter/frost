@@ -11,14 +11,17 @@ remain intact.
 
 ## Completed since the previous handoff
 
-- Block interaction now has a layout-reserved 8px gutter rather than a hit target that
-  overlaps column zero. Only rows belonging to finalized selectable blocks own it;
-  running/live-prompt rows remain ordinary terminal input. Left click keeps single,
-  toggle, and range selection, while right click opens a stable pane/zone action panel
-  for copy, recall/reinput, bookmark, top/bottom reveal, search, and session export.
-  Mouse gesture ownership is frozen at press time, so Shift or application mouse-mode
-  changes cannot produce an orphan press/release; running/full-screen and disabled
-  Block Mode keybindings fall through to the PTY.
+- Block interaction has a layout-reserved 8px gutter rather than paint over column zero.
+  Finalized rows are a local static-card surface: a single prompt/header click selects,
+  Shift selects a range from any card row, Ctrl+Shift toggles, and right click anywhere
+  opens a pointer-anchored stable pane/zone action panel. Plain/double/triple output
+  clicks retain native text selection, and Ctrl-click retains link activation. The menu
+  covers selected copy/Markdown, exact-block Agent context, recall/reinput, bookmark,
+  top/bottom reveal, search, and exact-block Markdown/JSON export. Mouse ownership is frozen at press time;
+  right/middle releases follow their press across pane bounds, completed-row wheel input
+  stays local even with primary application mouse reporting, and live/alternate-screen
+  interactions still route to the PTY. Running/full-screen and disabled Block Mode
+  keybindings fall through to the PTY.
 - Pane-local block bookmarks have bounded-history reconciliation, wrapped previous/next
   navigation, gutter and scrollbar markers, a default toggle chord (`Ctrl+Shift+B`),
   command-palette navigation, and search integration. Clear Blocks removes bookmarks;

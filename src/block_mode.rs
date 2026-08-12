@@ -159,17 +159,30 @@ impl BlockSelection {
         self.active = Some(last);
     }
 
-    /// Apply a gutter click. Plain click replaces, Ctrl toggles, and Shift
-    /// selects the inclusive range from the fixed anchor to `target`.
+    /// Apply the family card-click contract. Plain (including Ctrl-only on a
+    /// header) replaces, Shift selects the inclusive range from the fixed
+    /// anchor, and Ctrl+Shift toggles one block.
     pub fn click(&mut self, ids: &[u64], target: u64, ctrl: bool, shift: bool) {
-        if shift {
+        if ctrl && shift {
+            self.toggle(ids, target);
+        } else if shift {
             let anchor = self.anchor.or(self.active).unwrap_or(target);
             self.select_range(ids, anchor, target);
-        } else if ctrl {
-            self.toggle(ids, target);
         } else {
             self.replace(Some(target));
         }
+    }
+
+    /// Make a context-clicked block the active/anchor edge without collapsing
+    /// a multi-selection that already contains it.
+    pub fn activate(&mut self, ids: &[u64], target: u64) {
+        self.retain(ids);
+        if !self.selected.contains(&target) {
+            self.replace(Some(target));
+            return;
+        }
+        self.active = Some(target);
+        self.anchor = Some(target);
     }
 
     /// Extend/contract the active edge by one item while retaining the fixed
@@ -442,6 +455,29 @@ pub fn spans(starts: &[usize], live_boundary: usize) -> Vec<(usize, usize)> {
             (start, end.max(start))
         })
         .collect()
+}
+
+/// End-exclusive header hit column for one physical row of a finished card.
+/// `usize::MAX` means the full row. Command-bearing cards own every prompt /
+/// wrapped-command row before output begins, plus only the command-side cells
+/// when output starts on the same row. Background cards have no command span,
+/// so their first row remains the synthetic header target.
+pub fn finished_header_end_col(
+    has_command: bool,
+    prompt_start: usize,
+    output_start: Option<usize>,
+    output_start_col: usize,
+    row: usize,
+) -> usize {
+    if !has_command {
+        return if row == prompt_start { usize::MAX } else { 0 };
+    }
+    match output_start {
+        None => usize::MAX,
+        Some(output_row) if row < output_row => usize::MAX,
+        Some(output_row) if row == output_row => output_start_col,
+        Some(_) => 0,
+    }
 }
 
 /// Family minimum for the live input/running-command surface. Frost maps this
@@ -883,7 +919,7 @@ pub fn markdown_export_with_state(
 }
 
 /// Keyboard block navigation over completed zones (`ids` oldest-first, the
-/// same set the gutter click selects). Up with no live selection enters at the
+/// same set the card gestures select). Up with no live selection enters at the
 /// newest block; Down passes through. Up clamps (and remains owned) at the
 /// oldest block, while Down past the newest clears selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1444,6 +1480,32 @@ mod tests {
     }
 
     #[test]
+    fn finished_header_hit_covers_wrapped_command_and_stops_at_same_row_output() {
+        // A wrapped command occupies all rows before output and only the first
+        // five cells of the physical row where output begins.
+        assert_eq!(
+            finished_header_end_col(true, 10, Some(13), 5, 10),
+            usize::MAX
+        );
+        assert_eq!(
+            finished_header_end_col(true, 10, Some(13), 5, 12),
+            usize::MAX
+        );
+        assert_eq!(finished_header_end_col(true, 10, Some(13), 5, 13), 5);
+        assert_eq!(finished_header_end_col(true, 10, Some(13), 5, 14), 0);
+        assert_eq!(finished_header_end_col(true, 10, Some(10), 7, 10), 7);
+
+        // No-output commands remain header-selectable throughout their card;
+        // background output retains just its first-row header target.
+        assert_eq!(finished_header_end_col(true, 10, None, 0, 14), usize::MAX);
+        assert_eq!(
+            finished_header_end_col(false, 10, Some(10), 0, 10),
+            usize::MAX
+        );
+        assert_eq!(finished_header_end_col(false, 10, Some(10), 0, 11), 0);
+    }
+
+    #[test]
     fn active_span_is_six_rows_grows_with_cursor_and_preserves_clip_edges() {
         assert_eq!(
             visible_active_span(10, 10, 100, 0, 30),
@@ -1611,8 +1673,8 @@ mod tests {
     fn selected_markdown_copy_is_ordered_separated_and_bounded() {
         let mut selection = BlockSelection::default();
         // Deliberately select out of insertion order: source/terminal order wins.
-        selection.click(&[1, 2, 3], 2, true, false);
-        selection.click(&[1, 2, 3], 1, true, false);
+        selection.click(&[1, 2, 3], 2, true, true);
+        selection.click(&[1, 2, 3], 1, true, true);
         let source = || {
             [
                 (1, "## Command Block\n\nfirst\n".to_string()),
@@ -2012,7 +2074,7 @@ mod tests {
         assert!(selection.contains(20));
         assert_eq!(selection.len(), 1);
 
-        selection.click(&ids, 40, true, false);
+        selection.click(&ids, 40, true, true);
         assert_eq!(selection.active(), Some(40));
         assert!(selection.contains(20));
         assert!(selection.contains(40));
@@ -2020,7 +2082,7 @@ mod tests {
 
         // Ctrl toggling the active edge off falls back to the newest selected
         // id still present in terminal order.
-        selection.click(&ids, 40, true, false);
+        selection.click(&ids, 40, true, true);
         assert_eq!(selection.active(), Some(20));
         assert_eq!(selection.len(), 1);
 
@@ -2034,15 +2096,25 @@ mod tests {
         assert!(selection.contains(40));
         assert_eq!(selection.len(), 3);
 
-        // Frost deliberately gives Shift range precedence when both modifiers
-        // are held; unlike forge, Ctrl+Shift is not a toggle gesture here.
+        // Ctrl+Shift is the cross-card toggle gesture; Shift alone owns range.
         selection.click(&ids, 10, false, false);
-        selection.click(&ids, 30, true, true);
+        selection.click(&ids, 30, false, true);
         assert_eq!(selection.active(), Some(30));
         assert!(selection.contains(10));
         assert!(selection.contains(20));
         assert!(selection.contains(30));
         assert_eq!(selection.len(), 3);
+
+        selection.click(&ids, 20, true, true);
+        assert!(!selection.contains(20));
+        assert!(selection.contains(10));
+        assert!(selection.contains(30));
+        assert_eq!(selection.active(), Some(30));
+
+        // Ctrl alone on a header is a replace, not the toggle chord.
+        selection.click(&ids, 40, true, false);
+        assert_eq!(selection.active(), Some(40));
+        assert_eq!(selection.len(), 1);
     }
 
     #[test]
@@ -2052,10 +2124,38 @@ mod tests {
 
         // Simulate a missed reconciliation after 10 was evicted, then add and
         // remove a live id. The stale id must not leave an invisible selection.
-        selection.click(&[20, 30], 30, true, false);
-        selection.click(&[20, 30], 30, true, false);
+        selection.click(&[20, 30], 30, true, true);
+        selection.click(&[20, 30], 30, true, true);
         assert!(selection.is_empty());
         assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn context_activation_preserves_selected_range_and_resets_anchor() {
+        let ids = [10, 20, 30, 40];
+        let mut selection = BlockSelection::default();
+        selection.click(&ids, 10, false, false);
+        selection.click(&ids, 30, false, true);
+
+        selection.activate(&ids, 20);
+        assert_eq!(selection.active(), Some(20));
+        assert_eq!(selection.len(), 3);
+        assert!(selection.contains(10));
+        assert!(selection.contains(20));
+        assert!(selection.contains(30));
+
+        // A subsequent Shift gesture starts from the context-clicked card.
+        selection.click(&ids, 40, false, true);
+        assert_eq!(selection.active(), Some(40));
+        assert!(!selection.contains(10));
+        assert!(selection.contains(20));
+        assert!(selection.contains(30));
+        assert!(selection.contains(40));
+
+        // Context-clicking an unselected card collapses to that stable target.
+        selection.activate(&ids, 10);
+        assert_eq!(selection.active(), Some(10));
+        assert_eq!(selection.len(), 1);
     }
 
     #[test]

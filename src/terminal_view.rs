@@ -28,6 +28,30 @@ pub enum MouseButton {
     Right,
 }
 
+impl MouseButton {
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Middle => 1,
+            Self::Right => 2,
+        }
+    }
+}
+
+/// A completed-card press that belongs to Block Mode instead of the PTY or
+/// native terminal text selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockMouseAction {
+    /// Plain single press on the card's prompt/header row.
+    Replace,
+    /// Shift+single press anywhere in the completed card.
+    Range,
+    /// Ctrl+Shift+single press anywhere in the completed card.
+    Toggle,
+    /// Right press anywhere in the completed card.
+    Menu,
+}
+
 /// A semantic mouse interaction over the terminal grid, in 0-indexed cell
 /// coordinates. Emitted by [`TermWidget`] and handled by the application.
 #[derive(Debug, Clone, Copy)]
@@ -40,9 +64,32 @@ pub enum MouseInput {
         alt: bool,
         ctrl: bool,
         count: u32,
-        /// The press landed in the left-padding gutter band (block stripes),
-        /// before any cell math. Used for block selection.
-        gutter: bool,
+        /// Press landed on a finalized history-card row. This stays true for
+        /// ordinary output text selection even when no Block action claimed it.
+        finalized: bool,
+        /// Press is over a real grid cell that may activate a host-side link.
+        /// Every grid surface qualifies except a finalized command/header;
+        /// padding, gutter, and scrollbar never do.
+        link_eligible: bool,
+        /// Press is over real application-owned grid cells: an active/live
+        /// card row, or any real grid row in alternate/non-Block mode. Padding,
+        /// scrollbar, pre-zone history, and finalized cards remain local.
+        app_eligible: bool,
+        /// Block action claimed at press time. `None` keeps the ordinary PTY /
+        /// native text-selection pipeline, including double/triple click.
+        block: Option<BlockMouseAction>,
+        /// Stable finalized-zone identity from the exact row snapshot used to
+        /// classify `block`. The app must never re-target a later neighbour
+        /// merely because the viewport moved before update handled the press.
+        block_zone_id: Option<u64>,
+        /// A Ctrl+single-left link activation claimed for its entire gesture.
+        /// No Drag/Release is emitted, so it can never mutate text selection or
+        /// leak half a mouse-reporting sequence after opening the link.
+        link: bool,
+        /// Window-local pointer position. Context menus freeze this at open
+        /// time so later pointer movement cannot move the stable-target panel.
+        x: f32,
+        y: f32,
     },
     Drag {
         col: usize,
@@ -62,6 +109,9 @@ pub enum MouseInput {
         shift: bool,
         /// Number of whole lines this event scrolls (≥1).
         lines: usize,
+        /// Wheel is over real live/active grid cells (not padding, scrollbar,
+        /// or finalized history) and is therefore eligible for app reporting.
+        app_eligible: bool,
     },
     /// Drag/jump the scrollbar to an absolute scrollback offset
     /// (0 = bottom/live view).
@@ -102,8 +152,8 @@ const BLOCK_CARD_COMPACT_RADIUS: f32 = 6.0;
 /// A one-pixel breathing gap at real card edges gives adjacent single-grid
 /// blocks separation without inserting synthetic terminal rows.
 const BLOCK_CARD_EDGE_GAP: f32 = 1.0;
-/// Minimum width of the gutter hit band used for block selection. Ties to the
-/// stripe widths above: it must cover the widest stripe
+/// Width of the reserved card gutter. Ties to the stripe widths above: it must
+/// cover the widest stripe
 /// (`BLOCK_STRIPE_SELECTED_WIDTH` = 5px, plus 1px slack) so a press anywhere
 /// on the visible stripe selects the block, even when the configured left
 /// padding is narrower than the stripe. It must also exceed the window's
@@ -127,18 +177,52 @@ pub enum BlockCardKind {
     Active,
 }
 
-fn is_block_gutter_press(
+fn block_mouse_action(
     button: MouseButton,
     row_has_selectable_block: bool,
-    app_mouse: bool,
+    row_is_header: bool,
     shift: bool,
-    press_x: f32,
-    gutter_right: f32,
+    ctrl: bool,
+    count: u32,
+) -> Option<BlockMouseAction> {
+    if !row_has_selectable_block {
+        return None;
+    }
+    match button {
+        MouseButton::Right => Some(BlockMouseAction::Menu),
+        MouseButton::Left if count != 1 => None,
+        MouseButton::Left if ctrl && shift => Some(BlockMouseAction::Toggle),
+        MouseButton::Left if shift => Some(BlockMouseAction::Range),
+        MouseButton::Left if row_is_header => Some(BlockMouseAction::Replace),
+        MouseButton::Left | MouseButton::Middle => None,
+    }
+}
+
+fn app_mouse_surface_eligible(
+    over_grid_rows: bool,
+    over_grid_columns: bool,
+    full_grid: bool,
+    row_app_eligible: bool,
 ) -> bool {
-    matches!(button, MouseButton::Left | MouseButton::Right)
-        && row_has_selectable_block
-        && (shift || !app_mouse)
-        && press_x < gutter_right
+    over_grid_rows && over_grid_columns && (full_grid || row_app_eligible)
+}
+
+pub fn link_surface_eligible(
+    over_real_grid: bool,
+    finalized: bool,
+    finalized_header: bool,
+) -> bool {
+    over_real_grid && !(finalized && finalized_header)
+}
+
+pub fn ctrl_link_eligible(
+    button: MouseButton,
+    count: u32,
+    ctrl: bool,
+    shift: bool,
+    link_surface: bool,
+) -> bool {
+    link_surface && button == MouseButton::Left && count == 1 && ctrl && !shift
 }
 
 /// Block-mode chrome for one visible grid row, precomputed by the app the
@@ -146,10 +230,19 @@ fn is_block_gutter_press(
 /// nothing to draw.
 #[derive(Clone, Debug, Default)]
 pub struct BlockPaintRow {
-    /// This row belongs to a finalized block and may be selected from the
-    /// gutter. Running/live-prompt chrome deliberately leaves this false so
-    /// an empty stripe-band press remains an ordinary terminal click.
+    /// This row belongs to a finalized block and participates in card hit
+    /// routing. Running/live-prompt chrome deliberately leaves this false so
+    /// their presses remain ordinary terminal/application input.
     pub selectable: bool,
+    /// Stable retained zone represented by this finalized row. Unlike
+    /// `card_group`, this survives viewport re-layout and is safe for actions.
+    pub zone_id: Option<u64>,
+    /// This primary-buffer row belongs to the active/live card and may be
+    /// reported to an application that enabled mouse mode.
+    pub app_eligible: bool,
+    /// End-exclusive column of the command/header hit span on this row.
+    /// `0` means output body; `usize::MAX` means the full physical row.
+    pub header_end_col: usize,
     /// First row of a user-bookmarked block. Drawn as a small amber notch in
     /// the gutter so bookmark state does not rely on badge space or color of
     /// the command outcome stripe.
@@ -443,14 +536,29 @@ fn hovered_link_color() -> Color {
 struct State {
     dragging: bool,
     scrollbar_dragging: bool,
-    /// Gutter presses are complete one-shot gestures. Remember their button
-    /// so a later release cannot leak to a newly mouse-reporting application.
-    consumed_gutter: Option<MouseButton>,
+    /// Ordinary presses published to the app layer, independently per button.
+    /// Right/middle do not arm
+    /// text dragging, but their release must still follow the press across a
+    /// pane boundary so mouse-reporting applications never get stuck buttons.
+    published_presses: [bool; 3],
+    /// Block presses are complete one-shot gestures. Remember every consumed
+    /// button so interleaved releases cannot leak to a mouse-reporting app.
+    consumed_presses: [bool; 3],
     last_click: Option<(Instant, usize, usize)>,
     click_count: u32,
     /// Fractional wheel lines not yet consumed, so sub-line trackpad pixel
     /// deltas accumulate into whole-line scrolls instead of being lost.
     scroll_accum: f32,
+}
+
+fn owns_mouse_release(
+    published_presses: &[bool; 3],
+    dragging: bool,
+    scrollbar_dragging: bool,
+    button: MouseButton,
+) -> bool {
+    published_presses[button.slot()]
+        || (button == MouseButton::Left && (dragging || scrollbar_dragging))
 }
 
 /// Max gap between presses (ms) for them to count as a multi-click.
@@ -524,6 +632,9 @@ pub struct TermWidget<'a, Message> {
     /// Per visible row block chrome (stripes, separators, badges), aligned
     /// with the grid rows exactly like `selection`. Empty = no block mode.
     blocks: Vec<BlockPaintRow>,
+    /// Alternate screen and disabled Block Mode have no history-card split;
+    /// every real grid cell is application-owned there.
+    app_mouse_full_grid: bool,
     /// Paint-only density switch shared with Anvil/Forge. It changes card
     /// inset/radius but deliberately not [`Metrics`] or terminal dimensions.
     block_compact: bool,
@@ -559,13 +670,6 @@ pub struct TermWidget<'a, Message> {
     /// default-background fill is skipped so the translucent app background
     /// shows through; non-default cell backgrounds stay opaque, like ember.
     opacity: f32,
-    /// Whether the terminal application currently has mouse reporting
-    /// enabled. While it does (and Shift is not held — the same predicate the
-    /// app uses for `report_to_app`), a press in the stripe gutter must NOT
-    /// be classified as a gutter press: it travels the normal press pipeline
-    /// so the app receives a matched press/release pair instead of block
-    /// selection hijacking the click.
-    app_mouse: bool,
 }
 
 impl<'a, Message> TermWidget<'a, Message> {
@@ -608,6 +712,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             scroll_offset,
             scrollback_len,
             blocks: Vec::new(),
+            app_mouse_full_grid: false,
             block_compact: false,
             block_markers: Vec::new(),
             block_bookmark_markers: Vec::new(),
@@ -623,16 +728,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             preedit: None,
             blink_on: true,
             opacity: 1.0,
-            app_mouse: false,
         }
-    }
-
-    /// Tell the widget whether the terminal application currently has mouse
-    /// reporting enabled, so gutter (block-select) presses are suppressed
-    /// while an app owns the mouse (see the `app_mouse` field).
-    pub fn app_mouse(mut self, enabled: bool) -> Self {
-        self.app_mouse = enabled;
-        self
     }
 
     /// Set the window background opacity applied to the widget's default
@@ -710,6 +806,11 @@ impl<'a, Message> TermWidget<'a, Message> {
     /// Supply per-visible-row block chrome (empty disables block painting).
     pub fn blocks(mut self, blocks: Vec<BlockPaintRow>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    pub fn app_mouse_full_grid(mut self, full_grid: bool) -> Self {
+        self.app_mouse_full_grid = full_grid;
         self
     }
 
@@ -902,39 +1003,95 @@ fn solid_quad(bounds: Rectangle) -> Quad {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        block_card_geometry, block_card_hover_contains, block_card_segments, block_card_shadow,
-        block_card_stripe_bounds, block_card_visual, clipped_block_card_border_bounds,
-        glyph_shaping, is_block_gutter_press, should_use_cjk_fallback_font,
-        should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
-        should_use_symbol_fallback_font, terminal_glyph_font, BlockCardKind, BlockCardSegment,
-        BlockPaintRow, Metrics, MouseButton, BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS,
-        BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
+        app_mouse_surface_eligible, block_card_geometry, block_card_hover_contains,
+        block_card_segments, block_card_shadow, block_card_stripe_bounds, block_card_visual,
+        block_mouse_action, clipped_block_card_border_bounds, glyph_shaping, owns_mouse_release,
+        should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
+        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
+        BlockCardKind, BlockCardSegment, BlockMouseAction, BlockPaintRow, Metrics, MouseButton,
+        BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS, BLOCK_CARD_INSET, BLOCK_CARD_RADIUS,
+        BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Rectangle};
 
     #[test]
-    fn block_gutter_press_respects_application_mouse_ownership() {
-        let inside = |button, row_has_block, app_mouse, shift| {
-            is_block_gutter_press(button, row_has_block, app_mouse, shift, 7.0, 8.0)
+    fn block_card_press_contract_preserves_native_text_gestures() {
+        let action = |button, selectable, header, shift, ctrl, count| {
+            block_mouse_action(button, selectable, header, shift, ctrl, count)
         };
 
-        assert!(inside(MouseButton::Left, true, false, false));
-        assert!(inside(MouseButton::Right, true, false, false));
-        assert!(!inside(MouseButton::Left, true, true, false));
-        assert!(!inside(MouseButton::Right, true, true, false));
-        assert!(inside(MouseButton::Left, true, true, true));
-        assert!(!inside(MouseButton::Middle, true, false, false));
-        // A painted vector is not enough: only rows belonging to finalized
-        // blocks own the hit band. Live prompts/running rows remain ordinary.
-        assert!(!inside(MouseButton::Left, false, false, false));
-        assert!(!is_block_gutter_press(
-            MouseButton::Left,
-            true,
+        assert_eq!(
+            action(MouseButton::Left, true, true, false, false, 1),
+            Some(BlockMouseAction::Replace)
+        );
+        // Ctrl alone retains header selection semantics; in output it remains
+        // available to native link/text handling.
+        assert_eq!(
+            action(MouseButton::Left, true, true, false, true, 1),
+            Some(BlockMouseAction::Replace)
+        );
+        assert_eq!(action(MouseButton::Left, true, false, false, true, 1), None);
+        assert_eq!(
+            action(MouseButton::Left, true, false, true, false, 1),
+            Some(BlockMouseAction::Range)
+        );
+        assert_eq!(
+            action(MouseButton::Left, true, false, true, true, 1),
+            Some(BlockMouseAction::Toggle)
+        );
+        assert_eq!(
+            action(MouseButton::Right, true, false, false, false, 1),
+            Some(BlockMouseAction::Menu)
+        );
+        assert_eq!(
+            action(MouseButton::Middle, true, true, false, false, 1),
+            None
+        );
+        // Double/triple click always remains native, including on the header.
+        assert_eq!(action(MouseButton::Left, true, true, false, false, 2), None);
+        assert_eq!(action(MouseButton::Left, true, true, true, true, 3), None);
+        // Live/running/alternate-screen rows never become block targets.
+        assert_eq!(
+            action(MouseButton::Right, false, true, false, false, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn interleaved_buttons_own_their_independent_release_outside_the_pane() {
+        let mut published = [false; 3];
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            published[button.slot()] = true;
+        }
+        for button in [MouseButton::Right, MouseButton::Left, MouseButton::Middle] {
+            assert!(owns_mouse_release(&published, false, false, button));
+            published[button.slot()] = false;
+        }
+        assert_eq!(published, [false; 3]);
+
+        let none = [false; 3];
+        assert!(owns_mouse_release(&none, false, true, MouseButton::Left,));
+        assert!(!owns_mouse_release(
+            &none,
             false,
             false,
-            8.0,
-            8.0,
+            MouseButton::Middle,
         ));
+        assert!(!owns_mouse_release(&none, false, false, MouseButton::Right,));
+    }
+
+    #[test]
+    fn app_wheel_requires_live_grid_rows_and_columns() {
+        // Primary-screen history is eligible only on the explicitly active
+        // card row. Pre-zone scrollback is neither finalized nor app-owned.
+        assert!(app_mouse_surface_eligible(true, true, false, true));
+        assert!(!app_mouse_surface_eligible(true, true, false, false));
+        // Padding and the scrollbar/right-side non-grid strip stay local.
+        assert!(!app_mouse_surface_eligible(false, true, false, true));
+        assert!(!app_mouse_surface_eligible(true, false, false, true));
+        // Alternate/non-Block mode owns every *real* grid cell, not padding.
+        assert!(app_mouse_surface_eligible(true, true, true, false));
+        assert!(!app_mouse_surface_eligible(true, false, true, false));
     }
 
     #[test]
@@ -1373,6 +1530,7 @@ where
                     if let Some((_, _, sb_x, _, _)) = self.scrollbar_geometry(bounds) {
                         if pos.x >= sb_x {
                             state.scrollbar_dragging = true;
+                            state.published_presses[MouseButton::Left.slot()] = false;
                             let offset = self.offset_from_y(pos.y, bounds);
                             shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
                             shell.capture_event();
@@ -1380,28 +1538,11 @@ where
                         }
                     }
                 }
-                // The raw pixel decides gutter membership; `cell_at` above has
-                // already clamped a gutter press into column 0. The fixed hit
-                // band is layout-owned space before column zero, so it cannot
-                // steal the first cell. A press only counts as a gutter press
-                // when block chrome is painted and the press would not be
-                // reported to the app (`app_mouse` mirrors `report_to_app`):
-                // gutter presses are consumed for block selection and arm no
-                // drag pipeline, so they must never swallow a press that the
-                // app or text selection needs.
-                let gutter = is_block_gutter_press(
-                    button,
-                    self.blocks.get(row).is_some_and(|block| block.selectable),
-                    self.app_mouse,
-                    shift,
-                    pos.x,
-                    bounds.x + self.metrics.padding + self.metrics.block_gutter_width(),
-                );
-                if gutter {
-                    state.consumed_gutter = Some(button);
-                }
-                if button == MouseButton::Left && !gutter {
-                    state.dragging = true;
+                // Count every left press before deciding ownership. A first
+                // header click belongs to Block Mode, but a rapid second/third
+                // click on the same cell must fall through to native word/line
+                // selection instead of being trapped as repeated block clicks.
+                let count = if button == MouseButton::Left {
                     let now = Instant::now();
                     let same_cell = state
                         .last_click
@@ -1413,8 +1554,60 @@ where
                         .unwrap_or(false);
                     state.click_count = if same_cell { state.click_count + 1 } else { 1 };
                     state.last_click = Some((now, col, row));
+                    state.click_count
                 } else {
-                    state.click_count = 1;
+                    1
+                };
+
+                // Finished rows are a static card surface even if a live app
+                // currently has primary-buffer mouse reporting enabled. Only
+                // the active/live rows belong to that app. Exclude the
+                // scrollbar track and vertical padding from card hit testing.
+                let grid_top = bounds.y + self.metrics.padding;
+                let grid_bottom = grid_top + self.grid.len() as f32 * self.metrics.cell_h;
+                let before_scrollbar = self
+                    .scrollbar_geometry(bounds)
+                    .is_none_or(|(_, _, sb_x, _, _)| pos.x < sb_x);
+                let over_grid = pos.y >= grid_top && pos.y < grid_bottom;
+                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                let grid_width = self
+                    .grid
+                    .first()
+                    .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+                let scrollbar_left = self
+                    .scrollbar_geometry(bounds)
+                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
+                let grid_right = (grid_left + grid_width).min(scrollbar_left);
+                let over_grid_columns = pos.x >= grid_left && pos.x < grid_right;
+                let block_row = self.blocks.get(row);
+                let finalized = over_grid
+                    && before_scrollbar
+                    && block_row.is_some_and(|block| block.selectable);
+                let row_is_header = block_row.is_some_and(|block| col < block.header_end_col);
+                let app_eligible = app_mouse_surface_eligible(
+                    over_grid,
+                    over_grid_columns,
+                    self.app_mouse_full_grid,
+                    block_row.is_some_and(|block| block.app_eligible),
+                );
+                let link_eligible =
+                    link_surface_eligible(over_grid && over_grid_columns, finalized, row_is_header);
+                let block =
+                    block_mouse_action(button, finalized, row_is_header, shift, ctrl, count);
+                let block_zone_id = block.and_then(|_| block_row.and_then(|row| row.zone_id));
+                let link = block.is_none()
+                    && ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
+                    && self.link_at(col, row).is_some();
+                let consumed = block.is_some() || link;
+                if consumed {
+                    state.consumed_presses[button.slot()] = true;
+                    state.published_presses[button.slot()] = false;
+                } else {
+                    state.consumed_presses[button.slot()] = false;
+                    state.published_presses[button.slot()] = true;
+                }
+                if button == MouseButton::Left {
+                    state.dragging = !consumed;
                 }
                 shell.publish(on_mouse(MouseInput::Press {
                     col,
@@ -1423,8 +1616,15 @@ where
                     shift,
                     alt,
                     ctrl,
-                    count: state.click_count,
-                    gutter,
+                    count,
+                    finalized,
+                    link_eligible,
+                    app_eligible,
+                    block,
+                    block_zone_id,
+                    link,
+                    x: pos.x,
+                    y: pos.y,
                 }));
                 shell.capture_event();
             }
@@ -1452,27 +1652,31 @@ where
                     mouse::Button::Right => MouseButton::Right,
                     _ => return,
                 };
-                if state.consumed_gutter == Some(button) {
-                    state.consumed_gutter = None;
+                if state.consumed_presses[button.slot()] {
+                    state.consumed_presses[button.slot()] = false;
                     shell.capture_event();
                     return;
                 }
-                // Only the pane that owns the interaction (was dragging) or has
-                // the cursor over it should process the release; otherwise every
-                // split pane emits a release for the same physical click.
-                if !state.dragging
-                    && !state.scrollbar_dragging
-                    && cursor.position_over(bounds).is_none()
-                {
+                // Press ownership, not current hover, routes release. This is
+                // essential for right/middle application-mouse gestures: they
+                // never arm text dragging, but moving outside the pane before
+                // release must still deliver the matching button-up.
+                if !owns_mouse_release(
+                    &state.published_presses,
+                    state.dragging,
+                    state.scrollbar_dragging,
+                    button,
+                ) {
                     return;
                 }
+                state.published_presses[button.slot()] = false;
                 if button == MouseButton::Left {
                     if state.scrollbar_dragging {
                         state.scrollbar_dragging = false;
                         return;
                     }
                     // Only a press that armed the drag pipeline emits a
-                    // Release. A consumed gutter press never sets `dragging`,
+                    // Release. A consumed block press never sets `dragging`,
                     // so no Release (and no selection copy) follows it.
                     if !state.dragging {
                         return;
@@ -1512,6 +1716,24 @@ where
                 }
                 state.scroll_accum -= whole;
                 let (col, row) = self.cell_at(pos, bounds);
+                let block_row = self.blocks.get(row);
+                let grid_top = bounds.y + self.metrics.padding;
+                let grid_bottom = grid_top + self.grid.len() as f32 * self.metrics.cell_h;
+                let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                let grid_width = self
+                    .grid
+                    .first()
+                    .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+                let scrollbar_left = self
+                    .scrollbar_geometry(bounds)
+                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
+                let grid_right = (grid_left + grid_width).min(scrollbar_left);
+                let app_eligible = app_mouse_surface_eligible(
+                    pos.y >= grid_top && pos.y < grid_bottom,
+                    pos.x >= grid_left && pos.x < grid_right,
+                    self.app_mouse_full_grid,
+                    block_row.is_some_and(|block| block.app_eligible),
+                );
                 shell.publish(on_mouse(MouseInput::Wheel {
                     col,
                     row,
@@ -1519,6 +1741,7 @@ where
                     ctrl: self.ctrl,
                     shift: self.shift,
                     lines: whole.abs() as usize,
+                    app_eligible,
                 }));
                 shell.capture_event();
             }
@@ -2325,11 +2548,13 @@ where
     ) -> mouse::Interaction {
         if let Some(p) = cursor.position_over(layout.bounds()) {
             let (c, r) = self.cell_at(p, layout.bounds());
-            let gutter_right =
-                layout.bounds().x + self.metrics.padding + self.metrics.block_gutter_width();
-            if p.x < gutter_right
-                && self.blocks.get(r).is_some_and(|block| block.selectable)
-                && (self.shift || !self.app_mouse)
+            let before_scrollbar = self
+                .scrollbar_geometry(layout.bounds())
+                .is_none_or(|(_, _, sb_x, _, _)| p.x < sb_x);
+            if before_scrollbar
+                && self.blocks.get(r).is_some_and(|block| {
+                    block.selectable && (c < block.header_end_col || self.shift)
+                })
             {
                 return mouse::Interaction::Pointer;
             }
