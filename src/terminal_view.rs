@@ -1,7 +1,8 @@
 use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
 use crate::search::SearchMatch;
 use crate::terminal::{
-    clamp_terminal_dimensions, CursorShape, DynamicColorPalette, TerminalCell, UnderlineStyle,
+    clamp_terminal_dimensions, CursorShape, DynamicColorPalette, ProjectionKey, SyntheticRowKey,
+    TerminalCell, UnderlineStyle,
 };
 use crate::theme::Theme;
 use crate::theme::ThemeExt as _;
@@ -50,6 +51,15 @@ pub enum BlockMouseAction {
     Toggle,
     /// Right press anywhere in the completed card.
     Menu,
+}
+
+/// A collapsed-output summary that completed a stable click gesture. The
+/// application revalidates both identities against the session's current
+/// projection before mutating its policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryActivation {
+    pub key: SyntheticRowKey,
+    pub projection_key: ProjectionKey,
 }
 
 /// A semantic mouse interaction over the terminal grid, in 0-indexed cell
@@ -269,6 +279,15 @@ pub struct BlockPaintRow {
     /// Right-aligned first-row badge (text, color). Only set when the cells
     /// it covers are blank — the app checks before asking for it.
     pub badge: Option<(String, Color)>,
+    /// Host-owned collapse affordance. Summary rows never participate in
+    /// links, terminal text selection, cursor placement, or app mouse mode.
+    pub collapsed_summary: Option<CollapsedSummaryPaint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollapsedSummaryPaint {
+    pub key: SyntheticRowKey,
+    pub hidden_display_rows: usize,
 }
 
 /// One contiguous visible slice of a card. `real_top`/`real_bottom` survive
@@ -532,7 +551,6 @@ fn hovered_link_color() -> Color {
 }
 
 /// Per-widget interaction state retained across frames.
-#[derive(Default)]
 struct State {
     dragging: bool,
     scrollbar_dragging: bool,
@@ -549,6 +567,44 @@ struct State {
     /// Fractional wheel lines not yet consumed, so sub-line trackpad pixel
     /// deltas accumulate into whole-line scrolls instead of being lost.
     scroll_accum: f32,
+    summary_press: Option<SummaryPress>,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryPress {
+    key: SyntheticRowKey,
+    projection_key: ProjectionKey,
+    point: Point,
+    dragged: bool,
+}
+
+fn stable_summary_activation(
+    press: SummaryPress,
+    current: Option<CollapsedSummaryPaint>,
+    current_projection: Option<&ProjectionKey>,
+) -> Option<SummaryActivation> {
+    (!press.dragged
+        && current_projection == Some(&press.projection_key)
+        && current.is_some_and(|summary| summary.key == press.key))
+    .then_some(SummaryActivation {
+        key: press.key,
+        projection_key: press.projection_key,
+    })
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            dragging: false,
+            scrollbar_dragging: false,
+            published_presses: [false; 3],
+            consumed_presses: [false; 3],
+            last_click: None,
+            click_count: 0,
+            scroll_accum: 0.0,
+            summary_press: None,
+        }
+    }
 }
 
 fn owns_mouse_release(
@@ -652,6 +708,8 @@ pub struct TermWidget<'a, Message> {
     alt: bool,
     ctrl: bool,
     on_mouse: Option<Box<dyn Fn(MouseInput) -> Message + 'a>>,
+    on_summary: Option<Box<dyn Fn(SummaryActivation) -> Message + 'a>>,
+    projection_key: Option<ProjectionKey>,
     /// Detected clickable links in visible-grid coordinates (line = grid row).
     links: &'a [crate::link::Link],
     /// Kitty-graphics placements to paint over the grid.
@@ -722,6 +780,8 @@ impl<'a, Message> TermWidget<'a, Message> {
             alt: false,
             ctrl: false,
             on_mouse: None,
+            on_summary: None,
+            projection_key: None,
             links: &[],
             images: Vec::new(),
             scrollbar_always: true,
@@ -876,6 +936,17 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    /// Register the stable release-time action for a collapsed-output summary.
+    pub fn on_summary(
+        mut self,
+        projection_key: ProjectionKey,
+        f: impl Fn(SummaryActivation) -> Message + 'a,
+    ) -> Self {
+        self.projection_key = Some(projection_key);
+        self.on_summary = Some(Box::new(f));
+        self
+    }
+
     /// Supply the keyboard modifier state tracked by the application, used to
     /// distinguish selection (shift) and block-selection (alt) from app mouse
     /// reporting.
@@ -1007,12 +1078,66 @@ mod tests {
         block_card_segments, block_card_shadow, block_card_stripe_bounds, block_card_visual,
         block_mouse_action, clipped_block_card_border_bounds, glyph_shaping, owns_mouse_release,
         should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
-        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font, terminal_glyph_font,
-        BlockCardKind, BlockCardSegment, BlockMouseAction, BlockPaintRow, Metrics, MouseButton,
+        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font,
+        stable_summary_activation, terminal_glyph_font, BlockCardKind, BlockCardSegment,
+        BlockMouseAction, BlockPaintRow, CollapsedSummaryPaint, Metrics, MouseButton, SummaryPress,
         BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS, BLOCK_CARD_INSET, BLOCK_CARD_RADIUS,
         BLOCK_GUTTER_WIDTH,
     };
-    use iced::{Color, Rectangle};
+    use iced::{Color, Point, Rectangle};
+
+    #[test]
+    fn collapsed_summary_activation_requires_same_key_projection_and_no_drag() {
+        let synthetic = crate::terminal::SyntheticRowKey {
+            zone_id: 7,
+            policy_revision: 3,
+        };
+        let projection = crate::terminal::ProjectionKey {
+            source: crate::terminal::ProjectionSourceRevision {
+                grid: 1,
+                history: 2,
+                row_identity: 3,
+                alternate_screen: false,
+            },
+            scroll_offset: 0,
+            rows: 4,
+            cols: 20,
+            mode: crate::terminal::ProjectionMode::Transformed,
+            policy_revision: 3,
+            policy_ids: std::sync::Arc::from([7]),
+            document_rows: 8,
+        };
+        let paint = CollapsedSummaryPaint {
+            key: synthetic,
+            hidden_display_rows: 4,
+        };
+        let press = |dragged| SummaryPress {
+            key: synthetic,
+            projection_key: projection.clone(),
+            point: Point::ORIGIN,
+            dragged,
+        };
+
+        assert!(stable_summary_activation(press(false), Some(paint), Some(&projection)).is_some());
+        assert!(stable_summary_activation(press(true), Some(paint), Some(&projection)).is_none());
+        let mut stale_projection = projection.clone();
+        stale_projection.scroll_offset = 1;
+        assert!(
+            stable_summary_activation(press(false), Some(paint), Some(&stale_projection)).is_none()
+        );
+        assert!(stable_summary_activation(
+            press(false),
+            Some(CollapsedSummaryPaint {
+                key: crate::terminal::SyntheticRowKey {
+                    zone_id: 8,
+                    policy_revision: 3,
+                },
+                hidden_display_rows: 4,
+            }),
+            Some(&projection),
+        )
+        .is_none());
+    }
 
     #[test]
     fn block_card_press_contract_preserves_native_text_gestures() {
@@ -1523,6 +1648,11 @@ where
                     mouse::Button::Right => MouseButton::Right,
                     _ => return,
                 };
+                if button == MouseButton::Left {
+                    // A second press always supersedes an unfinished summary
+                    // gesture, even if the release was lost outside the pane.
+                    state.summary_press = None;
+                }
                 let (shift, alt, ctrl) = (self.shift, self.alt, self.ctrl);
                 // Grabbing the scrollbar gutter starts a scroll drag, not a
                 // text selection.
@@ -1580,18 +1710,50 @@ where
                 let grid_right = (grid_left + grid_width).min(scrollbar_left);
                 let over_grid_columns = pos.x >= grid_left && pos.x < grid_right;
                 let block_row = self.blocks.get(row);
+                let collapsed_summary = (over_grid && before_scrollbar && over_grid_columns)
+                    .then(|| block_row.and_then(|block| block.collapsed_summary))
+                    .flatten();
                 let finalized = over_grid
                     && before_scrollbar
                     && block_row.is_some_and(|block| block.selectable);
-                let row_is_header = block_row.is_some_and(|block| col < block.header_end_col);
+                let row_is_header = collapsed_summary.is_none()
+                    && block_row.is_some_and(|block| col < block.header_end_col);
                 let app_eligible = app_mouse_surface_eligible(
                     over_grid,
                     over_grid_columns,
                     self.app_mouse_full_grid,
-                    block_row.is_some_and(|block| block.app_eligible),
+                    collapsed_summary.is_none()
+                        && block_row.is_some_and(|block| block.app_eligible),
                 );
-                let link_eligible =
-                    link_surface_eligible(over_grid && over_grid_columns, finalized, row_is_header);
+                let link_eligible = collapsed_summary.is_none()
+                    && link_surface_eligible(
+                        over_grid && over_grid_columns,
+                        finalized,
+                        row_is_header,
+                    );
+                // A synthetic summary is a host control, not terminal text.
+                // Left activation completes only after stable release; middle
+                // is deliberately swallowed; right continues into the stable
+                // finalized-card menu path below.
+                if let Some(summary) = collapsed_summary {
+                    if button != MouseButton::Right {
+                        state.consumed_presses[button.slot()] = true;
+                        state.published_presses[button.slot()] = false;
+                        state.dragging = false;
+                        if button == MouseButton::Left && count == 1 {
+                            if let Some(projection_key) = self.projection_key.clone() {
+                                state.summary_press = Some(SummaryPress {
+                                    key: summary.key,
+                                    projection_key,
+                                    point: pos,
+                                    dragged: false,
+                                });
+                            }
+                        }
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 let block =
                     block_mouse_action(button, finalized, row_is_header, shift, ctrl, count);
                 let block_zone_id = block.and_then(|_| block_row.and_then(|row| row.zone_id));
@@ -1630,6 +1792,15 @@ where
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let pos = cursor.position().unwrap_or(Point::new(bounds.x, bounds.y));
+                if let Some(press) = state.summary_press.as_mut() {
+                    let dx = pos.x - press.point.x;
+                    let dy = pos.y - press.point.y;
+                    if dx * dx + dy * dy > 9.0 {
+                        press.dragged = true;
+                    }
+                    shell.capture_event();
+                    return;
+                }
                 if state.scrollbar_dragging {
                     let offset = self.offset_from_y(pos.y, bounds);
                     shell.publish(on_mouse(MouseInput::ScrollTo { offset }));
@@ -1652,6 +1823,46 @@ where
                     mouse::Button::Right => MouseButton::Right,
                     _ => return,
                 };
+                if button == MouseButton::Left {
+                    if let Some(press) = state.summary_press.take() {
+                        state.consumed_presses[button.slot()] = false;
+                        state.published_presses[button.slot()] = false;
+                        state.dragging = false;
+                        let current = cursor.position_over(bounds).and_then(|position| {
+                            let (col, row) = self.cell_at(position, bounds);
+                            let grid_left =
+                                bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+                            let grid_width = self
+                                .grid
+                                .first()
+                                .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+                            let scrollbar_left = self
+                                .scrollbar_geometry(bounds)
+                                .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
+                            (position.x >= grid_left
+                                && position.x < (grid_left + grid_width).min(scrollbar_left))
+                            .then(|| {
+                                self.blocks
+                                    .get(row)
+                                    .and_then(|block| block.collapsed_summary)
+                                    .map(|summary| (col, summary))
+                            })
+                            .flatten()
+                        });
+                        let activation = stable_summary_activation(
+                            press,
+                            current.map(|(_, summary)| summary),
+                            self.projection_key.as_ref(),
+                        );
+                        if let Some(activation) = activation {
+                            if let Some(on_summary) = self.on_summary.as_ref() {
+                                shell.publish(on_summary(activation));
+                            }
+                        }
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 if state.consumed_presses[button.slot()] {
                     state.consumed_presses[button.slot()] = false;
                     shell.capture_event();
@@ -2189,6 +2400,37 @@ where
                 run_fg,
                 run_font,
             );
+
+            if let Some(summary) = self
+                .blocks
+                .get(row_idx)
+                .and_then(|block| block.collapsed_summary)
+            {
+                let content = format!(
+                    "▸ {} output rows hidden — click to expand",
+                    summary.hidden_display_rows
+                );
+                let text_right = scrollbar_track_left - 8.0;
+                renderer.fill_text(
+                    Text {
+                        content,
+                        bounds: Size::new((text_right - ox - cw).max(0.0), ch),
+                        size: Pixels((font_size * 0.9).max(8.0)),
+                        line_height: text::LineHeight::Absolute(Pixels(ch)),
+                        font,
+                        align_x: text::Alignment::Left,
+                        align_y: iced::alignment::Vertical::Center,
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::None,
+                    },
+                    Point::new(ox + cw, y + ch / 2.0),
+                    Color {
+                        a: 0.82,
+                        ..default_fg
+                    },
+                    clip,
+                );
+            }
         }
 
         // Kitty graphics: paint each placement (already z-sorted) as a texture
@@ -2553,7 +2795,8 @@ where
                 .is_none_or(|(_, _, sb_x, _, _)| p.x < sb_x);
             if before_scrollbar
                 && self.blocks.get(r).is_some_and(|block| {
-                    block.selectable && (c < block.header_end_col || self.shift)
+                    block.collapsed_summary.is_some()
+                        || (block.selectable && (c < block.header_end_col || self.shift))
                 })
             {
                 return mouse::Interaction::Pointer;

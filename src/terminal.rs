@@ -3,13 +3,21 @@ use base64::Engine;
 use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
 thread_local! {
     static PROJECTED_HISTORY_DECOMPRESS_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// Bytes of encoded cell records inspected while answering layout queries.
+    /// Cached layouts keep this at zero regardless of history depth.
+    static PROJECTED_HISTORY_LAYOUT_BYTE_SCAN_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static PROJECTION_PLAN_BUILD_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
 }
@@ -540,12 +548,66 @@ pub struct ScrollbackLine {
     pub is_wrapped: bool,
     cols: u16,
     raw_row_id: RawRowId,
+    projected_active_len: u16,
+    projected_wide_continuations: SmallVec<[u16; 2]>,
 }
 
 #[derive(Clone, Debug)]
 enum CompressedLineData {
     Plain(String, u16),
     Encoded(Vec<u8>),
+}
+
+/// Allocation-free geometry needed to plan a projected history document.
+///
+/// `active_len` is exactly the prefix retained by P0's
+/// [`TerminalState::strip_trailing_blanks`] history reflow. This intentionally
+/// differs from compression: foreground/style-only trailing blanks are
+/// structural padding here, while a non-default background remains content.
+/// Wide continuation columns are the only per-cell facts reflow additionally
+/// needs in order to avoid splitting a glyph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+struct RawRowLayout {
+    absolute_row: usize,
+    raw_row: RawRowId,
+    active_len: usize,
+    wide_continuations: SmallVec<[usize; 2]>,
+    wrapped: bool,
+}
+
+impl RawRowLayout {
+    /// Build layout metadata for a live-grid row. Unlike scrollback, the grid
+    /// is already resident, so this is a borrowed scan with no cell cloning.
+    #[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+    fn from_cells(
+        cells: &[TerminalCell],
+        wrapped: bool,
+        absolute_row: usize,
+        raw_row: RawRowId,
+    ) -> Self {
+        let mut active_len = cells.len();
+        while active_len > 0
+            && cells[active_len - 1].character == ' '
+            && cells[active_len - 1].background == Color::Default
+            && !cells[active_len - 1].flags.wide()
+            && !cells[active_len - 1].flags.wide_continuation()
+        {
+            active_len -= 1;
+        }
+        let wide_continuations = cells[..active_len]
+            .iter()
+            .enumerate()
+            .filter_map(|(col, cell)| cell.flags.wide_continuation().then_some(col))
+            .collect();
+        Self {
+            absolute_row,
+            raw_row,
+            active_len,
+            wide_continuations,
+            wrapped,
+        }
+    }
 }
 
 impl ScrollbackLine {
@@ -559,6 +621,30 @@ impl ScrollbackLine {
         raw_row_id: RawRowId,
     ) -> Self {
         let cols = cells.len() as u16;
+        // Cache exactly the geometry used by P0 history reflow. This is not
+        // compression's retention rule: foreground/style-only trailing blanks
+        // remain encoded for round trips but are structural projection padding.
+        let projected_active_len = cells
+            .iter()
+            .rposition(|cell| {
+                cell.character != ' '
+                    || cell.background != Color::Default
+                    || cell.flags.wide()
+                    || cell.flags.wide_continuation()
+            })
+            .map_or(0, |col| col + 1);
+        let projected_wide_continuations = cells[..projected_active_len]
+            .iter()
+            .enumerate()
+            .filter_map(|(col, cell)| {
+                if cell.flags.wide_continuation() {
+                    u16::try_from(col).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let projected_active_len = u16::try_from(projected_active_len).unwrap_or(u16::MAX);
         let trailing_blanks = cells
             .iter()
             .rev()
@@ -588,6 +674,8 @@ impl ScrollbackLine {
                 is_wrapped,
                 cols,
                 raw_row_id,
+                projected_active_len,
+                projected_wide_continuations,
             }
         } else {
             let encoded = Self::encode_cells(&cells[..active_len]);
@@ -596,6 +684,8 @@ impl ScrollbackLine {
                 is_wrapped,
                 cols,
                 raw_row_id,
+                projected_active_len,
+                projected_wide_continuations,
             }
         }
     }
@@ -621,6 +711,22 @@ impl ScrollbackLine {
                 cells
             }
             CompressedLineData::Encoded(data) => Self::decode_cells(data, self.cols as usize),
+        }
+    }
+
+    #[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+    fn layout(&self, absolute_row: usize) -> RawRowLayout {
+        RawRowLayout {
+            absolute_row,
+            raw_row: self.raw_row_id,
+            active_len: usize::from(self.projected_active_len),
+            wide_continuations: self
+                .projected_wide_continuations
+                .iter()
+                .copied()
+                .map(usize::from)
+                .collect(),
+            wrapped: self.is_wrapped,
         }
     }
 
@@ -875,6 +981,14 @@ pub struct RawCellOrigin {
     pub col: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectedRawCellLocation {
+    Visible(ViewportCell),
+    Hidden { zone_id: u64 },
+    Retained,
+    Unmapped,
+}
+
 /// A cell coordinate in the currently projected viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ViewportCell {
@@ -898,27 +1012,840 @@ pub struct ProjectionSourceRevision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProjectionMode {
     Identity,
+    Transformed,
     Bypass,
+}
+
+/// Stable boundary in the retained raw terminal document. `col` is allowed
+/// to equal the physical row width when the boundary is end-exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawCellBoundary {
+    pub row: RawRowId,
+    pub col: usize,
+}
+
+/// Exact retained output range for one finalized command zone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FinishedOutputRange {
+    pub zone_id: u64,
+    pub start: RawCellBoundary,
+    pub end: RawCellBoundary,
+}
+
+/// Identity of a synthetic collapse row within one policy revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // Stage A contract; renderer wiring lands in the next slice.
+pub struct SyntheticRowKey {
+    pub zone_id: u64,
+    pub policy_revision: u64,
+}
+
+/// Provenance class for one projected document row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // Stage A contract; renderer wiring lands in the next slice.
+pub enum ProjectedRowKind {
+    Raw,
+    Padding,
+    CollapsedSummary {
+        key: SyntheticRowKey,
+        hidden_range: FinishedOutputRange,
+        hidden_display_rows: usize,
+    },
+}
+
+/// One contiguous piece of a physical raw row referenced by a planned
+/// display row. The plan deliberately carries geometry only: terminal cells
+/// remain compressed in scrollback (or resident in the live grid) until a
+/// viewport slice actually needs to materialize them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+struct RawSliceSource {
+    absolute_row: usize,
+    col_start: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+struct RawSliceOrigin {
+    row: RawRowId,
+    col_start: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+struct RawSlice {
+    view_col_start: usize,
+    source: RawSliceSource,
+    origin: Option<RawSliceOrigin>,
+    len: usize,
+    narrow_wide_body: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+struct ProjectionPlanRow {
+    raw_slices: SmallVec<[RawSlice; 2]>,
+    row_source: Option<RowSource>,
+    wrapped: bool,
+    kind: ProjectedRowKind,
+}
+
+/// Snapshot-local placement of one physical raw row in the planned document.
+/// Rows that are structurally elided by reflow remain present with no view
+/// bounds; collapse resolution must then fail closed instead of guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
+struct RawRowPlacement {
+    absolute_row: usize,
+    raw_row: RawRowId,
+    first_view_row: Option<usize>,
+    last_view_row: Option<usize>,
+}
+
+/// Allocation-light geometry for the complete projected document. This is
+/// built before viewport slicing and contains no `TerminalCell` vectors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+struct ProjectionPlan {
+    cols: usize,
+    rows: Vec<ProjectionPlanRow>,
+    raw_rows: Vec<RawRowPlacement>,
+    raw_slice_count: usize,
+    policy_revision: u64,
+    effective_collapsed: BTreeSet<u64>,
+    resolved_collapses: Vec<ResolvedCollapse>,
+    plan_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedCollapse {
+    range: FinishedOutputRange,
+    start_absolute: usize,
+    end_absolute: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HideSegment {
+    collapse: usize,
+    view_start: usize,
+    view_end: usize,
+}
+
+#[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+impl ProjectionPlan {
+    fn identity(
+        history_layouts: impl IntoIterator<Item = RawRowLayout>,
+        grid_layouts: impl IntoIterator<Item = RawRowLayout>,
+        cols: usize,
+    ) -> Self {
+        debug_assert!(cols > 0);
+        let history_layouts: Vec<_> = history_layouts.into_iter().collect();
+        let grid_layouts: Vec<_> = grid_layouts.into_iter().collect();
+        let mut rows = Vec::new();
+        let mut group = Vec::new();
+
+        // History is a reflowable logical document. The live grid is already
+        // at display width and P0 appends each physical row without joining it
+        // to a trailing wrapped scrollback row (or to adjacent grid rows).
+        for layout in history_layouts.iter().cloned() {
+            let wrapped = layout.wrapped;
+            group.push(layout);
+            if !wrapped {
+                Self::append_identity_group(&mut rows, &group, cols);
+                group.clear();
+            }
+        }
+        if !group.is_empty() {
+            Self::append_identity_group(&mut rows, &group, cols);
+        }
+        for layout in grid_layouts.iter().cloned() {
+            Self::append_grid_row(&mut rows, layout, cols);
+        }
+
+        let raw_rows = history_layouts
+            .iter()
+            .chain(&grid_layouts)
+            .map(|layout| RawRowPlacement {
+                absolute_row: layout.absolute_row,
+                raw_row: layout.raw_row,
+                first_view_row: None,
+                last_view_row: None,
+            })
+            .collect();
+        let raw_slice_count = rows.iter().map(|row| row.raw_slices.len()).sum();
+        let mut plan = Self {
+            cols,
+            rows,
+            raw_rows,
+            raw_slice_count,
+            policy_revision: 0,
+            effective_collapsed: BTreeSet::new(),
+            resolved_collapses: Vec::new(),
+            plan_revision: 0,
+        };
+        plan.rebuild_raw_row_placements();
+        plan
+    }
+
+    fn append_grid_row(output: &mut Vec<ProjectionPlanRow>, layout: RawRowLayout, cols: usize) {
+        let row_source = layout.raw_row.is_tracked().then_some(RowSource {
+            raw_row: layout.raw_row,
+            raw_absolute_row: layout.absolute_row,
+        });
+        let raw_slices = std::iter::once(RawSlice {
+            view_col_start: 0,
+            source: RawSliceSource {
+                absolute_row: layout.absolute_row,
+                col_start: 0,
+            },
+            origin: layout.raw_row.is_tracked().then_some(RawSliceOrigin {
+                row: layout.raw_row,
+                col_start: 0,
+            }),
+            // P0 live-grid provenance covers every physical cell,
+            // including default trailing blanks. Those are raw cells,
+            // unlike padding introduced by history reflow.
+            len: cols,
+            narrow_wide_body: false,
+        })
+        .collect();
+        output.push(ProjectionPlanRow {
+            raw_slices,
+            row_source,
+            wrapped: layout.wrapped,
+            kind: ProjectedRowKind::Raw,
+        });
+    }
+
+    fn append_identity_group(
+        output: &mut Vec<ProjectionPlanRow>,
+        group: &[RawRowLayout],
+        cols: usize,
+    ) {
+        let group_first_source = group.first().and_then(|layout| {
+            layout.raw_row.is_tracked().then_some(RowSource {
+                raw_row: layout.raw_row,
+                raw_absolute_row: layout.absolute_row,
+            })
+        });
+        let logical_len = group
+            .iter()
+            .fold(0usize, |len, layout| len.saturating_add(layout.active_len));
+        if logical_len == 0 {
+            output.push(ProjectionPlanRow {
+                raw_slices: SmallVec::new(),
+                row_source: group_first_source,
+                wrapped: false,
+                kind: ProjectedRowKind::Raw,
+            });
+            return;
+        }
+
+        if cols == 1 {
+            let group_start = output.len();
+            for layout in group {
+                let mut continuation = layout.wide_continuations.iter().copied().peekable();
+                for raw_col in 0..layout.active_len {
+                    if continuation.peek().copied() == Some(raw_col) {
+                        continuation.next();
+                        continue;
+                    }
+                    let raw_slice = RawSlice {
+                        view_col_start: 0,
+                        source: RawSliceSource {
+                            absolute_row: layout.absolute_row,
+                            col_start: raw_col,
+                        },
+                        origin: layout.raw_row.is_tracked().then_some(RawSliceOrigin {
+                            row: layout.raw_row,
+                            col_start: raw_col,
+                        }),
+                        len: 1,
+                        narrow_wide_body: layout
+                            .wide_continuations
+                            .binary_search(&(raw_col.saturating_add(1)))
+                            .is_ok(),
+                    };
+                    output.push(ProjectionPlanRow {
+                        raw_slices: std::iter::once(raw_slice).collect(),
+                        row_source: raw_slice.origin.map(|origin| RowSource {
+                            raw_row: origin.row,
+                            raw_absolute_row: raw_slice.source.absolute_row,
+                        }),
+                        wrapped: true,
+                        kind: ProjectedRowKind::Raw,
+                    });
+                }
+            }
+            if let Some(last) = output
+                .get_mut(group_start..)
+                .and_then(|rows| rows.last_mut())
+            {
+                last.wrapped = false;
+            }
+            return;
+        }
+
+        // Temporary source geometry is linear in physical rows / wide glyphs
+        // and is discarded once the plan has been emitted. Keeping cursors in
+        // both vectors makes planning O(source rows + planned rows + slices).
+        let mut logical_sources = Vec::with_capacity(group.len());
+        let mut logical_wide_continuations = Vec::new();
+        let mut source_start = 0usize;
+        for layout in group {
+            logical_wide_continuations.extend(
+                layout
+                    .wide_continuations
+                    .iter()
+                    .map(|raw_col| source_start.saturating_add(*raw_col)),
+            );
+            if layout.active_len > 0 {
+                logical_sources.push((
+                    source_start,
+                    RawSlice {
+                        view_col_start: 0,
+                        source: RawSliceSource {
+                            absolute_row: layout.absolute_row,
+                            col_start: 0,
+                        },
+                        origin: layout.raw_row.is_tracked().then_some(RawSliceOrigin {
+                            row: layout.raw_row,
+                            col_start: 0,
+                        }),
+                        len: layout.active_len,
+                        narrow_wide_body: false,
+                    },
+                ));
+            }
+            source_start = source_start.saturating_add(layout.active_len);
+        }
+
+        let mut logical_offset = 0usize;
+        let mut source_cursor = 0usize;
+        let mut wide_cursor = 0usize;
+        while logical_offset < logical_len {
+            let mut end = logical_offset.saturating_add(cols).min(logical_len);
+            while logical_wide_continuations
+                .get(wide_cursor)
+                .is_some_and(|position| *position < end)
+            {
+                wide_cursor += 1;
+            }
+            if end < logical_len
+                && logical_wide_continuations.get(wide_cursor).copied() == Some(end)
+            {
+                end -= 1;
+            }
+            while let Some((start, slice)) = logical_sources.get(source_cursor) {
+                if start.saturating_add(slice.len) > logical_offset {
+                    break;
+                }
+                source_cursor += 1;
+            }
+            let mut raw_slices: SmallVec<[RawSlice; 2]> = SmallVec::new();
+            for (start, slice) in logical_sources[source_cursor..].iter().copied() {
+                if start >= end {
+                    break;
+                }
+                let source_end = start.saturating_add(slice.len);
+                let overlap_start = start.max(logical_offset);
+                let overlap_end = source_end.min(end);
+                if overlap_start < overlap_end {
+                    raw_slices.push(RawSlice {
+                        view_col_start: overlap_start - logical_offset,
+                        source: RawSliceSource {
+                            absolute_row: slice.source.absolute_row,
+                            col_start: slice.source.col_start + overlap_start - start,
+                        },
+                        origin: slice.origin.map(|origin| RawSliceOrigin {
+                            row: origin.row,
+                            col_start: origin.col_start + overlap_start - start,
+                        }),
+                        len: overlap_end - overlap_start,
+                        narrow_wide_body: false,
+                    });
+                }
+            }
+            let row_source = raw_slices.iter().find_map(|slice| {
+                slice.origin.map(|origin| RowSource {
+                    raw_row: origin.row,
+                    raw_absolute_row: slice.source.absolute_row,
+                })
+            });
+            output.push(ProjectionPlanRow {
+                raw_slices,
+                row_source,
+                wrapped: end < logical_len,
+                kind: ProjectedRowKind::Raw,
+            });
+            logical_offset = end;
+        }
+    }
+
+    fn rebuild_raw_row_placements(&mut self) {
+        for placement in &mut self.raw_rows {
+            placement.first_view_row = None;
+            placement.last_view_row = None;
+        }
+        for (view_row, row) in self.rows.iter().enumerate() {
+            for absolute_row in row
+                .raw_slices
+                .iter()
+                .map(|slice| slice.source.absolute_row)
+                .chain(
+                    row.row_source
+                        .into_iter()
+                        .map(|source| source.raw_absolute_row),
+                )
+            {
+                let Some(placement) = self.raw_rows.get_mut(absolute_row) else {
+                    continue;
+                };
+                if placement.absolute_row != absolute_row {
+                    continue;
+                }
+                placement.first_view_row = Some(
+                    placement
+                        .first_view_row
+                        .map_or(view_row, |first| first.min(view_row)),
+                );
+                placement.last_view_row = Some(
+                    placement
+                        .last_view_row
+                        .map_or(view_row, |last| last.max(view_row)),
+                );
+            }
+        }
+    }
+
+    fn clipped_slices(
+        row: &ProjectionPlanRow,
+        view_start: usize,
+        view_end: usize,
+    ) -> SmallVec<[RawSlice; 2]> {
+        row.raw_slices
+            .iter()
+            .filter_map(|slice| {
+                let slice_start = slice.view_col_start;
+                let slice_end = slice_start.saturating_add(slice.len);
+                let overlap_start = slice_start.max(view_start);
+                let overlap_end = slice_end.min(view_end);
+                (overlap_start < overlap_end).then(|| {
+                    let delta = overlap_start - slice_start;
+                    RawSlice {
+                        view_col_start: overlap_start,
+                        source: RawSliceSource {
+                            absolute_row: slice.source.absolute_row,
+                            col_start: slice.source.col_start + delta,
+                        },
+                        origin: slice.origin.map(|origin| RawSliceOrigin {
+                            row: origin.row,
+                            col_start: origin.col_start + delta,
+                        }),
+                        len: overlap_end - overlap_start,
+                        narrow_wide_body: slice.narrow_wide_body,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn push_raw_fragment(
+        output: &mut Vec<ProjectionPlanRow>,
+        slices: SmallVec<[RawSlice; 2]>,
+        wrapped: bool,
+    ) {
+        if slices.is_empty() {
+            return;
+        }
+        let row_source = slices.iter().find_map(|slice| {
+            slice.origin.map(|origin| RowSource {
+                raw_row: origin.row,
+                raw_absolute_row: slice.source.absolute_row,
+            })
+        });
+        output.push(ProjectionPlanRow {
+            raw_slices: slices,
+            row_source,
+            wrapped,
+            kind: ProjectedRowKind::Raw,
+        });
+    }
+
+    /// Apply already validated, non-overlapping collapse ranges to the full
+    /// identity document. No cells are materialized: slices continue to point
+    /// at compressed history or the resident live grid.
+    fn splice_collapses(mut self, collapses: &[ResolvedCollapse], policy_revision: u64) -> Self {
+        if collapses.is_empty() {
+            self.policy_revision = policy_revision;
+            return self;
+        }
+
+        let raw_count = self.raw_rows.len();
+        let mut owners_by_raw: Vec<SmallVec<[usize; 2]>> =
+            (0..raw_count).map(|_| SmallVec::new()).collect();
+        for (index, collapse) in collapses.iter().enumerate() {
+            for absolute_row in collapse.start_absolute..=collapse.end_absolute {
+                if let Some(owners) = owners_by_raw.get_mut(absolute_row) {
+                    owners.push(index);
+                }
+            }
+        }
+        let mut owner_cursors = vec![0usize; raw_count];
+
+        let mut row_segments: Vec<SmallVec<[HideSegment; 2]>> = Vec::with_capacity(self.rows.len());
+        let mut hidden_display_rows = vec![0usize; collapses.len()];
+        for row in &self.rows {
+            let mut segments: SmallVec<[HideSegment; 2]> = SmallVec::new();
+            for slice in &row.raw_slices {
+                let Some(owners) = owners_by_raw.get(slice.source.absolute_row) else {
+                    continue;
+                };
+                let slice_start = slice.source.col_start;
+                let slice_end = slice_start.saturating_add(slice.len);
+                let cursor = &mut owner_cursors[slice.source.absolute_row];
+                while let Some(collapse_index) = owners.get(*cursor).copied() {
+                    let collapse = collapses[collapse_index];
+                    let raw_end = if slice.source.absolute_row == collapse.end_absolute {
+                        collapse.range.end.col
+                    } else {
+                        usize::MAX
+                    };
+                    if raw_end > slice_start {
+                        break;
+                    }
+                    *cursor += 1;
+                }
+                let mut owner_index = *cursor;
+                while let Some(collapse_index) = owners.get(owner_index).copied() {
+                    let collapse = collapses[collapse_index];
+                    let raw_start = if slice.source.absolute_row == collapse.start_absolute {
+                        collapse.range.start.col
+                    } else {
+                        0
+                    };
+                    if raw_start >= slice_end {
+                        break;
+                    }
+                    let raw_end = if slice.source.absolute_row == collapse.end_absolute {
+                        collapse.range.end.col
+                    } else {
+                        usize::MAX
+                    };
+                    let overlap_start = slice_start.max(raw_start);
+                    let overlap_end = slice_end.min(raw_end);
+                    if overlap_start < overlap_end {
+                        segments.push(HideSegment {
+                            collapse: collapse_index,
+                            view_start: slice.view_col_start + overlap_start - slice_start,
+                            view_end: slice.view_col_start + overlap_end - slice_start,
+                        });
+                    }
+                    if raw_end <= slice_end {
+                        owner_index += 1;
+                        *cursor = owner_index;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // A fully blank history line has row provenance but no cell span.
+            // Hiding it still changes the projected document by one row.
+            if segments.is_empty() && row.raw_slices.is_empty() {
+                if let Some(source) = row.row_source {
+                    if let Some(owners) = owners_by_raw.get(source.raw_absolute_row) {
+                        for collapse_index in owners.iter().copied() {
+                            segments.push(HideSegment {
+                                collapse: collapse_index,
+                                view_start: 0,
+                                view_end: self.cols,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let mut merged: SmallVec<[HideSegment; 2]> = SmallVec::new();
+            for segment in segments {
+                debug_assert!(merged.last().is_none_or(|previous| {
+                    (previous.view_start, previous.collapse)
+                        <= (segment.view_start, segment.collapse)
+                }));
+                if let Some(previous) = merged.last_mut() {
+                    if previous.collapse == segment.collapse
+                        && segment.view_start <= previous.view_end
+                    {
+                        previous.view_end = previous.view_end.max(segment.view_end);
+                        continue;
+                    }
+                }
+                merged.push(segment);
+            }
+            let mut last_counted = None;
+            for collapse_index in merged.iter().map(|segment| segment.collapse) {
+                if last_counted != Some(collapse_index) {
+                    hidden_display_rows[collapse_index] =
+                        hidden_display_rows[collapse_index].saturating_add(1);
+                    last_counted = Some(collapse_index);
+                }
+            }
+            row_segments.push(merged);
+        }
+
+        let effective: Vec<bool> = hidden_display_rows
+            .iter()
+            .map(|hidden_rows| *hidden_rows > 0)
+            .collect();
+        let mut summary_emitted = vec![false; collapses.len()];
+        let mut output = Vec::with_capacity(
+            self.rows
+                .len()
+                .saturating_add(effective.iter().filter(|value| **value).count()),
+        );
+        for (row, segments) in self.rows.iter().zip(row_segments) {
+            let segments: SmallVec<[HideSegment; 2]> = segments
+                .into_iter()
+                .filter(|segment| effective[segment.collapse])
+                .collect();
+            if segments.is_empty() {
+                output.push(row.clone());
+                continue;
+            }
+
+            let mut cursor = 0usize;
+            for segment in segments {
+                Self::push_raw_fragment(
+                    &mut output,
+                    Self::clipped_slices(row, cursor, segment.view_start),
+                    false,
+                );
+                if !summary_emitted[segment.collapse] {
+                    let collapse = collapses[segment.collapse];
+                    output.push(ProjectionPlanRow {
+                        raw_slices: SmallVec::new(),
+                        row_source: None,
+                        wrapped: false,
+                        kind: ProjectedRowKind::CollapsedSummary {
+                            key: SyntheticRowKey {
+                                zone_id: collapse.range.zone_id,
+                                policy_revision,
+                            },
+                            hidden_range: collapse.range,
+                            hidden_display_rows: hidden_display_rows[segment.collapse],
+                        },
+                    });
+                    summary_emitted[segment.collapse] = true;
+                }
+                cursor = cursor.max(segment.view_end);
+            }
+            Self::push_raw_fragment(
+                &mut output,
+                Self::clipped_slices(row, cursor, self.cols),
+                row.wrapped,
+            );
+        }
+
+        self.rows = output;
+        self.raw_slice_count = self.rows.iter().map(|row| row.raw_slices.len()).sum();
+        self.policy_revision = policy_revision;
+        self.effective_collapsed = collapses
+            .iter()
+            .enumerate()
+            .filter_map(|(index, collapse)| effective[index].then_some(collapse.range.zone_id))
+            .collect();
+        self.resolved_collapses = collapses
+            .iter()
+            .enumerate()
+            .filter_map(|(index, collapse)| effective[index].then_some(*collapse))
+            .collect();
+        self.rebuild_raw_row_placements();
+        self
+    }
+
+    fn summary_row(&self, zone_id: u64) -> Option<usize> {
+        self.rows.iter().position(|row| {
+            matches!(
+                row.kind,
+                ProjectedRowKind::CollapsedSummary { key, .. } if key.zone_id == zone_id
+            )
+        })
+    }
+
+    fn raw_absolute_row(&self, raw_row: RawRowId) -> Option<usize> {
+        self.raw_rows
+            .iter()
+            .find(|placement| placement.raw_row == raw_row)
+            .map(|placement| placement.absolute_row)
+    }
+
+    fn raw_cell_document_row(&self, origin: RawCellOrigin) -> Option<usize> {
+        self.rows.iter().position(|row| {
+            row.raw_slices.iter().any(|slice| {
+                slice.origin.is_some_and(|slice_origin| {
+                    slice_origin.row == origin.row
+                        && origin.col >= slice_origin.col_start
+                        && origin.col < slice_origin.col_start.saturating_add(slice.len)
+                })
+            })
+        })
+    }
+
+    fn raw_row_document_row(&self, raw_row: RawRowId) -> Option<usize> {
+        self.raw_rows
+            .iter()
+            .find(|placement| placement.raw_row == raw_row)
+            .and_then(|placement| placement.first_view_row)
+    }
+
+    fn summary_owning_raw_cell(&self, origin: RawCellOrigin) -> Option<usize> {
+        let absolute = self.raw_absolute_row(origin.row)?;
+        let collapse = self.resolved_collapses.iter().find(|collapse| {
+            if absolute < collapse.start_absolute || absolute > collapse.end_absolute {
+                return false;
+            }
+            let after_start =
+                absolute > collapse.start_absolute || origin.col >= collapse.range.start.col;
+            let before_end =
+                absolute < collapse.end_absolute || origin.col < collapse.range.end.col;
+            after_start && before_end
+        })?;
+        self.summary_row(collapse.range.zone_id)
+    }
+
+    fn document_row_for_anchor(&self, anchor: ProjectedTopAnchor) -> Option<usize> {
+        match anchor {
+            ProjectedTopAnchor::RawCell(origin) => self
+                .raw_cell_document_row(origin)
+                .or_else(|| self.summary_owning_raw_cell(origin)),
+            ProjectedTopAnchor::RawRow(row) => self.raw_row_document_row(row).or_else(|| {
+                let absolute = self.raw_absolute_row(row)?;
+                let collapse = self.resolved_collapses.iter().find(|collapse| {
+                    absolute >= collapse.start_absolute && absolute <= collapse.end_absolute
+                })?;
+                self.summary_row(collapse.range.zone_id)
+            }),
+            ProjectedTopAnchor::Summary {
+                zone_id,
+                hidden_range,
+            } => self.summary_row(zone_id).or_else(|| {
+                self.raw_cell_document_row(RawCellOrigin {
+                    row: hidden_range.start.row,
+                    col: hidden_range.start.col,
+                })
+                .or_else(|| self.raw_row_document_row(hidden_range.start.row))
+                .or_else(|| {
+                    let start = self.raw_absolute_row(hidden_range.start.row)?;
+                    let end = self.raw_absolute_row(hidden_range.end.row)?;
+                    self.raw_rows
+                        .iter()
+                        .filter(|placement| {
+                            placement.absolute_row >= start && placement.absolute_row <= end
+                        })
+                        .find_map(|placement| placement.first_view_row)
+                })
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn metadata_units(&self) -> usize {
+        self.rows.len() + self.raw_rows.len() + self.raw_slice_count
+    }
+}
+
+/// User-owned semantic transforms applied to the primary Block Mode history.
+/// An empty policy is the identity and must retain the P0 projection fast path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Stage A contract; policy storage/wiring lands in the next slice.
+pub struct ProjectionPolicy {
+    revision: u64,
+    collapsed: BTreeSet<u64>,
+}
+
+impl Default for ProjectionPolicy {
+    fn default() -> Self {
+        Self {
+            revision: 1,
+            collapsed: BTreeSet::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl ProjectionPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.collapsed.is_empty()
+    }
+
+    pub fn is_collapsed(&self, zone_id: u64) -> bool {
+        self.collapsed.contains(&zone_id)
+    }
+
+    pub fn collapsed_zone_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.collapsed.iter().copied()
+    }
+
+    fn ids(&self) -> SmallVec<[u64; 4]> {
+        self.collapsed.iter().copied().collect()
+    }
+
+    pub fn collapse(&mut self, zone_id: u64) -> bool {
+        if self.collapsed.contains(&zone_id) {
+            return false;
+        }
+        let Some(next_revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.collapsed.insert(zone_id);
+        self.revision = next_revision;
+        true
+    }
+
+    pub fn expand(&mut self, zone_id: u64) -> bool {
+        if !self.collapsed.contains(&zone_id) {
+            return false;
+        }
+        let Some(next_revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.collapsed.remove(&zone_id);
+        self.revision = next_revision;
+        true
+    }
 }
 
 /// Complete immutable identity of a projected viewport materialization.
 /// Consumer caches use this key instead of the diagnostic view revision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectionKey {
     pub source: ProjectionSourceRevision,
     pub scroll_offset: usize,
     pub rows: usize,
     pub cols: usize,
     pub mode: ProjectionMode,
+    pub policy_revision: u64,
+    pub policy_ids: std::sync::Arc<[u64]>,
+    pub document_rows: usize,
 }
 
 /// Immutable view of the existing terminal materialization plus stable raw
 /// provenance. P0 is deliberately identity-only: it cannot collapse, filter,
 /// delete, or otherwise change visible cells.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Transformed fields are consumed by the P1 UI wiring slice.
 pub struct ProjectedViewport {
     cells: std::sync::Arc<Vec<Vec<TerminalCell>>>,
     row_wrapped: std::sync::Arc<Vec<bool>>,
+    row_kinds: std::sync::Arc<Vec<ProjectedRowKind>>,
     provenance: std::sync::Arc<ProjectedProvenance>,
     raw_span_index: std::sync::Arc<Vec<usize>>,
     /// Sorted `(raw row, display row)` pairs. A display row may contain cells
@@ -930,8 +1857,16 @@ pub struct ProjectedViewport {
     identity_fast_path: bool,
     mode: ProjectionMode,
     scroll_offset: usize,
+    policy_revision: u64,
+    policy_ids: std::sync::Arc<[u64]>,
+    document_rows: usize,
+    document_start: usize,
+    top_padding: usize,
+    effective_collapsed: std::sync::Arc<BTreeSet<u64>>,
+    plan_revision: u64,
 }
 
+#[allow(dead_code)] // Transformed accessors are consumed by the P1 UI wiring slice.
 impl ProjectedViewport {
     pub fn cells(&self) -> &[Vec<TerminalCell>] {
         self.cells.as_ref()
@@ -939,6 +1874,10 @@ impl ProjectedViewport {
 
     pub fn row_wrapped(&self) -> &[bool] {
         self.row_wrapped.as_ref()
+    }
+
+    pub fn row_kinds(&self) -> &[ProjectedRowKind] {
+        self.row_kinds.as_ref()
     }
 
     pub fn view_to_raw(&self, cell: ViewportCell) -> Option<RawCellOrigin> {
@@ -964,6 +1903,33 @@ impl ProjectedViewport {
             .map(|index| &self.provenance.origin_spans[*index])
             .take_while(|span| span.raw_row == origin.row)
             .find_map(|span| span.raw_to_view(origin))
+    }
+
+    /// Map a non-empty half-open raw range only when one affine origin span
+    /// covers it in full. This is an O(log spans) all-or-nothing query for
+    /// consumers such as Kitty placements; it never bridges a collapsed gap.
+    pub fn raw_range_to_view(&self, start: RawCellOrigin, len: usize) -> Option<ViewportCell> {
+        if len == 0 || !start.row.is_tracked() {
+            return None;
+        }
+        let raw_end = start.col.checked_add(len)?;
+        let insertion = self.raw_span_index.partition_point(|index| {
+            let span = self.provenance.origin_spans[*index];
+            (span.raw_row, span.raw_col_start) <= (start.row, start.col)
+        });
+        let span = insertion
+            .checked_sub(1)
+            .and_then(|position| self.raw_span_index.get(position))
+            .map(|index| self.provenance.origin_spans[*index])?;
+        let span_len = span.view_col_end.checked_sub(span.view_col_start)?;
+        let span_raw_end = span.raw_col_start.checked_add(span_len)?;
+        if span.raw_row != start.row || start.col < span.raw_col_start || raw_end > span_raw_end {
+            return None;
+        }
+        Some(ViewportCell {
+            row: span.view_row,
+            col: span.view_col_start + start.col - span.raw_col_start,
+        })
     }
 
     /// Inclusive display-row bounds occupied by one tracked raw row.
@@ -1002,6 +1968,9 @@ impl ProjectedViewport {
             rows: self.cells.len(),
             cols: self.cells.first().map_or(0, Vec::len),
             mode: self.mode,
+            policy_revision: self.policy_revision,
+            policy_ids: std::sync::Arc::clone(&self.policy_ids),
+            document_rows: self.document_rows,
         }
     }
 
@@ -1012,7 +1981,7 @@ impl ProjectedViewport {
     /// P0 projections are semantic identities even when the terminal's legacy
     /// history materializer itself has to reflow retained rows for display.
     pub fn is_identity(&self) -> bool {
-        true
+        self.mode != ProjectionMode::Transformed
     }
 
     /// Whether provenance was built by the direct live-grid O(rows * cols)
@@ -1029,13 +1998,44 @@ impl ProjectedViewport {
         self.scroll_offset
     }
 
+    pub fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+
+    pub fn document_rows(&self) -> usize {
+        self.document_rows
+    }
+
+    pub fn document_start(&self) -> usize {
+        self.document_start
+    }
+
+    pub fn top_padding(&self) -> usize {
+        self.top_padding
+    }
+
+    pub fn view_document_row(&self, view_row: usize) -> Option<usize> {
+        (view_row >= self.top_padding && view_row < self.cells.len()).then(|| {
+            self.document_start
+                .saturating_add(view_row - self.top_padding)
+        })
+    }
+
+    pub fn max_scroll_offset(&self) -> usize {
+        self.document_rows.saturating_sub(self.cells.len())
+    }
+
+    pub fn effective_collapsed(&self) -> &BTreeSet<u64> {
+        self.effective_collapsed.as_ref()
+    }
+
     #[cfg(test)]
     fn origin_span_count(&self) -> usize {
         self.provenance.origin_spans.len()
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectedViewportCacheKey {
     grid_version: u64,
     history_revision: u64,
@@ -1045,6 +2045,88 @@ struct ProjectedViewportCacheKey {
     cols: usize,
     use_alt_buffer: bool,
     mode: ProjectionMode,
+    policy_revision: u64,
+    policy_ids: SmallVec<[u64; 4]>,
+    view_scroll_offset: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionPlanCacheKey {
+    history_revision: u64,
+    row_identity_revision: u64,
+    rows: usize,
+    cols: usize,
+    row_wrapped: SmallVec<[bool; 64]>,
+    policy_revision: u64,
+    policy_ids: SmallVec<[u64; 4]>,
+    next_zone_id: u64,
+    zone_count: usize,
+    provenance_count: usize,
+}
+
+type ProjectionPlanCache = (ProjectionPlanCacheKey, std::sync::Arc<ProjectionPlan>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectedTopAnchor {
+    RawCell(RawCellOrigin),
+    RawRow(RawRowId),
+    Summary {
+        zone_id: u64,
+        hidden_range: FinishedOutputRange,
+    },
+}
+
+/// Session-owned scroll state for a transformed block document. Alternate
+/// screen and Block-off bypass park this state instead of rewriting it.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Session wiring lands in the next slice.
+pub struct ProjectionViewState {
+    offset_from_bottom: usize,
+    follow_bottom: bool,
+    top_anchor: Option<ProjectedTopAnchor>,
+    last_plan_key: Option<ProjectionPlanCacheKey>,
+}
+
+impl Default for ProjectionViewState {
+    fn default() -> Self {
+        Self {
+            offset_from_bottom: 0,
+            follow_bottom: true,
+            top_anchor: None,
+            last_plan_key: None,
+        }
+    }
+}
+
+#[allow(dead_code)] // Session wiring lands in the next slice.
+impl ProjectionViewState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn offset_from_bottom(&self) -> usize {
+        self.offset_from_bottom
+    }
+
+    pub fn set_offset(&mut self, offset: usize, viewport: &ProjectedViewport) {
+        self.offset_from_bottom = offset.min(viewport.max_scroll_offset());
+        self.follow_bottom = self.offset_from_bottom == 0;
+    }
+
+    pub fn scroll(&mut self, lines: isize, viewport: &ProjectedViewport) {
+        let offset = if lines > 0 {
+            self.offset_from_bottom.saturating_add(lines as usize)
+        } else {
+            self.offset_from_bottom.saturating_sub(lines.unsigned_abs())
+        };
+        self.set_offset(offset, viewport);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.offset_from_bottom = 0;
+        self.follow_bottom = true;
+        self.top_anchor = None;
+    }
 }
 
 type ProjectedViewportCache = (ProjectedViewportCacheKey, std::sync::Arc<ProjectedViewport>);
@@ -1066,6 +2148,16 @@ struct RowSource {
 struct ProjectedProvenance {
     origin_spans: Vec<OriginSpan>,
     row_sources: Vec<Option<RowSource>>,
+}
+
+struct MaterializedProjection {
+    cells: Vec<Vec<TerminalCell>>,
+    row_wrapped: Vec<bool>,
+    row_kinds: Vec<ProjectedRowKind>,
+    provenance: ProjectedProvenance,
+    scroll_offset: usize,
+    document_start: usize,
+    top_padding: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1119,6 +2211,14 @@ pub struct Selection {
     pub anchor: (usize, usize),
     pub active: (usize, usize),
     pub mode: SelectionMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectedSelection {
+    plan_revision: u64,
+    anchor: (usize, usize),
+    active: (usize, usize),
+    mode: SelectionMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1192,6 +2292,12 @@ pub struct CommandZone {
     /// `Option` rows are `None`. Row consumers (stripes, gutter, markers,
     /// prompt jumps, reveal) must skip such zones.
     pub rows_evicted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FinishedOutputProvenance {
+    range: FinishedOutputRange,
+    row_ids: Vec<RawRowId>,
 }
 
 /// Export-facing output state for one retained command zone.
@@ -1296,8 +2402,11 @@ impl IdleBackgroundRawChunk {
 #[derive(Clone, Debug)]
 struct IdleBackgroundOutput {
     start_row: usize,
+    start_row_id: Option<RawRowId>,
     start_col: usize,
     last_row: usize,
+    last_row_id: Option<RawRowId>,
+    last_col_end: usize,
     anchor_started: bool,
     rows_evicted: bool,
     raw_chunks: VecDeque<IdleBackgroundRawChunk>,
@@ -1311,8 +2420,11 @@ impl IdleBackgroundOutput {
     fn new(start_row: usize, start_col: usize) -> Self {
         Self {
             start_row,
+            start_row_id: None,
             start_col,
             last_row: start_row,
+            last_row_id: None,
+            last_col_end: start_col,
             anchor_started: false,
             rows_evicted: false,
             raw_chunks: VecDeque::new(),
@@ -1607,6 +2719,7 @@ pub struct TerminalState {
     alt_grid: TerminalGrid,
     pub scrollback: VecDeque<ScrollbackLine>,
     pub selection: Option<Selection>,
+    projected_selection: Option<ProjectedSelection>,
     pub scroll_offset: usize,
     max_scrollback: usize,
     use_alt_buffer: bool,
@@ -1707,7 +2820,9 @@ pub struct TerminalState {
     /// Identity projection cache. Its key includes every viewport and raw-row
     /// structural input; cell contents continue to use `grid_version`.
     projected_viewport_cache: Option<ProjectedViewportCache>,
+    projection_plan_cache: Option<ProjectionPlanCache>,
     next_projected_view_revision: u64,
+    next_projection_plan_revision: u64,
 
     // OSC 8 hyperlink tracking
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)
@@ -1727,6 +2842,7 @@ pub struct TerminalState {
 
     // OSC 133 shell integration: command zones for prompt navigation
     pub command_zones: VecDeque<CommandZone>,
+    finished_output_provenance: HashMap<u64, FinishedOutputProvenance>,
     /// Next [`CommandZone::id`]; monotonic for the life of the terminal.
     next_zone_id: u64,
     current_zone_state: ZoneState,
@@ -1740,11 +2856,14 @@ pub struct TerminalState {
     /// First captured column on the OSC 133 `C` row. Initialized from the
     /// cursor at `C`, then lowered when output moves left and paints there.
     current_output_start_col: Option<usize>,
+    current_output_start_row_id: Option<RawRowId>,
     /// Furthest absolute row on which output wrote a character after `C`.
     /// The `D`/next-`A` cursor row alone is not enough: output without a final
     /// newline leaves the cursor on the last output row, which must be included
     /// in the otherwise end-exclusive captured range.
     current_output_extent_row: Option<usize>,
+    current_output_extent_col: Option<usize>,
+    current_output_extent_row_id: Option<RawRowId>,
     /// Once local input is accepted for this prompt, approval stays blocked
     /// until a fresh `B`. This closes the write-before-echo race.
     agent_prompt_input_tainted: bool,
@@ -1911,6 +3030,7 @@ impl TerminalState {
             alt_grid,
             scrollback: VecDeque::new(),
             selection: None,
+            projected_selection: None,
             scroll_offset: 0,
             max_scrollback: 10000,
             use_alt_buffer: false,
@@ -1973,7 +3093,9 @@ impl TerminalState {
             visible_cells_cache: None,
             history_revision: 1,
             projected_viewport_cache: None,
+            projection_plan_cache: None,
             next_projected_view_revision: 1,
+            next_projection_plan_revision: 1,
             current_hyperlink: None,
             osc8_hyperlinks: Vec::new(),
             sync_output_active: false,
@@ -1983,12 +3105,16 @@ impl TerminalState {
             pending_osc52_clipboard_set: None,
             pending_osc52_clipboard_query: false,
             command_zones: VecDeque::new(),
+            finished_output_provenance: HashMap::new(),
             next_zone_id: 0,
             current_zone_state: ZoneState::default(),
             current_command_start_col: None,
             current_command_extent_row: None,
             current_output_start_col: None,
+            current_output_start_row_id: None,
             current_output_extent_row: None,
+            current_output_extent_col: None,
+            current_output_extent_row_id: None,
             agent_prompt_input_tainted: false,
             prompt_submission_pending: false,
             prompt_cancel_pending: false,
@@ -2432,7 +3558,7 @@ impl TerminalState {
         }
     }
 
-    fn mark_command_echo_extent(&mut self, write_col: usize) {
+    fn mark_command_echo_extent(&mut self, write_col: usize, write_col_end: usize) {
         // A primary-screen lifecycle deliberately survives an alternate-screen
         // detour, but the detour's cells and cursor coordinates never belong to
         // that lifecycle's command/output rows.
@@ -2440,6 +3566,7 @@ impl TerminalState {
             return;
         }
         let absolute_row = self.scrollback.len() + self.cursor_row;
+        let raw_row_id = self.grid.raw_row_id(self.cursor_row);
         match self.current_zone_state {
             ZoneState::CommandStarted(_, _) => {
                 self.current_command_extent_row = Some(
@@ -2449,11 +3576,24 @@ impl TerminalState {
                 );
             }
             ZoneState::OutputStarted(_, _, output_start) => {
-                self.current_output_extent_row = Some(
-                    self.current_output_extent_row
-                        .unwrap_or(absolute_row)
-                        .max(absolute_row),
-                );
+                match self.current_output_extent_row.cmp(&Some(absolute_row)) {
+                    std::cmp::Ordering::Less => {
+                        self.current_output_extent_row = Some(absolute_row);
+                        self.current_output_extent_col = Some(write_col_end);
+                        self.current_output_extent_row_id = raw_row_id;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if self.current_output_extent_row_id != raw_row_id {
+                            self.current_output_extent_row_id = None;
+                        }
+                        self.current_output_extent_col = Some(
+                            self.current_output_extent_col
+                                .unwrap_or(write_col_end)
+                                .max(write_col_end),
+                        );
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
                 // Output may move left on its first physical row before
                 // painting (CR, BS, CUP, progress redraws). The cursor column
                 // at C is therefore only the initial lower bound.
@@ -2473,7 +3613,7 @@ impl TerminalState {
     /// OSC 133 `B`. Control-only redraws never call this hook, whitespace can
     /// update an existing candidate but cannot start one, and alt-screen bytes
     /// are deliberately excluded.
-    fn note_idle_background_cells(&mut self, col: usize, has_visible_text: bool) {
+    fn note_idle_background_cells(&mut self, col: usize, col_end: usize, has_visible_text: bool) {
         if self.use_alt_buffer
             || self.idle_prompt_input_dirty
             || !matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
@@ -2481,25 +3621,42 @@ impl TerminalState {
             return;
         }
         let row = self.scrollback.len().saturating_add(self.cursor_row);
+        let row_id = self.grid.raw_row_id(self.cursor_row);
         let Some(pending) = self.idle_background_output.as_mut() else {
             return;
         };
         if !pending.anchor_started {
             if has_visible_text {
                 pending.start_row = row;
+                pending.start_row_id = row_id;
                 pending.start_col = col;
                 pending.last_row = row;
+                pending.last_row_id = row_id;
+                pending.last_col_end = col_end;
                 pending.anchor_started = true;
             }
             return;
         }
         if row < pending.start_row {
             pending.start_row = row;
+            pending.start_row_id = row_id;
             pending.start_col = col;
         } else if row == pending.start_row {
+            if pending.start_row_id != row_id {
+                pending.start_row_id = None;
+            }
             pending.start_col = pending.start_col.min(col);
         }
-        pending.last_row = pending.last_row.max(row);
+        if row > pending.last_row {
+            pending.last_row = row;
+            pending.last_row_id = row_id;
+            pending.last_col_end = col_end;
+        } else if row == pending.last_row {
+            if pending.last_row_id != row_id {
+                pending.last_row_id = None;
+            }
+            pending.last_col_end = pending.last_col_end.max(col_end);
+        }
     }
 
     fn idle_background_capture_active(&self) -> bool {
@@ -2600,7 +3757,10 @@ impl TerminalState {
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
                 self.current_output_start_col = None;
+                self.current_output_start_row_id = None;
                 self.current_output_extent_row = None;
+                self.current_output_extent_col = None;
+                self.current_output_extent_row_id = None;
                 self.current_command_text = None;
                 self.current_command_id = mark_id;
                 self.current_command_start_id = None;
@@ -2620,7 +3780,10 @@ impl TerminalState {
                     self.current_command_start_col = Some(self.cursor_col);
                     self.current_command_extent_row = Some(absolute_row);
                     self.current_output_start_col = None;
+                    self.current_output_start_row_id = None;
                     self.current_output_extent_row = None;
+                    self.current_output_extent_col = None;
+                    self.current_output_extent_row_id = None;
                     self.current_command_text = None;
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
@@ -2659,7 +3822,10 @@ impl TerminalState {
                     self.current_command_truncated |= capture.truncated || metadata_truncated;
                     self.current_command_text = Some(captured_command.clone());
                     self.current_output_start_col = Some(self.cursor_col);
+                    self.current_output_start_row_id = self.grid.raw_row_id(self.cursor_row);
                     self.current_output_extent_row = None;
+                    self.current_output_extent_col = None;
+                    self.current_output_extent_row_id = None;
                     self.current_command_start_id.clone_from(&mark_id);
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
@@ -2758,6 +3924,12 @@ impl TerminalState {
                 .or_else(|| self.control_free_osc7_cwd());
                 let output_start_col = self.current_output_start_col.unwrap_or(0);
                 let output_end = self.live_output_end_row(absolute_row);
+                let provenance = self.bind_live_output_provenance(
+                    out_start,
+                    output_start_col,
+                    absolute_row,
+                    self.cursor_col,
+                );
                 let zone = CommandZone {
                     id: 0, // assigned by push_command_zone
                     prompt_start,
@@ -2780,7 +3952,7 @@ impl TerminalState {
                     completion_observed: true,
                     rows_evicted: false,
                 };
-                self.push_command_zone(zone);
+                self.push_command_zone_with_provenance(zone, provenance);
                 self.record_completed_command(
                     cmd_start,
                     out_start,
@@ -2796,7 +3968,10 @@ impl TerminalState {
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
                 self.current_output_start_col = None;
+                self.current_output_start_row_id = None;
                 self.current_output_extent_row = None;
+                self.current_output_extent_col = None;
+                self.current_output_extent_row_id = None;
                 self.current_command_text = None;
                 self.current_command_start_id = None;
                 self.current_command_cwd = None;
@@ -2829,7 +4004,16 @@ impl TerminalState {
 
     /// Append a finished zone, assigning its stable id and enforcing both the
     /// 256-entry cap and the captured-snapshot byte budget.
-    fn push_command_zone(&mut self, mut zone: CommandZone) {
+    #[allow(dead_code)] // Test/backward-compatible wrapper; production binds provenance.
+    fn push_command_zone(&mut self, zone: CommandZone) {
+        self.push_command_zone_with_provenance(zone, None);
+    }
+
+    fn push_command_zone_with_provenance(
+        &mut self,
+        mut zone: CommandZone,
+        mut provenance: Option<FinishedOutputProvenance>,
+    ) {
         let Some(next_zone_id) = self.next_zone_id.checked_add(1) else {
             // Stable ids are UI capabilities. Once the u64 space is exhausted,
             // seal block history instead of reusing an id that a stale menu,
@@ -2839,6 +4023,11 @@ impl TerminalState {
         };
         zone.id = self.next_zone_id;
         self.next_zone_id = next_zone_id;
+        if let Some(provenance) = provenance.as_mut() {
+            provenance.range.zone_id = zone.id;
+            self.finished_output_provenance
+                .insert(zone.id, provenance.clone());
+        }
         self.captured_output_bytes = self.captured_output_bytes.saturating_add(
             zone.captured_output
                 .as_ref()
@@ -2847,6 +4036,7 @@ impl TerminalState {
         self.command_zones.push_back(zone);
         if self.command_zones.len() > 256 {
             if let Some(evicted) = self.command_zones.pop_front() {
+                self.finished_output_provenance.remove(&evicted.id);
                 self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
                     evicted
                         .captured_output
@@ -2892,6 +4082,123 @@ impl TerminalState {
             .min(total_rows)
     }
 
+    fn bind_finished_output_provenance(
+        &self,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> Option<FinishedOutputProvenance> {
+        let total_rows = self.scrollback.len().checked_add(self.grid.rows())?;
+        if start_row >= total_rows || end_row >= total_rows || start_row > end_row {
+            return None;
+        }
+        let (start_id, start_width) = self.retained_raw_row(start_row)?;
+        let (end_id, end_width) = self.retained_raw_row(end_row)?;
+        if !start_id.is_tracked() || !end_id.is_tracked() {
+            return None;
+        }
+
+        let mut start_col = start_col.min(start_width);
+        if start_col > 0
+            && start_col < start_width
+            && self.retained_cell_is_wide_continuation(start_row, start_col)?
+        {
+            start_col -= 1;
+        }
+        let mut end_col = end_col.min(end_width);
+        if end_col < end_width {
+            let end_cell = if let Some(line) = self.scrollback.get(end_row) {
+                line.decompress().get(end_col).copied()
+            } else {
+                let grid_row = end_row.checked_sub(self.scrollback.len())?;
+                (end_col < self.grid.row_len()).then(|| *self.grid.get(grid_row, end_col))
+            }?;
+            if end_cell.flags.wide_continuation() {
+                end_col = end_col.saturating_add(1).min(end_width);
+            }
+        }
+        if start_row == end_row && start_col >= end_col {
+            return None;
+        }
+
+        let row_ids: Vec<_> = (start_row..=end_row)
+            .map(|absolute_row| self.retained_raw_row(absolute_row).map(|row| row.0))
+            .collect::<Option<_>>()?;
+        if row_ids.iter().any(|row| !row.is_tracked()) {
+            return None;
+        }
+        Some(FinishedOutputProvenance {
+            range: FinishedOutputRange {
+                zone_id: 0,
+                start: RawCellBoundary {
+                    row: start_id,
+                    col: start_col,
+                },
+                end: RawCellBoundary {
+                    row: end_id,
+                    col: end_col,
+                },
+            },
+            row_ids,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_output_provenance(
+        &self,
+        start_row: usize,
+        start_row_id: RawRowId,
+        start_col: usize,
+        extent_row: usize,
+        extent_row_id: RawRowId,
+        extent_col: usize,
+        boundary_row: usize,
+        boundary_col: usize,
+        pending_wrap: bool,
+    ) -> Option<FinishedOutputProvenance> {
+        if self.retained_raw_row(start_row)?.0 != start_row_id
+            || self.retained_raw_row(extent_row)?.0 != extent_row_id
+        {
+            return None;
+        }
+        let (end_row, end_col) = if boundary_row > extent_row {
+            let end_row = boundary_row.checked_sub(1)?;
+            (end_row, self.retained_raw_row(end_row)?.1)
+        } else if boundary_row == extent_row {
+            if pending_wrap {
+                (extent_row, self.retained_raw_row(extent_row)?.1)
+            } else if boundary_col < extent_col {
+                return None;
+            } else {
+                (extent_row, boundary_col)
+            }
+        } else {
+            return None;
+        };
+        self.bind_finished_output_provenance(start_row, start_col, end_row, end_col)
+    }
+
+    fn bind_live_output_provenance(
+        &self,
+        start_row: usize,
+        start_col: usize,
+        boundary_row: usize,
+        boundary_col: usize,
+    ) -> Option<FinishedOutputProvenance> {
+        self.bind_output_provenance(
+            start_row,
+            self.current_output_start_row_id?,
+            start_col,
+            self.current_output_extent_row?,
+            self.current_output_extent_row_id?,
+            self.current_output_extent_col?,
+            boundary_row,
+            boundary_col,
+            self.pending_wrap,
+        )
+    }
+
     /// Snapshot one zone's output rows for [`CommandZone::captured_output`]:
     /// the exact live extraction (same trimming, same 1 MiB cap, same
     /// whole-rows-only truncation flag), blank output collapsing to `None`.
@@ -2927,8 +4234,11 @@ impl TerminalState {
         let raw = pending.raw_bytes();
         let IdleBackgroundOutput {
             start_row,
+            start_row_id,
             start_col,
             last_row,
+            last_row_id,
+            last_col_end,
             anchor_started: _,
             rows_evicted,
             raw_chunks: _,
@@ -2956,24 +4266,39 @@ impl TerminalState {
         } else {
             (prompt_start, Some(start_row), start_col, Some(output_end))
         };
-        self.push_command_zone(CommandZone {
-            id: 0,
-            prompt_start,
-            command_start: None,
-            output_start,
-            output_start_col,
-            output_end,
-            exit_code: None,
-            command: None,
-            duration_ms: None,
-            finished_at_ms: Self::wall_clock_ms(),
-            command_truncated: false,
-            cwd,
-            captured_output: Some(captured_output),
-            captured_output_evicted: false,
-            completion_observed: false,
-            rows_evicted,
-        });
+        let provenance = (!rows_evicted)
+            .then(|| {
+                let start_id = start_row_id?;
+                let last_id = last_row_id?;
+                if self.retained_raw_row(start_row)?.0 != start_id
+                    || self.retained_raw_row(last_row)?.0 != last_id
+                {
+                    return None;
+                }
+                self.bind_finished_output_provenance(start_row, start_col, last_row, last_col_end)
+            })
+            .flatten();
+        self.push_command_zone_with_provenance(
+            CommandZone {
+                id: 0,
+                prompt_start,
+                command_start: None,
+                output_start,
+                output_start_col,
+                output_end,
+                exit_code: None,
+                command: None,
+                duration_ms: None,
+                finished_at_ms: Self::wall_clock_ms(),
+                command_truncated: false,
+                cwd,
+                captured_output: Some(captured_output),
+                captured_output_evicted: false,
+                completion_observed: false,
+                rows_evicted,
+            },
+            provenance,
+        );
     }
 
     /// The OSC 7 cwd, refused if it carries control characters: a zone cwd
@@ -3016,6 +4341,12 @@ impl TerminalState {
             .or_else(|| self.control_free_osc7_cwd());
         let output_start_col = self.current_output_start_col.unwrap_or(0);
         let output_end = self.live_output_end_row(boundary_row);
+        let provenance = self.bind_live_output_provenance(
+            out_start,
+            output_start_col,
+            boundary_row,
+            self.cursor_col,
+        );
         let zone = CommandZone {
             id: 0, // assigned by push_command_zone
             prompt_start,
@@ -3034,7 +4365,7 @@ impl TerminalState {
             completion_observed: false,
             rows_evicted: false,
         };
-        self.push_command_zone(zone);
+        self.push_command_zone_with_provenance(zone, provenance);
     }
 
     /// Command line for a finished zone: the exact text captured at `C`
@@ -3102,6 +4433,11 @@ impl TerminalState {
                 *row = row.saturating_sub(count);
             }
         }
+        self.finished_output_provenance.retain(|zone_id, _| {
+            self.command_zones
+                .iter()
+                .any(|zone| zone.id == *zone_id && !zone.rows_evicted)
+        });
         let live_prompt_trimmed = match self.current_zone_state {
             ZoneState::PromptStarted(prompt_start)
             | ZoneState::CommandStarted(prompt_start, _)
@@ -3189,6 +4525,61 @@ impl TerminalState {
         self.command_zones.iter().find(|zone| zone.id == id)
     }
 
+    #[allow(dead_code)] // Used by the Stage A resolver before consumer wiring lands.
+    fn retained_raw_row(&self, absolute_row: usize) -> Option<(RawRowId, usize)> {
+        if let Some(line) = self.scrollback.get(absolute_row) {
+            return Some((line.raw_row_id, line.cols as usize));
+        }
+        let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
+        Some((self.grid.raw_row_id(grid_row)?, self.grid.row_len()))
+    }
+
+    #[allow(dead_code)] // Used by the Stage A resolver before consumer wiring lands.
+    fn retained_cell_is_wide_continuation(&self, absolute_row: usize, col: usize) -> Option<bool> {
+        if let Some(line) = self.scrollback.get(absolute_row) {
+            return line
+                .decompress()
+                .get(col)
+                .map(|cell| cell.flags.wide_continuation());
+        }
+        let grid_row = absolute_row.checked_sub(self.scrollback.len())?;
+        (col < self.grid.row_len()).then(|| self.grid.get(grid_row, col).flags.wide_continuation())
+    }
+
+    /// Resolve a finalized zone's live output rows to stable, exact raw-cell
+    /// boundaries. Trimmed, malformed, empty, or untracked ranges fail closed.
+    /// If the recorded start cuts a wide glyph, the range expands left to hide
+    /// the complete glyph. The end is encoded on the last included row so an
+    /// output ending at the bottom of the document needs no fictitious next id.
+    #[allow(dead_code)] // Public Stage A contract; projection wiring lands next.
+    pub fn finished_output_range(&self, zone_id: u64) -> Option<FinishedOutputRange> {
+        let zone = self.zone_by_id(zone_id)?;
+        if zone.rows_evicted {
+            return None;
+        }
+        let provenance = self.finished_output_provenance.get(&zone_id)?;
+        let total_rows = self.scrollback.len().checked_add(self.grid.rows())?;
+        let start_absolute = zone.output_start?;
+        let end_absolute = zone.output_end?;
+        if start_absolute >= end_absolute
+            || end_absolute > total_rows
+            || end_absolute - start_absolute != provenance.row_ids.len()
+        {
+            return None;
+        }
+        for (offset, expected) in provenance.row_ids.iter().copied().enumerate() {
+            if self.retained_raw_row(start_absolute + offset)?.0 != expected {
+                return None;
+            }
+        }
+        let start_width = self.retained_raw_row(start_absolute)?.1;
+        let end_width = self.retained_raw_row(end_absolute - 1)?.1;
+        if provenance.range.start.col > start_width || provenance.range.end.col > end_width {
+            return None;
+        }
+        Some(provenance.range)
+    }
+
     /// Remove every finalized OSC 133 block while leaving the live prompt (or
     /// the command currently running) intact. This is the terminal-state half
     /// of Warp's "Clear Blocks" action.
@@ -3224,6 +4615,7 @@ impl TerminalState {
         self.scrollback.drain(..retained_scrollback_start);
 
         self.command_zones.clear();
+        self.finished_output_provenance.clear();
         self.captured_output_bytes = 0;
         self.on_scrollback_rows_trimmed(retained_scrollback_start);
 
@@ -3244,7 +4636,7 @@ impl TerminalState {
             self.visible_cells_cache = None;
         }
 
-        self.selection = None;
+        self.clear_text_selection();
         self.scroll_offset = 0;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
@@ -4218,7 +5610,11 @@ impl TerminalState {
         }
 
         if track_idle_output {
-            self.note_idle_background_cells(self.cursor_col, !ch.is_whitespace());
+            self.note_idle_background_cells(
+                self.cursor_col,
+                self.cursor_col.saturating_add(width),
+                !ch.is_whitespace(),
+            );
         }
         let write_col = self.cursor_col;
 
@@ -4271,7 +5667,7 @@ impl TerminalState {
         }
         // Mark the row as dirty after writing character
         self.mark_row_dirty(self.cursor_row);
-        self.mark_command_echo_extent(write_col);
+        self.mark_command_echo_extent(write_col, write_col.saturating_add(width));
     }
 
     fn put_ascii_run(&mut self, bytes: &[u8]) {
@@ -4304,6 +5700,7 @@ impl TerminalState {
             let end = col + chunk_len;
             self.note_idle_background_cells(
                 col,
+                end,
                 bytes[pos..pos + chunk_len]
                     .iter()
                     .any(|byte| !byte.is_ascii_whitespace()),
@@ -4336,7 +5733,7 @@ impl TerminalState {
             pos += chunk_len;
 
             self.mark_row_dirty(self.cursor_row);
-            self.mark_command_echo_extent(col);
+            self.mark_command_echo_extent(col, end);
 
             if self.cursor_col >= cols {
                 self.cursor_col = cols - 1;
@@ -5426,7 +6823,7 @@ impl TerminalState {
                         let trimmed = self.scrollback.len();
                         self.scrollback.clear();
                         self.on_scrollback_rows_trimmed(trimmed);
-                        self.selection = None;
+                        self.clear_text_selection();
                         self.scroll_offset = 0;
                         self.grid_version = self.grid_version.wrapping_add(1);
                         self.visible_cells_cache = None;
@@ -5993,12 +7390,16 @@ impl TerminalState {
         }
         self.scrollback.clear();
         self.command_zones.clear();
+        self.finished_output_provenance.clear();
         self.captured_output_bytes = 0;
         self.current_zone_state = ZoneState::default();
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
         self.current_output_start_col = None;
+        self.current_output_start_row_id = None;
         self.current_output_extent_row = None;
+        self.current_output_extent_col = None;
+        self.current_output_extent_row_id = None;
         self.agent_prompt_input_tainted = false;
         self.prompt_submission_pending = false;
         self.prompt_cancel_pending = false;
@@ -6022,7 +7423,7 @@ impl TerminalState {
         self.keyboard_enhancement_stack.clear();
         self.alt_keyboard_enhancement_flags = 0;
         self.alt_keyboard_enhancement_stack.clear();
-        self.selection = None;
+        self.clear_text_selection();
         self.current_hyperlink = None;
         // RIS resets the graphics namespace with the text screen: neither a
         // visible placement nor a half-finished upload may survive it.
@@ -6163,7 +7564,7 @@ impl TerminalState {
                     // Selection anchors are absolute (scrollback+grid) row indices
                     // tied to the buffer that was visible. After a buffer swap they
                     // would highlight unrelated lines, so drop the selection.
-                    self.selection = None;
+                    self.clear_text_selection();
                     // DECSTBM is a per-buffer attribute; reset to full-screen so a
                     // partial scroll region from the main buffer doesn't leak in.
                     self.scroll_region_top = 0;
@@ -6254,7 +7655,7 @@ impl TerminalState {
                     // See the matching set_mode arm: clear selection because its
                     // anchors point into the alt buffer, and reset DECSTBM so the
                     // alt buffer's scroll region doesn't carry into the main one.
-                    self.selection = None;
+                    self.clear_text_selection();
                     self.scroll_region_top = 0;
                     self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
 
@@ -6783,6 +8184,213 @@ impl TerminalState {
         std::mem::take(&mut self.pending_clipboard_requests)
     }
 
+    /// Plan the complete identity document before any viewport slicing. The
+    /// scrollback half uses compressed-row layout metadata only, so even a
+    /// very deep history stays cold until visible cells are requested.
+    #[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+    fn identity_projection_plan(&self, cols: usize) -> ProjectionPlan {
+        let history_layouts = self
+            .scrollback
+            .iter()
+            .enumerate()
+            .map(|(absolute_row, line)| line.layout(absolute_row));
+        let history_len = self.scrollback.len();
+        let grid_layouts = self.grid.iter().enumerate().map(|(grid_row, cells)| {
+            RawRowLayout::from_cells(
+                cells,
+                self.grid.row_wrapped[grid_row],
+                history_len + grid_row,
+                self.grid.row_ids[grid_row],
+            )
+        });
+        ProjectionPlan::identity(history_layouts, grid_layouts, cols.max(1))
+    }
+
+    /// Resolve requested collapse ids against the exact finalized-zone
+    /// provenance captured by the terminal. Any stale/malformed candidate is
+    /// ignored, and every member of an overlapping component is rejected so
+    /// policy order can never decide which block wins.
+    #[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
+    fn resolved_collapses(&self, policy: &ProjectionPolicy) -> Vec<ResolvedCollapse> {
+        let mut candidates: Vec<_> = policy
+            .collapsed_zone_ids()
+            .filter_map(|zone_id| {
+                let zone = self.zone_by_id(zone_id)?;
+                if zone.rows_evicted {
+                    return None;
+                }
+                let provenance = self.finished_output_provenance.get(&zone_id)?;
+                let start_absolute = zone.output_start?;
+                let end_absolute = zone.output_end?.checked_sub(1)?;
+                let expected_rows = end_absolute.checked_sub(start_absolute)?.checked_add(1)?;
+                (start_absolute <= end_absolute
+                    && provenance.row_ids.len() == expected_rows
+                    && provenance.range.zone_id == zone_id
+                    && provenance.range.start.row.is_tracked()
+                    && provenance.range.end.row.is_tracked())
+                .then_some(ResolvedCollapse {
+                    range: provenance.range,
+                    start_absolute,
+                    end_absolute,
+                })
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|collapse| {
+            (
+                collapse.start_absolute,
+                collapse.range.start.col,
+                collapse.end_absolute,
+                collapse.range.end.col,
+                collapse.range.zone_id,
+            )
+        });
+
+        let mut rejected = vec![false; candidates.len()];
+        let mut group_start = 0usize;
+        while group_start < candidates.len() {
+            let mut group_end = group_start + 1;
+            let mut furthest_end = (
+                candidates[group_start].end_absolute,
+                candidates[group_start].range.end.col,
+            );
+            while group_end < candidates.len() {
+                let next_start = (
+                    candidates[group_end].start_absolute,
+                    candidates[group_end].range.start.col,
+                );
+                if next_start >= furthest_end {
+                    break;
+                }
+                furthest_end = furthest_end.max((
+                    candidates[group_end].end_absolute,
+                    candidates[group_end].range.end.col,
+                ));
+                group_end += 1;
+            }
+            if group_end - group_start > 1 {
+                rejected[group_start..group_end].fill(true);
+            }
+            group_start = group_end;
+        }
+
+        candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, collapse)| {
+                if rejected[index]
+                    || self.finished_output_range(collapse.range.zone_id) != Some(collapse.range)
+                {
+                    None
+                } else {
+                    Some(collapse)
+                }
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
+    fn collapsed_projection_plan(&self, cols: usize, policy: &ProjectionPolicy) -> ProjectionPlan {
+        let mut identity = self.identity_projection_plan(cols);
+        if policy.is_identity() {
+            identity.policy_revision = policy.revision();
+            return identity;
+        }
+        let collapses = self.resolved_collapses(policy);
+        identity.splice_collapses(&collapses, policy.revision())
+    }
+
+    fn cached_collapsed_projection_plan(
+        &mut self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> Option<std::sync::Arc<ProjectionPlan>> {
+        let key = self.projection_plan_cache_key(cols, policy);
+        if let Some((cached_key, plan)) = &self.projection_plan_cache {
+            if *cached_key == key {
+                return Some(std::sync::Arc::clone(plan));
+            }
+        }
+        let collapses = self.resolved_collapses(policy);
+        if collapses.is_empty() {
+            return None;
+        }
+        #[cfg(test)]
+        PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        let mut plan = self
+            .identity_projection_plan(cols)
+            .splice_collapses(&collapses, policy.revision());
+        if plan.effective_collapsed.is_empty() {
+            return None;
+        }
+        plan.plan_revision = self.next_projection_plan_revision;
+        if self.next_projection_plan_revision != 0 {
+            self.next_projection_plan_revision = self
+                .next_projection_plan_revision
+                .checked_add(1)
+                .unwrap_or(0);
+        }
+        let plan = std::sync::Arc::new(plan);
+        self.projection_plan_cache = Some((key, std::sync::Arc::clone(&plan)));
+        Some(plan)
+    }
+
+    fn projection_plan_cache_key(
+        &self,
+        cols: usize,
+        policy: &ProjectionPolicy,
+    ) -> ProjectionPlanCacheKey {
+        ProjectionPlanCacheKey {
+            history_revision: self.history_revision,
+            row_identity_revision: self.grid.identity_revision,
+            rows: self.grid.rows(),
+            cols,
+            row_wrapped: self.grid.row_wrapped.iter().copied().collect(),
+            policy_revision: policy.revision(),
+            policy_ids: policy.ids(),
+            next_zone_id: self.next_zone_id,
+            zone_count: self.command_zones.len(),
+            provenance_count: self.finished_output_provenance.len(),
+        }
+    }
+
+    /// Test oracle for the future viewport-slice materializer. It intentionally
+    /// consumes only `RawSlice::source`; missing raw origins must never erase
+    /// terminal bytes from the projected document.
+    #[cfg(test)]
+    fn materialize_identity_projection_plan(
+        &self,
+        plan: &ProjectionPlan,
+    ) -> Vec<Vec<TerminalCell>> {
+        let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
+        plan.rows
+            .iter()
+            .map(|planned_row| {
+                let mut cells = vec![TerminalCell::default(); plan.cols];
+                for slice in &planned_row.raw_slices {
+                    let source = if slice.source.absolute_row < self.scrollback.len() {
+                        history_cache
+                            .entry(slice.source.absolute_row)
+                            .or_insert_with(|| {
+                                self.scrollback[slice.source.absolute_row].decompress()
+                            })
+                            .as_slice()
+                    } else {
+                        let grid_row = slice.source.absolute_row - self.scrollback.len();
+                        &self.grid[grid_row]
+                    };
+                    let source_end = slice.source.col_start + slice.len;
+                    let view_end = slice.view_col_start + slice.len;
+                    cells[slice.view_col_start..view_end]
+                        .copy_from_slice(&source[slice.source.col_start..source_end]);
+                    if slice.narrow_wide_body {
+                        cells[slice.view_col_start].flags.set_wide(false);
+                    }
+                }
+                cells
+            })
+            .collect()
+    }
+
     fn reflow_projected_origins(
         lines: &[ScrollbackLine],
         new_cols: usize,
@@ -6881,7 +8489,7 @@ impl TerminalState {
                     .filter_map(|span| {
                         let overlap_start = span.view_col_start.max(offset);
                         let overlap_end = span.view_col_end.min(end);
-                        (overlap_start < overlap_end).then_some(LineOriginSpan {
+                        (overlap_start < overlap_end).then(|| LineOriginSpan {
                             view_col_start: overlap_start - offset,
                             view_col_end: overlap_end - offset,
                             raw_row: span.raw_row,
@@ -7014,6 +8622,10 @@ impl TerminalState {
         &mut self,
         block_mode: bool,
     ) -> std::sync::Arc<ProjectedViewport> {
+        // Identity and bypass coordinates are raw-buffer coordinates. A
+        // projected selection can never cross this boundary, while an
+        // existing raw selection remains valid and must be preserved.
+        self.projected_selection = None;
         let rows = self.grid.rows();
         let cols = if rows > 0 { self.grid.row_len() } else { 80 };
         let mode = if block_mode && !self.use_alt_buffer {
@@ -7030,6 +8642,9 @@ impl TerminalState {
             cols,
             use_alt_buffer: self.use_alt_buffer,
             mode,
+            policy_revision: 0,
+            policy_ids: SmallVec::new(),
+            view_scroll_offset: self.scroll_offset,
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
             if *cached_key == key {
@@ -7087,6 +8702,7 @@ impl TerminalState {
             self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
+            row_kinds: std::sync::Arc::new(vec![ProjectedRowKind::Raw; cells.len()]),
             cells,
             row_wrapped,
             provenance,
@@ -7102,11 +8718,492 @@ impl TerminalState {
             identity_fast_path: self.scroll_offset == 0,
             mode,
             scroll_offset: self.scroll_offset,
+            policy_revision: 0,
+            policy_ids: std::sync::Arc::from([]),
+            document_rows: self.scrollback.len().saturating_add(rows),
+            document_start: self.viewport_absolute_start(),
+            top_padding: 0,
+            effective_collapsed: std::sync::Arc::new(BTreeSet::new()),
+            plan_revision: 0,
         });
         if view_revision != 0 {
             self.projected_viewport_cache = Some((key, std::sync::Arc::clone(&viewport)));
         }
         viewport
+    }
+
+    fn materialize_projection_plan(
+        &self,
+        plan: &ProjectionPlan,
+        requested_scroll_offset: usize,
+        rows: usize,
+        cols: usize,
+    ) -> MaterializedProjection {
+        let scroll_offset = requested_scroll_offset.min(plan.rows.len().saturating_sub(rows));
+        let visible_end = plan.rows.len().saturating_sub(scroll_offset);
+        let visible_start = visible_end.saturating_sub(rows);
+        let visible_plan_rows = &plan.rows[visible_start..visible_end];
+        let top_padding = rows.saturating_sub(visible_plan_rows.len());
+
+        let mut cells = Vec::with_capacity(rows);
+        let mut row_wrapped = Vec::with_capacity(rows);
+        let mut row_kinds = Vec::with_capacity(rows);
+        let mut row_sources = Vec::with_capacity(rows);
+        let mut origin_spans = Vec::new();
+        for _ in 0..top_padding {
+            cells.push(vec![TerminalCell::default(); cols]);
+            row_wrapped.push(false);
+            row_kinds.push(ProjectedRowKind::Padding);
+            row_sources.push(None);
+        }
+
+        let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
+        for planned in visible_plan_rows {
+            let view_row = cells.len();
+            let mut line = vec![TerminalCell::default(); cols];
+            if matches!(planned.kind, ProjectedRowKind::Raw) {
+                for slice in &planned.raw_slices {
+                    let source = if slice.source.absolute_row < self.scrollback.len() {
+                        history_cache
+                            .entry(slice.source.absolute_row)
+                            .or_insert_with(|| {
+                                self.scrollback[slice.source.absolute_row].decompress()
+                            })
+                            .as_slice()
+                    } else {
+                        let Some(grid_row) =
+                            slice.source.absolute_row.checked_sub(self.scrollback.len())
+                        else {
+                            continue;
+                        };
+                        let Some(source) =
+                            (grid_row < self.grid.rows()).then(|| &self.grid[grid_row])
+                        else {
+                            continue;
+                        };
+                        source
+                    };
+                    let source_end = slice.source.col_start.saturating_add(slice.len);
+                    let view_end = slice.view_col_start.saturating_add(slice.len);
+                    let Some(source_cells) = source.get(slice.source.col_start..source_end) else {
+                        continue;
+                    };
+                    let Some(view_cells) = line.get_mut(slice.view_col_start..view_end) else {
+                        continue;
+                    };
+                    view_cells.copy_from_slice(source_cells);
+                    if slice.narrow_wide_body {
+                        if let Some(cell) = line.get_mut(slice.view_col_start) {
+                            cell.flags.set_wide(false);
+                        }
+                    }
+                    if let Some(origin) = slice.origin {
+                        origin_spans.push(OriginSpan {
+                            view_row,
+                            view_col_start: slice.view_col_start,
+                            view_col_end: view_end,
+                            raw_row: origin.row,
+                            raw_col_start: origin.col_start,
+                        });
+                    }
+                }
+            }
+            cells.push(line);
+            row_wrapped.push(planned.wrapped);
+            row_kinds.push(planned.kind);
+            row_sources.push(
+                matches!(planned.kind, ProjectedRowKind::Raw)
+                    .then_some(planned.row_source)
+                    .flatten(),
+            );
+        }
+        while cells.len() < rows {
+            cells.push(vec![TerminalCell::default(); cols]);
+            row_wrapped.push(false);
+            row_kinds.push(ProjectedRowKind::Padding);
+            row_sources.push(None);
+        }
+
+        MaterializedProjection {
+            cells,
+            row_wrapped,
+            row_kinds,
+            provenance: ProjectedProvenance {
+                origin_spans,
+                row_sources,
+            },
+            scroll_offset,
+            document_start: visible_start,
+            top_padding,
+        }
+    }
+
+    fn projection_indexes(
+        provenance: &ProjectedProvenance,
+    ) -> (Vec<usize>, Vec<(RawRowId, usize)>) {
+        let mut raw_span_index: Vec<_> = (0..provenance.origin_spans.len()).collect();
+        raw_span_index.sort_unstable_by_key(|index| {
+            let span = provenance.origin_spans[*index];
+            (
+                span.raw_row,
+                span.raw_col_start,
+                span.view_row,
+                span.view_col_start,
+            )
+        });
+        let mut raw_row_index: Vec<_> =
+            provenance
+                .origin_spans
+                .iter()
+                .map(|span| (span.raw_row, span.view_row))
+                .chain(provenance.row_sources.iter().enumerate().filter_map(
+                    |(view_row, source)| source.map(|source| (source.raw_row, view_row)),
+                ))
+                .collect();
+        raw_row_index.sort_unstable();
+        raw_row_index.dedup();
+        (raw_span_index, raw_row_index)
+    }
+
+    /// Materialize a viewport from a session-owned projection policy. Empty,
+    /// stale, alternate-screen, and Block-disabled policies share the legacy
+    /// P0 cell Arc; active collapses decode only raw rows referenced by the
+    /// requested projected viewport slice.
+    #[allow(dead_code)] // Session/UI wiring lands in the next slice.
+    pub fn get_projected_viewport_with_policy(
+        &mut self,
+        block_mode: bool,
+        policy: &ProjectionPolicy,
+        view_scroll_offset: usize,
+    ) -> std::sync::Arc<ProjectedViewport> {
+        if !block_mode || self.use_alt_buffer || policy.is_identity() {
+            return self.get_projected_viewport(block_mode);
+        }
+
+        let rows = self.grid.rows();
+        let cols = self.grid.row_len().max(1);
+        let cache_key = ProjectedViewportCacheKey {
+            grid_version: self.grid_version,
+            history_revision: self.history_revision,
+            row_identity_revision: self.grid.identity_revision,
+            scroll_offset: self.scroll_offset,
+            rows,
+            cols,
+            use_alt_buffer: self.use_alt_buffer,
+            mode: ProjectionMode::Transformed,
+            policy_revision: policy.revision(),
+            policy_ids: policy.ids(),
+            view_scroll_offset,
+        };
+        if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
+            if *cached_key == cache_key {
+                let viewport = std::sync::Arc::clone(viewport);
+                self.enter_transformed_selection_space(viewport.plan_revision);
+                return viewport;
+            }
+        }
+
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            return self.get_projected_viewport(true);
+        };
+        self.enter_transformed_selection_space(plan.plan_revision);
+
+        let document_rows = plan.rows.len();
+        let effective_collapsed = std::sync::Arc::new(plan.effective_collapsed.clone());
+        let materialized =
+            self.materialize_projection_plan(plan.as_ref(), view_scroll_offset, rows, cols);
+        let (raw_span_index, raw_row_index) = Self::projection_indexes(&materialized.provenance);
+        let view_revision = self.next_projected_view_revision;
+        if view_revision != 0 {
+            self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
+        }
+        let viewport = std::sync::Arc::new(ProjectedViewport {
+            cells: std::sync::Arc::new(materialized.cells),
+            row_wrapped: std::sync::Arc::new(materialized.row_wrapped),
+            row_kinds: std::sync::Arc::new(materialized.row_kinds),
+            provenance: std::sync::Arc::new(materialized.provenance),
+            raw_span_index: std::sync::Arc::new(raw_span_index),
+            raw_row_index: std::sync::Arc::new(raw_row_index),
+            source_revision: ProjectionSourceRevision {
+                grid: self.grid_version,
+                history: self.history_revision,
+                row_identity: self.grid.identity_revision,
+                alternate_screen: self.use_alt_buffer,
+            },
+            view_revision,
+            identity_fast_path: false,
+            mode: ProjectionMode::Transformed,
+            scroll_offset: materialized.scroll_offset,
+            policy_revision: policy.revision(),
+            policy_ids: std::sync::Arc::from(policy.collapsed_zone_ids().collect::<Vec<_>>()),
+            document_rows,
+            document_start: materialized.document_start,
+            top_padding: materialized.top_padding,
+            effective_collapsed,
+            plan_revision: plan.plan_revision,
+        });
+        if view_revision != 0 {
+            self.projected_viewport_cache = Some((cache_key, std::sync::Arc::clone(&viewport)));
+        }
+        viewport
+    }
+
+    /// Enter projected-document coordinates. Raw selections cannot describe
+    /// a transformed document. A projected selection survives ordinary cell
+    /// updates and viewport scrolling only while its exact plan is retained.
+    fn enter_transformed_selection_space(&mut self, plan_revision: u64) {
+        self.selection = None;
+        if plan_revision == 0
+            || self
+                .projected_selection
+                .as_ref()
+                .is_some_and(|selection| selection.plan_revision != plan_revision)
+        {
+            self.projected_selection = None;
+        }
+    }
+
+    fn projected_top_anchor(viewport: &ProjectedViewport) -> Option<ProjectedTopAnchor> {
+        let view_row = viewport.top_padding;
+        match viewport.row_kinds.get(view_row).copied()? {
+            ProjectedRowKind::Padding => None,
+            ProjectedRowKind::CollapsedSummary {
+                key, hidden_range, ..
+            } => Some(ProjectedTopAnchor::Summary {
+                zone_id: key.zone_id,
+                hidden_range,
+            }),
+            ProjectedRowKind::Raw => viewport
+                .provenance
+                .origin_spans
+                .iter()
+                .filter(|span| span.view_row == view_row)
+                .min_by_key(|span| span.view_col_start)
+                .map(|span| {
+                    ProjectedTopAnchor::RawCell(RawCellOrigin {
+                        row: span.raw_row,
+                        col: span.raw_col_start,
+                    })
+                })
+                .or_else(|| {
+                    viewport
+                        .provenance
+                        .row_sources
+                        .get(view_row)
+                        .copied()
+                        .flatten()
+                        .map(|source| ProjectedTopAnchor::RawRow(source.raw_row))
+                }),
+        }
+    }
+
+    fn retained_absolute_for_raw(&self, raw_row: RawRowId) -> Option<usize> {
+        self.scrollback
+            .iter()
+            .position(|line| line.raw_row_id() == raw_row)
+            .or_else(|| {
+                self.grid
+                    .row_ids
+                    .iter()
+                    .position(|row| *row == raw_row)
+                    .map(|grid_row| self.scrollback.len() + grid_row)
+            })
+    }
+
+    fn restore_identity_scroll_from_projection(&mut self, state: &ProjectionViewState) {
+        if state.follow_bottom {
+            self.scroll_offset = 0;
+            return;
+        }
+        let raw_row = match state.top_anchor {
+            Some(ProjectedTopAnchor::RawCell(origin)) => Some(origin.row),
+            Some(ProjectedTopAnchor::RawRow(row)) => Some(row),
+            Some(ProjectedTopAnchor::Summary { hidden_range, .. }) => Some(hidden_range.start.row),
+            None => None,
+        };
+        let Some(absolute) = raw_row.and_then(|row| self.retained_absolute_for_raw(row)) else {
+            self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+            return;
+        };
+        let desired_start = absolute.min(self.scrollback.len());
+        self.scroll_offset = self.scrollback.len().saturating_sub(desired_start);
+    }
+
+    /// Resolve a session-owned projected scroll state against the current
+    /// document. Rebuilds preserve the top raw/synthetic anchor while a view
+    /// at offset zero continues following the bottom.
+    #[allow(dead_code)] // Session wiring lands in the next slice.
+    pub fn get_projected_viewport_with_state(
+        &mut self,
+        block_mode: bool,
+        policy: &ProjectionPolicy,
+        state: &mut ProjectionViewState,
+    ) -> std::sync::Arc<ProjectedViewport> {
+        if !block_mode || self.use_alt_buffer {
+            self.projected_selection = None;
+            return self.get_projected_viewport(block_mode);
+        }
+        if policy.is_identity() {
+            if state.last_plan_key.is_some() {
+                self.restore_identity_scroll_from_projection(state);
+                state.last_plan_key = None;
+            }
+            return self.get_projected_viewport(true);
+        }
+
+        let cols = self.grid.row_len().max(1);
+        if state.last_plan_key.is_none() && self.scroll_offset > 0 {
+            let identity = self.get_projected_viewport(true);
+            state.top_anchor = Self::projected_top_anchor(&identity);
+            state.follow_bottom = false;
+        }
+        let plan_key = self.projection_plan_cache_key(cols, policy);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            if state.last_plan_key.is_some() {
+                self.restore_identity_scroll_from_projection(state);
+                state.last_plan_key = None;
+            }
+            return self.get_projected_viewport(true);
+        };
+
+        if state.last_plan_key.as_ref() != Some(&plan_key) {
+            self.clear_text_selection();
+            let max_start = plan.rows.len().saturating_sub(self.grid.rows());
+            if state.follow_bottom {
+                state.offset_from_bottom = 0;
+            } else if let Some(target) = state
+                .top_anchor
+                .and_then(|anchor| plan.document_row_for_anchor(anchor))
+            {
+                state.offset_from_bottom = max_start.saturating_sub(target.min(max_start));
+            } else {
+                state.offset_from_bottom = state.offset_from_bottom.min(max_start);
+            }
+        }
+
+        let viewport =
+            self.get_projected_viewport_with_policy(true, policy, state.offset_from_bottom);
+        state.offset_from_bottom = viewport.scroll_offset();
+        state.follow_bottom = state.offset_from_bottom == 0;
+        state.top_anchor = (!state.follow_bottom)
+            .then(|| Self::projected_top_anchor(&viewport))
+            .flatten();
+        state.last_plan_key = Some(plan_key);
+        viewport
+    }
+
+    pub fn locate_raw_cell_in_projection(
+        &self,
+        projection: &ProjectedViewport,
+        origin: RawCellOrigin,
+    ) -> ProjectedRawCellLocation {
+        if let Some(cell) = projection.raw_to_view(origin) {
+            return ProjectedRawCellLocation::Visible(cell);
+        }
+        if projection.mode() != ProjectionMode::Transformed {
+            return if self.retained_absolute_for_raw(origin.row).is_some() {
+                ProjectedRawCellLocation::Retained
+            } else {
+                ProjectedRawCellLocation::Unmapped
+            };
+        }
+        let Some((key, plan)) = self.projection_plan_cache.as_ref() else {
+            return ProjectedRawCellLocation::Unmapped;
+        };
+        if !self.projection_plan_key_matches_current_source(key) {
+            return ProjectedRawCellLocation::Unmapped;
+        }
+        if let Some(summary_row) = plan.summary_owning_raw_cell(origin) {
+            if let ProjectedRowKind::CollapsedSummary { key, .. } = plan.rows[summary_row].kind {
+                return ProjectedRawCellLocation::Hidden {
+                    zone_id: key.zone_id,
+                };
+            }
+        }
+        if plan.raw_cell_document_row(origin).is_some()
+            || plan.raw_row_document_row(origin.row).is_some()
+        {
+            ProjectedRawCellLocation::Retained
+        } else {
+            ProjectedRawCellLocation::Unmapped
+        }
+    }
+
+    /// Move a transformed view to a retained raw cell without changing the
+    /// collapse policy. Callers explicitly expand a hidden owner first, then
+    /// invoke this method to reveal and highlight the same stable raw match.
+    pub fn reveal_raw_cell_in_projection(
+        &mut self,
+        policy: &ProjectionPolicy,
+        state: &mut ProjectionViewState,
+        origin: RawCellOrigin,
+    ) -> bool {
+        if policy.is_identity() || self.use_alt_buffer {
+            let Some(absolute) = self.retained_absolute_for_raw(origin.row) else {
+                return false;
+            };
+            self.reveal_buffer_row(absolute);
+            return true;
+        }
+        let cols = self.grid.row_len().max(1);
+        let plan_key = self.projection_plan_cache_key(cols, policy);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            return false;
+        };
+        let Some(target) = plan
+            .raw_cell_document_row(origin)
+            .or_else(|| plan.raw_row_document_row(origin.row))
+        else {
+            return false;
+        };
+        let max_start = plan.rows.len().saturating_sub(self.grid.rows());
+        state.offset_from_bottom = max_start.saturating_sub(target.min(max_start));
+        state.follow_bottom = false;
+        state.top_anchor = Some(ProjectedTopAnchor::RawCell(origin));
+        state.last_plan_key = Some(plan_key);
+        true
+    }
+
+    /// Reveal one effective collapsed summary without mutating the projection
+    /// policy. This gives block navigation a stable destination even though
+    /// every raw cell owned by the block is intentionally hidden.
+    #[allow(dead_code)] // Public navigation hook; UI wiring lands separately.
+    pub fn reveal_collapsed_summary(
+        &mut self,
+        policy: &ProjectionPolicy,
+        state: &mut ProjectionViewState,
+        zone_id: u64,
+    ) -> bool {
+        if policy.is_identity() || self.use_alt_buffer {
+            return false;
+        }
+        let cols = self.grid.row_len().max(1);
+        let plan_key = self.projection_plan_cache_key(cols, policy);
+        let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
+            return false;
+        };
+        let Some(summary_row) = plan.summary_row(zone_id) else {
+            return false;
+        };
+        let ProjectedRowKind::CollapsedSummary {
+            key, hidden_range, ..
+        } = plan.rows[summary_row].kind
+        else {
+            return false;
+        };
+        if key.zone_id != zone_id || key.policy_revision != policy.revision() {
+            return false;
+        }
+
+        let max_start = plan.rows.len().saturating_sub(self.grid.rows());
+        state.offset_from_bottom = max_start.saturating_sub(summary_row.min(max_start));
+        state.follow_bottom = false;
+        state.top_anchor = Some(ProjectedTopAnchor::Summary {
+            zone_id,
+            hidden_range,
+        });
+        state.last_plan_key = Some(plan_key);
+        true
     }
 
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
@@ -7232,11 +9329,136 @@ impl TerminalState {
 
     #[allow(dead_code)]
     pub fn select_text(&mut self, anchor: (usize, usize), active: (usize, usize)) {
+        self.projected_selection = None;
         self.selection = Some(Selection {
             anchor,
             active,
             mode: SelectionMode::Normal,
         });
+    }
+
+    pub fn clear_text_selection(&mut self) {
+        self.selection = None;
+        self.projected_selection = None;
+    }
+
+    pub fn has_text_selection(&self) -> bool {
+        self.selection.is_some() || self.projected_selection.is_some()
+    }
+
+    fn projection_selection_revision(&self, projection: &ProjectedViewport) -> Option<u64> {
+        if projection.mode() != ProjectionMode::Transformed {
+            return None;
+        }
+        let (key, plan) = self.projection_plan_cache.as_ref()?;
+        (plan.plan_revision != 0
+            && projection.plan_revision == plan.plan_revision
+            && self.projection_plan_key_matches_current_source(key)
+            && projection.source_revision.history == key.history_revision
+            && projection.source_revision.row_identity == key.row_identity_revision
+            && projection.source_revision.alternate_screen == self.use_alt_buffer
+            && plan.rows.len() == projection.document_rows()
+            && plan.policy_revision == projection.policy_revision())
+        .then_some(plan.plan_revision)
+    }
+
+    fn projection_plan_key_matches_current_source(&self, key: &ProjectionPlanCacheKey) -> bool {
+        key.history_revision == self.history_revision
+            && key.row_identity_revision == self.grid.identity_revision
+            && key.rows == self.grid.rows()
+            && key.cols == self.grid.row_len().max(1)
+            && key.row_wrapped.as_slice() == self.grid.row_wrapped.as_slice()
+            && key.next_zone_id == self.next_zone_id
+            && key.zone_count == self.command_zones.len()
+            && key.provenance_count == self.finished_output_provenance.len()
+    }
+
+    fn projected_selection_point(
+        projection: &ProjectedViewport,
+        viewport_pos: (usize, usize),
+    ) -> Option<(usize, usize)> {
+        let mut cell = ViewportCell {
+            row: viewport_pos.0,
+            col: viewport_pos.1,
+        };
+        if projection
+            .cells()
+            .get(cell.row)?
+            .get(cell.col)?
+            .flags
+            .wide_continuation()
+            && cell.col > 0
+        {
+            cell.col -= 1;
+        }
+        if projection.view_to_raw(cell).is_none() {
+            let span_start = projection
+                .provenance
+                .origin_spans
+                .partition_point(|span| span.view_row < cell.row);
+            if projection.provenance.origin_spans[span_start..]
+                .first()
+                .is_some_and(|span| span.view_row == cell.row)
+            {
+                return None;
+            }
+            let row_source = projection
+                .provenance
+                .row_sources
+                .get(cell.row)
+                .copied()
+                .flatten()?;
+            if !row_source.raw_row.is_tracked()
+                || !matches!(
+                    projection.row_kinds().get(cell.row),
+                    Some(ProjectedRowKind::Raw)
+                )
+            {
+                return None;
+            }
+        }
+        Some((projection.view_document_row(cell.row)?, cell.col))
+    }
+
+    fn projected_row_real_column_bounds(
+        projection: &ProjectedViewport,
+        row: usize,
+    ) -> Option<(usize, usize)> {
+        let start = projection
+            .provenance
+            .origin_spans
+            .partition_point(|span| span.view_row < row);
+        let mut spans = projection.provenance.origin_spans[start..]
+            .iter()
+            .take_while(|span| span.view_row == row);
+        let Some(first) = spans.next() else {
+            let source = projection
+                .provenance
+                .row_sources
+                .get(row)
+                .copied()
+                .flatten()?;
+            return (source.raw_row.is_tracked()
+                && matches!(projection.row_kinds().get(row), Some(ProjectedRowKind::Raw)))
+            .then(|| {
+                (
+                    0,
+                    projection
+                        .cells()
+                        .get(row)
+                        .map_or(0, |cells| cells.len().saturating_sub(1)),
+                )
+            });
+        };
+        Some(spans.fold(
+            (first.view_col_start, first.view_col_end.saturating_sub(1)),
+            |(left, right), span| {
+                (
+                    left.min(span.view_col_start),
+                    right.max(span.view_col_end.saturating_sub(1)),
+                )
+            },
+        ))
     }
 
     /// Start a new selection at a viewport-relative position.
@@ -7252,6 +9474,25 @@ impl TerminalState {
         viewport_pos: (usize, usize),
         mode: SelectionMode,
     ) {
+        if projection.mode() == ProjectionMode::Transformed {
+            let Some(plan_revision) = self.projection_selection_revision(projection) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(point) = Self::projected_selection_point(projection, viewport_pos) else {
+                self.clear_text_selection();
+                return;
+            };
+            self.selection = None;
+            self.projected_selection = Some(ProjectedSelection {
+                plan_revision,
+                anchor: point,
+                active: point,
+                mode,
+            });
+            return;
+        }
+        self.projected_selection = None;
         let abs = (
             self.projected_row_to_absolute(projection, viewport_pos.0),
             viewport_pos.1,
@@ -7290,6 +9531,24 @@ impl TerminalState {
         projection: &ProjectedViewport,
         viewport_pos: (usize, usize),
     ) {
+        if projection.mode() == ProjectionMode::Transformed {
+            let Some(plan_revision) = self.projection_selection_revision(projection) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(point) = Self::projected_selection_point(projection, viewport_pos) else {
+                return;
+            };
+            let Some(selection) = self.projected_selection.as_mut() else {
+                return;
+            };
+            if selection.plan_revision != plan_revision {
+                self.clear_text_selection();
+                return;
+            }
+            selection.active = point;
+            return;
+        }
         let abs_row = self.projected_row_to_absolute(projection, viewport_pos.0);
         if let Some(ref mut sel) = self.selection {
             sel.active = (abs_row, viewport_pos.1);
@@ -7324,6 +9583,29 @@ impl TerminalState {
         let Some((left, right)) = Self::word_columns_at(line, col) else {
             return;
         };
+        if projection.mode() == ProjectionMode::Transformed {
+            let Some(plan_revision) = self.projection_selection_revision(projection) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(anchor) = Self::projected_selection_point(projection, (row, left)) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(active) = Self::projected_selection_point(projection, (row, right)) else {
+                self.clear_text_selection();
+                return;
+            };
+            self.selection = None;
+            self.projected_selection = Some(ProjectedSelection {
+                plan_revision,
+                anchor,
+                active,
+                mode: SelectionMode::Normal,
+            });
+            return;
+        }
+        self.projected_selection = None;
         let abs_row = self.projected_row_to_absolute(projection, row);
         self.selection = Some(Selection {
             anchor: (abs_row, left),
@@ -7434,6 +9716,48 @@ impl TerminalState {
         let Some((target_left, target_right)) = Self::word_columns_at(line, col) else {
             return;
         };
+        if projection.mode() == ProjectionMode::Transformed {
+            let Some(plan_revision) = self.projection_selection_revision(projection) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some(target_start) =
+                Self::projected_selection_point(projection, (row, target_left))
+            else {
+                return;
+            };
+            let Some(target_end) = Self::projected_selection_point(projection, (row, target_right))
+            else {
+                return;
+            };
+            let Some(selection) = self.projected_selection.as_mut() else {
+                self.projected_selection = Some(ProjectedSelection {
+                    plan_revision,
+                    anchor: target_start,
+                    active: target_end,
+                    mode: SelectionMode::Normal,
+                });
+                return;
+            };
+            if selection.plan_revision != plan_revision {
+                self.clear_text_selection();
+                return;
+            }
+            let (origin_start, origin_end) = if selection.anchor <= selection.active {
+                (selection.anchor, selection.active)
+            } else {
+                (selection.active, selection.anchor)
+            };
+            if target_start < origin_start {
+                selection.anchor = origin_end;
+                selection.active = target_start;
+            } else {
+                selection.anchor = origin_start;
+                selection.active = target_end;
+            }
+            selection.mode = SelectionMode::Normal;
+            return;
+        }
         let target_row = self.projected_row_to_absolute(projection, row);
         self.extend_word_selection_to_span(target_row, target_left, target_right);
     }
@@ -7506,6 +9830,40 @@ impl TerminalState {
         projection: &ProjectedViewport,
         row: usize,
     ) {
+        if projection.mode() == ProjectionMode::Transformed {
+            let Some(plan_revision) = self.projection_selection_revision(projection) else {
+                self.clear_text_selection();
+                return;
+            };
+            let Some((left, right)) = Self::projected_row_real_column_bounds(projection, row)
+            else {
+                return;
+            };
+            let Some(target_start) = Self::projected_selection_point(projection, (row, left))
+            else {
+                return;
+            };
+            let Some(target_end) = Self::projected_selection_point(projection, (row, right)) else {
+                return;
+            };
+            let Some(selection) = self.projected_selection.as_mut() else {
+                return;
+            };
+            if selection.plan_revision != plan_revision {
+                self.clear_text_selection();
+                return;
+            }
+            let origin_row = selection.anchor.0;
+            if target_start.0 < origin_row {
+                selection.anchor = (origin_row, selection.anchor.1.max(selection.active.1));
+                selection.active = target_start;
+            } else {
+                selection.anchor = (origin_row, selection.anchor.1.min(selection.active.1));
+                selection.active = target_end;
+            }
+            selection.mode = SelectionMode::Normal;
+            return;
+        }
         let Some(sel) = self.selection else {
             return;
         };
@@ -7525,6 +9883,43 @@ impl TerminalState {
                 active: (target_row, cols.saturating_sub(1)),
                 mode: SelectionMode::Normal,
             }
+        });
+    }
+
+    pub fn select_line_in_projection(&mut self, projection: &ProjectedViewport, row: usize) {
+        if projection.mode() != ProjectionMode::Transformed {
+            let cols = projection.cells().first().map_or(0, Vec::len);
+            self.projected_selection = None;
+            let abs_row = self.projected_row_to_absolute(projection, row);
+            self.selection = Some(Selection {
+                anchor: (abs_row, 0),
+                active: (abs_row, cols.saturating_sub(1)),
+                mode: SelectionMode::Normal,
+            });
+            return;
+        }
+        let Some(plan_revision) = self.projection_selection_revision(projection) else {
+            self.clear_text_selection();
+            return;
+        };
+        let Some((left, right)) = Self::projected_row_real_column_bounds(projection, row) else {
+            self.clear_text_selection();
+            return;
+        };
+        let Some(anchor) = Self::projected_selection_point(projection, (row, left)) else {
+            self.clear_text_selection();
+            return;
+        };
+        let Some(active) = Self::projected_selection_point(projection, (row, right)) else {
+            self.clear_text_selection();
+            return;
+        };
+        self.selection = None;
+        self.projected_selection = Some(ProjectedSelection {
+            plan_revision,
+            anchor,
+            active,
+            mode: SelectionMode::Normal,
         });
     }
 
@@ -7616,7 +10011,120 @@ impl TerminalState {
         Some((left, right))
     }
 
+    fn copy_projected_selection(&self) -> Option<String> {
+        let selection = self.projected_selection.as_ref()?;
+        let (plan_key, plan) = self.projection_plan_cache.as_ref()?;
+        if plan.plan_revision == 0
+            || plan.plan_revision != selection.plan_revision
+            || !self.projection_plan_key_matches_current_source(plan_key)
+        {
+            return None;
+        }
+        let (start, end) = if selection.anchor <= selection.active {
+            (selection.anchor, selection.active)
+        } else {
+            (selection.active, selection.anchor)
+        };
+        if start.0 >= plan.rows.len() || end.0 >= plan.rows.len() {
+            return None;
+        }
+
+        let mut result = String::new();
+        let mut history_cache: Option<(usize, Vec<TerminalCell>)> = None;
+        let mut hard_break_pending = false;
+        for document_row in start.0..=end.0 {
+            let planned = &plan.rows[document_row];
+            let (selected_left, selected_right) = if selection.mode == SelectionMode::Block {
+                (
+                    selection.anchor.1.min(selection.active.1),
+                    selection.anchor.1.max(selection.active.1),
+                )
+            } else {
+                (
+                    if document_row == start.0 { start.1 } else { 0 },
+                    if document_row == end.0 {
+                        end.1
+                    } else {
+                        plan.cols.saturating_sub(1)
+                    },
+                )
+            };
+
+            if matches!(planned.kind, ProjectedRowKind::CollapsedSummary { .. }) {
+                hard_break_pending = !result.ends_with('\n');
+                continue;
+            }
+            if matches!(planned.kind, ProjectedRowKind::Raw) {
+                if hard_break_pending {
+                    result.push('\n');
+                    hard_break_pending = false;
+                }
+                if planned.raw_slices.is_empty()
+                    && planned.row_source.is_some()
+                    && selected_left <= selected_right
+                {
+                    result.extend(std::iter::repeat_n(
+                        ' ',
+                        selected_right
+                            .min(plan.cols.saturating_sub(1))
+                            .saturating_sub(selected_left)
+                            .saturating_add(1),
+                    ));
+                }
+                for slice in &planned.raw_slices {
+                    let slice_start = slice.view_col_start;
+                    let slice_end = slice_start.saturating_add(slice.len);
+                    let overlap_start = slice_start.max(selected_left);
+                    let overlap_end = slice_end.min(selected_right.saturating_add(1));
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+                    let source = if slice.source.absolute_row < self.scrollback.len() {
+                        if history_cache.as_ref().map(|(row, _)| *row)
+                            != Some(slice.source.absolute_row)
+                        {
+                            history_cache = Some((
+                                slice.source.absolute_row,
+                                self.scrollback[slice.source.absolute_row].decompress(),
+                            ));
+                        }
+                        history_cache.as_ref()?.1.as_slice()
+                    } else {
+                        let grid_row = slice
+                            .source
+                            .absolute_row
+                            .checked_sub(self.scrollback.len())?;
+                        if grid_row >= self.grid.rows() {
+                            return None;
+                        }
+                        &self.grid[grid_row]
+                    };
+                    let source_start = slice
+                        .source
+                        .col_start
+                        .saturating_add(overlap_start - slice_start);
+                    let source_end = source_start.saturating_add(overlap_end - overlap_start);
+                    for cell in source.get(source_start..source_end)? {
+                        if !cell.flags.wide_continuation() {
+                            result.push(cell.character);
+                        }
+                    }
+                }
+                if document_row < end.0
+                    && (selection.mode == SelectionMode::Block || !planned.wrapped)
+                {
+                    result.push('\n');
+                    hard_break_pending = false;
+                }
+            }
+        }
+        Some(result)
+    }
+
     pub fn copy_selection(&self) -> Option<String> {
+        if self.projected_selection.is_some() {
+            return self.copy_projected_selection();
+        }
         self.selection.map(|sel| {
             let (start, end) = if sel.anchor <= sel.active {
                 (sel.anchor, sel.active)
@@ -7819,7 +10327,7 @@ impl TerminalState {
         // line. Defer that optional history cleanup instead of severing the
         // running lifecycle (and Agent execution correlation) mid-command.
         if live_start.is_some_and(|start| start < old_scrollback_len) {
-            self.selection = None;
+            self.clear_text_selection();
             self.scroll_offset = 0;
             return false;
         }
@@ -7844,7 +10352,7 @@ impl TerminalState {
         // their row anchors while keeping identity/metadata/output snapshots;
         // zones and a live lifecycle still in the unchanged grid shift by the
         // new scrollback prefix length.
-        self.selection = None;
+        self.clear_text_selection();
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
                 continue;
@@ -7870,6 +10378,11 @@ impl TerminalState {
                 }
             }
         }
+        self.finished_output_provenance.retain(|zone_id, _| {
+            self.command_zones
+                .iter()
+                .any(|zone| zone.id == *zone_id && !zone.rows_evicted)
+        });
         self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
             ZoneState::Idle => ZoneState::Idle,
             ZoneState::PromptStarted(prompt_start) => {
@@ -8041,6 +10554,58 @@ impl TerminalState {
         projection: &ProjectedViewport,
         viewport_row: usize,
     ) -> Option<(usize, usize)> {
+        if projection.mode() == ProjectionMode::Transformed {
+            let selection = self.projected_selection.as_ref()?;
+            let (plan_key, plan) = self.projection_plan_cache.as_ref()?;
+            if plan.plan_revision == 0
+                || plan.plan_revision != selection.plan_revision
+                || projection.plan_revision != selection.plan_revision
+                || !self.projection_plan_key_matches_current_source(plan_key)
+                || !matches!(
+                    projection.row_kinds().get(viewport_row),
+                    Some(ProjectedRowKind::Raw)
+                )
+            {
+                return None;
+            }
+            let document_row = projection.view_document_row(viewport_row)?;
+            let (start, end) = if selection.anchor <= selection.active {
+                (selection.anchor, selection.active)
+            } else {
+                (selection.active, selection.anchor)
+            };
+            if document_row < start.0 || document_row > end.0 {
+                return None;
+            }
+            let (mut left, mut right) = if selection.mode == SelectionMode::Block {
+                (
+                    selection.anchor.1.min(selection.active.1),
+                    selection.anchor.1.max(selection.active.1),
+                )
+            } else {
+                (
+                    if document_row == start.0 { start.1 } else { 0 },
+                    if document_row == end.0 {
+                        end.1
+                    } else {
+                        usize::MAX
+                    },
+                )
+            };
+            let (real_left, real_right) =
+                Self::projected_row_real_column_bounds(projection, viewport_row)?;
+            left = left.max(real_left);
+            right = right.min(real_right);
+            if projection
+                .cells()
+                .get(viewport_row)
+                .and_then(|cells| cells.get(right))
+                .is_some_and(|cell| cell.flags.wide())
+            {
+                right = right.saturating_add(1).min(real_right);
+            }
+            return (left <= right).then_some((left, right));
+        }
         let abs_row = self.projected_row_to_absolute(projection, viewport_row);
         self.selection_cols_at_absolute_row(abs_row)
     }
@@ -8839,6 +11404,280 @@ mod tests {
     }
 
     #[test]
+    fn compressed_row_layout_is_exact_without_decompressing_cells() {
+        let mut encoded_cells = vec![TerminalCell::default(); 8];
+        encoded_cells[0].character = 'A';
+        // A styled space is retained by compression and must contribute to
+        // layout even though its glyph is visually blank.
+        encoded_cells[2].foreground = Color::Red;
+        encoded_cells[4].character = '中';
+        encoded_cells[4].flags.set_wide(true);
+        encoded_cells[5].flags.set_wide_continuation(true);
+        let encoded = ScrollbackLine::compress(&encoded_cells, true);
+
+        super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
+        let layout = encoded.layout(17);
+        assert_eq!(layout.absolute_row, 17);
+        assert_eq!(layout.raw_row, encoded.raw_row_id());
+        assert_eq!(layout.active_len, 6);
+        assert_eq!(layout.wide_continuations.as_slice(), &[5]);
+        assert!(layout.wrapped);
+        assert_eq!(
+            super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get()),
+            0,
+            "layout planning must not materialize terminal cells"
+        );
+
+        let mut plain_cells = vec![TerminalCell::default(); 8];
+        plain_cells[0].character = 'A';
+        plain_cells[1].character = 'B';
+        let plain = ScrollbackLine::compress(&plain_cells, false).layout(3);
+        assert_eq!(plain.active_len, 2);
+        assert!(plain.wide_continuations.is_empty());
+        assert!(!plain.wrapped);
+
+        let mut styled_blank = vec![TerminalCell::default(); 8];
+        styled_blank[3].foreground = Color::Red;
+        let styled_blank = ScrollbackLine::compress(&styled_blank, false).layout(4);
+        assert_eq!(
+            styled_blank.active_len, 0,
+            "P0 history reflow strips a trailing foreground-styled blank"
+        );
+
+        let mut decorated_blank = vec![TerminalCell::default(); 8];
+        decorated_blank[3].flags.set_bold(true);
+        let decorated_blank = ScrollbackLine::compress(&decorated_blank, false).layout(5);
+        assert_eq!(
+            decorated_blank.active_len, 0,
+            "P0 history reflow strips a trailing style-only blank"
+        );
+
+        let mut background_blank = vec![TerminalCell::default(); 8];
+        background_blank[3].background = Color::Blue;
+        let background_blank = ScrollbackLine::compress(&background_blank, false).layout(6);
+        assert_eq!(
+            background_blank.active_len, 4,
+            "P0 history reflow retains a trailing background-painted blank"
+        );
+    }
+
+    #[test]
+    fn identity_projection_plan_matches_eager_history_reflow_across_widths() {
+        for cols in 1..=9 {
+            let mut terminal = TerminalState::new(cols, 3);
+            let mut first = vec![TerminalCell::default(); 7];
+            first[0].character = 'A';
+            first[1].character = '中';
+            first[1].flags.set_wide(true);
+            first[2].flags.set_wide_continuation(true);
+            first[4].foreground = Color::Red;
+            let mut second = vec![TerminalCell::default(); 7];
+            second[0].character = 'B';
+            second[1].character = 'C';
+            let history = vec![
+                ScrollbackLine::compress(&first, true),
+                ScrollbackLine::compress(&second, false),
+                ScrollbackLine::compress(&[TerminalCell::default(); 7], false),
+            ];
+            for line in &history {
+                terminal.push_scrollback_compressed(line.clone());
+            }
+
+            let plan = terminal.identity_projection_plan(cols);
+            let eager = TerminalState::reflow_projected_origins(&history, cols, 0);
+            assert_eq!(
+                plan.rows.len(),
+                eager.len() + terminal.grid.rows(),
+                "width {cols}"
+            );
+            for (planned, eager) in plan.rows.iter().zip(&eager) {
+                let mut expected: Vec<_> = eager
+                    .spans
+                    .iter()
+                    .map(|span| super::RawSlice {
+                        view_col_start: span.view_col_start,
+                        source: super::RawSliceSource {
+                            absolute_row: span.raw_absolute_row,
+                            col_start: span.raw_col_start,
+                        },
+                        origin: Some(super::RawSliceOrigin {
+                            row: span.raw_row,
+                            col_start: span.raw_col_start,
+                        }),
+                        len: span.view_col_end - span.view_col_start,
+                        narrow_wide_body: false,
+                    })
+                    .collect();
+                if cols == 1 {
+                    for slice in &mut expected {
+                        let line = &history[slice.source.absolute_row];
+                        slice.narrow_wide_body = line
+                            .layout(slice.source.absolute_row)
+                            .wide_continuations
+                            .binary_search(&(slice.source.col_start + 1))
+                            .is_ok();
+                    }
+                }
+                assert_eq!(planned.raw_slices.as_slice(), expected, "width {cols}");
+                assert_eq!(planned.row_source, eager.row_source, "width {cols}");
+            }
+        }
+    }
+
+    #[test]
+    fn identity_projection_plan_trailing_blank_rules_match_eager_p0() {
+        let mut foreground = vec![TerminalCell::default(); 8];
+        foreground[3].foreground = Color::Red;
+        let mut style = vec![TerminalCell::default(); 8];
+        style[3].flags.set_bold(true);
+        let mut background = vec![TerminalCell::default(); 8];
+        background[3].background = Color::Blue;
+        let history = vec![
+            ScrollbackLine::compress(&foreground, false),
+            ScrollbackLine::compress(&style, false),
+            ScrollbackLine::compress(&background, false),
+        ];
+
+        let plan = super::ProjectionPlan::identity(
+            history
+                .iter()
+                .enumerate()
+                .map(|(row, line)| line.layout(row)),
+            std::iter::empty(),
+            2,
+        );
+        let eager = TerminalState::reflow_projected_origins(&history, 2, 0);
+        assert_eq!(plan.rows.len(), eager.len());
+        for (planned, eager) in plan.rows.iter().zip(&eager) {
+            assert_eq!(planned.raw_slices.len(), eager.spans.len());
+            for (slice, span) in planned.raw_slices.iter().zip(&eager.spans) {
+                assert_eq!(slice.view_col_start, span.view_col_start);
+                assert_eq!(slice.origin.map(|origin| origin.row), Some(span.raw_row));
+                assert_eq!(slice.source.absolute_row, span.raw_absolute_row);
+                assert_eq!(slice.source.col_start, span.raw_col_start);
+                assert_eq!(slice.len, span.view_col_end - span.view_col_start);
+            }
+        }
+        assert!(plan.rows[0].raw_slices.is_empty());
+        assert!(plan.rows[1].raw_slices.is_empty());
+        assert_eq!(plan.rows[2].raw_slices[0].len, 2);
+        assert_eq!(plan.rows[3].raw_slices[0].source.col_start, 2);
+    }
+
+    #[test]
+    fn identity_projection_plan_keeps_history_grid_boundary_and_wide_narrowing() {
+        let mut terminal = TerminalState::new(1, 2);
+        let mut wide = vec![TerminalCell::default(); 3];
+        wide[0].character = '中';
+        wide[0].flags.set_wide(true);
+        wide[1].flags.set_wide_continuation(true);
+        terminal.push_scrollback_compressed(ScrollbackLine::compress(&wide, true));
+        terminal.grid.get_mut(0, 0).character = 'G';
+        terminal.grid.row_wrapped[0] = true;
+
+        let plan = terminal.identity_projection_plan(1);
+        assert_eq!(
+            plan.rows.len(),
+            3,
+            "one history glyph row plus two grid rows"
+        );
+        assert!(plan.rows[0].raw_slices[0].narrow_wide_body);
+        assert_eq!(
+            plan.rows[1].row_source,
+            Some(super::RowSource {
+                raw_row: terminal.grid.row_ids[0],
+                raw_absolute_row: 1,
+            })
+        );
+        assert_eq!(plan.rows[1].raw_slices[0].source.col_start, 0);
+        assert!(
+            plan.rows[1].wrapped,
+            "grid wrapping is metadata, not a join"
+        );
+    }
+
+    #[test]
+    fn identity_projection_plan_untracked_sources_keep_bytes_but_origins_fail_closed() {
+        let mut terminal = TerminalState::new(6, 2);
+        terminal.grid.get_mut(0, 0).character = 'x';
+        terminal.grid.get_mut(1, 0).character = 'g';
+        terminal.grid.row_ids[1] = super::RawRowId::UNTRACKED;
+        let mut history_cells = vec![TerminalCell::default(); 6];
+        history_cells[0].character = 'h';
+        history_cells[1].foreground = Color::Red;
+        terminal.push_scrollback_compressed(ScrollbackLine::compress_with_raw_row_id(
+            &history_cells,
+            false,
+            super::RawRowId::UNTRACKED,
+        ));
+
+        let plan = terminal.identity_projection_plan(6);
+        assert_eq!(plan.rows.len(), 3);
+        assert_eq!(plan.rows[0].raw_slices.len(), 1);
+        assert_eq!(plan.rows[0].raw_slices[0].view_col_start, 0);
+        assert_eq!(plan.rows[0].raw_slices[0].source.col_start, 0);
+        assert_eq!(plan.rows[0].raw_slices[0].origin, None);
+        assert_eq!(plan.rows[0].row_source, None);
+        assert_eq!(plan.rows[1].raw_slices[0].len, 6);
+        assert_eq!(
+            plan.rows[1].row_source,
+            Some(super::RowSource {
+                raw_row: terminal.grid.row_ids[0],
+                raw_absolute_row: 1,
+            })
+        );
+        assert_eq!(plan.rows[2].raw_slices.len(), 1);
+        assert_eq!(plan.rows[2].raw_slices[0].origin, None);
+        assert_eq!(plan.rows[2].row_source, None);
+
+        let actual = terminal.materialize_identity_projection_plan(&plan);
+        let mut expected =
+            TerminalState::reflow_projected_origins(terminal.scrollback.make_contiguous(), 6, 0)
+                .into_iter()
+                .map(|line| line.cells)
+                .collect::<Vec<_>>();
+        expected.extend(terminal.grid.to_vec());
+        assert_eq!(actual, expected, "UNTRACKED affects origins, never cells");
+    }
+
+    #[test]
+    fn identity_projection_plan_is_layout_only_and_linear_for_deep_history() {
+        let mut terminal = TerminalState::new(80, 2);
+        terminal.set_max_scrollback(10_001);
+        let mut cells = vec![TerminalCell::default(); 80];
+        cells[0].character = 'x';
+        cells[0].foreground = Color::Red;
+        for _ in 0..10_000 {
+            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+        }
+        assert!(terminal
+            .scrollback
+            .iter()
+            .all(|line| matches!(line.data, super::CompressedLineData::Encoded(_))));
+
+        super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
+        super::PROJECTED_HISTORY_LAYOUT_BYTE_SCAN_COUNT.with(|count| count.set(0));
+        let plan = terminal.identity_projection_plan(80);
+        assert_eq!(
+            super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get()),
+            0,
+            "full-document planning must not materialize scrollback cells"
+        );
+        assert_eq!(
+            super::PROJECTED_HISTORY_LAYOUT_BYTE_SCAN_COUNT.with(|count| count.get()),
+            0,
+            "cached layout planning must not scan encoded cell records"
+        );
+        assert_eq!(plan.rows.len(), 10_000 + terminal.grid.rows());
+        assert!(plan.raw_slice_count <= plan.rows.len());
+        assert_eq!(
+            plan.metadata_units(),
+            plan.rows.len() + plan.raw_rows.len() + plan.raw_slice_count
+        );
+        assert!(plan.metadata_units() <= 3 * plan.rows.len());
+    }
+
+    #[test]
     fn identity_projection_matches_live_cells_and_round_trips_every_cell() {
         let mut terminal = TerminalState::new(6, 3);
         terminal.process_batch("A中Z".as_bytes());
@@ -8876,6 +11715,1085 @@ mod tests {
         let cached = terminal.get_projected_viewport(true);
         assert!(std::sync::Arc::ptr_eq(&projection, &cached));
         assert_eq!(projection.view_revision(), cached.view_revision());
+    }
+
+    #[test]
+    fn finished_output_range_keeps_same_row_prompt_suffix_outside() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(
+            "\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07中Z\x1b]133;D;0\x07".as_bytes(),
+        );
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let row_id = terminal.grid.raw_row_id(0).expect("tracked output row");
+        let before_suffix = terminal
+            .finished_output_range(zone_id)
+            .expect("exact finished output");
+        assert_eq!(
+            before_suffix.start,
+            super::RawCellBoundary {
+                row: row_id,
+                col: 5
+            }
+        );
+        assert_eq!(
+            before_suffix.end,
+            super::RawCellBoundary {
+                row: row_id,
+                col: 8
+            }
+        );
+
+        terminal.process_input("界$ next".as_bytes());
+        assert_eq!(terminal.finished_output_range(zone_id), Some(before_suffix));
+    }
+
+    #[test]
+    fn finished_output_range_rejects_cursor_back_but_accepts_pending_wrap() {
+        let mut cursor_back = TerminalState::new(8, 4);
+        cursor_back.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07abc\r\x1b]133;D;0\x07",
+        );
+        let id = cursor_back.command_zones.back().expect("finished zone").id;
+        assert_eq!(cursor_back.finished_output_range(id), None);
+
+        let mut wrapped = TerminalState::new(8, 4);
+        wrapped.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x0712345678\x1b]133;D;0\x07",
+        );
+        let id = wrapped.command_zones.back().expect("finished zone").id;
+        let range = wrapped
+            .finished_output_range(id)
+            .expect("pending-wrap range");
+        assert_eq!(range.end.col, 8);
+    }
+
+    #[test]
+    fn finished_output_range_includes_trailing_blank_rows_before_marker() {
+        let mut terminal = TerminalState::new(12, 5);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\r\n\r\n\x1b]133;D;0\x07",
+        );
+        let zone = terminal.command_zones.back().expect("finished zone");
+        assert_eq!(zone.output_start, Some(1));
+        assert_eq!(zone.output_end, Some(3));
+        let range = terminal
+            .finished_output_range(zone.id)
+            .expect("blank rows retain exact provenance");
+        assert_eq!(
+            range.end.row,
+            terminal.grid.raw_row_id(2).expect("last blank output row")
+        );
+        assert_eq!(range.end.col, 12);
+        assert_eq!(
+            terminal.finished_output_provenance[&zone.id].row_ids.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn finished_output_range_expands_wide_boundaries_and_rejects_replacement() {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.grid[0][2].character = '中';
+        terminal.grid[0][2].flags.set_wide(true);
+        terminal.grid[0][3].flags.set_wide_continuation(true);
+        let provenance = terminal
+            .bind_finished_output_provenance(0, 3, 0, 3)
+            .expect("wide boundaries become nonempty");
+        assert_eq!(provenance.range.start.col, 2);
+        assert_eq!(provenance.range.end.col, 4);
+        let lead_end = terminal
+            .bind_finished_output_provenance(0, 0, 0, 2)
+            .expect("wide lead is an exact boundary before the glyph");
+        assert_eq!(lead_end.range.end.col, 2);
+
+        terminal.process_input(
+            b"\r\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\x1b]133;D;0\x07",
+        );
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let range = terminal
+            .finished_output_range(zone_id)
+            .expect("bound provenance");
+        let row = terminal
+            .grid
+            .row_ids
+            .iter()
+            .position(|row| *row == range.start.row)
+            .expect("range row retained");
+        terminal.grid.row_ids[row] = super::RawRowId::fresh();
+        assert_eq!(terminal.finished_output_range(zone_id), None);
+    }
+
+    #[test]
+    fn collapse_plan_splices_same_row_prefix_summary_and_suffix_without_mutating_raw() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(
+            "\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07中Z\x1b]133;D;0\x07界$ next".as_bytes(),
+        );
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let raw_before = terminal.grid.to_vec();
+        let identity = terminal.identity_projection_plan(20);
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let collapsed = terminal.collapsed_projection_plan(20, &policy);
+
+        assert_eq!(
+            terminal.grid.to_vec(),
+            raw_before,
+            "projection is read-only"
+        );
+        assert_eq!(
+            collapsed.effective_collapsed,
+            std::collections::BTreeSet::from([zone_id])
+        );
+        assert_eq!(collapsed.rows.len(), identity.rows.len() + 2);
+        assert_eq!(collapsed.rows[0].raw_slices[0].source.col_start, 0);
+        assert_eq!(collapsed.rows[0].raw_slices[0].len, 5);
+        assert!(matches!(
+            collapsed.rows[1].kind,
+            super::ProjectedRowKind::CollapsedSummary {
+                key: super::SyntheticRowKey { zone_id: id, .. },
+                hidden_display_rows: 1,
+                ..
+            } if id == zone_id
+        ));
+        assert!(collapsed.rows[1].raw_slices.is_empty());
+        assert_eq!(collapsed.rows[2].raw_slices[0].view_col_start, 8);
+        assert_eq!(collapsed.rows[2].raw_slices[0].source.col_start, 8);
+        assert_eq!(
+            collapsed.rows[2].raw_slices[0].len, 12,
+            "the post-output prompt suffix keeps its original columns"
+        );
+        let materialized = terminal.materialize_identity_projection_plan(&collapsed);
+        assert_eq!(materialized[0][0].character, '$');
+        assert!(materialized[1]
+            .iter()
+            .all(|cell| *cell == TerminalCell::default()));
+        assert_eq!(materialized[2][8].character, '界');
+        assert_eq!(materialized[2][10].character, '$');
+    }
+
+    #[test]
+    fn collapse_plan_hides_multiple_rows_and_counts_blank_output_row() {
+        let mut terminal = TerminalState::new(12, 5);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\r\n\r\n\x1b]133;D;0\x07tail",
+        );
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let collapsed = terminal.collapsed_projection_plan(12, &policy);
+        let summary = collapsed
+            .rows
+            .iter()
+            .find_map(|row| match row.kind {
+                super::ProjectedRowKind::CollapsedSummary {
+                    hidden_display_rows,
+                    ..
+                } => Some(hidden_display_rows),
+                super::ProjectedRowKind::Raw | super::ProjectedRowKind::Padding => None,
+            })
+            .expect("one summary row");
+        assert_eq!(summary, 2, "visible output plus its blank line are hidden");
+        assert_eq!(
+            collapsed
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, super::ProjectedRowKind::CollapsedSummary { .. }))
+                .count(),
+            1
+        );
+        let visible = terminal.materialize_identity_projection_plan(&collapsed);
+        assert!(visible.iter().flatten().any(|cell| cell.character == 't'));
+        assert!(!visible.iter().flatten().any(|cell| cell.character == 'o'));
+    }
+
+    #[test]
+    fn collapse_plan_keeps_two_disjoint_ranges_on_one_raw_row() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.process_input(b"abcdefghijkl");
+        let raw_row = terminal.grid.raw_row_id(0).expect("tracked grid row");
+        let base = terminal.identity_projection_plan(12);
+        let collapses = [
+            super::ResolvedCollapse {
+                range: super::FinishedOutputRange {
+                    zone_id: 41,
+                    start: super::RawCellBoundary {
+                        row: raw_row,
+                        col: 2,
+                    },
+                    end: super::RawCellBoundary {
+                        row: raw_row,
+                        col: 4,
+                    },
+                },
+                start_absolute: 0,
+                end_absolute: 0,
+            },
+            super::ResolvedCollapse {
+                range: super::FinishedOutputRange {
+                    zone_id: 42,
+                    start: super::RawCellBoundary {
+                        row: raw_row,
+                        col: 6,
+                    },
+                    end: super::RawCellBoundary {
+                        row: raw_row,
+                        col: 8,
+                    },
+                },
+                start_absolute: 0,
+                end_absolute: 0,
+            },
+        ];
+        let collapsed = base.splice_collapses(&collapses, 9);
+        assert_eq!(
+            collapsed.effective_collapsed,
+            std::collections::BTreeSet::from([41, 42])
+        );
+        assert_eq!(
+            collapsed
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, super::ProjectedRowKind::CollapsedSummary { .. }))
+                .count(),
+            2
+        );
+        let visible = terminal.materialize_identity_projection_plan(&collapsed);
+        let text: String = visible
+            .iter()
+            .flat_map(|row| row.iter().map(|cell| cell.character))
+            .collect();
+        assert!(text.contains("ab"));
+        assert!(text.contains("ef"));
+        assert!(text.contains("ijkl"));
+        assert!(!text.contains('c'));
+        assert!(!text.contains('g'));
+    }
+
+    #[test]
+    fn collapse_policy_prunes_stale_and_overlapping_ranges_as_a_component() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07output\x1b]133;D;0\x07",
+        );
+        let first = terminal
+            .command_zones
+            .back()
+            .expect("finished zone")
+            .clone();
+        let first_provenance = terminal.finished_output_provenance[&first.id].clone();
+        let second_id = first.id + 10_000;
+        let mut second = first.clone();
+        second.id = second_id;
+        let mut second_provenance = first_provenance;
+        second_provenance.range.zone_id = second_id;
+        terminal.command_zones.push_back(second);
+        terminal
+            .finished_output_provenance
+            .insert(second_id, second_provenance);
+
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(first.id));
+        assert!(policy.collapse(second_id));
+        assert!(policy.collapse(u64::MAX));
+        assert!(terminal.resolved_collapses(&policy).is_empty());
+        let plan = terminal.collapsed_projection_plan(20, &policy);
+        assert!(plan.effective_collapsed.is_empty());
+        assert!(plan
+            .rows
+            .iter()
+            .all(|row| matches!(row.kind, super::ProjectedRowKind::Raw)));
+    }
+
+    #[test]
+    fn collapse_plan_is_layout_only_and_metadata_linear_for_deep_history() {
+        let mut terminal = TerminalState::new(80, 2);
+        terminal.set_max_scrollback(10_001);
+        let mut cells = vec![TerminalCell::default(); 80];
+        cells[0].character = 'x';
+        cells[0].foreground = Color::Red;
+        for _ in 0..10_000 {
+            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+        }
+        let identity = terminal.identity_projection_plan(80);
+        let collapses: Vec<_> = (0..128)
+            .map(|index| {
+                let absolute = index * 64;
+                let row = terminal.scrollback[absolute].raw_row_id();
+                super::ResolvedCollapse {
+                    range: super::FinishedOutputRange {
+                        zone_id: index as u64,
+                        start: super::RawCellBoundary { row, col: 0 },
+                        end: super::RawCellBoundary { row, col: 1 },
+                    },
+                    start_absolute: absolute,
+                    end_absolute: absolute,
+                }
+            })
+            .collect();
+        super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
+        let base_units = identity.metadata_units();
+        let collapsed = identity.splice_collapses(&collapses, 2);
+        assert_eq!(
+            super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get()),
+            0
+        );
+        assert_eq!(collapsed.effective_collapsed.len(), collapses.len());
+        assert!(collapsed.metadata_units() <= base_units + 4 * collapses.len());
+        assert!(collapsed.rows.len() <= 10_002 + 2 * collapses.len());
+    }
+
+    #[test]
+    fn projected_viewport_identity_and_stale_policies_share_the_p0_arc() {
+        let mut terminal = TerminalState::new(12, 4);
+        terminal.process_input(b"plain");
+        let identity = super::ProjectionPolicy::new();
+        let base = terminal.get_projected_viewport(true);
+        let same = terminal.get_projected_viewport_with_policy(true, &identity, 0);
+        assert!(std::sync::Arc::ptr_eq(&base, &same));
+        assert!(std::sync::Arc::ptr_eq(&base.cells, &same.cells));
+
+        let mut stale = super::ProjectionPolicy::new();
+        assert!(stale.collapse(u64::MAX));
+        let stale_view = terminal.get_projected_viewport_with_policy(true, &stale, 0);
+        assert!(std::sync::Arc::ptr_eq(&base, &stale_view));
+
+        let bypass = terminal.get_projected_viewport(false);
+        let bypass_policy = terminal.get_projected_viewport_with_policy(false, &stale, 99);
+        assert!(std::sync::Arc::ptr_eq(&bypass, &bypass_policy));
+        assert_eq!(bypass_policy.mode(), super::ProjectionMode::Bypass);
+    }
+
+    #[test]
+    fn deep_stale_collapse_policy_does_not_build_a_projection_plan() {
+        let mut terminal = TerminalState::new(80, 4);
+        terminal.set_max_scrollback(10_001);
+        let mut cells = vec![TerminalCell::default(); 80];
+        cells[0].character = 'x';
+        for _ in 0..10_000 {
+            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+        }
+        let base = terminal.get_projected_viewport(true);
+        let mut stale = super::ProjectionPolicy::new();
+        assert!(stale.collapse(u64::MAX));
+        super::PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+
+        let projected = terminal.get_projected_viewport_with_policy(true, &stale, 0);
+
+        assert!(std::sync::Arc::ptr_eq(&base, &projected));
+        assert_eq!(
+            super::PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get()),
+            0
+        );
+    }
+
+    #[test]
+    fn collapse_with_no_projected_cell_intersection_shares_the_identity_arc() {
+        let mut terminal = TerminalState::new(20, 2);
+        terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07   \x1b]133;D;0\x07");
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let range = terminal
+            .finished_output_range(zone_id)
+            .expect("spaces still have exact raw provenance");
+        assert!(range.start.col < range.end.col);
+        terminal.process_input(b"\r\n\r\n\r\n");
+        assert!(terminal.scrollback.iter().any(|line| {
+            line.raw_row_id() == range.start.row
+                && usize::from(line.projected_active_len) == range.start.col
+        }));
+
+        let identity = terminal.get_projected_viewport(true);
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let projected = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+
+        assert!(std::sync::Arc::ptr_eq(&identity, &projected));
+        assert_eq!(projected.mode(), super::ProjectionMode::Identity);
+        assert!(projected.effective_collapsed().is_empty());
+    }
+
+    #[test]
+    fn transformed_viewport_materializes_summary_origins_and_same_row_suffix() {
+        let mut terminal = TerminalState::new(20, 6);
+        terminal.process_input(
+            "\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07中Z\x1b]133;D;0\x07界$ next".as_bytes(),
+        );
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let range = terminal
+            .finished_output_range(zone_id)
+            .expect("exact output range");
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        terminal.current_bg = Color::Red;
+        let viewport = terminal.get_projected_viewport_with_policy(true, &policy, 2);
+
+        assert_eq!(viewport.mode(), super::ProjectionMode::Transformed);
+        assert!(!viewport.is_identity());
+        assert_eq!(viewport.policy_revision(), policy.revision());
+        assert_eq!(
+            viewport.effective_collapsed(),
+            &std::collections::BTreeSet::from([zone_id])
+        );
+        assert_eq!(viewport.document_rows(), 8);
+        assert_eq!(viewport.document_start(), 0);
+        assert_eq!(viewport.max_scroll_offset(), 2);
+        let summary_row = viewport
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, super::ProjectedRowKind::CollapsedSummary { .. }))
+            .expect("summary row visible");
+        assert!(viewport.cells()[summary_row]
+            .iter()
+            .all(|cell| *cell == TerminalCell::default()));
+        assert_eq!(
+            viewport.view_to_raw(super::ViewportCell {
+                row: summary_row,
+                col: 0,
+            }),
+            None
+        );
+        assert_eq!(
+            viewport.raw_to_view(super::RawCellOrigin {
+                row: range.start.row,
+                col: range.start.col,
+            }),
+            None,
+            "hidden output has no projected origin"
+        );
+        let suffix = viewport
+            .raw_to_view(super::RawCellOrigin {
+                row: range.end.row,
+                col: range.end.col,
+            })
+            .expect("same-row suffix remains mapped");
+        assert_eq!(
+            viewport.raw_range_to_view(
+                super::RawCellOrigin {
+                    row: range.end.row,
+                    col: range.end.col,
+                },
+                2,
+            ),
+            Some(suffix),
+            "one affine suffix span maps in one logarithmic query"
+        );
+        assert_eq!(
+            viewport.raw_range_to_view(
+                super::RawCellOrigin {
+                    row: range.start.row,
+                    col: range.start.col.saturating_sub(1),
+                },
+                range
+                    .end
+                    .col
+                    .saturating_sub(range.start.col)
+                    .saturating_add(2),
+            ),
+            None,
+            "a raw range must not bridge the collapsed output hole"
+        );
+        assert_eq!(
+            viewport.raw_range_to_view(
+                super::RawCellOrigin {
+                    row: range.end.row,
+                    col: range.end.col,
+                },
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            viewport.raw_range_to_view(
+                super::RawCellOrigin {
+                    row: range.end.row,
+                    col: usize::MAX,
+                },
+                1,
+            ),
+            None,
+            "overflowing half-open ranges fail closed"
+        );
+        assert_eq!(suffix.col, range.end.col);
+        assert_eq!(viewport.cells()[suffix.row][suffix.col].character, '界');
+        assert_eq!(viewport.view_document_row(summary_row), Some(1));
+
+        terminal.select_line_in_projection(&viewport, suffix.row);
+        let selected_suffix = terminal
+            .copy_selection()
+            .expect("suffix-only line selection");
+        assert!(selected_suffix.contains("界$ next"));
+        assert!(!selected_suffix.contains('中'));
+    }
+
+    #[test]
+    fn transformed_viewport_late_materializer_decodes_only_visible_unique_history() {
+        let mut terminal = TerminalState::new(80, 2);
+        terminal.set_max_scrollback(10_001);
+        let mut cells = vec![TerminalCell::default(); 80];
+        cells[0].character = 'x';
+        cells[0].foreground = Color::Red;
+        for _ in 0..10_000 {
+            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+        }
+        let identity = terminal.identity_projection_plan(80);
+        let absolute = 5_000;
+        let row = terminal.scrollback[absolute].raw_row_id();
+        let collapse = super::ResolvedCollapse {
+            range: super::FinishedOutputRange {
+                zone_id: 77,
+                start: super::RawCellBoundary { row, col: 0 },
+                end: super::RawCellBoundary { row, col: 1 },
+            },
+            start_absolute: absolute,
+            end_absolute: absolute,
+        };
+        let plan = identity.splice_collapses(&[collapse], 2);
+        let summary_row = plan
+            .rows
+            .iter()
+            .position(|row| matches!(row.kind, super::ProjectedRowKind::CollapsedSummary { .. }))
+            .expect("summary in full plan");
+        let max_start = plan.rows.len().saturating_sub(terminal.grid.rows());
+        let offset = max_start.saturating_sub(summary_row.min(max_start));
+
+        super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
+        let materialized =
+            terminal.materialize_projection_plan(&plan, offset, terminal.grid.rows(), 80);
+        assert_eq!(materialized.document_start, summary_row);
+        assert!(matches!(
+            materialized.row_kinds[0],
+            super::ProjectedRowKind::CollapsedSummary { .. }
+        ));
+        assert!(materialized
+            .provenance
+            .origin_spans
+            .iter()
+            .all(|span| span.raw_row != row));
+        assert_eq!(
+            super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get()),
+            1,
+            "summary source stays cold and the one visible raw row decodes once"
+        );
+    }
+
+    #[test]
+    fn projected_structural_padding_ignores_the_live_sgr_background() {
+        let mut terminal = TerminalState::new(6, 2);
+        terminal.current_bg = Color::Red;
+        let plan = terminal.identity_projection_plan(6);
+        let materialized = terminal.materialize_projection_plan(&plan, 0, 4, 6);
+
+        assert_eq!(materialized.top_padding, 2);
+        for row in &materialized.cells[..materialized.top_padding] {
+            assert!(row.iter().all(|cell| *cell == TerminalCell::default()));
+        }
+        assert!(materialized.row_kinds[..materialized.top_padding]
+            .iter()
+            .all(|kind| *kind == super::ProjectedRowKind::Padding));
+    }
+
+    #[test]
+    fn transformed_plan_cache_survives_view_scroll_and_ordinary_cell_updates() {
+        let mut terminal = TerminalState::new(20, 6);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07output\x1b]133;D;0\x07",
+        );
+        let zone_id = terminal.command_zones.back().expect("finished zone").id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        super::PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+
+        let first = terminal.get_projected_viewport_with_policy(true, &policy, 2);
+        let cached = terminal.get_projected_viewport_with_policy(true, &policy, 2);
+        assert!(std::sync::Arc::ptr_eq(&first, &cached));
+        let _scrolled = terminal.get_projected_viewport_with_policy(true, &policy, 1);
+        terminal.process_batch(b"!");
+        let updated = terminal.get_projected_viewport_with_policy(true, &policy, 1);
+        assert!(!std::sync::Arc::ptr_eq(&_scrolled, &updated));
+        assert!(updated
+            .cells()
+            .iter()
+            .flatten()
+            .any(|cell| cell.character == '!'));
+        assert_eq!(
+            super::PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get()),
+            1,
+            "scroll and cell content updates reuse the full-document plan"
+        );
+    }
+
+    #[test]
+    fn projection_view_state_preserves_bottom_and_raw_or_summary_top_anchor() {
+        let mut terminal = TerminalState::new(12, 4);
+        for index in 0..8 {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07c{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let zone_id = terminal.command_zones[3].id;
+        let range = terminal
+            .finished_output_range(zone_id)
+            .expect("exact middle output");
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+
+        let mut bottom = super::ProjectionViewState::new();
+        let bottom_view = terminal.get_projected_viewport_with_state(true, &policy, &mut bottom);
+        assert_eq!(bottom.offset_from_bottom(), 0);
+        assert_eq!(bottom_view.scroll_offset(), 0);
+        terminal.process_input(b"tail");
+        let appended = terminal.get_projected_viewport_with_state(true, &policy, &mut bottom);
+        assert_eq!(appended.scroll_offset(), 0, "bottom continues following");
+
+        let summary_document_row = terminal
+            .cached_collapsed_projection_plan(12, &policy)
+            .expect("effective collapse plan")
+            .summary_row(zone_id)
+            .expect("summary in document");
+        let max_start = appended
+            .document_rows()
+            .saturating_sub(terminal.grid.rows());
+        let summary_offset = max_start.saturating_sub(summary_document_row.min(max_start));
+        bottom.set_offset(summary_offset, &appended);
+        let summary_top = terminal.get_projected_viewport_with_state(true, &policy, &mut bottom);
+        assert!(matches!(
+            summary_top.row_kinds()[summary_top.top_padding],
+            super::ProjectedRowKind::CollapsedSummary { .. }
+        ));
+
+        assert!(policy.expand(zone_id));
+        let expanded = terminal.get_projected_viewport_with_state(true, &policy, &mut bottom);
+        let output_start = expanded
+            .raw_to_view(super::RawCellOrigin {
+                row: range.start.row,
+                col: range.start.col,
+            })
+            .expect("summary anchor expands to output start");
+        assert_eq!(output_start.row, expanded.top_padding);
+        assert_ne!(expanded.mode(), super::ProjectionMode::Transformed);
+    }
+
+    #[test]
+    fn expanding_blank_output_start_preserves_summary_top_with_other_collapse() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07\r\nout-one\r\n\x1b]133;D;0\x07",
+        );
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07out-two\r\n\x1b]133;D;0\x07",
+        );
+        let first_id = terminal.command_zones[0].id;
+        let second_id = terminal.command_zones[1].id;
+        let first_range = terminal
+            .finished_output_range(first_id)
+            .expect("first output provenance");
+        let identity = terminal.identity_projection_plan(12);
+        let start_placement = identity
+            .raw_rows
+            .iter()
+            .find(|placement| placement.raw_row == first_range.start.row)
+            .expect("blank output-start row retained");
+        assert!(
+            identity.rows[start_placement.first_view_row.expect("blank row mapped")]
+                .raw_slices
+                .is_empty()
+        );
+
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(first_id));
+        assert!(policy.collapse(second_id));
+        let mut state = super::ProjectionViewState::new();
+        let initial = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let summary_document_row = terminal
+            .cached_collapsed_projection_plan(12, &policy)
+            .expect("effective collapse plan")
+            .summary_row(first_id)
+            .expect("first summary");
+        let max_start = initial.document_rows().saturating_sub(terminal.grid.rows());
+        state.set_offset(
+            max_start.saturating_sub(summary_document_row.min(max_start)),
+            &initial,
+        );
+        let summary_top = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(matches!(
+            summary_top.row_kinds()[summary_top.top_padding],
+            super::ProjectedRowKind::CollapsedSummary { key, .. } if key.zone_id == first_id
+        ));
+
+        assert!(policy.expand(first_id));
+        let expanded = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(expanded.mode(), super::ProjectionMode::Transformed);
+        assert_eq!(
+            expanded
+                .raw_row_view_bounds(first_range.start.row)
+                .map(|bounds| bounds.0),
+            Some(expanded.top_padding),
+            "a summary anchored to an empty raw row expands back to that row"
+        );
+    }
+
+    #[test]
+    fn projection_view_state_scroll_is_projection_owned_and_bypass_parks_it() {
+        let mut terminal = TerminalState::new(12, 4);
+        for index in 0..6 {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07c{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let zone_id = terminal.command_zones[2].id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let raw_offset = terminal.scroll_offset;
+        let mut state = super::ProjectionViewState::new();
+        let view = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        state.scroll(3, &view);
+        let scrolled = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(
+            scrolled.scroll_offset(),
+            3.min(scrolled.max_scroll_offset())
+        );
+        assert_eq!(
+            terminal.scroll_offset, raw_offset,
+            "raw PTY scroll is untouched"
+        );
+
+        let parked_offset = state.offset_from_bottom();
+        let bypass = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+        assert_eq!(bypass.mode(), super::ProjectionMode::Bypass);
+        assert_eq!(state.offset_from_bottom(), parked_offset);
+    }
+
+    #[test]
+    fn projected_selection_copy_skips_hidden_output_and_summary_rows() {
+        let mut terminal = TerminalState::new(24, 12);
+        for (command, output) in [("one", "LEFT"), ("two", "SECRET"), ("three", "RIGHT")] {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let hidden_id = terminal.command_zones[1].id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let viewport = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let locate = |needle: char| {
+            viewport
+                .cells()
+                .iter()
+                .enumerate()
+                .find_map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .position(|cell| cell.character == needle)
+                        .map(|col| (row, col))
+                })
+                .expect("visible endpoint")
+        };
+        let locate_last = |needle: char| {
+            viewport
+                .cells()
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .rposition(|cell| cell.character == needle)
+                        .map(|col| (row, col))
+                })
+                .expect("visible endpoint")
+        };
+        let start = locate('L');
+        let end = locate_last('T');
+
+        terminal.start_selection_in_projection(&viewport, start, super::SelectionMode::Normal);
+        terminal.update_selection_in_projection(&viewport, end);
+        let copied = terminal.copy_selection().expect("projected selection");
+
+        assert!(copied.contains("LEFT"));
+        assert!(copied.contains("RIGHT"));
+        assert!(!copied.contains("SECRET"));
+        assert!(copied.contains('\n'));
+        assert_eq!(copied.lines().count(), 4);
+        assert!(copied.lines().all(|line| !line.trim().is_empty()));
+        assert!(terminal.has_text_selection());
+
+        terminal.on_resize(24, 10);
+        assert_eq!(
+            terminal.copy_selection(),
+            None,
+            "a structural source change invalidates the old projected selection"
+        );
+
+        assert!(policy.expand(hidden_id));
+        let _identity = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(!terminal.has_text_selection());
+        assert_eq!(terminal.copy_selection(), None);
+    }
+
+    #[test]
+    fn projection_returns_keep_selection_coordinate_spaces_mutually_exclusive() {
+        let mut terminal = TerminalState::new(24, 12);
+        for (command, output) in [("one", "SECRET"), ("two", "VISIBLE")] {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let hidden_id = terminal.command_zones[0].id;
+        let second_id = terminal.command_zones[1].id;
+        let hidden_range = terminal
+            .finished_output_range(hidden_id)
+            .expect("hidden output range");
+        let hidden_absolute = terminal.command_zones[0]
+            .output_start
+            .expect("hidden absolute row");
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let transformed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let (visible_row, visible_col) = transformed
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .position(|cell| cell.character == 'V')
+                    .map(|col| (row, col))
+            })
+            .expect("visible projected word");
+        terminal.select_word_in_projection(&transformed, visible_row, visible_col);
+        assert_eq!(terminal.copy_selection().as_deref(), Some("VISIBLE"));
+
+        let same_plan =
+            terminal.get_projected_viewport_with_policy(true, &policy, transformed.scroll_offset());
+        assert_eq!(same_plan.plan_revision, transformed.plan_revision);
+        assert_eq!(terminal.copy_selection().as_deref(), Some("VISIBLE"));
+
+        let bypass = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+        assert_eq!(bypass.mode(), super::ProjectionMode::Bypass);
+        assert!(terminal.projected_selection.is_none());
+        terminal.select_text(
+            (hidden_absolute, hidden_range.start.col),
+            (hidden_absolute, hidden_range.end.col.saturating_sub(1)),
+        );
+        assert!(terminal
+            .copy_selection()
+            .is_some_and(|text| text.contains("SECRET")));
+        let _bypass_again = terminal.get_projected_viewport(false);
+        assert!(
+            terminal.selection.is_some(),
+            "bypass preserves raw selection"
+        );
+        assert!(terminal.projected_selection.is_none());
+
+        let transformed_again =
+            terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(transformed_again.plan_revision, transformed.plan_revision);
+        assert!(
+            terminal.selection.is_none(),
+            "transformed clears raw selection"
+        );
+        assert!(terminal.projected_selection.is_none());
+        assert_eq!(terminal.copy_selection(), None);
+
+        let (visible_row, visible_col) = transformed_again
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .position(|cell| cell.character == 'V')
+                    .map(|col| (row, col))
+            })
+            .expect("visible projected word after return");
+        terminal.select_word_in_projection(&transformed_again, visible_row, visible_col);
+        assert!(terminal.projected_selection.is_some());
+        assert!(policy.collapse(second_id));
+        let changed = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        assert_eq!(changed.mode(), super::ProjectionMode::Transformed);
+        assert!(
+            terminal.projected_selection.is_none(),
+            "new plan clears projected selection"
+        );
+        assert!(terminal.selection.is_none());
+    }
+
+    #[test]
+    fn projected_empty_raw_row_selects_but_padding_and_summary_do_not() {
+        let mut terminal = TerminalState::new(12, 6);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07",
+        );
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07hide\r\n\x1b]133;D;0\x07",
+        );
+        let first_range = terminal
+            .finished_output_range(terminal.command_zones[0].id)
+            .expect("blank output start");
+        let hidden_id = terminal.command_zones[1].id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let viewport = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let blank_row = viewport
+            .raw_row_view_bounds(first_range.start.row)
+            .expect("empty raw row provenance")
+            .0;
+        terminal.start_selection_in_projection(
+            &viewport,
+            (blank_row, 0),
+            super::SelectionMode::Normal,
+        );
+        terminal.update_selection_in_projection(&viewport, (blank_row, 5));
+        assert!(terminal.has_text_selection());
+        assert_eq!(terminal.copy_selection().as_deref(), Some("      "));
+
+        let summary = viewport
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, super::ProjectedRowKind::CollapsedSummary { .. }))
+            .expect("summary visible");
+        terminal.start_selection_in_projection(
+            &viewport,
+            (summary, 0),
+            super::SelectionMode::Normal,
+        );
+        assert!(!terminal.has_text_selection());
+    }
+
+    #[test]
+    fn projected_wide_selection_highlights_body_and_continuation() {
+        let mut terminal = TerminalState::new(12, 6);
+        terminal.process_input(
+            "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07中\r\n\x1b]133;D;0\x07".as_bytes(),
+        );
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07hide\r\n\x1b]133;D;0\x07",
+        );
+        let hidden_id = terminal.command_zones[1].id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let viewport = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let (row, body) = viewport
+            .cells()
+            .iter()
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .position(|cell| cell.character == '中')
+                    .map(|col| (row, col))
+            })
+            .expect("wide glyph visible");
+        assert!(viewport.cells()[row][body + 1].flags.wide_continuation());
+
+        terminal.start_selection_in_projection(
+            &viewport,
+            (row, body + 1),
+            super::SelectionMode::Normal,
+        );
+
+        assert_eq!(terminal.copy_selection().as_deref(), Some("中"));
+        assert_eq!(
+            terminal.row_selection_cols_in_projection(&viewport, row),
+            Some((body, body + 1))
+        );
+    }
+
+    #[test]
+    fn reveal_collapsed_summary_moves_projected_state_without_expanding_policy() {
+        let mut terminal = TerminalState::new(20, 4);
+        for index in 0..7 {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07c{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let zone_id = terminal.command_zones[2].id;
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let revision = policy.revision();
+        let mut state = super::ProjectionViewState::new();
+
+        assert!(terminal.reveal_collapsed_summary(&policy, &mut state, zone_id));
+        assert!(policy.is_collapsed(zone_id));
+        assert_eq!(policy.revision(), revision, "reveal never expands policy");
+        assert!(!state.follow_bottom);
+        assert!(state.last_plan_key.is_some());
+        assert!(matches!(
+            state.top_anchor,
+            Some(super::ProjectedTopAnchor::Summary { zone_id: id, .. }) if id == zone_id
+        ));
+
+        let revealed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(revealed.row_kinds().iter().any(|kind| matches!(
+            kind,
+            super::ProjectedRowKind::CollapsedSummary { key, .. } if key.zone_id == zone_id
+        )));
+        assert!(policy.is_collapsed(zone_id));
+
+        let parked = state.offset_from_bottom();
+        assert!(!terminal.reveal_collapsed_summary(&policy, &mut state, u64::MAX));
+        assert_eq!(state.offset_from_bottom(), parked);
+    }
+
+    #[test]
+    fn hidden_raw_match_requires_explicit_expand_before_reveal() {
+        let mut terminal = TerminalState::new(20, 3);
+        for (command, output) in [("one", "hidden-one"), ("two", "hidden-two")] {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let first_id = terminal.command_zones[0].id;
+        let second_id = terminal.command_zones[1].id;
+        let first_range = terminal
+            .finished_output_range(first_id)
+            .expect("first exact output");
+        let origin = super::RawCellOrigin {
+            row: first_range.start.row,
+            col: first_range.start.col,
+        };
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(first_id));
+        assert!(policy.collapse(second_id));
+        let mut state = super::ProjectionViewState::new();
+        let collapsed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(
+            terminal.locate_raw_cell_in_projection(&collapsed, origin),
+            super::ProjectedRawCellLocation::Hidden { zone_id: first_id }
+        );
+        assert!(!terminal.reveal_raw_cell_in_projection(&policy, &mut state, origin));
+
+        assert!(policy.expand(first_id));
+        assert!(terminal.reveal_raw_cell_in_projection(&policy, &mut state, origin));
+        let revealed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(matches!(
+            terminal.locate_raw_cell_in_projection(&revealed, origin),
+            super::ProjectedRawCellLocation::Visible(_)
+        ));
+        assert!(revealed.effective_collapsed().contains(&second_id));
     }
 
     #[test]
@@ -11299,6 +15217,11 @@ mod tests {
             terminal.zone_output_text(zone.id).as_deref(),
             Some("notice")
         );
+        let range = terminal
+            .finished_output_range(zone.id)
+            .expect("background keeps exact live provenance");
+        assert_eq!(range.start.col, 2);
+        assert_eq!(range.end.col, 8);
         assert!(terminal.take_completed_commands().is_empty());
     }
 
@@ -11317,6 +15240,34 @@ mod tests {
             terminal.zone_output_text(zone.id).as_deref(),
             Some("  indented\n")
         );
+    }
+
+    #[test]
+    fn background_provenance_stops_at_last_recorded_cell_before_later_a() {
+        let mut terminal = TerminalState::new(20, 6);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07notice\r\n");
+        terminal.process_input(b"\r\n\x1b]133;A\x07");
+        let zone = terminal.command_zones.back().expect("background block");
+        let range = terminal
+            .finished_output_range(zone.id)
+            .expect("exact background range");
+        assert_eq!(range.start.col, 2);
+        assert_eq!(range.end.col, 8);
+        assert_eq!(range.start.row, range.end.row);
+
+        let mut tainted = TerminalState::new(20, 6);
+        tainted.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07notice");
+        tainted.note_user_input(b"typed");
+        tainted.process_input(b"typed\r\n\x1b]133;A\x07");
+        let zone = tainted
+            .command_zones
+            .back()
+            .expect("frozen background block");
+        let range = tainted
+            .finished_output_range(zone.id)
+            .expect("later echo cannot extend background provenance");
+        assert_eq!(range.start.col, 2);
+        assert_eq!(range.end.col, 8);
     }
 
     #[test]
@@ -11442,6 +15393,8 @@ mod tests {
         let (output, truncated) = terminal.zone_output_text_capped(zone.id).unwrap();
         assert!(!truncated, "raw capture is independent from scrollback");
         assert!(zone.rows_evicted);
+        assert_eq!(terminal.finished_output_range(zone.id), None);
+        assert!(!terminal.finished_output_provenance.contains_key(&zone.id));
         assert!(output.contains("line-00"), "retained head: {output:?}");
         assert!(output.contains("line-11"), "retained tail: {output:?}");
         assert!(output.len() <= TerminalState::ZONE_OUTPUT_CAP_BYTES);

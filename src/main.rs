@@ -41,8 +41,12 @@ use iced::widget::{
 };
 use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
 use pty::{Pty, ReaderPoll};
-use terminal::{ProjectedViewport, ProjectionKey, TerminalState};
-use terminal_view::{BlockMouseAction, KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
+use terminal::{
+    ProjectedViewport, ProjectionKey, ProjectionPolicy, ProjectionViewState, TerminalState,
+};
+use terminal_view::{
+    BlockMouseAction, KittyRender, Metrics, MouseButton, MouseInput, SummaryActivation, TermWidget,
+};
 use theme::Theme;
 
 /// Must stay equal to the installed entry's basename
@@ -151,6 +155,21 @@ fn app_mouse_uses_full_grid(block_mode: bool, alt_screen: bool, usable_partition
     !block_mode || alt_screen || !usable_partitions
 }
 
+fn prompt_jump_target(
+    rows: impl Iterator<Item = usize>,
+    viewport_top: usize,
+    older: bool,
+) -> Option<usize> {
+    rows.filter(|row| {
+        if older {
+            *row < viewport_top
+        } else {
+            *row > viewport_top
+        }
+    })
+    .reduce(|best, row| if older { best.max(row) } else { best.min(row) })
+}
+
 /// Resolve the finalized card currently covering one viewport row. This is
 /// kept independent of `Frost` so stale-render tests can drive a real PTY
 /// lifecycle and change only the viewport between render and dispatch.
@@ -160,11 +179,20 @@ fn finalized_block_at_viewport_row(
     projection: &ProjectedViewport,
     row: usize,
 ) -> Option<u64> {
-    if !block_mode_enabled
-        || terminal.is_alt_buffer_active()
-        || projection.mode() != terminal::ProjectionMode::Identity
-    {
+    if !block_mode_enabled || terminal.is_alt_buffer_active() {
         return None;
+    }
+    match projection.row_kinds().get(row)? {
+        terminal::ProjectedRowKind::CollapsedSummary { key, .. } => {
+            return (key.policy_revision == projection.policy_revision()
+                && projection.effective_collapsed().contains(&key.zone_id)
+                && terminal
+                    .zone_by_id(key.zone_id)
+                    .is_some_and(|zone| !zone.rows_evicted))
+            .then_some(key.zone_id);
+        }
+        terminal::ProjectedRowKind::Padding => return None,
+        terminal::ProjectedRowKind::Raw => {}
     }
     let abs_row = projection.view_row_absolute(row)?;
     let total = terminal.scrollback_len() + terminal.grid.rows();
@@ -210,6 +238,57 @@ fn project_search_match(
     })
 }
 
+/// Project a Kitty placement as one indivisible rectangle. Reflow or collapse
+/// may split its backing raw rows; rendering only a surviving fragment would
+/// visually bridge hidden output, so every occupied row must map to a
+/// consecutive display row at the same column.
+fn projected_kitty_anchor(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    buffer_row: usize,
+    col: usize,
+    cols: usize,
+    rows: usize,
+) -> Option<terminal::ViewportCell> {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    if rows > projection.cells().len() || cols > projection.cells().first().map_or(0, Vec::len) {
+        return None;
+    }
+    let mut first = None;
+    for row_delta in 0..rows {
+        let absolute_row = buffer_row.checked_add(row_delta)?;
+        let origin = terminal.raw_cell_origin_at_absolute(absolute_row, col)?;
+        let mapped = projection.raw_range_to_view(origin, cols)?;
+        match first {
+            None => first = Some(mapped),
+            Some(anchor)
+                if mapped.row == anchor.row.checked_add(row_delta)? && mapped.col == anchor.col => {
+            }
+            Some(_) => return None,
+        }
+    }
+    first
+}
+
+/// Translate a visible projected cell back onto the live PTY grid. History,
+/// padding and synthetic rows fail closed; only this mapping may feed app
+/// mouse reports or click-to-cursor movement while collapse shifts rows.
+fn projected_live_grid_cell(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    row: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    let origin = projection.view_to_raw(terminal::ViewportCell { row, col })?;
+    let absolute = projection.view_row_absolute(row)?;
+    let history = terminal.scrollback_len();
+    if absolute < history || terminal.raw_row_id_at_absolute(absolute)? != origin.row {
+        return None;
+    }
+    Some((origin.col, absolute - history))
+}
+
 struct ProjectedZoneMemberships {
     rows: Vec<Option<(usize, usize)>>,
     #[cfg(test)]
@@ -253,6 +332,21 @@ fn projected_zone_memberships(
     }
 }
 
+fn projected_card_real_top(
+    visible_raw_top: Option<usize>,
+    summary_top: Option<usize>,
+    outcome: block_mode::BlockOutcome,
+) -> Option<usize> {
+    visible_raw_top.or_else(|| {
+        // Collapse hides output only. A command card whose header is merely
+        // above the viewport must stay top-clipped; only Background has no
+        // surviving header and may promote its summary to the semantic top.
+        matches!(outcome, block_mode::BlockOutcome::Background)
+            .then_some(summary_top)
+            .flatten()
+    })
+}
+
 /// A claimed card gesture may use only the stable id painted under the press.
 /// A later viewport mapping is evidence for validation, never a replacement
 /// target: moving onto a neighbour fails closed.
@@ -264,6 +358,24 @@ fn validated_claimed_block_target(
     let rendered_zone_id = rendered_zone_id?;
     (retained_finalized && current_row_zone_id == Some(rendered_zone_id))
         .then_some(rendered_zone_id)
+}
+
+fn validated_summary_target(
+    projection: &ProjectedViewport,
+    activation: &SummaryActivation,
+) -> Option<u64> {
+    let key = activation.key;
+    (projection.key() == activation.projection_key
+        && key.policy_revision == projection.policy_revision()
+        && projection.effective_collapsed().contains(&key.zone_id)
+        && projection.row_kinds().iter().any(|kind| {
+            matches!(
+                kind,
+                terminal::ProjectedRowKind::CollapsedSummary { key: current, .. }
+                    if *current == key
+            )
+        }))
+    .then_some(key.zone_id)
 }
 
 fn agent_context_exit_label(exit_code: i32) -> String {
@@ -290,6 +402,15 @@ fn bounded_ai_block_output(output: &str, no_reported_status: bool) -> (String, b
     let bounded = jterm_core::ai::truncate_for_context(&prepared, 80);
     let truncated = bounded != prepared;
     (bounded, truncated)
+}
+
+fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
+    if error
+        .as_deref()
+        .is_some_and(|message| message.starts_with("Match is hidden in collapsed block #"))
+    {
+        *error = None;
+    }
 }
 
 /// Commands whose configured chords must fall through to the PTY whenever
@@ -883,6 +1004,8 @@ enum BlockMenuAction {
     Search,
     ExportMarkdown,
     ExportJson,
+    CollapseOutput,
+    ExpandOutput,
     Clear,
 }
 
@@ -1553,6 +1676,8 @@ enum Message {
     ModifiersChanged(keyboard::Modifiers),
     /// A mouse interaction within the pane showing the stable session id.
     MousePane(usize, MouseInput),
+    /// Stable release of a host-owned collapsed-output summary row.
+    SummaryActivate(usize, SummaryActivation),
     /// Clipboard result scoped to the stable session that requested the paste.
     Pasted(usize, Option<String>),
     /// Text appended by search-replace or a sidebar path pick. Both sources
@@ -1803,6 +1928,10 @@ struct Session {
     /// coordinate consumers for this refresh.
     projection: Arc<ProjectedViewport>,
     projection_block_mode: bool,
+    /// User-owned transforms survive Block Mode/alternate-screen bypass. The
+    /// companion view state owns scrolling only while a transform is active.
+    projection_policy: ProjectionPolicy,
+    projection_view_state: ProjectionViewState,
     cursor: (usize, usize),
     cursor_visible: bool,
     /// Cached working directory, refreshed periodically so the status bar can
@@ -1894,7 +2023,13 @@ impl Session {
         let mut terminal = TerminalState::new(cols, rows);
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
-        let projection = terminal.get_projected_viewport(config.block_mode);
+        let projection_policy = ProjectionPolicy::new();
+        let mut projection_view_state = ProjectionViewState::new();
+        let projection = terminal.get_projected_viewport_with_state(
+            config.block_mode,
+            &projection_policy,
+            &mut projection_view_state,
+        );
         let cursor = terminal.get_cursor_pos();
         let cursor_visible = terminal.is_cursor_visible();
         Ok(Session {
@@ -1905,6 +2040,8 @@ impl Session {
             reader_fd,
             projection,
             projection_block_mode: config.block_mode,
+            projection_policy,
+            projection_view_state,
             cursor,
             cursor_visible,
             cwd_cache: None,
@@ -2039,16 +2176,173 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        self.projection = self
-            .terminal
-            .get_projected_viewport(self.projection_block_mode);
-        debug_assert!(self.projection.is_identity());
-        debug_assert_eq!(
-            self.projection.uses_identity_fast_path(),
-            self.terminal.scroll_offset == 0
+        // The identity/P0 hot path must not allocate or scan every retained
+        // zone on each PTY batch. Reconcile only after a transform exists.
+        if !self.projection_policy.is_identity() {
+            let stale_collapses: Vec<u64> = self
+                .projection_policy
+                .collapsed_zone_ids()
+                .filter(|id| {
+                    self.terminal
+                        .zone_by_id(*id)
+                        .is_none_or(|zone| zone.rows_evicted)
+                })
+                .collect();
+            for id in stale_collapses {
+                self.projection_policy.expand(id);
+            }
+        }
+        self.projection = self.terminal.get_projected_viewport_with_state(
+            self.projection_block_mode,
+            &self.projection_policy,
+            &mut self.projection_view_state,
         );
-        self.cursor = self.terminal.get_cursor_pos();
-        self.cursor_visible = self.terminal.is_cursor_visible();
+        if self.projection.is_identity() {
+            debug_assert_eq!(
+                self.projection.uses_identity_fast_path(),
+                self.terminal.scroll_offset == 0
+            );
+        }
+        let raw_cursor = self.terminal.get_cursor_pos();
+        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            let absolute_row = self.terminal.scrollback_len().saturating_add(raw_cursor.0);
+            let mapped = self
+                .terminal
+                .raw_cell_origin_at_absolute(absolute_row, raw_cursor.1)
+                .and_then(|origin| self.projection.raw_to_view(origin));
+            self.cursor = mapped
+                .map(|cell| (cell.row, cell.col))
+                .unwrap_or(raw_cursor);
+            self.cursor_visible = self.terminal.is_cursor_visible() && mapped.is_some();
+        } else {
+            self.cursor = raw_cursor;
+            self.cursor_visible = self.terminal.is_cursor_visible();
+        }
+    }
+
+    fn scroll(&mut self, lines: isize) {
+        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            self.projection_view_state.scroll(lines, &self.projection);
+        } else {
+            self.terminal.scroll(lines);
+        }
+        self.refresh();
+    }
+
+    fn set_scroll_offset(&mut self, offset: usize) {
+        if self.projection.mode() == terminal::ProjectionMode::Transformed {
+            self.projection_view_state
+                .set_offset(offset, &self.projection);
+        } else {
+            self.terminal.set_scroll_offset(offset);
+        }
+        self.refresh();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.terminal.scroll_to_bottom();
+        self.projection_view_state.scroll_to_bottom();
+        self.refresh();
+    }
+
+    /// Navigate OSC 133 prompt boundaries in the currently displayed
+    /// document. Transformed history owns a projected offset, so its prompt
+    /// jumps reveal stable raw headers instead of mutating the dormant legacy
+    /// scroll offset.
+    fn jump_prompt(&mut self, older: bool) -> bool {
+        if self.projection.mode() != terminal::ProjectionMode::Transformed {
+            let moved = if older {
+                self.terminal.jump_to_prev_prompt()
+            } else {
+                self.terminal.jump_to_next_prompt()
+            };
+            if moved {
+                self.refresh();
+            }
+            return moved;
+        }
+
+        let top = self
+            .projection
+            .row_kinds()
+            .iter()
+            .enumerate()
+            .skip(self.projection.top_padding())
+            .find_map(|(row, kind)| match kind {
+                terminal::ProjectedRowKind::Raw => self.projection.view_row_absolute(row),
+                terminal::ProjectedRowKind::CollapsedSummary { key, .. } => self
+                    .terminal
+                    .zone_by_id(key.zone_id)
+                    .and_then(|zone| zone.output_start)
+                    .or_else(|| {
+                        self.terminal
+                            .zone_by_id(key.zone_id)
+                            .map(|zone| zone.prompt_start)
+                    }),
+                terminal::ProjectedRowKind::Padding => None,
+            })
+            .unwrap_or_else(|| self.terminal.scrollback_len());
+        let active_prompt = self
+            .terminal
+            .running_zone_start()
+            .or(self.terminal.live_prompt_row());
+        let target = prompt_jump_target(
+            self.terminal
+                .command_zones
+                .iter()
+                .filter(|zone| !zone.rows_evicted)
+                .map(|zone| zone.prompt_start)
+                .chain(active_prompt),
+            top,
+            older,
+        );
+
+        match target {
+            Some(row) => {
+                let Some(origin) = self.terminal.raw_cell_origin_at_absolute(row, 0) else {
+                    return false;
+                };
+                let moved = self.terminal.reveal_raw_cell_in_projection(
+                    &self.projection_policy,
+                    &mut self.projection_view_state,
+                    origin,
+                );
+                if moved {
+                    self.refresh();
+                }
+                moved
+            }
+            None if !older && self.projection.scroll_offset() > 0 => {
+                self.scroll_to_bottom();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn reveal_absolute_cell(&mut self, absolute_row: usize, col: usize) -> bool {
+        let Some(origin) = self.terminal.raw_cell_origin_at_absolute(absolute_row, col) else {
+            return false;
+        };
+        match self
+            .terminal
+            .locate_raw_cell_in_projection(&self.projection, origin)
+        {
+            terminal::ProjectedRawCellLocation::Visible(_) => true,
+            terminal::ProjectedRawCellLocation::Retained => {
+                let revealed = self.terminal.reveal_raw_cell_in_projection(
+                    &self.projection_policy,
+                    &mut self.projection_view_state,
+                    origin,
+                );
+                if revealed {
+                    self.refresh();
+                }
+                revealed
+            }
+            terminal::ProjectedRawCellLocation::Hidden { .. }
+            | terminal::ProjectedRawCellLocation::Unmapped => false,
+        }
     }
 
     fn queue_accepts_entry(
@@ -2705,11 +2999,15 @@ impl Frost {
             self.rows = rows;
         }
         for sess in &mut self.sessions {
+            let projection_mode_changed = sess.projection_block_mode != self.config.block_mode;
             sess.projection_block_mode = self.config.block_mode;
             sess.terminal
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
+            if projection_mode_changed {
+                sess.refresh();
+            }
         }
         self.relayout();
         if resized {
@@ -4420,6 +4718,7 @@ impl Frost {
                 // A PTY-bound keystroke dismisses the block selection.
                 sess.block_selection.clear();
                 sess.terminal.scroll_to_bottom();
+                sess.projection_view_state.scroll_to_bottom();
                 sess.write_pty(bytes);
                 sess.refresh();
             }
@@ -4570,8 +4869,7 @@ impl Frost {
                 let speed = self.config.scroll_speed.max(1) as isize;
                 let delta = if older { speed } else { -speed };
                 if let Some(sess) = self.sessions.get_mut(self.active) {
-                    sess.terminal.scroll(delta);
-                    sess.refresh();
+                    sess.scroll(delta);
                 }
                 Task::none()
             }
@@ -4617,14 +4915,7 @@ impl Frost {
                     return Some(Task::none());
                 }
                 if let Some(sess) = self.sessions.get_mut(self.active) {
-                    let moved = if matches!(cmd, C::TerminalPromptPrev) {
-                        sess.terminal.jump_to_prev_prompt()
-                    } else {
-                        sess.terminal.jump_to_next_prompt()
-                    };
-                    if moved {
-                        sess.refresh();
-                    }
+                    sess.jump_prompt(matches!(cmd, C::TerminalPromptPrev));
                 }
                 Task::none()
             }
@@ -5056,8 +5347,25 @@ impl Frost {
             return Task::none();
         };
         if let Some(sess) = self.sessions.get_mut(self.active) {
-            sess.terminal.reveal_buffer_row(target);
-            sess.refresh();
+            let revealed = if bottom && sess.projection.effective_collapsed().contains(&zone_id) {
+                let revealed = sess.terminal.reveal_collapsed_summary(
+                    &sess.projection_policy,
+                    &mut sess.projection_view_state,
+                    zone_id,
+                );
+                if revealed {
+                    sess.refresh();
+                }
+                revealed
+            } else {
+                sess.reveal_absolute_cell(target, 0)
+            };
+            if !revealed {
+                self.push_toast(
+                    "Block position is no longer available".to_string(),
+                    ToastKind::Info,
+                );
+            }
         }
         Task::none()
     }
@@ -5179,6 +5487,37 @@ impl Frost {
                 .block_export_zone_task(menu.zone_id, block_export::SessionExportFormat::Markdown),
             BlockMenuAction::ExportJson => {
                 self.block_export_zone_task(menu.zone_id, block_export::SessionExportFormat::Json)
+            }
+            BlockMenuAction::CollapseOutput => {
+                let changed = self.sessions.get_mut(self.active).is_some_and(|sess| {
+                    sess.id == menu.session_id
+                        && !sess.projection_policy.is_collapsed(menu.zone_id)
+                        && sess.terminal.finished_output_range(menu.zone_id).is_some()
+                        && sess.projection_policy.collapse(menu.zone_id)
+                });
+                if changed {
+                    if let Some(sess) = self.sessions.get_mut(self.active) {
+                        sess.refresh();
+                    }
+                    self.refresh_active_context();
+                }
+                Task::none()
+            }
+            BlockMenuAction::ExpandOutput => {
+                let changed = self.sessions.get_mut(self.active).is_some_and(|sess| {
+                    sess.id == menu.session_id
+                        // Requested state remains user-recoverable even when
+                        // stale/overlapping provenance made it ineffective.
+                        && sess.projection_policy.is_collapsed(menu.zone_id)
+                        && sess.projection_policy.expand(menu.zone_id)
+                });
+                if changed {
+                    if let Some(sess) = self.sessions.get_mut(self.active) {
+                        sess.refresh();
+                    }
+                    self.refresh_active_context();
+                }
+                Task::none()
             }
             BlockMenuAction::Clear => self.request_block_clear(),
         }
@@ -5626,6 +5965,7 @@ impl Frost {
                 // (clipboard, middle-click primary, prompt insert/recall).
                 sess.block_selection.clear();
                 sess.terminal.scroll_to_bottom();
+                sess.projection_view_state.scroll_to_bottom();
                 written = sess.write_pty(&paste.bytes);
                 rejected = !written;
                 sess.refresh();
@@ -5711,6 +6051,38 @@ impl Frost {
         )
     }
 
+    fn handle_summary_activation(
+        &mut self,
+        source_session_id: usize,
+        activation: SummaryActivation,
+    ) -> Task<Message> {
+        let Some(source) = self.session_index_by_id(source_session_id) else {
+            return Task::none();
+        };
+        // A release from a pane that left the visible layout must not mutate a
+        // parked tab/session. Stable identity prevents retargeting; visibility
+        // is the final ownership check.
+        if !self.layout().contains_session(source) {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(source) else {
+            return Task::none();
+        };
+        let Some(zone_id) = validated_summary_target(&sess.projection, &activation) else {
+            return Task::none();
+        };
+        if sess.projection_policy.expand(zone_id) {
+            sess.refresh();
+            self.block_menu = None;
+            if self.layout().contains_session(source) {
+                self.set_focus(source);
+                self.session_dirty = true;
+            }
+            self.refresh_active_context();
+        }
+        Task::none()
+    }
+
     /// Route a grid mouse interaction either to the running application (when it
     /// has enabled mouse reporting and Shift is not held) or to local selection
     /// and scrollback handling.
@@ -5780,7 +6152,7 @@ impl Frost {
             // A claimed card gesture replaces any older native cell range.
             // Otherwise the ordinary Copy shortcut would keep preferring a
             // stale highlight over the block selection the user just made.
-            sess.terminal.selection = None;
+            sess.terminal.clear_text_selection();
             sess.refresh();
             return Task::none();
         }
@@ -5979,9 +6351,15 @@ impl Frost {
                 ..
             } => {
                 if report_to_app {
-                    if let Some(report) = sess.terminal.get_mouse_report(btn_code(button), col, row)
+                    if let Some((grid_col, grid_row)) =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
                     {
-                        sess.write_pty(&report);
+                        if let Some(report) =
+                            sess.terminal
+                                .get_mouse_report(btn_code(button), grid_col, grid_row)
+                        {
+                            sess.write_pty(&report);
+                        }
                     }
                     return Task::none();
                 }
@@ -5990,18 +6368,9 @@ impl Frost {
                         2 => sess
                             .terminal
                             .select_word_in_projection(&sess.projection, row, col),
-                        n if n >= 3 => {
-                            let (cols, _) = sess.terminal.get_dimensions();
-                            sess.terminal.start_selection_in_projection(
-                                &sess.projection,
-                                (row, 0),
-                                terminal::SelectionMode::Normal,
-                            );
-                            sess.terminal.update_selection_in_projection(
-                                &sess.projection,
-                                (row, cols.saturating_sub(1)),
-                            );
-                        }
+                        n if n >= 3 => sess
+                            .terminal
+                            .select_line_in_projection(&sess.projection, row),
                         _ if alt => sess.terminal.start_selection_in_projection(
                             &sess.projection,
                             (row, col),
@@ -6024,8 +6393,14 @@ impl Frost {
             MouseInput::Drag { col, row, count } => {
                 if report_to_app {
                     if sess.terminal.is_mouse_motion_enabled() {
-                        if let Some(report) = sess.terminal.get_mouse_report(32, col, row) {
-                            sess.write_pty(&report);
+                        if let Some((grid_col, grid_row)) =
+                            projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                        {
+                            if let Some(report) =
+                                sess.terminal.get_mouse_report(32, grid_col, grid_row)
+                            {
+                                sess.write_pty(&report);
+                            }
                         }
                     }
                     return Task::none();
@@ -6046,11 +6421,16 @@ impl Frost {
             }
             MouseInput::Release { col, row, button } => {
                 if report_to_app {
-                    if let Some(report) =
-                        sess.terminal
-                            .get_mouse_release_report(btn_code(button), col, row)
+                    if let Some((grid_col, grid_row)) =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
                     {
-                        sess.write_pty(&report);
+                        if let Some(report) = sess.terminal.get_mouse_release_report(
+                            btn_code(button),
+                            grid_col,
+                            grid_row,
+                        ) {
+                            sess.write_pty(&report);
+                        }
                     }
                     return Task::none();
                 }
@@ -6060,12 +6440,18 @@ impl Frost {
                     // `copy_selection` would return that cell's character and
                     // swallow the click.
                     if let Some(cell) = clicked_cell {
-                        sess.terminal.selection = None;
-                        let bytes = sess.terminal.click_cursor_move(
+                        sess.terminal.clear_text_selection();
+                        let bytes = projected_live_grid_cell(
+                            &sess.terminal,
+                            &sess.projection,
                             cell.row.max(0) as usize,
                             cell.col.max(0) as usize,
-                            click_moves_cursor,
-                        );
+                        )
+                        .map(|(grid_col, grid_row)| {
+                            sess.terminal
+                                .click_cursor_move(grid_row, grid_col, click_moves_cursor)
+                        })
+                        .unwrap_or_default();
                         if !bytes.is_empty() {
                             sess.write_pty(&bytes);
                         }
@@ -6093,21 +6479,25 @@ impl Frost {
                 }
                 if report_to_app {
                     let code = if up { 64 } else { 65 };
-                    // One wheel report per line so apps see the full magnitude.
-                    for _ in 0..lines.max(1) {
-                        if let Some(report) = sess.terminal.get_mouse_report(code, col, row) {
-                            sess.write_pty(&report);
+                    if let Some((grid_col, grid_row)) =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                    {
+                        // One wheel report per line so apps see the full magnitude.
+                        for _ in 0..lines.max(1) {
+                            if let Some(report) =
+                                sess.terminal.get_mouse_report(code, grid_col, grid_row)
+                            {
+                                sess.write_pty(&report);
+                            }
                         }
                     }
                     return Task::none();
                 }
                 let step = speed * lines.max(1) as isize;
-                sess.terminal.scroll(if up { step } else { -step });
-                sess.refresh();
+                sess.scroll(if up { step } else { -step });
             }
             MouseInput::ScrollTo { offset } => {
-                sess.terminal.set_scroll_offset(offset);
-                sess.refresh();
+                sess.set_scroll_offset(offset);
             }
         }
         Task::none()
@@ -6128,16 +6518,15 @@ impl Frost {
         // split, a pane is shorter than `self.rows`.
         let page = sess.terminal.grid.rows().saturating_sub(1).max(1) as isize;
         match key {
-            Key::Named(Named::PageUp) => sess.terminal.scroll(page),
-            Key::Named(Named::PageDown) => sess.terminal.scroll(-page),
+            Key::Named(Named::PageUp) => sess.scroll(page),
+            Key::Named(Named::PageDown) => sess.scroll(-page),
             Key::Named(Named::Home) => {
-                let len = sess.terminal.scrollback_len();
-                sess.terminal.set_scroll_offset(len);
+                let len = sess.projection.max_scroll_offset();
+                sess.set_scroll_offset(len);
             }
-            Key::Named(Named::End) => sess.terminal.scroll_to_bottom(),
+            Key::Named(Named::End) => sess.scroll_to_bottom(),
             _ => return false,
         }
-        sess.refresh();
         true
     }
 
@@ -6172,12 +6561,40 @@ impl Frost {
     /// visible snapshot. Kept separate from recomputation so streaming PTY
     /// output never steals the user's manually chosen scroll position.
     fn reveal_current_search_match(&mut self) {
+        // This is a location diagnostic for the previously active match, not
+        // a search-engine error. Recompute it for the new target.
+        clear_stale_hidden_match_diagnostic(&mut self.search.error_message);
         let Some(found) = self.search.current_match() else {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(self.active) {
-            sess.terminal.reveal_buffer_row(found.line);
-            sess.refresh();
+            let Some(origin) = sess
+                .terminal
+                .raw_cell_origin_at_absolute(found.line, found.col_start)
+            else {
+                return;
+            };
+            match sess
+                .terminal
+                .locate_raw_cell_in_projection(&sess.projection, origin)
+            {
+                terminal::ProjectedRawCellLocation::Hidden { zone_id } => {
+                    self.search.error_message = Some(format!(
+                        "Match is hidden in collapsed block #{zone_id}; expand its output to reveal"
+                    ));
+                }
+                terminal::ProjectedRawCellLocation::Visible(_) => {}
+                terminal::ProjectedRawCellLocation::Retained => {
+                    if sess.terminal.reveal_raw_cell_in_projection(
+                        &sess.projection_policy,
+                        &mut sess.projection_view_state,
+                        origin,
+                    ) {
+                        sess.refresh();
+                    }
+                }
+                terminal::ProjectedRawCellLocation::Unmapped => {}
+            }
         }
         self.links_cache_key = None;
     }
@@ -6637,16 +7054,14 @@ impl Frost {
             }
             PaletteAction::ScrollToTop => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
-                    let len = sess.terminal.scrollback_len();
-                    sess.terminal.set_scroll_offset(len);
-                    sess.refresh();
+                    let len = sess.projection.max_scroll_offset();
+                    sess.set_scroll_offset(len);
                 }
                 Task::none()
             }
             PaletteAction::ScrollToBottom => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
-                    sess.terminal.scroll_to_bottom();
-                    sess.refresh();
+                    sess.scroll_to_bottom();
                 }
                 Task::none()
             }
@@ -6682,14 +7097,7 @@ impl Frost {
                     return Task::none();
                 }
                 if let Some(sess) = self.sessions.get_mut(self.active) {
-                    let moved = if matches!(action, PaletteAction::PromptJumpPrev) {
-                        sess.terminal.jump_to_prev_prompt()
-                    } else {
-                        sess.terminal.jump_to_next_prompt()
-                    };
-                    if moved {
-                        sess.refresh();
-                    }
+                    sess.jump_prompt(matches!(action, PaletteAction::PromptJumpPrev));
                 }
                 Task::none()
             }
@@ -6758,7 +7166,7 @@ impl Frost {
         if let Some(sess) = self.sessions.get_mut(self.active) {
             sess.block_selection.replace(Some(id));
             if !rows_evicted {
-                sess.terminal.reveal_buffer_row(prompt_row);
+                sess.reveal_absolute_cell(prompt_row, 0);
             }
             sess.refresh();
         }
@@ -6786,8 +7194,7 @@ impl Frost {
             .and_then(|sess| block_search_reveal_row(&sess.terminal, hit));
         if let Some(row) = row {
             if let Some(sess) = self.sessions.get_mut(self.active) {
-                sess.terminal.reveal_buffer_row(row);
-                sess.refresh();
+                sess.reveal_absolute_cell(row, 0);
             }
         }
     }
@@ -7242,7 +7649,7 @@ impl Frost {
         let cleared = sess.terminal.clear_completed_blocks();
         sess.block_selection.clear();
         sess.block_bookmarks.clear();
-        sess.terminal.selection = None;
+        sess.terminal.clear_text_selection();
         sess.refresh();
 
         self.block_search = None;
@@ -7293,7 +7700,7 @@ impl Frost {
             .filter(|zone| !zone.rows_evicted)
             .map(|zone| zone.prompt_start)
         {
-            sess.terminal.reveal_buffer_row(prompt_start);
+            sess.reveal_absolute_cell(prompt_start, 0);
         }
         sess.refresh();
         Task::none()
@@ -8628,6 +9035,7 @@ impl Frost {
                         // (any PTY-bound key, not Escape specifically).
                         sess.block_selection.clear();
                         sess.terminal.scroll_to_bottom();
+                        sess.projection_view_state.scroll_to_bottom();
                         sess.write_pty(&bytes);
                         sess.refresh();
                     }
@@ -8660,6 +9068,7 @@ impl Frost {
                         // as `encode_key` and the paste paths.
                         sess.block_selection.clear();
                         sess.terminal.scroll_to_bottom();
+                        sess.projection_view_state.scroll_to_bottom();
                         sess.write_pty(text.as_bytes());
                         sess.refresh();
                     }
@@ -8667,6 +9076,12 @@ impl Frost {
             }
             Message::ModifiersChanged(mods) => {
                 self.modifiers = mods;
+            }
+            Message::SummaryActivate(session_id, activation) => {
+                if !self.terminal_mouse_active() {
+                    return Task::none();
+                }
+                return self.handle_summary_activation(session_id, activation);
             }
             Message::MousePane(session_id, input) => {
                 if !self.terminal_mouse_active() {
@@ -9801,12 +10216,24 @@ impl Frost {
                 let img = kg.get_image(p.image_id)?;
                 let crop = kitty_graphics::placement_crop(img, p)?;
                 let (handle, _) = self.kitty_handles.get(&(sess.id, p.image_id, crop))?;
+                // `row` records the protocol-time screen coordinate; retained
+                // rendering deliberately keys off the stable `buffer_row`.
+                let _protocol_screen_row = p.row;
+                let rows = (p.rows as usize).max(1);
+                let anchor = projected_kitty_anchor(
+                    &sess.terminal,
+                    &sess.projection,
+                    p.buffer_row,
+                    p.col as usize,
+                    (p.cols as usize).max(1),
+                    rows,
+                )?;
                 Some(KittyRender {
                     handle: handle.clone(),
-                    col: p.col as usize,
-                    row: p.row as usize,
+                    col: anchor.col,
+                    row: anchor.row,
                     cols: (p.cols as usize).max(1),
-                    rows: (p.rows as usize).max(1),
+                    rows,
                     id: p.image_id,
                     px_w: crop.2,
                     px_h: crop.3,
@@ -9824,7 +10251,7 @@ impl Frost {
         };
         let key = (sess.id, sess.projection.key());
         let cacheable = sess.projection.view_revision() != 0;
-        if cacheable && self.links_cache_key == Some(key) {
+        if cacheable && self.links_cache_key == Some(key.clone()) {
             return;
         }
         self.links_cache_key = cacheable.then_some(key);
@@ -10989,6 +11416,13 @@ impl Frost {
             if let Some(retention) = retention {
                 body = body.push(text(retention).size(11).style(text::warning));
             }
+            if sess.projection_policy.is_collapsed(zone.id) {
+                body = body.push(row_btn("Expand output", BlockMenuAction::ExpandOutput));
+            } else if !sess.projection_policy.is_collapsed(zone.id)
+                && sess.terminal.finished_output_range(zone.id).is_some()
+            {
+                body = body.push(row_btn("Collapse output", BlockMenuAction::CollapseOutput));
+            }
             let selection = block_menu_selection_summary(
                 sess.terminal
                     .command_zones
@@ -11261,7 +11695,7 @@ impl Frost {
     fn block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
         use block_mode::BlockOutcome;
 
-        if sess.projection.mode() != terminal::ProjectionMode::Identity {
+        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
         let rows = sess.projection.cells().len();
@@ -11290,19 +11724,64 @@ impl Frost {
         let view_absolute_rows: Vec<_> = (0..rows)
             .map(|row| sess.projection.view_row_absolute(row))
             .collect();
-        let memberships = projected_zone_memberships(&view_absolute_rows, &spans);
+        let mut memberships = projected_zone_memberships(&view_absolute_rows, &spans);
+        let zone_indexes: std::collections::HashMap<u64, usize> = zones
+            .iter()
+            .enumerate()
+            .map(|(index, zone)| (zone.id, index))
+            .collect();
+        let mut summary_bounds = vec![(None, None); zones.len()];
+        for (view_row, kind) in sess.projection.row_kinds().iter().enumerate() {
+            let terminal::ProjectedRowKind::CollapsedSummary { key, .. } = kind else {
+                continue;
+            };
+            let Some(&zone_index) = zone_indexes.get(&key.zone_id) else {
+                continue;
+            };
+            let zone = zones[zone_index];
+            memberships.rows[view_row] =
+                Some((zone_index, zone.output_start.unwrap_or(zone.prompt_start)));
+            let (first, last) = &mut summary_bounds[zone_index];
+            *first = Some(first.map_or(view_row, |row: usize| row.min(view_row)));
+            *last = Some(last.map_or(view_row, |row: usize| row.max(view_row)));
+        }
         let zone_view_edges: Vec<_> = spans
             .iter()
-            .map(|&(zone_start, zone_end)| {
-                let top = terminal
+            .enumerate()
+            .map(|(zone_index, &(zone_start, zone_end))| {
+                let visible_raw_top = terminal
                     .raw_row_id_at_absolute(zone_start)
                     .and_then(|row| sess.projection.raw_row_view_bounds(row))
                     .map(|(first, _)| first);
-                let bottom = zone_end
-                    .checked_sub(1)
-                    .and_then(|row| terminal.raw_row_id_at_absolute(row))
-                    .and_then(|row| sess.projection.raw_row_view_bounds(row))
-                    .map(|(_, last)| last);
+                let top = projected_card_real_top(
+                    visible_raw_top,
+                    summary_bounds[zone_index].0,
+                    block_mode::classify(
+                        zones[zone_index].command.as_deref(),
+                        zones[zone_index].exit_code,
+                    ),
+                );
+                let bottom = if sess
+                    .projection
+                    .effective_collapsed()
+                    .contains(&zones[zone_index].id)
+                {
+                    // The synthetic summary is the real visual bottom even
+                    // when a same-row command prefix leaves the raw row mapped.
+                    summary_bounds[zone_index].1.or_else(|| {
+                        zone_end
+                            .checked_sub(1)
+                            .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                            .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                            .map(|(_, last)| last)
+                    })
+                } else {
+                    zone_end
+                        .checked_sub(1)
+                        .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                        .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                        .map(|(_, last)| last)
+                };
                 (top, bottom)
             })
             .collect();
@@ -11344,6 +11823,18 @@ impl Frost {
                 zone.output_start_col,
                 absolute_row,
             );
+            if let Some(terminal::ProjectedRowKind::CollapsedSummary {
+                key,
+                hidden_display_rows,
+                ..
+            }) = sess.projection.row_kinds().get(view_row)
+            {
+                row.header_end_col = 0;
+                row.collapsed_summary = Some(terminal_view::CollapsedSummaryPaint {
+                    key: *key,
+                    hidden_display_rows: *hidden_display_rows,
+                });
+            }
             row.stripe = Some(color);
             row.stripe_strong = active;
             // Zero is reserved for the live/input card below. The value is
@@ -11453,6 +11944,9 @@ impl Frost {
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
+        if sess.projection.mode() == terminal::ProjectionMode::Transformed {
+            return Vec::new();
+        }
         let terminal = &sess.terminal;
         let total = terminal.scrollback_len() + terminal.grid.rows();
         let failed: Vec<usize> = terminal
@@ -11473,6 +11967,11 @@ impl Frost {
 
     fn block_bookmark_marker_fractions(&self, sess: &Session) -> Vec<f32> {
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            return Vec::new();
+        }
+        // Raw document fractions are invalid once rows have been vertically
+        // projected. Hide them until markers carry stable raw origins.
+        if sess.projection.mode() == terminal::ProjectionMode::Transformed {
             return Vec::new();
         }
         let total = sess.terminal.scrollback_len() + sess.terminal.grid.rows();
@@ -11498,7 +11997,7 @@ impl Frost {
         let focused = self.focused && is_active && self.terminal_input_active();
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
-        let selection: Vec<Option<(usize, usize)>> = if sess.terminal.selection.is_some() {
+        let selection: Vec<Option<(usize, usize)>> = if sess.terminal.has_text_selection() {
             (0..sess.projection.cells().len())
                 .map(|r| {
                     sess.terminal
@@ -11557,7 +12056,7 @@ impl Frost {
             self.nerd_symbol,
             selection,
             sess.projection.scroll_offset(),
-            sess.terminal.scrollback_len(),
+            sess.projection.max_scroll_offset(),
         )
         .modifiers(
             self.modifiers.shift(),
@@ -11593,6 +12092,9 @@ impl Frost {
         .blink_on(self.blink_on)
         .opacity(self.config.opacity)
         .on_mouse(move |inp| Message::MousePane(session_id, inp))
+        .on_summary(sess.projection.key(), move |activation| {
+            Message::SummaryActivate(session_id, activation)
+        })
         .into()
     }
 
@@ -13656,6 +14158,7 @@ impl Frost {
             return None;
         }
         sess.terminal.scroll_to_bottom();
+        sess.projection_view_state.scroll_to_bottom();
         if !sess.write_agent_pty(&paste.bytes) {
             sess.terminal.disarm_agent_execution(approved.generation);
             self.agent.execution_start_failed(
@@ -14095,11 +14598,9 @@ impl Frost {
                     return None;
                 }
                 let row = terminal.running_zone_start()?;
-                let viewport_start = terminal.viewport_absolute_start();
-                if row < viewport_start || row >= viewport_start + terminal.grid.rows() {
-                    return None;
-                }
-                let (_, elapsed_ms) = self.fitting_running_badge(session, row - viewport_start)?;
+                let raw_row = terminal.raw_row_id_at_absolute(row)?;
+                let (view_row, _) = session.projection.raw_row_view_bounds(raw_row)?;
+                let (_, elapsed_ms) = self.fitting_running_badge(session, view_row)?;
                 Some(if elapsed_ms < 3_600_000 {
                     std::time::Duration::from_secs(1)
                 } else {
@@ -14957,6 +15458,15 @@ mod tests {
     }
 
     #[test]
+    fn projected_prompt_navigation_chooses_the_nearest_strict_boundary() {
+        let prompts = [2, 8, 15, 23];
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 15, true), Some(8));
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 15, false), Some(23));
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 2, true), None);
+        assert_eq!(prompt_jump_target(prompts.into_iter(), 23, false), None);
+    }
+
+    #[test]
     fn search_matches_use_exact_projected_origins_and_fail_closed() {
         let mut terminal = terminal::TerminalState::new(4, 3);
         let mut raw = vec![terminal::TerminalCell::default(); 8];
@@ -15001,6 +15511,114 @@ mod tests {
     }
 
     #[test]
+    fn moving_from_hidden_search_match_clears_only_location_diagnostic() {
+        let mut hidden =
+            Some("Match is hidden in collapsed block #7; expand its output to reveal".to_string());
+        clear_stale_hidden_match_diagnostic(&mut hidden);
+        assert_eq!(hidden, None);
+
+        let mut regex_error = Some("invalid regular expression".to_string());
+        clear_stale_hidden_match_diagnostic(&mut regex_error);
+        assert_eq!(regex_error.as_deref(), Some("invalid regular expression"));
+    }
+
+    #[test]
+    fn collapsed_summary_target_is_stable_and_kitty_is_all_or_nothing() {
+        let mut terminal = terminal::TerminalState::new(24, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07out\r\nmore\r\n\x1b]133;D;0\x07tail",
+        );
+        let zone = terminal.command_zones.back().expect("finished block");
+        let zone_id = zone.id;
+        let output_start = zone.output_start.expect("retained output start");
+        let output_col = zone.output_start_col;
+
+        let identity = terminal.get_projected_viewport(true);
+        assert!(
+            projected_kitty_anchor(&terminal, &identity, output_start, output_col, 1, 2).is_some()
+        );
+
+        let mut policy = terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(zone_id));
+        let mut view_state = terminal::ProjectionViewState::new();
+        let collapsed = terminal.get_projected_viewport_with_state(true, &policy, &mut view_state);
+        let (summary_row, summary_key) = collapsed
+            .row_kinds()
+            .iter()
+            .enumerate()
+            .find_map(|(row, kind)| match kind {
+                terminal::ProjectedRowKind::CollapsedSummary { key, .. } => Some((row, *key)),
+                terminal::ProjectedRowKind::Raw | terminal::ProjectedRowKind::Padding => None,
+            })
+            .expect("visible collapsed summary");
+        let activation = SummaryActivation {
+            key: summary_key,
+            projection_key: collapsed.key(),
+        };
+        assert_eq!(
+            validated_summary_target(&collapsed, &activation),
+            Some(zone_id)
+        );
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &collapsed, summary_row),
+            Some(zone_id),
+            "summary retains the right-click block target"
+        );
+        assert_eq!(
+            projected_kitty_anchor(&terminal, &collapsed, output_start, output_col, 1, 2),
+            None,
+            "a placement touching hidden output must disappear as a whole"
+        );
+
+        // A placement whose anchor survives on a shared header/output row is
+        // still hidden when its horizontal extent crosses the collapsed
+        // suffix. Checking only the anchor would incorrectly draw the image.
+        let mut same_row = terminal::TerminalState::new(32, 4);
+        same_row.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07out\x1b]133;D;0\x07 tail",
+        );
+        let same_zone = same_row.command_zones.back().expect("same-row block");
+        let same_zone_id = same_zone.id;
+        let same_output_row = same_zone.output_start.expect("same-row output");
+        let same_output_col = same_zone.output_start_col;
+        assert!(same_output_col > 0);
+        let same_identity = same_row.get_projected_viewport(true);
+        assert!(projected_kitty_anchor(
+            &same_row,
+            &same_identity,
+            same_output_row,
+            same_output_col - 1,
+            2,
+            1,
+        )
+        .is_some());
+        let mut same_policy = terminal::ProjectionPolicy::new();
+        assert!(same_policy.collapse(same_zone_id));
+        let mut same_state = terminal::ProjectionViewState::new();
+        let same_collapsed =
+            same_row.get_projected_viewport_with_state(true, &same_policy, &mut same_state);
+        assert_eq!(
+            projected_kitty_anchor(
+                &same_row,
+                &same_collapsed,
+                same_output_row,
+                same_output_col - 1,
+                2,
+                1,
+            ),
+            None,
+            "horizontal overlap with a hidden suffix hides the whole placement"
+        );
+
+        let mut stale = activation.clone();
+        stale.projection_key.scroll_offset = stale.projection_key.scroll_offset.saturating_add(1);
+        assert_eq!(validated_summary_target(&collapsed, &stale), None);
+        let mut wrong_row = activation;
+        wrong_row.key.zone_id = wrong_row.key.zone_id.saturating_add(1);
+        assert_eq!(validated_summary_target(&collapsed, &wrong_row), None);
+    }
+
+    #[test]
     fn projected_zone_sweep_is_linear_and_keeps_padding_unowned() {
         let view_rows: Vec<_> = (0..512).map(|row| (row != 257).then_some(row)).collect();
         let spans: Vec<_> = (0..256).map(|zone| (zone * 2, zone * 2 + 2)).collect();
@@ -15011,6 +15629,25 @@ mod tests {
         assert_eq!(memberships.rows[256], Some((128, 256)));
         assert_eq!(memberships.rows[257], None);
         assert_eq!(memberships.rows[511], Some((255, 511)));
+    }
+
+    #[test]
+    fn collapsed_summary_is_real_top_only_for_headerless_background() {
+        assert_eq!(
+            projected_card_real_top(None, Some(3), block_mode::BlockOutcome::Success,),
+            None,
+            "an offscreen command header remains a clipped card edge"
+        );
+        assert_eq!(
+            projected_card_real_top(None, Some(3), block_mode::BlockOutcome::Background,),
+            Some(3),
+            "a Background summary replaces the entire headerless card"
+        );
+        assert_eq!(
+            projected_card_real_top(Some(1), Some(3), block_mode::BlockOutcome::Background,),
+            Some(1),
+            "a visible real top always wins"
+        );
     }
 
     #[test]
