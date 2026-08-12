@@ -41,7 +41,7 @@ use iced::widget::{
 };
 use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
 use pty::{Pty, ReaderPoll};
-use terminal::{TerminalCell, TerminalState};
+use terminal::{ProjectedViewport, ProjectionKey, TerminalState};
 use terminal_view::{BlockMouseAction, KittyRender, Metrics, MouseButton, MouseInput, TermWidget};
 use theme::Theme;
 
@@ -157,12 +157,16 @@ fn app_mouse_uses_full_grid(block_mode: bool, alt_screen: bool, usable_partition
 fn finalized_block_at_viewport_row(
     block_mode_enabled: bool,
     terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
     row: usize,
 ) -> Option<u64> {
-    if !block_mode_enabled || terminal.is_alt_buffer_active() {
+    if !block_mode_enabled
+        || terminal.is_alt_buffer_active()
+        || projection.mode() != terminal::ProjectionMode::Identity
+    {
         return None;
     }
-    let abs_row = terminal.viewport_absolute_start().checked_add(row)?;
+    let abs_row = projection.view_row_absolute(row)?;
     let total = terminal.scrollback_len() + terminal.grid.rows();
     let live_boundary = terminal
         .running_zone_start()
@@ -179,6 +183,74 @@ fn finalized_block_at_viewport_row(
         .zip(block_mode::spans(&starts, live_boundary))
         .find(|(_, (span_start, span_end))| abs_row >= *span_start && abs_row < *span_end)
         .map(|(zone, _)| zone.id)
+}
+
+/// Map one raw-buffer search match through the exact immutable projection.
+/// A match split across display rows, trimmed origin, or structural padding is
+/// not guessed onto a nearby cell.
+fn project_search_match(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    matched: &search::SearchMatch,
+) -> Option<search::SearchMatch> {
+    let end_col = matched.col_end.checked_sub(1)?;
+    let start_origin = terminal.raw_cell_origin_at_absolute(matched.line, matched.col_start)?;
+    let end_origin = terminal.raw_cell_origin_at_absolute(matched.line, end_col)?;
+    let start = projection.raw_to_view(start_origin)?;
+    let end = projection.raw_to_view(end_origin)?;
+    if projection.view_to_raw(start) != Some(start_origin)
+        || projection.view_to_raw(end) != Some(end_origin)
+    {
+        return None;
+    }
+    (start.row == end.row).then_some(search::SearchMatch {
+        line: start.row,
+        col_start: start.col,
+        col_end: end.col.saturating_add(1),
+    })
+}
+
+struct ProjectedZoneMemberships {
+    rows: Vec<Option<(usize, usize)>>,
+    #[cfg(test)]
+    scan_steps: usize,
+}
+
+/// Assign sorted projected raw rows to sorted zone spans in one forward pass.
+/// `None` rows are structural viewport padding and remain unowned.
+fn projected_zone_memberships(
+    view_absolute_rows: &[Option<usize>],
+    zone_spans: &[(usize, usize)],
+) -> ProjectedZoneMemberships {
+    let mut zone_index = 0;
+    #[cfg(test)]
+    let mut scan_steps = 0;
+    let rows = view_absolute_rows
+        .iter()
+        .map(|absolute_row| {
+            #[cfg(test)]
+            {
+                scan_steps += 1;
+            }
+            let absolute_row = (*absolute_row)?;
+            while zone_index < zone_spans.len() && absolute_row >= zone_spans[zone_index].1 {
+                zone_index += 1;
+                #[cfg(test)]
+                {
+                    scan_steps += 1;
+                }
+            }
+            zone_spans
+                .get(zone_index)
+                .filter(|(start, end)| absolute_row >= *start && absolute_row < *end)
+                .map(|_| (zone_index, absolute_row))
+        })
+        .collect();
+    ProjectedZoneMemberships {
+        rows,
+        #[cfg(test)]
+        scan_steps,
+    }
 }
 
 /// A claimed card gesture may use only the stable id painted under the press.
@@ -1727,7 +1799,10 @@ struct Session {
     pty: Pty,
     master_fd: RawFd,
     reader_fd: Arc<OwnedFd>,
-    grid: Arc<Vec<Vec<TerminalCell>>>,
+    /// One immutable materialization shared by rendering, links, and stable
+    /// coordinate consumers for this refresh.
+    projection: Arc<ProjectedViewport>,
+    projection_block_mode: bool,
     cursor: (usize, usize),
     cursor_visible: bool,
     /// Cached working directory, refreshed periodically so the status bar can
@@ -1819,7 +1894,7 @@ impl Session {
         let mut terminal = TerminalState::new(cols, rows);
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
-        let grid = terminal.get_visible_cells();
+        let projection = terminal.get_projected_viewport(config.block_mode);
         let cursor = terminal.get_cursor_pos();
         let cursor_visible = terminal.is_cursor_visible();
         Ok(Session {
@@ -1828,7 +1903,8 @@ impl Session {
             pty,
             master_fd,
             reader_fd,
-            grid,
+            projection,
+            projection_block_mode: config.block_mode,
             cursor,
             cursor_visible,
             cwd_cache: None,
@@ -1963,7 +2039,14 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        self.grid = self.terminal.get_visible_cells();
+        self.projection = self
+            .terminal
+            .get_projected_viewport(self.projection_block_mode);
+        debug_assert!(self.projection.is_identity());
+        debug_assert_eq!(
+            self.projection.uses_identity_fast_path(),
+            self.terminal.scroll_offset == 0
+        );
         self.cursor = self.terminal.get_cursor_pos();
         self.cursor_visible = self.terminal.is_cursor_visible();
     }
@@ -2250,8 +2333,9 @@ struct Frost {
     config_dirty: bool,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
-    /// `(stable_session_id, grid_version, scroll_offset)` for cached `links`.
-    links_cache_key: Option<(usize, u64, usize)>,
+    /// Stable session plus the complete immutable projection identity used by
+    /// the cached visible links.
+    links_cache_key: Option<(usize, ProjectionKey)>,
     /// Cached GPU image handles keyed by (stable session id, Kitty image id,
     /// source-crop rectangle). The generation invalidates same-sized
     /// retransmissions; the crop is part of the key because `x=`/`y=`/`w=`/`h=`
@@ -2621,6 +2705,7 @@ impl Frost {
             self.rows = rows;
         }
         for sess in &mut self.sessions {
+            sess.projection_block_mode = self.config.block_mode;
             sess.terminal
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
@@ -5618,7 +5703,12 @@ impl Frost {
     /// no target. Mouse events retain this stable identity across focus moves.
     fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
         let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
-        finalized_block_at_viewport_row(self.config.block_mode, &sess.terminal, row)
+        finalized_block_at_viewport_row(
+            self.config.block_mode,
+            &sess.terminal,
+            &sess.projection,
+            row,
+        )
     }
 
     /// Route a grid mouse interaction either to the running application (when it
@@ -5897,15 +5987,31 @@ impl Frost {
                 }
                 match button {
                     MouseButton::Left => match count {
-                        2 => sess.terminal.select_word_at(row, col),
+                        2 => sess
+                            .terminal
+                            .select_word_in_projection(&sess.projection, row, col),
                         n if n >= 3 => {
                             let (cols, _) = sess.terminal.get_dimensions();
-                            sess.terminal.start_selection((row, 0));
-                            sess.terminal
-                                .update_selection((row, cols.saturating_sub(1)));
+                            sess.terminal.start_selection_in_projection(
+                                &sess.projection,
+                                (row, 0),
+                                terminal::SelectionMode::Normal,
+                            );
+                            sess.terminal.update_selection_in_projection(
+                                &sess.projection,
+                                (row, cols.saturating_sub(1)),
+                            );
                         }
-                        _ if alt => sess.terminal.start_block_selection((row, col)),
-                        _ => sess.terminal.start_selection((row, col)),
+                        _ if alt => sess.terminal.start_selection_in_projection(
+                            &sess.projection,
+                            (row, col),
+                            terminal::SelectionMode::Block,
+                        ),
+                        _ => sess.terminal.start_selection_in_projection(
+                            &sess.projection,
+                            (row, col),
+                            terminal::SelectionMode::Normal,
+                        ),
                     },
                     MouseButton::Middle => {
                         let id = sess.id;
@@ -5925,9 +6031,17 @@ impl Frost {
                     return Task::none();
                 }
                 match count {
-                    2 => sess.terminal.extend_word_selection_to(row, col),
-                    n if n >= 3 => sess.terminal.extend_line_selection_to(row),
-                    _ => sess.terminal.update_selection((row, col)),
+                    2 => sess.terminal.extend_word_selection_in_projection(
+                        &sess.projection,
+                        row,
+                        col,
+                    ),
+                    n if n >= 3 => sess
+                        .terminal
+                        .extend_line_selection_in_projection(&sess.projection, row),
+                    _ => sess
+                        .terminal
+                        .update_selection_in_projection(&sess.projection, (row, col)),
                 }
             }
             MouseInput::Release { col, row, button } => {
@@ -9708,19 +9822,18 @@ impl Frost {
             self.links.clear();
             return;
         };
-        let key = (
-            sess.id,
-            sess.terminal.get_grid_version(),
-            sess.terminal.scroll_offset,
-        );
-        if self.links_cache_key == Some(key) {
+        let key = (sess.id, sess.projection.key());
+        let cacheable = sess.projection.view_revision() != 0;
+        if cacheable && self.links_cache_key == Some(key) {
             return;
         }
-        self.links_cache_key = Some(key);
-        let row_wrapped = sess.terminal.get_visible_row_wrapped();
+        self.links_cache_key = cacheable.then_some(key);
         self.links = self
             .link_detector
-            .detect_links_in_visible_cells_with_wrapping(&sess.grid, &row_wrapped);
+            .detect_links_in_visible_cells_with_wrapping(
+                sess.projection.cells(),
+                sess.projection.row_wrapped(),
+            );
     }
 
     // --- Theme-derived chrome colors and styles ---------------------------
@@ -11131,7 +11244,8 @@ impl Frost {
         let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0)).ceil()
             as usize;
         let chars: Vec<char> = sess
-            .grid
+            .projection
+            .cells()
             .get(viewport_row)?
             .iter()
             .map(Self::block_badge_cell_char)
@@ -11141,22 +11255,20 @@ impl Frost {
 
     /// Block-mode metadata for each of `sess`'s visible rows: card grouping,
     /// real (not viewport-clipped) edges, state/tint, outcome stripes and
-    /// first-row badges. Absolute zone rows translate to viewport rows with the same
-    /// arithmetic (and the same reflow approximation) as search matches.
+    /// first-row badges. Raw zone anchors enter the snapshot only through exact
+    /// projected origins; structural padding and stale rows fail closed.
     /// Empty when the feature is off or a full-screen app owns the grid.
     fn block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
         use block_mode::BlockOutcome;
 
-        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+        if sess.projection.mode() != terminal::ProjectionMode::Identity {
             return Vec::new();
         }
-        let rows = sess.grid.len();
+        let rows = sess.projection.cells().len();
         if rows == 0 {
             return Vec::new();
         }
         let terminal = &sess.terminal;
-        let start = terminal.viewport_absolute_start();
-        let end = start + rows;
         let total = terminal.scrollback_len() + terminal.grid.rows();
         let running = terminal.running_zone_start();
         let live_prompt = terminal.live_prompt_row();
@@ -11175,13 +11287,36 @@ impl Frost {
         // matching the semantic Block palette in Anvil/Forge.
         let accent = self.c_accent();
         let mut paint = vec![terminal_view::BlockPaintRow::default(); rows];
+        let view_absolute_rows: Vec<_> = (0..rows)
+            .map(|row| sess.projection.view_row_absolute(row))
+            .collect();
+        let memberships = projected_zone_memberships(&view_absolute_rows, &spans);
+        let zone_view_edges: Vec<_> = spans
+            .iter()
+            .map(|&(zone_start, zone_end)| {
+                let top = terminal
+                    .raw_row_id_at_absolute(zone_start)
+                    .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                    .map(|(first, _)| first);
+                let bottom = zone_end
+                    .checked_sub(1)
+                    .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                    .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                    .map(|(_, last)| last);
+                (top, bottom)
+            })
+            .collect();
 
-        for (zone_index, (zone, &(zone_start, zone_end))) in
-            zones.iter().copied().zip(&spans).enumerate()
-        {
-            if zone_end <= start || zone_start >= end {
+        // Populate all finished-card rows in one projection-order sweep. The
+        // old per-zone `filter().collect()` rescanned and allocated for every
+        // zone (up to 256 * viewport rows on every frame).
+        for (view_row, membership) in memberships.rows.iter().copied().enumerate() {
+            let Some((zone_index, absolute_row)) = membership else {
                 continue;
-            }
+            };
+            let zone = zones[zone_index];
+            let (zone_start, _) = spans[zone_index];
+            let (top_view, bottom_view) = zone_view_edges[zone_index];
             let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
             let color = match outcome {
                 BlockOutcome::Success => self.theme.ansi_color(2),
@@ -11197,59 +11332,66 @@ impl Frost {
             };
             let selected = sess.block_selection.contains(zone.id);
             let active = sess.block_selection.active() == Some(zone.id);
-            for abs_row in zone_start.max(start)..zone_end.min(end) {
-                let row = &mut paint[abs_row - start];
-                row.selectable = true;
-                row.zone_id = Some(zone.id);
-                row.header_end_col = block_mode::finished_header_end_col(
-                    zone.command
-                        .as_deref()
-                        .is_some_and(|command| !command.trim().is_empty()),
-                    zone_start,
-                    zone.output_start,
-                    zone.output_start_col,
-                    abs_row,
-                );
-                row.stripe = Some(color);
-                row.stripe_strong = active;
-                // Zero is reserved for the live/input card below. The value is
-                // viewport-local; stable interactions continue to key on the
-                // terminal zone id rather than this paint grouping.
-                row.card_group = Some(zone_index + 1);
-                row.card_kind = card_kind;
-                row.card_top = abs_row == zone_start;
-                row.card_bottom = abs_row.saturating_add(1) == zone_end;
-                row.card_selected = selected;
-                row.card_selection_active = active;
-            }
-            if zone_start >= start {
-                let row = &mut paint[zone_start - start];
-                row.separator = true;
-                row.bookmarked = sess.block_bookmarks.contains(zone.id);
-                if let Some(plain) = block_mode::badge_text(outcome, zone.duration_ms) {
-                    // The selected block's badge appends its LOCAL finish
-                    // time. Two-stage fit (ember's rule): if the suffixed
-                    // badge no longer fits, fall back to the plain badge
-                    // before skipping the badge entirely.
-                    let suffixed = zone.finished_at_ms.filter(|_| active).map(|ms| {
-                        let offset = block_mode::local_offset_secs((ms / 1000) as i64);
-                        format!("{plain} · {}", block_mode::clock_at_offset(ms, offset))
-                    });
-                    // The badge also spans its inset from the scrollbar gutter
-                    // and its background padding; all of it must be blank.
-                    let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0)
-                        / self.metrics.cell_w.max(1.0))
+            let row = &mut paint[view_row];
+            row.selectable = true;
+            row.zone_id = Some(zone.id);
+            row.header_end_col = block_mode::finished_header_end_col(
+                zone.command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty()),
+                zone_start,
+                zone.output_start,
+                zone.output_start_col,
+                absolute_row,
+            );
+            row.stripe = Some(color);
+            row.stripe_strong = active;
+            // Zero is reserved for the live/input card below. The value is
+            // viewport-local; stable interactions continue to key on the
+            // terminal zone id rather than this paint grouping.
+            row.card_group = Some(zone_index + 1);
+            row.card_kind = card_kind;
+            row.card_top = top_view == Some(view_row);
+            row.card_bottom = bottom_view == Some(view_row);
+            row.card_selected = selected;
+            row.card_selection_active = active;
+        }
+
+        // Separators and badges exist only on a zone's real projected top, so
+        // this bounded zone pass never scans viewport rows.
+        for (zone_index, zone) in zones.iter().copied().enumerate() {
+            let Some(top_view) = zone_view_edges[zone_index].0 else {
+                continue;
+            };
+            let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+            let color = match outcome {
+                BlockOutcome::Success => self.theme.ansi_color(2),
+                BlockOutcome::Failed(_) => self.theme.ansi_color(1),
+                BlockOutcome::Unknown => self.theme.ansi_color(3),
+                BlockOutcome::Background => accent,
+            };
+            let active = sess.block_selection.active() == Some(zone.id);
+            let row = &mut paint[top_view];
+            row.separator = true;
+            row.bookmarked = sess.block_bookmarks.contains(zone.id);
+            if let Some(plain) = block_mode::badge_text(outcome, zone.duration_ms) {
+                // The selected block's badge appends its LOCAL finish time.
+                // If the suffix no longer fits, retain the plain badge.
+                let suffixed = zone.finished_at_ms.filter(|_| active).map(|ms| {
+                    let offset = block_mode::local_offset_secs((ms / 1000) as i64);
+                    format!("{plain} · {}", block_mode::clock_at_offset(ms, offset))
+                });
+                let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0))
                     .ceil() as usize;
-                    let chars: Vec<char> = sess.grid[zone_start - start]
-                        .iter()
-                        .map(Self::block_badge_cell_char)
-                        .collect();
-                    for badge in suffixed.into_iter().chain(std::iter::once(plain)) {
-                        let needed = badge.chars().count() + inset;
-                        if block_mode::badge_fits(&chars, needed) {
-                            row.badge = Some((badge, color));
-                            break;
-                        }
+                let chars: Vec<char> = sess.projection.cells()[top_view]
+                    .iter()
+                    .map(Self::block_badge_cell_char)
+                    .collect();
+                for badge in suffixed.into_iter().chain(std::iter::once(plain)) {
+                    let needed = badge.chars().count() + inset;
+                    if block_mode::badge_fits(&chars, needed) {
+                        row.badge = Some((badge, color));
+                        break;
                     }
                 }
             }
@@ -11265,25 +11407,35 @@ impl Frost {
                     .scrollback_len()
                     .saturating_add(terminal.get_cursor_pos().0)
             });
-            if let Some(span) =
-                block_mode::visible_active_span(active_start, active_extent_row, total, start, end)
-            {
-                for abs_row in span.start..span.end {
-                    let row = &mut paint[abs_row - start];
+            let active_end = active_extent_row
+                .saturating_add(1)
+                .max(active_start.saturating_add(block_mode::MIN_INPUT_ROWS))
+                .min(total);
+            let active_top_view = terminal
+                .raw_row_id_at_absolute(active_start)
+                .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                .map(|(first, _)| first);
+            let active_bottom_view = active_end
+                .checked_sub(1)
+                .and_then(|row| terminal.raw_row_id_at_absolute(row))
+                .and_then(|row| sess.projection.raw_row_view_bounds(row))
+                .map(|(_, last)| last);
+            for (view_row, absolute_row) in view_absolute_rows.iter().copied().enumerate() {
+                if absolute_row.is_some_and(|row| row >= active_start && row < active_end) {
+                    let row = &mut paint[view_row];
                     row.app_eligible = true;
                     row.stripe = Some(accent);
                     row.card_group = Some(0);
                     row.card_kind = terminal_view::BlockCardKind::Active;
-                    row.card_top = span.real_top && abs_row == span.start;
-                    row.card_bottom = span.real_bottom && abs_row.saturating_add(1) == span.end;
+                    row.card_top = active_top_view == Some(view_row);
+                    row.card_bottom = active_bottom_view == Some(view_row);
                 }
             }
-            if active_start >= start && active_start < end {
-                let row = &mut paint[active_start - start];
+            if let Some(active_top_view) = active_top_view {
+                let row = &mut paint[active_top_view];
                 row.separator = true;
                 if running.is_some() {
-                    if let Some((badge, _)) = self.fitting_running_badge(sess, active_start - start)
-                    {
+                    if let Some((badge, _)) = self.fitting_running_badge(sess, active_top_view) {
                         row.badge = Some((badge, accent));
                     }
                 }
@@ -11347,8 +11499,11 @@ impl Frost {
         // Only walk the grid to build per-row selection spans when a selection
         // actually exists; otherwise hand the widget an empty Vec (no highlight).
         let selection: Vec<Option<(usize, usize)>> = if sess.terminal.selection.is_some() {
-            (0..sess.grid.len())
-                .map(|r| sess.terminal.row_selection_cols(r))
+            (0..sess.projection.cells().len())
+                .map(|r| {
+                    sess.terminal
+                        .row_selection_cols_in_projection(&sess.projection, r)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -11356,22 +11511,21 @@ impl Frost {
         // Only paint match highlights while the search bar is open; otherwise
         // stale matches (whose line indices drift as the grid scrolls) linger.
         let (search_matches, current) = if is_active && self.search.is_open {
-            let start = sess.terminal.viewport_absolute_start();
-            let end = start.saturating_add(sess.grid.len());
             let visible = self
                 .search
                 .matches
                 .iter()
-                .filter(|m| m.line >= start && m.line < end)
-                .map(|m| search::SearchMatch {
-                    line: m.line - start,
-                    col_start: m.col_start,
-                    col_end: m.col_end,
+                .filter_map(|matched| {
+                    project_search_match(&sess.terminal, &sess.projection, matched)
                 })
                 .collect();
-            let current = self.search.current_match().and_then(|m| {
-                (m.line >= start && m.line < end).then_some((m.line - start, m.col_start))
-            });
+            let current = self
+                .search
+                .current_match()
+                .and_then(|matched| {
+                    project_search_match(&sess.terminal, &sess.projection, &matched)
+                })
+                .map(|m| (m.line, m.col_start));
             (visible, current)
         } else {
             (Vec::new(), None)
@@ -11389,7 +11543,7 @@ impl Frost {
             sess.terminal.has_usable_block_partitions(),
         );
         TermWidget::new(
-            &sess.grid,
+            sess.projection.cells(),
             sess.cursor,
             sess.cursor_visible,
             sess.terminal.cursor_shape,
@@ -11402,7 +11556,7 @@ impl Frost {
             self.math_symbol,
             self.nerd_symbol,
             selection,
-            sess.terminal.scroll_offset,
+            sess.projection.scroll_offset(),
             sess.terminal.scrollback_len(),
         )
         .modifiers(
@@ -13917,8 +14071,8 @@ impl Frost {
         // unfocused) then stays fully idle.
         let has_blink = self.layout().leaves().iter().any(|&idx| {
             self.sessions.get(idx).is_some_and(|s| {
-                s.terminal
-                    .grid
+                s.projection
+                    .cells()
                     .iter()
                     .flatten()
                     .any(|cell| cell.flags.blink())
@@ -14803,6 +14957,123 @@ mod tests {
     }
 
     #[test]
+    fn search_matches_use_exact_projected_origins_and_fail_closed() {
+        let mut terminal = terminal::TerminalState::new(4, 3);
+        let mut raw = vec![terminal::TerminalCell::default(); 8];
+        for (cell, ch) in raw.iter_mut().zip("abcdef".chars()) {
+            cell.character = ch;
+        }
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&raw, false));
+        terminal.set_scroll_offset(1);
+        let projection = terminal.get_projected_viewport(true);
+
+        assert_eq!(
+            project_search_match(
+                &terminal,
+                &projection,
+                &search::SearchMatch {
+                    line: 0,
+                    col_start: 4,
+                    col_end: 6,
+                },
+            ),
+            Some(search::SearchMatch {
+                line: 0,
+                col_start: 0,
+                col_end: 2,
+            })
+        );
+        assert_eq!(
+            project_search_match(
+                &terminal,
+                &projection,
+                &search::SearchMatch {
+                    line: 0,
+                    col_start: 5,
+                    col_end: 8,
+                },
+            ),
+            None,
+            "trimmed trailing padding must not inherit the nearest origin"
+        );
+    }
+
+    #[test]
+    fn projected_zone_sweep_is_linear_and_keeps_padding_unowned() {
+        let view_rows: Vec<_> = (0..512).map(|row| (row != 257).then_some(row)).collect();
+        let spans: Vec<_> = (0..256).map(|zone| (zone * 2, zone * 2 + 2)).collect();
+        let memberships = projected_zone_memberships(&view_rows, &spans);
+
+        assert!(memberships.scan_steps <= view_rows.len() + spans.len());
+        assert_eq!(memberships.rows[0], Some((0, 0)));
+        assert_eq!(memberships.rows[256], Some((128, 256)));
+        assert_eq!(memberships.rows[257], None);
+        assert_eq!(memberships.rows[511], Some((255, 511)));
+    }
+
+    #[test]
+    fn empty_history_row_retains_finished_block_target_without_cell_origin() {
+        let mut terminal = terminal::TerminalState::new(8, 3);
+        let mut first = vec![terminal::TerminalCell::default(); 8];
+        first[0].character = 'A';
+        let empty = vec![terminal::TerminalCell::default(); 8];
+        let mut last = vec![terminal::TerminalCell::default(); 8];
+        last[0].character = 'Z';
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&first, false));
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&empty, false));
+        terminal
+            .scrollback
+            .push_back(terminal::ScrollbackLine::compress(&last, false));
+        terminal.command_zones.push_back(terminal::CommandZone {
+            id: 41,
+            prompt_start: 0,
+            command_start: Some(0),
+            output_start: Some(0),
+            output_start_col: 0,
+            output_end: Some(2),
+            exit_code: Some(0),
+            command: Some("fixture".into()),
+            duration_ms: None,
+            finished_at_ms: None,
+            command_truncated: false,
+            cwd: None,
+            captured_output: None,
+            captured_output_evicted: false,
+            completion_observed: true,
+            rows_evicted: false,
+        });
+        terminal.set_scroll_offset(terminal.scrollback_len());
+        let projection = terminal.get_projected_viewport(true);
+        let blank_view_row = (0..projection.cells().len())
+            .find(|row| projection.view_row_absolute(*row) == Some(1))
+            .expect("pure empty history row remains projected");
+
+        assert_eq!(
+            projection.view_to_raw(terminal::ViewportCell {
+                row: blank_view_row,
+                col: 0,
+            }),
+            None,
+            "row ownership must not manufacture a selectable cell"
+        );
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &projection, blank_view_row),
+            Some(41),
+            "stripe/card and right-click target retain the finished zone"
+        );
+        assert_eq!(
+            validated_claimed_block_target(Some(41), Some(41), true),
+            Some(41)
+        );
+    }
+
+    #[test]
     fn claimed_block_press_does_not_retarget_after_pty_viewport_shift() {
         let mut terminal = terminal::TerminalState::new(24, 4);
         for index in 0..4 {
@@ -14821,8 +15092,10 @@ mod tests {
         let mut mappings = Vec::new();
         for offset in 0..=terminal.scrollback_len() {
             terminal.set_scroll_offset(offset);
+            let projection = terminal.get_projected_viewport(true);
             for row in 0..rows {
-                if let Some(id) = finalized_block_at_viewport_row(true, &terminal, row) {
+                if let Some(id) = finalized_block_at_viewport_row(true, &terminal, &projection, row)
+                {
                     mappings.push((offset, row, id));
                 }
             }
@@ -14841,13 +15114,15 @@ mod tests {
             .expect("fixture must shift one viewport row onto a neighbouring block");
 
         terminal.set_scroll_offset(render_offset);
+        let render_projection = terminal.get_projected_viewport(true);
         assert_eq!(
-            finalized_block_at_viewport_row(true, &terminal, row),
+            finalized_block_at_viewport_row(true, &terminal, &render_projection, row),
             Some(rendered_id)
         );
         terminal.set_scroll_offset(dispatch_offset);
+        let dispatch_projection = terminal.get_projected_viewport(true);
         assert_eq!(
-            finalized_block_at_viewport_row(true, &terminal, row),
+            finalized_block_at_viewport_row(true, &terminal, &dispatch_projection, row),
             Some(current_id)
         );
         assert!(terminal.zone_by_id(rendered_id).is_some());

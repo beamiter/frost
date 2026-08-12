@@ -4,7 +4,15 @@ use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTED_HISTORY_DECOMPRESS_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 /// Character class for word selection boundaries.
 #[derive(PartialEq)]
@@ -75,6 +83,34 @@ pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
 
+/// Stable identity of one retained physical terminal row.
+///
+/// The identity follows a row while it moves between the live grid and
+/// scrollback. Operations that physically re-materialize history (rather than
+/// merely moving a retained row) allocate new identities, so stale projected
+/// coordinates fail closed instead of being guessed onto unrelated content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RawRowId(u64);
+
+impl RawRowId {
+    const UNTRACKED: Self = Self(0);
+
+    fn fresh() -> Self {
+        static NEXT_RAW_ROW_ID: AtomicU64 = AtomicU64::new(1);
+        NEXT_RAW_ROW_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map(Self)
+            .unwrap_or(Self::UNTRACKED)
+    }
+
+    #[inline]
+    fn is_tracked(self) -> bool {
+        self != Self::UNTRACKED
+    }
+}
+
 pub fn clamp_terminal_dimensions(cols: usize, rows: usize) -> (usize, usize) {
     (
         cols.clamp(1, MAX_TERMINAL_COLS),
@@ -90,6 +126,8 @@ pub struct TerminalGrid {
     rows: usize,
     cols: usize,
     pub row_wrapped: Vec<bool>,
+    row_ids: Vec<RawRowId>,
+    identity_revision: u64,
 }
 
 impl TerminalGrid {
@@ -99,6 +137,8 @@ impl TerminalGrid {
             rows,
             cols,
             row_wrapped: vec![false; rows],
+            row_ids: (0..rows).map(|_| RawRowId::fresh()).collect(),
+            identity_revision: 1,
         }
     }
 
@@ -120,6 +160,17 @@ impl TerminalGrid {
     #[inline]
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// Identity of a retained physical grid row.
+    #[inline]
+    pub fn raw_row_id(&self, row: usize) -> Option<RawRowId> {
+        self.row_ids.get(row).copied()
+    }
+
+    #[inline]
+    fn bump_identity_revision(&mut self) {
+        self.identity_revision = self.identity_revision.wrapping_add(1).max(1);
     }
 
     /// 获取行作Vec引用（用于兼容旧代码）
@@ -199,6 +250,9 @@ impl TerminalGrid {
         self.cells[last_start..].fill(TerminalCell::default());
         self.row_wrapped.copy_within(1.., 0);
         self.row_wrapped[self.rows - 1] = false;
+        self.row_ids.copy_within(1.., 0);
+        self.row_ids[self.rows - 1] = RawRowId::fresh();
+        self.bump_identity_revision();
     }
 
     /// 是否为空
@@ -236,8 +290,12 @@ impl TerminalGrid {
         let mut new_wrapped = vec![false; new_rows];
         new_wrapped[..copy_rows].copy_from_slice(&self.row_wrapped[..copy_rows]);
         self.row_wrapped = new_wrapped;
+        let mut new_row_ids: Vec<_> = (0..new_rows).map(|_| RawRowId::fresh()).collect();
+        new_row_ids[..copy_rows].copy_from_slice(&self.row_ids[..copy_rows]);
+        self.row_ids = new_row_ids;
         self.rows = new_rows;
         self.cols = new_cols;
+        self.bump_identity_revision();
     }
 
     /// 获取mut访问所有行
@@ -481,6 +539,7 @@ pub struct ScrollbackLine {
     data: CompressedLineData,
     pub is_wrapped: bool,
     cols: u16,
+    raw_row_id: RawRowId,
 }
 
 #[derive(Clone, Debug)]
@@ -491,6 +550,14 @@ enum CompressedLineData {
 
 impl ScrollbackLine {
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
+        Self::compress_with_raw_row_id(cells, is_wrapped, RawRowId::fresh())
+    }
+
+    fn compress_with_raw_row_id(
+        cells: &[TerminalCell],
+        is_wrapped: bool,
+        raw_row_id: RawRowId,
+    ) -> Self {
         let cols = cells.len() as u16;
         let trailing_blanks = cells
             .iter()
@@ -520,6 +587,7 @@ impl ScrollbackLine {
                 data: CompressedLineData::Plain(text, trailing_blanks as u16),
                 is_wrapped,
                 cols,
+                raw_row_id,
             }
         } else {
             let encoded = Self::encode_cells(&cells[..active_len]);
@@ -527,11 +595,19 @@ impl ScrollbackLine {
                 data: CompressedLineData::Encoded(encoded),
                 is_wrapped,
                 cols,
+                raw_row_id,
             }
         }
     }
 
+    /// Identity of this retained physical scrollback row.
+    pub fn raw_row_id(&self) -> RawRowId {
+        self.raw_row_id
+    }
+
     pub fn decompress(&self) -> Vec<TerminalCell> {
+        #[cfg(test)]
+        PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(count.get() + 1));
         match &self.data {
             CompressedLineData::Plain(text, trailing) => {
                 let mut cells: Vec<TerminalCell> = text
@@ -762,7 +838,7 @@ impl ScrollbackLine {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalCell {
     pub character: char,
     pub foreground: Color,
@@ -782,7 +858,255 @@ impl Default for TerminalCell {
 }
 
 const _: () = assert!(std::mem::size_of::<TerminalCell>() == 16);
-type VisibleCellsCache = (u64, usize, std::sync::Arc<Vec<Vec<TerminalCell>>>);
+type VisibleCellsCache = (
+    u64,
+    usize,
+    std::sync::Arc<Vec<Vec<TerminalCell>>>,
+    Option<std::sync::Arc<ProjectedProvenance>>,
+);
+
+/// Stable raw provenance of one displayed cell.
+///
+/// Wide-character continuation cells retain their own raw column. Synthetic
+/// padding has no origin and therefore cannot accidentally target a raw cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawCellOrigin {
+    pub row: RawRowId,
+    pub col: usize,
+}
+
+/// A cell coordinate in the currently projected viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ViewportCell {
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Revisions of the raw sources used to build a projected viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectionSourceRevision {
+    pub grid: u64,
+    pub history: u64,
+    pub row_identity: u64,
+    pub alternate_screen: bool,
+}
+
+/// Whether semantic history projection is eligible for this snapshot. P0's
+/// cell output is identical in both modes, but the distinction is part of the
+/// cache contract so disabling Block Mode or entering alt screen can never
+/// reuse a future transformed projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProjectionMode {
+    Identity,
+    Bypass,
+}
+
+/// Complete immutable identity of a projected viewport materialization.
+/// Consumer caches use this key instead of the diagnostic view revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectionKey {
+    pub source: ProjectionSourceRevision,
+    pub scroll_offset: usize,
+    pub rows: usize,
+    pub cols: usize,
+    pub mode: ProjectionMode,
+}
+
+/// Immutable view of the existing terminal materialization plus stable raw
+/// provenance. P0 is deliberately identity-only: it cannot collapse, filter,
+/// delete, or otherwise change visible cells.
+#[derive(Clone, Debug)]
+pub struct ProjectedViewport {
+    cells: std::sync::Arc<Vec<Vec<TerminalCell>>>,
+    row_wrapped: std::sync::Arc<Vec<bool>>,
+    provenance: std::sync::Arc<ProjectedProvenance>,
+    raw_span_index: std::sync::Arc<Vec<usize>>,
+    /// Sorted `(raw row, display row)` pairs. A display row may contain cells
+    /// from more than one soft-wrapped raw row, while a logically empty raw
+    /// row contributes only row provenance and no cell-origin span.
+    raw_row_index: std::sync::Arc<Vec<(RawRowId, usize)>>,
+    source_revision: ProjectionSourceRevision,
+    view_revision: u64,
+    identity_fast_path: bool,
+    mode: ProjectionMode,
+    scroll_offset: usize,
+}
+
+impl ProjectedViewport {
+    pub fn cells(&self) -> &[Vec<TerminalCell>] {
+        self.cells.as_ref()
+    }
+
+    pub fn row_wrapped(&self) -> &[bool] {
+        self.row_wrapped.as_ref()
+    }
+
+    pub fn view_to_raw(&self, cell: ViewportCell) -> Option<RawCellOrigin> {
+        let start = self
+            .provenance
+            .origin_spans
+            .partition_point(|span| span.view_row < cell.row);
+        self.provenance.origin_spans[start..]
+            .iter()
+            .take_while(|span| span.view_row == cell.row)
+            .find_map(|span| span.view_to_raw(cell))
+    }
+
+    pub fn raw_to_view(&self, origin: RawCellOrigin) -> Option<ViewportCell> {
+        if !origin.row.is_tracked() {
+            return None;
+        }
+        let start = self
+            .raw_span_index
+            .partition_point(|index| self.provenance.origin_spans[*index].raw_row < origin.row);
+        self.raw_span_index[start..]
+            .iter()
+            .map(|index| &self.provenance.origin_spans[*index])
+            .take_while(|span| span.raw_row == origin.row)
+            .find_map(|span| span.raw_to_view(origin))
+    }
+
+    /// Inclusive display-row bounds occupied by one tracked raw row.
+    pub fn raw_row_view_bounds(&self, row: RawRowId) -> Option<(usize, usize)> {
+        if !row.is_tracked() {
+            return None;
+        }
+        let start = self
+            .raw_row_index
+            .partition_point(|(raw_row, _)| *raw_row < row);
+        let mut rows = self.raw_row_index[start..]
+            .iter()
+            .take_while(|(raw_row, _)| *raw_row == row)
+            .map(|(_, view_row)| *view_row);
+        let first = rows.next()?;
+        Some(rows.fold((first, first), |(min, max), view_row| {
+            (min.min(view_row), max.max(view_row))
+        }))
+    }
+
+    /// Snapshot-local absolute buffer row backing the first real cell on a
+    /// display row. Structural padding has no answer and fails closed.
+    pub fn view_row_absolute(&self, view_row: usize) -> Option<usize> {
+        self.provenance
+            .row_sources
+            .get(view_row)
+            .copied()
+            .flatten()
+            .map(|source| source.raw_absolute_row)
+    }
+
+    pub fn key(&self) -> ProjectionKey {
+        ProjectionKey {
+            source: self.source_revision,
+            scroll_offset: self.scroll_offset,
+            rows: self.cells.len(),
+            cols: self.cells.first().map_or(0, Vec::len),
+            mode: self.mode,
+        }
+    }
+
+    pub fn view_revision(&self) -> u64 {
+        self.view_revision
+    }
+
+    /// P0 projections are semantic identities even when the terminal's legacy
+    /// history materializer itself has to reflow retained rows for display.
+    pub fn is_identity(&self) -> bool {
+        true
+    }
+
+    /// Whether provenance was built by the direct live-grid O(rows * cols)
+    /// path, with no legacy history reflow required.
+    pub fn uses_identity_fast_path(&self) -> bool {
+        self.identity_fast_path
+    }
+
+    pub fn mode(&self) -> ProjectionMode {
+        self.mode
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    #[cfg(test)]
+    fn origin_span_count(&self) -> usize {
+        self.provenance.origin_spans.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectedViewportCacheKey {
+    grid_version: u64,
+    history_revision: u64,
+    row_identity_revision: u64,
+    scroll_offset: usize,
+    rows: usize,
+    cols: usize,
+    use_alt_buffer: bool,
+    mode: ProjectionMode,
+}
+
+type ProjectedViewportCache = (ProjectedViewportCacheKey, std::sync::Arc<ProjectedViewport>);
+
+#[derive(Debug)]
+struct ProjectedLine {
+    cells: Vec<TerminalCell>,
+    spans: Vec<LineOriginSpan>,
+    row_source: Option<RowSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowSource {
+    raw_row: RawRowId,
+    raw_absolute_row: usize,
+}
+
+#[derive(Debug)]
+struct ProjectedProvenance {
+    origin_spans: Vec<OriginSpan>,
+    row_sources: Vec<Option<RowSource>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineOriginSpan {
+    view_col_start: usize,
+    view_col_end: usize,
+    raw_row: RawRowId,
+    raw_col_start: usize,
+    raw_absolute_row: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OriginSpan {
+    view_row: usize,
+    view_col_start: usize,
+    view_col_end: usize,
+    raw_row: RawRowId,
+    raw_col_start: usize,
+}
+
+impl OriginSpan {
+    fn view_to_raw(&self, cell: ViewportCell) -> Option<RawCellOrigin> {
+        (cell.row == self.view_row
+            && (self.view_col_start..self.view_col_end).contains(&cell.col)
+            && self.raw_row.is_tracked())
+        .then_some(RawCellOrigin {
+            row: self.raw_row,
+            col: self.raw_col_start + cell.col - self.view_col_start,
+        })
+    }
+
+    fn raw_to_view(&self, origin: RawCellOrigin) -> Option<ViewportCell> {
+        let len = self.view_col_end - self.view_col_start;
+        (origin.row == self.raw_row
+            && (self.raw_col_start..self.raw_col_start + len).contains(&origin.col))
+        .then_some(ViewportCell {
+            row: self.view_row,
+            col: self.view_col_start + origin.col - self.raw_col_start,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMode {
@@ -1378,6 +1702,12 @@ pub struct TerminalState {
 
     // Cached visible cells to avoid per-frame cloning
     visible_cells_cache: Option<VisibleCellsCache>,
+    /// Monotonic revision of retained-history membership/identity.
+    history_revision: u64,
+    /// Identity projection cache. Its key includes every viewport and raw-row
+    /// structural input; cell contents continue to use `grid_version`.
+    projected_viewport_cache: Option<ProjectedViewportCache>,
+    next_projected_view_revision: u64,
 
     // OSC 8 hyperlink tracking
     current_hyperlink: Option<(String, Option<String>)>, // (url, id)
@@ -1641,6 +1971,9 @@ impl TerminalState {
             // This ensures dirty tracking works correctly even with scrollback
             row_versions: vec![1; rows], // Use 'rows' here since grid.rows() == rows at init
             visible_cells_cache: None,
+            history_revision: 1,
+            projected_viewport_cache: None,
+            next_projected_view_revision: 1,
             current_hyperlink: None,
             osc8_hyperlinks: Vec::new(),
             sync_output_active: false,
@@ -2732,10 +3065,17 @@ impl TerminalState {
     /// copy/Markdown for old zones; the snapshot taken at finalization is
     /// what makes retention meaningful. The in-progress zone clamps to row
     /// zero so a still-running command keeps producing a usable zone.
+    fn bump_history_revision(&mut self) {
+        self.history_revision = self.history_revision.wrapping_add(1).max(1);
+        self.visible_cells_cache = None;
+        self.projected_viewport_cache = None;
+    }
+
     fn on_scrollback_rows_trimmed(&mut self, count: usize) {
         if count == 0 {
             return;
         }
+        self.bump_history_revision();
         self.kitty_graphics.on_buffer_rows_trimmed(count);
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
@@ -4128,6 +4468,7 @@ impl TerminalState {
             self.on_scrollback_rows_trimmed(1);
         }
         self.scrollback.push_back(line);
+        self.bump_history_revision();
         // Pin the viewport when the user is reading history: without this,
         // start_idx = scrollback.len() - scroll_offset - rows drifts by +1
         // for every new line, sliding the visible region toward the bottom.
@@ -4152,6 +4493,9 @@ impl TerminalState {
         self.grid.cells[src_start..src_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top..bottom, top + 1);
         self.grid.row_wrapped[top] = false;
+        self.grid.row_ids.copy_within(top..bottom, top + 1);
+        self.grid.row_ids[top] = RawRowId::fresh();
+        self.grid.bump_identity_revision();
         self.mark_rows_dirty(top, bottom);
     }
 
@@ -4172,9 +4516,10 @@ impl TerminalState {
         let allow_alt_scrollback = self.use_alt_buffer && self.sync_output_active;
         let scrollback_line =
             if scrolls_off_screen_top && (!self.use_alt_buffer || allow_alt_scrollback) {
-                Some(ScrollbackLine::compress(
+                Some(ScrollbackLine::compress_with_raw_row_id(
                     &self.grid[top],
                     self.grid.row_wrapped[top],
+                    self.grid.row_ids[top],
                 ))
             } else {
                 None
@@ -4189,6 +4534,9 @@ impl TerminalState {
         self.grid.cells[blank_start..blank_start + cols].fill(blank);
         self.grid.row_wrapped.copy_within(top + 1..=bottom, top);
         self.grid.row_wrapped[bottom] = false;
+        self.grid.row_ids.copy_within(top + 1..bottom + 1, top);
+        self.grid.row_ids[bottom] = RawRowId::fresh();
+        self.grid.bump_identity_revision();
 
         self.mark_rows_dirty(top, bottom);
 
@@ -4277,11 +4625,6 @@ impl TerminalState {
         for row in start..=end.min(self.row_versions.len().saturating_sub(1)) {
             self.row_versions[row] = self.grid_version;
         }
-    }
-
-    /// P4：获取网格版本号（用于缓存比较）
-    pub fn get_grid_version(&self) -> u64 {
-        self.grid_version
     }
 
     pub fn take_osc52_clipboard_set(&mut self) -> Option<String> {
@@ -5131,6 +5474,12 @@ impl TerminalState {
                         let dst = (self.cursor_row + 1) * cols;
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         self.grid.cells[src_start..src_start + cols].fill(blank);
+                        self.grid.row_ids.copy_within(
+                            self.cursor_row..self.scroll_region_bottom,
+                            self.cursor_row + 1,
+                        );
+                        self.grid.row_ids[self.cursor_row] = RawRowId::fresh();
+                        self.grid.bump_identity_revision();
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
@@ -5149,6 +5498,12 @@ impl TerminalState {
                         self.grid.cells.copy_within(src_start..src_end, dst);
                         let blank_start = self.scroll_region_bottom * cols;
                         self.grid.cells[blank_start..blank_start + cols].fill(blank);
+                        self.grid.row_ids.copy_within(
+                            self.cursor_row + 1..self.scroll_region_bottom + 1,
+                            self.cursor_row,
+                        );
+                        self.grid.row_ids[self.scroll_region_bottom] = RawRowId::fresh();
+                        self.grid.bump_identity_revision();
                     }
                 }
                 self.mark_rows_dirty(self.cursor_row, self.scroll_region_bottom);
@@ -5633,6 +5988,9 @@ impl TerminalState {
         self.pending_wrap = false;
         // xterm RIS also discards saved lines and resets cursor style, dynamic
         // colors, keyboard-protocol state, selection, and any open hyperlink.
+        if !self.scrollback.is_empty() {
+            self.bump_history_revision();
+        }
         self.scrollback.clear();
         self.command_zones.clear();
         self.captured_output_bytes = 0;
@@ -5985,6 +6343,40 @@ impl TerminalState {
     /// Absolute buffer row represented by viewport row zero.
     pub fn viewport_absolute_start(&self) -> usize {
         self.scrollback.len().saturating_sub(self.scroll_offset)
+    }
+
+    /// Stable identity of one currently retained absolute buffer row.
+    pub fn raw_row_id_at_absolute(&self, absolute_row: usize) -> Option<RawRowId> {
+        if absolute_row < self.scrollback.len() {
+            self.scrollback
+                .get(absolute_row)
+                .map(ScrollbackLine::raw_row_id)
+                .filter(|row| row.is_tracked())
+        } else {
+            self.grid
+                .raw_row_id(absolute_row - self.scrollback.len())
+                .filter(|row| row.is_tracked())
+        }
+    }
+
+    /// Stable identity of one currently retained absolute buffer cell.
+    pub fn raw_cell_origin_at_absolute(
+        &self,
+        absolute_row: usize,
+        col: usize,
+    ) -> Option<RawCellOrigin> {
+        let width = if absolute_row < self.scrollback.len() {
+            self.scrollback.get(absolute_row)?.cols as usize
+        } else {
+            self.grid.cols()
+        };
+        if col >= width {
+            return None;
+        }
+        Some(RawCellOrigin {
+            row: self.raw_row_id_at_absolute(absolute_row)?,
+            col,
+        })
     }
 
     /// Scroll just enough to reveal an absolute (`scrollback + grid`) row,
@@ -6391,8 +6783,334 @@ impl TerminalState {
         std::mem::take(&mut self.pending_clipboard_requests)
     }
 
+    fn reflow_projected_origins(
+        lines: &[ScrollbackLine],
+        new_cols: usize,
+        raw_absolute_start: usize,
+    ) -> Vec<ProjectedLine> {
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < lines.len() {
+            let group_first_source = lines[i].raw_row_id.is_tracked().then_some(RowSource {
+                raw_row: lines[i].raw_row_id,
+                raw_absolute_row: raw_absolute_start + i,
+            });
+            let mut logical_cells: Vec<TerminalCell> = Vec::new();
+            let mut logical_spans: Vec<LineOriginSpan> = Vec::new();
+            let mut append_line = |line: &ScrollbackLine, raw_absolute_row: usize| {
+                let decompressed = line.decompress();
+                let retained = Self::strip_trailing_blanks(&decompressed);
+                let view_col_start = logical_cells.len();
+                logical_cells.extend_from_slice(retained);
+                if !retained.is_empty() && line.raw_row_id.is_tracked() {
+                    logical_spans.push(LineOriginSpan {
+                        view_col_start,
+                        view_col_end: logical_cells.len(),
+                        raw_row: line.raw_row_id,
+                        raw_col_start: 0,
+                        raw_absolute_row,
+                    });
+                }
+            };
+
+            append_line(&lines[i], raw_absolute_start + i);
+            while i < lines.len() && lines[i].is_wrapped {
+                i += 1;
+                if i < lines.len() {
+                    append_line(&lines[i], raw_absolute_start + i);
+                }
+            }
+            i += 1;
+
+            if logical_cells.is_empty() {
+                result.push(ProjectedLine {
+                    cells: vec![TerminalCell::default(); new_cols],
+                    spans: Vec::new(),
+                    row_source: group_first_source,
+                });
+                continue;
+            }
+
+            if new_cols == 1 {
+                for (logical_col, cell) in logical_cells.iter().enumerate() {
+                    if cell.flags.wide_continuation() {
+                        continue;
+                    }
+                    let mut projected_cell = *cell;
+                    projected_cell.flags.set_wide(false);
+                    let spans = logical_spans
+                        .iter()
+                        .find(|span| {
+                            (span.view_col_start..span.view_col_end).contains(&logical_col)
+                        })
+                        .map(|span| {
+                            vec![LineOriginSpan {
+                                view_col_start: 0,
+                                view_col_end: 1,
+                                raw_row: span.raw_row,
+                                raw_col_start: span.raw_col_start + logical_col
+                                    - span.view_col_start,
+                                raw_absolute_row: span.raw_absolute_row,
+                            }]
+                        })
+                        .unwrap_or_default();
+                    result.push(ProjectedLine {
+                        cells: vec![projected_cell],
+                        row_source: spans.first().map(|span| RowSource {
+                            raw_row: span.raw_row,
+                            raw_absolute_row: span.raw_absolute_row,
+                        }),
+                        spans,
+                    });
+                }
+                continue;
+            }
+
+            let mut offset = 0;
+            while offset < logical_cells.len() {
+                let mut end = (offset + new_cols).min(logical_cells.len());
+                if end < logical_cells.len()
+                    && logical_cells[end].flags.wide_continuation()
+                    && end > offset
+                {
+                    end -= 1;
+                }
+                let spans: Vec<LineOriginSpan> = logical_spans
+                    .iter()
+                    .filter_map(|span| {
+                        let overlap_start = span.view_col_start.max(offset);
+                        let overlap_end = span.view_col_end.min(end);
+                        (overlap_start < overlap_end).then_some(LineOriginSpan {
+                            view_col_start: overlap_start - offset,
+                            view_col_end: overlap_end - offset,
+                            raw_row: span.raw_row,
+                            raw_col_start: span.raw_col_start + overlap_start - span.view_col_start,
+                            raw_absolute_row: span.raw_absolute_row,
+                        })
+                    })
+                    .collect();
+                let mut cells = logical_cells[offset..end].to_vec();
+                cells.resize(new_cols, TerminalCell::default());
+                let row_source = spans.first().map(|span| RowSource {
+                    raw_row: span.raw_row,
+                    raw_absolute_row: span.raw_absolute_row,
+                });
+                result.push(ProjectedLine {
+                    cells,
+                    spans,
+                    row_source,
+                });
+                offset = end;
+            }
+        }
+
+        result
+    }
+
+    fn live_view_provenance(&self, rows: usize, cols: usize) -> ProjectedProvenance {
+        let mut origin_spans = Vec::with_capacity(rows);
+        let mut row_sources = Vec::with_capacity(rows);
+        for (view_row, raw_row) in self.grid.row_ids.iter().copied().take(rows).enumerate() {
+            let source = raw_row.is_tracked().then_some(RowSource {
+                raw_row,
+                raw_absolute_row: self.scrollback.len() + view_row,
+            });
+            row_sources.push(source);
+            if let Some(source) = source {
+                origin_spans.push(OriginSpan {
+                    view_row,
+                    view_col_start: 0,
+                    view_col_end: cols,
+                    raw_row: source.raw_row,
+                    raw_col_start: 0,
+                });
+            }
+        }
+        ProjectedProvenance {
+            origin_spans,
+            row_sources,
+        }
+    }
+
+    fn materialize_scrolled_viewport(
+        &self,
+        rows: usize,
+        cols: usize,
+    ) -> (Vec<Vec<TerminalCell>>, ProjectedProvenance) {
+        let mut start_idx = self
+            .scrollback
+            .len()
+            .saturating_sub(self.scroll_offset + rows);
+        while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
+            start_idx -= 1;
+        }
+        let history: Vec<_> = self.scrollback.iter().skip(start_idx).cloned().collect();
+        let reflowed = Self::reflow_projected_origins(&history, cols, start_idx);
+        let skip = reflowed.len().saturating_sub(self.scroll_offset + rows);
+        let visible_start = skip + (reflowed.len() - skip).saturating_sub(self.scroll_offset);
+        let history_rows = (reflowed.len() - visible_start).min(rows);
+        let mut cells: Vec<Vec<TerminalCell>> = reflowed[visible_start..]
+            .iter()
+            .take(rows)
+            .map(|line| line.cells.clone())
+            .collect();
+        let mut row_sources: Vec<_> = reflowed[visible_start..]
+            .iter()
+            .take(rows)
+            .map(|line| line.row_source)
+            .collect();
+        let mut spans = Vec::new();
+        for (view_row, line) in reflowed[visible_start..].iter().take(rows).enumerate() {
+            spans.extend(line.spans.iter().map(|span| OriginSpan {
+                view_row,
+                view_col_start: span.view_col_start,
+                view_col_end: span.view_col_end,
+                raw_row: span.raw_row,
+                raw_col_start: span.raw_col_start,
+            }));
+        }
+
+        for (grid_row, raw_row) in self.grid.row_ids.iter().copied().enumerate() {
+            let view_row = history_rows + grid_row;
+            if view_row >= rows {
+                break;
+            }
+            cells.push(self.normalize_line_width(self.grid[grid_row].to_vec(), cols));
+            let row_source = raw_row.is_tracked().then_some(RowSource {
+                raw_row,
+                raw_absolute_row: self.scrollback.len() + grid_row,
+            });
+            row_sources.push(row_source);
+            if let Some(row_source) = row_source {
+                spans.push(OriginSpan {
+                    view_row,
+                    view_col_start: 0,
+                    view_col_end: cols,
+                    raw_row: row_source.raw_row,
+                    raw_col_start: 0,
+                });
+            }
+        }
+
+        while cells.len() < rows {
+            cells.push(self.blank_line(cols));
+            row_sources.push(None);
+        }
+
+        (
+            cells,
+            ProjectedProvenance {
+                origin_spans: spans,
+                row_sources,
+            },
+        )
+    }
+
+    /// Return the P0 identity history projection. Its cells are the exact Arc
+    /// produced by the legacy visible-cell materializer; the only added data is
+    /// stable, fail-closed raw provenance and revision metadata.
+    pub fn get_projected_viewport(
+        &mut self,
+        block_mode: bool,
+    ) -> std::sync::Arc<ProjectedViewport> {
+        let rows = self.grid.rows();
+        let cols = if rows > 0 { self.grid.row_len() } else { 80 };
+        let mode = if block_mode && !self.use_alt_buffer {
+            ProjectionMode::Identity
+        } else {
+            ProjectionMode::Bypass
+        };
+        let key = ProjectedViewportCacheKey {
+            grid_version: self.grid_version,
+            history_revision: self.history_revision,
+            row_identity_revision: self.grid.identity_revision,
+            scroll_offset: self.scroll_offset,
+            rows,
+            cols,
+            use_alt_buffer: self.use_alt_buffer,
+            mode,
+        };
+        if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
+            if *cached_key == key {
+                return std::sync::Arc::clone(viewport);
+            }
+        }
+
+        let cells = self.get_visible_cells();
+        let row_wrapped = std::sync::Arc::new(self.get_visible_row_wrapped());
+        let provenance = if self.scroll_offset == 0 {
+            std::sync::Arc::new(self.live_view_provenance(rows, cols))
+        } else {
+            self.visible_cells_cache
+                .as_ref()
+                .and_then(|(_, _, _, provenance)| provenance.as_ref())
+                .map(std::sync::Arc::clone)
+                .expect("scrolled visible cache includes projection provenance")
+        };
+        debug_assert_eq!(provenance.row_sources.len(), cells.len());
+        debug_assert!(provenance.origin_spans.iter().all(|span| {
+            span.view_row < cells.len()
+                && span.view_col_start < span.view_col_end
+                && span.view_col_end <= cells[span.view_row].len()
+                && span.raw_row.is_tracked()
+        }));
+        let mut raw_span_index: Vec<_> = (0..provenance.origin_spans.len()).collect();
+        raw_span_index.sort_unstable_by_key(|index| {
+            let span = provenance.origin_spans[*index];
+            (
+                span.raw_row,
+                span.raw_col_start,
+                span.view_row,
+                span.view_col_start,
+            )
+        });
+        // Cell spans cover every non-empty raw row represented on a display
+        // row, including a later raw-row suffix/prefix after reflow. Row
+        // sources add the empty-line case without making structural padding
+        // selectable. Sorting and deduplication keep lookup logarithmic and
+        // storage proportional to row/span count rather than cell count.
+        let mut raw_row_index: Vec<_> =
+            provenance
+                .origin_spans
+                .iter()
+                .map(|span| (span.raw_row, span.view_row))
+                .chain(provenance.row_sources.iter().enumerate().filter_map(
+                    |(view_row, source)| source.map(|source| (source.raw_row, view_row)),
+                ))
+                .collect();
+        raw_row_index.sort_unstable();
+        raw_row_index.dedup();
+
+        let view_revision = self.next_projected_view_revision;
+        if view_revision != 0 {
+            self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
+        }
+        let viewport = std::sync::Arc::new(ProjectedViewport {
+            cells,
+            row_wrapped,
+            provenance,
+            raw_span_index: std::sync::Arc::new(raw_span_index),
+            raw_row_index: std::sync::Arc::new(raw_row_index),
+            source_revision: ProjectionSourceRevision {
+                grid: self.grid_version,
+                history: self.history_revision,
+                row_identity: self.grid.identity_revision,
+                alternate_screen: self.use_alt_buffer,
+            },
+            view_revision,
+            identity_fast_path: self.scroll_offset == 0,
+            mode,
+            scroll_offset: self.scroll_offset,
+        });
+        if view_revision != 0 {
+            self.projected_viewport_cache = Some((key, std::sync::Arc::clone(&viewport)));
+        }
+        viewport
+    }
+
     pub fn get_visible_cells(&mut self) -> std::sync::Arc<Vec<Vec<TerminalCell>>> {
-        if let Some((cached_version, cached_offset, ref cells)) = self.visible_cells_cache {
+        if let Some((cached_version, cached_offset, ref cells, _)) = self.visible_cells_cache {
             if cached_version == self.grid_version && cached_offset == self.scroll_offset {
                 return std::sync::Arc::clone(cells);
             }
@@ -6406,9 +7124,9 @@ impl TerminalState {
         // Arc each frame, so by the next miss we are usually the sole owner and can
         // refill the existing nested Vecs in place instead of reallocating per row.
         let prev = self.visible_cells_cache.take();
-        let prev_version = prev.as_ref().map(|(v, _, _)| *v);
-        let prev_offset = prev.as_ref().map(|(_, o, _)| *o);
-        let mut recycled = prev.map(|(_, _, a)| a);
+        let prev_version = prev.as_ref().map(|(v, _, _, _)| *v);
+        let prev_offset = prev.as_ref().map(|(_, o, _, _)| *o);
+        let mut recycled = prev.map(|(_, _, a, _)| a);
 
         if self.scroll_offset == 0 {
             // Fast path: copy current grid, reusing inner Vec capacity when possible.
@@ -6440,61 +7158,18 @@ impl TerminalState {
                     self.grid_version,
                     self.scroll_offset,
                     std::sync::Arc::clone(&arc),
+                    None,
                 ));
                 return arc;
             }
         }
 
-        let cells = if self.scroll_offset == 0 {
+        let (cells, origin_spans) = if self.scroll_offset == 0 {
             // Fast path (shared allocation): fresh copy of current grid.
-            self.grid.to_vec()
+            (self.grid.to_vec(), None)
         } else {
-            // Slow path: reflow scrollback
-            // Padding added to retained history is structural, not newly erased
-            // live-screen content, so it must not inherit the current SGR color.
-            let blank_cell = TerminalCell::default();
-
-            let mut start_idx = self
-                .scrollback
-                .len()
-                .saturating_sub(self.scroll_offset + rows);
-            while start_idx > 0 && self.scrollback[start_idx - 1].is_wrapped {
-                start_idx -= 1;
-            }
-            let end_idx = self.scrollback.len();
-            let to_reflow: Vec<ScrollbackLine> = self
-                .scrollback
-                .iter()
-                .skip(start_idx)
-                .take(end_idx - start_idx)
-                .cloned()
-                .collect();
-
-            let reflowed = Self::reflow_lines(&to_reflow, cols, &blank_cell);
-            let skip = reflowed.len().saturating_sub(self.scroll_offset + rows);
-            let visible_start = skip + (reflowed.len() - skip).saturating_sub(self.scroll_offset);
-            let mut result: Vec<Vec<TerminalCell>> = reflowed[visible_start..]
-                .iter()
-                .map(|l| l.decompress())
-                .collect();
-
-            if result.len() > rows {
-                result.truncate(rows);
-            }
-
-            for row in self.grid.iter() {
-                if result.len() < rows {
-                    result.push(self.normalize_line_width(row.to_vec(), cols));
-                } else {
-                    break;
-                }
-            }
-
-            while result.len() < rows {
-                result.push(self.blank_line(cols));
-            }
-
-            result
+            let (cells, spans) = self.materialize_scrolled_viewport(rows, cols);
+            (cells, Some(std::sync::Arc::new(spans)))
         };
 
         // Reuse the recycled Arc's outer allocation if we still solely own it.
@@ -6509,6 +7184,7 @@ impl TerminalState {
             self.grid_version,
             self.scroll_offset,
             std::sync::Arc::clone(&arc),
+            origin_spans,
         ));
         arc
     }
@@ -6537,8 +7213,21 @@ impl TerminalState {
     }
 
     #[inline]
+    #[cfg(test)]
     fn viewport_row_to_absolute(&self, viewport_row: usize) -> usize {
         self.scrollback.len().saturating_sub(self.scroll_offset) + viewport_row
+    }
+
+    #[inline]
+    fn projected_row_to_absolute(
+        &self,
+        projection: &ProjectedViewport,
+        viewport_row: usize,
+    ) -> usize {
+        self.scrollback
+            .len()
+            .saturating_sub(projection.scroll_offset())
+            + viewport_row
     }
 
     #[allow(dead_code)]
@@ -6552,14 +7241,29 @@ impl TerminalState {
 
     /// Start a new selection at a viewport-relative position.
     /// Converts to absolute buffer coordinates internally.
+    #[cfg(test)]
     pub fn start_selection(&mut self, viewport_pos: (usize, usize)) {
         self.start_selection_with_mode(viewport_pos, SelectionMode::Normal);
     }
 
-    pub fn start_block_selection(&mut self, viewport_pos: (usize, usize)) {
-        self.start_selection_with_mode(viewport_pos, SelectionMode::Block);
+    pub fn start_selection_in_projection(
+        &mut self,
+        projection: &ProjectedViewport,
+        viewport_pos: (usize, usize),
+        mode: SelectionMode,
+    ) {
+        let abs = (
+            self.projected_row_to_absolute(projection, viewport_pos.0),
+            viewport_pos.1,
+        );
+        self.selection = Some(Selection {
+            anchor: abs,
+            active: abs,
+            mode,
+        });
     }
 
+    #[cfg(test)]
     fn start_selection_with_mode(&mut self, viewport_pos: (usize, usize), mode: SelectionMode) {
         let abs = (
             self.viewport_row_to_absolute(viewport_pos.0),
@@ -6573,8 +7277,20 @@ impl TerminalState {
     }
 
     /// Update the active end of the current selection with a viewport-relative position.
+    #[cfg(test)]
     pub fn update_selection(&mut self, viewport_pos: (usize, usize)) {
         let abs_row = self.viewport_row_to_absolute(viewport_pos.0);
+        if let Some(ref mut sel) = self.selection {
+            sel.active = (abs_row, viewport_pos.1);
+        }
+    }
+
+    pub fn update_selection_in_projection(
+        &mut self,
+        projection: &ProjectedViewport,
+        viewport_pos: (usize, usize),
+    ) {
+        let abs_row = self.projected_row_to_absolute(projection, viewport_pos.0);
         if let Some(ref mut sel) = self.selection {
             sel.active = (abs_row, viewport_pos.1);
         }
@@ -6583,6 +7299,7 @@ impl TerminalState {
     /// Select the word at the given (row, col) position in the visible grid.
     /// Word boundaries are determined by character class: alphanumeric/underscore,
     /// whitespace, or punctuation/symbols.
+    #[cfg(test)]
     pub fn select_word_at(&mut self, row: usize, col: usize) {
         let Some((abs_row, left, right)) = self.word_span_at(row, col) else {
             return;
@@ -6595,12 +7312,39 @@ impl TerminalState {
         });
     }
 
+    pub fn select_word_in_projection(
+        &mut self,
+        projection: &ProjectedViewport,
+        row: usize,
+        col: usize,
+    ) {
+        let Some(line) = projection.cells().get(row) else {
+            return;
+        };
+        let Some((left, right)) = Self::word_columns_at(line, col) else {
+            return;
+        };
+        let abs_row = self.projected_row_to_absolute(projection, row);
+        self.selection = Some(Selection {
+            anchor: (abs_row, left),
+            active: (abs_row, right),
+            mode: SelectionMode::Normal,
+        });
+    }
+
+    #[cfg(test)]
     fn word_span_at(&mut self, row: usize, col: usize) -> Option<(usize, usize, usize)> {
         let visible = self.get_visible_cells();
         if row >= visible.len() {
             return None;
         }
         let line = &visible[row];
+        let (left, right) = Self::word_columns_at(line, col)?;
+        let abs_row = self.viewport_row_to_absolute(row);
+        Some((abs_row, left, right))
+    }
+
+    fn word_columns_at(line: &[TerminalCell], col: usize) -> Option<(usize, usize)> {
         let cols = line.len();
         if col >= cols {
             return None;
@@ -6613,8 +7357,7 @@ impl TerminalState {
         }
 
         if let Some((left, right)) = Self::select_extended_token_span(line, start_col) {
-            let abs_row = self.viewport_row_to_absolute(row);
-            return Some((abs_row, left, right));
+            return Some((left, right));
         }
 
         let ch = line[start_col].character;
@@ -6667,15 +7410,40 @@ impl TerminalState {
             right += 1;
         }
 
-        let abs_row = self.viewport_row_to_absolute(row);
-        Some((abs_row, left, right))
+        Some((left, right))
     }
 
     /// Extend an existing double-click selection using word boundaries.
+    #[cfg(test)]
     pub fn extend_word_selection_to(&mut self, row: usize, col: usize) {
         let Some((target_row, target_left, target_right)) = self.word_span_at(row, col) else {
             return;
         };
+        self.extend_word_selection_to_span(target_row, target_left, target_right);
+    }
+
+    pub fn extend_word_selection_in_projection(
+        &mut self,
+        projection: &ProjectedViewport,
+        row: usize,
+        col: usize,
+    ) {
+        let Some(line) = projection.cells().get(row) else {
+            return;
+        };
+        let Some((target_left, target_right)) = Self::word_columns_at(line, col) else {
+            return;
+        };
+        let target_row = self.projected_row_to_absolute(projection, row);
+        self.extend_word_selection_to_span(target_row, target_left, target_right);
+    }
+
+    fn extend_word_selection_to_span(
+        &mut self,
+        target_row: usize,
+        target_left: usize,
+        target_right: usize,
+    ) {
         let Some(sel) = self.selection else {
             self.selection = Some(Selection {
                 anchor: (target_row, target_left),
@@ -6709,12 +7477,40 @@ impl TerminalState {
     }
 
     /// Extend an existing triple-click selection to whole viewport rows.
+    #[cfg(test)]
     pub fn extend_line_selection_to(&mut self, row: usize) {
         let Some(sel) = self.selection else {
             return;
         };
         let cols = self.grid.row_len();
         let target_row = self.viewport_row_to_absolute(row);
+        let origin_row = sel.anchor.0;
+
+        self.selection = Some(if target_row < origin_row {
+            Selection {
+                anchor: (origin_row, cols.saturating_sub(1)),
+                active: (target_row, 0),
+                mode: SelectionMode::Normal,
+            }
+        } else {
+            Selection {
+                anchor: (origin_row, 0),
+                active: (target_row, cols.saturating_sub(1)),
+                mode: SelectionMode::Normal,
+            }
+        });
+    }
+
+    pub fn extend_line_selection_in_projection(
+        &mut self,
+        projection: &ProjectedViewport,
+        row: usize,
+    ) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let cols = projection.cells().first().map_or(0, Vec::len);
+        let target_row = self.projected_row_to_absolute(projection, row);
         let origin_row = sel.anchor.0;
 
         self.selection = Some(if target_row < origin_row {
@@ -7036,6 +7832,7 @@ impl TerminalState {
         while self.scrollback.len() > self.max_scrollback {
             self.scrollback.pop_front();
         }
+        self.bump_history_revision();
         let new_scrollback_len = self.scrollback.len();
         self.kitty_graphics
             .on_scrollback_reflow(old_scrollback_len, new_scrollback_len);
@@ -7135,13 +7932,19 @@ impl TerminalState {
             if top_remove > 0 {
                 let cols_now = self.grid.row_len();
                 for r in 0..top_remove {
-                    let line = ScrollbackLine::compress(&self.grid[r], self.grid.row_wrapped[r]);
+                    let line = ScrollbackLine::compress_with_raw_row_id(
+                        &self.grid[r],
+                        self.grid.row_wrapped[r],
+                        self.grid.row_ids[r],
+                    );
                     self.push_scrollback_compressed(line);
                 }
                 let src_start = top_remove * cols_now;
                 let total = old_rows * cols_now;
                 self.grid.cells.copy_within(src_start..total, 0);
                 self.grid.row_wrapped.copy_within(top_remove..old_rows, 0);
+                self.grid.row_ids.copy_within(top_remove..old_rows, 0);
+                self.grid.bump_identity_revision();
                 self.cursor_row -= top_remove;
                 self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
             }
@@ -7226,9 +8029,24 @@ impl TerminalState {
     }
 
     #[inline]
+    #[cfg(test)]
     pub fn row_selection_cols(&self, viewport_row: usize) -> Option<(usize, usize)> {
-        let sel = self.selection?;
         let abs_row = self.viewport_row_to_absolute(viewport_row);
+        self.selection_cols_at_absolute_row(abs_row)
+    }
+
+    #[inline]
+    pub fn row_selection_cols_in_projection(
+        &self,
+        projection: &ProjectedViewport,
+        viewport_row: usize,
+    ) -> Option<(usize, usize)> {
+        let abs_row = self.projected_row_to_absolute(projection, viewport_row);
+        self.selection_cols_at_absolute_row(abs_row)
+    }
+
+    fn selection_cols_at_absolute_row(&self, abs_row: usize) -> Option<(usize, usize)> {
+        let sel = self.selection?;
         let (start, end) = if sel.anchor <= sel.active {
             (sel.anchor, sel.active)
         } else {
@@ -8018,6 +8836,399 @@ mod tests {
                 "flags differ at column {column}"
             );
         }
+    }
+
+    #[test]
+    fn identity_projection_matches_live_cells_and_round_trips_every_cell() {
+        let mut terminal = TerminalState::new(6, 3);
+        terminal.process_batch("A中Z".as_bytes());
+        let expected = terminal.get_visible_cells();
+        let row_ids: Vec<_> = (0..terminal.grid.rows())
+            .map(|row| terminal.grid.raw_row_id(row).expect("retained row id"))
+            .collect();
+
+        let projection = terminal.get_projected_viewport(true);
+        assert!(projection.is_identity());
+        assert!(projection.uses_identity_fast_path());
+        assert_eq!(projection.cells(), expected.as_ref());
+        assert_eq!(projection.row_wrapped(), terminal.grid.row_wrapped);
+        assert!(std::sync::Arc::ptr_eq(&expected, &projection.cells));
+
+        for (row, row_id) in row_ids.into_iter().enumerate() {
+            for col in 0..terminal.grid.cols() {
+                let view = super::ViewportCell { row, col };
+                let origin = projection.view_to_raw(view).expect("live raw origin");
+                assert_eq!(origin, super::RawCellOrigin { row: row_id, col });
+                assert_eq!(projection.raw_to_view(origin), Some(view));
+            }
+        }
+
+        let wide_body = projection
+            .view_to_raw(super::ViewportCell { row: 0, col: 1 })
+            .expect("wide body origin");
+        let continuation = projection
+            .view_to_raw(super::ViewportCell { row: 0, col: 2 })
+            .expect("wide continuation origin");
+        assert_eq!(wide_body.row, continuation.row);
+        assert_eq!(continuation.col, wide_body.col + 1);
+        assert_ne!(wide_body, continuation);
+
+        let cached = terminal.get_projected_viewport(true);
+        assert!(std::sync::Arc::ptr_eq(&projection, &cached));
+        assert_eq!(projection.view_revision(), cached.view_revision());
+    }
+
+    #[test]
+    fn raw_row_identity_follows_grid_rows_into_scrollback_and_survives_trim() {
+        let mut terminal = TerminalState::new(4, 2);
+        terminal.grid[0][0].character = 'A';
+        terminal.grid[1][0].character = 'B';
+        let first = terminal.grid.raw_row_id(0).expect("first row id");
+        let second = terminal.grid.raw_row_id(1).expect("second row id");
+        terminal.cursor_row = 1;
+
+        terminal.process_batch(b"\n");
+        assert_eq!(terminal.scrollback[0].raw_row_id(), first);
+        assert_eq!(terminal.grid.raw_row_id(0), Some(second));
+        let fresh_bottom = terminal.grid.raw_row_id(1).expect("fresh blank row");
+        assert_ne!(fresh_bottom, first);
+        assert_ne!(fresh_bottom, second);
+
+        terminal.grid[1][0].character = 'C';
+        terminal.process_batch(b"\n");
+        assert_eq!(terminal.scrollback[1].raw_row_id(), second);
+        terminal.set_max_scrollback(1);
+        assert_eq!(terminal.scrollback.len(), 1);
+        assert_eq!(terminal.scrollback[0].raw_row_id(), second);
+
+        terminal.set_scroll_offset(1);
+        let projection = terminal.get_projected_viewport(true);
+        assert_eq!(
+            projection.raw_to_view(super::RawCellOrigin { row: first, col: 0 }),
+            None,
+            "trimmed identities must fail closed"
+        );
+        assert!(projection
+            .raw_to_view(super::RawCellOrigin {
+                row: second,
+                col: 0,
+            })
+            .is_some());
+    }
+
+    #[test]
+    fn inserted_deleted_and_reverse_indexed_rows_move_identity_with_content() {
+        let mut inserted = TerminalState::new(3, 4);
+        let before: Vec<_> = (0..4)
+            .map(|row| inserted.grid.raw_row_id(row).unwrap())
+            .collect();
+        inserted.process_batch(b"\x1b[2;1H\x1b[L");
+        assert_eq!(inserted.grid.raw_row_id(0), Some(before[0]));
+        assert_ne!(inserted.grid.raw_row_id(1), Some(before[1]));
+        assert_eq!(inserted.grid.raw_row_id(2), Some(before[1]));
+        assert_eq!(inserted.grid.raw_row_id(3), Some(before[2]));
+
+        let mut deleted = TerminalState::new(3, 4);
+        let before: Vec<_> = (0..4)
+            .map(|row| deleted.grid.raw_row_id(row).unwrap())
+            .collect();
+        deleted.process_batch(b"\x1b[2;1H\x1b[M");
+        assert_eq!(deleted.grid.raw_row_id(0), Some(before[0]));
+        assert_eq!(deleted.grid.raw_row_id(1), Some(before[2]));
+        assert_eq!(deleted.grid.raw_row_id(2), Some(before[3]));
+        assert!(!before.contains(&deleted.grid.raw_row_id(3).unwrap()));
+
+        let mut reverse_indexed = TerminalState::new(3, 4);
+        let before: Vec<_> = (0..4)
+            .map(|row| reverse_indexed.grid.raw_row_id(row).unwrap())
+            .collect();
+        reverse_indexed.process_batch(b"\x1b[1;1H\x1bM");
+        assert!(!before.contains(&reverse_indexed.grid.raw_row_id(0).unwrap()));
+        assert_eq!(reverse_indexed.grid.raw_row_id(1), Some(before[0]));
+        assert_eq!(reverse_indexed.grid.raw_row_id(2), Some(before[1]));
+        assert_eq!(reverse_indexed.grid.raw_row_id(3), Some(before[2]));
+    }
+
+    #[test]
+    fn resize_preserves_retained_rows_but_normalization_reidentifies_history() {
+        let mut terminal = TerminalState::new(5, 4);
+        for row in 0..4 {
+            terminal.grid[row][0].character = char::from(b'A' + row as u8);
+        }
+        let before: Vec<_> = (0..4)
+            .map(|row| terminal.grid.raw_row_id(row).expect("row id"))
+            .collect();
+        terminal.cursor_row = 3;
+        terminal.on_resize(5, 2);
+
+        assert_eq!(terminal.scrollback[0].raw_row_id(), before[0]);
+        assert_eq!(terminal.scrollback[1].raw_row_id(), before[1]);
+        assert_eq!(terminal.grid.raw_row_id(0), Some(before[2]));
+        assert_eq!(terminal.grid.raw_row_id(1), Some(before[3]));
+
+        let retained_grid_ids = [before[2], before[3]];
+        terminal.on_resize(5, 4);
+        assert_eq!(terminal.grid.raw_row_id(0), Some(retained_grid_ids[0]));
+        assert_eq!(terminal.grid.raw_row_id(1), Some(retained_grid_ids[1]));
+        assert!(!retained_grid_ids.contains(&terminal.grid.raw_row_id(2).unwrap()));
+        assert!(!retained_grid_ids.contains(&terminal.grid.raw_row_id(3).unwrap()));
+
+        let old_history_ids: Vec<_> = terminal
+            .scrollback
+            .iter()
+            .map(ScrollbackLine::raw_row_id)
+            .collect();
+        terminal.start_selection((0, 0));
+        assert!(terminal.normalize_scrollback_width());
+        assert!(terminal.selection.is_none());
+        assert!(terminal
+            .scrollback
+            .iter()
+            .all(|line| !old_history_ids.contains(&line.raw_row_id())));
+
+        terminal.set_scroll_offset(terminal.scrollback.len());
+        let projection = terminal.get_projected_viewport(true);
+        for old in old_history_ids {
+            assert_eq!(
+                projection.raw_to_view(super::RawCellOrigin { row: old, col: 0 }),
+                None,
+                "physically normalized origins must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn history_projection_preserves_soft_wrap_wide_origins_and_padding() {
+        for cols in 1..=8 {
+            let mut terminal = TerminalState::new(cols, 3);
+            let mut first = vec![TerminalCell::default(); 4];
+            first[0].character = 'A';
+            first[1].character = '中';
+            first[1].flags.set_wide(true);
+            first[2].flags.set_wide_continuation(true);
+            first[3].character = 'B';
+            let mut second = vec![TerminalCell::default(); 4];
+            second[0].character = 'C';
+            let first_line = ScrollbackLine::compress(&first, true);
+            let first_id = first_line.raw_row_id();
+            let second_line = ScrollbackLine::compress(&second, false);
+            terminal.push_scrollback_compressed(first_line);
+            terminal.push_scrollback_compressed(second_line);
+            terminal.set_scroll_offset(terminal.scrollback.len());
+
+            let expected = terminal.get_visible_cells();
+            let projection = terminal.get_projected_viewport(true);
+            assert!(projection.is_identity());
+            assert!(!projection.uses_identity_fast_path());
+            assert_eq!(projection.cells(), expected.as_ref(), "width {cols}");
+            assert_eq!(
+                projection.row_wrapped(),
+                terminal.get_visible_row_wrapped(),
+                "width {cols}"
+            );
+            for row in 0..projection.cells().len() {
+                for col in 0..projection.cells()[row].len() {
+                    let view = super::ViewportCell { row, col };
+                    if let Some(origin) = projection.view_to_raw(view) {
+                        assert_eq!(projection.raw_to_view(origin), Some(view), "width {cols}");
+                    }
+                }
+            }
+
+            if cols >= 3 {
+                let body = projection
+                    .raw_to_view(super::RawCellOrigin {
+                        row: first_id,
+                        col: 1,
+                    })
+                    .expect("wide body visible");
+                let continuation = projection
+                    .raw_to_view(super::RawCellOrigin {
+                        row: first_id,
+                        col: 2,
+                    })
+                    .expect("wide continuation visible");
+                assert_eq!(body.row, continuation.row, "width {cols}");
+                assert_eq!(body.col + 1, continuation.col, "width {cols}");
+                assert_eq!(
+                    projection.view_to_raw(continuation),
+                    Some(super::RawCellOrigin {
+                        row: first_id,
+                        col: 2,
+                    }),
+                    "continuation keeps its own raw column at width {cols}"
+                );
+            }
+
+            if cols == 3 {
+                assert_eq!(
+                    projection.view_to_raw(super::ViewportCell { row: 1, col: 2 }),
+                    None,
+                    "reflow padding is structural"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projected_row_bounds_cover_multi_source_rows_and_empty_rows() {
+        let mut terminal = TerminalState::new(6, 4);
+        let mut suffix = vec![TerminalCell::default(); 6];
+        suffix[0].character = 'A';
+        suffix[1].character = 'a';
+        let suffix = ScrollbackLine::compress(&suffix, true);
+        let suffix_id = suffix.raw_row_id();
+        let mut prefix = vec![TerminalCell::default(); 6];
+        prefix[0].character = 'B';
+        prefix[1].character = 'b';
+        let prefix = ScrollbackLine::compress(&prefix, false);
+        let prefix_id = prefix.raw_row_id();
+        let empty = ScrollbackLine::compress(&[TerminalCell::default(); 6], false);
+        let empty_id = empty.raw_row_id();
+        terminal.push_scrollback_compressed(suffix);
+        terminal.push_scrollback_compressed(prefix);
+        terminal.push_scrollback_compressed(empty);
+        terminal.set_scroll_offset(terminal.scrollback.len());
+
+        let projection = terminal.get_projected_viewport(true);
+        assert_eq!(projection.raw_row_view_bounds(suffix_id), Some((0, 0)));
+        assert_eq!(
+            projection.raw_row_view_bounds(prefix_id),
+            Some((0, 0)),
+            "the later raw-row prefix sharing a display row must be indexed"
+        );
+        assert_eq!(projection.raw_row_view_bounds(empty_id), Some((1, 1)));
+        assert_eq!(projection.view_row_absolute(1), Some(2));
+        assert_eq!(
+            projection.view_to_raw(super::ViewportCell { row: 1, col: 0 }),
+            None,
+            "empty-row ownership must not invent a selectable cell origin"
+        );
+        assert_eq!(
+            projection.view_to_raw(super::ViewportCell { row: 0, col: 4 }),
+            None,
+            "display padding must remain origin-free"
+        );
+    }
+
+    #[test]
+    fn scrolled_projection_decodes_each_source_line_once_and_cache_hits_decode_none() {
+        let mut terminal = TerminalState::new(4, 3);
+        for ch in ['A', 'B', 'C', 'D'] {
+            let mut cells = vec![TerminalCell::default(); 4];
+            cells[0].character = ch;
+            terminal.push_scrollback_compressed(ScrollbackLine::compress(&cells, false));
+        }
+        terminal.set_scroll_offset(terminal.scrollback.len());
+
+        super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.set(0));
+        let first = terminal.get_projected_viewport(true);
+        let miss_decodes = super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get());
+        assert_eq!(miss_decodes, terminal.scrollback.len());
+
+        let cached = terminal.get_projected_viewport(true);
+        let hit_decodes = super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get());
+        assert!(std::sync::Arc::ptr_eq(&first, &cached));
+        assert_eq!(hit_decodes, miss_decodes);
+
+        let visible = terminal.get_visible_cells();
+        let visible_decodes = super::PROJECTED_HISTORY_DECOMPRESS_COUNT.with(|count| count.get());
+        assert!(std::sync::Arc::ptr_eq(&visible, &first.cells));
+        assert_eq!(visible_decodes, miss_decodes);
+    }
+
+    #[test]
+    fn projection_revisions_track_view_source_resize_and_alt_bypass() {
+        let mut terminal = TerminalState::new(4, 2);
+        terminal.grid[0][0].character = 'A';
+        terminal.cursor_row = 1;
+        terminal.process_batch(b"\n");
+
+        let live = terminal.get_projected_viewport(true);
+        assert_eq!(live.mode(), super::ProjectionMode::Identity);
+        let bypass = terminal.get_projected_viewport(false);
+        assert_eq!(bypass.mode(), super::ProjectionMode::Bypass);
+        assert_ne!(live.view_revision(), bypass.view_revision());
+        assert_ne!(live.key(), bypass.key());
+        assert_eq!(live.cells(), bypass.cells());
+        let identity_again = terminal.get_projected_viewport(true);
+        assert_ne!(bypass.view_revision(), identity_again.view_revision());
+        assert_eq!(live.key(), identity_again.key());
+        terminal.set_scroll_offset(1);
+        let scrolled = terminal.get_projected_viewport(true);
+        assert_ne!(live.view_revision(), scrolled.view_revision());
+        assert_eq!(live.key().source, scrolled.key().source);
+
+        terminal.on_resize(6, 2);
+        let resized = terminal.get_projected_viewport(true);
+        assert_ne!(scrolled.view_revision(), resized.view_revision());
+        assert_ne!(
+            scrolled.key().source.row_identity,
+            resized.key().source.row_identity
+        );
+
+        terminal.process_batch(b"\x1b[?1049h");
+        let alternate = terminal.get_projected_viewport(true);
+        assert!(alternate.is_identity());
+        assert_eq!(alternate.mode(), super::ProjectionMode::Bypass);
+        assert!(alternate.key().source.alternate_screen);
+        assert_eq!(alternate.cells(), terminal.get_visible_cells().as_ref());
+        assert_ne!(resized.view_revision(), alternate.view_revision());
+
+        terminal.process_batch(b"\x1b[?1049l");
+        let primary = terminal.get_projected_viewport(true);
+        assert!(!primary.key().source.alternate_screen);
+        assert!(primary.is_identity());
+        assert_ne!(alternate.view_revision(), primary.view_revision());
+    }
+
+    #[test]
+    fn selection_snapshot_passthrough_preserves_raw_storage_and_copy_bytes() {
+        let mut legacy = TerminalState::new(12, 3);
+        let mut projected = TerminalState::new(12, 3);
+        legacy.process_batch(b"hello world");
+        projected.process_batch(b"hello world");
+
+        legacy.start_selection((0, 1));
+        legacy.update_selection((0, 4));
+        let snapshot = projected.get_projected_viewport(true);
+        projected.start_selection_in_projection(&snapshot, (0, 1), super::SelectionMode::Normal);
+        projected.update_selection_in_projection(&snapshot, (0, 4));
+        assert_eq!(projected.selection, legacy.selection);
+        assert_eq!(projected.copy_selection(), legacy.copy_selection());
+        assert_eq!(
+            projected.row_selection_cols_in_projection(&snapshot, 0),
+            legacy.row_selection_cols(0)
+        );
+
+        legacy.select_word_at(0, 7);
+        projected.select_word_in_projection(&snapshot, 0, 7);
+        assert_eq!(projected.selection, legacy.selection);
+        assert_eq!(projected.copy_selection(), legacy.copy_selection());
+
+        legacy.extend_line_selection_to(2);
+        projected.extend_line_selection_in_projection(&snapshot, 2);
+        assert_eq!(projected.selection, legacy.selection);
+        assert_eq!(projected.copy_selection(), legacy.copy_selection());
+    }
+
+    #[test]
+    fn maximum_live_projection_origin_storage_scales_with_rows_not_cells() {
+        let mut terminal = TerminalState::new(super::MAX_TERMINAL_COLS, super::MAX_TERMINAL_ROWS);
+        let projection = terminal.get_projected_viewport(true);
+
+        assert_eq!(projection.cells().len(), super::MAX_TERMINAL_ROWS);
+        assert!(projection
+            .cells()
+            .iter()
+            .all(|row| row.len() == super::MAX_TERMINAL_COLS));
+        assert_eq!(projection.origin_span_count(), super::MAX_TERMINAL_ROWS);
+        assert_eq!(projection.raw_span_index.len(), super::MAX_TERMINAL_ROWS);
+        assert!(
+            projection.origin_span_count() * 8
+                < super::MAX_TERMINAL_COLS * super::MAX_TERMINAL_ROWS,
+            "origin metadata must remain row/span proportional"
+        );
     }
 
     #[test]

@@ -488,6 +488,7 @@ pub const MIN_INPUT_ROWS: usize = 6;
 /// `real_top`/`real_bottom` say whether the corresponding target edge is
 /// actually visible, rather than manufactured by viewport clipping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct VisibleActiveSpan {
     pub start: usize,
     pub end: usize,
@@ -499,6 +500,7 @@ pub struct VisibleActiveSpan {
 /// with output/cursor movement but stays at least [`MIN_INPUT_ROWS`] below the
 /// prompt. The terminal/grid end remains a hard limit because this is visual
 /// chrome over Frost's existing continuous grid.
+#[cfg(test)]
 pub fn visible_active_span(
     active_start: usize,
     cursor_absolute_row: usize,
