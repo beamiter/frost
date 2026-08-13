@@ -2752,6 +2752,17 @@ pub struct TerminalState {
     pub selection: Option<Selection>,
     projected_selection: Option<ProjectedSelection>,
     pub scroll_offset: usize,
+    /// Rows an app asked to erase with ED 3 while the viewport was scrolled
+    /// back, held until the viewport returns to the live bottom.
+    pending_saved_line_purge: usize,
+    /// Monotonic count of rows appended to scrollback, used to tell whether the
+    /// provisional alternate-screen snapshot is still the tail.
+    scrollback_pushes: u64,
+    /// The alternate screen's superseding snapshot: `(rows, pushes)` recorded
+    /// when it was appended. Replaced by the next synchronized frame, and left
+    /// as permanent history once the alternate screen ends or the app scrolls
+    /// real rows in behind it.
+    provisional_alt_snapshot: Option<(usize, u64)>,
     max_scrollback: usize,
     use_alt_buffer: bool,
     disable_alt_screen: bool,
@@ -3065,6 +3076,9 @@ impl TerminalState {
             selection: None,
             projected_selection: None,
             scroll_offset: 0,
+            pending_saved_line_purge: 0,
+            scrollback_pushes: 0,
+            provisional_alt_snapshot: None,
             max_scrollback: 10000,
             use_alt_buffer: false,
             disable_alt_screen: false,
@@ -4535,10 +4549,57 @@ impl TerminalState {
         self.projected_viewport_cache = None;
     }
 
+    /// ED 3 ("erase saved lines").
+    ///
+    /// Honored immediately while the viewport already follows the live bottom,
+    /// which is where a user-typed `clear` always runs — typing scrolls to the
+    /// bottom first. An app that erases saved lines *while the user is scrolled
+    /// back reading them* is a different situation: full-screen TUIs re-lay out
+    /// their transcript by emitting `ED 2` + `ED 3` and repainting (codex-cli
+    /// does this on every re-render), and obeying that mid-read deleted the
+    /// history under the reader and snapped the viewport to the bottom. Defer
+    /// instead: remember how many rows the app asked to drop and retire exactly
+    /// that prefix once the viewport is back at the bottom, so the app's request
+    /// still lands without interrupting the read.
+    fn erase_saved_lines(&mut self) {
+        if self.scroll_offset > 0 {
+            self.pending_saved_line_purge = self.scrollback.len();
+            return;
+        }
+        self.purge_saved_lines(self.scrollback.len());
+    }
+
+    /// Retire the oldest `rows` scrollback rows, rebasing every row-indexed
+    /// structure through the shared trim bookkeeping.
+    fn purge_saved_lines(&mut self, rows: usize) {
+        self.pending_saved_line_purge = 0;
+        let rows = rows.min(self.scrollback.len());
+        if rows == 0 {
+            return;
+        }
+        self.scrollback.drain(..rows);
+        self.on_scrollback_rows_trimmed(rows);
+        self.clear_text_selection();
+        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+        self.grid_version = self.grid_version.wrapping_add(1);
+        self.visible_cells_cache = None;
+    }
+
+    /// Apply a deferred [`Self::erase_saved_lines`] once the viewport follows
+    /// the live bottom again.
+    fn settle_pending_saved_line_purge(&mut self) {
+        if self.pending_saved_line_purge > 0 && self.scroll_offset == 0 {
+            self.purge_saved_lines(self.pending_saved_line_purge);
+        }
+    }
+
     fn on_scrollback_rows_trimmed(&mut self, count: usize) {
         if count == 0 {
             return;
         }
+        // Rows the cap (or any other trim) already dropped are rows a deferred
+        // ED 3 must no longer count, or settling it would eat live content.
+        self.pending_saved_line_purge = self.pending_saved_line_purge.saturating_sub(count);
         self.bump_history_revision();
         self.kitty_graphics.on_buffer_rows_trimmed(count);
         for zone in &mut self.command_zones {
@@ -5962,29 +6023,81 @@ impl TerminalState {
         &mut self,
         allow_alt_buffer: bool,
         dedupe_snapshot: bool,
-    ) {
+    ) -> usize {
         if (self.use_alt_buffer && !allow_alt_buffer) || self.grid.rows() == 0 {
-            return;
+            return 0;
         }
 
         let first = (0..self.grid.rows()).find(|&row| !self.line_is_blank(row));
         let last = (0..self.grid.rows()).rfind(|&row| !self.line_is_blank(row));
         let (Some(first), Some(last)) = (first, last) else {
-            return;
+            return 0;
         };
 
         if dedupe_snapshot {
             let snapshot = self.visible_screen_snapshot().unwrap_or_default();
             if snapshot == self.last_archived_screen_snapshot {
-                return;
+                return 0;
             }
             self.last_archived_screen_snapshot = snapshot;
         }
 
+        let before = self.scrollback_pushes;
         for row in first..=last {
             let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
+        self.scrollback_pushes.wrapping_sub(before) as usize
+    }
+
+    /// One synchronized frame of a full-screen app, kept scrollable.
+    ///
+    /// The alternate screen is transient: a repaint is the *same* page redrawn,
+    /// not new history. Recording every frame let an animated TUI (a spinner, an
+    /// elapsed timer) append a whole screen 20+ times a second, which buried and
+    /// then evicted the real history behind thousands of near-identical copies.
+    /// So the alternate screen contributes at most one *provisional* snapshot,
+    /// superseded by each following frame, and promoted to permanent history
+    /// only when the app erases that screen. Content that genuinely scrolls off
+    /// the top still reaches scrollback through the scroll-region path, so a TUI
+    /// whose transcript scrolls stays fully scrollable.
+    fn archive_alt_screen_frame(&mut self) {
+        // A reader holding a scrolled-back viewport owns the history: never
+        // rewrite it underneath them for a frame that is still on screen. The
+        // snapshot stays provisional so returning to the bottom can still
+        // supersede it — unless the app scrolled real rows in behind it, which
+        // `retire_provisional_alt_snapshot` detects and refuses.
+        if self.scroll_offset > 0 {
+            return;
+        }
+        let Some(snapshot) = self.visible_screen_snapshot() else {
+            return;
+        };
+        if snapshot == self.last_archived_screen_snapshot {
+            return;
+        }
+        self.retire_provisional_alt_snapshot();
+        let appended = self.archive_visible_screen_to_scrollback_with_options(true, true);
+        self.provisional_alt_snapshot =
+            (appended > 0).then_some((appended, self.scrollback_pushes));
+    }
+
+    /// Drop the superseded snapshot. Exactly undoes the append that created it,
+    /// which is sound only while those rows are still the scrollback tail — any
+    /// row the app scrolled off since then is real history sitting behind them.
+    fn retire_provisional_alt_snapshot(&mut self) {
+        let Some((rows, pushes)) = self.provisional_alt_snapshot.take() else {
+            return;
+        };
+        if pushes != self.scrollback_pushes || self.scroll_offset > 0 {
+            return;
+        }
+        let rows = rows.min(self.scrollback.len());
+        if rows == 0 {
+            return;
+        }
+        self.scrollback.truncate(self.scrollback.len() - rows);
+        self.bump_history_revision();
     }
 
     fn push_scrollback_compressed(&mut self, line: ScrollbackLine) {
@@ -6004,6 +6117,7 @@ impl TerminalState {
             self.on_scrollback_rows_trimmed(1);
         }
         self.scrollback.push_back(line);
+        self.scrollback_pushes = self.scrollback_pushes.wrapping_add(1);
         self.bump_history_revision();
         // Pin the viewport when the user is reading history: without this,
         // start_idx = scrollback.len() - scroll_offset - rows drifts by +1
@@ -6146,6 +6260,9 @@ impl TerminalState {
     /// P3 优化：批量处理输入数据，只在处理完成后触发一次网格版本更新
     /// 相比多次 process_input，这个方法避免了多次网格版本递增
     pub fn process_batch(&mut self, input: &[u8]) {
+        // Resize, an alternate-screen swap and the projection restore all park
+        // the viewport at the bottom without going through the scroll helpers.
+        self.settle_pending_saved_line_purge();
         self.grid_version = self.grid_version.wrapping_add(1);
         self.process_input(input);
     }
@@ -6209,7 +6326,7 @@ impl TerminalState {
             if let Some(start) = self.sync_output_start {
                 if start.elapsed() > std::time::Duration::from_secs(1) {
                     if self.use_alt_buffer {
-                        self.archive_visible_screen_to_scrollback_with_options(true, true);
+                        self.archive_alt_screen_frame();
                     } else {
                         self.last_synced_primary_screen_snapshot =
                             self.visible_screen_snapshot().unwrap_or_default();
@@ -6942,13 +7059,7 @@ impl TerminalState {
                     }
                     3 => {
                         // Clear scrollback (xterm extension)
-                        let trimmed = self.scrollback.len();
-                        self.scrollback.clear();
-                        self.on_scrollback_rows_trimmed(trimmed);
-                        self.clear_text_selection();
-                        self.scroll_offset = 0;
-                        self.grid_version = self.grid_version.wrapping_add(1);
-                        self.visible_cells_cache = None;
+                        self.erase_saved_lines();
                     }
                     _ => {}
                 }
@@ -7512,6 +7623,8 @@ impl TerminalState {
             self.bump_history_revision();
         }
         self.scrollback.clear();
+        self.pending_saved_line_purge = 0;
+        self.provisional_alt_snapshot = None;
         self.command_zones.clear();
         self.finished_output_provenance.clear();
         self.captured_output_bytes = 0;
@@ -7590,7 +7703,12 @@ impl TerminalState {
     fn clear_screen_no_home(&mut self) {
         if self.sync_output_active {
             if self.use_alt_buffer {
-                self.archive_visible_screen_to_scrollback_with_options(true, true);
+                // The alternate screen holds no document, only the screen the
+                // app is currently painting, so an erase here is part of a
+                // repaint rather than history being destroyed. Treat it as one
+                // more frame: promoting it would let a clear-every-frame TUI
+                // make every repaint permanent, which is the flood again.
+                self.archive_alt_screen_frame();
             } else {
                 self.archive_primary_screen_unless_last_synced_snapshot();
             }
@@ -7672,6 +7790,7 @@ impl TerminalState {
 
                     // Reset scroll offset so we don't show scrollback in alt buffer
                     self.scroll_offset = 0;
+                    self.provisional_alt_snapshot = None;
 
                     // Switch to alternate buffer
                     std::mem::swap(&mut self.grid, &mut self.alt_grid);
@@ -7778,6 +7897,9 @@ impl TerminalState {
                         &mut self.alt_keyboard_enhancement_stack,
                     );
                     self.use_alt_buffer = false;
+                    // Whatever the alternate screen last left in scrollback is
+                    // all that remains of it, so it stops being provisional.
+                    self.provisional_alt_snapshot = None;
                     self.modes.remove(&mode);
                     self.pending_wrap = false;
                     // Likewise, alt-screen OSC 8 state never leaks back onto
@@ -7836,7 +7958,7 @@ impl TerminalState {
             2026 => {
                 // End synchronized output: force full render
                 if self.use_alt_buffer {
-                    self.archive_visible_screen_to_scrollback_with_options(true, true);
+                    self.archive_alt_screen_frame();
                 } else {
                     self.last_synced_primary_screen_snapshot =
                         self.visible_screen_snapshot().unwrap_or_default();
@@ -7936,6 +8058,7 @@ impl TerminalState {
             return;
         }
         self.scroll_offset = offset.min(self.scrollback.len());
+        self.settle_pending_saved_line_purge();
     }
 
     pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
@@ -7976,6 +8099,7 @@ impl TerminalState {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+        self.settle_pending_saved_line_purge();
     }
 
     fn push_utf8_mouse_coord(output: &mut Vec<u8>, value: usize) {
@@ -10348,10 +10472,8 @@ impl TerminalState {
         let max_scroll = self.scrollback.len();
         self.scroll_offset = self.scroll_offset.min(max_scroll);
 
-        // When scrolling to bottom (offset 0), reset to live view
-        if self.scroll_offset == 0 {
-            self.scroll_offset = 0;
-        }
+        // Back at the live bottom: a purge deferred mid-read now takes effect.
+        self.settle_pending_saved_line_purge();
     }
 
     fn strip_trailing_blanks(cells: &[TerminalCell]) -> &[TerminalCell] {
@@ -13462,6 +13584,123 @@ mod tests {
     }
 
     #[test]
+    fn erase_saved_lines_at_the_bottom_still_clears_scrollback() {
+        let mut terminal = TerminalState::new(8, 3);
+        for index in 0..10 {
+            terminal.process_input(format!("line-{index}\r\n").as_bytes());
+        }
+        assert!(terminal.scrollback_len() > 0);
+
+        terminal.process_input(b"\x1b[3J");
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            0,
+            "a purge requested at the live bottom is honored immediately"
+        );
+        assert_eq!(terminal.scroll_offset, 0);
+    }
+
+    #[test]
+    fn erase_saved_lines_does_not_yank_a_reader_off_their_history() {
+        let mut terminal = TerminalState::new(8, 3);
+        for index in 0..10 {
+            terminal.process_input(format!("line-{index}\r\n").as_bytes());
+        }
+        let history = terminal.scrollback_len();
+        terminal.scroll(4);
+        let reading_at = terminal.scroll_offset;
+        assert!(reading_at > 0, "fixture must leave the viewport in history");
+
+        // codex-cli re-renders its transcript with exactly this pair.
+        terminal.process_input(b"\x1b[H\x1b[3J");
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            history,
+            "history a user is reading must survive the app's purge"
+        );
+        assert_eq!(
+            terminal.scroll_offset, reading_at,
+            "the viewport must not be snapped to the live bottom mid-read"
+        );
+    }
+
+    #[test]
+    fn deferred_purge_retires_exactly_the_pre_purge_prefix() {
+        let mut terminal = TerminalState::new(8, 3);
+        for index in 0..10 {
+            terminal.process_input(format!("old-{index}\r\n").as_bytes());
+        }
+        terminal.scroll(4);
+        let erased = terminal.scrollback_len();
+        assert!(erased > 0, "fixture must have saved lines to erase");
+
+        terminal.process_input(b"\x1b[3J");
+        assert_eq!(terminal.scrollback_len(), erased, "the purge is deferred");
+
+        // Rows the app repaints after the purge are new history, not erased.
+        for index in 0..6 {
+            terminal.process_input(format!("new-{index}\r\n").as_bytes());
+        }
+        let before_settling = terminal.scrollback_len();
+
+        terminal.scroll_to_bottom();
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            before_settling - erased,
+            "settling retires the erased prefix, and only that prefix"
+        );
+        assert_eq!(terminal.scroll_offset, 0);
+        let survivors: Vec<String> = terminal
+            .scrollback
+            .iter()
+            .map(|line| {
+                line.decompress()
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !survivors.contains(&"old-0".to_string()),
+            "the oldest erased row must be gone once the reader returns, got {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_purge_never_outlives_the_rows_the_cap_already_trimmed() {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.set_max_scrollback(6);
+        for index in 0..10 {
+            terminal.process_input(format!("old-{index}\r\n").as_bytes());
+        }
+        terminal.scroll(3);
+        terminal.process_input(b"\x1b[3J");
+
+        // The cap evicts the deferred rows itself while the reader stays put.
+        for index in 0..6 {
+            terminal.process_input(format!("new-{index}\r\n").as_bytes());
+        }
+        assert_eq!(
+            terminal.pending_saved_line_purge, 0,
+            "rows the cap already dropped must stop counting toward the purge"
+        );
+        let before_settling = terminal.scrollback_len();
+
+        terminal.scroll_to_bottom();
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            before_settling,
+            "a purge whose rows the cap already evicted must not take live rows too"
+        );
+    }
+
+    #[test]
     fn synchronized_primary_screen_redraws_do_not_fill_scrollback() {
         let mut terminal = TerminalState::new(24, 4);
 
@@ -13553,9 +13792,12 @@ mod tests {
         terminal.process_input(b"second page\r\nbeta\r\ndone ");
         terminal.process_input(b"\x1b[?2026l");
 
-        assert!(
-            terminal.scrollback_len() >= 6,
-            "expected synchronized alt-screen snapshots in scrollback"
+        // Each frame supersedes the previous one: the alternate screen holds a
+        // scrollable copy of what it shows, not one copy per repaint.
+        assert_eq!(
+            terminal.scrollback_len(),
+            3,
+            "expected exactly one synchronized alt-screen snapshot in scrollback"
         );
 
         terminal.scroll(3);
@@ -13571,8 +13813,138 @@ mod tests {
             .collect::<String>();
 
         assert!(
-            text.contains("first page") || text.contains("second page"),
-            "expected archived synchronized screen content, got {text:?}"
+            text.contains("second page"),
+            "expected the newest archived synchronized screen, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn animated_alt_screen_frames_do_not_grow_scrollback() {
+        let mut terminal = TerminalState::new(16, 3);
+        terminal.process_input(b"\x1b[?1049h");
+
+        for frame in 0..200 {
+            terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+            terminal.process_input(
+                format!("working {frame:03}\r\nrow-a {frame:03}\r\nrow-b {frame:03}").as_bytes(),
+            );
+            terminal.process_input(b"\x1b[?2026l");
+        }
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            3,
+            "an animated TUI must not append one screen per repaint"
+        );
+    }
+
+    #[test]
+    fn alt_screen_frames_that_clear_every_repaint_do_not_grow_scrollback() {
+        let mut terminal = TerminalState::new(16, 3);
+        terminal.process_input(b"\x1b[?1049h");
+
+        for frame in 0..200 {
+            terminal.process_input(b"\x1b[?2026h\x1b[H\x1b[2J\x1b[1;1H");
+            terminal.process_input(
+                format!("working {frame:03}\r\nrow-a {frame:03}\r\nrow-b {frame:03}").as_bytes(),
+            );
+            terminal.process_input(b"\x1b[?2026l");
+        }
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            3,
+            "an erase inside the alternate screen is a repaint, not new history"
+        );
+    }
+
+    #[test]
+    fn alt_screen_frames_leave_a_scrolled_back_reader_untouched() {
+        let mut terminal = TerminalState::new(16, 3);
+        for index in 0..12 {
+            terminal.process_input(format!("hist-{index}\r\n").as_bytes());
+        }
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1Hframe zero\x1b[?2026l");
+
+        terminal.scroll(4);
+        let reading_at = terminal.scroll_offset;
+        let history = terminal.scrollback_len();
+        assert!(reading_at > 0, "fixture must leave the viewport in history");
+
+        for frame in 1..50 {
+            terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+            terminal.process_input(format!("frame {frame:03}").as_bytes());
+            terminal.process_input(b"\x1b[?2026l");
+        }
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            history,
+            "frames still on screen must not be appended under a reader"
+        );
+        assert_eq!(
+            terminal.scroll_offset, reading_at,
+            "the reader's viewport must not move"
+        );
+    }
+
+    #[test]
+    fn reading_history_and_returning_leaves_one_alt_screen_snapshot() {
+        let mut terminal = TerminalState::new(16, 3);
+        for index in 0..12 {
+            terminal.process_input(format!("hist-{index}\r\n").as_bytes());
+        }
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1Hframe zero\x1b[?2026l");
+        let settled = terminal.scrollback_len();
+
+        // Scroll away, let the app paint, then come back — repeatedly.
+        for cycle in 0..5 {
+            terminal.scroll(4);
+            terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+            terminal.process_input(format!("away {cycle}").as_bytes());
+            terminal.process_input(b"\x1b[?2026l");
+            terminal.scroll_to_bottom();
+            terminal.process_input(b"\x1b[?2026h\x1b[1;1H");
+            terminal.process_input(format!("back {cycle}").as_bytes());
+            terminal.process_input(b"\x1b[?2026l");
+        }
+
+        assert_eq!(
+            terminal.scrollback_len(),
+            settled,
+            "each read-and-return must not strand another snapshot in history"
+        );
+    }
+
+    #[test]
+    fn alt_screen_content_that_scrolls_off_the_top_is_still_kept() {
+        let mut terminal = TerminalState::new(16, 3);
+        terminal.process_input(b"\x1b[?1049h");
+
+        // A transcript-style TUI: each frame pushes a line off the screen top.
+        for index in 0..8 {
+            terminal.process_input(b"\x1b[?2026h");
+            terminal.process_input(format!("scrolled-{index}\r\n").as_bytes());
+            terminal.process_input(b"\x1b[?2026l");
+        }
+
+        let history: Vec<String> = terminal
+            .scrollback
+            .iter()
+            .map(|line| {
+                line.decompress()
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            history.iter().any(|row| row == "scrolled-0"),
+            "rows the app scrolled off the alternate screen stay scrollable, got {history:?}"
         );
     }
 
