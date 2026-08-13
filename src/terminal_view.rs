@@ -96,6 +96,10 @@ pub enum MouseInput {
         /// No Drag/Release is emitted, so it can never mutate text selection or
         /// leak half a mouse-reporting sequence after opening the link.
         link: bool,
+        /// Immutable terminal projection revision used to classify `link`.
+        /// The application revalidates it before opening so resize, scrolling,
+        /// buffer swaps, and output cannot retarget a stale press.
+        link_revision: u64,
         /// Window-local pointer position. Context menus freeze this at open
         /// time so later pointer movement cannot move the stable-target panel.
         x: f32,
@@ -712,6 +716,7 @@ pub struct TermWidget<'a, Message> {
     projection_key: Option<ProjectionKey>,
     /// Detected clickable links in visible-grid coordinates (line = grid row).
     links: &'a [crate::link::Link],
+    link_revision: u64,
     /// Kitty-graphics placements to paint over the grid.
     images: Vec<KittyRender>,
     /// When false (Auto), the scrollbar is only drawn while scrolled up; when
@@ -783,6 +788,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             on_summary: None,
             projection_key: None,
             links: &[],
+            link_revision: 0,
             images: Vec::new(),
             scrollbar_always: true,
             preedit: None,
@@ -819,8 +825,9 @@ impl<'a, Message> TermWidget<'a, Message> {
     }
 
     /// Supply detected links to color, underline, and make clickable.
-    pub fn links(mut self, links: &'a [crate::link::Link]) -> Self {
+    pub fn links(mut self, links: &'a [crate::link::Link], revision: u64) -> Self {
         self.links = links;
+        self.link_revision = revision;
         self
     }
 
@@ -851,9 +858,45 @@ impl<'a, Message> TermWidget<'a, Message> {
 
     /// Find the link covering a given (col, row) cell, if any.
     fn link_at(&self, col: usize, row: usize) -> Option<&crate::link::Link> {
-        self.links
-            .iter()
-            .find(|l| l.line == row && col >= l.col_start && col < l.col_end)
+        self.links.iter().find(|l| {
+            l.line == row
+                && col >= l.col_start
+                && col < l.col_end
+                && match l.link_type {
+                    crate::link::LinkType::Url => crate::link::is_openable_url(&l.text),
+                    crate::link::LinkType::FilePath | crate::link::LinkType::IpAddress => true,
+                }
+        })
+    }
+
+    /// Resolve pointer hover through the same real-grid and Block Mode surface
+    /// rules used by press handling, so the hand cursor/highlight never
+    /// promises an activation the application will refuse.
+    fn link_at_position(&self, position: Point, bounds: Rectangle) -> Option<&crate::link::Link> {
+        let (col, row) = self.cell_at(position, bounds);
+        let before_scrollbar = self
+            .scrollbar_geometry(bounds)
+            .is_none_or(|(_, _, scrollbar_x, _, _)| position.x < scrollbar_x);
+        let grid_top = bounds.y + self.metrics.padding;
+        let grid_bottom = grid_top + self.grid.len() as f32 * self.metrics.cell_h;
+        let grid_left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+        let grid_width = self
+            .grid
+            .first()
+            .map_or(0.0, |cells| cells.len() as f32 * self.metrics.cell_w);
+        let block = self.blocks.get(row);
+        let over_real_grid = before_scrollbar
+            && position.y >= grid_top
+            && position.y < grid_bottom
+            && position.x >= grid_left
+            && position.x < grid_left + grid_width;
+        let eligible = block.is_none_or(|block| block.collapsed_summary.is_none())
+            && link_surface_eligible(
+                over_real_grid,
+                block.is_some_and(|block| block.selectable),
+                block.is_some_and(|block| col < block.header_end_col),
+            );
+        eligible.then(|| self.link_at(col, row)).flatten()
     }
 
     /// Supply search matches (and the active match identity) to highlight.
@@ -1076,13 +1119,13 @@ mod tests {
     use super::{
         app_mouse_surface_eligible, block_card_geometry, block_card_hover_contains,
         block_card_segments, block_card_shadow, block_card_stripe_bounds, block_card_visual,
-        block_mouse_action, clipped_block_card_border_bounds, glyph_shaping, owns_mouse_release,
-        should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
-        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font,
-        stable_summary_activation, terminal_glyph_font, BlockCardKind, BlockCardSegment,
-        BlockMouseAction, BlockPaintRow, CollapsedSummaryPaint, Metrics, MouseButton, SummaryPress,
-        BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS, BLOCK_CARD_INSET, BLOCK_CARD_RADIUS,
-        BLOCK_GUTTER_WIDTH,
+        block_mouse_action, clipped_block_card_border_bounds, ctrl_link_eligible, glyph_shaping,
+        link_surface_eligible, owns_mouse_release, should_use_cjk_fallback_font,
+        should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
+        should_use_symbol_fallback_font, stable_summary_activation, terminal_glyph_font,
+        BlockCardKind, BlockCardSegment, BlockMouseAction, BlockPaintRow, CollapsedSummaryPaint,
+        Metrics, MouseButton, SummaryPress, BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS,
+        BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Point, Rectangle};
 
@@ -1180,6 +1223,40 @@ mod tests {
             action(MouseButton::Right, false, true, false, false, 1),
             None
         );
+    }
+
+    #[test]
+    fn link_gesture_requires_ctrl_single_left_and_a_real_link_surface() {
+        assert!(ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            link_surface_eligible(true, false, false),
+        ));
+        assert!(!ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            link_surface_eligible(false, false, false),
+        ));
+        assert!(!ctrl_link_eligible(
+            MouseButton::Left,
+            1,
+            true,
+            false,
+            link_surface_eligible(true, true, true),
+        ));
+        assert!(!ctrl_link_eligible(MouseButton::Left, 2, true, false, true,));
+        assert!(!ctrl_link_eligible(
+            MouseButton::Right,
+            1,
+            true,
+            false,
+            true,
+        ));
+        assert!(!ctrl_link_eligible(MouseButton::Left, 1, true, true, true,));
     }
 
     #[test]
@@ -1785,6 +1862,7 @@ where
                     block,
                     block_zone_id,
                     link,
+                    link_revision: self.link_revision,
                     x: pos.x,
                     y: pos.y,
                 }));
@@ -1976,8 +2054,7 @@ where
         // The link currently under the pointer (brightened on hover).
         let hovered: Option<&crate::link::Link> = cursor
             .position_over(bounds)
-            .map(|p| self.cell_at(p, bounds))
-            .and_then(|(hc, hr)| self.link_at(hc, hr));
+            .and_then(|position| self.link_at_position(position, bounds));
         let pad = self.metrics.padding;
         let cw = self.metrics.cell_w;
         let ch = self.metrics.cell_h;
@@ -2801,7 +2878,7 @@ where
             {
                 return mouse::Interaction::Pointer;
             }
-            if self.link_at(c, r).is_some() {
+            if self.link_at_position(p, layout.bounds()).is_some() {
                 return mouse::Interaction::Pointer;
             }
         }

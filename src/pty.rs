@@ -1212,16 +1212,44 @@ mod unix_pty {
             if pid == 0 {
                 unsafe {
                     let _ = libc::close(read_fd);
+                    // The production child immediately execs, which closes every
+                    // unrelated CLOEXEC descriptor. This fixture can deliberately
+                    // pause before exit, so emulate that boundary explicitly: if
+                    // it retained a process-wide flock opened by another parallel
+                    // test, dropping the lock in the parent would not release it
+                    // until this child was killed. Keep the status writer at one
+                    // known descriptor and close everything above it.
+                    const STATUS_FD: RawFd = 3;
+                    if write_fd != STATUS_FD {
+                        if libc::dup2(write_fd, STATUS_FD) < 0 {
+                            libc::_exit(126);
+                        }
+                        let _ = libc::close(write_fd);
+                    }
+                    #[cfg(target_os = "linux")]
+                    let close_range_unavailable =
+                        libc::close_range(STATUS_FD as libc::c_uint + 1, libc::c_uint::MAX, 0) != 0;
+                    #[cfg(not(target_os = "linux"))]
+                    let close_range_unavailable = true;
+                    if close_range_unavailable {
+                        // This test module only exercises Unix targets. The
+                        // conservative old-kernel fallback avoids allocation
+                        // after fork. Test processes keep descriptors in this
+                        // low range; production takes the exec/CLOEXEC path.
+                        for fd in (STATUS_FD + 1)..1024 {
+                            let _ = libc::close(fd);
+                        }
+                    }
                     if let Some(byte) = partial_status {
                         let _ =
-                            libc::write(write_fd, (&byte as *const u8).cast::<libc::c_void>(), 1);
+                            libc::write(STATUS_FD, (&byte as *const u8).cast::<libc::c_void>(), 1);
                     }
                     if keep_writer_open {
                         loop {
                             libc::pause();
                         }
                     }
-                    let _ = libc::close(write_fd);
+                    let _ = libc::close(STATUS_FD);
                     libc::_exit(0);
                 }
             }

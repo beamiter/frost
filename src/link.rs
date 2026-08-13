@@ -1,59 +1,11 @@
 /// 链接检测和交互模块
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-/// OSC 8 超链接（从 ANSI 转义序列解析）
-/// Will be integrated in Phase 3
-#[allow(dead_code)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Hyperlink {
-    pub url: String,
-    pub text: String,
-    pub id: Option<String>,
-}
-
-impl Hyperlink {
-    #[allow(dead_code)]
-    pub fn to_ansi_string(&self) -> String {
-        let id = self.id.as_deref().unwrap_or("");
-        format!(
-            "\x1b]8;{};{}\x1b\\{}\x1b]8;;\x1b\\",
-            id, self.url, self.text
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn from_ansi_string(s: &str) -> Option<Self> {
-        // 简化解析：\x1b]8;id;url\x1b\text\x1b]8;;\x1b\
-        if !s.contains("\x1b]8;") {
-            return None;
-        }
-
-        // 提取 URL 和文本
-        let parts: Vec<&str> = s.split("\x1b\\").collect();
-        if parts.len() >= 2 {
-            let url_part = parts[0];
-            let text = parts[1];
-
-            if let Some(url_start) = url_part.find(';') {
-                let url = &url_part[url_start + 1..];
-                return Some(Hyperlink {
-                    url: url.to_string(),
-                    text: text.to_string(),
-                    id: None,
-                });
-            }
-        }
-
-        None
-    }
-}
 
 /// 链接类型
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum LinkType {
-    /// URL (http/https/ftp)
+    /// URL (http/https)
     Url,
     /// 本地文件路径
     FilePath,
@@ -107,11 +59,13 @@ pub struct LinkDetector {
 
 impl LinkDetector {
     pub fn new(config: LinkDetectionConfig) -> Self {
-        // URL 正则：http(s)?:// 或 ftp://
+        // Recognize common URL-shaped text first; `is_openable_url` below is
+        // still the sole policy deciding which matches become actionable.
         // Parens are allowed in the body (e.g. Wikipedia `/wiki/Foo_(bar)`); an
         // unbalanced trailing `)` is trimmed in code below.
         let url_regex =
-            Regex::new(r"(?:https?|ftp)://[^\s<>\[\]{}|\\^`]*[^\s<>\[\]{}|\\^`.,;:!?\-]").unwrap();
+            Regex::new(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\[\]{}|\\^`]*[^\s<>\[\]{}|\\^`.,;:!?\-]")
+                .unwrap();
 
         // IP 地址正则：x.x.x.x 格式
         let ip_regex = Regex::new(
@@ -142,19 +96,25 @@ impl LinkDetector {
     /// 在单行文本中检测所有链接
     pub fn detect_links_in_line(&self, line: &str, line_idx: usize) -> Vec<Link> {
         let mut links = Vec::new();
+        let mut url_spans = Vec::new();
 
-        // 检测 URL
-        if self.config.detect_urls {
-            for mat in self.url_regex.find_iter(line) {
-                let mut url = mat.as_str();
-                // Drop trailing unbalanced `)` so a URL inside parentheses like
-                // `(https://example.com)` doesn't swallow the closing paren,
-                // while a balanced `/wiki/Foo_(bar)` is kept intact.
-                while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
-                    url = &url[..url.len() - 1];
-                }
-                let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-                let col_end = Self::byte_offset_to_char_offset(line, mat.start() + url.len());
+        // Detect every URL-shaped span even when URL activation is disabled:
+        // an IP/file-looking substring inside a refused scheme must never fall
+        // back to a different link type.
+        for mat in self.url_regex.find_iter(line) {
+            let mut url = mat.as_str();
+            // Drop trailing unbalanced `)` so a URL inside parentheses like
+            // `(https://example.com)` doesn't swallow the closing paren,
+            // while a balanced `/wiki/Foo_(bar)` is kept intact.
+            while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
+                url = &url[..url.len() - 1];
+            }
+            let col_start = Self::byte_offset_to_char_offset(line, mat.start());
+            let col_end = Self::byte_offset_to_char_offset(line, mat.start() + url.len());
+            // Reserve the whole URL-shaped span even when policy rejects it.
+            // Otherwise `https://user@192.0.2.1` could activate its inner IP.
+            url_spans.push((col_start, col_end));
+            if self.config.detect_urls && is_openable_url(url) {
                 links.push(Link {
                     line: line_idx,
                     col_start,
@@ -171,9 +131,12 @@ impl LinkDetector {
                 let col_start = Self::byte_offset_to_char_offset(line, mat.start());
                 let col_end = Self::byte_offset_to_char_offset(line, mat.end());
                 // 避免与 URL 重复
-                if !links
+                if !url_spans
                     .iter()
-                    .any(|l| l.col_start <= col_start && col_end <= l.col_end)
+                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                    && !links
+                        .iter()
+                        .any(|l| l.col_start <= col_start && col_end <= l.col_end)
                 {
                     links.push(Link {
                         line: line_idx,
@@ -203,9 +166,12 @@ impl LinkDetector {
                     Self::byte_offset_to_char_offset(line, start_byte + matched_text.len());
 
                 // 避免与 URL 重复
-                if !links
+                if !url_spans
                     .iter()
-                    .any(|l| l.col_start <= col_start && col_end <= l.col_end)
+                    .any(|&(start, end)| start <= col_start && col_end <= end)
+                    && !links
+                        .iter()
+                        .any(|l| l.col_start <= col_start && col_end <= l.col_end)
                     && Self::is_valid_file_path(matched_text)
                 {
                     links.push(Link {
@@ -537,53 +503,6 @@ fn resolve_existing_file_path(
     .into())
 }
 
-/// 复制链接到剪贴板
-#[allow(dead_code)]
-pub fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::io::Write;
-        let mut child = std::process::Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Write;
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::io::Write;
-        let mut child = std::process::Command::new("clip")
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,9 +599,41 @@ mod tests {
         };
 
         let detector = LinkDetector::new(config);
-        let line = "Visit https://example.com for more info";
+        let line = "Visit https://192.0.2.1/a for more info";
         let links = detector.detect_links_in_line(line, 0);
 
         assert!(!links.iter().any(|l| l.link_type == LinkType::Url));
+        assert!(links.is_empty(), "inner IP must not bypass URL policy");
+    }
+
+    #[test]
+    fn unsafe_url_shapes_never_fall_back_to_inner_ip_links() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        for text in [
+            "ftp://192.0.2.1/archive",
+            "https://user:token@192.0.2.1/private",
+            "file://192.0.2.1/etc/passwd",
+        ] {
+            assert!(
+                detector.detect_links_in_line(text, 0).is_empty(),
+                "unsafe enclosing URL became actionable: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn openable_url_policy_is_applied_during_detection_and_opening() {
+        assert!(is_openable_url("https://example.com/a?b=c#d"));
+        assert!(is_openable_url("HTTP://example.com"));
+        assert!(!is_openable_url("ftp://example.com/archive"));
+        assert!(!is_openable_url("https://user@example.com/private"));
+        assert!(!is_openable_url("https://example.com/line\nbreak"));
+        assert!(!is_openable_url("https://example.com\\evil"));
+
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let links = detector
+            .detect_links_in_line("ok https://example.com bad ftp://example.com/archive", 0);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, "https://example.com");
     }
 }

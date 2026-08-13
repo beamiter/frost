@@ -1,15 +1,44 @@
 # Engineering handoff
 
-Updated: 2026-08-10
+Updated: 2026-08-13
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
-the Block Mode hardening/discoverability pass on top of the prior Agent review,
-configuration, terminal parsing, history, keybindings, and session-persistence work.
-Block lifecycle identities and cell boundaries are checked, finalized rows own a real
-gutter, stale UI targets fail closed, and the jsh/link policies from the prior baseline
-remain intact.
+native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
+prebuilt-artifact install path on top of the Block Mode, Agent review, configuration,
+terminal parsing, history, keybindings, and session-persistence work. Block and link
+lifecycle identities and cell boundaries are checked, finalized rows own a real gutter,
+stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- OSC 8 metadata now reaches the ordinary link interaction pipeline. URI and id fields
+  are rejected before allocation above 2 KiB / 256 B, the terminal-local interner is
+  capped at 4096 entries, and compact cell keys survive live-grid edits, in-memory
+  scrollback compression, scrolling, resize/reflow, and safe alternate-screen swaps.
+  Explicit spans override overlapping heuristic links and are revalidated through the
+  one HTTP(S)-only `is_openable_url` policy at parse, projection, hit-test, app merge,
+  and opener boundaries. Ctrl+single-left activation carries the projection revision,
+  so output or viewport movement cannot retarget a stale click.
+- App-owned `fc-list`, `fc-match`, and `notify-send` calls now share a bounded helper
+  process boundary. Programs resolve only from fixed absolute system candidates whose
+  canonical file and directory chain is trusted. Each helper leads a process group,
+  stdout and stderr drain concurrently under independent byte caps, and one deadline
+  terminates and reaps the entire group. Exit observation uses `waitid(WNOWAIT)` so the
+  group leader retains its PID until cleanup and a recycled PGID can never be signalled.
+- The source installer accepts `--binary PATH`, allowing release archives, CI artifacts,
+  and distro staging to reuse the same path contract without Cargo. A real `DESTDIR`
+  install/uninstall test checks all six artifacts, modes, launcher paths, escaping, and
+  failure diagnostics. Desktop and AppStream validation now run in CI; custom desktop
+  executable paths with undefined/unportable `%`, forbidden `=`, or control characters
+  fail explicitly. The application manifest is `publish = false` because its exact-pinned
+  git core cannot form a usable crates.io package.
+- The fork-based PTY startup-timeout fixture now closes unrelated inherited descriptors
+  before deliberately pausing. This mirrors the production child's immediate exec and
+  prevents a parallel test's CLOEXEC process lock from remaining held by the fixture.
+- The durable snapshot concurrency test now treats only the production lock's bounded
+  `TimedOut` result as permissible under saturated filesystem contention. It still
+  requires a complete single-generation publish with no staging residue, then performs
+  another production write after every contender returns to prove the lock was released.
 
 - Block interaction has a layout-reserved 8px gutter rather than paint over column zero.
   Finalized rows are a local static-card surface: a single prompt/header click selects,
@@ -112,21 +141,12 @@ remain intact.
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
 
-## Remaining boundaries
+## Remaining release boundary
 
-### Own the remaining app-owned helpers
-
-`jsh_version_banner` is now group-owned and bounded, but the app-owned
-`fc-list`, `fc-match`, and notification helpers still resolve through a mutable
-`PATH` and read unbounded output without a deadline. Give them the same
-treatment: a trusted absolute program, a process group, concurrent bounded
-drains of stdout and stderr, one deadline, and a reaped group.
-
-### Connect OSC 8 to clicking, or keep it inert deliberately
-
-OSC 8 targets are parsed but not clickable. When that changes, route them
-through `link::is_openable_url` — it is now the single policy — and cap the URI
-and id fields before interning them.
+The repository still has no formal release tag, so AppStream deliberately has no
+fabricated `<releases>` entry. Add the first release node with the real version and date
+when the first tag is cut; `appstreamcli validate --pedantic --no-net` currently reports
+that omission as its one expected pedantic note.
 
 ## Release checks
 

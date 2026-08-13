@@ -7,6 +7,9 @@ repository = "https://github.com/beamiter/frost"
 homepage = "https://github.com/beamiter/frost"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
+# frost ships as a Linux application; its exact-pinned git core is not a
+# crates.io dependency, so publishing this manifest there would be unusable.
+publish = false
 keywords = ["terminal", "terminal-emulator", "iced", "gpu", "linux"]
 categories = ["command-line-utilities"]
 

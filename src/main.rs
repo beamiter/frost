@@ -8,6 +8,7 @@ use jterm_core::pane_layout::{
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
 mod ansi;
+mod app_helpers;
 mod block_export;
 mod block_mode;
 mod color;
@@ -358,6 +359,13 @@ fn validated_claimed_block_target(
     let rendered_zone_id = rendered_zone_id?;
     (retained_finalized && current_row_zone_id == Some(rendered_zone_id))
         .then_some(rendered_zone_id)
+}
+
+/// A link press is meaningful only in the immutable projection it was painted
+/// from. Revision zero means the projection identity counter exhausted and is
+/// deliberately never activatable.
+fn link_projection_matches(rendered_revision: u64, current_revision: u64) -> bool {
+    rendered_revision != 0 && rendered_revision == current_revision
 }
 
 fn validated_summary_target(
@@ -6185,20 +6193,30 @@ impl Frost {
             count,
             link_eligible,
             link: widget_claimed_link,
+            link_revision,
             ..
         } = input
         {
-            let current_link =
-                terminal_view::ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
-                    .then(|| {
-                        self.links
-                            .iter()
-                            .find(|link| {
-                                link.line == row && col >= link.col_start && col < link.col_end
-                            })
-                            .cloned()
-                    })
-                    .flatten();
+            let revision_matches = self
+                .session_index_by_id(source_session_id)
+                .and_then(|source| self.sessions.get(source))
+                .is_some_and(|session| {
+                    link_projection_matches(link_revision, session.projection.view_revision())
+                });
+            let current_link = revision_matches
+                .then(|| {
+                    terminal_view::ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
+                        .then(|| {
+                            self.links
+                                .iter()
+                                .find(|link| {
+                                    link.line == row && col >= link.col_start && col < link.col_end
+                                })
+                                .cloned()
+                        })
+                        .flatten()
+                })
+                .flatten();
             if widget_claimed_link || current_link.is_some() {
                 self.click_tracker.cancel();
                 self.terminal_mouse_gestures[button.slot()] =
@@ -10255,12 +10273,32 @@ impl Frost {
             return;
         }
         self.links_cache_key = cacheable.then_some(key);
-        self.links = self
+        let mut links = self
             .link_detector
             .detect_links_in_visible_cells_with_wrapping(
                 sess.projection.cells(),
                 sess.projection.row_wrapped(),
             );
+        // OSC 8 is metadata rather than visible URL text. Give its exact cell
+        // spans precedence over heuristic matches, while still routing every
+        // target through the same `is_openable_url` policy in the terminal,
+        // here, and once more immediately before the opener is spawned.
+        let osc8_links = sess
+            .terminal
+            .osc8_links_in_visible_cells(sess.projection.cells());
+        links.retain(|detected| {
+            !osc8_links.iter().any(|explicit| {
+                detected.line == explicit.line
+                    && detected.col_start < explicit.col_end
+                    && explicit.col_start < detected.col_end
+            })
+        });
+        links.extend(
+            osc8_links
+                .into_iter()
+                .filter(|link| link::is_openable_url(&link.text)),
+        );
+        self.links = links;
     }
 
     // --- Theme-derived chrome colors and styles ---------------------------
@@ -12073,7 +12111,7 @@ impl Frost {
         .block_compact(self.config.block_compact)
         .block_markers(self.block_marker_fractions(sess))
         .block_bookmark_markers(self.block_bookmark_marker_fractions(sess))
-        .links(links)
+        .links(links, sess.projection.view_revision())
         .dynamic_palette(&sess.terminal.dynamic_palette)
         .dynamic_defaults(
             sess.terminal.dynamic_fg,
@@ -14747,10 +14785,7 @@ fn enqueue_desktop_notification(title: String, body: String) {
             .name("frost-notifications".to_string())
             .spawn(move || {
                 while let Ok((title, body)) = receiver.recv() {
-                    let _ = std::process::Command::new("notify-send")
-                        .arg(title)
-                        .arg(body)
-                        .status();
+                    let _ = app_helpers::notify_send(&title, &body);
                 }
             });
         sender
@@ -15777,6 +15812,14 @@ mod tests {
             None,
             "an evicted/non-finalized painted target fails closed"
         );
+    }
+
+    #[test]
+    fn stale_or_exhausted_link_projection_revision_fails_closed() {
+        assert!(link_projection_matches(41, 41));
+        assert!(!link_projection_matches(41, 42));
+        assert!(!link_projection_matches(0, 0));
+        assert!(!link_projection_matches(0, 41));
     }
 
     #[test]

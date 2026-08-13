@@ -2,7 +2,6 @@ use crate::persistence::{self, AtomicWriteError, FileRevision};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_NAME_BYTES: usize = 256;
@@ -392,7 +391,10 @@ fn default_line_spacing() -> f32 {
 fn detect_fonts_by_query(extra_args: &[&str]) -> Vec<String> {
     let mut args = Vec::from(extra_args);
     args.push("family");
-    if let Ok(output) = Command::new("fc-list").args(&args).output() {
+    if let Ok(output) = crate::app_helpers::fc_list(&args) {
+        if !output.status.success() {
+            return Vec::new();
+        }
         if let Ok(stdout) = String::from_utf8(output.stdout) {
             let mut seen = std::collections::HashSet::new();
             let mut families: Vec<String> = stdout
@@ -417,11 +419,11 @@ fn detect_fonts_by_query(extra_args: &[&str]) -> Vec<String> {
 }
 
 fn detect_font_by_match(args: &[&str]) -> Option<String> {
-    let output = Command::new("fc-match")
-        .args(args)
-        .args(["family"])
-        .output()
-        .ok()?;
+    let mut helper_args = Vec::from(args);
+    helper_args.push("family");
+    let output = crate::app_helpers::fc_match(&helper_args)
+        .ok()
+        .filter(|output| output.status.success())?;
     let stdout = String::from_utf8(output.stdout).ok()?;
     stdout
         .lines()
@@ -436,12 +438,9 @@ fn detect_font_by_match(args: &[&str]) -> Option<String> {
 
 fn detect_preferred_font(candidates: &[&str]) -> Option<String> {
     for candidate in candidates {
-        let output = Command::new("fc-match")
-            .arg("-f")
-            .arg("%{family}\n")
-            .arg(candidate)
-            .output()
-            .ok()?;
+        let output = crate::app_helpers::fc_match(&["-f", "%{family}\n", candidate])
+            .ok()
+            .filter(|output| output.status.success())?;
         let stdout = String::from_utf8(output.stdout).ok()?;
         let line = stdout.lines().next()?.trim();
         let line_lower = line.to_lowercase();

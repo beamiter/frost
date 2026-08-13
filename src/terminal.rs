@@ -5,6 +5,7 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
@@ -87,9 +88,23 @@ const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?65;1;9c";
 const SECONDARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[>1;7802;0c";
 const XTERM_VERSION_RESPONSE: &[u8] = b"\x1bP>|VTE(7802)\x1b\\";
 const MAX_TERMINAL_TITLE_CHARS: usize = 256;
+/// OSC 8 fields are terminal-controlled input. Bound both fields before
+/// allocating or interning them; the URI limit intentionally matches the
+/// single opener policy in `link::is_openable_url`.
+const MAX_OSC8_URI_BYTES: usize = 2 * 1024;
+const MAX_OSC8_ID_BYTES: usize = 256;
+/// Cell keys are `u16`, but a much smaller terminal-local cap bounds retained
+/// URI/id memory even when a child emits a fresh id for every character.
+const MAX_OSC8_HYPERLINKS: usize = 4 * 1024;
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Osc8Hyperlink {
+    uri: String,
+    id: Option<String>,
+}
 
 /// Stable identity of one retained physical terminal row.
 ///
@@ -592,6 +607,7 @@ impl RawRowLayout {
             && cells[active_len - 1].background == Color::Default
             && !cells[active_len - 1].flags.wide()
             && !cells[active_len - 1].flags.wide_continuation()
+            && cells[active_len - 1].hyperlink == 0
         {
             active_len -= 1;
         }
@@ -631,6 +647,7 @@ impl ScrollbackLine {
                     || cell.background != Color::Default
                     || cell.flags.wide()
                     || cell.flags.wide_continuation()
+                    || cell.hyperlink != 0
             })
             .map_or(0, |col| col + 1);
         let projected_wide_continuations = cells[..projected_active_len]
@@ -655,6 +672,7 @@ impl ScrollbackLine {
                     && c.flags.is_default_style()
                     && !c.flags.wide()
                     && !c.flags.wide_continuation()
+                    && c.hyperlink == 0
             })
             .count();
 
@@ -665,6 +683,7 @@ impl ScrollbackLine {
                 && c.flags.is_default_style()
                 && !c.flags.wide()
                 && !c.flags.wide_continuation()
+                && c.hyperlink == 0
         });
 
         if all_default_attrs {
@@ -871,6 +890,7 @@ impl ScrollbackLine {
                     && next.foreground == cell.foreground
                     && next.background == cell.background
                     && next.flags == cell.flags
+                    && next.hyperlink == cell.hyperlink
                 {
                     run += 1;
                 } else {
@@ -879,7 +899,8 @@ impl ScrollbackLine {
             }
 
             // Format:
-            // [char_len:1][char_bytes][fg][bg][style_flags:1][extra_flags:1][run:1]
+            // [char_len:1][char_bytes][fg][bg][style_flags:1][extra_flags:1]
+            // [hyperlink:2][run:1]
             // style_flags uses every bit, so blink shares extra_flags with the
             // two wide-character markers.
             buf.push(ch_bytes.len() as u8);
@@ -892,6 +913,7 @@ impl ScrollbackLine {
                 | if cell.flags.wide_continuation() { 2 } else { 0 }
                 | if cell.flags.blink() { 4 } else { 0 };
             buf.push(extra_flags);
+            buf.extend_from_slice(&cell.hyperlink.to_le_bytes());
             buf.push(run);
 
             i += run as usize;
@@ -920,6 +942,11 @@ impl ScrollbackLine {
             pos += 1;
             let extra_flags = data.get(pos).copied().unwrap_or(0);
             pos += 1;
+            let hyperlink = u16::from_le_bytes([
+                data.get(pos).copied().unwrap_or(0),
+                data.get(pos + 1).copied().unwrap_or(0),
+            ]);
+            pos += 2;
             let run = data.get(pos).copied().unwrap_or(1).max(1);
             pos += 1;
 
@@ -933,6 +960,7 @@ impl ScrollbackLine {
                 foreground: fg,
                 background: bg,
                 flags,
+                hyperlink,
             };
             for _ in 0..run {
                 cells.push(cell);
@@ -950,6 +978,8 @@ pub struct TerminalCell {
     pub foreground: Color,
     pub background: Color,
     pub flags: StyleFlags,
+    /// Terminal-local OSC 8 intern key; zero means no explicit hyperlink.
+    pub(crate) hyperlink: u16,
 }
 
 impl Default for TerminalCell {
@@ -959,6 +989,7 @@ impl Default for TerminalCell {
             foreground: Color::Default,
             background: Color::Default,
             flags: StyleFlags::new(),
+            hyperlink: 0,
         }
     }
 }
@@ -2824,10 +2855,12 @@ pub struct TerminalState {
     next_projected_view_revision: u64,
     next_projection_plan_revision: u64,
 
-    // OSC 8 hyperlink tracking
-    current_hyperlink: Option<(String, Option<String>)>, // (url, id)
-    #[allow(dead_code)]
-    osc8_hyperlinks: Vec<crate::link::Link>, // Stored hyperlinks from OSC 8
+    // OSC 8 hyperlink tracking. Cells retain only the compact terminal-local
+    // key; targets live in this bounded interner and are revalidated when
+    // materialized into clickable view spans.
+    current_hyperlink: Option<u16>,
+    osc8_hyperlinks: Vec<Arc<Osc8Hyperlink>>,
+    osc8_hyperlink_keys: HashMap<Arc<Osc8Hyperlink>, u16>,
 
     // Synchronized output (mode 2026): suppress rendering until mode is cleared
     pub sync_output_active: bool,
@@ -3098,6 +3131,7 @@ impl TerminalState {
             next_projection_plan_revision: 1,
             current_hyperlink: None,
             osc8_hyperlinks: Vec::new(),
+            osc8_hyperlink_keys: HashMap::new(),
             sync_output_active: false,
             sync_output_start: None,
             last_archived_screen_snapshot: Vec::new(),
@@ -3237,6 +3271,105 @@ impl TerminalState {
                 _ => {}
             }
         }
+    }
+
+    /// Apply one OSC 8 state transition (`params;URI`). Invalid, oversized, or
+    /// non-openable targets close the current link instead of leaving an older
+    /// target armed across attacker-controlled text.
+    fn handle_osc8(&mut self, value: &str) {
+        let Some((params, uri)) = value.split_once(';') else {
+            self.current_hyperlink = None;
+            return;
+        };
+        if uri.is_empty() {
+            self.current_hyperlink = None;
+            return;
+        }
+
+        // Check borrowed fields before any owned allocation enters the
+        // interner. URI truncation is deliberately forbidden: it could turn a
+        // rejected target into a different, valid destination.
+        if uri.len() > MAX_OSC8_URI_BYTES || !crate::link::is_openable_url(uri) {
+            self.current_hyperlink = None;
+            return;
+        }
+        let id = params
+            .split(':')
+            .find_map(|parameter| parameter.strip_prefix("id="));
+        if id.is_some_and(|id| id.len() > MAX_OSC8_ID_BYTES) {
+            self.current_hyperlink = None;
+            return;
+        }
+
+        let candidate = Osc8Hyperlink {
+            uri: uri.to_owned(),
+            id: id.map(str::to_owned),
+        };
+        if let Some(&key) = self.osc8_hyperlink_keys.get(&candidate) {
+            self.current_hyperlink = Some(key);
+            return;
+        }
+        if self.osc8_hyperlinks.len() >= MAX_OSC8_HYPERLINKS {
+            self.current_hyperlink = None;
+            return;
+        }
+        let Some(key) = self
+            .osc8_hyperlinks
+            .len()
+            .checked_add(1)
+            .and_then(|key| u16::try_from(key).ok())
+        else {
+            self.current_hyperlink = None;
+            return;
+        };
+        let target = Arc::new(candidate);
+        self.osc8_hyperlinks.push(Arc::clone(&target));
+        self.osc8_hyperlink_keys.insert(target, key);
+        self.current_hyperlink = Some(key);
+    }
+
+    /// Materialize OSC 8 cell metadata into visible link spans. Every target
+    /// passes the opener policy again here so stale/corrupt keys fail closed;
+    /// `open_link` performs the final check at activation time as well.
+    pub fn osc8_links_in_visible_cells(
+        &self,
+        visible_cells: &[Vec<TerminalCell>],
+    ) -> Vec<crate::link::Link> {
+        let mut links = Vec::new();
+        for (line, cells) in visible_cells.iter().enumerate() {
+            let mut col = 0;
+            while col < cells.len() {
+                let key = cells[col].hyperlink;
+                if key == 0 {
+                    col += 1;
+                    continue;
+                }
+                let col_start = col;
+                col += 1;
+                while col < cells.len() && cells[col].hyperlink == key {
+                    col += 1;
+                }
+                let Some(target) = self.osc8_hyperlinks.get(usize::from(key) - 1) else {
+                    continue;
+                };
+                if !crate::link::is_openable_url(&target.uri) {
+                    continue;
+                }
+                links.push(crate::link::Link {
+                    line,
+                    col_start,
+                    col_end: col,
+                    link_type: crate::link::LinkType::Url,
+                    text: target.uri.clone(),
+                });
+            }
+        }
+        links
+    }
+
+    #[cfg(test)]
+    fn osc8_interned_count(&self) -> usize {
+        self.osc8_hyperlinks.len()
     }
 
     fn reset_osc_color(&mut self, command: &str) {
@@ -5649,12 +5782,14 @@ impl TerminalState {
         cell.flags = self.current_flags;
         cell.flags.set_wide(width == 2);
         cell.flags.set_wide_continuation(false);
+        cell.hyperlink = self.current_hyperlink.unwrap_or(0);
 
         // Set up wide character continuation cell if needed
         if width == 2 && self.cursor_col + 1 < cols {
             let cont_cell = self.grid.get_mut(self.cursor_row, self.cursor_col + 1);
             *cont_cell = blank_cell;
             cont_cell.flags.set_wide_continuation(true);
+            cont_cell.hyperlink = self.current_hyperlink.unwrap_or(0);
         }
 
         self.cursor_col += width;
@@ -5696,6 +5831,7 @@ impl TerminalState {
             let mut flags = self.current_flags;
             flags.set_wide(false);
             flags.set_wide_continuation(false);
+            let hyperlink = self.current_hyperlink.unwrap_or(0);
             let col = self.cursor_col;
             let end = col + chunk_len;
             self.note_idle_background_cells(
@@ -5727,6 +5863,7 @@ impl TerminalState {
                 cell.foreground = fg;
                 cell.background = bg;
                 cell.flags = flags;
+                cell.hyperlink = hyperlink;
             }
 
             self.cursor_col += chunk_len;
@@ -5754,6 +5891,7 @@ impl TerminalState {
             foreground: Color::Default,
             background: bg,
             flags: StyleFlags::default(),
+            hyperlink: 0,
         }
     }
 
@@ -5782,6 +5920,7 @@ impl TerminalState {
                 && cell.foreground == blank.foreground
                 && cell.background == blank.background
                 && cell.flags == blank.flags
+                && cell.hyperlink == 0
         })
     }
 
@@ -5991,6 +6130,7 @@ impl TerminalState {
             foreground: Color::Default,
             background: bg_color,
             flags: StyleFlags::default(),
+            hyperlink: 0,
         };
         // If clearing a continuation cell, also clear the wide character body
         if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
@@ -6302,25 +6442,7 @@ impl TerminalState {
                                         } else if command == "8" {
                                             // OSC 8 - Hyperlinks
                                             // Format: ESC ] 8 ; params ; URI ST
-                                            // params can include id=<identifier>
-                                            // Empty URI = close hyperlink
-                                            if let Some((params, uri)) = value.split_once(';') {
-                                                if uri.is_empty() {
-                                                    // Close hyperlink
-                                                    self.current_hyperlink = None;
-                                                } else {
-                                                    // Open hyperlink
-                                                    let id = params
-                                                        .split(':')
-                                                        .find_map(|p| p.strip_prefix("id="))
-                                                        .map(|s| s.to_string());
-                                                    self.current_hyperlink =
-                                                        Some((uri.to_string(), id));
-                                                }
-                                            } else if value.is_empty() {
-                                                // OSC 8 ; ; (close hyperlink)
-                                                self.current_hyperlink = None;
-                                            }
+                                            self.handle_osc8(value);
                                         } else if command == "4" {
                                             self.handle_osc_palette(value);
                                         } else if command == "10"
@@ -7353,6 +7475,7 @@ impl TerminalState {
                     foreground: Color::Default,
                     background: Color::Default,
                     flags: StyleFlags::default(),
+                    hyperlink: 0,
                 };
             }
         }
@@ -7425,6 +7548,8 @@ impl TerminalState {
         self.alt_keyboard_enhancement_stack.clear();
         self.clear_text_selection();
         self.current_hyperlink = None;
+        self.osc8_hyperlinks.clear();
+        self.osc8_hyperlink_keys.clear();
         // RIS resets the graphics namespace with the text screen: neither a
         // visible placement nor a half-finished upload may survive it.
         self.kitty_graphics.clear();
@@ -7480,6 +7605,7 @@ impl TerminalState {
                     foreground: Color::Default,
                     background: bg_color,
                     flags: StyleFlags::default(),
+                    hyperlink: 0,
                 };
             }
         }
@@ -7560,6 +7686,9 @@ impl TerminalState {
                         &mut self.alt_keyboard_enhancement_stack,
                     );
                     self.use_alt_buffer = true;
+                    // Retained cells keep their keys, but an unterminated
+                    // primary-screen link must not arm alternate-screen text.
+                    self.current_hyperlink = None;
 
                     // Selection anchors are absolute (scrollback+grid) row indices
                     // tied to the buffer that was visible. After a buffer swap they
@@ -7651,6 +7780,9 @@ impl TerminalState {
                     self.use_alt_buffer = false;
                     self.modes.remove(&mode);
                     self.pending_wrap = false;
+                    // Likewise, alt-screen OSC 8 state never leaks back onto
+                    // newly printed primary-screen cells.
+                    self.current_hyperlink = None;
 
                     // See the matching set_mode arm: clear selection because its
                     // anchors point into the alt buffer, and reset DECSTBM so the
@@ -10229,6 +10361,7 @@ impl TerminalState {
             && cells[end - 1].background == Color::Default
             && !cells[end - 1].flags.wide()
             && !cells[end - 1].flags.wide_continuation()
+            && cells[end - 1].hyperlink == 0
         {
             end -= 1;
         }
@@ -11367,8 +11500,107 @@ mod tests {
 
     use super::{
         AgentPromptStatus, ClipboardReadKind, Color, CursorShape, IdleBackgroundOutput,
-        ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_TERMINAL_TITLE_CHARS,
+        ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_OSC8_ID_BYTES,
+        MAX_OSC8_URI_BYTES, MAX_TERMINAL_TITLE_CHARS,
     };
+
+    fn osc8_spans(terminal: &mut TerminalState) -> Vec<crate::link::Link> {
+        let visible = terminal.get_visible_cells();
+        terminal.osc8_links_in_visible_cells(visible.as_ref())
+    }
+
+    #[test]
+    fn osc8_marks_exact_cells_and_closes_without_marking_following_text() {
+        let mut terminal = TerminalState::new(20, 3);
+        terminal.process_batch(
+            b"\x1b]8;id=docs;https://example.com/target\x1b\\click\x1b]8;;\x1b\\ plain",
+        );
+
+        assert_eq!(
+            osc8_spans(&mut terminal),
+            [crate::link::Link {
+                line: 0,
+                col_start: 0,
+                col_end: 5,
+                link_type: crate::link::LinkType::Url,
+                text: "https://example.com/target".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn osc8_rejects_unsafe_or_oversized_fields_before_interning() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.process_batch(b"\x1b]8;;file:///etc/passwd\x1b\\unsafe");
+        assert!(osc8_spans(&mut terminal).is_empty());
+        assert_eq!(terminal.osc8_interned_count(), 0);
+
+        let oversized_uri = format!(
+            "\x1b]8;;https://example.com/{}\x1b\\U",
+            "x".repeat(MAX_OSC8_URI_BYTES)
+        );
+        terminal.process_batch(oversized_uri.as_bytes());
+        let oversized_id = format!(
+            "\x1b]8;id={};https://example.com\x1b\\I",
+            "x".repeat(MAX_OSC8_ID_BYTES + 1)
+        );
+        terminal.process_batch(oversized_id.as_bytes());
+        assert_eq!(terminal.osc8_interned_count(), 0);
+        assert!(osc8_spans(&mut terminal).is_empty());
+    }
+
+    #[test]
+    fn osc8_survives_scrollback_and_resize_but_not_buffer_state_leaks() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal
+            .process_batch(b"\x1b]8;;https://example.com/a\x1b\\linked\x1b]8;;\x1b\\\r\nnext\r\n");
+        terminal.scroll(1);
+        assert!(osc8_spans(&mut terminal)
+            .iter()
+            .any(|link| link.text == "https://example.com/a"));
+
+        terminal.on_resize(10, 3);
+        terminal.scroll(isize::MAX);
+        assert!(osc8_spans(&mut terminal)
+            .iter()
+            .any(|link| link.text == "https://example.com/a"));
+
+        terminal.scroll_to_bottom();
+        terminal.process_batch(b"\x1b]8;;https://example.com/leak\x1b\\\x1b[?1049hALT");
+        assert!(osc8_spans(&mut terminal).is_empty());
+        terminal.process_batch(b"\x1b]8;;https://example.com/alt\x1b\\A\x1b[?1049lP");
+        assert!(osc8_spans(&mut terminal)
+            .iter()
+            .all(|link| link.text != "https://example.com/alt"));
+    }
+
+    #[test]
+    fn osc8_metadata_survives_compressed_scrollback_round_trip() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal
+            .process_batch(b"\x1b]8;;https://example.com/x\x1b\\link\x1b]8;;\x1b\\\r\nnext\r\n");
+        let restored = terminal
+            .scrollback
+            .front()
+            .expect("linked row reached scrollback")
+            .decompress();
+        let links = terminal.osc8_links_in_visible_cells(&[restored]);
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].col_start, links[0].col_end), (0, 4));
+    }
+
+    #[test]
+    fn osc8_erase_and_ris_leave_no_clickable_metadata() {
+        let mut terminal = TerminalState::new(12, 2);
+        terminal.process_batch(b"\x1b]8;;https://example.com/x\x1b\\linked");
+        assert_eq!(osc8_spans(&mut terminal).len(), 1);
+
+        terminal.process_batch(b"\r\x1b[2K");
+        assert!(osc8_spans(&mut terminal).is_empty());
+        terminal.process_batch(b"\x1b]8;;https://example.com/y\x1b\\again\x1bc");
+        assert_eq!(terminal.osc8_interned_count(), 0);
+        assert!(osc8_spans(&mut terminal).is_empty());
+    }
 
     #[test]
     fn scrollback_compression_round_trips_blink_style() {

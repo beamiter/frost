@@ -11,6 +11,9 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - UTF-8、中文宽字符、True Color、256 色、鼠标报告、括号粘贴和扩展键盘协议
 - Kitty 图像直接传输（`f=100` PNG、`f=24` RGB、`f=32` RGBA），协议的结构层与 anvil/2/4 共用 `jterm_core::kitty_graphics`；带传输、像素、解压内存和放置数量上限，并对带 `i=`/`I=` 的命令回送 `OK` / `EINVAL` / `ENOTSUP` / `ENOENT` 应答
 - 文件侧栏、路径插入、链接识别、命令面板、主题编辑和实时设置
+- OSC 8 显式超链接会随网格、scrollback 与 resize/reflow 保留；`Ctrl+单击` 打开时与文本
+  检测链接共用同一套安全策略，只允许无凭据、无视觉欺骗的绝对 HTTP(S) URL。URI、id 和
+  会话内链接表均有硬上限，过期 viewport 点击会按投影版本拒绝而不会误开新位置的目标
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
@@ -23,6 +26,8 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   命令完成结果按一次性执行代次精确关联，迟到或仅后缀相同的输出不会推进 Agent
 - PTY 启动采用 fork→exec 错误握手；无效目录、shell/exec 失败会显示可重试诊断而不是崩溃
 - 配置与快捷键热重载采用 last-known-good；坏文件会显示路径/行列并暂停自动写回
+- 字体探测与桌面通知只调用固定可信系统程序，独立进程组内并发有界读取 stdout/stderr，
+  统一超时后终止并回收整组；工作目录或可写 `PATH` 项不能替换这些后台 helper
 
 ## 构建与运行
 
@@ -47,10 +52,16 @@ cargo build --release --locked
 
 ```bash
 ./scripts/install.sh              # 构建并安装二进制 + 启动器条目
+./scripts/install.sh --binary /path/to/frost  # 安装已构建的二进制，跳过 Cargo
 ./scripts/install.sh --dry-run    # 只打印将要执行的命令，不改动文件
 ./scripts/install.sh --no-desktop # 只装二进制
 ./scripts/uninstall.sh            # 一并移除；配置与历史保留
 ```
+
+`--binary` 适合发布压缩包、CI 产物和发行版打包：安装器不会调用 Rust 工具链，仍会用同一套
+受测路径安装二进制、desktop 文件、AppStream 元数据和图标。输入必须是可读的普通文件；目标
+二进制权限统一设为 `0755`。它可与 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR`
+组合使用。
 
 默认装到 `~/.local`（可用 `--prefix` / `--bin-dir` 覆盖，打包场景用 `DESTDIR`）：
 
@@ -78,7 +89,10 @@ dock。有三个细节决定它到底显不显示，安装脚本都已处理：
 
 - `Exec=` / `TryExec=` 会被改写成二进制的绝对路径（`/usr` 这类系统 prefix 保留相对
   形式以便重定位）。桌面会话的 `PATH` 在登录时就固定了，若 `~/.local/bin` 不在其中，
-  `TryExec=frost` 会失败并让条目**整个从应用列表消失**。
+  `TryExec=frost` 会失败并让条目**整个从应用列表消失**。自定义路径中的空格、`$` 和
+  反斜杠会按 Desktop Entry 规范分别编码到 `Exec` / `TryExec`；规范禁止可执行路径含
+  `=`。含 `%` 的绝对路径还会落入「引号内 field code 行为未定义」的兼容陷阱，因此这
+  两种路径在启用桌面集成时都会被安装器明确拒绝。
 - 安装与卸载后都会刷新 `update-desktop-database` 和 `gtk-update-icon-cache`；陈旧的
   图标缓存会盖住刚装进去的图标。`DESTDIR` 打包时跳过，交给包管理器处理。
 - `StartupWMClass` 为 `io.github.beamiter.frost`，与窗口真实的 `WM_CLASS` 一致。
@@ -293,7 +307,7 @@ frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不
 
 ## 安全说明
 
-终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。剪贴板写入仍按主流终端兼容行为允许。Kitty 图像和通知均有资源或频率限制。
+终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。剪贴板写入仍按主流终端兼容行为允许。Kitty 图像、OSC 8 链接和通知均有资源、协议或频率限制。
 
 ## 开发验证
 
@@ -302,9 +316,15 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --all-features --locked
+bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+bash scripts/test-install-paths.sh
+desktop-file-validate data/io.github.beamiter.frost.desktop
+appstreamcli validate --pedantic --no-net data/io.github.beamiter.frost.metainfo.xml
 ```
 
-CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛。
+CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛；安装测试还会用
+预编译 fixture 做一次真实 `DESTDIR` 安装/卸载往返，核对权限、桌面启动路径和全部资源文件。
 
 调试构建可设置 `FROST_DEBUG=1` 输出有界的协议字节预览。
 

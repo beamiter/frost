@@ -1930,7 +1930,22 @@ mod tests {
             0o700
         );
         drop(first);
-        assert!(try_acquire_instance_lock_at(&path).is_some());
+        // Other tests exercise the real fork→exec PTY boundary in parallel.
+        // A child forked while `first` was live inherits the flock until its
+        // immediate exec applies CLOEXEC, so an instantaneous retry can observe
+        // that harmless transition window. Require bounded eventual release;
+        // a genuine leaked descriptor still fails after the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let reacquired = loop {
+            if let Some(lock) = try_acquire_instance_lock_at(&path) {
+                break Some(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(reacquired.is_some(), "released lock stayed held after exec");
         let _ = std::fs::remove_dir_all(&root);
     }
 
