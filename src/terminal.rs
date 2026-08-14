@@ -6710,6 +6710,7 @@ impl TerminalState {
                             let mut intermediates = [0u8; 8];
                             let mut inter_len = 0;
                             let mut final_byte = None;
+                            let mut cancelled = false;
 
                             while i < data_slice.len() {
                                 match data_slice[i] {
@@ -6729,14 +6730,65 @@ impl TerminalState {
                                         final_byte = Some(data_slice[i]);
                                         break;
                                     }
+                                    // ECMA-48 allows C0 controls inside a control
+                                    // sequence. Pagers such as util-linux `more`
+                                    // can insert CR/LF while wrapping colored text,
+                                    // even between the digits of an SGR parameter.
+                                    // Execute those controls immediately and keep
+                                    // collecting the surrounding CSI sequence.
+                                    b'\x08' => {
+                                        self.pending_wrap = false;
+                                        self.cursor_col = self.cursor_col.saturating_sub(1);
+                                    }
+                                    b'\t' => {
+                                        self.pending_wrap = false;
+                                        self.cursor_col = self.next_tab_stop(self.cursor_col);
+                                    }
+                                    b'\n' | b'\x0b' | b'\x0c' => {
+                                        self.pending_wrap = false;
+                                        self.index();
+                                    }
+                                    b'\r' => {
+                                        self.pending_wrap = false;
+                                        self.cursor_col = 0;
+                                    }
+                                    b'\x0e' => self.active_charset = self.g1_charset,
+                                    b'\x0f' => self.active_charset = self.g0_charset,
+                                    // CAN and SUB cancel the current control
+                                    // sequence. Leave a following ESC untouched so
+                                    // the outer parser can begin the replacement.
+                                    b'\x18' | b'\x1a' => {
+                                        cancelled = true;
+                                        i += 1;
+                                        break;
+                                    }
+                                    b'\x1b' => {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    // Other C0 controls are either padding or have
+                                    // no visible effect in Frost, but they do not
+                                    // make the CSI incomplete.
+                                    0x00..=0x1f => {}
                                     _ => break,
                                 }
                                 i += 1;
                             }
 
+                            if cancelled {
+                                continue;
+                            }
+
                             let Some(final_byte) = final_byte else {
+                                // C0 controls embedded in the partial CSI were
+                                // already executed above. Buffer only the CSI
+                                // syntax so a later PTY read does not replay a
+                                // linefeed or carriage return.
+                                self.pending_escape.extend_from_slice(b"\x1b[");
                                 self.pending_escape
-                                    .extend_from_slice(&data_slice[esc_start..]);
+                                    .extend_from_slice(&param_bytes[..param_len]);
+                                self.pending_escape
+                                    .extend_from_slice(&intermediates[..inter_len]);
                                 break;
                             };
 
@@ -10563,12 +10615,19 @@ impl TerminalState {
     /// Normalize retained history after a burst of width changes. This is kept
     /// separate from `on_resize` so window/divider drags can debounce the O(n)
     /// decompress/reflow/recompress pass instead of freezing every pointer step.
-    /// Returns `false` when a live lifecycle already entered scrollback and
-    /// the caller must retry after it closes; `true` when normalization is
-    /// complete (including an empty history).
+    /// Returns `false` while a reader is scrolled back, or when a live lifecycle
+    /// already entered scrollback, and the caller must retry later; `true` when
+    /// normalization is complete (including an empty history).
     pub fn normalize_scrollback_width(&mut self) -> bool {
         if self.scrollback.is_empty() {
             return true;
+        }
+        // Reflow changes the number of physical rows, so doing it underneath a
+        // reader invalidates the viewport's distance-from-bottom anchor. Keep
+        // the old-width rows (the viewport materializer pads/crops them safely)
+        // until the user returns to the live bottom, then normalize once.
+        if self.scroll_offset > 0 {
+            return false;
         }
         let old_scrollback_len = self.scrollback.len();
         let live_start = match self.current_zone_state {
@@ -10583,7 +10642,6 @@ impl TerminalState {
         // running lifecycle (and Agent execution correlation) mid-command.
         if live_start.is_some_and(|start| start < old_scrollback_len) {
             self.clear_text_selection();
-            self.scroll_offset = 0;
             return false;
         }
         let cols = self.grid.row_len().max(1);
@@ -10742,7 +10800,11 @@ impl TerminalState {
             }
         }
 
-        self.scroll_offset = 0;
+        // Resizing the live grid must not cancel a user's scrollback read. A
+        // row shrink may have pushed grid rows into history above, and the
+        // push helper already increased the offset to keep the same top row.
+        // Growing or changing width leaves the retained-history distance valid.
+        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         // Width resize mutates grid rows, but retained scrollback keeps its old
@@ -14019,6 +14081,72 @@ mod tests {
     }
 
     #[test]
+    fn resize_does_not_yank_scrolled_back_reader_to_live_bottom() {
+        let mut terminal = TerminalState::new(8, 4);
+        for row in 0..10 {
+            terminal.process_input(format!("row-{row}\r\n").as_bytes());
+        }
+        terminal.scroll(3);
+
+        let initial_offset = terminal.scroll_offset;
+        let initial_start = terminal.viewport_absolute_start();
+        let initial_top = terminal
+            .raw_row_id_at_absolute(initial_start)
+            .expect("top history row");
+        assert!(initial_offset > 0);
+
+        terminal.on_resize(10, 4);
+        assert_eq!(terminal.scroll_offset, initial_offset);
+        assert_eq!(terminal.viewport_absolute_start(), initial_start);
+        assert_eq!(
+            terminal.raw_row_id_at_absolute(initial_start),
+            Some(initial_top)
+        );
+
+        // Shrinking the grid moves two rows into history. Its history push path
+        // must increase the offset by the same amount so the visible anchor is
+        // still the exact row the reader was looking at.
+        terminal.on_resize(10, 2);
+        assert_eq!(terminal.scroll_offset, initial_offset + 2);
+        assert_eq!(terminal.viewport_absolute_start(), initial_start);
+        assert_eq!(
+            terminal.raw_row_id_at_absolute(initial_start),
+            Some(initial_top)
+        );
+    }
+
+    #[test]
+    fn history_reflow_waits_until_scrolled_back_reader_returns_to_bottom() {
+        let mut terminal = TerminalState::new(4, 2);
+        for row in 0..6 {
+            terminal.process_input(format!("{row}\r\n").as_bytes());
+        }
+        terminal.on_resize(7, 2);
+        terminal.scroll(2);
+        terminal.start_selection((0, 0));
+
+        let history_len = terminal.scrollback_len();
+        let offset = terminal.scroll_offset;
+        let viewport_start = terminal.viewport_absolute_start();
+        assert!(!terminal.normalize_scrollback_width());
+        assert_eq!(terminal.scrollback_len(), history_len);
+        assert_eq!(terminal.scroll_offset, offset);
+        assert_eq!(terminal.viewport_absolute_start(), viewport_start);
+        assert!(terminal.selection.is_some());
+        assert!(terminal
+            .scrollback
+            .iter()
+            .all(|line| line.decompress().len() == 4));
+
+        terminal.scroll_to_bottom();
+        assert!(terminal.normalize_scrollback_width());
+        assert!(terminal
+            .scrollback
+            .iter()
+            .all(|line| line.decompress().len() == 7));
+    }
+
+    #[test]
     fn history_reflow_padding_does_not_inherit_live_background() {
         let mut terminal = TerminalState::new(3, 2);
         terminal.grid[0][0].character = 'A';
@@ -14282,6 +14410,38 @@ mod tests {
         assert_eq!(terminal.grid[0][1].character, 'r');
         assert_eq!(terminal.grid[0][2].character, 'c');
         assert_eq!(terminal.grid[0][0].foreground, Color::Rgb(81, 175, 239));
+    }
+
+    #[test]
+    fn csi_executes_embedded_crlf_and_continues_parsing() {
+        let mut terminal = TerminalState::new(16, 3);
+
+        // util-linux `more` can wrap Git's colored output in the middle of an
+        // SGR parameter, producing this exact ESC [ 3 CR LF 3 m shape.
+        terminal.process_input(b"A\x1b[3\r\n3mB\x1b[mC");
+
+        assert!(terminal.pending_escape.is_empty());
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.grid[1][0].character, 'B');
+        assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
+        assert_eq!(terminal.grid[1][1].character, 'C');
+        assert_eq!(terminal.grid[1][1].foreground, Color::Default);
+    }
+
+    #[test]
+    fn partial_csi_does_not_replay_embedded_linefeed_on_next_chunk() {
+        let mut terminal = TerminalState::new(16, 4);
+
+        terminal.process_input(b"\x1b[3\r\n");
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.pending_escape, b"\x1b[3");
+
+        terminal.process_input(b"3mX");
+
+        assert!(terminal.pending_escape.is_empty());
+        assert_eq!(terminal.cursor_row, 1);
+        assert_eq!(terminal.grid[1][0].character, 'X');
+        assert_eq!(terminal.grid[1][0].foreground, Color::Yellow);
     }
 
     #[test]
