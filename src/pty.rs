@@ -600,6 +600,29 @@ mod unix_pty {
             configured_shell: Option<&str>,
             command_argv: Option<&[String]>,
         ) -> Result<Self> {
+            Self::new_with_cwd_env(
+                cols,
+                rows,
+                cwd,
+                session_id,
+                configured_shell,
+                command_argv,
+                &[],
+            )
+        }
+
+        /// [`Self::new_with_cwd`] plus explicit environment overrides, used by
+        /// the task-validation terminal to neutralize shell startup files
+        /// (`BASH_ENV`/`ENV`/`ZDOTDIR`) even beyond the no-rc argv flags.
+        pub fn new_with_cwd_env(
+            cols: usize,
+            rows: usize,
+            cwd: Option<&str>,
+            session_id: Option<&str>,
+            configured_shell: Option<&str>,
+            command_argv: Option<&[String]>,
+            extra_env: &[(&str, &str)],
+        ) -> Result<Self> {
             // Reject stale session-history paths before allocating a PTY or
             // forking. The child still reports chdir failures through the setup
             // pipe below, closing the validation-to-fork race.
@@ -785,14 +808,15 @@ mod unix_pty {
                 // worker thread held at the moment of the fork. `child_env`
                 // returns a ready CString block so the child only collects
                 // pointers and execve's.
-                let env_cstrings = match jterm_core::child_env::envp(&child_env_options(), &[]) {
-                    Ok(block) => block,
-                    Err(error) => {
-                        libc::close(master);
-                        libc::close(slave);
-                        return Err(anyhow!("Failed to build the child environment: {error}"));
-                    }
-                };
+                let env_cstrings =
+                    match jterm_core::child_env::envp(&child_env_options(), extra_env) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            libc::close(master);
+                            libc::close(slave);
+                            return Err(anyhow!("Failed to build the child environment: {error}"));
+                        }
+                    };
                 let mut envp: Vec<*const libc::c_char> =
                     env_cstrings.iter().map(|c| c.as_ptr()).collect();
                 envp.push(std::ptr::null());
@@ -1068,6 +1092,14 @@ mod unix_pty {
                 }
             }
             Ok(())
+        }
+
+        /// The child's real exit status once reaped (negative = `-signal`),
+        /// reaping via [`Self::is_alive`] first when the state is still open.
+        /// Task terminals report this to the task reducer on PTY EOF.
+        pub fn exited_code(&mut self) -> Option<i32> {
+            let _ = self.is_alive();
+            self.exit_code_cached
         }
 
         pub fn is_alive(&mut self) -> bool {
@@ -1352,6 +1384,18 @@ mod windows_pty {
 
 #[cfg(unix)]
 pub use unix_pty::{Pty, ReaderPoll};
+
+/// Absolute shell path a pane would spawn, exposed for task provenance:
+/// [`SemanticCommandContext`](crate::agent_task::SemanticCommandContext)
+/// records this identity so validation replays the source command through the
+/// same shell rather than a later hot-reloaded configuration.
+#[cfg(unix)]
+pub(crate) fn resolved_shell_identity(
+    configured_shell: Option<&str>,
+    cwd: Option<&str>,
+) -> Option<String> {
+    unix_pty::choose_shell(configured_shell, cwd).ok()
+}
 
 #[cfg(windows)]
 pub use windows_pty::Pty;

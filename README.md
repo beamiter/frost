@@ -24,6 +24,15 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
 - Shell Agent 提案始终逐条人工审批；只有绑定 pane 处于空闲且提示符输入为空时才可发送，
   命令完成结果按一次性执行代次精确关联，迟到或仅后缀相同的输出不会推进 Agent
+- 失败命令块（OSC 133 报告非零退出码的已完成块）在右键菜单与命令面板中提供
+  **Fix with Agent** / **Explain with Agent** / **Retry** 动作。Fix/Explain 把精确命令、
+  有界捕获输出和已验证的 cwd 作为框架化不可信上下文，开启一个全新的 Agent 任务：绝不接续
+  无关的历史会话快照，任务始终按稳定会话 id 绑定来源 pane（焦点切换不影响），也不会替换仍在
+  运行的已批命令、待审提案或未结束的会话。Retry 走守护式语义重放：仅精确、未截断、单行的命令，
+  且仅当块记录的 cwd 与独立观测到的本地 shell 进程 cwd（`/proc`）一致时才执行——SSH/tmux 类
+  包装进程的本地 cwd 不代表其报告的工作目录，因此失败关闭；此外还要求主屏幕、提示符空闲、
+  输入为空且开启 bracketed paste。被 16 KiB 上限截断的命令与 Background 块一律不进入
+  Retry/Agent 路径
 - PTY 启动采用 fork→exec 错误握手；无效目录、shell/exec 失败会显示可重试诊断而不是崩溃
 - 配置与快捷键热重载采用 last-known-good；坏文件会显示路径/行列并暂停自动写回
 - 字体探测与桌面通知只调用固定可信系统程序，独立进程组内并发有界读取 stdout/stderr，
@@ -149,7 +158,8 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 Block mode 的命令首行支持普通单击；`Shift+单击` 可从卡片任意行选择连续范围，
 `Ctrl+Shift+单击` 可从任意行切换单块。正文普通/双击/三击仍归终端原生文本选择，
 `Ctrl+单击` 链接仍打开链接。右键卡片任意位置会在指针旁打开固定 pane/块目标的动作面板，
-可复制、向 Agent 附加该块、回填、书签、跳转、搜索和导出；右键已选范围中的块不会折叠范围。
+可复制、向 Agent 附加该块、回填、书签、跳转、搜索和导出；失败块额外提供
+**Fix with Agent** / **Explain with Agent** / **Retry**；右键已选范围中的块不会折叠范围。
 有精确保留输出的已完成块还提供 `Collapse output / Expand output`：折叠会从滚动文档中真正
 移除输出行并放入一行可点击摘要，不修改 PTY 原始缓冲；块级复制、导出与 Agent 仍使用完整输出。
 Block Mode 关闭或进入 alternate screen 时会暂时绕过折叠视图，返回后恢复原状态。
@@ -244,7 +254,45 @@ ai_stream = true
 # 会自动写入 ~/.config/frost/ai.key。环境变量 FROST_AI_API_KEY_FILE
 # 优先于此项（与 forge 一致），且不会被写回配置文件。
 # ai_api_key_file = "~/.config/frost/ai.key"
+
+# 向非本地 AI provider 发送命令上下文（命令、cwd、捕获输出）的显式授权。
+# 直连本机回环 Ollama 不需要此项；继承的 HTTP 代理会取消该豁免。
+ai_share_command_context = false
+# 实验性 Tasks 面板（侧栏 "Tasks" 页）：为失败命令块创建独立 Git worktree
+# 任务，并可选地运行原生 Codex 会话。与云端 AI 授权相互独立。
+experimental_task_sidebar = false
 ```
+
+### 实验性 Tasks 面板（原生 Codex 运行时）
+
+开启 `experimental_task_sidebar` 后，失败命令块的右键菜单会出现 **Create task**：
+frost 为该命令创建独立的 Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记一个任务卡片。
+任务卡片上的 **Start Codex** 在 `ai_enabled` 与 `ai_share_command_context` 都已开启时可用，
+进入可取消的后台准备阶段（校验已注册 worktree、固定目录描述符、解析可信 codex/node 启动链、
+构造受限 prompt、创建私有 0700 CODEX_HOME），全程不阻塞 UI；准备完成时任务代际与当前的
+共享/脱敏授权会再次校验，取消、过期或授权被撤销的结果会被直接销毁而不会启动 Codex。
+
+原生会话通过 codex app-server 的换行分隔 JSONL 协议运行，目前只接受已审计的
+**codex-cli 0.147.0** 协议版本；登录仅通过 login RPC 传递当前内存中的访问令牌，
+并在启动线程前校验 effective config，拒绝任何继承的 MCP、hooks、插件、应用、项目信任或
+托管配置来源。审批策略固定为 `never`：托管审批请求只完整展示并只能 **Deny**。
+每个 turn 结束后会话停在 **Ready for review**：可以发送有界评审反馈在同一线程上开始顺序后续
+turn（最多 32 个），或选择 **Finish Codex** 结束会话。一个回合完成后会话不可恢复、不可重启。
+
+隔离与回收：provider 运行在描述符固定的独立 worktree 和瞬态 user-systemd cgroup
+（需要 **cgroup v2** 与可用的 systemd 用户会话）中；`/tmp` 不在可写根内，工具子进程获得
+无登录、无代理、仅含受审绝对 PATH 的独立环境；frost 异常退出时由外部 guardian 触发
+`cgroup.kill`。只有在 cgroup 为空且 leader 被回收后，任务才进入可验证状态。
+
+会话完全停止后，**Run validation** 会在 worktree 内的独立只读验证终端中重放创建该任务的
+原始命令（要求精确、未截断、单行；拒绝控制字符与双向伪装字符、符号链接逃逸，并重新校验
+Git 注册与分支；通过打开的目录描述符 + fchdir 传递 cwd，shell 以非登录、no-rc 方式启动）。
+验证结果为 running/passed/failed/needs-review/cancelled；即使验证通过，也必须显式点击
+**Mark complete** 才算接受任务。**Review diff** 显示相对任务基准提交的有界
+`git status --short` 与已跟踪文件的 `git diff HEAD`（未跟踪文件只列出路径）。
+原生会话失败或退出不成功时，可以用 **Open terminal Agent** 在终端中显式继续（PTY 兼容路径）。
+任务元数据仅存在于运行时；**Hide task** 只隐藏元数据，不会删除 worktree。
+
 
 `Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
 

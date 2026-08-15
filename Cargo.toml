@@ -36,6 +36,8 @@ lru = "0.18"
 regex = "1.13"
 fuzzy-matcher = "0.3"
 uuid = { version = "1.23", features = ["v4", "serde"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
 
 [profile.dev]
 incremental = true

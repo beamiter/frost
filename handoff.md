@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-13
+Updated: 2026-08-15
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,60 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- The experimental native Codex task runtime is ported from ember as `src/agent_task/`
+  (context, diff, driver, event, launcher, native, runtime, task, validation, worktree,
+  the app-server and fake drivers, plus `pinned_dir` descriptor capabilities), with the
+  iced-side state in `src/agent_task_ui.rs`. The feature is gated by
+  `experimental_task_sidebar = false` and adds a **Tasks** dock panel plus a failed-block
+  **Create task** menu action. **Start Codex** enters a bounded, cancellable background
+  Preparing phase (registered-worktree verification, descriptor pinning, trusted
+  codex/node launcher resolution, prompt construction, private 0700 `CODEX_HOME`) driven
+  by a 50 ms/500 ms iced tick rather than egui repaints; completion is gated by task
+  generation plus the still-current `ai_enabled` + `ai_share_command_context` policy, and
+  cancelled/stale/revoked results drop their directory capabilities, credential buffers,
+  and temp home without spawning. The provider worker re-proves Git identity and the
+  trusted launch chain immediately before spawn. The native protocol stays version-gated
+  to the audited codex-cli 0.147.0 app-server identity with access-token-only login,
+  pre-thread effective-config attestation (rejecting inherited MCP/hooks/plugins/apps/
+  project trust/managed authority), hosted search and tool network disabled, approval
+  policy `never`, and display-and-deny managed approvals (Deny only). Sequential
+  follow-up turns reuse the same loaded thread with identical cwd/sandbox/env/approval
+  authority, duplicate/overlapping turns are rejected, live sessions cap at 32 turns
+  with completed-turn tombstones, a later turn invalidates earlier validation evidence,
+  and **Finish Codex** (cgroup empty + leader reaped before the terminal event) gates
+  validation; sessions remain single-use with no resume. Containment keeps the
+  descriptor-pinned worktree plus transient user-systemd cgroup (cgroup v2,
+  `cgroup.kill` guardian), `/tmp` excluded from writable roots, and a no-login,
+  proxy-free tool environment with a vetted absolute PATH. Validation replays the exact
+  single-line source command in a separate read-only-after-exit terminal: canonical
+  source-subdir → worktree mapping, missing-dir/control/bidi/symlink-escape rejection,
+  non-login no-rc shell argv plus `BASH_ENV`/`ENV`/`ZDOTDIR=/dev/null` (new
+  `Pty::new_with_cwd_env` extra-env seam), Git registration + branch rechecked, and the
+  cwd carried through the pinned descriptor's `/proc/self/fd` path. Results land as
+  running/passed/failed/needs-review/cancelled via the PTY-exit hook (real child status
+  from `Pty::exited_code`); pass-gated **Mark complete** stays explicit. **Review diff**
+  runs the bounded `git status --short` + tracked `git diff <base>` worker. The opaque
+  terminal fallback (direct, retry, or post-native-failure) spawns a new tab in the
+  worktree through the trusted launcher argv and atomically rebinds the task's terminal
+  session, preserving sticky Terminal/TerminalFallback provenance; task-bound PTY exits
+  and closes reduce through `handle_terminal_session_exit`/`_closed` keyed by frost-local
+  stable session strings. OSC 133 command zones now record `command_exact` (metadata vs
+  prompt-row reconstruction) so validation keeps failing closed on inexact commands.
+  Task metadata is runtime-only; **Hide task** archives metadata and leaves the worktree.
+
+- Failed completed blocks now expose ember's Fix / Explain / Retry action chain through the
+  block context menu and the command palette, adapted to the per-command-approval Shell Agent
+  rather than ember's task dashboard. Fix/Explain start a fresh Agent task bound to the source
+  pane by stable session id: the path never claims the persisted Agent snapshot, never replaces
+  a running approved command, a pending model round, or an open transcript, and attaches the
+  exact command, bounded captured output, and verified cwd as framed untrusted context. Retry is
+  a guarded semantic replay into the source pane: exact, non-truncated (16 KiB capture),
+  single-line commands only, at an idle empty bracketed-paste prompt on the main screen, and only
+  while the recorded cwd matches an independently observed local shell-process cwd; SSH/tmux-style
+  wrappers fail closed because their local process cwd is not the reported workspace. Background
+  blocks and unknown-status records are never eligible; eligibility, cwd provenance, and the
+  Agent replace-guards are pure functions/unit-tested state-machine paths.
 
 - OSC 8 metadata now reaches the ordinary link interaction pipeline. URI and id fields
   are rejected before allocation above 2 KiB / 256 B, the terminal-local interner is

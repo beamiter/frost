@@ -161,6 +161,19 @@ pub struct Config {
     #[serde(default = "default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// Explicit consent for sending semantic terminal context (command, cwd,
+    /// and captured output) to a non-local AI provider. Local Ollama requests
+    /// sent directly to a loopback Ollama endpoint do not require this
+    /// opt-in; an inherited HTTP proxy disables that exemption.
+    #[serde(default)]
+    pub ai_share_command_context: bool,
+
+    /// Show the provider-neutral Tasks dashboard. This is independent from
+    /// cloud-AI consent because local Agent CLIs and task bookkeeping do not
+    /// inherently send terminal context off-machine.
+    #[serde(default)]
+    pub experimental_task_sidebar: bool,
+
     #[serde(default = "default_font_size")]
     pub font_size: f32,
 
@@ -574,6 +587,8 @@ impl Default for Config {
             ai_stream: default_ai_stream(),
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
+            ai_share_command_context: false,
+            experimental_task_sidebar: false,
             font_size: default_font_size(),
             font_family: default_font_family(),
             font_weight: default_font_weight(),
@@ -1177,6 +1192,14 @@ mod tests {
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded[0], container);
         assert_eq!(reloaded[1].host, "new-box");
+    }
+
+    #[test]
+    fn task_dashboard_and_context_sharing_default_off() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(!config.experimental_task_sidebar);
+        assert!(!config.ai_share_command_context);
+        assert!(config.ai_redact_secrets);
     }
 
     #[test]

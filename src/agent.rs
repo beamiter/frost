@@ -431,6 +431,84 @@ impl AgentUi {
         }
     }
 
+    /// Start a fresh Agent task from one failed block's captured context
+    /// (ember's Fix/Explain, adapted to per-command approval).
+    ///
+    /// Unlike [`Self::open`], this path deliberately never claims or restores
+    /// the process-wide Agent snapshot: a failed command selected by the user
+    /// is the complete provenance for a new task and must not be appended to
+    /// an unrelated transcript from an earlier Frost run. The context is
+    /// attached to subsequent model requests until the user clears it or the
+    /// session is replaced, and the task stays bound to the source terminal
+    /// (`session_id`) even when another pane is focused.
+    ///
+    /// A live task is never replaced: an approved command still executing, a
+    /// pending model round, or an open transcript all refuse. The fixed
+    /// `prompt` is submitted immediately so the fresh session enters
+    /// [`AgentState::AwaitingModel`]; it must never interpolate the untrusted
+    /// command or output text, which travel only inside the framed
+    /// [`BlockContext`].
+    pub fn start_for_block(
+        &mut self,
+        config: &Config,
+        session_id: usize,
+        context: BlockContext,
+        prompt: &str,
+    ) -> Result<(), String> {
+        if !config.ai_enabled {
+            return Err("AI features are disabled by configuration".to_string());
+        }
+        if context.cmd.trim().is_empty() {
+            return Err("the failed block has no command context".to_string());
+        }
+        if self.awaiting.is_some() {
+            return Err(
+                "An approved Agent command is still running; wait for its correlated completion before replacing this task"
+                    .to_string(),
+            );
+        }
+        if let Some(session) = self.session.as_ref() {
+            let active = match session.state() {
+                AgentState::AwaitingObservation { .. } => Some(
+                    "An approved Agent command is still running; wait for its correlated completion before replacing this task",
+                ),
+                AgentState::AwaitingModel | AgentState::AwaitingApproval { .. } => Some(
+                    "Another Agent task is still active; stop or finish it before starting a new one",
+                ),
+                AgentState::Ready if !session.transcript().is_empty() => Some(
+                    "Another Agent task is still open; finish it or choose New task first",
+                ),
+                AgentState::Ready
+                | AgentState::Completed
+                | AgentState::Cancelled
+                | AgentState::TurnLimitReached => None,
+            };
+            if let Some(message) = active {
+                return Err(message.to_string());
+            }
+        }
+        // Validate the provider before replacing a finished task: a config
+        // error must not destroy the transcript the user is still reviewing.
+        let provider_label = client_from_config(config)?.display_name();
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err("initial Agent prompt is empty".to_string());
+        }
+        let mut fresh = AgentSession::new(config.agent_max_turns);
+        fresh
+            .submit_user(prompt.to_string())
+            .map_err(|error| error.to_string())?;
+
+        self.close_session();
+        self.is_open = true;
+        self.bound_session_id = Some(session_id);
+        self.session = Some(fresh);
+        self.last_manual_completed = Some(context);
+        self.provider_label = provider_label;
+        self.status.clear();
+        Ok(())
+    }
+
     /// Persist the live session (if any) for the next run. Called on app
     /// exit, before the session is dropped.
     pub fn persist(&self) {
@@ -1140,6 +1218,147 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn failed_block_context() -> BlockContext {
+        BlockContext {
+            cmd: "cargo test".to_string(),
+            output: "failures:\n    terminal::test".to_string(),
+            cwd: Some("/workspace/frost".to_string()),
+            exit_code: 101,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn start_for_block_opens_a_fresh_task_bound_to_the_source_session() {
+        let mut agent = AgentUi::new();
+        agent
+            .start_for_block(
+                &ai_config(),
+                7,
+                failed_block_context(),
+                "Fix the attached failed command",
+            )
+            .unwrap();
+
+        assert!(agent.is_open);
+        assert_eq!(agent.bound_session_id, Some(7));
+        let session = agent.session.as_ref().expect("fresh session");
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+        assert_eq!(session.transcript().len(), 1);
+        assert!(matches!(
+            session.transcript().first(),
+            Some(Turn::User(message)) if message == "Fix the attached failed command"
+        ));
+        let attached = agent
+            .last_manual_completed
+            .as_ref()
+            .expect("failed block context is attached");
+        assert_eq!(attached.cmd, "cargo test");
+        assert_eq!(attached.exit_code, 101);
+        assert_eq!(attached.cwd.as_deref(), Some("/workspace/frost"));
+    }
+
+    #[test]
+    fn start_for_block_refuses_to_replace_a_live_task() {
+        let config = ai_config();
+
+        // An approved command still executing (both the local one-shot
+        // execution slot and the protocol state) refuses a new task.
+        let mut agent = AgentUi::new();
+        let mut session = AgentSession::new(8);
+        session.submit_user("look").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        agent.session = Some(session);
+        assert!(agent.approve(id, None).is_some());
+        let error = agent
+            .start_for_block(&config, 3, failed_block_context(), "Fix it")
+            .unwrap_err();
+        assert!(error.contains("still running"), "{error}");
+        // The refused start leaves the supervised task untouched.
+        assert!(matches!(
+            agent.session.as_ref().unwrap().state(),
+            AgentState::AwaitingObservation { .. }
+        ));
+
+        // A pending model round or approval is also a live task.
+        let mut agent = AgentUi::new();
+        let mut session = AgentSession::new(8);
+        session.submit_user("look").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        agent.session = Some(session);
+        let error = agent
+            .start_for_block(&config, 3, failed_block_context(), "Fix it")
+            .unwrap_err();
+        assert!(error.contains("still active"), "{error}");
+
+        // An open transcript in Ready is not silently appended to.
+        let mut agent = AgentUi::new();
+        let mut session = AgentSession::new(8);
+        session.submit_user("look").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"say","message":"hi"}"#)
+            .unwrap();
+        agent.session = Some(session);
+        let error = agent
+            .start_for_block(&config, 3, failed_block_context(), "Fix it")
+            .unwrap_err();
+        assert!(error.contains("still open"), "{error}");
+    }
+
+    #[test]
+    fn start_for_block_replaces_only_a_finished_transcript() {
+        let mut agent = AgentUi::new();
+        let mut session = AgentSession::new(8);
+        session.submit_user("look").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"done","message":"all good"}"#)
+            .unwrap();
+        agent.session = Some(session);
+
+        agent
+            .start_for_block(
+                &ai_config(),
+                9,
+                failed_block_context(),
+                "Explain the attached failed command",
+            )
+            .unwrap();
+
+        let session = agent.session.as_ref().unwrap();
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+        assert_eq!(session.transcript().len(), 1);
+        assert_eq!(agent.bound_session_id, Some(9));
+    }
+
+    #[test]
+    fn start_for_block_fails_closed_on_config_and_context() {
+        let disabled = Config {
+            ai_enabled: false,
+            ..ai_config()
+        };
+        let mut agent = AgentUi::new();
+        let error = agent
+            .start_for_block(&disabled, 3, failed_block_context(), "Fix it")
+            .unwrap_err();
+        assert!(error.contains("disabled"), "{error}");
+        assert!(agent.session.is_none());
+
+        let mut blank = failed_block_context();
+        blank.cmd = "  ".to_string();
+        let error = agent
+            .start_for_block(&ai_config(), 3, blank, "Fix it")
+            .unwrap_err();
+        assert!(error.contains("no command context"), "{error}");
+        assert!(agent.session.is_none());
     }
 
     #[test]

@@ -110,6 +110,42 @@ pub(crate) fn sanitize_prompt_payload(
     Ok(sanitized)
 }
 
+/// Prepare a replayed history command for the task validation path. CR/CRLF
+/// normalize to LF and LF/tab stay structural; every other C0/C1 scalar is
+/// removed and non-control visual spoofing fails closed. The result must
+/// retain some non-whitespace text.
+pub(crate) fn sanitize_history_replay(
+    text: &str,
+    max_bytes: usize,
+) -> Result<String, ReviewTextError> {
+    if text.len() > max_bytes {
+        return Err(ReviewTextError::TooLarge { limit: max_bytes });
+    }
+    let mut sanitized = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                sanitized.push('\n');
+            }
+            '\n' | '\t' => sanitized.push(character),
+            control if is_c0_or_c1(control) => {}
+            visual if is_visual_spoof(visual) => return Err(ReviewTextError::VisualSpoof),
+            visible => sanitized.push(visible),
+        }
+    }
+    if sanitized
+        .trim_matches(|character| matches!(character, ' ' | '\n' | '\t'))
+        .is_empty()
+    {
+        return Err(ReviewTextError::Empty);
+    }
+    Ok(sanitized)
+}
+
 /// Strip C0/C1 from an untrusted prompt-recall/Agent payload, then apply the
 /// strict single-line and visual-spoof gate. This is defense in depth: normal
 /// history and jagent proposals are rejected before this final payload seam.

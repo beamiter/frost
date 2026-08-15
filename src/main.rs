@@ -7,6 +7,8 @@ use jterm_core::pane_layout::{
 };
 use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline};
 mod agent;
+mod agent_task;
+mod agent_task_ui;
 mod ansi;
 mod app_helpers;
 mod block_export;
@@ -477,6 +479,16 @@ fn block_prompt_replace_blocker(
 /// paste: the first-line fallback prevents later selected commands executing.
 fn block_reinput_policy() -> PastePolicy {
     PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly)
+}
+
+/// Guarded failed-block retry auto-submits: the same de-fanging as reinput,
+/// plus a trailing CR after the bracketed frame. Only reached for exact,
+/// non-truncated, single-line commands whose recorded cwd was verified.
+fn block_retry_policy() -> PastePolicy {
+    PastePolicy {
+        submit: true,
+        ..block_reinput_policy()
+    }
 }
 /// Height of the status strip above each pane while split. A single pane has
 /// no strip: the tab bar and status bar already name it, and the row would
@@ -1014,7 +1026,18 @@ enum BlockMenuAction {
     ExportJson,
     CollapseOutput,
     ExpandOutput,
+    FixWithAgent,
+    ExplainWithAgent,
+    CreateTask,
+    Retry,
     Clear,
+}
+
+/// Which fresh Agent task a failed block starts (ember's Fix/Explain).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedBlockAgentIntent {
+    Fix,
+    Explain,
 }
 
 /// Stable, counted target for the destructive Clear Blocks confirmation.
@@ -1079,6 +1102,8 @@ enum SidebarPanel {
     Files,
     /// Vertical session tab list.
     Tabs,
+    /// Experimental agent Tasks dashboard (config-gated).
+    Tasks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1643,6 +1668,24 @@ enum Message {
     AgentNewTask,
     AgentClearContext,
     AgentClose,
+    // Experimental Tasks dashboard (native Codex runtime + isolated worktrees).
+    TaskPanelToggle,
+    TaskSelect(agent_task::TaskId),
+    TaskHide(agent_task::TaskId),
+    TaskStartCodex(agent_task::TaskId),
+    TaskCancelCodex(agent_task::TaskId),
+    TaskFinishCodex(agent_task::TaskId),
+    TaskFollowUpInput(String),
+    TaskFollowUpSend(agent_task::TaskId),
+    TaskApprovalDeny(agent_task::TaskId, agent_task::ApprovalId),
+    TaskDiffOpen(agent_task::TaskId),
+    TaskDiffClose,
+    TaskValidationStart(agent_task::TaskId),
+    TaskMarkComplete(agent_task::TaskId),
+    TaskTerminalOpen(agent_task::TaskId),
+    /// Periodic reducer/driver poll while the dashboard is open or a provider
+    /// session is active.
+    TaskTick,
     /// Result of the background jsh update check (boxed: one rare message must
     /// not widen every other variant).
     JshChecked(Box<jterm_core::jsh_install::Status>),
@@ -1670,6 +1713,8 @@ enum Message {
     SetAiMaxTokens(u32),
     SetAiTemperature(String),
     SetAiRedactSecrets(bool),
+    SetAiShareCommandContext(bool),
+    SetExperimentalTaskSidebar(bool),
     SetAiStream(bool),
     SetAiKeyFile(String),
     SetAiKeyDraft(String),
@@ -1958,6 +2003,10 @@ struct Session {
     /// retained for the bottom bar. None until a command completes (or when
     /// the shell omitted the code).
     last_exit: Option<i32>,
+    /// Task-bound terminals (Agent CLI fallback, validation runs) stay open
+    /// after the child exits so their transcript remains reviewable; ordinary
+    /// sessions still close on exit. Set when the exit reducer ran.
+    hold_after_exit: bool,
     /// Wall-clock duration of that command, when the shell reported an
     /// execution phase.
     last_duration_ms: Option<u64>,
@@ -2016,8 +2065,30 @@ impl Session {
         cwd: Option<&str>,
         command_argv: Option<&[String]>,
     ) -> anyhow::Result<Session> {
-        let pty = Pty::new_with_cwd(cols, rows, cwd, None, config.shell.as_deref(), command_argv)
-            .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
+        Self::spawn_argv_env(config, id, cols, rows, cwd, command_argv, &[])
+    }
+
+    /// [`Self::spawn_argv`] plus explicit child-environment overrides. The
+    /// task-validation terminal uses this to neutralize shell startup files.
+    fn spawn_argv_env(
+        config: &Config,
+        id: usize,
+        cols: usize,
+        rows: usize,
+        cwd: Option<&str>,
+        command_argv: Option<&[String]>,
+        extra_env: &[(&str, &str)],
+    ) -> anyhow::Result<Session> {
+        let pty = Pty::new_with_cwd_env(
+            cols,
+            rows,
+            cwd,
+            None,
+            config.shell.as_deref(),
+            command_argv,
+            extra_env,
+        )
+        .map_err(|error| anyhow::anyhow!("cannot create terminal session: {error}"))?;
         let master_fd = pty.master_fd();
         let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if reader_fd < 0 {
@@ -2056,6 +2127,7 @@ impl Session {
             fg_proc_cache: None,
             git_meta_cache: None,
             last_exit: None,
+            hold_after_exit: false,
             last_duration_ms: None,
             block_selection: block_mode::BlockSelection::default(),
             block_bookmarks: block_mode::BlockBookmarks::default(),
@@ -2609,6 +2681,13 @@ struct Frost {
     /// a repeated shortcut cannot queue unbounded copies of terminal output.
     block_export_in_flight: bool,
     agent: agent::AgentUi,
+    /// Provider-neutral task lifecycle reducer for the experimental Tasks
+    /// dashboard (runtime-only metadata; nothing is persisted).
+    task_manager: agent_task::TaskManager,
+    /// Owner of native Codex provider sessions and their bounded views.
+    agent_runtime: agent_task::AgentRuntimeManager,
+    /// iced-side state for the Tasks dashboard overlay.
+    task_panel: agent_task_ui::TaskPanel,
     keybindings: keybindings::KeyBindings,
     config_panel_open: bool,
     help_open: bool,
@@ -2846,6 +2925,9 @@ impl Frost {
             palette: command_palette::PaletteState::new(),
             block_export_in_flight: false,
             agent: agent::AgentUi::new(),
+            task_manager: agent_task::TaskManager::new(),
+            agent_runtime: agent_task::AgentRuntimeManager::new(),
+            task_panel: agent_task_ui::TaskPanel::new(),
             keybindings: keybindings_load.bindings,
             config_panel_open: false,
             help_open: false,
@@ -3682,6 +3764,12 @@ impl Frost {
         }
         let mut sess = self.sessions.remove(index);
         let closed_id = sess.id;
+        // A user-initiated close of a task-bound terminal cancels the binding
+        // (no child exit status was observed). Sessions already reported
+        // through `handle_terminal_session_exit` are in a terminal state, so
+        // this is a no-op for them.
+        self.task_manager
+            .handle_terminal_session_closed(&agent_task_ui::terminal_session_id(closed_id));
         self.history_reflow_sessions.remove(&closed_id);
         // The strip's transient state is keyed by tab id; a closed tab is
         // dropped from it in `prune_closed_pane` once we know whether the tab
@@ -5464,6 +5552,34 @@ impl Frost {
         let Some(menu) = self.block_menu.take() else {
             return Task::none();
         };
+        // Fix/Explain/Retry look the source session up by its stable id rather
+        // than through the focused pane: the Agent task or replay stays bound
+        // to the terminal that produced the block even when focus moved after
+        // the menu opened.
+        match action {
+            BlockMenuAction::FixWithAgent => {
+                return self.failed_block_agent_task(
+                    menu.session_id,
+                    menu.zone_id,
+                    FailedBlockAgentIntent::Fix,
+                );
+            }
+            BlockMenuAction::ExplainWithAgent => {
+                return self.failed_block_agent_task(
+                    menu.session_id,
+                    menu.zone_id,
+                    FailedBlockAgentIntent::Explain,
+                );
+            }
+            BlockMenuAction::Retry => {
+                return self.failed_block_retry_task(menu.session_id, menu.zone_id);
+            }
+            BlockMenuAction::CreateTask => {
+                self.task_create_from_block(menu.session_id, menu.zone_id);
+                return Task::none();
+            }
+            _ => {}
+        }
         let target_is_live = self.sessions.get(self.active).is_some_and(|sess| {
             sess.id == menu.session_id && sess.terminal.zone_by_id(menu.zone_id).is_some()
         });
@@ -5528,6 +5644,12 @@ impl Frost {
                 Task::none()
             }
             BlockMenuAction::Clear => self.request_block_clear(),
+            // Returned by the stable-id dispatch above, before the focus-bound
+            // liveness check these remaining actions require.
+            BlockMenuAction::FixWithAgent
+            | BlockMenuAction::ExplainWithAgent
+            | BlockMenuAction::CreateTask
+            | BlockMenuAction::Retry => Task::none(),
         }
     }
 
@@ -5573,6 +5695,276 @@ impl Frost {
         }
         self.agent.last_manual_completed = Some(context);
         iced::widget::operation::focus(AGENT_INPUT_ID.clone())
+    }
+
+    /// Start a fresh Agent task for one failed block (ember's Fix/Explain,
+    /// adapted to frost's per-command-approval Shell Agent). The source
+    /// session is found by stable id — not by focus — so the task stays bound
+    /// to the terminal that produced the block. Every guard fails closed with
+    /// a toast and leaves any live Agent task untouched.
+    fn failed_block_agent_task(
+        &mut self,
+        session_id: usize,
+        zone_id: u64,
+        intent: FailedBlockAgentIntent,
+    ) -> Task<Message> {
+        let prepared = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == session_id)
+            .map(|sess| {
+                let Some(zone) = sess.terminal.zone_by_id(zone_id) else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                if !matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                ) {
+                    return Err(
+                        "Fix/Explain are available for failed command blocks".to_string()
+                    );
+                }
+                if let Some(reason) = block_mode::failed_block_agent_disabled_reason(
+                    zone.command.as_deref(),
+                    zone.command_truncated,
+                    zone.cwd.as_deref(),
+                ) {
+                    return Err(format!("Cannot start an Agent task: {reason}"));
+                }
+                // cwd provenance: the block's recorded cwd is self-reported
+                // OSC 133 data, so it must agree with an independent local
+                // observation of the shell process before it can anchor a
+                // task. SSH/tmux-style wrappers fail closed here.
+                let recorded = zone.cwd.clone().expect("eligibility guarantees a cwd");
+                let reported = sess.terminal.current_working_dir().map(str::to_string);
+                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                if !block_mode::verified_local_command_cwd(
+                    &recorded,
+                    reported.as_deref(),
+                    process.as_deref(),
+                ) {
+                    return Err(
+                        "Cannot start an Agent task: the recorded cwd is not independently verified; return a local shell to the command's directory first"
+                            .to_string(),
+                    );
+                }
+                let (output, output_truncated) =
+                    match sess.terminal.zone_output_export_capped(zone_id) {
+                        Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                            (text, truncated)
+                        }
+                        Some(terminal::ZoneOutputExport::Empty) => (String::new(), false),
+                        Some(terminal::ZoneOutputExport::Unavailable) => (
+                            "[output unavailable: retained snapshot and scrollback rows were evicted]"
+                                .to_string(),
+                            true,
+                        ),
+                        None => {
+                            return Err("Block menu target is no longer available".to_string())
+                        }
+                    };
+                // A failed block always has a reported status.
+                let (ai_output, ai_output_truncated) = bounded_ai_block_output(&output, false);
+                Ok(jterm_core::ai::BlockContext {
+                    cmd: zone
+                        .command
+                        .clone()
+                        .expect("eligibility guarantees a command"),
+                    output: ai_output,
+                    cwd: Some(recorded),
+                    exit_code: zone.exit_code.unwrap_or(-1),
+                    truncated: output_truncated || ai_output_truncated,
+                })
+            });
+        let context = match prepared {
+            Some(Ok(context)) => context,
+            Some(Err(message)) => {
+                self.push_toast(message, ToastKind::Warning);
+                return Task::none();
+            }
+            None => {
+                self.push_toast(
+                    "Block menu target is no longer available".to_string(),
+                    ToastKind::Info,
+                );
+                return Task::none();
+            }
+        };
+        // The instruction never interpolates command or output text: both are
+        // untrusted PTY evidence and travel only inside the framed context.
+        let prompt = match intent {
+            FailedBlockAgentIntent::Fix => "Fix the attached failed command. Diagnose the root cause from its captured output and propose the smallest safe fix; every command you propose is reviewed before it runs.",
+            FailedBlockAgentIntent::Explain => "Explain the attached failed command: identify the root cause, cite the relevant evidence in its captured output, and propose the smallest safe next step. Do not propose changes unless I ask.",
+        };
+        match self
+            .agent
+            .start_for_block(&self.config, session_id, context, prompt)
+        {
+            Ok(()) => {
+                self.push_toast(
+                    match intent {
+                        FailedBlockAgentIntent::Fix => "Agent is working on the failed command",
+                        FailedBlockAgentIntent::Explain => "Agent is explaining the failed command",
+                    },
+                    ToastKind::Success,
+                );
+                self.agent_drive_task().unwrap_or_else(Task::none)
+            }
+            Err(message) => {
+                self.push_toast(message, ToastKind::Warning);
+                Task::none()
+            }
+        }
+    }
+
+    /// Guarded semantic replay of one failed block's exact command into its
+    /// source pane (ember's Retry). Nothing is written unless the command is
+    /// exact, non-truncated, single-line and safe, its recorded cwd matches an
+    /// independently observed local shell cwd, and the pane sits at an idle,
+    /// empty, bracketed-paste prompt on the main screen. Every refusal fails
+    /// closed with a toast.
+    fn failed_block_retry_task(&mut self, session_id: usize, zone_id: u64) -> Task<Message> {
+        let Some(index) = self.sessions.iter().position(|sess| sess.id == session_id) else {
+            self.push_toast(
+                "Block menu target is no longer available".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        };
+        let prepared: Result<String, String> = {
+            let sess = &mut self.sessions[index];
+            (|| {
+                let Some(zone) = sess.terminal.zone_by_id(zone_id) else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                if !matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                ) {
+                    return Err("Retry is available for failed command blocks".to_string());
+                }
+                let command = zone.command.clone();
+                let command_truncated = zone.command_truncated;
+                let recorded = zone.cwd.clone();
+                let reported = sess.terminal.current_working_dir().map(str::to_string);
+                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                if let Some(reason) = block_mode::retry_replay_disabled_reason(
+                    command.as_deref(),
+                    command_truncated,
+                    recorded.as_deref(),
+                    reported.as_deref(),
+                    process.as_deref(),
+                ) {
+                    return Err(format!("Command not retried: {reason}"));
+                }
+                if sess.terminal.is_alt_buffer_active() {
+                    return Err("Command not retried: a full-screen program is active".to_string());
+                }
+                if let Some(reason) = block_prompt_replace_blocker(sess.agent_prompt_status()) {
+                    return Err(format!("Command not retried: {reason}"));
+                }
+                if !sess.terminal.is_bracketed_paste_enabled() {
+                    return Err(
+                        "Command not retried: safe replay requires bracketed paste mode"
+                            .to_string(),
+                    );
+                }
+                let command = command.expect("eligibility guarantees a command");
+                let command = command.trim_end_matches(['\r', '\n']).to_string();
+                // Byte-exact replay: any control or visual spoof rejects the
+                // whole command instead of altering what will run.
+                crate::review_text::validate_single_line(
+                    &command,
+                    block_mode::FAILED_BLOCK_COMMAND_MAX_BYTES,
+                )
+                .map_err(|error| format!("Command not retried: {error}"))?;
+                Ok(command)
+            })()
+        };
+        let command = match prepared {
+            Ok(command) => command,
+            Err(message) => {
+                self.push_toast(message, ToastKind::Warning);
+                return Task::none();
+            }
+        };
+        // Final prompt-ownership re-check at the write boundary, same as
+        // reinput: the prompt that was safe above may have changed since.
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            self.push_toast(format!("Command not retried: {reason}"), ToastKind::Warning);
+            return Task::none();
+        }
+        if self.write_paste_to_session(session_id, &command, block_retry_policy(), true) {
+            self.push_toast("Command queued to run", ToastKind::Success);
+        }
+        Task::none()
+    }
+
+    /// The active pane's target for the palette's failed-block actions: the
+    /// selected block when it is a failed one, otherwise the newest failed
+    /// block (the family's "selected (or latest)" rule).
+    fn palette_failed_block_target(&mut self) -> Option<(usize, u64)> {
+        let sess = self.sessions.get_mut(self.active)?;
+        let ids: Vec<u64> = sess
+            .terminal
+            .command_zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect();
+        sess.block_selection.retain(&ids);
+        let is_failed = |zone: &&terminal::CommandZone| {
+            matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Failed(_)
+            )
+        };
+        let target = sess
+            .block_selection
+            .active()
+            .filter(|id| {
+                sess.terminal
+                    .zone_by_id(*id)
+                    .is_some_and(|zone| is_failed(&zone))
+            })
+            .or_else(|| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .rev()
+                    .find(is_failed)
+                    .map(|zone| zone.id)
+            })?;
+        Some((sess.id, target))
+    }
+
+    /// Palette entry point for Fix/Explain on the active pane's failed block.
+    fn palette_failed_block_agent_task(&mut self, intent: FailedBlockAgentIntent) -> Task<Message> {
+        match self.palette_failed_block_target() {
+            Some((session_id, zone_id)) => {
+                self.failed_block_agent_task(session_id, zone_id, intent)
+            }
+            None => {
+                self.push_toast(
+                    "No failed command block (needs OSC 133 shell integration)".to_string(),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// Palette entry point for Retry on the active pane's failed block.
+    fn palette_failed_block_retry_task(&mut self) -> Task<Message> {
+        match self.palette_failed_block_target() {
+            Some((session_id, zone_id)) => self.failed_block_retry_task(session_id, zone_id),
+            None => {
+                self.push_toast(
+                    "No failed command block (needs OSC 133 shell integration)".to_string(),
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+        }
     }
 
     /// Toggle the cross-block search picker (`block:search`). While it is
@@ -7038,6 +7430,7 @@ impl Frost {
                     }
                 }
             }
+            PaletteAction::ToggleTasks => Task::done(Message::TaskPanelToggle),
             PaletteAction::OpenSettings => {
                 self.config_panel_open = true;
                 Task::none()
@@ -7109,6 +7502,13 @@ impl Frost {
             PaletteAction::BlockToggleBookmark => self.block_toggle_target_bookmark(),
             PaletteAction::BlockJumpPrevBookmark => self.block_jump_bookmark(true),
             PaletteAction::BlockJumpNextBookmark => self.block_jump_bookmark(false),
+            PaletteAction::BlockFixWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Fix)
+            }
+            PaletteAction::BlockExplainWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Explain)
+            }
+            PaletteAction::BlockRetryFailed => self.palette_failed_block_retry_task(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 if !self.ensure_block_action_available("Prompt navigation") {
@@ -8532,6 +8932,80 @@ impl Frost {
             }
             Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
             Message::AgentClose => self.agent.close(),
+            Message::TaskPanelToggle => {
+                self.toggle_task_panel();
+            }
+            Message::TaskSelect(task_id) => {
+                self.task_panel.selected = Some(task_id);
+                self.task_panel.follow_up.clear();
+            }
+            Message::TaskHide(task_id) => {
+                if let Err(error) = self.task_manager.archive(task_id) {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                } else if self.task_panel.selected == Some(task_id) {
+                    self.task_panel.selected = None;
+                }
+            }
+            Message::TaskStartCodex(task_id) => self.task_start_codex(task_id),
+            Message::TaskCancelCodex(task_id) => {
+                if let Err(error) = self.agent_runtime.cancel(task_id) {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                }
+            }
+            Message::TaskFinishCodex(task_id) => {
+                if let Err(error) = self.agent_runtime.finish_codex(&self.task_manager, task_id) {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                }
+            }
+            Message::TaskFollowUpInput(value) => {
+                if value.len() <= agent_task::NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
+                    self.task_panel.follow_up = value;
+                }
+            }
+            Message::TaskFollowUpSend(task_id) => {
+                let text = self.task_panel.follow_up.clone();
+                match self.agent_runtime.prompt_codex(
+                    &self.task_manager,
+                    task_id,
+                    &text,
+                    agent_task_ui::prompt_policy(&self.config),
+                ) {
+                    Ok(()) => self.task_panel.follow_up.clear(),
+                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                }
+            }
+            Message::TaskApprovalDeny(task_id, approval_id) => {
+                if let Err(error) = self.agent_runtime.decide_approval(
+                    task_id,
+                    approval_id,
+                    agent_task::ApprovalDecision::Deny { reason: None },
+                ) {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                }
+            }
+            Message::TaskDiffOpen(task_id) => {
+                if let Some(task) = self.task_manager.get(task_id) {
+                    let result = self
+                        .task_panel
+                        .diff
+                        .request_from(task.worktree_path.clone(), task.base_commit.clone());
+                    if let Err(error) = result {
+                        self.push_toast(error.to_string(), ToastKind::Warning);
+                    }
+                }
+            }
+            Message::TaskDiffClose => {
+                self.task_panel.diff.is_open = false;
+            }
+            Message::TaskValidationStart(task_id) => self.task_start_validation(task_id),
+            Message::TaskMarkComplete(task_id) => {
+                match self.task_manager.complete_after_validation(task_id) {
+                    Ok(()) => self.push_toast("Task marked complete", ToastKind::Success),
+                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                }
+            }
+            Message::TaskTerminalOpen(task_id) => self.task_open_terminal(task_id),
+            Message::TaskTick => self.tasks_tick(),
             Message::AgentInput(value) => self.agent.input = value,
             Message::AgentSubmit => {
                 self.agent.submit_input();
@@ -8644,6 +9118,17 @@ impl Frost {
             Message::SetAiRedactSecrets(redact) => {
                 self.config.ai_redact_secrets = redact;
                 self.config_dirty = true;
+            }
+            Message::SetAiShareCommandContext(share) => {
+                self.config.ai_share_command_context = share;
+                self.config_dirty = true;
+            }
+            Message::SetExperimentalTaskSidebar(enabled) => {
+                self.config.experimental_task_sidebar = enabled;
+                self.config_dirty = true;
+                if !enabled && self.sidebar_panel == SidebarPanel::Tasks {
+                    self.sidebar_panel = SidebarPanel::Tabs;
+                }
             }
             Message::SetAiStream(stream) => {
                 self.config.ai_stream = stream;
@@ -8769,6 +9254,26 @@ impl Frost {
                     .iter()
                     .position(|session| session.id == id && session.master_fd == fd)
                 {
+                    // A task-bound terminal (Agent or validation) reports its
+                    // real child exit status to the reducer and stays open so
+                    // its transcript remains reviewable; the task card drives
+                    // the lifecycle from here. Ordinary sessions still close.
+                    let session_key = agent_task_ui::terminal_session_id(id);
+                    let task_bound = self
+                        .task_manager
+                        .task_for_terminal_session(&session_key)
+                        .is_some();
+                    let exit_code = self.sessions[index].pty.exited_code();
+                    self.task_manager
+                        .handle_terminal_session_exit(&session_key, exit_code);
+                    if task_bound {
+                        self.sessions[index].hold_after_exit = true;
+                        self.push_toast(
+                            "Task terminal exited; its transcript stays open for review",
+                            ToastKind::Info,
+                        );
+                        return Task::none();
+                    }
                     return self.close_session(index);
                 }
             }
@@ -11487,6 +11992,23 @@ impl Frost {
             } else {
                 body.push(row_btn("Ask AI about block", BlockMenuAction::AskAi))
             };
+            // Failed completed blocks expose the ember-style action chain:
+            // fresh Fix/Explain Agent tasks and a guarded semantic Retry.
+            if matches!(outcome, block_mode::BlockOutcome::Failed(_)) {
+                body = body.push(
+                    row![
+                        row_btn("Fix with Agent", BlockMenuAction::FixWithAgent),
+                        row_btn("Explain with Agent", BlockMenuAction::ExplainWithAgent),
+                        row_btn("Retry", BlockMenuAction::Retry),
+                    ]
+                    .spacing(6),
+                );
+                // The experimental dashboard adds worktree task creation for
+                // the same failed block (ember's Create task).
+                if self.config.experimental_task_sidebar {
+                    body = body.push(row_btn("Create task", BlockMenuAction::CreateTask));
+                }
+            }
             body = body.push(
                 row![
                     row_btn(
@@ -12154,11 +12676,26 @@ impl Frost {
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center);
+        // The experimental Tasks dashboard joins the switcher only when the
+        // feature flag is on; with the flag off no task UI is reachable.
+        let header = if self.config.experimental_task_sidebar {
+            row![
+                panel_btn("Tabs", SidebarPanel::Tabs),
+                panel_btn("Files", SidebarPanel::Files),
+                panel_btn("Tasks", SidebarPanel::Tasks),
+                Space::new().width(Length::Fill),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+        } else {
+            header
+        };
         let header = container(header).padding([4, 6]);
 
         let panel: Element<'_, Message> = match self.sidebar_panel {
             SidebarPanel::Tabs => self.sidebar_tabs_view(),
             SidebarPanel::Files => self.sidebar_files_view(),
+            SidebarPanel::Tasks => self.sidebar_tasks_view(),
         };
 
         container(column![header, panel].spacing(2))
@@ -13639,6 +14176,24 @@ impl Frost {
                 .on_toggle(Message::SetAiStream)
                 .into(),
         );
+        let ai_share_row = responsive_control_row(
+            compact,
+            "Cloud context",
+            checkbox(self.config.ai_share_command_context)
+                .label("Share command context with non-local AI")
+                .text_size(13)
+                .on_toggle(Message::SetAiShareCommandContext)
+                .into(),
+        );
+        let task_sidebar_row = responsive_control_row(
+            compact,
+            "Tasks",
+            checkbox(self.config.experimental_task_sidebar)
+                .label("Experimental Tasks dashboard (Codex worktrees)")
+                .text_size(13)
+                .on_toggle(Message::SetExperimentalTaskSidebar)
+                .into(),
+        );
         let agent_turns_row = responsive_slider_row(
             compact,
             "Agent turns",
@@ -13790,6 +14345,8 @@ impl Frost {
             ai_key_store_row,
             ai_redact_row,
             ai_stream_row,
+            ai_share_row,
+            task_sidebar_row,
             agent_turns_row,
             remote_hosts_section,
             buttons,
@@ -14209,6 +14766,865 @@ impl Frost {
         self.agent_drive_task()
     }
 
+    // ===== Experimental Tasks dashboard (agent_task) =====
+
+    /// Show or hide the Tasks dock panel. With the feature flag off the
+    /// toggle only explains how to enable it.
+    fn toggle_task_panel(&mut self) {
+        if !self.config.experimental_task_sidebar {
+            self.push_toast(
+                "Enable the experimental Tasks dashboard in Settings first",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let showing = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
+        if showing {
+            self.sidebar_open = false;
+        } else {
+            self.sidebar_open = true;
+            self.sidebar_panel = SidebarPanel::Tasks;
+        }
+    }
+
+    /// Create an isolated-worktree task from one failed command block. The
+    /// eligibility gates mirror the Fix/Explain Agent path; the actual Git
+    /// work is prepared on a background worker and registered on TaskTick.
+    fn task_create_from_block(&mut self, session_id: usize, zone_id: u64) {
+        if !self.config.experimental_task_sidebar {
+            return;
+        }
+        if self.task_panel.pending_creation.is_some() {
+            self.push_toast(
+                "Another task worktree is still being created",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let prepared = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == session_id)
+            .map(|sess| {
+                let Some(zone) = sess.terminal.zone_by_id(zone_id) else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                if !matches!(
+                    block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                    block_mode::BlockOutcome::Failed(_)
+                ) {
+                    return Err("Tasks can be created for failed command blocks".to_string());
+                }
+                if let Some(reason) = block_mode::failed_block_agent_disabled_reason(
+                    zone.command.as_deref(),
+                    zone.command_truncated,
+                    zone.cwd.as_deref(),
+                ) {
+                    return Err(format!("Cannot create a task: {reason}"));
+                }
+                let recorded = zone.cwd.clone().expect("eligibility guarantees a cwd");
+                let reported = sess.terminal.current_working_dir().map(str::to_string);
+                let process = jterm_core::process::process_cwd(sess.pty.get_child_pid());
+                if !block_mode::verified_local_command_cwd(
+                    &recorded,
+                    reported.as_deref(),
+                    process.as_deref(),
+                ) {
+                    return Err(
+                        "Cannot create a task: the recorded cwd is not independently verified; return a local shell to the command's directory first"
+                            .to_string(),
+                    );
+                }
+                let (output_text, output_truncated, output_available) =
+                    match sess.terminal.zone_output_export_capped(zone_id) {
+                        Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
+                            (text, truncated, true)
+                        }
+                        Some(terminal::ZoneOutputExport::Empty) => (String::new(), false, true),
+                        Some(terminal::ZoneOutputExport::Unavailable) => {
+                            (String::new(), false, false)
+                        }
+                        None => {
+                            return Err("Block menu target is no longer available".to_string())
+                        }
+                    };
+                let command = zone.command.clone().expect("eligibility guarantees a command");
+                Ok(agent_task::SemanticCommandContext {
+                    source_session_id: agent_task_ui::terminal_session_id(session_id),
+                    source_execution_id: format!("zone-{zone_id}"),
+                    source_sequence: zone_id,
+                    source_shell: pty::resolved_shell_identity(
+                        self.config.shell.as_deref(),
+                        Some(&recorded),
+                    ),
+                    command: Some(command),
+                    command_exact: zone.command_exact,
+                    command_truncated: zone.command_truncated,
+                    cwd: Some(recorded),
+                    cwd_after: None,
+                    exit_code: zone.exit_code,
+                    duration_ms: zone.duration_ms,
+                    output_text,
+                    output_available,
+                    output_truncated,
+                    output_total_bytes: 0,
+                    started_at: None,
+                    finished_at: None,
+                })
+            });
+        let context = match prepared {
+            Some(Ok(context)) => context,
+            Some(Err(message)) => {
+                self.push_toast(message, ToastKind::Warning);
+                return;
+            }
+            None => {
+                self.push_toast("Block menu target is no longer available", ToastKind::Info);
+                return;
+            }
+        };
+        match agent_task_ui::begin_worktree_creation(context, agent_task::AgentProvider::Codex) {
+            Ok(pending) => {
+                self.task_panel.pending_creation = Some(pending);
+                self.sidebar_open = true;
+                self.sidebar_panel = SidebarPanel::Tasks;
+                self.push_toast(
+                    "Creating an isolated Git worktree for Codex…",
+                    ToastKind::Info,
+                );
+            }
+            Err(error) => self.push_toast(error, ToastKind::Warning),
+        }
+    }
+
+    /// Enter the bounded, cancellable background preparation phase for a
+    /// native Codex session. Consent is re-evaluated here and again when the
+    /// prepared result lands; a revoked policy never spawns a provider.
+    fn task_start_codex(&mut self, task_id: agent_task::TaskId) {
+        let policy = agent_task_ui::prompt_policy(&self.config);
+        if !policy.share_command_context {
+            self.push_toast(
+                "Start Codex requires AI and command-context sharing in Settings",
+                ToastKind::Warning,
+            );
+            return;
+        }
+        match self
+            .agent_runtime
+            .start_codex(&mut self.task_manager, task_id, policy)
+        {
+            Ok(()) => self.push_toast("Preparing an isolated Codex session…", ToastKind::Info),
+            Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+        }
+    }
+
+    /// Drain pending worktree creation, native provider events, and the diff
+    /// worker. Driven by the iced tick subscription; never blocks.
+    fn tasks_tick(&mut self) {
+        let pending = self
+            .task_panel
+            .pending_creation
+            .as_ref()
+            .map(|pending| pending.receiver.try_recv());
+        match pending {
+            None | Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {}
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.task_panel.pending_creation = None;
+                self.push_toast(
+                    "Task worktree worker stopped unexpectedly",
+                    ToastKind::Warning,
+                );
+            }
+            Some(Ok(Err(error))) => {
+                self.task_panel.pending_creation = None;
+                self.push_toast(
+                    format!("Could not create task worktree: {error}"),
+                    ToastKind::Warning,
+                );
+            }
+            Some(Ok(Ok(prepared))) => {
+                self.task_panel.pending_creation = None;
+                let provider_name = prepared.provider.display_name();
+                let worktree = prepared.worktree;
+                let new_task = agent_task::NewTask {
+                    title: prepared.title,
+                    provider: prepared.provider,
+                    repo_root: worktree.repository,
+                    worktree_path: worktree.path,
+                    branch: worktree.branch,
+                    base_commit: worktree.head,
+                    source_context: Some(prepared.context),
+                };
+                match self.task_manager.create(new_task) {
+                    Ok(task_id) => {
+                        self.task_panel.selected = Some(task_id);
+                        self.push_toast(
+                            format!("Created an isolated {provider_name} task; choose Start Codex"),
+                            ToastKind::Success,
+                        );
+                    }
+                    Err(error) => self.push_toast(
+                        format!("Worktree was preserved, but task registration failed: {error}"),
+                        ToastKind::Warning,
+                    ),
+                }
+            }
+        }
+
+        if self.agent_runtime.has_any_activity() {
+            let report = self.agent_runtime.poll(
+                &mut self.task_manager,
+                agent_task_ui::prompt_policy(&self.config),
+            );
+            for issue in report.issues {
+                self.push_toast(
+                    crate::review_text::visible_bounded(
+                        &issue.detail,
+                        agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES,
+                    ),
+                    ToastKind::Warning,
+                );
+            }
+            for completion in report.completions {
+                let outcome = match completion.outcome {
+                    agent_task::AgentSessionOutcome::Clean => "finished",
+                    agent_task::AgentSessionOutcome::Failed => "failed",
+                    agent_task::AgentSessionOutcome::Cancelled => "was cancelled",
+                };
+                self.push_toast(format!("Codex session {outcome}"), ToastKind::Info);
+            }
+        }
+
+        self.task_panel.diff.poll();
+    }
+
+    /// Open the opaque PTY compatibility path: a new terminal tab running the
+    /// provider CLI directly inside the task worktree. Also implements the
+    /// explicit terminal fallback after an unsuccessful native session and
+    /// the retry of an exited task terminal (the new PTY atomically replaces
+    /// the exited transcript binding; sticky provenance is preserved).
+    fn task_open_terminal(&mut self, task_id: agent_task::TaskId) {
+        if self.agent_runtime.has_preparing(task_id) {
+            self.push_toast(
+                "Cancel native Codex preparation before starting a terminal",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let failed_terminal_retry = self
+            .task_manager
+            .terminal_retry_session_id(task_id)
+            .ok()
+            .map(str::to_owned);
+        let native_recovery = failed_terminal_retry.is_none()
+            && self.agent_runtime.can_continue_in_terminal(task_id)
+            && self
+                .task_manager
+                .native_terminal_fallback_eligible(task_id)
+                .is_ok();
+        let launch = self.task_manager.get(task_id).and_then(|task| {
+            ((task.status == agent_task::TaskStatus::Created && task.terminal_session_id.is_none())
+                || (native_recovery && task.terminal_session_id.is_none())
+                || failed_terminal_retry
+                    .as_deref()
+                    .is_some_and(|old| task.terminal_session_id.as_deref() == Some(old)))
+            .then(|| {
+                (
+                    task.provider,
+                    task.repo_root.clone(),
+                    task.worktree_path.clone(),
+                )
+            })
+        });
+        let Some((provider, repository, worktree)) = launch else {
+            self.push_toast(
+                "Task is no longer waiting for an Agent terminal",
+                ToastKind::Info,
+            );
+            return;
+        };
+        let launch = match agent_task::AgentLaunchSpec::resolve(provider, &repository, &worktree) {
+            Ok(launch) => launch,
+            Err(error) => {
+                if failed_terminal_retry.is_none() && !native_recovery {
+                    let _ = self.task_manager.update_status(
+                        task_id,
+                        agent_task::TaskStatus::Created,
+                        Some(error.to_string()),
+                    );
+                }
+                self.push_toast(error.to_string(), ToastKind::Warning);
+                return;
+            }
+        };
+        if failed_terminal_retry.is_none() && !native_recovery {
+            let _ =
+                self.task_manager
+                    .update_status(task_id, agent_task::TaskStatus::Starting, None);
+        }
+        let session_id = self.next_id;
+        let session_key = agent_task_ui::terminal_session_id(session_id);
+        let spawned = Session::spawn_argv(
+            &self.config,
+            session_id,
+            self.cols,
+            self.rows,
+            worktree.to_str(),
+            Some(&launch.argv),
+        );
+        let session = match spawned {
+            Ok(session) => session,
+            Err(error) => {
+                if failed_terminal_retry.is_none() && !native_recovery {
+                    let _ = self.task_manager.update_status(
+                        task_id,
+                        agent_task::TaskStatus::Created,
+                        Some(error.to_string()),
+                    );
+                }
+                self.push_toast(
+                    format!("Could not start {}: {error}", provider.display_name()),
+                    ToastKind::Warning,
+                );
+                return;
+            }
+        };
+        let binding = if let Some(old_session) = failed_terminal_retry.as_deref() {
+            self.task_manager
+                .bind_terminal_retry_session(task_id, old_session, session_key.clone())
+        } else if native_recovery {
+            self.task_manager
+                .bind_native_terminal_fallback_session(task_id, session_key.clone())
+        } else {
+            self.task_manager
+                .bind_terminal_session(task_id, session_key)
+        };
+        if let Err(error) = binding {
+            // The PTY is live but never gained task authority; tear it down
+            // and restore the pre-spawn task state.
+            let mut session = session;
+            let _ = session.pty.terminate();
+            if failed_terminal_retry.is_none() && !native_recovery {
+                let _ = self.task_manager.update_status(
+                    task_id,
+                    agent_task::TaskStatus::Created,
+                    Some(error.to_string()),
+                );
+            }
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        if native_recovery {
+            self.agent_runtime.clear_retained(task_id);
+        }
+        self.session_diagnostic = None;
+        self.next_id += 1;
+        let insert = (self.active + 1).min(self.sessions.len());
+        self.sessions.insert(insert, session);
+        self.reindex_tabs_after_insert(insert);
+        self.open_tab_with(insert);
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast(
+            format!(
+                "Opened {} in an isolated task terminal; task context stays in Frost",
+                provider.display_name()
+            ),
+            ToastKind::Success,
+        );
+    }
+
+    /// Re-run the task's exact source command in a separate validation
+    /// terminal inside the isolated worktree. Preflight re-proves the Git
+    /// registration and pins the cwd through an open directory descriptor
+    /// before any PTY exists.
+    fn task_start_validation(&mut self, task_id: agent_task::TaskId) {
+        if let Err(error) = self.task_manager.next_validation_attempt(task_id) {
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        let prepared = {
+            let Some(task) = self.task_manager.get(task_id) else {
+                self.push_toast("Task is no longer available", ToastKind::Info);
+                return;
+            };
+            match agent_task::prepare_task_validation(task) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.push_toast(error.to_string(), ToastKind::Warning);
+                    return;
+                }
+            }
+        };
+        let argv = match agent_task_ui::validation_command_argv(
+            Some(&prepared.source_shell),
+            &prepared.command,
+        ) {
+            Ok(argv) => argv,
+            Err(error) => {
+                self.push_toast(error, ToastKind::Warning);
+                return;
+            }
+        };
+        let session_id = self.next_id;
+        let session_key = agent_task_ui::terminal_session_id(session_id);
+        // The child chdirs through the pinned descriptor path, so a replaced
+        // worktree directory cannot redirect validation after preflight.
+        let pinned_cwd = prepared.pinned_cwd.proc_path();
+        let spawned = Session::spawn_argv_env(
+            &self.config,
+            session_id,
+            self.cols,
+            self.rows,
+            pinned_cwd.to_str(),
+            Some(&argv),
+            &agent_task_ui::VALIDATION_ENV_OVERRIDES,
+        );
+        let session = match spawned {
+            Ok(session) => session,
+            Err(error) => {
+                self.push_toast(
+                    format!("Could not start the validation terminal: {error}"),
+                    ToastKind::Warning,
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .task_manager
+            .bind_validation_session(task_id, session_key)
+        {
+            let mut session = session;
+            let _ = session.pty.terminate();
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
+        self.session_diagnostic = None;
+        self.next_id += 1;
+        let insert = (self.active + 1).min(self.sessions.len());
+        self.sessions.insert(insert, session);
+        self.reindex_tabs_after_insert(insert);
+        self.open_tab_with(insert);
+        self.relayout();
+        self.refresh_active_context();
+        self.save_session_snapshot();
+        self.push_toast(
+            "Running the exact source command in a validation terminal",
+            ToastKind::Info,
+        );
+    }
+
+    /// The Tasks dashboard dock panel: task list plus the selected task card.
+    fn sidebar_tasks_view(&self) -> Element<'_, Message> {
+        if !self.config.experimental_task_sidebar {
+            return text("Enable the experimental Tasks dashboard in Settings")
+                .size(12)
+                .style(text::secondary)
+                .into();
+        }
+        let mut body = column![].spacing(6);
+        if self.task_panel.pending_creation.is_some() {
+            body = body.push(
+                text("Creating isolated worktree…")
+                    .size(12)
+                    .style(text::secondary),
+            );
+        }
+        let mut tasks: Vec<&agent_task::AgentTask> = self
+            .task_manager
+            .tasks()
+            .iter()
+            .filter(|task| task.status != agent_task::TaskStatus::Archived)
+            .collect();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
+        if tasks.is_empty() && self.task_panel.pending_creation.is_none() {
+            body = body.push(text("No Agent tasks yet").size(13));
+            body = body.push(
+                text("Create one from a failed command block's menu (Create task). Each task gets its own Git worktree.")
+                    .size(11)
+                    .style(text::secondary),
+            );
+        }
+        for task in &tasks {
+            let mut label = crate::review_text::visible_bounded(
+                &task.title,
+                agent_task_ui::MAX_TASK_TITLE_DISPLAY_BYTES,
+            );
+            if self.task_manager.task_needs_attention(task.id) {
+                label = format!("● {label}");
+            }
+            let row_button = button(text(label).size(12))
+                .on_press(Message::TaskSelect(task.id))
+                .padding([2, 6])
+                .style(self.tab_btn_style(self.task_panel.selected == Some(task.id)));
+            body = body.push(
+                column![
+                    row_button,
+                    text(format!(
+                        "{} · {}",
+                        task.provider.display_name(),
+                        task.status.label()
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                ]
+                .spacing(1),
+            );
+        }
+        if let Some(task_id) = self.task_panel.selected {
+            if let Some(task) = self.task_manager.get(task_id) {
+                body = body.push(self.task_card(task));
+            }
+        }
+        scrollable(body).height(Length::Fill).into()
+    }
+
+    /// The selected task's detail card: lifecycle state, native turn view,
+    /// approvals (display-and-deny), review/validation/terminal actions.
+    fn task_card(&self, task: &agent_task::AgentTask) -> Element<'_, Message> {
+        use agent_task::{TaskRuntimeKind, TaskStatus, TaskValidationStatus};
+
+        let mut card = column![].spacing(6);
+        card = card.push(text(crate::review_text::visible_bounded(&task.title, 200)).size(13));
+        card = card.push(
+            text(format!(
+                "Status: {} · Runtime: {:?}",
+                task.status.label(),
+                task.runtime_kind
+            ))
+            .size(11)
+            .style(text::secondary),
+        );
+        card = card.push(
+            text(format!(
+                "Branch {} · {}",
+                crate::review_text::visible_bounded(&task.branch, 128),
+                agent_task::diff::visible_diff_cwd(&task.worktree_path),
+            ))
+            .size(10)
+            .style(text::secondary),
+        );
+        if let Some(detail) = task.status_detail.as_deref() {
+            card = card.push(
+                text(crate::review_text::visible_bounded(
+                    detail,
+                    agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES,
+                ))
+                .size(11)
+                .style(text::secondary),
+            );
+        }
+
+        let preparing = self.agent_runtime.has_preparing(task.id);
+        let running = self.agent_runtime.has_running(task.id);
+        let stream_active = self.task_manager.has_active_agent_event_stream(task.id);
+
+        // Native session projection: current/latest turn plus pending
+        // approvals (display-and-deny) and bounded completed-turn history.
+        if let Some(snapshot) = self.agent_runtime.snapshot(task.id) {
+            card = card.push(
+                text(format!("Native session: {:?}", snapshot.phase))
+                    .size(11)
+                    .style(text::secondary),
+            );
+            if !snapshot.agent_text.is_empty() {
+                let truncated = if snapshot.agent_text_truncated {
+                    " (compacted)"
+                } else {
+                    ""
+                };
+                card = card.push(
+                    container(
+                        scrollable(
+                            text(format!(
+                                "{}{}",
+                                crate::review_text::visible_bounded(
+                                    &snapshot.agent_text,
+                                    64 * 1024
+                                ),
+                                truncated
+                            ))
+                            .size(11)
+                            .font(iced::Font::MONOSPACE),
+                        )
+                        .height(Length::Fixed(160.0)),
+                    )
+                    .padding(6)
+                    .style(container::bordered_box),
+                );
+            }
+            for command in &snapshot.commands {
+                card = card.push(
+                    text(format!(
+                        "$ {} · {}",
+                        crate::review_text::visible_bounded(&command.command, 512),
+                        command.status
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                );
+            }
+            for approval in &snapshot.pending_approvals {
+                let mut approval_card = column![].spacing(4);
+                approval_card = approval_card.push(
+                    text(format!(
+                        "Managed approval request ({:?}); accepting is disabled",
+                        approval.kind
+                    ))
+                    .size(11)
+                    .style(text::danger),
+                );
+                if let Some(command) = approval.command.as_deref() {
+                    approval_card = approval_card.push(
+                        text(crate::review_text::visible_bounded(command, 1024))
+                            .size(10)
+                            .font(iced::Font::MONOSPACE),
+                    );
+                }
+                for path in &approval.file_paths {
+                    approval_card = approval_card.push(
+                        text(crate::review_text::visible_bounded(path, 512))
+                            .size(10)
+                            .font(iced::Font::MONOSPACE),
+                    );
+                }
+                if let Some(reason) = approval.reason.as_deref() {
+                    approval_card = approval_card.push(
+                        text(crate::review_text::visible_bounded(reason, 512))
+                            .size(10)
+                            .style(text::secondary),
+                    );
+                }
+                approval_card = approval_card.push(
+                    button(text("Deny").size(11))
+                        .style(button::danger)
+                        .on_press(Message::TaskApprovalDeny(task.id, approval.id)),
+                );
+                card = card.push(
+                    container(approval_card)
+                        .padding(6)
+                        .style(container::bordered_box),
+                );
+            }
+            if !snapshot.turn_history.is_empty() {
+                card = card.push(
+                    text(format!(
+                        "Completed turns: {} ({} in history)",
+                        snapshot.completed_turns,
+                        snapshot.turn_history.len()
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                );
+            }
+        }
+
+        // Action rows.
+        let mut actions = row![].spacing(6);
+        if preparing {
+            actions = actions.push(text("Preparing…").size(11).style(text::secondary));
+            actions = actions.push(
+                button(text("Cancel").size(11))
+                    .style(button::secondary)
+                    .on_press(Message::TaskCancelCodex(task.id)),
+            );
+        } else if task.status == TaskStatus::Created
+            && task.runtime_kind == TaskRuntimeKind::Unassigned
+        {
+            let mut start = button(text("Start Codex").size(11)).style(button::primary);
+            if agent_task_ui::prompt_policy(&self.config).share_command_context {
+                start = start.on_press(Message::TaskStartCodex(task.id));
+            }
+            actions = actions.push(start);
+            actions = actions.push(
+                button(text("Open terminal Agent").size(11))
+                    .style(button::secondary)
+                    .on_press(Message::TaskTerminalOpen(task.id)),
+            );
+        }
+        if running && stream_active {
+            actions = actions.push(
+                button(text("Cancel Codex").size(11))
+                    .style(button::danger)
+                    .on_press(Message::TaskCancelCodex(task.id)),
+            );
+            if task.status == TaskStatus::ReadyForReview {
+                actions = actions.push(
+                    button(text("Finish Codex").size(11))
+                        .style(button::primary)
+                        .on_press(Message::TaskFinishCodex(task.id)),
+                );
+            }
+        }
+        card = card.push(actions);
+
+        // Review feedback starts another sequential turn on the live native
+        // session.
+        if running
+            && stream_active
+            && task.status == TaskStatus::ReadyForReview
+            && task.runtime_kind == TaskRuntimeKind::Native
+        {
+            let completed_turns = self
+                .agent_runtime
+                .snapshot(task.id)
+                .map(|snapshot| snapshot.completed_turns)
+                .unwrap_or(0);
+            let input = text_input(
+                "Review feedback for the next turn…",
+                &self.task_panel.follow_up,
+            )
+            .on_input(Message::TaskFollowUpInput)
+            .size(12);
+            let mut send = button(text("Send turn").size(11));
+            if agent_task_ui::native_follow_up_can_send(&self.task_panel.follow_up, completed_turns)
+            {
+                send = send.on_press(Message::TaskFollowUpSend(task.id));
+            }
+            card = card.push(row![input, send].spacing(6));
+        }
+
+        // Review / validation / completion actions once the provider has
+        // fully stopped.
+        if task.status == TaskStatus::ReadyForReview && !stream_active {
+            let mut review = row![].spacing(6);
+            review = review.push(
+                button(text("Review diff").size(11))
+                    .style(button::secondary)
+                    .on_press(Message::TaskDiffOpen(task.id)),
+            );
+            if task.validation.status != TaskValidationStatus::Running {
+                review = review.push(
+                    button(text("Run validation").size(11))
+                        .style(button::secondary)
+                        .on_press(Message::TaskValidationStart(task.id)),
+                );
+            }
+            let mut complete = button(text("Mark complete").size(11)).style(button::primary);
+            if task.validation.status == TaskValidationStatus::Passed {
+                complete = complete.on_press(Message::TaskMarkComplete(task.id));
+            }
+            review = review.push(complete);
+            card = card.push(review);
+            card = card.push(
+                text(format!(
+                    "Validation: {}{}",
+                    task.validation.status.label(),
+                    task.validation
+                        .status_detail
+                        .as_deref()
+                        .map(|detail| format!(
+                            " — {}",
+                            crate::review_text::visible_bounded(
+                                detail,
+                                agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES
+                            )
+                        ))
+                        .unwrap_or_default()
+                ))
+                .size(10)
+                .style(text::secondary),
+            );
+        }
+
+        // Explicit terminal fallback after an unsuccessful native session, or
+        // retry of an exited task terminal.
+        let terminal_retry = self.task_manager.terminal_retry_session_id(task.id).is_ok();
+        let native_fallback = self.agent_runtime.can_continue_in_terminal(task.id)
+            && self
+                .task_manager
+                .native_terminal_fallback_eligible(task.id)
+                .is_ok();
+        if task.status == TaskStatus::Failed && (terminal_retry || native_fallback) {
+            card = card.push(
+                button(
+                    text(if native_fallback {
+                        "Continue in terminal"
+                    } else {
+                        "Retry terminal Agent"
+                    })
+                    .size(11),
+                )
+                .style(button::secondary)
+                .on_press(Message::TaskTerminalOpen(task.id)),
+            );
+        }
+
+        if !task.status.is_running() && task.validation.status != TaskValidationStatus::Running {
+            card = card.push(
+                button(text("Hide task").size(11))
+                    .style(button::secondary)
+                    .on_press(Message::TaskHide(task.id)),
+            );
+        }
+
+        // Bounded worktree diff surface (status + tracked diff against the
+        // task's immutable base commit).
+        if self.task_panel.diff.is_open {
+            let state = self.task_panel.diff.state();
+            let mut diff_card = column![].spacing(4);
+            diff_card = diff_card.push(
+                row![
+                    text(format!(
+                        "git diff {}",
+                        self.task_panel.diff.requested_base().unwrap_or("HEAD")
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                    Space::new().width(Length::Fill),
+                    button(text("✕").size(10))
+                        .style(button::secondary)
+                        .padding(2)
+                        .on_press(Message::TaskDiffClose),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+            if state.loading {
+                diff_card = diff_card.push(
+                    text("Loading tracked changes…")
+                        .size(11)
+                        .style(text::secondary),
+                );
+            }
+            if let Some(error) = &state.error {
+                diff_card = diff_card.push(
+                    text(crate::review_text::visible_bounded(error, 1024))
+                        .size(11)
+                        .style(text::danger),
+                );
+            }
+            if state.truncated {
+                diff_card = diff_card.push(
+                    text("Diff exceeded the retained display limits")
+                        .size(10)
+                        .style(text::danger),
+                );
+            }
+            if !state.loading && state.error.is_none() {
+                let body_text = if state.text.is_empty() {
+                    "No tracked changes relative to the task baseline.".to_string()
+                } else {
+                    state.text.clone()
+                };
+                diff_card = diff_card.push(
+                    container(
+                        scrollable(text(body_text).size(10).font(iced::Font::MONOSPACE))
+                            .height(Length::Fixed(240.0)),
+                    )
+                    .padding(6)
+                    .style(container::bordered_box),
+                );
+            }
+            card = card.push(diff_card);
+        }
+
+        container(card)
+            .padding(8)
+            .style(container::bordered_box)
+            .into()
+    }
+
     /// Overlay panel for Agent mode: transcript, per-command approval cards,
     /// and the composer. All state lives in `agent::AgentUi`.
     fn agent_panel(&self) -> Element<'_, Message> {
@@ -14606,6 +16022,25 @@ impl Frost {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
         );
+        // Tasks dashboard pump: fast while a provider is starting/running or a
+        // worktree is being created, slow while the panel merely shows parked
+        // review state. With the flag off and no activity there is no tick.
+        let tasks_open = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
+        if self.agent_runtime.has_any_activity()
+            || self.task_panel.pending_creation.is_some()
+            || self.task_panel.diff.is_open
+            || tasks_open
+        {
+            let interval = if self.agent_runtime.needs_fast_poll()
+                || self.task_panel.pending_creation.is_some()
+                || self.task_panel.diff.state().loading
+            {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_millis(500)
+            };
+            subs.push(iced::time::every(interval).map(|_| Message::TaskTick));
+        }
         // The blink tick redraws and re-shapes the whole grid every 530ms purely
         // to animate blinking cells. Run it only while focused AND when a visible
         // pane actually has blinking text — the common case (no blink, or
@@ -15714,6 +17149,7 @@ mod tests {
             duration_ms: None,
             finished_at_ms: None,
             command_truncated: false,
+            command_exact: false,
             cwd: None,
             captured_output: None,
             captured_output_evicted: false,

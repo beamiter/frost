@@ -2298,6 +2298,9 @@ pub struct CommandZone {
     /// (including the fail-closed unavailable placeholder). It is not safe to
     /// re-run; copying is still fine.
     pub command_truncated: bool,
+    /// [`Self::command`] came from exact OSC 133 command metadata rather than
+    /// prompt-row reconstruction. Task validation replay requires this.
+    pub command_exact: bool,
     /// Working directory the command ran in: the shell's OSC 133 `cwd`/
     /// `cwd_url` param when one arrived, else the OSC 7 cwd at `D`.
     pub cwd: Option<String>,
@@ -2937,6 +2940,10 @@ pub struct TerminalState {
     /// metadata. A real lifecycle always stores a non-blank identity here
     /// unless the command itself was exactly blank.
     current_command_text: Option<String>,
+    /// Whether [`Self::current_command_text`] came from exact OSC 133
+    /// command metadata rather than prompt-row reconstruction. Only
+    /// metadata-exact commands may authorize task validation replay.
+    current_command_exact: bool,
 
     // OSC 10/11/12 dynamic colors
     pub dynamic_fg: Option<(u8, u8, u8)>,
@@ -3173,6 +3180,7 @@ impl TerminalState {
             armed_agent_execution: None,
             active_agent_execution: None,
             current_command_text: None,
+            current_command_exact: false,
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor_color: None,
@@ -3909,6 +3917,7 @@ impl TerminalState {
                 self.current_output_extent_col = None;
                 self.current_output_extent_row_id = None;
                 self.current_command_text = None;
+                self.current_command_exact = false;
                 self.current_command_id = mark_id;
                 self.current_command_start_id = None;
                 self.current_command_cwd = metadata_cwd;
@@ -3932,6 +3941,7 @@ impl TerminalState {
                     self.current_output_extent_col = None;
                     self.current_output_extent_row_id = None;
                     self.current_command_text = None;
+                    self.current_command_exact = false;
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
                     }
@@ -3960,14 +3970,20 @@ impl TerminalState {
                     self.idle_background_output = None;
                     self.prompt_submission_pending = false;
                     self.prompt_cancel_pending = false;
-                    let capture = metadata_command
-                        .filter(|capture| capture.truncated || !capture.text.trim().is_empty())
+                    let metadata_capture = metadata_command
+                        .filter(|capture| capture.truncated || !capture.text.trim().is_empty());
+                    // Exact means the shell supplied the command as OSC 133
+                    // metadata; prompt-row reconstruction stays inexact even
+                    // when it happens to match what ran.
+                    let command_exact = metadata_capture.is_some();
+                    let capture = metadata_capture
                         .or_else(|| self.current_prompt_command_capture())
                         .unwrap_or_else(CommandCapture::unavailable)
                         .ensure_command_identity();
                     let captured_command = capture.text;
                     self.current_command_truncated |= capture.truncated || metadata_truncated;
                     self.current_command_text = Some(captured_command.clone());
+                    self.current_command_exact = command_exact;
                     self.current_output_start_col = Some(self.cursor_col);
                     self.current_output_start_row_id = self.grid.raw_row_id(self.cursor_row);
                     self.current_output_extent_row = None;
@@ -4089,6 +4105,7 @@ impl TerminalState {
                     duration_ms,
                     finished_at_ms: Self::wall_clock_ms(),
                     command_truncated,
+                    command_exact: self.current_command_exact,
                     cwd,
                     captured_output: self.capture_zone_output(
                         out_start,
@@ -4120,6 +4137,7 @@ impl TerminalState {
                 self.current_output_extent_col = None;
                 self.current_output_extent_row_id = None;
                 self.current_command_text = None;
+                self.current_command_exact = false;
                 self.current_command_start_id = None;
                 self.current_command_cwd = None;
                 self.current_command_truncated = false;
@@ -4438,6 +4456,7 @@ impl TerminalState {
                 duration_ms: None,
                 finished_at_ms: Self::wall_clock_ms(),
                 command_truncated: false,
+                command_exact: false,
                 cwd,
                 captured_output: Some(captured_output),
                 captured_output_evicted: false,
@@ -4506,6 +4525,7 @@ impl TerminalState {
             duration_ms: None,
             finished_at_ms: None,
             command_truncated: self.current_command_truncated,
+            command_exact: self.current_command_exact,
             cwd,
             captured_output: self.capture_zone_output(out_start, output_end, output_start_col),
             captured_output_evicted: false,
@@ -7697,6 +7717,7 @@ impl TerminalState {
         self.armed_agent_execution = None;
         self.active_agent_execution = None;
         self.current_command_text = None;
+        self.current_command_exact = false;
         self.current_command_id = None;
         self.current_command_start_id = None;
         self.current_command_started_at = None;

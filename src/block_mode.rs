@@ -1002,6 +1002,90 @@ pub fn select_failed_neighbor(
     }
 }
 
+/// Byte budget for one exact captured command entering the Agent context or
+/// the guarded Retry replay. Identical to the terminal's 16 KiB capture cap:
+/// an untruncated captured command always fits, so a violation here means the
+/// caller bypassed capture.
+pub const FAILED_BLOCK_COMMAND_MAX_BYTES: usize = 16 * 1024;
+
+/// An execution-authorizing action needs an independently observed local
+/// shell cwd (ember's rule, unchanged). OSC 7/133 cwd values remain useful
+/// display/context data, but because any PTY program can emit them they
+/// cannot validate themselves: `recorded` (the block's own cwd) must be an
+/// absolute path equal to the shell process's current directory, and to the
+/// terminal's latest reported cwd when one exists. SSH/tmux-style wrappers
+/// fail closed because their local process cwd does not describe the reported
+/// workspace; those need an explicit remote execution backend.
+pub fn verified_local_command_cwd(
+    recorded: &str,
+    reported: Option<&str>,
+    process: Option<&str>,
+) -> bool {
+    let recorded = std::path::Path::new(recorded);
+    recorded.is_absolute()
+        && process.is_some_and(|process| std::path::Path::new(process) == recorded)
+        && reported.is_none_or(|reported| std::path::Path::new(reported) == recorded)
+}
+
+/// Why a failed completed block cannot start a Fix/Explain Agent task. The
+/// caller classifies first ([`classify`] must be [`BlockOutcome::Failed`]);
+/// these reasons cover only what Agent context and cwd provenance need beyond
+/// a failed outcome. A truncated capture is not the command that ran, and a
+/// missing recorded cwd makes the task's working directory unverifiable.
+pub fn failed_block_agent_disabled_reason(
+    command: Option<&str>,
+    command_truncated: bool,
+    cwd: Option<&str>,
+) -> Option<&'static str> {
+    if command_truncated {
+        return Some("the command capture is truncated or unavailable");
+    }
+    let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
+        return Some("the block has no command");
+    };
+    if command.len() > FAILED_BLOCK_COMMAND_MAX_BYTES {
+        return Some("the command exceeds the Agent context limit");
+    }
+    if cwd.is_none_or(|cwd| cwd.trim().is_empty()) {
+        return Some("the command working directory is unavailable");
+    }
+    None
+}
+
+/// Why a failed block's exact command cannot be replayed into its source
+/// pane. Retry is execution, so it composes the Agent provenance rules with
+/// two stronger ones: the command must be a single line (a multi-line replay
+/// could smuggle extra executions past the user's review), and the recorded
+/// cwd must match an independently observed local shell cwd
+/// ([`verified_local_command_cwd`]). Prompt ownership (idle shell, empty
+/// prompt, bracketed paste) is checked live by the caller.
+pub fn retry_replay_disabled_reason(
+    command: Option<&str>,
+    command_truncated: bool,
+    recorded_cwd: Option<&str>,
+    reported_cwd: Option<&str>,
+    process_cwd: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(reason) =
+        failed_block_agent_disabled_reason(command, command_truncated, recorded_cwd)
+    {
+        return Some(reason);
+    }
+    let command = command.expect("Agent eligibility guarantees a command");
+    if command
+        .trim_end_matches(['\r', '\n'])
+        .chars()
+        .any(|ch| matches!(ch, '\r' | '\n'))
+    {
+        return Some("replay is disabled for multiline commands");
+    }
+    let recorded = recorded_cwd.expect("Agent eligibility guarantees a cwd");
+    if !verified_local_command_cwd(recorded, reported_cwd, process_cwd) {
+        return Some("the recorded cwd does not match the shell's current directory");
+    }
+    None
+}
+
 /// Hard cap on the hits one block search returns; the scan stops early once
 /// it is reached (the query can always be refined).
 pub const BLOCK_SEARCH_HIT_CAP: usize = 500;
@@ -2527,5 +2611,155 @@ mod tests {
         assert!(!badge_fits(&blank_tail, 13)); // wider than the row
         let nul_tail: Vec<char> = vec!['x', '\0', '\0'];
         assert!(badge_fits(&nul_tail, 2));
+    }
+
+    #[test]
+    fn background_block_is_never_a_failed_action_target() {
+        // A commandless zone with a raw nonzero status stays Background, so
+        // the menu never offers Fix/Explain/Retry for it; a real command with
+        // no reported status stays Unknown rather than failed.
+        assert_eq!(classify(None, Some(1)), BlockOutcome::Background);
+        assert_eq!(classify(Some("  "), Some(1)), BlockOutcome::Background);
+        assert_eq!(classify(Some("false"), None), BlockOutcome::Unknown);
+        assert!(matches!(
+            classify(Some("false"), Some(1)),
+            BlockOutcome::Failed(1)
+        ));
+    }
+
+    #[test]
+    fn agent_eligibility_rejects_truncated_blank_oversized_and_cwdless() {
+        let ok = failed_block_agent_disabled_reason(Some("cargo test"), false, Some("/work"));
+        assert_eq!(ok, None);
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo test"), true, Some("/work")),
+            Some("the command capture is truncated or unavailable")
+        );
+        // A missing command whose producer set the truncated flag reports the
+        // truncation rather than being reclassified as background.
+        assert_eq!(
+            failed_block_agent_disabled_reason(None, true, Some("/work")),
+            Some("the command capture is truncated or unavailable")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(None, false, Some("/work")),
+            Some("the block has no command")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some(" \t"), false, Some("/work")),
+            Some("the block has no command")
+        );
+        let oversized = "x".repeat(FAILED_BLOCK_COMMAND_MAX_BYTES + 1);
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some(&oversized), false, Some("/work")),
+            Some("the command exceeds the Agent context limit")
+        );
+        let at_limit = "x".repeat(FAILED_BLOCK_COMMAND_MAX_BYTES);
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some(&at_limit), false, Some("/work")),
+            None
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo test"), false, None),
+            Some("the command working directory is unavailable")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo test"), false, Some("  ")),
+            Some("the command working directory is unavailable")
+        );
+    }
+
+    #[test]
+    fn verified_cwd_requires_independent_agreement() {
+        assert!(verified_local_command_cwd(
+            "/work/app",
+            Some("/work/app"),
+            Some("/work/app")
+        ));
+        // No reported cwd still verifies against the process observation.
+        assert!(verified_local_command_cwd(
+            "/work/app",
+            None,
+            Some("/work/app")
+        ));
+        assert!(!verified_local_command_cwd(
+            "relative/dir",
+            Some("relative/dir"),
+            Some("relative/dir")
+        ));
+        assert!(!verified_local_command_cwd("/work/app", None, None));
+        assert!(!verified_local_command_cwd(
+            "/work/app",
+            Some("/elsewhere"),
+            Some("/work/app")
+        ));
+        // SSH/tmux-style wrapper: the local process cwd is not the reported
+        // workspace, so execution authority fails closed.
+        assert!(!verified_local_command_cwd(
+            "/remote/work",
+            Some("/remote/work"),
+            Some("/home/user")
+        ));
+    }
+
+    #[test]
+    fn retry_replay_composes_agent_rules_with_single_line_and_cwd_match() {
+        let eligible = retry_replay_disabled_reason(
+            Some("cargo test"),
+            false,
+            Some("/work/app"),
+            Some("/work/app"),
+            Some("/work/app"),
+        );
+        assert_eq!(eligible, None);
+        // A trailing newline from capture is not "multiline".
+        assert_eq!(
+            retry_replay_disabled_reason(
+                Some("cargo test\n"),
+                false,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            None
+        );
+        assert_eq!(
+            retry_replay_disabled_reason(
+                Some("cargo test\n cargo clippy"),
+                false,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("replay is disabled for multiline commands")
+        );
+        assert_eq!(
+            retry_replay_disabled_reason(
+                Some("cargo test"),
+                true,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/work/app"),
+            ),
+            Some("the command capture is truncated or unavailable")
+        );
+        assert_eq!(
+            retry_replay_disabled_reason(
+                Some("cargo test"),
+                false,
+                Some("/work/app"),
+                Some("/work/app"),
+                Some("/home/user"),
+            ),
+            Some("the recorded cwd does not match the shell's current directory")
+        );
+        assert_eq!(
+            retry_replay_disabled_reason(Some("cargo test"), false, Some("/work/app"), None, None,),
+            Some("the recorded cwd does not match the shell's current directory")
+        );
+        assert_eq!(
+            retry_replay_disabled_reason(None, false, None, None, None),
+            Some("the block has no command")
+        );
     }
 }
