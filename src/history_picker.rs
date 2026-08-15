@@ -29,7 +29,7 @@ pub fn sanitized_command(command: &str) -> Option<&str> {
 pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
     if cwd.len() > MAX_HISTORY_CWD_BYTES
         || cwd.chars().any(char::is_control)
-        || crate::review_text::contains_visual_spoofing(cwd)
+        || jterm_core::review_input::contains_visual_spoofing(cwd)
     {
         None
     } else {

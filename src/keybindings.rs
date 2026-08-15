@@ -53,7 +53,9 @@ pub enum Command {
     // actions keep the family chords (Ctrl+Shift+A/I/K), and block:search uses
     // Ctrl+Alt+F because Ctrl+Shift+G is terminal:copy_last_output here;
     // Bookmark toggling/navigation use the family Ctrl+Shift+B and Ctrl+,/.
-    // chords; the remaining block commands stay palette-only until bound.
+    // chords. The failed-block Agent actions (fix/explain/retry) ride the same
+    // free Ctrl+Alt letter family as block:search: Ctrl+Alt+X/E/T. The
+    // remaining block commands stay palette-only until bound.
     BlockJumpFirstFailed,
     BlockJumpPrevFailed,
     BlockJumpNextFailed,
@@ -73,6 +75,11 @@ pub enum Command {
     BlockToggleBookmark,
     BlockJumpPrevBookmark,
     BlockJumpNextBookmark,
+    // Failed-block Agent/retry actions (f740a6f) ride the free Ctrl+Alt
+    // letter family like block:search and search:replace:toggle.
+    BlockFixWithAgent,
+    BlockExplainWithAgent,
+    BlockRetryFailed,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -161,6 +168,9 @@ impl std::fmt::Display for Command {
             Command::BlockToggleBookmark => write!(f, "block:toggle_bookmark"),
             Command::BlockJumpPrevBookmark => write!(f, "block:jump_prev_bookmark"),
             Command::BlockJumpNextBookmark => write!(f, "block:jump_next_bookmark"),
+            Command::BlockFixWithAgent => write!(f, "block:fix_with_agent"),
+            Command::BlockExplainWithAgent => write!(f, "block:explain_with_agent"),
+            Command::BlockRetryFailed => write!(f, "block:retry_failed"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -238,6 +248,9 @@ impl std::str::FromStr for Command {
             "block:toggle_bookmark" => Ok(Command::BlockToggleBookmark),
             "block:jump_prev_bookmark" => Ok(Command::BlockJumpPrevBookmark),
             "block:jump_next_bookmark" => Ok(Command::BlockJumpNextBookmark),
+            "block:fix_with_agent" => Ok(Command::BlockFixWithAgent),
+            "block:explain_with_agent" => Ok(Command::BlockExplainWithAgent),
+            "block:retry_failed" => Ok(Command::BlockRetryFailed),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -455,6 +468,21 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+.".to_string(), "block:jump_next_bookmark".to_string());
+        // Failed-block Agent actions and retry: same free ctrl+alt letter
+        // family as block:search (F) and search:replace:toggle (R). X/E/T do
+        // not collide with any default (ctrl+alt letters in use: F/G/R) and
+        // their alt-less bases (ctrl+x/e/t) are unbound, so the Alt-copy
+        // fallback never shadows them.
+        bindings
+            .bindings
+            .insert("ctrl+alt+x".to_string(), "block:fix_with_agent".to_string());
+        bindings.bindings.insert(
+            "ctrl+alt+e".to_string(),
+            "block:explain_with_agent".to_string(),
+        );
+        bindings
+            .bindings
+            .insert("ctrl+alt+t".to_string(), "block:retry_failed".to_string());
 
         // 配置操作
         bindings
@@ -816,6 +844,9 @@ mod tests {
             ("ctrl+shift+g", Command::TerminalCopyLastOutput),
             ("ctrl+,", Command::BlockJumpPrevBookmark),
             ("ctrl+.", Command::BlockJumpNextBookmark),
+            ("ctrl+alt+x", Command::BlockFixWithAgent),
+            ("ctrl+alt+e", Command::BlockExplainWithAgent),
+            ("ctrl+alt+t", Command::BlockRetryFailed),
         ];
         for (chord, expected) in cases {
             assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
@@ -857,6 +888,9 @@ mod tests {
             ("block:toggle_bookmark", Command::BlockToggleBookmark),
             ("block:jump_prev_bookmark", Command::BlockJumpPrevBookmark),
             ("block:jump_next_bookmark", Command::BlockJumpNextBookmark),
+            ("block:fix_with_agent", Command::BlockFixWithAgent),
+            ("block:explain_with_agent", Command::BlockExplainWithAgent),
+            ("block:retry_failed", Command::BlockRetryFailed),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
@@ -927,9 +961,12 @@ mod tests {
             bound_block_commands,
             vec![
                 "block:clear",
+                "block:explain_with_agent",
+                "block:fix_with_agent",
                 "block:jump_next_bookmark",
                 "block:jump_prev_bookmark",
                 "block:reinput_selected_commands",
+                "block:retry_failed",
                 "block:search",
                 "block:select_all",
                 "block:toggle_bookmark",

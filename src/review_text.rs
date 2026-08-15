@@ -1,5 +1,8 @@
-//! Local compatibility with the current review-input contract while frost
-//! remains exact-pinned to an older published `jterm_core`/`jagent` pair.
+//! frost-specific review-input extras layered on the shared
+//! `jterm_core::review_input` primitives (the visual-spoof predicate and the
+//! whole-string spoof check live there now). What stays local is what core
+//! does not cover: per-surface byte limits, the parameterized single-line
+//! validator, the multiline sanitizers, and bounded display escaping.
 
 use std::fmt;
 
@@ -31,35 +34,6 @@ impl fmt::Display for ReviewTextError {
     }
 }
 
-pub(crate) fn is_visual_spoof(character: char) -> bool {
-    (character.is_whitespace() && character != ' ')
-        || matches!(
-            character,
-            '\u{00ad}'
-                | '\u{034f}'
-                | '\u{061c}'
-                | '\u{115f}'..='\u{1160}'
-                | '\u{17b4}'..='\u{17b5}'
-                | '\u{180b}'..='\u{180f}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{3164}'
-                | '\u{fe00}'..='\u{fe0f}'
-                | '\u{feff}'
-                | '\u{ffa0}'
-                | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
-                | '\u{e0100}'..='\u{e01ef}'
-        )
-}
-
-pub(crate) fn contains_visual_spoofing(text: &str) -> bool {
-    text.chars().any(is_visual_spoof)
-}
-
 pub(crate) fn validate_single_line(text: &str, max_bytes: usize) -> Result<&str, ReviewTextError> {
     if text.len() > max_bytes {
         return Err(ReviewTextError::TooLarge { limit: max_bytes });
@@ -70,7 +44,7 @@ pub(crate) fn validate_single_line(text: &str, max_bytes: usize) -> Result<&str,
     if text.chars().any(char::is_control) {
         return Err(ReviewTextError::ControlCharacter);
     }
-    if contains_visual_spoofing(text) {
+    if jterm_core::review_input::contains_visual_spoofing(text) {
         return Err(ReviewTextError::VisualSpoof);
     }
     Ok(text)
@@ -83,7 +57,7 @@ fn is_c0_or_c1(character: char) -> bool {
 /// Prepare clipboard/search/sidebar text for insertion into the shell editor.
 /// LF and tab are structural product input; CR/CRLF normalize to LF. Every
 /// other C0/C1 scalar is removed, while non-control visual spoofing fails
-/// closed because this pinned frontend has no Unicode-risk confirmation UI.
+/// closed because this frontend has no Unicode-risk confirmation UI.
 pub(crate) fn sanitize_prompt_payload(
     text: &str,
     max_bytes: usize,
@@ -103,7 +77,9 @@ pub(crate) fn sanitize_prompt_payload(
             }
             '\n' | '\t' => sanitized.push(character),
             control if is_c0_or_c1(control) => {}
-            visual if is_visual_spoof(visual) => return Err(ReviewTextError::VisualSpoof),
+            visual if jterm_core::review_input::is_visual_spoofing_character(visual) => {
+                return Err(ReviewTextError::VisualSpoof);
+            }
             visible => sanitized.push(visible),
         }
     }
@@ -133,7 +109,9 @@ pub(crate) fn sanitize_history_replay(
             }
             '\n' | '\t' => sanitized.push(character),
             control if is_c0_or_c1(control) => {}
-            visual if is_visual_spoof(visual) => return Err(ReviewTextError::VisualSpoof),
+            visual if jterm_core::review_input::is_visual_spoofing_character(visual) => {
+                return Err(ReviewTextError::VisualSpoof);
+            }
             visible => sanitized.push(visible),
         }
     }
@@ -174,7 +152,8 @@ pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
             '\r' => "\\r".to_string(),
             '\t' => "\\t".to_string(),
             unsafe_character
-                if unsafe_character.is_control() || is_visual_spoof(unsafe_character) =>
+                if unsafe_character.is_control()
+                    || jterm_core::review_input::is_visual_spoofing_character(unsafe_character) =>
             {
                 format!("\\u{{{:X}}}", unsafe_character as u32)
             }

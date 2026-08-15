@@ -136,6 +136,8 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
 | 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；可筛选失败/慢命令/书签/Background；Enter 定位匹配输出行） |
 | 添加/移除块书签 | `Ctrl+Shift+B`（仅作用于当前选择；无选择时按键继续交给 PTY；前后书签导航为 `Ctrl+,` / `Ctrl+.`） |
+| Agent 修复 / 解释失败命令块 | `Ctrl+Alt+X` / `Ctrl+Alt+E`（作用于选中的或最新的失败块，需 OSC 133） |
+| 重试失败命令块 | `Ctrl+Alt+T`（cwd 一致时原样重放该块命令） |
 | 全选命令块 | `Ctrl+Shift+A` |
 | 清空已完成命令块 | `Ctrl+Shift+K`（显示块数并要求确认；不可撤销；保留当前提示符或运行中命令） |
 | 回填所选命令 | `Ctrl+Shift+I`（只回填，不执行） |

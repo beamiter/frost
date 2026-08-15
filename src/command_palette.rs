@@ -441,19 +441,19 @@ impl PaletteState {
             PaletteItem {
                 name: "Fix Failed Block with Agent",
                 description: "Start a fresh Agent task to fix the selected (or latest) failed block",
-                shortcut: "",
+                shortcut: "Ctrl+Alt+X",
                 action: PaletteAction::BlockFixWithAgent,
             },
             PaletteItem {
                 name: "Explain Failed Block with Agent",
                 description: "Start a fresh Agent task to explain the selected (or latest) failed block",
-                shortcut: "",
+                shortcut: "Ctrl+Alt+E",
                 action: PaletteAction::BlockExplainWithAgent,
             },
             PaletteItem {
                 name: "Retry Failed Block",
                 description: "Replay the selected (or latest) failed block's exact command when its cwd still matches",
-                shortcut: "",
+                shortcut: "Ctrl+Alt+T",
                 action: PaletteAction::BlockRetryFailed,
             },
             PaletteItem {

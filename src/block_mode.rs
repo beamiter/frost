@@ -559,7 +559,7 @@ fn fenced(body: &str) -> String {
 /// controls are omitted entirely so exported review text cannot reorder or
 /// hide the path around it.
 fn markdown_meta_code(value: &str) -> String {
-    if crate::review_text::contains_visual_spoofing(value) {
+    if jterm_core::review_input::contains_visual_spoofing(value) {
         return "`[unsafe path omitted]`".to_string();
     }
     let mut longest = 0usize;

@@ -452,6 +452,9 @@ fn command_requires_block_context(command: &keybindings::Command) -> bool {
             | C::BlockToggleBookmark
             | C::BlockJumpPrevBookmark
             | C::BlockJumpNextBookmark
+            | C::BlockFixWithAgent
+            | C::BlockExplainWithAgent
+            | C::BlockRetryFailed
     )
 }
 
@@ -5005,6 +5008,13 @@ impl Frost {
             }
             C::BlockJumpPrevBookmark => self.block_jump_bookmark(true),
             C::BlockJumpNextBookmark => self.block_jump_bookmark(false),
+            C::BlockFixWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Fix)
+            }
+            C::BlockExplainWithAgent => {
+                self.palette_failed_block_agent_task(FailedBlockAgentIntent::Explain)
+            }
+            C::BlockRetryFailed => self.palette_failed_block_retry_task(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
                 if !self.ensure_block_action_available("Prompt navigation") {
                     return Some(Task::none());
@@ -14504,6 +14514,14 @@ impl Frost {
             ),
             kb("Ctrl+Shift+B", "Toggle bookmark on selected block"),
             kb("Ctrl+, / Ctrl+.", "Previous / next bookmark (wraps)"),
+            kb(
+                "Ctrl+Alt+X / E",
+                "Fix / explain selected (or latest) failed block with Agent"
+            ),
+            kb(
+                "Ctrl+Alt+T",
+                "Retry selected (or latest) failed block's command"
+            ),
             kb(
                 "Ctrl+Shift+A / I / K",
                 "Select all / reinput / clear blocks"
