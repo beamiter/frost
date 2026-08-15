@@ -1657,6 +1657,122 @@ impl SessionsSnapshot {
     }
 }
 
+/// 按索引剔除会话后的快照重映射结果。
+///
+/// 任务终端（Agent / 校验）只存在于运行时：它们的任务元数据不进快照，重启后
+/// 只会变成一个恰好落在任务 worktree 里的普通 shell，极易误操作。所以保存端
+/// 把它们整个从快照里剔除，而不是恢复原样。剔除会移动其余会话的下标，因此
+/// 所有引用会话索引的地方——窗格树叶子、标签页焦点、活动索引——都必须经这张
+/// 重映射表改写；失去全部窗格的标签页随之移除。
+pub struct PrunedSessions {
+    pub sessions: Vec<SessionSnapshot>,
+    pub tabs: Vec<TabSnapshot>,
+    pub active_index: Option<usize>,
+    pub active_tab: Option<usize>,
+}
+
+/// 从快照中剔除 `keep` 为 `false` 的会话（按下标），并重映射所有指向会话索引
+/// 的引用。`keep` 短于 `sessions` 时按剔除处理（宁缺毋滥）。只剩一个幸存子节点
+/// 的 Split 塌缩为该子节点；全部子节点被剔除的标签页整体移除。活动会话/标签页
+/// 被剔除时回退到第一个幸存者。
+pub fn prune_sessions(
+    sessions: Vec<SessionSnapshot>,
+    tabs: Vec<TabSnapshot>,
+    active_index: Option<usize>,
+    active_tab: Option<usize>,
+    keep: &[bool],
+) -> PrunedSessions {
+    // 旧下标 -> 新下标；被剔除的会话为 None。
+    let mut remap: Vec<Option<usize>> = vec![None; sessions.len()];
+    let mut kept_sessions = Vec::new();
+    for (old, snap) in sessions.into_iter().enumerate() {
+        if keep.get(old).copied().unwrap_or(false) {
+            remap[old] = Some(kept_sessions.len());
+            kept_sessions.push(snap);
+        }
+    }
+
+    let mut kept_tabs = Vec::new();
+    let mut tab_remap: Vec<Option<usize>> = vec![None; tabs.len()];
+    for (old_tab, tab) in tabs.into_iter().enumerate() {
+        let Some(tree) = prune_tree(&tab.tree, &remap) else {
+            continue;
+        };
+        // 焦点会话被剔除时退到幸存树的第一个叶子；恢复端只要求焦点指向本页
+        // 仍拥有的窗格。
+        let focus = tab
+            .focus
+            .and_then(|session| remap.get(session).copied().flatten())
+            .or_else(|| first_leaf(&tree));
+        tab_remap[old_tab] = Some(kept_tabs.len());
+        kept_tabs.push(TabSnapshot {
+            tree,
+            focus,
+            title: tab.title,
+            pinned: tab.pinned,
+            marked: tab.marked,
+        });
+    }
+
+    let active_index = active_index
+        .and_then(|index| remap.get(index).copied().flatten())
+        .or((!kept_sessions.is_empty()).then_some(0));
+    let active_tab = active_tab
+        .and_then(|index| tab_remap.get(index).copied().flatten())
+        .or((!kept_tabs.is_empty()).then_some(0));
+    PrunedSessions {
+        sessions: kept_sessions,
+        tabs: kept_tabs,
+        active_index,
+        active_tab,
+    }
+}
+
+/// 重映射一棵窗格树，剔除指向被删会话的叶子。Split 只剩一个幸存子节点时
+/// 塌缩掉这一层，免得恢复端见到单子节点 Split 直接拒掉整棵树。
+fn prune_tree(tree: &PaneTreeSnapshot, remap: &[Option<usize>]) -> Option<PaneTreeSnapshot> {
+    match tree {
+        PaneTreeSnapshot::Leaf { session } => remap
+            .get(*session)
+            .copied()
+            .flatten()
+            .map(|session| PaneTreeSnapshot::Leaf { session }),
+        PaneTreeSnapshot::Split {
+            axis,
+            ratios,
+            children,
+        } => {
+            let ratios_aligned = ratios.len() == children.len();
+            let mut kept: Vec<(PaneTreeSnapshot, f32)> = Vec::new();
+            for (index, child) in children.iter().enumerate() {
+                if let Some(child) = prune_tree(child, remap) {
+                    // 占比只对齐保留；恢复端会重新归一化，剔除一个子节点后
+                    // 总和不足 1 没有问题。
+                    let ratio = if ratios_aligned { ratios[index] } else { 1.0 };
+                    kept.push((child, ratio));
+                }
+            }
+            match kept.len() {
+                0 => None,
+                1 => Some(kept.pop().expect("len checked").0),
+                _ => Some(PaneTreeSnapshot::Split {
+                    axis: axis.clone(),
+                    ratios: kept.iter().map(|(_, ratio)| *ratio).collect(),
+                    children: kept.into_iter().map(|(child, _)| child).collect(),
+                }),
+            }
+        }
+    }
+}
+
+/// 幸存窗格树的第一个叶子（会话索引），用于修复被剔除的焦点。
+fn first_leaf(tree: &PaneTreeSnapshot) -> Option<usize> {
+    match tree {
+        PaneTreeSnapshot::Leaf { session } => Some(*session),
+        PaneTreeSnapshot::Split { children, .. } => children.iter().find_map(first_leaf),
+    }
+}
+
 fn sanitize_tree_shape(tree: &mut PaneTreeSnapshot) -> bool {
     fn visit(
         tree: &mut PaneTreeSnapshot,
@@ -2413,5 +2529,145 @@ mod tests {
         ));
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn leaf(session: usize) -> PaneTreeSnapshot {
+        PaneTreeSnapshot::Leaf { session }
+    }
+
+    fn tab(tree: PaneTreeSnapshot, focus: Option<usize>) -> TabSnapshot {
+        TabSnapshot {
+            tree,
+            focus,
+            title: None,
+            pinned: false,
+            marked: false,
+        }
+    }
+
+    fn tree_sessions(tree: &PaneTreeSnapshot) -> Vec<usize> {
+        match tree {
+            PaneTreeSnapshot::Leaf { session } => vec![*session],
+            PaneTreeSnapshot::Split { children, .. } => {
+                children.iter().flat_map(tree_sessions).collect()
+            }
+        }
+    }
+
+    #[test]
+    fn prune_sessions_is_identity_when_everything_is_kept() {
+        let sessions = vec![
+            SessionSnapshot { cwd: None },
+            SessionSnapshot {
+                cwd: Some("/tmp".to_string()),
+            },
+        ];
+        let tabs = vec![
+            tab(leaf(0), Some(0)),
+            tab(
+                PaneTreeSnapshot::Split {
+                    axis: "vertical".to_string(),
+                    ratios: vec![0.25, 0.75],
+                    children: vec![leaf(0), leaf(1)],
+                },
+                Some(1),
+            ),
+        ];
+        let pruned = prune_sessions(sessions, tabs, Some(1), Some(1), &[true, true]);
+        assert_eq!(pruned.sessions.len(), 2);
+        assert_eq!(pruned.active_index, Some(1));
+        assert_eq!(pruned.active_tab, Some(1));
+        assert_eq!(tree_sessions(&pruned.tabs[1].tree), vec![0, 1]);
+        assert_eq!(pruned.tabs[1].focus, Some(1));
+        match &pruned.tabs[1].tree {
+            PaneTreeSnapshot::Split { ratios, .. } => {
+                assert_eq!(ratios, &vec![0.25, 0.75]);
+            }
+            _ => panic!("split must survive identity pruning"),
+        }
+    }
+
+    #[test]
+    fn prune_sessions_remaps_leaves_focus_and_active_indices() {
+        // 会话 1 是任务终端，被剔除；会话 2 顺移为 1。
+        let sessions = vec![
+            SessionSnapshot { cwd: None },
+            SessionSnapshot { cwd: None },
+            SessionSnapshot {
+                cwd: Some("/work".to_string()),
+            },
+        ];
+        let tabs = vec![
+            tab(leaf(0), Some(0)),
+            tab(
+                PaneTreeSnapshot::Split {
+                    axis: "horizontal".to_string(),
+                    ratios: vec![0.5, 0.5],
+                    children: vec![leaf(1), leaf(2)],
+                },
+                Some(2),
+            ),
+        ];
+        let pruned = prune_sessions(sessions, tabs, Some(2), Some(1), &[true, false, true]);
+        assert_eq!(pruned.sessions.len(), 2);
+        assert_eq!(pruned.sessions[1].cwd.as_deref(), Some("/work"));
+        // 只剩一个幸存子节点的 Split 塌缩成叶子，焦点重映射到新下标。
+        assert_eq!(tree_sessions(&pruned.tabs[1].tree), vec![1]);
+        assert!(matches!(
+            pruned.tabs[1].tree,
+            PaneTreeSnapshot::Leaf { session: 1 }
+        ));
+        assert_eq!(pruned.tabs[1].focus, Some(1));
+        assert_eq!(pruned.active_index, Some(1));
+        assert_eq!(pruned.active_tab, Some(1));
+    }
+
+    #[test]
+    fn prune_sessions_drops_tabs_left_without_panes_and_repairs_focus() {
+        let sessions = vec![SessionSnapshot { cwd: None }, SessionSnapshot { cwd: None }];
+        // 标签页 0 只含被剔除的会话 0，整体移除；标签页 1 的焦点恰好指向
+        // 被剔除的会话，回退到幸存树的第一个叶子。
+        let tabs = vec![
+            tab(leaf(0), Some(0)),
+            tab(
+                PaneTreeSnapshot::Split {
+                    axis: "vertical".to_string(),
+                    ratios: vec![0.5, 0.5],
+                    children: vec![leaf(0), leaf(1)],
+                },
+                Some(0),
+            ),
+        ];
+        let pruned = prune_sessions(sessions, tabs, Some(0), Some(0), &[false, true]);
+        assert_eq!(pruned.sessions.len(), 1);
+        assert_eq!(pruned.tabs.len(), 1);
+        assert_eq!(tree_sessions(&pruned.tabs[0].tree), vec![0]);
+        assert_eq!(pruned.tabs[0].focus, Some(0));
+        // 活动会话/标签页都被剔除时回退到第一个幸存者。
+        assert_eq!(pruned.active_index, Some(0));
+        assert_eq!(pruned.active_tab, Some(0));
+    }
+
+    #[test]
+    fn prune_sessions_handles_every_session_excluded() {
+        let sessions = vec![SessionSnapshot { cwd: None }];
+        let tabs = vec![tab(leaf(0), Some(0))];
+        let pruned = prune_sessions(sessions, tabs, Some(0), Some(0), &[false]);
+        assert!(pruned.sessions.is_empty());
+        assert!(pruned.tabs.is_empty());
+        assert_eq!(pruned.active_index, None);
+        assert_eq!(pruned.active_tab, None);
+    }
+
+    #[test]
+    fn prune_sessions_fails_closed_on_a_short_keep_list() {
+        let sessions = vec![SessionSnapshot { cwd: None }, SessionSnapshot { cwd: None }];
+        let tabs = vec![tab(leaf(0), Some(0)), tab(leaf(1), Some(1))];
+        // keep 只覆盖第一个会话：其余一律剔除，绝不误留。
+        let pruned = prune_sessions(sessions, tabs, Some(1), Some(1), &[true]);
+        assert_eq!(pruned.sessions.len(), 1);
+        assert_eq!(pruned.tabs.len(), 1);
+        assert_eq!(pruned.active_index, Some(0));
+        assert_eq!(pruned.active_tab, Some(0));
     }
 }

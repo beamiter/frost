@@ -11,6 +11,51 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- Held-open task terminals (Agent CLI fallback and validation runs whose child
+  exited but whose tab stays for transcript review) now behave as read-only
+  transcripts end to end. PTY-bound user bytes are refused before reaching the
+  writer: `Session::write_pty_with_origin` gates on `transcript_read_only()`
+  (exactly `hold_after_exit`), so keyboard, IME commit, every paste flavor, the
+  control-key keybinding sender, mouse reports, and Agent payloads can no longer
+  hit EIO on the dead master fd; the keyboard/IME/paste/keybinding dispatchers
+  pre-check and surface one throttled toast ("Task terminal exited; its
+  transcript is read-only", 1.6 s interval so key repeat cannot stack toasts)
+  instead of a dead echo. The chrome carries the persistent affordance: tab
+  strip, dock list, and window title gain an " (exited)" suffix through
+  `Session::label`, and the pane header shows a dim `■ exited` chip beside the
+  running-process indicator. Task terminals also leave the session snapshot
+  entirely — the filter won over restore-with-suffix because task metadata is
+  runtime-only and a restored plain shell parked in a task worktree is a trap.
+  `session_persistence::prune_sessions` drops excluded sessions and rewrites
+  every index-bearing reference against the post-filter numbering (pane-tree
+  leaves, tab focus falling back to the first surviving leaf, `active_index`,
+  `active_tab`); single-survivor splits collapse so the restore-side shape
+  validation never sees one-child splits, tabs left without panes drop, and the
+  legacy compat `tree` keeps deriving from the pruned tabs inside
+  `SessionsSnapshot::new`. Exclusion covers both task-bound sessions
+  (`task_for_terminal_session`, Agent and validation roles) and any
+  `hold_after_exit` transcript whose binding a retry replaced. Headless tests
+  cover the input-block/label predicates and pruning identity, leaf/focus/active
+  remapping, split collapse, tab drop with focus repair, all-excluded, and
+  fail-closed short keep lists.
+
+- The jterm_core pin advances to `b8b1b89` (`b8b1b89148726204e2d46518ba9327d05a968f8e`,
+  routing notifications through the bounded helper boundary). With the old-pin
+  compatibility shim no longer needed, `src/review_text.rs` shrinks to the genuinely
+  frost-specific extras — per-surface byte limits, the parameterized
+  `validate_single_line`, the multiline `sanitize_prompt_payload` /
+  `sanitize_history_replay` / `sanitize_untrusted_single_line`, and `visible_bounded` —
+  while the duplicated visual-spoof primitives are deleted here and every former call
+  site (`block_mode`, `history_picker`, `agent`, `agent_task::{native, event, task,
+  diff, drivers::codex_app_server}`) now calls `jterm_core::review_input`
+  (`is_visual_spoofing_character`, `contains_visual_spoofing`) directly. The three
+  failed-block palette actions gain default chords in the free Ctrl+Alt letter family:
+  `block:fix_with_agent` on Ctrl+Alt+X, `block:explain_with_agent` on Ctrl+Alt+E, and
+  `block:retry_failed` on Ctrl+Alt+T — no collision with Ctrl+Alt+F/G/R, the pane-focus
+  arrows, opacity `=`/`-`, or the Alt-copy fallback (their alt-less bases ctrl+x/e/t are
+  unbound). They dispatch through the same block-context PTY-passthrough preflight, and
+  the command palette, the help overlay, and the README shortcut table all list them.
+
 - The jterm_core pin advances to `86661a7` and the app-owned boundaries sink
   into it. `src/app_helpers.rs` is deleted: font and notification helpers now
   call `jterm_core::helper::{fc_list, fc_match, notify_send}` directly, which

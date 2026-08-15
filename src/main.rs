@@ -2046,6 +2046,29 @@ fn agent_prompt_status_with_foreground(
     }
 }
 
+/// Suffix appended to a session's label while it shows a held-open task
+/// transcript, so the dead tab reads differently from a live shell wherever
+/// the label appears (tab strip, dock, window title).
+const READ_ONLY_LABEL_SUFFIX: &str = " (exited)";
+
+/// Whether a session in this state refuses PTY-bound user bytes: a held-open
+/// task transcript's child has exited (that is exactly what `hold_after_exit`
+/// records), so its bytes would only hit EIO on the dead master fd. Ordinary
+/// sessions forward everything.
+fn user_input_blocked(hold_after_exit: bool) -> bool {
+    hold_after_exit
+}
+
+/// A session's strip/window label with the read-only suffix applied when the
+/// session shows a held-open task transcript.
+fn session_label(base: String, transcript_read_only: bool) -> String {
+    if transcript_read_only {
+        format!("{base}{READ_ONLY_LABEL_SUFFIX}")
+    } else {
+        base
+    }
+}
+
 impl Session {
     fn spawn(
         config: &Config,
@@ -2146,6 +2169,10 @@ impl Session {
     /// the user where they are. Falls back to "Session N" only when none of
     /// those are known yet.
     fn label(&self) -> String {
+        session_label(self.label_base(), self.transcript_read_only())
+    }
+
+    fn label_base(&self) -> String {
         let t = self.terminal.window_title.trim();
         if !t.is_empty() {
             return t.to_string();
@@ -2511,6 +2538,14 @@ impl Session {
             && Self::queue_accepts_entry(&self.write_queue, len, false)
     }
 
+    /// True while this tab is a held-open task transcript whose child has
+    /// already exited (`hold_after_exit` is set exactly then). User bytes
+    /// have nowhere to go: every PTY-bound write path refuses them up front
+    /// and the chrome shows the transcript as read-only.
+    fn transcript_read_only(&self) -> bool {
+        user_input_blocked(self.hold_after_exit)
+    }
+
     /// Queue data in-order and make one non-blocking drain attempt. Returns false
     /// if the bounded queue rejected the write or the PTY has failed.
     fn write_pty(&mut self, data: &[u8]) -> bool {
@@ -2527,6 +2562,14 @@ impl Session {
     fn write_pty_with_origin(&mut self, data: &[u8], taint_prompt: bool) -> bool {
         if data.is_empty() {
             return true;
+        }
+        // A held-open task transcript's child already exited; its bytes would
+        // only hit EIO on the dead master fd. The keyboard/paste dispatchers
+        // pre-check `transcript_read_only` to show the read-only hint; this
+        // guard catches every remaining user-write path (mouse reports,
+        // Agent payloads) silently.
+        if self.transcript_read_only() {
+            return false;
         }
         if !self.can_queue_user_bytes(data.len()) {
             log::warn!(
@@ -2831,6 +2874,9 @@ struct Frost {
     /// Last desktop notification launch. OSC 9/777 originates inside the PTY
     /// (and may be remote over SSH), so process spawning is globally rate-limited.
     last_notification_at: Option<std::time::Instant>,
+    /// Last read-only hint for typing into a held-open task transcript. The
+    /// toast is throttled so key repeat cannot stack duplicates.
+    read_only_hint_at: Option<std::time::Instant>,
     /// Sessions whose history needs one width-normalization pass after resize
     /// activity settles, keyed by stable session id.
     history_reflow_sessions: std::collections::HashSet<usize>,
@@ -2992,6 +3038,7 @@ impl Frost {
             block_clear_confirm: None,
             tab_close_confirm: None,
             last_notification_at: None,
+            read_only_hint_at: None,
             history_reflow_sessions: std::collections::HashSet::new(),
             history_reflow_due: None,
             _instance_lock: instance_lock,
@@ -3538,24 +3585,46 @@ impl Frost {
             .iter()
             .map(|s| session_persistence::SessionSnapshot { cwd: s.cwd() })
             .collect();
-        // Persist every tab's pane tree so a restart restores the same tabs
-        // with the same panes in each.
-        let tabs: Vec<session_persistence::TabSnapshot> = self
-            .tabs
+        // Task-bound terminals (Agent CLI fallback, validation runs) and any
+        // held-open exited transcript stay out of the snapshot: their task
+        // metadata is runtime-only, so restoring one would produce a plain
+        // shell that happens to sit in a task worktree. `prune_sessions`
+        // rewrites every pane-tree leaf, focus, and active index against the
+        // post-filter session indices.
+        let keep: Vec<bool> = self
+            .sessions
             .iter()
-            .map(|tab| session_persistence::TabSnapshot {
-                tree: pane_tree_to_snapshot(&tab.tree),
-                focus: Some(tab.focus),
-                title: tab.title.clone(),
-                pinned: tab.pinned,
-                marked: tab.marked,
+            .map(|s| {
+                !s.hold_after_exit
+                    && self
+                        .task_manager
+                        .task_for_terminal_session(&agent_task_ui::terminal_session_id(s.id))
+                        .is_none()
             })
             .collect();
-        let snapshot = session_persistence::SessionsSnapshot::new(
+        let pruned = session_persistence::prune_sessions(
             snaps,
+            // Persist every tab's pane tree so a restart restores the same
+            // tabs with the same panes in each.
+            self.tabs
+                .iter()
+                .map(|tab| session_persistence::TabSnapshot {
+                    tree: pane_tree_to_snapshot(&tab.tree),
+                    focus: Some(tab.focus),
+                    title: tab.title.clone(),
+                    pinned: tab.pinned,
+                    marked: tab.marked,
+                })
+                .collect(),
             Some(self.active),
-            tabs,
             Some(self.active_tab),
+            &keep,
+        );
+        let snapshot = session_persistence::SessionsSnapshot::new(
+            pruned.sessions,
+            pruned.active_index,
+            pruned.tabs,
+            pruned.active_tab,
         );
         let Some(json) = snapshot.to_json() else {
             log::warn!("[SessionPersistence] Cannot serialize the current session snapshot");
@@ -3961,6 +4030,25 @@ impl Frost {
     fn expire_toasts(&mut self) {
         let now = std::time::Instant::now();
         self.toasts.retain(|t| t.expires_at > now);
+    }
+
+    /// Typing or pasting into a held-open task transcript cannot reach a
+    /// child — the PTY is gone. Show one throttled hint instead of a dead
+    /// echo; the pane header carries the persistent "exited" marker.
+    fn hint_read_only_transcript(&mut self) {
+        const HINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1600);
+        let now = std::time::Instant::now();
+        if self
+            .read_only_hint_at
+            .is_some_and(|at| now.duration_since(at) < HINT_INTERVAL)
+        {
+            return;
+        }
+        self.read_only_hint_at = Some(now);
+        self.push_toast(
+            "Task terminal exited; its transcript is read-only",
+            ToastKind::Info,
+        );
     }
 
     /// Apply a tab context-menu action. Close/CloseOthers/CloseToRight close
@@ -4812,6 +4900,14 @@ impl Frost {
         }
         // Write raw bytes to the focused session's PTY (control-key commands).
         let mut send = |bytes: &[u8]| {
+            if self
+                .sessions
+                .get(self.active)
+                .is_some_and(Session::transcript_read_only)
+            {
+                self.hint_read_only_transcript();
+                return;
+            }
             if let Some(sess) = self.sessions.get_mut(self.active) {
                 // A PTY-bound keystroke dismisses the block selection.
                 sess.block_selection.clear();
@@ -6354,31 +6450,41 @@ impl Frost {
     ) -> bool {
         let mut rejected = false;
         let mut written = false;
+        let mut dead_input = false;
         if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
-            let modes = PasteModes {
-                bracketed: sess.terminal.is_bracketed_paste_enabled(),
-            };
-            let paste = pty_input::encode_prompt_insert(text, modes, policy, clear_line_first);
-            // A clipboard that was nothing but paste markers normalizes away
-            // entirely; writing zero bytes would toast about a full queue.
-            if paste.is_empty() {
-                return false;
-            }
-            // Size-check the *encoded* bytes: framing and control stripping have
-            // already changed the length the queue must accept.
-            if !sess.can_queue_user_bytes(paste.bytes.len()) {
-                rejected = true;
+            if sess.transcript_read_only() {
+                // Held-open task transcript: pasting is a visible no-op.
+                dead_input = true;
             } else {
-                // PTY-bound input dismisses the block selection, same as
-                // `encode_key` and IME commit. Covers every paste flavor
-                // (clipboard, middle-click primary, prompt insert/recall).
-                sess.block_selection.clear();
-                sess.terminal.scroll_to_bottom();
-                sess.projection_view_state.scroll_to_bottom();
-                written = sess.write_pty(&paste.bytes);
-                rejected = !written;
-                sess.refresh();
+                let modes = PasteModes {
+                    bracketed: sess.terminal.is_bracketed_paste_enabled(),
+                };
+                let paste = pty_input::encode_prompt_insert(text, modes, policy, clear_line_first);
+                // A clipboard that was nothing but paste markers normalizes away
+                // entirely; writing zero bytes would toast about a full queue.
+                if paste.is_empty() {
+                    return false;
+                }
+                // Size-check the *encoded* bytes: framing and control stripping have
+                // already changed the length the queue must accept.
+                if !sess.can_queue_user_bytes(paste.bytes.len()) {
+                    rejected = true;
+                } else {
+                    // PTY-bound input dismisses the block selection, same as
+                    // `encode_key` and IME commit. Covers every paste flavor
+                    // (clipboard, middle-click primary, prompt insert/recall).
+                    sess.block_selection.clear();
+                    sess.terminal.scroll_to_bottom();
+                    sess.projection_view_state.scroll_to_bottom();
+                    written = sess.write_pty(&paste.bytes);
+                    rejected = !written;
+                    sess.refresh();
+                }
             }
+        }
+        if dead_input {
+            self.hint_read_only_transcript();
+            return false;
         }
         if rejected {
             self.push_toast(
@@ -9549,6 +9655,7 @@ impl Frost {
                     if self.handle_scroll_shortcut(&key, modifiers) {
                         return Task::none();
                     }
+                    let mut dead_input = false;
                     let Some(sess) = self.sessions.get_mut(self.active) else {
                         return Task::none();
                     };
@@ -9563,13 +9670,23 @@ impl Frost {
                     if let Some(bytes) =
                         encode_key(&key, location, modifiers, text.as_deref(), app_cursor, enh)
                     {
-                        // Typing into the shell dismisses the block selection
-                        // (any PTY-bound key, not Escape specifically).
-                        sess.block_selection.clear();
-                        sess.terminal.scroll_to_bottom();
-                        sess.projection_view_state.scroll_to_bottom();
-                        sess.write_pty(&bytes);
-                        sess.refresh();
+                        if sess.transcript_read_only() {
+                            // Held-open task transcript: the PTY is gone, so
+                            // typing becomes a visible no-op instead of an EIO
+                            // in the log.
+                            dead_input = true;
+                        } else {
+                            // Typing into the shell dismisses the block selection
+                            // (any PTY-bound key, not Escape specifically).
+                            sess.block_selection.clear();
+                            sess.terminal.scroll_to_bottom();
+                            sess.projection_view_state.scroll_to_bottom();
+                            sess.write_pty(&bytes);
+                            sess.refresh();
+                        }
+                    }
+                    if dead_input {
+                        self.hint_read_only_transcript();
                     }
                 }
             }
@@ -9578,6 +9695,7 @@ impl Frost {
                 if !self.terminal_input_active() {
                     return Task::none();
                 }
+                let mut dead_input = false;
                 let Some(sess) = self.sessions.get_mut(self.active) else {
                     return Task::none();
                 };
@@ -9596,14 +9714,22 @@ impl Frost {
                     }
                     Ime::Commit(text) => {
                         sess.terminal.clear_preedit();
-                        // PTY-bound input dismisses the block selection, same
-                        // as `encode_key` and the paste paths.
-                        sess.block_selection.clear();
-                        sess.terminal.scroll_to_bottom();
-                        sess.projection_view_state.scroll_to_bottom();
-                        sess.write_pty(text.as_bytes());
+                        if sess.transcript_read_only() {
+                            // Same read-only rule as typed keys.
+                            dead_input = true;
+                        } else {
+                            // PTY-bound input dismisses the block selection, same
+                            // as `encode_key` and the paste paths.
+                            sess.block_selection.clear();
+                            sess.terminal.scroll_to_bottom();
+                            sess.projection_view_state.scroll_to_bottom();
+                            sess.write_pty(text.as_bytes());
+                        }
                         sess.refresh();
                     }
+                }
+                if dead_input {
+                    self.hint_read_only_transcript();
                 }
             }
             Message::ModifiersChanged(mods) => {
@@ -13216,6 +13342,11 @@ impl Frost {
                 self.c_accent(),
                 0.6,
             )));
+        }
+        // Held-open task transcript: the child exited, so the pane is
+        // read-only. The chip mirrors the hint toast's wording.
+        if sess.transcript_read_only() {
+            line = line.push(text("■ exited").size(11).color(self.c_text_dim()));
         }
         line = line.push(Space::new().width(Length::Fill));
         if drop_target {
@@ -16903,6 +17034,21 @@ mod tests {
         continuation.flags.set_wide_continuation(false);
         let chars = [' ', Frost::block_badge_cell_char(&continuation)];
         assert!(block_mode::badge_fits(&chars, 1));
+    }
+
+    #[test]
+    fn held_transcript_blocks_user_input_and_marks_the_label() {
+        // The dead-PTY input guard: only a held-open task transcript refuses
+        // user bytes; ordinary sessions forward everything.
+        assert!(user_input_blocked(true));
+        assert!(!user_input_blocked(false));
+
+        // The chrome affordance rides the same predicate.
+        assert_eq!(
+            session_label("codex".to_string(), true),
+            format!("codex{READ_ONLY_LABEL_SUFFIX}")
+        );
+        assert_eq!(session_label("codex".to_string(), false), "codex");
     }
 
     #[test]

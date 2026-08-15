@@ -294,6 +294,9 @@ Git 注册与分支；通过打开的目录描述符 + fchdir 传递 cwd，shell
 `git status --short` 与已跟踪文件的 `git diff HEAD`（未跟踪文件只列出路径）。
 原生会话失败或退出不成功时，可以用 **Open terminal Agent** 在终端中显式继续（PTY 兼容路径）。
 任务元数据仅存在于运行时；**Hide task** 只隐藏元数据，不会删除 worktree。
+任务终端（Agent 或验证）的子进程退出后标签页会保留为只读副本供回看：标题带 "(exited)" 后缀、
+pane 头部显示 `■ exited`，键盘与粘贴输入不再写入已死的 PTY，只会弹出一条节流提示；任务终端
+也不会进入会话快照，重启后不会恢复成恰好落在任务 worktree 里的普通 shell。
 
 
 `Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
