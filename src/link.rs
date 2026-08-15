@@ -316,34 +316,14 @@ impl LinkDetector {
 
 /// The one policy every clickable target must satisfy.
 ///
-/// A link's text comes from the attached process, so a click is the terminal
-/// acting on untrusted data. Only an absolute HTTP(S) URL with an authority and
-/// no userinfo qualifies: `file:` would open a local file with its default
-/// application, `ssh:` and `git:` would start a network client, and
-/// `https://user:token@host` would hand the opener a credential the user never
-/// typed. Whitespace, controls, backslashes, and visually ambiguous characters
-/// are refused so the target reads as the origin it resolves to.
+/// Shared with the whole jterm family as `jterm_core::link::is_openable_url`:
+/// a link's text comes from the attached process, so a click is the terminal
+/// acting on untrusted data. Only an absolute HTTP(S) URL with an authority
+/// and no userinfo qualifies; whitespace, controls, backslashes, and visually
+/// ambiguous characters are refused so the target reads as the origin it
+/// resolves to.
 pub(crate) fn is_openable_url(url: &str) -> bool {
-    const MAX_URL_BYTES: usize = 2 * 1024;
-
-    if url.is_empty()
-        || url.len() > MAX_URL_BYTES
-        || url
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-        || url.contains('\\')
-        || crate::review_text::contains_visual_spoofing(url)
-    {
-        return false;
-    }
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return false;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains('@')
+    jterm_core::link::is_openable_url(url)
 }
 
 /// 打开链接

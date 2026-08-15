@@ -11,6 +11,21 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- The jterm_core pin advances to `86661a7` and the app-owned boundaries sink
+  into it. `src/app_helpers.rs` is deleted: font and notification helpers now
+  call `jterm_core::helper::{fc_list, fc_match, notify_send}` directly, which
+  carry the same fixed candidates, canonical-chain trust, clamped child PATH,
+  per-stream byte caps, and single group-killing deadline on top of core's
+  `SupervisedChild`. `link::is_openable_url` delegates to
+  `jterm_core::link::is_openable_url`, the family-shared HTTP(S)-only opener
+  policy. `persistence::prepare_command_history_path` is now a one-line
+  delegate to `jterm_core::command_history::prepare_path` — the preflight the
+  old pin lacked — and its three regression tests moved to core with the
+  implementation. The session decoder's text budget and borrowed deferred raw
+  fields now come from `jterm_core::bounded_json` (`TextBudget`,
+  `DeferredRawField`); only frost's schema, repair counters, and seeds remain
+  app-side.
+
 - The experimental native Codex task runtime is ported from ember as `src/agent_task/`
   (context, diff, driver, event, launcher, native, runtime, task, validation, worktree,
   the app-server and fake drivers, plus `pinned_dir` descriptor capabilities), with the

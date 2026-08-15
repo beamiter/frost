@@ -130,7 +130,7 @@ pub struct SessionsSnapshot {
 /// thousands of Vec elements before `sanitize` gets a chance to truncate it.
 #[derive(Clone, Copy)]
 struct DecodeBudget {
-    remaining_text_bytes: usize,
+    text: jterm_core::bounded_json::TextBudget,
     extra_sessions: usize,
     invalid_cwds: usize,
     invalid_titles: usize,
@@ -143,7 +143,7 @@ struct DecodeBudget {
 impl DecodeBudget {
     fn new(text_bytes: usize) -> Self {
         Self {
-            remaining_text_bytes: text_bytes,
+            text: jterm_core::bounded_json::TextBudget::new(text_bytes),
             extra_sessions: 0,
             invalid_cwds: 0,
             invalid_titles: 0,
@@ -159,13 +159,7 @@ impl DecodeBudget {
         field: &'static str,
         bytes: usize,
     ) -> Result<(), E> {
-        let Some(remaining) = self.remaining_text_bytes.checked_sub(bytes) else {
-            return Err(E::custom(format_args!(
-                "session snapshot exceeds its cumulative text budget while decoding '{field}'"
-            )));
-        };
-        self.remaining_text_bytes = remaining;
-        Ok(())
+        self.text.charge(field, bytes)
     }
 
     fn warnings(self, restored_sessions: usize) -> Vec<String> {
@@ -529,46 +523,7 @@ impl serde::de::Visitor<'_> for DiscardStringVisitor {
     }
 }
 
-/// Raw fields are borrowed from the input so a deeply nested optional layout
-/// is not cloned once per ancestor. The duplicate bit lets `null` still count
-/// as a present field.
-#[derive(Default)]
-struct DeferredRawField<'de> {
-    value: Option<&'de serde_json::value::RawValue>,
-    duplicate: bool,
-}
-
-impl<'de> DeferredRawField<'de> {
-    fn read<A: serde::de::MapAccess<'de>>(&mut self, map: &mut A) -> Result<(), A::Error> {
-        if self.value.is_some() {
-            self.duplicate = true;
-            map.next_value::<serde::de::IgnoredAny>()?;
-        } else {
-            self.value = Some(map.next_value::<&'de serde_json::value::RawValue>()?);
-        }
-        Ok(())
-    }
-
-    fn required<E: serde::de::Error>(
-        self,
-        field: &'static str,
-    ) -> Result<&'de serde_json::value::RawValue, E> {
-        if self.duplicate {
-            return Err(E::duplicate_field(field));
-        }
-        self.value.ok_or_else(|| E::missing_field(field))
-    }
-
-    fn optional<E: serde::de::Error>(
-        self,
-        field: &'static str,
-    ) -> Result<Option<&'de serde_json::value::RawValue>, E> {
-        if self.duplicate {
-            return Err(E::duplicate_field(field));
-        }
-        Ok(self.value)
-    }
-}
+use jterm_core::bounded_json::DeferredRawField;
 
 struct RawSessionsSnapshot<'de> {
     version: u32,

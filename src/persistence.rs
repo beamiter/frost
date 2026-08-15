@@ -380,100 +380,13 @@ pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
     write_snapshot_atomic(&path, &encoded, MAX_API_KEY_FILE_BYTES)
 }
 
-fn command_history_lock_path(path: &Path) -> io::Result<PathBuf> {
-    let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "command-history path has no file name",
-        )
-    })?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut lock_name = name.to_os_string();
-    lock_name.push(".lock");
-    Ok(parent.join(lock_name))
-}
-
-fn validate_optional_history_entry(path: &Path, for_write: bool) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(for_write);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a regular history file", path.display()),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        // SAFETY: geteuid has no preconditions and only reads process state.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{} must be owned by the current user and have exactly one hard link",
-                    path.display()
-                ),
-            ));
-        }
-        let mode = metadata.permissions().mode();
-        if mode & 0o022 != 0 {
-            if for_write {
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("{} must not be group- or world-writable", path.display()),
-                ));
-            }
-        } else if for_write && mode & 0o077 != 0 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-    }
-    Ok(())
-}
-
-/// Validate the configured command-history handoff before entering the pinned
-/// core's background writer/reader. The immediate parent is owner-controlled,
-/// and existing history/lock entries are descriptor-checked without following
-/// links or blocking on FIFOs. This closes the old pin's unsafe-open window
-/// against other users; a future published core pin can subsume the wrapper.
+/// Validate the configured command-history handoff before entering core's
+/// background writer/reader. The policy now lives in the pinned core as
+/// `jterm_core::command_history::prepare_path`: the immediate parent is
+/// owner-controlled, and existing history/lock entries are descriptor-checked
+/// without following links or blocking on FIFOs.
 pub fn prepare_command_history_path(path: &Path, for_write: bool) -> io::Result<()> {
-    if path.file_name().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "command-history path has no file name",
-        ));
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    match fs::symlink_metadata(parent) {
-        Ok(_) => drop(open_snapshot_parent(parent)?),
-        Err(error) if error.kind() == io::ErrorKind::NotFound && for_write => {
-            create_private_snapshot_parent(parent)?;
-            drop(open_snapshot_parent(parent)?);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    }
-    validate_optional_history_entry(path, for_write)?;
-    validate_optional_history_entry(&command_history_lock_path(path)?, for_write)
+    jterm_core::command_history::prepare_path(path, for_write)
 }
 
 /// Atomically replace a private snapshot without chmodding a configured
@@ -1318,99 +1231,6 @@ mod tests {
         assert!(read_api_key_file(fifo.to_str().unwrap()).is_err());
         assert!(write_api_key_file(fifo.to_str().unwrap(), "replacement").is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_history_preflight_creates_a_private_parent_and_tightens_entries() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = Scratch::new("history-create");
-        let parent = root.0.join("state");
-        let path = parent.join("history.jsonl");
-
-        prepare_command_history_path(&path, true).unwrap();
-        assert_eq!(
-            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-
-        let lock = command_history_lock_path(&path).unwrap();
-        fs::write(&path, b"history\n").unwrap();
-        fs::write(&lock, b"").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
-
-        assert!(prepare_command_history_path(&path, false).is_err());
-
-        prepare_command_history_path(&path, true).unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_history_preflight_rejects_links_and_fifos_without_blocking() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let root = Scratch::new("history-unsafe");
-        let victim = root.0.join("victim.jsonl");
-        fs::write(&victim, b"victim\n").unwrap();
-        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
-
-        let symlink_path = root.0.join("symlink.jsonl");
-        symlink(&victim, &symlink_path).unwrap();
-        assert!(prepare_command_history_path(&symlink_path, false).is_err());
-        assert!(prepare_command_history_path(&symlink_path, true).is_err());
-
-        let hard_link_path = root.0.join("hard-link.jsonl");
-        fs::hard_link(&victim, &hard_link_path).unwrap();
-        assert!(prepare_command_history_path(&hard_link_path, false).is_err());
-        assert!(prepare_command_history_path(&hard_link_path, true).is_err());
-
-        let fifo_path = root.0.join("fifo.jsonl");
-        let encoded = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: encoded is a live NUL-terminated pathname for this call.
-        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
-        let started = Instant::now();
-        assert!(prepare_command_history_path(&fifo_path, false).is_err());
-        assert!(prepare_command_history_path(&fifo_path, true).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
-
-        let safe_history = root.0.join("safe.jsonl");
-        let unsafe_lock = command_history_lock_path(&safe_history).unwrap();
-        symlink(&victim, &unsafe_lock).unwrap();
-        assert!(prepare_command_history_path(&safe_history, true).is_err());
-        assert!(!safe_history.exists());
-        assert_eq!(fs::read(&victim).unwrap(), b"victim\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_history_preflight_rejects_a_writable_parent_without_chmodding_it() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = Scratch::new("history-writable-parent");
-        let parent = root.0.join("shared");
-        fs::create_dir(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
-        let path = parent.join("history.jsonl");
-
-        assert!(prepare_command_history_path(&path, false).is_err());
-        assert!(prepare_command_history_path(&path, true).is_err());
-        assert!(!path.exists());
-        assert_eq!(
-            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
-            0o777
-        );
     }
 
     #[cfg(unix)]

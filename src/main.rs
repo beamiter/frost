@@ -10,7 +10,6 @@ mod agent;
 mod agent_task;
 mod agent_task_ui;
 mod ansi;
-mod app_helpers;
 mod block_export;
 mod block_mode;
 mod color;
@@ -16220,7 +16219,7 @@ fn enqueue_desktop_notification(title: String, body: String) {
             .name("frost-notifications".to_string())
             .spawn(move || {
                 while let Ok((title, body)) = receiver.recv() {
-                    let _ = app_helpers::notify_send(&title, &body);
+                    let _ = jterm_core::helper::notify_send(&title, &body);
                 }
             });
         sender
