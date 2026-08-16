@@ -6096,10 +6096,33 @@ impl TerminalState {
         if snapshot == self.last_archived_screen_snapshot {
             return;
         }
+        let old_grid_base = self.scrollback.len();
         self.retire_provisional_alt_snapshot();
         let appended = self.archive_visible_screen_to_scrollback_with_options(true, true);
         self.provisional_alt_snapshot =
             (appended > 0).then_some((appended, self.scrollback_pushes));
+        self.rebase_raw_selection_for_grid_base_change(old_grid_base, self.scrollback.len());
+    }
+
+    /// Synchronized alternate-screen frames are copied into (and superseded
+    /// within) scrollback without moving the live grid. Raw selection rows are
+    /// absolute `scrollback + grid` coordinates, so a changing snapshot height
+    /// must move live-grid anchors with the grid base. Codex does this on every
+    /// repaint.
+    fn rebase_raw_selection_for_grid_base_change(&mut self, old_base: usize, new_base: usize) {
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        for point in [&mut selection.anchor, &mut selection.active] {
+            if point.0 < old_base {
+                continue;
+            }
+            point.0 = if new_base >= old_base {
+                point.0.saturating_add(new_base - old_base)
+            } else {
+                point.0.saturating_sub(old_base - new_base)
+            };
+        }
     }
 
     /// Drop the superseded snapshot. Exactly undoes the append that created it,
@@ -13909,6 +13932,26 @@ mod tests {
             text.contains("second page"),
             "expected the newest archived synchronized screen, got {text:?}"
         );
+    }
+
+    #[test]
+    fn synchronized_alt_screen_redraw_rebases_live_selection() {
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.process_input(b"\x1b[?1049h");
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1Hfirst\r\nsecond\x1b[?2026l");
+
+        terminal.start_selection((0, 0));
+        terminal.update_selection((0, 4));
+        let old_base = terminal.scrollback_len();
+        assert_eq!(terminal.selection.unwrap().anchor.0, old_base);
+
+        terminal.process_input(b"\x1b[?2026h\x1b[1;1Hfresh\r\nsecond\r\nthird\x1b[?2026l");
+
+        let new_base = terminal.scrollback_len();
+        assert_ne!(new_base, old_base);
+        assert_eq!(terminal.selection.unwrap().anchor.0, new_base);
+        assert_eq!(terminal.row_selection_cols(0), Some((0, 4)));
+        assert_eq!(terminal.copy_selection().as_deref(), Some("fresh"));
     }
 
     #[test]

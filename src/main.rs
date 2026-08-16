@@ -17,6 +17,7 @@ mod command_palette;
 mod config;
 mod debug;
 mod history_picker;
+mod image_drop;
 mod keybindings;
 mod kitty_graphics;
 mod link;
@@ -1742,6 +1743,8 @@ enum Message {
     SummaryActivate(usize, SummaryActivation),
     /// Clipboard result scoped to the stable session that requested the paste.
     Pasted(usize, Option<String>),
+    /// One decoded local path delivered by the window system's file-drop event.
+    ImageDropped(std::path::PathBuf),
     /// Text appended by search-replace or a sidebar path pick. Both sources
     /// can contain terminal/file-system controlled bytes, so this is an
     /// untrusted paste and never receives the control-preserving policy.
@@ -9824,6 +9827,27 @@ impl Frost {
                 }
                 return self.handle_mouse(session_id, input);
             }
+            Message::ImageDropped(path) => {
+                if !self.terminal_input_active() {
+                    self.push_toast(
+                        "Image drop ignored while another panel owns input",
+                        ToastKind::Info,
+                    );
+                    return Task::none();
+                }
+                match image_drop::prompt_payload(&[path]) {
+                    Ok(payload) => {
+                        let Some(id) = self.sessions.get(self.active).map(|session| session.id)
+                        else {
+                            return Task::none();
+                        };
+                        return Task::done(Message::PromptInsert(id, payload));
+                    }
+                    Err(error) => {
+                        self.push_toast(format!("Image drop rejected: {error}"), ToastKind::Warning)
+                    }
+                }
+            }
             Message::Pasted(id, Some(text)) => {
                 match crate::review_text::sanitize_prompt_payload(
                     &text,
@@ -16179,6 +16203,9 @@ impl Frost {
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                Some(Message::ImageDropped(path))
+            }
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
             iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
             iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
