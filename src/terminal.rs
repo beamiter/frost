@@ -8441,8 +8441,18 @@ impl TerminalState {
         let columns = self.grid.cols() as i64;
         let cursor = click_cursor::Cell::new(self.cursor_row as i64, self.cursor_col as i64);
         let click = click_cursor::Cell::new(click_row as i64, click_col as i64);
-        let Some(target) = click_cursor::target_cell(cursor, click, columns, self.editable_span())
-        else {
+        let Some(span) = self.editable_span() else {
+            return Vec::new();
+        };
+        // The pinned core still clamps every out-of-span click to Home/End.
+        // Refuse rows belonging to completed blocks here so selecting history
+        // cannot silently move the live shell cursor.
+        let first_row = span.start.row.min(span.end.row);
+        let last_row = span.start.row.max(span.end.row);
+        if click.row < first_row || click.row > last_row {
+            return Vec::new();
+        }
+        let Some(target) = click_cursor::target_cell(cursor, click, columns, Some(span)) else {
             return Vec::new();
         };
 
@@ -16623,6 +16633,23 @@ mod tests {
     fn a_click_on_the_prompt_goes_to_the_start_of_the_line() {
         let terminal = terminal_at_prompt(32, 4, "ls");
         assert_eq!(terminal.click_cursor_move(0, 0, true), b"\x1b[D".repeat(4));
+    }
+
+    #[test]
+    fn a_click_in_a_completed_block_preserves_the_live_cursor() {
+        let mut terminal = super::TerminalState::new(32, 4);
+        terminal.process_input(b"completed output\r\n");
+        terminal.process_input(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hello");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 12));
+        assert!(
+            terminal.click_cursor_move(0, 7, true).is_empty(),
+            "history interaction must not synthesize Left/Home for the live editor"
+        );
+        assert_eq!(
+            terminal.click_cursor_move(1, 7, true),
+            b"\x1b[D".repeat(5),
+            "click-to-place remains active on the current input row"
+        );
     }
 
     #[test]
