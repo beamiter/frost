@@ -98,6 +98,9 @@ pub struct TabSnapshot {
     /// 「重要」标记（多选模型）。
     #[serde(default)]
     pub marked: bool,
+    /// Hide the real title in tab chrome while retaining it for later reveal.
+    #[serde(default)]
+    pub private_title: bool,
 }
 
 /// 会话列表快照。
@@ -220,6 +223,7 @@ enum SnapshotField {
     Title,
     Pinned,
     Marked,
+    PrivateTitle,
     Unknown,
 }
 
@@ -260,6 +264,7 @@ impl serde::de::Visitor<'_> for SnapshotFieldVisitor {
             "title" => SnapshotField::Title,
             "pinned" => SnapshotField::Pinned,
             "marked" => SnapshotField::Marked,
+            "private_title" => SnapshotField::PrivateTitle,
             _ => SnapshotField::Unknown,
         })
     }
@@ -1160,6 +1165,7 @@ struct RawTab<'de> {
     title: Option<String>,
     pinned: bool,
     marked: bool,
+    private_title: bool,
 }
 
 struct RawTabSeed<'a> {
@@ -1192,6 +1198,7 @@ impl<'de> serde::de::Visitor<'de> for RawTabSeed<'_> {
         let mut title: Option<Option<String>> = None;
         let mut pinned = None;
         let mut marked = None;
+        let mut private_title = None;
         while let Some(key) = map.next_key::<SnapshotField>()? {
             match key {
                 SnapshotField::Tree => tree.read(&mut map)?,
@@ -1221,6 +1228,12 @@ impl<'de> serde::de::Visitor<'de> for RawTabSeed<'_> {
                     }
                     marked = Some(map.next_value::<bool>()?);
                 }
+                SnapshotField::PrivateTitle => {
+                    if private_title.is_some() {
+                        return Err(A::Error::duplicate_field("private_title"));
+                    }
+                    private_title = Some(map.next_value::<bool>()?);
+                }
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
                 }
@@ -1232,6 +1245,7 @@ impl<'de> serde::de::Visitor<'de> for RawTabSeed<'_> {
             title: title.unwrap_or(None),
             pinned: pinned.unwrap_or(false),
             marked: marked.unwrap_or(false),
+            private_title: private_title.unwrap_or(false),
         })
     }
 }
@@ -1301,6 +1315,7 @@ fn decode_tab(
         title: staged.title,
         pinned: staged.pinned,
         marked: staged.marked,
+        private_title: staged.private_title,
     })
 }
 
@@ -1711,6 +1726,7 @@ pub fn prune_sessions(
             title: tab.title,
             pinned: tab.pinned,
             marked: tab.marked,
+            private_title: tab.private_title,
         });
     }
 
@@ -2063,6 +2079,7 @@ mod tests {
                 title: None,
                 pinned: false,
                 marked: false,
+                private_title: true,
                 tree: PaneTreeSnapshot::Split {
                     axis: "vertical".to_string(),
                     ratios: vec![0.6, 0.4],
@@ -2087,6 +2104,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back.tabs.len(), 1);
         assert_eq!(back.tabs[0].focus, Some(1));
+        assert!(back.tabs[0].private_title);
         assert_eq!(back.active_tab, Some(0));
         let PaneTreeSnapshot::Split { axis, children, .. } = back.tabs[0].tree.clone() else {
             panic!("expected a split at the root");
@@ -2155,6 +2173,7 @@ mod tests {
                     title: None,
                     pinned: false,
                     marked: false,
+                    private_title: false,
                 };
                 MAX_RESTORED_TABS + 10
             ],
@@ -2190,6 +2209,7 @@ mod tests {
             title: title.map(str::to_string),
             pinned,
             marked,
+            private_title: false,
         };
         let snapshot = SessionsSnapshot {
             version: 2,
@@ -2542,6 +2562,7 @@ mod tests {
             title: None,
             pinned: false,
             marked: false,
+            private_title: false,
         }
     }
 

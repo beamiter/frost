@@ -662,6 +662,8 @@ struct Tab {
     /// Marking is this family's multi-select model: "Close Marked Tabs" acts
     /// on exactly the marked set.
     marked: bool,
+    /// Redact the tab's real title everywhere outside its terminal content.
+    private_title: bool,
 }
 
 impl Tab {
@@ -673,6 +675,7 @@ impl Tab {
             title: None,
             pinned: false,
             marked: false,
+            private_title: false,
         }
     }
 
@@ -703,6 +706,7 @@ struct RestoredTab {
     title: Option<String>,
     pinned: bool,
     marked: bool,
+    private_title: bool,
 }
 
 impl RestoredTab {
@@ -715,6 +719,7 @@ impl RestoredTab {
             title: None,
             pinned: false,
             marked: false,
+            private_title: false,
         }
     }
 }
@@ -1270,6 +1275,7 @@ fn build_restored_tabs(
             title,
             pinned,
             marked,
+            private_title,
         } = restored;
         if !valid_restored_layout(&tree, session_count) {
             continue;
@@ -1292,6 +1298,7 @@ fn build_restored_tabs(
             title,
             pinned,
             marked,
+            private_title,
         });
         next_id += 1;
     }
@@ -1928,6 +1935,7 @@ enum TabMenuAction {
     NewTab,
     TogglePinned(usize),
     ToggleMarked(usize),
+    TogglePrivateTitle(usize),
     /// Open a `[[remote_hosts]]` entry (by config index) in a new tab.
     ConnectRemote(usize),
 }
@@ -3056,10 +3064,12 @@ impl Frost {
     }
 
     fn title(&self) -> String {
-        self.sessions
-            .get(self.active)
-            .map(|s| s.label())
-            .unwrap_or_else(|| "frost".to_string())
+        let title = self.tab_label(self.active_tab);
+        if title.is_empty() {
+            "frost".to_string()
+        } else {
+            title
+        }
     }
 
     fn iced_theme(&self) -> iced::Theme {
@@ -3614,6 +3624,7 @@ impl Frost {
                     title: tab.title.clone(),
                     pinned: tab.pinned,
                     marked: tab.marked,
+                    private_title: tab.private_title,
                 })
                 .collect(),
             Some(self.active),
@@ -4088,6 +4099,7 @@ impl Frost {
                 let Some(source) = self.tab_focus(tab) else {
                     return Task::none();
                 };
+                let private_title = self.tabs[tab].private_title;
                 let cwd = self
                     .sessions
                     .get(source)
@@ -4107,6 +4119,7 @@ impl Frost {
                         self.reindex_tabs_after_insert(insert);
                         self.active_tab = tab;
                         self.open_tab_with(insert);
+                        self.tabs[self.active_tab].private_title = private_title;
                         self.relayout();
                         self.refresh_active_context();
                         self.save_session_snapshot();
@@ -4163,6 +4176,23 @@ impl Frost {
                         "Marked tab as important"
                     } else {
                         "Cleared tab mark"
+                    },
+                    ToastKind::Info,
+                );
+                Task::none()
+            }
+            TabMenuAction::TogglePrivateTitle(id) => {
+                let Some(tab) = self.tab_index_by_id(id) else {
+                    return Task::none();
+                };
+                let private = !self.tabs[tab].private_title;
+                self.tabs[tab].private_title = private;
+                self.session_dirty = true;
+                self.push_toast(
+                    if private {
+                        "Tab title details hidden"
+                    } else {
+                        "Tab title details visible"
                     },
                     ToastKind::Info,
                 );
@@ -4413,6 +4443,15 @@ impl Frost {
     /// A tab's strip label. A title set through the context menu's Rename wins;
     /// otherwise the tab keeps following its focused session's own label.
     fn tab_label(&self, tab: usize) -> String {
+        if self.tabs.get(tab).is_some_and(|tab| tab.private_title) {
+            return "Private".to_string();
+        }
+        self.tab_real_label(tab)
+    }
+
+    /// The title retained behind the privacy mask. Shell title updates and
+    /// rename keep changing this value so revealing it restores immediately.
+    fn tab_real_label(&self, tab: usize) -> String {
         if let Some(title) = self.tabs.get(tab).and_then(|tab| tab.title.clone()) {
             return title;
         }
@@ -4521,6 +4560,7 @@ impl Frost {
                         title: snapshot.title.clone(),
                         pinned: snapshot.pinned,
                         marked: snapshot.marked,
+                        private_title: snapshot.private_title,
                     })
                 })
                 .collect()
@@ -10667,7 +10707,7 @@ impl Frost {
                 };
                 // Seed the editor with what the strip currently shows, so a
                 // rename starts from the label the user just right-clicked.
-                self.tab_rename = Some((id, self.tab_label(tab)));
+                self.tab_rename = Some((id, self.tab_real_label(tab)));
                 return iced::widget::operation::focus(TAB_RENAME_INPUT_ID.clone());
             }
             Message::TabRenameInput(draft) => {
@@ -11302,6 +11342,7 @@ impl Frost {
         let only_one = self.tabs.len() <= 1;
         let last_idx = self.tabs.len().saturating_sub(1);
         let pinned = self.tabs.get(i).is_some_and(|tab| tab.pinned);
+        let private_title = self.tabs.get(i).is_some_and(|tab| tab.private_title);
         let marked_count = self.tabs.iter().filter(|tab| tab.marked).count();
         let is_marked = self.tabs.get(i).is_some_and(|tab| tab.marked);
 
@@ -11332,6 +11373,14 @@ impl Frost {
             Message::TabMenuAction(TabMenuAction::Duplicate(id)),
         ));
         menu = menu.push(row_btn("Rename", Message::TabRenameStart(id)));
+        menu = menu.push(row_btn(
+            if private_title {
+                "Show Title Details"
+            } else {
+                "Hide Title Details"
+            },
+            Message::TabMenuAction(TabMenuAction::TogglePrivateTitle(id)),
+        ));
         menu = menu.push(row_btn(
             if is_marked {
                 "Unmark"
@@ -11374,8 +11423,8 @@ impl Frost {
         }
 
         // Item count for the height estimate the placement clamps against:
-        // the six always-present entries plus the conditional ones.
-        let rows = 6
+        // the seven always-present entries plus the conditional ones.
+        let rows = 7
             + usize::from(!only_one)
             + usize::from(i < last_idx)
             + usize::from(marked_count > 0)
@@ -18019,6 +18068,7 @@ mod tests {
             title: None,
             pinned: false,
             marked: false,
+            private_title: false,
             tree: PaneTree::Split {
                 axis: Axis::Vertical,
                 children: sessions.iter().map(|&s| PaneTree::Leaf(s)).collect(),
@@ -18288,6 +18338,7 @@ mod tests {
                 title: None,
                 pinned: false,
                 marked: false,
+                private_title: false,
             },
             Tab::new(8, 3),
         ];
@@ -18452,6 +18503,7 @@ mod tests {
                 title: Some("build".to_string()),
                 pinned: false,
                 marked: true,
+                private_title: true,
             },
             RestoredTab {
                 tree: PaneTree::Leaf(2),
@@ -18459,6 +18511,7 @@ mod tests {
                 title: None,
                 pinned: true,
                 marked: false,
+                private_title: false,
             },
         ];
 
@@ -18473,6 +18526,7 @@ mod tests {
         assert_eq!(tabs[2].sessions(), vec![1]);
         assert_eq!(tabs[2].title.as_deref(), Some("build"));
         assert!(tabs[2].marked);
+        assert!(tabs[2].private_title);
         // The reorder followed the active tab instead of leaving the index put.
         assert_eq!(tabs[active].sessions(), vec![1]);
     }
