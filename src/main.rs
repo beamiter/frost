@@ -11176,6 +11176,30 @@ impl Frost {
         }
     }
 
+    /// Close button embedded in a tab. The tab container owns the shared
+    /// background and outline; only the close button's hover affordance paints
+    /// a separate background.
+    fn tab_close_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let hover = Theme::rgb_to_color32(self.theme.tabbar.close_btn_hover);
+        let text = self.c_text();
+        move |_t, status| {
+            let background = match status {
+                button::Status::Hovered | button::Status::Pressed => Some(hover.into()),
+                _ => None,
+            };
+            button::Style {
+                background,
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
     fn tab_bar(&self) -> Element<'_, Message> {
         let mut tabs = row![].spacing(2).padding(2);
         // Sidebar/dock toggle button at the far left of the tab bar.
@@ -11221,16 +11245,13 @@ impl Frost {
             } else {
                 label
             };
-            // The tab's label area is a styled container wrapped in a
-            // mouse_area so we get on_press/on_release/on_enter/on_exit. The
-            // styling mirrors `tab_btn_style` so visually it matches the rest
-            // of the chrome.
+            // The label and close button share one styled outer container. The
+            // label keeps its own mouse area so dragging it cannot accidentally
+            // trigger the close button.
             let hovered = self.hovered_tab == Some(id);
             let dragging_this = self.dragging_tab == Some(id);
             let label = format!("{}{label}", self.tab_state_prefix(i));
-            let tab_label = container(text(label).size(13))
-                .padding([3, 8])
-                .style(self.tab_container_style(active, hovered, dragging_this));
+            let tab_label = container(text(label).size(13)).padding([3, 8]);
             // Drag press/release lives on the label so a press on the close
             // button never starts a tab drag. Right-click opens the context menu.
             let tab: Element<'_, Message> = mouse_area(tab_label)
@@ -11246,12 +11267,13 @@ impl Frost {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(id))
                     .padding([3, 6])
-                    .style(self.close_btn_style())
+                    .style(self.tab_close_btn_style())
                     .into()
             } else {
                 Space::new().width(Length::Fixed(18.0)).into()
             };
-            let cell = row![tab, close].spacing(1).align_y(iced::Alignment::Center);
+            let cell = container(row![tab, close].align_y(iced::Alignment::Center))
+                .style(self.tab_container_style(active, hovered, dragging_this));
             // Hover tracking on the whole cell so moving onto the close
             // button does not collapse it out of the layout.
             tabs = tabs.push(
@@ -13106,8 +13128,7 @@ impl Frost {
             let label = format!("{}{label}", self.tab_state_prefix(i));
             let tab_label = container(text(label).size(13).wrapping(text::Wrapping::None))
                 .width(Length::Fill)
-                .padding([4, 8])
-                .style(self.tab_container_style(active, hovered, dragging_this));
+                .padding([4, 8]);
             // Right-click opens the same tab menu the top strip uses — this is
             // the tab list in Side mode, so it must offer the same actions.
             let tab: Element<'_, Message> = mouse_area(tab_label)
@@ -13121,7 +13142,7 @@ impl Frost {
                 button(text("×").size(13))
                     .on_press(Message::CloseTab(id))
                     .padding([4, 6])
-                    .style(self.close_btn_style())
+                    .style(self.tab_close_btn_style())
                     .into()
             } else {
                 Space::new().into()
@@ -13129,7 +13150,9 @@ impl Frost {
             let close = container(close_inner)
                 .width(Length::Fixed(24.0))
                 .center_x(Length::Fixed(24.0));
-            let cell = row![tab, close].spacing(2).align_y(iced::Alignment::Center);
+            let cell = container(row![tab, close].align_y(iced::Alignment::Center))
+                .width(Length::Fill)
+                .style(self.tab_container_style(active, hovered, dragging_this));
             list = list.push(
                 mouse_area(cell)
                     .on_enter(Message::TabHover(Some(id)))
