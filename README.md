@@ -17,8 +17,9 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面。侧栏还可通过
   `[[remote_hosts]]` 原生浏览 SSH 主机与运行中的 Docker 容器（无需 sshfs）：远程一侧只运行一段
   标准 POSIX sh 探测脚本（经 `ssh` / `docker exec` 的 stdin 传入）。右键任意节点或空白区可打开
-  文件操作菜单：新建文件/目录、重命名、删除（含确认框）、复制/剪切/粘贴与刷新，本地与远程行为一致；
-  跨位置粘贴即为上传/下载（远程⇄远程经本地临时中转），文件按流式传输、目录经 tar 转发，
+  文件操作菜单：新建文件/目录、重命名、删除（含确认框）、复制/剪切/粘贴、复制路径与刷新，
+  本地与远程行为一致；跨位置粘贴即为上传/下载（远程⇄远程经本地临时中转），文件按流式传输、
+  目录经 tar 转发，实时显示传输进度（可随时取消，取消不会留下半截文件），
   全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
@@ -448,11 +449,14 @@ a remote tree is read one directory level at a time by running a small POSIX
 sh probe script through `ssh` / `docker exec` stdin, with bounded output and
 hard timeouts. Right-clicking a node (or the empty area below the tree, which
 targets the root directory) opens a file-operations menu — New File, New
-Folder, Rename, Delete (with a full-path confirmation), Copy, Cut, Paste and
-Refresh — that works identically locally and remotely. Paste also crosses
-locations: a remote entry pasted locally downloads, a local entry pasted to
-a remote host uploads, and remote→remote relays through a unique local temp
-path. Files stream (never buffered whole, 512 MiB cap, group-kill on
-timeout) and directories travel as tar; a cut across locations deletes the
-source only after the copy completes. Remote failures surface inline in the
-panel rather than taking the tree down.
+Folder, Rename, Delete (with a full-path confirmation), Copy, Cut, Copy Path,
+Paste and Refresh — that works identically locally and remotely. Paste also
+crosses locations: a remote entry pasted locally downloads, a local entry
+pasted to a remote host uploads, and remote→remote relays through a unique
+local temp path. Files stream (never buffered whole, 512 MiB cap, group-kill
+on timeout) and directories travel as tar; a cut across locations deletes
+the source only after the copy completes. Transfers report live progress in
+the panel (uploads show bytes against the file's size) and can be cancelled
+from the same notice — a cancelled transfer never leaves a partial file in
+place. Remote failures surface inline in the panel rather than taking the
+tree down.

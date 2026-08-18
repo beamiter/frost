@@ -56,16 +56,18 @@ pub struct Entry {
 /// 4 op failed, 17 target exists. Keep this string byte-for-byte in sync with
 /// the protocol the parser and the exit-code mapping below implement. v2 adds
 /// the streaming ops `cat` (file → stdout), `put` (stdin → new file, via a
-/// temp + re-check + mv so a partial stream never lands on the target), and
-/// `tar`/`untar` (directory ⇄ tar stream); every v1 op is byte-identical.
-/// The stdin-consuming ops print one `fsprobe-ready` line on stdout first:
-/// the client must not stream payload before it arrives, because the shell's
-/// own script buffering would otherwise eat payload bytes.
+/// temp + optional declared-size re-check + mv, so a truncated or partial
+/// stream never lands on the target, with a trap cleaning the temp when the
+/// shell dies), and `tar`/`untar` (directory ⇄ tar stream); every v1 op is
+/// byte-identical. The stdin-consuming ops print one `fsprobe-ready` line on
+/// stdout first: the client must not stream payload before it arrives,
+/// because the shell's own script buffering would otherwise eat payload bytes.
 const PROBE_SCRIPT: &str = r#"# remote-fs probe v2 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 # put/untar print "fsprobe-ready" on stdout before reading stdin as payload;
 # stream only after the marker, or the shell's script buffering eats the bytes.
+# put takes an optional declared size ($3): a short stream fails 4, never commits.
 set -u
 op=${1:-}
 case "$op" in
@@ -128,8 +130,13 @@ case "$op" in
     case "$p" in /*) ;; *) exit 2 ;; esac
     [ -e "$p" ] && exit 17
     t="$p.fspart.$$"
+    trap 'rm -f "$t" 2>/dev/null' EXIT
     printf 'fsprobe-ready\n'
     if ! cat > "$t"; then rm -f "$t"; exit 4; fi
+    if [ -n "${3:-}" ]; then
+      bytes=$(wc -c < "$t" | tr -d '[:space:]')
+      [ "$bytes" = "$3" ] || { rm -f "$t"; exit 4; }
+    fi
     if [ -e "$p" ]; then rm -f "$t"; exit 17; fi
     mv "$t" "$p" || { rm -f "$t"; exit 4; }
     ;;
@@ -173,6 +180,106 @@ pub const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 /// still bounded, and the watchdog kills the whole process group at the end
 /// of it either way.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Progress publishes at most about four times a second…
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// …and at least every 256 KiB transferred, whichever comes first.
+const PROGRESS_MIN_BYTES: u64 = 256 * 1024;
+
+/// The pure throttle rule behind [`TransferProgress::report`]: publish when
+/// either enough time or enough new bytes have passed since the last publish.
+fn should_publish(last: (Instant, u64), now: Instant, total: u64) -> bool {
+    now.duration_since(last.0) >= PROGRESS_MIN_INTERVAL
+        || total.saturating_sub(last.1) >= PROGRESS_MIN_BYTES
+}
+
+/// Shared state for one in-flight transfer: a throttled byte counter the UI
+/// polls, plus the cancellation flag the worker's watchdog polls. One fresh
+/// handle per transfer; cancel racing completion is a no-op because the
+/// outcome is only reported as cancelled when the transfer actually failed.
+#[derive(Debug)]
+pub struct TransferProgress {
+    bytes: std::sync::atomic::AtomicU64,
+    cancelled: std::sync::atomic::AtomicBool,
+    last_publish: std::sync::Mutex<(Instant, u64)>,
+}
+
+impl TransferProgress {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            // Backdated so the very first report publishes immediately.
+            last_publish: std::sync::Mutex::new((
+                Instant::now()
+                    .checked_sub(PROGRESS_MIN_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+                0,
+            )),
+        })
+    }
+
+    /// Bytes transferred so far (last published value).
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask the worker to stop; the watchdog's group kill does the rest.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record `total` bytes so far, throttled: at most ~4 publishes a second
+    /// unless at least 256 KiB went by since the last one.
+    pub fn report(&self, total: u64) {
+        let now = Instant::now();
+        let mut last = self.last_publish.lock().expect("progress lock");
+        if should_publish(*last, now, total) {
+            *last = (now, total);
+            self.bytes
+                .store(total, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the final byte count, unthrottled, so the last UI poll before
+    /// the result message shows the complete transfer.
+    pub fn finish(&self, total: u64) {
+        let now = Instant::now();
+        let mut last = self.last_publish.lock().expect("progress lock");
+        *last = (now, total);
+        self.bytes
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The sentinel error cancellation surfaces as; the worker maps it (and any
+/// other artifact of the group kill) to a neutral "cancelled" report via the
+/// progress flag, never to an error.
+fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled")
+}
+
+/// Human-readable byte counts for the transfer notice: `512 B`, `2.0 KiB`,
+/// `12.4 MiB`, `1.0 GiB`.
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    }
+}
 
 /// What a helper run produced, with both streams already capped.
 #[derive(Debug)]
@@ -278,17 +385,25 @@ fn kill_tree(child: &mut std::process::Child) {
 }
 
 /// Wait for `child`, killing the whole group and reporting
-/// [`io::ErrorKind::TimedOut`] when it outlives `timeout`.
+/// [`io::ErrorKind::TimedOut`] when it outlives `timeout`. When a transfer
+/// progress handle is attached, a set cancellation flag takes the exact same
+/// path — group kill, then [`io::ErrorKind::Interrupted`] — so cancel and
+/// timeout are indistinguishable to the pipes downstream.
 fn wait_status(
     child: &mut std::process::Child,
     timeout: Duration,
     program: &str,
+    cancel: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
+                if cancel.is_some_and(|progress| progress.is_cancelled()) {
+                    kill_tree(child);
+                    return Err(cancelled_error());
+                }
                 if Instant::now() >= deadline {
                     kill_tree(child);
                     return Err(io::Error::new(
@@ -364,7 +479,7 @@ fn run_capture(
     let stdout_reader = std::thread::spawn(move || read_bounded(&mut stdout_pipe, max_out));
     let stderr_reader = std::thread::spawn(move || read_bounded(&mut stderr_pipe, max_out));
 
-    let status = match wait_status(&mut child, timeout, &program) {
+    let status = match wait_status(&mut child, timeout, &program, None) {
         Ok(status) => status,
         Err(error) => {
             // Join the readers so no thread outlives the pipes.
@@ -849,8 +964,14 @@ fn transfer_cap_error(cap: u64) -> io::Error {
 }
 
 /// Copy `reader` → `writer` counting bytes; past `cap` the copy aborts with
-/// `InvalidData` instead of streaming unboundedly.
-fn stream_capped<R: Read, W: Write>(mut reader: R, mut writer: W, cap: u64) -> io::Result<u64> {
+/// `InvalidData` instead of streaming unboundedly. With a progress handle
+/// attached, the running total is reported (throttled) after every chunk.
+fn stream_capped<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    cap: u64,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
+) -> io::Result<u64> {
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
@@ -863,6 +984,9 @@ fn stream_capped<R: Read, W: Write>(mut reader: R, mut writer: W, cap: u64) -> i
             return Err(transfer_cap_error(cap));
         }
         writer.write_all(&buffer[..read])?;
+        if let Some(progress) = progress {
+            progress.report(total);
+        }
     }
 }
 
@@ -884,14 +1008,15 @@ struct StreamOutcome {
 }
 
 /// Stream one argv's stdout into the fresh temp `temp`, bounded by `cap` and
-/// the transfer watchdog. Transport errors (spawn, timeout, cap overflow, io)
-/// unlink the temp and return `Err`; a clean run with a non-zero status
-/// leaves the temp for the caller to judge and remove.
+/// the transfer watchdog. Transport errors (spawn, timeout, cancel, cap
+/// overflow, io) unlink the temp and return `Err`; a clean run with a
+/// non-zero status leaves the temp for the caller to judge and remove.
 fn stream_argv_to_temp(
     argv: &[String],
     stdin_bytes: &[u8],
     temp: &Path,
     cap: u64,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<StreamOutcome> {
     // create_new: the name is unique by construction, and anything already
     // there is not ours to overwrite.
@@ -919,10 +1044,14 @@ fn stream_argv_to_temp(
             .ok_or_else(|| io::Error::other("child stderr pipe was not created"))?;
         let stderr_reader =
             std::thread::spawn(move || read_bounded(&mut stderr_pipe, MAX_OP_BYTES));
-        let streamer = std::thread::spawn(move || stream_capped(&mut stdout_pipe, &mut file, cap));
-        // The watchdog covers a stalled remote; after a group kill the pipes
-        // close and both threads end, so the joins below always terminate.
-        let status = wait_status(&mut child, TRANSFER_TIMEOUT, &program);
+        let streamer_progress = progress.cloned();
+        let streamer = std::thread::spawn(move || {
+            stream_capped(&mut stdout_pipe, &mut file, cap, streamer_progress.as_ref())
+        });
+        // The watchdog covers a stalled remote and the cancel flag; after a
+        // group kill the pipes close and both threads end, so the joins below
+        // always terminate.
+        let status = wait_status(&mut child, TRANSFER_TIMEOUT, &program, progress);
         let streamed = streamer
             .join()
             .map_err(|_| io::Error::other("stream writer thread panicked"));
@@ -930,7 +1059,10 @@ fn stream_argv_to_temp(
             .join()
             .map_err(|_| io::Error::other("stream reader thread panicked"));
         let status = status?;
-        streamed??;
+        let total = streamed??;
+        if let Some(progress) = progress {
+            progress.finish(total);
+        }
         let (stderr, _truncated) = stderr??;
         Ok(StreamOutcome { status, stderr })
     })();
@@ -951,8 +1083,9 @@ fn stream_file_to_probe(
     args: &[&str],
     local_file: &Path,
     cap: u64,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<()> {
-    stream_file_to_argv(&probe_argv(host, op, args), local_file, cap)
+    stream_file_to_argv(&probe_argv(host, op, args), local_file, cap, progress)
 }
 
 /// The one line the probe prints on stdout right before it consumes stdin as
@@ -998,7 +1131,12 @@ fn drain_with_ready_marker<R: Read>(
 
 /// [`stream_file_to_probe`] at the argv level; `argv` must be a `sh -s`-style
 /// probe invocation, because stdin carries the probe script then the file.
-fn stream_file_to_argv(argv: &[String], local_file: &Path, cap: u64) -> io::Result<()> {
+fn stream_file_to_argv(
+    argv: &[String],
+    local_file: &Path,
+    cap: u64,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
+) -> io::Result<()> {
     let size = std::fs::metadata(local_file)?.len();
     if size > cap {
         return Err(transfer_cap_error(cap));
@@ -1026,7 +1164,8 @@ fn stream_file_to_argv(argv: &[String], local_file: &Path, cap: u64) -> io::Resu
     let stderr_reader = std::thread::spawn(move || read_bounded(&mut stderr_pipe, MAX_OP_BYTES));
     let pgid = child.id();
     let path = local_file.to_path_buf();
-    let writer = std::thread::spawn(move || -> io::Result<()> {
+    let writer_progress = progress.cloned();
+    let writer = std::thread::spawn(move || -> io::Result<u64> {
         let result = stdin
             .write_all(PROBE_SCRIPT.as_bytes())
             .and_then(|()| {
@@ -1042,7 +1181,7 @@ fn stream_file_to_argv(argv: &[String], local_file: &Path, cap: u64) -> io::Resu
             })
             .and_then(|()| {
                 let mut file = std::fs::File::open(&path)?;
-                stream_capped(&mut file, &mut stdin, cap).map(|_bytes| ())
+                stream_capped(&mut file, &mut stdin, cap, writer_progress.as_ref())
             });
         if let Err(error) = &result {
             // BrokenPipe/UnexpectedEof mean the child is already gone and its
@@ -1062,7 +1201,7 @@ fn stream_file_to_argv(argv: &[String], local_file: &Path, cap: u64) -> io::Resu
         }
         result
     });
-    let status = wait_status(&mut child, TRANSFER_TIMEOUT, &program);
+    let status = wait_status(&mut child, TRANSFER_TIMEOUT, &program, progress);
     let written = writer
         .join()
         .map_err(|_| io::Error::other("stream writer thread panicked"));
@@ -1074,7 +1213,11 @@ fn stream_file_to_argv(argv: &[String], local_file: &Path, cap: u64) -> io::Resu
         .map_err(|_| io::Error::other("stream reader thread panicked"));
     let status = status?;
     match written? {
-        Ok(()) => {}
+        Ok(total) => {
+            if let Some(progress) = progress {
+                progress.finish(total);
+            }
+        }
         // The probe closed its end early (a pre-read exit 17, say); its exit
         // status below carries the real reason.
         Err(error)
@@ -1122,7 +1265,11 @@ fn verify_local_tar() -> io::Result<()> {
 
 /// Stage a local directory as a capped tar stream in a temp file, ready to
 /// feed a remote `untar`.
-fn stage_local_tar(src: &Path, cap: u64) -> io::Result<PathBuf> {
+fn stage_local_tar(
+    src: &Path,
+    cap: u64,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
+) -> io::Result<PathBuf> {
     verify_local_tar()?;
     let name = src
         .file_name()
@@ -1143,7 +1290,7 @@ fn stage_local_tar(src: &Path, cap: u64) -> io::Result<PathBuf> {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
-    let outcome = stream_argv_to_temp(&argv, b"", &temp, cap)?;
+    let outcome = stream_argv_to_temp(&argv, b"", &temp, cap, progress)?;
     if !outcome.status.success() {
         let _ = std::fs::remove_file(&temp);
         return Err(io::Error::other(format!(
@@ -1216,6 +1363,7 @@ pub fn download(
     src: &Path,
     dst: &Path,
     is_dir: bool,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<()> {
     let host = remote_host(remote_loc, hosts)?;
     // The friendly before-check: fail on an existing destination before a
@@ -1241,6 +1389,7 @@ pub fn download(
             PROBE_SCRIPT.as_bytes(),
             &temp,
             MAX_TRANSFER_BYTES,
+            progress,
         )?;
         if !outcome.status.success() {
             let _ = std::fs::remove_file(&temp);
@@ -1267,6 +1416,7 @@ pub fn download(
             PROBE_SCRIPT.as_bytes(),
             &temp,
             MAX_TRANSFER_BYTES,
+            progress,
         )?;
         if !outcome.status.success() {
             let _ = std::fs::remove_file(&temp);
@@ -1289,6 +1439,7 @@ pub fn upload(
     src: &Path,
     dst: &Path,
     is_dir: bool,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<()> {
     let host = remote_host(remote_loc, hosts)?;
     if is_dir {
@@ -1308,13 +1459,14 @@ pub fn upload(
                 "destination has no parent directory",
             )
         })?;
-        let staged = stage_local_tar(src, MAX_TRANSFER_BYTES)?;
+        let staged = stage_local_tar(src, MAX_TRANSFER_BYTES, progress)?;
         let result = stream_file_to_probe(
             host,
             "untar",
             &[remote_path(remote_parent)?],
             &staged,
             MAX_TRANSFER_BYTES,
+            progress,
         );
         let _ = std::fs::remove_file(&staged);
         result
@@ -1326,7 +1478,17 @@ pub fn upload(
                 format!("{} is not a regular file", src.display()),
             ));
         }
-        stream_file_to_probe(host, "put", &[remote_path(dst)?], src, MAX_TRANSFER_BYTES)
+        // The declared size lets the probe refuse a truncated stream instead
+        // of committing it (a cancelled/killed upload never lands partial).
+        let size = metadata.len().to_string();
+        stream_file_to_probe(
+            host,
+            "put",
+            &[remote_path(dst)?, &size],
+            src,
+            MAX_TRANSFER_BYTES,
+            progress,
+        )
     }
 }
 
@@ -1342,11 +1504,16 @@ pub fn transfer(
     src: &Path,
     dst: &Path,
     is_dir: bool,
+    progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<()> {
     match (src_loc, dst_loc) {
         (FsLocation::Local, FsLocation::Local) => copy(src_loc, hosts, src, dst),
-        (FsLocation::Local, FsLocation::Remote(_)) => upload(dst_loc, hosts, src, dst, is_dir),
-        (FsLocation::Remote(_), FsLocation::Local) => download(src_loc, hosts, src, dst, is_dir),
+        (FsLocation::Local, FsLocation::Remote(_)) => {
+            upload(dst_loc, hosts, src, dst, is_dir, progress)
+        }
+        (FsLocation::Remote(_), FsLocation::Local) => {
+            download(src_loc, hosts, src, dst, is_dir, progress)
+        }
         (FsLocation::Remote(i), FsLocation::Remote(j)) if i == j => copy(src_loc, hosts, src, dst),
         (FsLocation::Remote(_), FsLocation::Remote(_)) => {
             let relay = unique_staging_path(&std::env::temp_dir(), "frost-relay");
@@ -1361,8 +1528,8 @@ pub fn transfer(
             } else {
                 (relay.clone(), false)
             };
-            let result = download(src_loc, hosts, src, &staged, is_dir)
-                .and_then(|()| upload(dst_loc, hosts, &staged, dst, is_dir));
+            let result = download(src_loc, hosts, src, &staged, is_dir, progress)
+                .and_then(|()| upload(dst_loc, hosts, &staged, dst, is_dir, progress));
             let cleanup = if is_relay_dir {
                 std::fs::remove_dir_all(&relay)
             } else {
@@ -1510,7 +1677,7 @@ mod tests {
             .map(|arg| (*arg).to_string())
             .collect();
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
-        let result = stream_file_to_argv(&argv, &staging, MAX_TRANSFER_BYTES);
+        let result = stream_file_to_argv(&argv, &staging, MAX_TRANSFER_BYTES, None);
         let _ = std::fs::remove_file(&staging);
         result
     }
@@ -1692,10 +1859,10 @@ mod tests {
     #[test]
     fn stream_capped_aborts_past_the_cap() {
         let mut out = Vec::new();
-        let error = stream_capped(&b"0123456789"[..], &mut out, 4).expect_err("over cap");
+        let error = stream_capped(&b"0123456789"[..], &mut out, 4, None).expect_err("over cap");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let mut out = Vec::new();
-        let bytes = stream_capped(&b"0123"[..], &mut out, 4).expect("under cap");
+        let bytes = stream_capped(&b"0123"[..], &mut out, 4, None).expect("under cap");
         assert_eq!(bytes, 4);
         assert_eq!(out, b"0123");
     }
@@ -1708,7 +1875,7 @@ mod tests {
             .iter()
             .map(|arg| (*arg).to_string())
             .collect();
-        let error = stream_argv_to_temp(&argv, b"", &temp, 4096).expect_err("over cap");
+        let error = stream_argv_to_temp(&argv, b"", &temp, 4096, None).expect_err("over cap");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!temp.exists(), "partial temp must be unlinked");
         std::fs::remove_dir_all(root).expect("remove test tree");
@@ -1725,18 +1892,19 @@ mod tests {
             .iter()
             .map(|arg| (*arg).to_string())
             .collect();
-        stream_file_to_argv(&argv, &blob, MAX_TRANSFER_BYTES).expect("upload via sh");
+        stream_file_to_argv(&argv, &blob, MAX_TRANSFER_BYTES, None).expect("upload via sh");
         assert_eq!(
             std::fs::read(&dst).expect("read deposited"),
             binary_payload()
         );
         // A collision surfaces as AlreadyExists through the same path.
-        let error = stream_file_to_argv(&argv, &blob, MAX_TRANSFER_BYTES).expect_err("exists");
+        let error =
+            stream_file_to_argv(&argv, &blob, MAX_TRANSFER_BYTES, None).expect_err("exists");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         // The up-front metadata check fires before any spawn.
         let huge = root.join("huge.bin");
         std::fs::write(&huge, b"xx").expect("write huge stub");
-        let error = stream_file_to_argv(&argv, &huge, 1).expect_err("over cap up front");
+        let error = stream_file_to_argv(&argv, &huge, 1, None).expect_err("over cap up front");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
@@ -1780,7 +1948,8 @@ mod tests {
         let root = temp_tree();
         std::fs::write(root.join("nested").join("blob.bin"), binary_payload())
             .expect("write nested blob");
-        let staged = stage_local_tar(&root.join("nested"), MAX_TRANSFER_BYTES).expect("stage tar");
+        let staged =
+            stage_local_tar(&root.join("nested"), MAX_TRANSFER_BYTES, None).expect("stage tar");
         let unpack = root.join("unpacked");
         std::fs::create_dir(&unpack).expect("create unpack dir");
         extract_tar(&staged, &unpack).expect("extract");
@@ -1808,6 +1977,7 @@ mod tests {
             &root.join("file.txt"),
             &dst,
             false,
+            None,
         )
         .expect("local transfer");
         assert_eq!(std::fs::read(&dst).expect("read copy"), b"x");
@@ -1821,6 +1991,7 @@ mod tests {
             &file,
             Path::new("/tmp/file.txt"),
             false,
+            None,
         );
         assert_eq!(up.expect_err("upload").kind(), io::ErrorKind::InvalidInput);
         let down = transfer(
@@ -1830,6 +2001,7 @@ mod tests {
             Path::new("/etc/hostname"),
             &root.join("downloaded"),
             false,
+            None,
         );
         assert_eq!(
             down.expect_err("download").kind(),
@@ -1842,6 +2014,7 @@ mod tests {
             Path::new("/etc/hostname"),
             Path::new("/tmp/hostname"),
             false,
+            None,
         );
         assert_eq!(
             relay.expect_err("relay").kind(),
@@ -1857,7 +2030,107 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
-    // ── List parsing ────────────────────────────────────────────────────
+    // ── Progress, formatting, cancellation ─────────────────────────────
+
+    #[test]
+    fn format_bytes_picks_the_right_unit() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(2048), "2.0 KiB");
+        assert_eq!(format_bytes(13_002_342), "12.4 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(
+            format_bytes(3 * 1024 * 1024 * 1024 + 608_000_000),
+            "3.6 GiB"
+        );
+    }
+
+    #[test]
+    fn progress_throttle_publishes_on_time_or_bytes() {
+        let start = Instant::now();
+        // After a publish, either 250 ms or 256 KiB must pass before the next.
+        assert!(!should_publish(
+            (start, 0),
+            start + Duration::from_millis(10),
+            100
+        ));
+        assert!(should_publish(
+            (start, 0),
+            start + Duration::from_millis(250),
+            100
+        ));
+        assert!(should_publish(
+            (start, 0),
+            start + Duration::from_millis(10),
+            256 * 1024
+        ));
+        assert!(!should_publish(
+            (start, 1000),
+            start + Duration::from_millis(10),
+            1000 + 256 * 1024 - 1
+        ));
+
+        let progress = TransferProgress::new();
+        progress.report(64);
+        assert_eq!(progress.bytes(), 64, "first report publishes immediately");
+        progress.report(128);
+        assert_eq!(progress.bytes(), 64, "throttled: too soon, too few bytes");
+        progress.report(64 + 256 * 1024);
+        assert_eq!(progress.bytes(), 64 + 256 * 1024, "byte-delta publishes");
+        progress.finish(999);
+        assert_eq!(progress.bytes(), 999, "finish always publishes");
+    }
+
+    #[test]
+    fn cancel_kills_the_group_and_cleans_the_temp() {
+        let root = temp_tree();
+        let temp = unique_staging_path(&root, "sleep");
+        let argv: Vec<String> = ["sh", "-c", "sleep 30"]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect();
+        let progress = TransferProgress::new();
+        let token = progress.clone();
+        let gate = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            token.cancel();
+        });
+        let started = Instant::now();
+        let error = stream_argv_to_temp(&argv, b"", &temp, 4096, Some(&progress))
+            .expect_err("cancel must abort the stream");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!temp.exists(), "partial temp must be unlinked on cancel");
+        gate.join().expect("cancel thread");
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn probe_put_verifies_the_declared_size() {
+        let root = temp_tree();
+        let root_str = root.to_str().expect("utf-8 temp path").to_string();
+        let path = format!("{root_str}/sized.bin");
+        // Declared size matches: the file lands.
+        probe_stream_in("put", &[&path, "6"], b"abcdef").expect("put with size");
+        assert_eq!(
+            std::fs::read(root.join("sized.bin")).expect("read"),
+            b"abcdef"
+        );
+        // Declared size short: truncated stream fails 4 and leaves nothing —
+        // this is what keeps a killed upload from committing a partial file.
+        let short = format!("{root_str}/short.bin");
+        let error = probe_stream_in("put", &[&short, "100"], b"abc").expect_err("size mismatch");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!root.join("short.bin").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .expect("read test tree")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("fspart"))
+            .collect();
+        assert!(leftovers.is_empty(), "failed put must not leave its temp");
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    } // ── List parsing ────────────────────────────────────────────────────
 
     #[test]
     fn parse_list_handles_odd_names_and_truncation() {

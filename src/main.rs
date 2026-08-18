@@ -1128,6 +1128,7 @@ enum SidebarMenuAction {
     Delete,
     Copy,
     Cut,
+    CopyPath,
     Paste,
     Refresh,
 }
@@ -1160,15 +1161,43 @@ struct SidebarDialogState {
     error: Option<String>,
 }
 
-/// Location-scoped sidebar clipboard. Paste is offered only while the tree
-/// shows the same location the entry was taken from — a remote path pasted
-/// onto a different machine would be a silent category error.
+/// Location-scoped sidebar clipboard. Paste within the same location copies
+/// or moves; paste across locations downloads, uploads, or relays.
 #[derive(Clone, Debug)]
 struct FsClipboard {
     loc: remote_fs::FsLocation,
     path: std::path::PathBuf,
     is_dir: bool,
     cut: bool,
+}
+
+/// UI state for one in-flight sidebar transfer: the shared byte/cancel handle
+/// plus the fixed label the progress notice is built from. `total` is known
+/// only for uploads (the local file's metadata size); downloads and relays
+/// show transferred bytes alone.
+#[derive(Clone)]
+struct SidebarTransferUi {
+    progress: std::sync::Arc<remote_fs::TransferProgress>,
+    verb: String,
+    name: String,
+    total: Option<u64>,
+}
+
+impl SidebarTransferUi {
+    /// "download name… 12.4 MiB" / "upload name… 2.0 KiB / 12.4 MiB".
+    fn status_text(&self) -> String {
+        let done = remote_fs::format_bytes(self.progress.bytes());
+        match self.total {
+            Some(total) => format!(
+                "{} {}… {} / {}",
+                self.verb,
+                self.name,
+                done,
+                remote_fs::format_bytes(total)
+            ),
+            None => format!("{} {}… {}", self.verb, self.name, done),
+        }
+    }
 }
 
 /// One filesystem mutation handed to a worker task. `Move` is the cut-paste
@@ -1212,11 +1241,13 @@ enum SidebarOp {
 /// tree's current location before any refresh is issued. `location` is the
 /// tree the op changed (the destination for transfers). `warning` rides
 /// along an `Ok` for partial successes (a cut whose source would not delete).
+/// `cancelled` is a neutral user abort — never styled as an error.
 #[derive(Clone, Debug)]
 struct SidebarOpReport {
     location: remote_fs::FsLocation,
     op: SidebarOp,
     warning: Option<String>,
+    cancelled: bool,
     result: Result<(), String>,
 }
 
@@ -1943,6 +1974,10 @@ enum Message {
     SidebarDeleteConfirm,
     SidebarDeleteCancel,
     SidebarOpFinished(SidebarOpReport),
+    /// 250 ms poll of the in-flight transfer's byte counter.
+    SidebarTransferTick,
+    /// The cancel button beside the transfer progress notice.
+    SidebarTransferCancel,
     /// Press on a divider (identified by its owning split node + gap).
     DividerDragStart(DividerId),
     DividerDragMove(iced::Point),
@@ -2962,12 +2997,15 @@ struct Frost {
     sidebar_delete_confirm: Option<std::path::PathBuf>,
     /// Location-scoped clipboard for sidebar Copy/Cut/Paste.
     sidebar_clipboard: Option<FsClipboard>,
+    /// In-flight cross-location transfer (progress notice + cancel button).
+    sidebar_transfer: Option<SidebarTransferUi>,
     /// Pointer-over-dock flag gating the window-space pointer tracker.
     sidebar_hovered: bool,
     /// Last window-space pointer position over the dock (menu anchor).
     sidebar_pointer: iced::Point,
-    /// Transient status line under the files header (op failures/success).
-    sidebar_notice: Option<String>,
+    /// Transient status line under the files header (op failures/success);
+    /// the flag marks neutral (progress/cancelled) vs error styling.
+    sidebar_notice: Option<(String, bool)>,
     /// Divider being dragged, identified by its owning split node's path + gap.
     dragging_divider: Option<DividerId>,
     /// Divider under the pointer (drives its hover highlight).
@@ -3182,6 +3220,7 @@ impl Frost {
             sidebar_dialog: None,
             sidebar_delete_confirm: None,
             sidebar_clipboard: None,
+            sidebar_transfer: None,
             sidebar_hovered: false,
             sidebar_pointer: iced::Point::ORIGIN,
             sidebar_notice: None,
@@ -3643,6 +3682,11 @@ impl Frost {
                 });
                 Task::none()
             }
+            SidebarMenuAction::CopyPath => {
+                // The row's full path as plain text — remote rows keep the
+                // bare remote path, no prefix.
+                iced::clipboard::write(copy_path_payload(&menu.path))
+            }
             SidebarMenuAction::Paste => {
                 let Some(clipboard) = self.sidebar_clipboard.clone() else {
                     return Task::none();
@@ -3650,24 +3694,47 @@ impl Frost {
                 let op = match sidebar_paste_op(&clipboard, &self.sidebar.location, &target_dir) {
                     Ok(op) => op,
                     Err(problem) => {
-                        self.sidebar_notice = Some(problem);
+                        self.sidebar_notice = Some((problem, false));
                         return Task::none();
                     }
                 };
-                // Transfers can run long; say so in the panel while they do.
+                // Cross-location transfers can run long: give them a progress
+                // handle, a live notice, and a cancel button. One at a time:
+                // the cancel affordance addresses exactly one handle, so a
+                // second transfer is refused while one runs.
+                let mut progress = None;
                 if clipboard.loc != self.sidebar.location {
-                    let verb = transfer_verb(&clipboard.loc, &self.sidebar.location, clipboard.cut);
-                    let name = clipboard
-                        .path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.sidebar_notice = Some(format!("{verb} {name}…"));
+                    if self.sidebar_transfer.is_some() {
+                        self.sidebar_notice =
+                            Some(("A transfer is already running".to_string(), false));
+                        return Task::none();
+                    }
+                    let handle = remote_fs::TransferProgress::new();
+                    let total =
+                        if clipboard.loc == remote_fs::FsLocation::Local && !clipboard.is_dir {
+                            std::fs::metadata(&clipboard.path).ok().map(|m| m.len())
+                        } else {
+                            None
+                        };
+                    let ui = SidebarTransferUi {
+                        progress: handle.clone(),
+                        verb: transfer_verb(&clipboard.loc, &self.sidebar.location, false),
+                        name: clipboard
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        total,
+                    };
+                    self.sidebar_notice = Some((ui.status_text(), true));
+                    self.sidebar_transfer = Some(ui);
+                    progress = Some(handle);
                 }
                 sidebar_op_task(
                     self.sidebar.location.clone(),
                     self.sidebar.hosts_snapshot().to_vec(),
                     op,
+                    progress,
                 )
             }
             SidebarMenuAction::Refresh => sidebar_load_task(self.sidebar.refresh()),
@@ -3710,6 +3777,7 @@ impl Frost {
             self.sidebar.location.clone(),
             self.sidebar.hosts_snapshot().to_vec(),
             op,
+            None,
         )
     }
 
@@ -3720,13 +3788,14 @@ impl Frost {
             return Task::none();
         };
         if let Err(problem) = remote_fs::validate_delete_path(&path) {
-            self.sidebar_notice = Some(problem);
+            self.sidebar_notice = Some((problem, false));
             return Task::none();
         }
         sidebar_op_task(
             self.sidebar.location.clone(),
             self.sidebar.hosts_snapshot().to_vec(),
             SidebarOp::Delete(path),
+            None,
         )
     }
 
@@ -10687,26 +10756,57 @@ impl Frost {
             Message::SidebarDeleteConfirm => return self.confirm_sidebar_delete(),
             Message::SidebarDeleteCancel => self.sidebar_delete_confirm = None,
             Message::SidebarOpFinished(report) => {
-                match report.result {
-                    Ok(()) => {
-                        // A completed cut-paste consumes the clipboard; copies
-                        // stay reusable. That holds for a cross-location cut
-                        // even when the source delete came back as a warning.
-                        if matches!(
-                            report.op,
-                            SidebarOp::Move { .. } | SidebarOp::TransferMove { .. }
-                        ) {
-                            self.sidebar_clipboard = None;
-                        }
-                        self.sidebar_notice = report.warning;
-                        // Refresh only when the tree still shows the location
-                        // the op ran against — a switch mid-op must not yank
-                        // the freshly switched tree away.
-                        if report.location == self.sidebar.location {
-                            return sidebar_load_task(self.sidebar.refresh());
-                        }
+                // Any transfer report retires the progress UI, success or not.
+                if matches!(
+                    report.op,
+                    SidebarOp::Transfer { .. } | SidebarOp::TransferMove { .. }
+                ) {
+                    self.sidebar_transfer = None;
+                }
+                if report.cancelled {
+                    // Neutral abort, not an error; the clipboard survives a
+                    // cancelled cut so nothing is silently consumed.
+                    self.sidebar_notice = Some(("Transfer cancelled".to_string(), true));
+                    if report.location == self.sidebar.location {
+                        return sidebar_load_task(self.sidebar.refresh());
                     }
-                    Err(error) => self.sidebar_notice = Some(error),
+                } else {
+                    match report.result {
+                        Ok(()) => {
+                            // A completed cut-paste consumes the clipboard;
+                            // copies stay reusable. That holds for a
+                            // cross-location cut even when the source delete
+                            // came back as a warning.
+                            if matches!(
+                                report.op,
+                                SidebarOp::Move { .. } | SidebarOp::TransferMove { .. }
+                            ) {
+                                self.sidebar_clipboard = None;
+                            }
+                            self.sidebar_notice = report.warning.map(|warning| (warning, false));
+                            // Refresh only when the tree still shows the
+                            // location the op ran against — a switch mid-op
+                            // must not yank the freshly switched tree away.
+                            if report.location == self.sidebar.location {
+                                return sidebar_load_task(self.sidebar.refresh());
+                            }
+                        }
+                        Err(error) => self.sidebar_notice = Some((error, false)),
+                    }
+                }
+            }
+            Message::SidebarTransferTick => {
+                if let Some(transfer) = &self.sidebar_transfer {
+                    self.sidebar_notice = Some((transfer.status_text(), true));
+                }
+            }
+            Message::SidebarTransferCancel => {
+                // Just set the flag: the worker's watchdog takes the same
+                // group-kill path as a timeout, and the report decides the
+                // final status. A finished transfer has no state left here,
+                // so cancel racing completion is a no-op.
+                if let Some(transfer) = &self.sidebar_transfer {
+                    transfer.progress.cancel();
                 }
             }
             Message::SearchToggleRegex => {
@@ -11985,6 +12085,7 @@ impl Frost {
         menu = menu.push(row_btn("Delete", SidebarMenuAction::Delete));
         menu = menu.push(row_btn("Copy", SidebarMenuAction::Copy));
         menu = menu.push(row_btn("Cut", SidebarMenuAction::Cut));
+        menu = menu.push(row_btn("Copy Path", SidebarMenuAction::CopyPath));
         // Paste is offered for any clipboard; within one location it copies
         // or moves, across locations it downloads/uploads (remote→remote via
         // a local relay). The label previews what the click would do.
@@ -12018,7 +12119,7 @@ impl Frost {
         /// Header line + the panel's own vertical padding.
         const PANEL_CHROME_H: f32 = 40.0;
         const EDGE_GAP: f32 = 4.0;
-        let panel_h = PANEL_CHROME_H + 8.0 * ROW_H;
+        let panel_h = PANEL_CHROME_H + 9.0 * ROW_H;
         let x = (state.at.x)
             .min(self.win_size.width - PANEL_W - EDGE_GAP)
             .max(EDGE_GAP);
@@ -13723,14 +13824,35 @@ impl Frost {
             rows.push(container(picker).padding([0, 6]).into());
         }
         // Transient op feedback (validation failures, ssh errors) lives in the
-        // panel itself, where the user is looking.
-        if let Some(notice) = &self.sidebar_notice {
+        // panel itself, where the user is looking; progress and cancellation
+        // get the neutral style, errors the danger one. A running transfer
+        // adds a cancel button beside its notice.
+        if let Some((notice, neutral)) = &self.sidebar_notice {
+            let transferring = self.sidebar_transfer.is_some();
+            let cancel: Element<'_, Message> = if transferring {
+                button(text("×").size(11))
+                    .on_press(Message::SidebarTransferCancel)
+                    .padding([0, 5])
+                    .style(self.ghost_btn_style())
+                    .into()
+            } else {
+                Space::new().into()
+            };
             rows.push(
                 container(
-                    text(notice.clone())
-                        .size(11)
-                        .wrapping(text::Wrapping::Word)
-                        .style(text::danger),
+                    row![
+                        text(notice.clone())
+                            .size(11)
+                            .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .style(if *neutral {
+                                text::secondary
+                            } else {
+                                text::danger
+                            }),
+                        cancel,
+                    ]
+                    .align_y(iced::Alignment::Center),
                 )
                 .padding([2, 8])
                 .into(),
@@ -16961,6 +17083,14 @@ impl Frost {
                 },
             ));
         }
+        // Transfer progress poll: four updates a second while one runs, which
+        // is also the sink's own throttle quantum.
+        if self.sidebar_transfer.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(250))
+                    .map(|_| Message::SidebarTransferTick),
+            );
+        }
         if self.tab_drag_hover_since.is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(50))
@@ -17158,21 +17288,31 @@ fn sidebar_paste_op(
     })
 }
 
+/// The text "Copy Path" puts on the host clipboard: the row's full path,
+/// lossy-decoded, exactly as the tree shows it (remote rows carry no prefix).
+fn copy_path_payload(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// Run one sidebar file operation off the UI thread. The location and hosts
 /// snapshot travel with the op, so a config edit or location switch made
-/// while it runs cannot redirect it to another machine.
+/// while it runs cannot redirect it to another machine. Transfers also carry
+/// their progress handle (byte counter + cancellation flag).
 fn sidebar_op_task(
     location: remote_fs::FsLocation,
     hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
     op: SidebarOp,
+    progress: Option<std::sync::Arc<remote_fs::TransferProgress>>,
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let (report_location, warning, result) = run_sidebar_op(&location, &hosts, &op);
+            let (report_location, warning, cancelled, result) =
+                run_sidebar_op(&location, &hosts, &op, progress.as_ref());
             SidebarOpReport {
                 location: report_location,
                 op,
                 warning,
+                cancelled,
                 result: result.map_err(|error| error.to_string()),
             }
         },
@@ -17180,38 +17320,58 @@ fn sidebar_op_task(
     )
 }
 
-/// Execute one op and report `(changed_location, warning, result)`. Factored
-/// out of the task so the ordering (transfer first, delete source after) is
+/// Execute one op and report `(changed_location, warning, cancelled, result)`.
+/// Factored out of the task so the ordering (transfer first, delete source
+/// after; cancel is neutral and only counts when the transfer failed) is
 /// testable headlessly.
 fn run_sidebar_op(
     location: &remote_fs::FsLocation,
     hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
     op: &SidebarOp,
-) -> (remote_fs::FsLocation, Option<String>, std::io::Result<()>) {
+    progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
+) -> (
+    remote_fs::FsLocation,
+    Option<String>,
+    bool,
+    std::io::Result<()>,
+) {
+    /// A report counts as cancelled only when the user asked AND the transfer
+    /// actually failed because of it — cancel racing completion is a no-op.
+    fn was_cancelled(
+        progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
+        result: &std::io::Result<()>,
+    ) -> bool {
+        progress.is_some_and(|progress| progress.is_cancelled()) && result.is_err()
+    }
     match op {
         SidebarOp::CreateFile(path) => (
             location.clone(),
             None,
+            false,
             remote_fs::create_file(location, hosts, path),
         ),
         SidebarOp::CreateDir(path) => (
             location.clone(),
             None,
+            false,
             remote_fs::create_dir(location, hosts, path),
         ),
         SidebarOp::Rename { src, dst } | SidebarOp::Move { src, dst } => (
             location.clone(),
             None,
+            false,
             remote_fs::rename(location, hosts, src, dst),
         ),
         SidebarOp::Delete(path) => (
             location.clone(),
             None,
+            false,
             remote_fs::delete(location, hosts, path),
         ),
         SidebarOp::Copy { src, dst } => (
             location.clone(),
             None,
+            false,
             remote_fs::copy(location, hosts, src, dst),
         ),
         SidebarOp::Transfer {
@@ -17220,11 +17380,14 @@ fn run_sidebar_op(
             src,
             dst,
             is_dir,
-        } => (
-            dst_loc.clone(),
-            None,
-            remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir),
-        ),
+        } => {
+            let result = remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir, progress);
+            let cancelled = was_cancelled(progress, &result);
+            if cancelled {
+                cleanup_after_cancel(dst_loc, hosts, dst, *is_dir);
+            }
+            (dst_loc.clone(), None, cancelled, result)
+        }
         SidebarOp::TransferMove {
             src_loc,
             dst_loc,
@@ -17235,21 +17398,46 @@ fn run_sidebar_op(
             // Cut across locations = copy, then delete the source. A failed
             // transfer never touches the source; a failed delete after a
             // successful transfer is a partial success, reported as a warning.
-            if let Err(error) = remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir) {
-                return (dst_loc.clone(), None, Err(error));
+            if let Err(error) =
+                remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir, progress)
+            {
+                let result = Err(error);
+                let cancelled = was_cancelled(progress, &result);
+                if cancelled {
+                    cleanup_after_cancel(dst_loc, hosts, dst, *is_dir);
+                }
+                return (dst_loc.clone(), None, cancelled, result);
             }
             match remote_fs::delete(src_loc, hosts, src) {
-                Ok(()) => (dst_loc.clone(), None, Ok(())),
+                Ok(()) => (dst_loc.clone(), None, false, Ok(())),
                 Err(error) => (
                     dst_loc.clone(),
                     Some(format!(
                         "Copied to {}, but deleting the source failed: {error}",
                         dst.display()
                     )),
+                    false,
                     Ok(()),
                 ),
             }
         }
+    }
+}
+
+/// Best-effort tidy-up after a cancelled transfer: local staging temps are
+/// already unlinked by the streaming paths and the probe's own trap/size
+/// re-check keeps a cancelled file upload from landing, but a cancelled
+/// directory upload may have partially extracted on the remote — remove what
+/// the transfer itself created. Failure here is silent by design: the next
+/// listing shows whatever remains.
+fn cleanup_after_cancel(
+    dst_loc: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    dst: &std::path::Path,
+    is_dir: bool,
+) {
+    if is_dir && matches!(dst_loc, remote_fs::FsLocation::Remote(_)) {
+        let _ = remote_fs::delete(dst_loc, hosts, dst);
     }
 }
 
@@ -20405,9 +20593,11 @@ mod tests {
             dst: dst_dir.join("file.txt"),
             is_dir: false,
         };
-        let (changed, warning, result) = run_sidebar_op(&FsLocation::Local, &[], &op);
+        let (changed, warning, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, None);
         assert!(result.is_ok(), "transfer move failed: {result:?}");
         assert!(warning.is_none());
+        assert!(!cancelled);
         assert_eq!(changed, FsLocation::Local);
         assert_eq!(
             std::fs::read(dst_dir.join("file.txt")).expect("read moved file"),
@@ -20425,10 +20615,57 @@ mod tests {
             dst: std::path::PathBuf::from("/tmp/stranded.txt"),
             is_dir: false,
         };
-        let (changed, _warning, result) = run_sidebar_op(&FsLocation::Remote(9), &[], &op);
+        let (changed, _warning, cancelled, result) =
+            run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
         assert!(result.is_err(), "unknown host must fail the transfer");
+        assert!(!cancelled);
         assert_eq!(changed, FsLocation::Remote(9));
         assert!(stranded.exists(), "source survives a failed transfer");
         std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn sidebar_cancel_after_completion_is_a_no_op() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&dst_dir).expect("create test tree");
+        let src = root.join("file.txt");
+        std::fs::write(&src, b"payload").expect("write source");
+        // A cancel flag set "after" the transfer completed (here: set up
+        // front, with a Local→Local op that never consults it) must not turn
+        // a successful result into a cancelled one.
+        let progress = remote_fs::TransferProgress::new();
+        progress.cancel();
+        let op = SidebarOp::TransferMove {
+            src_loc: FsLocation::Local,
+            dst_loc: FsLocation::Local,
+            src: src.clone(),
+            dst: dst_dir.join("file.txt"),
+            is_dir: false,
+        };
+        let (_changed, _warning, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(
+            result.is_ok(),
+            "local op ignores the cancel flag: {result:?}"
+        );
+        assert!(!cancelled, "cancel racing completion is a no-op");
+        assert!(dst_dir.join("file.txt").exists());
+        assert!(!src.exists());
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn copy_path_payload_is_the_plain_full_path() {
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/var/log/syslog")),
+            "/var/log/syslog"
+        );
+        // Remote rows copy the bare remote path — no ssh:/docker: prefix.
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/home/yj/some file.txt")),
+            "/home/yj/some file.txt"
+        );
     }
 }
