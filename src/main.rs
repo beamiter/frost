@@ -1172,7 +1172,9 @@ struct FsClipboard {
 }
 
 /// One filesystem mutation handed to a worker task. `Move` is the cut-paste
-/// case: it clears the clipboard on success, `Rename` does not.
+/// case: it clears the clipboard on success, `Rename` does not. `Transfer` is
+/// a cross-location copy (download/upload/relay), `TransferMove` the
+/// cross-location cut: transfer first, then delete the source.
 #[derive(Clone, Debug)]
 enum SidebarOp {
     CreateFile(std::path::PathBuf),
@@ -1190,14 +1192,31 @@ enum SidebarOp {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
+    Transfer {
+        src_loc: remote_fs::FsLocation,
+        dst_loc: remote_fs::FsLocation,
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        is_dir: bool,
+    },
+    TransferMove {
+        src_loc: remote_fs::FsLocation,
+        dst_loc: remote_fs::FsLocation,
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        is_dir: bool,
+    },
 }
 
 /// Worker report for a finished [`SidebarOp`], matched back against the
-/// tree's current location before any refresh is issued.
+/// tree's current location before any refresh is issued. `location` is the
+/// tree the op changed (the destination for transfers). `warning` rides
+/// along an `Ok` for partial successes (a cut whose source would not delete).
 #[derive(Clone, Debug)]
 struct SidebarOpReport {
     location: remote_fs::FsLocation,
     op: SidebarOp,
+    warning: Option<String>,
     result: Result<(), String>,
 }
 
@@ -3628,26 +3647,23 @@ impl Frost {
                 let Some(clipboard) = self.sidebar_clipboard.clone() else {
                     return Task::none();
                 };
-                // Cross-location paste is disabled in the menu; fail closed
-                // here too in case the location moved underneath the click.
+                let op = match sidebar_paste_op(&clipboard, &self.sidebar.location, &target_dir) {
+                    Ok(op) => op,
+                    Err(problem) => {
+                        self.sidebar_notice = Some(problem);
+                        return Task::none();
+                    }
+                };
+                // Transfers can run long; say so in the panel while they do.
                 if clipboard.loc != self.sidebar.location {
-                    return Task::none();
+                    let verb = transfer_verb(&clipboard.loc, &self.sidebar.location, clipboard.cut);
+                    let name = clipboard
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.sidebar_notice = Some(format!("{verb} {name}…"));
                 }
-                let Some(dst) = remote_fs::paste_destination(&target_dir, &clipboard.path) else {
-                    self.sidebar_notice = Some("That source has no file name to paste".to_string());
-                    return Task::none();
-                };
-                let op = if clipboard.cut {
-                    SidebarOp::Move {
-                        src: clipboard.path,
-                        dst,
-                    }
-                } else {
-                    SidebarOp::Copy {
-                        src: clipboard.path,
-                        dst,
-                    }
-                };
                 sidebar_op_task(
                     self.sidebar.location.clone(),
                     self.sidebar.hosts_snapshot().to_vec(),
@@ -10674,11 +10690,15 @@ impl Frost {
                 match report.result {
                     Ok(()) => {
                         // A completed cut-paste consumes the clipboard; copies
-                        // stay reusable.
-                        if matches!(report.op, SidebarOp::Move { .. }) {
+                        // stay reusable. That holds for a cross-location cut
+                        // even when the source delete came back as a warning.
+                        if matches!(
+                            report.op,
+                            SidebarOp::Move { .. } | SidebarOp::TransferMove { .. }
+                        ) {
                             self.sidebar_clipboard = None;
                         }
-                        self.sidebar_notice = None;
+                        self.sidebar_notice = report.warning;
                         // Refresh only when the tree still shows the location
                         // the op ran against — a switch mid-op must not yank
                         // the freshly switched tree away.
@@ -11965,13 +11985,10 @@ impl Frost {
         menu = menu.push(row_btn("Delete", SidebarMenuAction::Delete));
         menu = menu.push(row_btn("Copy", SidebarMenuAction::Copy));
         menu = menu.push(row_btn("Cut", SidebarMenuAction::Cut));
-        // Paste is same-location only: a path copied from one machine must
-        // never be silently applied to another. The label previews what the
-        // clipboard would drop here.
-        let paste_clip = self
-            .sidebar_clipboard
-            .as_ref()
-            .filter(|clipboard| clipboard.loc == self.sidebar.location);
+        // Paste is offered for any clipboard; within one location it copies
+        // or moves, across locations it downloads/uploads (remote→remote via
+        // a local relay). The label previews what the click would do.
+        let paste_clip = self.sidebar_clipboard.as_ref();
         let paste_label = match paste_clip {
             Some(clip) => {
                 let name = clip
@@ -11980,7 +11997,7 @@ impl Frost {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let suffix = if clip.is_dir { "/" } else { "" };
-                let verb = if clip.cut { "move" } else { "copy" };
+                let verb = transfer_verb(&clip.loc, &self.sidebar.location, clip.cut);
                 format!("Paste {name}{suffix} ({verb})")
             }
             None => "Paste".to_string(),
@@ -17079,6 +17096,68 @@ fn sidebar_load_task(request: sidebar::DirectoryRequest) -> Task<Message> {
     )
 }
 
+/// The menu/notice verb for a paste: copy/move within one location,
+/// download/upload (or a relay) across locations.
+fn transfer_verb(
+    src_loc: &remote_fs::FsLocation,
+    dst_loc: &remote_fs::FsLocation,
+    cut: bool,
+) -> String {
+    use remote_fs::FsLocation;
+    let transport = match (src_loc, dst_loc) {
+        (FsLocation::Local, FsLocation::Remote(_)) => "upload",
+        (FsLocation::Remote(_), FsLocation::Local) => "download",
+        (FsLocation::Remote(i), FsLocation::Remote(j)) if i != j => "relay",
+        _ => return if cut { "move" } else { "copy" }.to_string(),
+    };
+    if cut {
+        format!("{transport} + delete")
+    } else {
+        transport.to_string()
+    }
+}
+
+/// Turn the clipboard into the op a paste should run. Same-location keeps the
+/// copy/move semantics; cross-location becomes a download, an upload, or a
+/// remote→remote relay, with a cut meaning transfer-then-delete-source.
+fn sidebar_paste_op(
+    clipboard: &FsClipboard,
+    current: &remote_fs::FsLocation,
+    target_dir: &std::path::Path,
+) -> Result<SidebarOp, String> {
+    let Some(dst) = remote_fs::paste_destination(target_dir, &clipboard.path) else {
+        return Err("That source has no file name to paste".to_string());
+    };
+    let src = clipboard.path.clone();
+    if clipboard.loc == *current {
+        return Ok(if clipboard.cut {
+            SidebarOp::Move { src, dst }
+        } else {
+            SidebarOp::Copy { src, dst }
+        });
+    }
+    let src_loc = clipboard.loc.clone();
+    let dst_loc = current.clone();
+    let is_dir = clipboard.is_dir;
+    Ok(if clipboard.cut {
+        SidebarOp::TransferMove {
+            src_loc,
+            dst_loc,
+            src,
+            dst,
+            is_dir,
+        }
+    } else {
+        SidebarOp::Transfer {
+            src_loc,
+            dst_loc,
+            src,
+            dst,
+            is_dir,
+        }
+    })
+}
+
 /// Run one sidebar file operation off the UI thread. The location and hosts
 /// snapshot travel with the op, so a config edit or location switch made
 /// while it runs cannot redirect it to another machine.
@@ -17089,23 +17168,89 @@ fn sidebar_op_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let result = match &op {
-                SidebarOp::CreateFile(path) => remote_fs::create_file(&location, &hosts, path),
-                SidebarOp::CreateDir(path) => remote_fs::create_dir(&location, &hosts, path),
-                SidebarOp::Rename { src, dst } | SidebarOp::Move { src, dst } => {
-                    remote_fs::rename(&location, &hosts, src, dst)
-                }
-                SidebarOp::Delete(path) => remote_fs::delete(&location, &hosts, path),
-                SidebarOp::Copy { src, dst } => remote_fs::copy(&location, &hosts, src, dst),
-            };
+            let (report_location, warning, result) = run_sidebar_op(&location, &hosts, &op);
             SidebarOpReport {
-                location,
+                location: report_location,
                 op,
+                warning,
                 result: result.map_err(|error| error.to_string()),
             }
         },
         Message::SidebarOpFinished,
     )
+}
+
+/// Execute one op and report `(changed_location, warning, result)`. Factored
+/// out of the task so the ordering (transfer first, delete source after) is
+/// testable headlessly.
+fn run_sidebar_op(
+    location: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    op: &SidebarOp,
+) -> (remote_fs::FsLocation, Option<String>, std::io::Result<()>) {
+    match op {
+        SidebarOp::CreateFile(path) => (
+            location.clone(),
+            None,
+            remote_fs::create_file(location, hosts, path),
+        ),
+        SidebarOp::CreateDir(path) => (
+            location.clone(),
+            None,
+            remote_fs::create_dir(location, hosts, path),
+        ),
+        SidebarOp::Rename { src, dst } | SidebarOp::Move { src, dst } => (
+            location.clone(),
+            None,
+            remote_fs::rename(location, hosts, src, dst),
+        ),
+        SidebarOp::Delete(path) => (
+            location.clone(),
+            None,
+            remote_fs::delete(location, hosts, path),
+        ),
+        SidebarOp::Copy { src, dst } => (
+            location.clone(),
+            None,
+            remote_fs::copy(location, hosts, src, dst),
+        ),
+        SidebarOp::Transfer {
+            src_loc,
+            dst_loc,
+            src,
+            dst,
+            is_dir,
+        } => (
+            dst_loc.clone(),
+            None,
+            remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir),
+        ),
+        SidebarOp::TransferMove {
+            src_loc,
+            dst_loc,
+            src,
+            dst,
+            is_dir,
+        } => {
+            // Cut across locations = copy, then delete the source. A failed
+            // transfer never touches the source; a failed delete after a
+            // successful transfer is a partial success, reported as a warning.
+            if let Err(error) = remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir) {
+                return (dst_loc.clone(), None, Err(error));
+            }
+            match remote_fs::delete(src_loc, hosts, src) {
+                Ok(()) => (dst_loc.clone(), None, Ok(())),
+                Err(error) => (
+                    dst_loc.clone(),
+                    Some(format!(
+                        "Copied to {}, but deleting the source failed: {error}",
+                        dst.display()
+                    )),
+                    Ok(()),
+                ),
+            }
+        }
+    }
 }
 
 /// Score and sort tabs against the switcher query. Empty query returns all in
@@ -20125,5 +20270,165 @@ mod tests {
             state.count_label(),
             "2 matches · older blocks not searched · older blocks not indexed"
         );
+    }
+
+    fn sidebar_clipboard(
+        loc: remote_fs::FsLocation,
+        path: &std::path::Path,
+        is_dir: bool,
+        cut: bool,
+    ) -> FsClipboard {
+        FsClipboard {
+            loc,
+            path: path.to_path_buf(),
+            is_dir,
+            cut,
+        }
+    }
+
+    #[test]
+    fn sidebar_paste_op_dispatches_same_and_cross_location() {
+        use remote_fs::FsLocation;
+        let dir = std::path::Path::new("/target");
+        // Same location keeps the copy/move semantics.
+        let clip = sidebar_clipboard(
+            FsLocation::Local,
+            std::path::Path::new("/a/file.txt"),
+            false,
+            false,
+        );
+        match sidebar_paste_op(&clip, &FsLocation::Local, dir) {
+            Ok(SidebarOp::Copy { src, dst }) => {
+                assert_eq!(src, std::path::PathBuf::from("/a/file.txt"));
+                assert_eq!(dst, std::path::PathBuf::from("/target/file.txt"));
+            }
+            other => panic!("expected Copy, got {other:?}"),
+        }
+        let clip = sidebar_clipboard(
+            FsLocation::Local,
+            std::path::Path::new("/a/file.txt"),
+            false,
+            true,
+        );
+        assert!(matches!(
+            sidebar_paste_op(&clip, &FsLocation::Local, dir),
+            Ok(SidebarOp::Move { .. })
+        ));
+        // Cross-location becomes a transfer: upload, download, or relay,
+        // with a cut meaning transfer-then-delete-source.
+        match sidebar_paste_op(&clip, &FsLocation::Remote(0), dir) {
+            Ok(SidebarOp::TransferMove {
+                src_loc,
+                dst_loc,
+                dst,
+                is_dir,
+                ..
+            }) => {
+                assert_eq!(src_loc, FsLocation::Local);
+                assert_eq!(dst_loc, FsLocation::Remote(0));
+                assert_eq!(dst, std::path::PathBuf::from("/target/file.txt"));
+                assert!(!is_dir);
+            }
+            other => panic!("expected TransferMove, got {other:?}"),
+        }
+        let clip = sidebar_clipboard(
+            FsLocation::Remote(1),
+            std::path::Path::new("/src/packed"),
+            true,
+            false,
+        );
+        match sidebar_paste_op(&clip, &FsLocation::Local, dir) {
+            Ok(SidebarOp::Transfer {
+                src_loc,
+                dst_loc,
+                is_dir,
+                ..
+            }) => {
+                assert_eq!(src_loc, FsLocation::Remote(1));
+                assert_eq!(dst_loc, FsLocation::Local);
+                assert!(is_dir);
+            }
+            other => panic!("expected Transfer, got {other:?}"),
+        }
+        // A nameless source ("/") can never be pasted anywhere.
+        let clip = sidebar_clipboard(FsLocation::Local, std::path::Path::new("/"), true, false);
+        assert!(sidebar_paste_op(&clip, &FsLocation::Local, dir).is_err());
+    }
+
+    #[test]
+    fn transfer_verb_names_the_transport() {
+        use remote_fs::FsLocation;
+        assert_eq!(
+            transfer_verb(&FsLocation::Local, &FsLocation::Local, false),
+            "copy"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Local, &FsLocation::Local, true),
+            "move"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Remote(0), false),
+            "copy"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Local, &FsLocation::Remote(0), false),
+            "upload"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, false),
+            "download"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Remote(1), false),
+            "relay"
+        );
+        assert_eq!(
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, true),
+            "download + delete"
+        );
+    }
+
+    #[test]
+    fn sidebar_transfer_move_copies_then_deletes_the_source() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&dst_dir).expect("create test tree");
+        let src = root.join("file.txt");
+        std::fs::write(&src, b"payload").expect("write source");
+        // Local→Local runs headlessly: the destination appears and the source
+        // is deleted only afterwards.
+        let op = SidebarOp::TransferMove {
+            src_loc: FsLocation::Local,
+            dst_loc: FsLocation::Local,
+            src: src.clone(),
+            dst: dst_dir.join("file.txt"),
+            is_dir: false,
+        };
+        let (changed, warning, result) = run_sidebar_op(&FsLocation::Local, &[], &op);
+        assert!(result.is_ok(), "transfer move failed: {result:?}");
+        assert!(warning.is_none());
+        assert_eq!(changed, FsLocation::Local);
+        assert_eq!(
+            std::fs::read(dst_dir.join("file.txt")).expect("read moved file"),
+            b"payload"
+        );
+        assert!(!src.exists(), "cut source must be deleted after the copy");
+
+        // A failed transfer must never touch the source.
+        let stranded = root.join("stranded.txt");
+        std::fs::write(&stranded, b"keep me").expect("write stranded");
+        let op = SidebarOp::TransferMove {
+            src_loc: FsLocation::Local,
+            dst_loc: FsLocation::Remote(9),
+            src: stranded.clone(),
+            dst: std::path::PathBuf::from("/tmp/stranded.txt"),
+            is_dir: false,
+        };
+        let (changed, _warning, result) = run_sidebar_op(&FsLocation::Remote(9), &[], &op);
+        assert!(result.is_err(), "unknown host must fail the transfer");
+        assert_eq!(changed, FsLocation::Remote(9));
+        assert!(stranded.exists(), "source survives a failed transfer");
+        std::fs::remove_dir_all(root).expect("remove test tree");
     }
 }
