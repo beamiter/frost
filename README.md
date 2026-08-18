@@ -14,7 +14,11 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 - OSC 8 显式超链接会随网格、scrollback 与 resize/reflow 保留；`Ctrl+单击` 打开时与文本
   检测链接共用同一套安全策略，只允许无凭据、无视觉欺骗的绝对 HTTP(S) URL。URI、id 和
   会话内链接表均有硬上限，过期 viewport 点击会按投影版本拒绝而不会误开新位置的目标
-- 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面
+- 文件侧栏按目录异步懒加载，支持返回上级与刷新；慢盘、NFS/FUSE 不再阻塞主界面。侧栏还可通过
+  `[[remote_hosts]]` 原生浏览 SSH 主机与运行中的 Docker 容器（无需 sshfs）：远程一侧只运行一段
+  标准 POSIX sh 探测脚本（经 `ssh` / `docker exec` 的 stdin 传入）。右键任意节点或空白区可打开
+  文件操作菜单：新建文件/目录、重命名、删除（含确认框）、复制/剪切/粘贴（仅限同一位置内）与刷新，
+  本地与远程行为一致；所有操作均有输出上限与超时保护，远端失败会在面板内联显示
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 Block mode：完成命令、Background 输出和当前输入/运行区以主题相对卡片呈现（状态条、轻染色、圆角、状态/耗时徽标，支持普通与 Compact Block Spacing），空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
@@ -435,3 +439,15 @@ The grammar, validation and argv are shared with the whole jterm family
 (`jterm_core::jsh_remote::RemoteHostConfig`); typing `ssh host` or
 `docker exec -it name bash` into a jsh prompt reaches the same machinery with
 no configuration at all.
+
+The file sidebar (Ctrl+\, Files panel) browses these hosts natively — no
+sshfs, nothing to install on the far side. A location picker above the tree
+switches between Local and every configured entry (`ssh: …` / `docker: …`);
+a remote tree is read one directory level at a time by running a small POSIX
+sh probe script through `ssh` / `docker exec` stdin, with bounded output and
+hard timeouts. Right-clicking a node (or the empty area below the tree, which
+targets the root directory) opens a file-operations menu — New File, New
+Folder, Rename, Delete (with a full-path confirmation), Copy, Cut, Paste and
+Refresh — that works identically locally and remotely. Paste stays within the
+location the entry was copied or cut from, and remote failures surface inline
+in the panel rather than taking the tree down.

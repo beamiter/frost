@@ -3,8 +3,17 @@
 //! The UI owns [`Sidebar`] and sends [`DirectoryRequest`] values to a worker
 //! task. Only one directory level is read per request, so opening the sidebar or
 //! expanding a node never recursively walks the filesystem on the UI thread.
+//!
+//! A request carries its [`FsLocation`] and a snapshot of the configured
+//! remote hosts, so the worker reads either the local disk or, through
+//! [`crate::remote_fs`]'s sh probe, an ssh destination / running container —
+//! with the generation guard unchanged.
 
 use std::path::{Path, PathBuf};
+
+use jterm_core::jsh_remote::RemoteHostConfig;
+
+use crate::remote_fs::{self, FsLocation};
 
 /// Loading lifecycle for a directory node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,10 +66,14 @@ impl FileTreeNode {
 
 /// A filesystem request created by [`Sidebar`]. `generation` prevents a slow
 /// response for an old cwd from replacing the tree after the user navigates.
+/// `location` + `hosts` snapshot where the read happens, so a config edit
+/// mid-flight cannot redirect an already-issued request to another host.
 #[derive(Clone, Debug)]
 pub struct DirectoryRequest {
     pub generation: u64,
     pub path: PathBuf,
+    pub location: FsLocation,
+    pub hosts: Vec<RemoteHostConfig>,
 }
 
 /// Worker result consumed by [`Sidebar::apply_load`].
@@ -76,6 +89,11 @@ pub struct DirectoryResult {
 pub struct Sidebar {
     pub current_dir: PathBuf,
     pub root: FileTreeNode,
+    /// Where the tree is rooted: this machine or one of `hosts`.
+    pub location: FsLocation,
+    /// Snapshot of `config.remote_hosts`, kept in sync by the UI; indices in
+    /// [`FsLocation::Remote`] resolve against it.
+    hosts: Vec<RemoteHostConfig>,
     generation: u64,
 }
 
@@ -85,7 +103,51 @@ impl Sidebar {
         Self {
             root: FileTreeNode::directory(current_dir.clone(), true),
             current_dir,
+            location: FsLocation::Local,
+            hosts: Vec::new(),
             generation: 0,
+        }
+    }
+
+    /// Replace the remote-host snapshot (called when the config changes).
+    pub fn set_hosts(&mut self, hosts: Vec<RemoteHostConfig>) {
+        self.hosts = hosts;
+    }
+
+    /// The snapshot every request and file operation must travel with.
+    pub fn hosts_snapshot(&self) -> &[RemoteHostConfig] {
+        &self.hosts
+    }
+
+    /// Begin switching the tree to `location`. The generation bump drops
+    /// every in-flight load for the old location; the new start directory is
+    /// resolved asynchronously and applied through [`Sidebar::resolve_location`].
+    pub fn begin_location_change(&mut self, location: FsLocation) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.location = location;
+        self.root.children.clear();
+        self.root.state = DirectoryState::Loading;
+        self.generation
+    }
+
+    /// Apply an asynchronously resolved start directory for a pending
+    /// location change. Returns `None` for stale resolutions and for failures
+    /// (the root then shows the error instead of a tree).
+    pub fn resolve_location(
+        &mut self,
+        generation: u64,
+        start: Result<PathBuf, String>,
+    ) -> Option<DirectoryRequest> {
+        if generation != self.generation {
+            return None;
+        }
+        match start {
+            Ok(dir) => Some(self.set_current_dir(dir)),
+            Err(error) => {
+                self.root = FileTreeNode::directory(self.current_dir.clone(), true);
+                self.root.state = DirectoryState::Error(error);
+                None
+            }
         }
     }
 
@@ -100,28 +162,33 @@ impl Sidebar {
     /// Load the initial root without changing its generation.
     pub fn begin_load_root(&mut self) -> DirectoryRequest {
         self.root.state = DirectoryState::Loading;
+        self.request_for(self.root.path.clone())
+    }
+
+    /// A request for one directory level, stamped with the current
+    /// generation, location, and host snapshot.
+    fn request_for(&self, path: PathBuf) -> DirectoryRequest {
         DirectoryRequest {
             generation: self.generation,
-            path: self.root.path.clone(),
+            path,
+            location: self.location.clone(),
+            hosts: self.hosts.clone(),
         }
     }
 
     /// Toggle a directory and, when necessary, request its first one-level load.
     pub fn toggle_node(&mut self, path: &Path) -> Option<DirectoryRequest> {
-        let generation = self.generation;
         let node = find_node_mut(&mut self.root, path)?;
         if !node.is_dir {
             return None;
         }
+        let node_path = node.path.clone();
 
         match node.state {
             DirectoryState::Unloaded | DirectoryState::Error(_) => {
                 node.expanded = true;
                 node.state = DirectoryState::Loading;
-                Some(DirectoryRequest {
-                    generation,
-                    path: node.path.clone(),
-                })
+                Some(self.request_for(node_path))
             }
             DirectoryState::Loading => {
                 node.expanded = !node.expanded;
@@ -169,39 +236,22 @@ impl Default for Sidebar {
 
 /// Read exactly one directory level. This function is intentionally synchronous;
 /// callers run it inside an iced worker task instead of the UI update loop.
+/// The request's location picks the backend: local disk, or the remote-fs sh
+/// probe over ssh / `docker exec`.
 pub fn load_directory(request: DirectoryRequest) -> DirectoryResult {
-    let entries = read_directory(&request.path);
+    let entries = remote_fs::list_dir(&request.location, &request.hosts, &request.path)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| FileTreeNode::entry(entry.name, entry.path, entry.is_dir))
+                .collect()
+        })
+        .map_err(|error| error.to_string());
     DirectoryResult {
         generation: request.generation,
         path: request.path,
         entries,
     }
-}
-
-fn read_directory(path: &Path) -> Result<Vec<FileTreeNode>, String> {
-    let entries = std::fs::read_dir(path)
-        .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-    let mut nodes = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // Match the existing sidebar behavior. Hidden files remain available by
-        // typing paths in the terminal without overwhelming the visual tree.
-        if name.starts_with('.') {
-            continue;
-        }
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("Cannot inspect {}: {error}", entry.path().display()))?;
-        nodes.push(FileTreeNode::entry(name, entry.path(), file_type.is_dir()));
-    }
-    nodes.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    Ok(nodes)
 }
 
 fn display_name(path: &Path) -> String {
@@ -271,5 +321,47 @@ mod tests {
 
         std::fs::remove_dir_all(first).expect("remove first tree");
         std::fs::remove_dir_all(second).expect("remove second tree");
+    }
+
+    #[test]
+    fn location_change_is_generation_guarded() {
+        let root = temp_tree();
+        let mut sidebar = Sidebar::new();
+        let first = sidebar.begin_location_change(FsLocation::Remote(0));
+        let second = sidebar.begin_location_change(FsLocation::Local);
+        assert_ne!(first, second);
+        // A stale resolution for the older change is dropped, the current one
+        // re-roots the tree at the resolved start directory.
+        assert!(sidebar.resolve_location(first, Ok(root.clone())).is_none());
+        let request = sidebar
+            .resolve_location(second, Ok(root.clone()))
+            .expect("current resolution applies");
+        assert!(sidebar.apply_load(load_directory(request)));
+        assert_eq!(sidebar.root.path, root);
+        assert_eq!(sidebar.location, FsLocation::Local);
+
+        // A failed resolution becomes the root's error state, never a panic.
+        let generation = sidebar.begin_location_change(FsLocation::Remote(9));
+        assert!(sidebar
+            .resolve_location(generation, Err("no such host".to_string()))
+            .is_none());
+        assert!(matches!(sidebar.root.state, DirectoryState::Error(_)));
+
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn remote_listing_failure_becomes_an_error_state() {
+        let mut sidebar = Sidebar::new();
+        let generation = sidebar.begin_location_change(FsLocation::Remote(0));
+        let request = sidebar
+            .resolve_location(generation, Ok(PathBuf::from("/tmp")))
+            .expect("resolution applies");
+        // No hosts in the snapshot: the request fails closed and the error
+        // lands in the node's error slot.
+        let result = load_directory(request);
+        assert!(result.entries.is_err());
+        assert!(sidebar.apply_load(result));
+        assert!(matches!(sidebar.root.state, DirectoryState::Error(_)));
     }
 }

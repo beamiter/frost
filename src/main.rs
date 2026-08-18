@@ -23,6 +23,7 @@ mod kitty_graphics;
 mod link;
 mod persistence;
 mod pty;
+mod remote_fs;
 mod review_text;
 mod search;
 mod search_replace;
@@ -555,6 +556,8 @@ static BLOCK_SEARCH_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-list"));
 static TAB_RENAME_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-rename-input"));
+static SIDEBAR_DIALOG_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-dialog-input"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 
@@ -1112,6 +1115,104 @@ enum SidebarPanel {
     Tabs,
     /// Experimental agent Tasks dashboard (config-gated).
     Tasks,
+}
+
+/// Actions of the file tree's right-click menu. New File/New Folder/Paste act
+/// inside the clicked directory (or the clicked file's parent); Rename/
+/// Delete/Copy/Cut act on the clicked node itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarMenuAction {
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+    Copy,
+    Cut,
+    Paste,
+    Refresh,
+}
+
+/// Open file-tree context menu: the right-clicked node plus the pointer
+/// position frozen at press time (the floating panel anchors to it).
+#[derive(Clone, Debug)]
+struct SidebarMenuState {
+    path: std::path::PathBuf,
+    is_dir: bool,
+    at: iced::Point,
+}
+
+/// What the sidebar's modal text input is collecting a name for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarDialogKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+/// Modal New File / New Folder / Rename input. `path` is the target directory
+/// for creates and the node being renamed for Rename; `error` shows the last
+/// failed validation inline.
+#[derive(Clone, Debug)]
+struct SidebarDialogState {
+    kind: SidebarDialogKind,
+    path: std::path::PathBuf,
+    input: String,
+    error: Option<String>,
+}
+
+/// Location-scoped sidebar clipboard. Paste is offered only while the tree
+/// shows the same location the entry was taken from — a remote path pasted
+/// onto a different machine would be a silent category error.
+#[derive(Clone, Debug)]
+struct FsClipboard {
+    loc: remote_fs::FsLocation,
+    path: std::path::PathBuf,
+    is_dir: bool,
+    cut: bool,
+}
+
+/// One filesystem mutation handed to a worker task. `Move` is the cut-paste
+/// case: it clears the clipboard on success, `Rename` does not.
+#[derive(Clone, Debug)]
+enum SidebarOp {
+    CreateFile(std::path::PathBuf),
+    CreateDir(std::path::PathBuf),
+    Rename {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
+    Delete(std::path::PathBuf),
+    Copy {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
+    Move {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
+}
+
+/// Worker report for a finished [`SidebarOp`], matched back against the
+/// tree's current location before any refresh is issued.
+#[derive(Clone, Debug)]
+struct SidebarOpReport {
+    location: remote_fs::FsLocation,
+    op: SidebarOp,
+    result: Result<(), String>,
+}
+
+/// One entry of the file tree's location picker: a location plus the label
+/// built from the current config (`Local`, `ssh: dev`, `docker: myubuntu`).
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarLocationChoice {
+    location: remote_fs::FsLocation,
+    label: String,
+}
+
+impl std::fmt::Display for SidebarLocationChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1801,6 +1902,28 @@ enum Message {
     SidebarGoParent,
     SidebarRefresh,
     SidebarLoaded(sidebar::DirectoryResult),
+    /// Switch the file tree between Local and a configured remote host.
+    SidebarSetLocation(remote_fs::FsLocation),
+    /// Async start-directory resolution for a location switch (generation-guarded).
+    SidebarLocationResolved(u64, Result<std::path::PathBuf, String>),
+    /// Pointer enter/exit on the dock gates the menu-anchor tracking below.
+    SidebarHover(bool),
+    /// Window-space pointer position while hovering the dock; the file-ops
+    /// menu anchors to the last one seen before the right-press.
+    SidebarPointerMoved(iced::Point),
+    /// Right-press on a tree row: open the file-ops menu for that node
+    /// (path, is_dir).
+    SidebarMenuOpen(std::path::PathBuf, bool),
+    /// Right-press on the empty area below the tree: menu for the root dir.
+    SidebarMenuOpenRoot,
+    SidebarMenuClose,
+    SidebarMenuAction(SidebarMenuAction),
+    SidebarDialogInput(String),
+    SidebarDialogSubmit,
+    SidebarDialogCancel,
+    SidebarDeleteConfirm,
+    SidebarDeleteCancel,
+    SidebarOpFinished(SidebarOpReport),
     /// Press on a divider (identified by its owning split node + gap).
     DividerDragStart(DividerId),
     DividerDragMove(iced::Point),
@@ -2812,6 +2935,20 @@ struct Frost {
     dock_width: f32,
     /// Whether the sidebar-resize divider is being dragged.
     dragging_sidebar: bool,
+    /// Right-click file-ops menu of the file tree (floating, pointer-anchored).
+    sidebar_menu: Option<SidebarMenuState>,
+    /// Modal New File / New Folder / Rename input of the file tree.
+    sidebar_dialog: Option<SidebarDialogState>,
+    /// Delete confirmation target; the modal shows the full path before dispatch.
+    sidebar_delete_confirm: Option<std::path::PathBuf>,
+    /// Location-scoped clipboard for sidebar Copy/Cut/Paste.
+    sidebar_clipboard: Option<FsClipboard>,
+    /// Pointer-over-dock flag gating the window-space pointer tracker.
+    sidebar_hovered: bool,
+    /// Last window-space pointer position over the dock (menu anchor).
+    sidebar_pointer: iced::Point,
+    /// Transient status line under the files header (op failures/success).
+    sidebar_notice: Option<String>,
     /// Divider being dragged, identified by its owning split node's path + gap.
     dragging_divider: Option<DividerId>,
     /// Divider under the pointer (drives its hover highlight).
@@ -3022,6 +3159,13 @@ impl Frost {
             sidebar_panel,
             dock_width: SIDEBAR_W,
             dragging_sidebar: false,
+            sidebar_menu: None,
+            sidebar_dialog: None,
+            sidebar_delete_confirm: None,
+            sidebar_clipboard: None,
+            sidebar_hovered: false,
+            sidebar_pointer: iced::Point::ORIGIN,
+            sidebar_notice: None,
             dragging_divider: None,
             hovered_divider: None,
             last_divider_press: None,
@@ -3059,6 +3203,8 @@ impl Frost {
         // external input, so every index is validated before use.
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
         app.relayout();
+        // The file tree carries a snapshot of the configured remote hosts.
+        app.sidebar.set_hosts(app.config.remote_hosts.clone());
         // frost prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. Nothing is installed without an
         // explicit click.
@@ -3164,6 +3310,11 @@ impl Frost {
         self.relayout();
         if resized {
             self.refresh_active_context();
+        }
+        // Keep the file tree's remote-host snapshot aligned with the config;
+        // requests and file ops travel with this copy, never a live borrow.
+        if self.sidebar.hosts_snapshot() != self.config.remote_hosts.as_slice() {
+            self.sidebar.set_hosts(self.config.remote_hosts.clone());
         }
     }
 
@@ -3360,6 +3511,9 @@ impl Frost {
             && self.block_clear_confirm.is_none()
             && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
+            && self.sidebar_menu.is_none()
+            && self.sidebar_dialog.is_none()
+            && self.sidebar_delete_confirm.is_none()
     }
 
     /// Search is intentionally non-modal for scrolling/selection. The remaining
@@ -3378,6 +3532,9 @@ impl Frost {
             && self.block_clear_confirm.is_none()
             && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
+            && self.sidebar_menu.is_none()
+            && self.sidebar_dialog.is_none()
+            && self.sidebar_delete_confirm.is_none()
     }
 
     /// Toggle the left dock and refresh its file root when it becomes visible.
@@ -3385,13 +3542,19 @@ impl Frost {
     /// palette behave identically.
     fn toggle_sidebar(&mut self) -> Task<Message> {
         self.sidebar_open = !self.sidebar_open;
+        // The cwd follow is local-only, exactly as in SetSidebarPanel.
+        let follow_local = self.sidebar.location == remote_fs::FsLocation::Local;
         let request = if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
-            if let Some(cwd) = self
-                .sessions
-                .get(self.active)
-                .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
-            {
-                Some(self.sidebar.set_current_dir(std::path::PathBuf::from(cwd)))
+            if follow_local {
+                if let Some(cwd) = self
+                    .sessions
+                    .get(self.active)
+                    .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+                {
+                    Some(self.sidebar.set_current_dir(std::path::PathBuf::from(cwd)))
+                } else {
+                    Some(self.sidebar.refresh())
+                }
             } else {
                 Some(self.sidebar.refresh())
             }
@@ -3400,6 +3563,155 @@ impl Frost {
         };
         self.apply_config();
         request.map_or_else(Task::none, sidebar_load_task)
+    }
+
+    /// Dispatch one file-tree context-menu action against its frozen target.
+    /// Directory-scope actions (New File/New Folder/Paste) act inside the
+    /// clicked directory, or inside the clicked file's parent.
+    fn execute_sidebar_menu_action(
+        &mut self,
+        menu: SidebarMenuState,
+        action: SidebarMenuAction,
+    ) -> Task<Message> {
+        let target_dir = if menu.is_dir {
+            menu.path.clone()
+        } else {
+            menu.path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| menu.path.clone())
+        };
+        match action {
+            SidebarMenuAction::NewFile | SidebarMenuAction::NewFolder => {
+                self.sidebar_dialog = Some(SidebarDialogState {
+                    kind: if action == SidebarMenuAction::NewFile {
+                        SidebarDialogKind::NewFile
+                    } else {
+                        SidebarDialogKind::NewFolder
+                    },
+                    path: target_dir,
+                    input: String::new(),
+                    error: None,
+                });
+                iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
+            }
+            SidebarMenuAction::Rename => {
+                // Seed the editor with the clicked node's current name, so a
+                // rename starts from what the user just right-clicked.
+                let input = menu
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.sidebar_dialog = Some(SidebarDialogState {
+                    kind: SidebarDialogKind::Rename,
+                    path: menu.path,
+                    input,
+                    error: None,
+                });
+                iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
+            }
+            SidebarMenuAction::Delete => {
+                self.sidebar_delete_confirm = Some(menu.path);
+                Task::none()
+            }
+            SidebarMenuAction::Copy | SidebarMenuAction::Cut => {
+                self.sidebar_clipboard = Some(FsClipboard {
+                    loc: self.sidebar.location.clone(),
+                    path: menu.path,
+                    is_dir: menu.is_dir,
+                    cut: action == SidebarMenuAction::Cut,
+                });
+                Task::none()
+            }
+            SidebarMenuAction::Paste => {
+                let Some(clipboard) = self.sidebar_clipboard.clone() else {
+                    return Task::none();
+                };
+                // Cross-location paste is disabled in the menu; fail closed
+                // here too in case the location moved underneath the click.
+                if clipboard.loc != self.sidebar.location {
+                    return Task::none();
+                }
+                let Some(dst) = remote_fs::paste_destination(&target_dir, &clipboard.path) else {
+                    self.sidebar_notice = Some("That source has no file name to paste".to_string());
+                    return Task::none();
+                };
+                let op = if clipboard.cut {
+                    SidebarOp::Move {
+                        src: clipboard.path,
+                        dst,
+                    }
+                } else {
+                    SidebarOp::Copy {
+                        src: clipboard.path,
+                        dst,
+                    }
+                };
+                sidebar_op_task(
+                    self.sidebar.location.clone(),
+                    self.sidebar.hosts_snapshot().to_vec(),
+                    op,
+                )
+            }
+            SidebarMenuAction::Refresh => sidebar_load_task(self.sidebar.refresh()),
+        }
+    }
+
+    /// Validate the modal name input and turn it into a create/rename op.
+    /// A failed validation stays in the dialog as its inline error.
+    fn submit_sidebar_dialog(&mut self) -> Task<Message> {
+        let Some(dialog) = self.sidebar_dialog.clone() else {
+            return Task::none();
+        };
+        if let Err(problem) = remote_fs::validate_new_name(&dialog.input) {
+            if let Some(current) = self.sidebar_dialog.as_mut() {
+                current.error = Some(problem);
+            }
+            return Task::none();
+        }
+        self.sidebar_dialog = None;
+        let op = match dialog.kind {
+            SidebarDialogKind::NewFile => SidebarOp::CreateFile(dialog.path.join(&dialog.input)),
+            SidebarDialogKind::NewFolder => SidebarOp::CreateDir(dialog.path.join(&dialog.input)),
+            SidebarDialogKind::Rename => {
+                let Some(parent) = dialog.path.parent() else {
+                    return Task::none();
+                };
+                let dst = parent.join(&dialog.input);
+                if dst == dialog.path {
+                    // Unchanged name: nothing to do, and the probe would
+                    // (correctly) refuse it as already-existing.
+                    return Task::none();
+                }
+                SidebarOp::Rename {
+                    src: dialog.path,
+                    dst,
+                }
+            }
+        };
+        sidebar_op_task(
+            self.sidebar.location.clone(),
+            self.sidebar.hosts_snapshot().to_vec(),
+            op,
+        )
+    }
+
+    /// Run the confirmed deletion. The one absolute rule (never `/`) is
+    /// re-checked here, at dispatch time, not only in the menu layer.
+    fn confirm_sidebar_delete(&mut self) -> Task<Message> {
+        let Some(path) = self.sidebar_delete_confirm.take() else {
+            return Task::none();
+        };
+        if let Err(problem) = remote_fs::validate_delete_path(&path) {
+            self.sidebar_notice = Some(problem);
+            return Task::none();
+        }
+        sidebar_op_task(
+            self.sidebar.location.clone(),
+            self.sidebar.hosts_snapshot().to_vec(),
+            SidebarOp::Delete(path),
+        )
     }
 
     /// Terminal area height: window minus the tab bar and (when enabled) the
@@ -9474,6 +9786,36 @@ impl Frost {
                         }
                         return Task::none();
                     }
+                    // The sidebar's file dialogs are modal over the terminal:
+                    // Enter submits (the focused input also reports it via
+                    // on_submit), Esc backs out, and no other key reaches the
+                    // PTY while one is up.
+                    if self.sidebar_dialog.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            return self.submit_sidebar_dialog();
+                        }
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.sidebar_dialog = None;
+                        }
+                        return Task::none();
+                    }
+                    if self.sidebar_delete_confirm.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                            return self.confirm_sidebar_delete();
+                        }
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.sidebar_delete_confirm = None;
+                        }
+                        return Task::none();
+                    }
+                    // The sidebar file menu is pointer-driven; keep every
+                    // keypress out of the PTY while it is visible.
+                    if self.sidebar_menu.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.sidebar_menu = None;
+                        }
+                        return Task::none();
+                    }
                     // Apart from the rename editor (whose keys the focused text
                     // input captures before this point), the tab menu is
                     // pointer-driven; keep every other keypress out of the PTY
@@ -10212,14 +10554,19 @@ impl Frost {
             Message::SetSidebarPanel(panel) => {
                 self.sidebar_panel = panel;
                 // Opening the file tree should reflect the active tab's cwd.
+                // That follow is a local-filesystem notion only: with a remote
+                // location active, keep its root and just reload it.
                 if panel == SidebarPanel::Files {
-                    if let Some(cwd) = self
-                        .sessions
-                        .get(self.active)
-                        .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
-                    {
-                        let request = self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
-                        return sidebar_load_task(request);
+                    if self.sidebar.location == remote_fs::FsLocation::Local {
+                        if let Some(cwd) = self
+                            .sessions
+                            .get(self.active)
+                            .and_then(|s| s.cwd_cache.clone().or_else(|| s.cwd()))
+                        {
+                            let request =
+                                self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
+                            return sidebar_load_task(request);
+                        }
                     }
                     return sidebar_load_task(self.sidebar.refresh());
                 }
@@ -10270,6 +10617,77 @@ impl Frost {
             }
             Message::SidebarLoaded(result) => {
                 self.sidebar.apply_load(result);
+            }
+            Message::SidebarSetLocation(location) => {
+                if location != self.sidebar.location {
+                    let generation = self.sidebar.begin_location_change(location.clone());
+                    let hosts = self.sidebar.hosts_snapshot().to_vec();
+                    return Task::perform(
+                        async move {
+                            remote_fs::start_dir(&location, &hosts)
+                                .map_err(|error| error.to_string())
+                        },
+                        move |result| Message::SidebarLocationResolved(generation, result),
+                    );
+                }
+            }
+            Message::SidebarLocationResolved(generation, start) => {
+                if let Some(request) = self.sidebar.resolve_location(generation, start) {
+                    return sidebar_load_task(request);
+                }
+            }
+            Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
+            Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
+            Message::SidebarMenuOpen(path, is_dir) => {
+                self.sidebar_menu = Some(SidebarMenuState {
+                    path,
+                    is_dir,
+                    // Freeze the anchor now; the pointer moves on toward the
+                    // panel as soon as it appears.
+                    at: self.sidebar_pointer,
+                });
+            }
+            Message::SidebarMenuOpenRoot => {
+                self.sidebar_menu = Some(SidebarMenuState {
+                    path: self.sidebar.current_dir.clone(),
+                    is_dir: true,
+                    at: self.sidebar_pointer,
+                });
+            }
+            Message::SidebarMenuClose => self.sidebar_menu = None,
+            Message::SidebarMenuAction(action) => {
+                if let Some(menu) = self.sidebar_menu.take() {
+                    return self.execute_sidebar_menu_action(menu, action);
+                }
+            }
+            Message::SidebarDialogInput(value) => {
+                if let Some(dialog) = self.sidebar_dialog.as_mut() {
+                    dialog.input = value;
+                    dialog.error = None;
+                }
+            }
+            Message::SidebarDialogSubmit => return self.submit_sidebar_dialog(),
+            Message::SidebarDialogCancel => self.sidebar_dialog = None,
+            Message::SidebarDeleteConfirm => return self.confirm_sidebar_delete(),
+            Message::SidebarDeleteCancel => self.sidebar_delete_confirm = None,
+            Message::SidebarOpFinished(report) => {
+                match report.result {
+                    Ok(()) => {
+                        // A completed cut-paste consumes the clipboard; copies
+                        // stay reusable.
+                        if matches!(report.op, SidebarOp::Move { .. }) {
+                            self.sidebar_clipboard = None;
+                        }
+                        self.sidebar_notice = None;
+                        // Refresh only when the tree still shows the location
+                        // the op ran against — a switch mid-op must not yank
+                        // the freshly switched tree away.
+                        if report.location == self.sidebar.location {
+                            return sidebar_load_task(self.sidebar.refresh());
+                        }
+                    }
+                    Err(error) => self.sidebar_notice = Some(error),
+                }
             }
             Message::SearchToggleRegex => {
                 self.search.toggle_regex();
@@ -11526,6 +11944,185 @@ impl Frost {
             .align_top(Length::Fill)
             .padding(iced::Padding::from(0).top(y).left(x));
         stack![Element::from(dismiss), Element::from(placed)].into()
+    }
+
+    /// Floating file-ops menu opened by right-clicking a file-tree row (or the
+    /// empty area below the tree, which targets the root dir). Placement is
+    /// the tab menu's: pointer-anchored and clamped into the window.
+    fn sidebar_menu_view(&self, state: &SidebarMenuState) -> Element<'_, Message> {
+        let row_btn = |label: &str, action: SidebarMenuAction| {
+            button(text(label.to_string()).size(13))
+                .on_press(Message::SidebarMenuAction(action))
+                .padding([4, 10])
+                .width(Length::Fill)
+                .style(self.ghost_btn_style())
+        };
+        let target = state.path.display().to_string();
+        let mut menu = column![text(target).size(12).style(text::secondary)].spacing(2);
+        menu = menu.push(row_btn("New File", SidebarMenuAction::NewFile));
+        menu = menu.push(row_btn("New Folder", SidebarMenuAction::NewFolder));
+        menu = menu.push(row_btn("Rename", SidebarMenuAction::Rename));
+        menu = menu.push(row_btn("Delete", SidebarMenuAction::Delete));
+        menu = menu.push(row_btn("Copy", SidebarMenuAction::Copy));
+        menu = menu.push(row_btn("Cut", SidebarMenuAction::Cut));
+        // Paste is same-location only: a path copied from one machine must
+        // never be silently applied to another. The label previews what the
+        // clipboard would drop here.
+        let paste_clip = self
+            .sidebar_clipboard
+            .as_ref()
+            .filter(|clipboard| clipboard.loc == self.sidebar.location);
+        let paste_label = match paste_clip {
+            Some(clip) => {
+                let name = clip
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let suffix = if clip.is_dir { "/" } else { "" };
+                let verb = if clip.cut { "move" } else { "copy" };
+                format!("Paste {name}{suffix} ({verb})")
+            }
+            None => "Paste".to_string(),
+        };
+        let paste = button(text(paste_label).size(13))
+            .padding([4, 10])
+            .width(Length::Fill)
+            .style(self.ghost_btn_style());
+        menu = menu.push(if paste_clip.is_some() {
+            paste.on_press(Message::SidebarMenuAction(SidebarMenuAction::Paste))
+        } else {
+            paste
+        });
+        menu = menu.push(row_btn("Refresh", SidebarMenuAction::Refresh));
+
+        const PANEL_W: f32 = 220.0;
+        const ROW_H: f32 = 27.0;
+        /// Header line + the panel's own vertical padding.
+        const PANEL_CHROME_H: f32 = 40.0;
+        const EDGE_GAP: f32 = 4.0;
+        let panel_h = PANEL_CHROME_H + 8.0 * ROW_H;
+        let x = (state.at.x)
+            .min(self.win_size.width - PANEL_W - EDGE_GAP)
+            .max(EDGE_GAP);
+        let y = (state.at.y)
+            .min(self.win_size.height - panel_h - EDGE_GAP)
+            .max(TAB_BAR_H);
+        let panel = container(menu)
+            .width(Length::Fixed(PANEL_W))
+            .padding(8)
+            .style(container::dark);
+        // Dismiss-on-outside-click sheet behind the panel.
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SidebarMenuClose);
+        let placed = container(panel)
+            .align_left(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(iced::Padding::from(0).top(y).left(x));
+        stack![Element::from(dismiss), Element::from(placed)].into()
+    }
+
+    /// Centered modal collecting a name for New File / New Folder / Rename.
+    /// Validation errors show inline and keep the dialog open; Enter submits,
+    /// Esc cancels (both also handled at the app key layer).
+    fn sidebar_dialog_view(&self, state: &SidebarDialogState) -> Element<'_, Message> {
+        let (title, placeholder, confirm) = match state.kind {
+            SidebarDialogKind::NewFile => ("New file", "file name", "Create"),
+            SidebarDialogKind::NewFolder => ("New folder", "folder name", "Create"),
+            SidebarDialogKind::Rename => ("Rename", "new name", "Rename"),
+        };
+        let mut body = column![
+            text(title).size(14),
+            text(state.path.display().to_string())
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+            text_input(placeholder, &state.input)
+                .id(SIDEBAR_DIALOG_INPUT_ID.clone())
+                .on_input(Message::SidebarDialogInput)
+                .on_submit(Message::SidebarDialogSubmit)
+                .size(13),
+        ]
+        .spacing(8);
+        if let Some(error) = &state.error {
+            body = body.push(text(error.clone()).size(11).style(text::danger));
+        }
+        body = body.push(
+            row![
+                button(text("Cancel").size(13))
+                    .on_press(Message::SidebarDialogCancel)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(text(confirm).size(13))
+                    .on_press(Message::SidebarDialogSubmit)
+                    .padding([4, 12]),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+        let panel = container(body)
+            .width(Length::Fixed(360.0))
+            .padding(14)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SidebarDialogCancel);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Centered modal confirming one deletion with the full path spelled out.
+    /// There is no trash and no undo, locally or over ssh.
+    fn sidebar_delete_confirm_view(&self, path: &std::path::Path) -> Element<'_, Message> {
+        let body = column![
+            text("Delete permanently?").size(14),
+            text(path.display().to_string())
+                .size(12)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+            text("Directories are removed with everything inside them. This cannot be undone.")
+                .size(12)
+                .wrapping(text::Wrapping::Word)
+                .style(text::danger),
+            row![
+                button(text("Cancel").size(13))
+                    .on_press(Message::SidebarDeleteCancel)
+                    .padding([4, 12])
+                    .style(self.ghost_btn_style()),
+                Space::new().width(Length::Fill),
+                button(text("Delete").size(13))
+                    .on_press(Message::SidebarDeleteConfirm)
+                    .padding([4, 12])
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(10);
+        let panel = container(body)
+            .width(Length::Fixed(380.0))
+            .padding(14)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::SidebarDeleteCancel);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
     /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
@@ -13047,7 +13644,10 @@ impl Frost {
     }
 
     /// File-tree panel body. Directories toggle expand/collapse on click; files
-    /// type their (quoted) path into the active terminal.
+    /// type their (quoted) path into the active terminal. A location picker
+    /// switches the tree between this machine and the configured remote hosts;
+    /// right-clicking a row (or the empty area below it) opens the file-ops
+    /// menu.
     fn sidebar_files_view(&self) -> Element<'_, Message> {
         let title = self
             .sidebar
@@ -13079,6 +13679,46 @@ impl Frost {
         .spacing(4)
         .align_y(iced::Alignment::Center);
         let mut rows: Vec<Element<'_, Message>> = vec![container(header).padding([4, 6]).into()];
+        // The location picker only exists once at least one remote host is
+        // configured; with none, "Local" would be the only entry.
+        if !self.config.remote_hosts.is_empty() {
+            let mut choices = vec![SidebarLocationChoice {
+                location: remote_fs::FsLocation::Local,
+                label: remote_fs::FsLocation::Local.label(&self.config.remote_hosts),
+            }];
+            for index in 0..self.config.remote_hosts.len() {
+                let location = remote_fs::FsLocation::Remote(index);
+                choices.push(SidebarLocationChoice {
+                    label: location.label(&self.config.remote_hosts),
+                    location,
+                });
+            }
+            let selected = choices
+                .iter()
+                .find(|choice| choice.location == self.sidebar.location)
+                .cloned()
+                .or_else(|| choices.first().cloned());
+            let picker = pick_list(choices, selected, |choice| {
+                Message::SidebarSetLocation(choice.location)
+            })
+            .text_size(12)
+            .width(Length::Fill);
+            rows.push(container(picker).padding([0, 6]).into());
+        }
+        // Transient op feedback (validation failures, ssh errors) lives in the
+        // panel itself, where the user is looking.
+        if let Some(notice) = &self.sidebar_notice {
+            rows.push(
+                container(
+                    text(notice.clone())
+                        .size(11)
+                        .wrapping(text::Wrapping::Word)
+                        .style(text::danger),
+                )
+                .padding([2, 8])
+                .into(),
+            );
+        }
         match &self.sidebar.root.state {
             sidebar::DirectoryState::Loading => rows.push(
                 container(text("Loading…").size(11).style(text::secondary))
@@ -13106,7 +13746,12 @@ impl Frost {
             self.collect_sidebar_nodes(child, 0, &mut rows);
         }
         let list = iced::widget::Column::with_children(rows).spacing(1);
-        scrollable(list).height(Length::Fill).into()
+        let list: Element<'_, Message> = scrollable(list).height(Length::Fill).into();
+        // Right-press on the empty area below the tree targets the root dir;
+        // row menus are captured by the rows' own mouse areas first.
+        mouse_area(list)
+            .on_right_press(Message::SidebarMenuOpenRoot)
+            .into()
     }
 
     /// Vertical session tab list shown in the dock. Mirrors the top tab strip:
@@ -13231,12 +13876,16 @@ impl Frost {
         } else {
             Message::SidebarInsertPath(node.path.clone())
         };
+        let row_button = button(label)
+            .on_press(msg)
+            .width(Length::Fill)
+            .padding([1, 2])
+            .style(self.ghost_btn_style());
+        // Left-click keeps its old meaning (toggle/insert); right-click opens
+        // the file-ops menu for this node.
         out.push(
-            button(label)
-                .on_press(msg)
-                .width(Length::Fill)
-                .padding([1, 2])
-                .style(self.ghost_btn_style())
+            mouse_area(row_button)
+                .on_right_press(Message::SidebarMenuOpen(node.path.clone(), node.is_dir))
                 .into(),
         );
         if node.is_dir && node.expanded {
@@ -13717,9 +14366,14 @@ impl Frost {
         };
 
         // Optional left dock (file tree and/or tab list) beside the terminal,
-        // separated by a draggable resize divider.
+        // separated by a draggable resize divider. Enter/exit tracking on the
+        // dock gates the window-space pointer subscription the file-ops menu
+        // anchors to (the tab strip does the same for its menu).
         let main_area: Element<'_, Message> = if self.dock_open() {
-            let dock_row = row![self.sidebar_view(), self.sidebar_divider(), body]
+            let dock = mouse_area(self.sidebar_view())
+                .on_enter(Message::SidebarHover(true))
+                .on_exit(Message::SidebarHover(false));
+            let dock_row = row![dock, self.sidebar_divider(), body]
                 .width(Length::Fill)
                 .height(Length::Fill);
             // While dragging, pointer moves drive the resize and release ends it.
@@ -13787,6 +14441,23 @@ impl Frost {
         };
         let root: Element<'_, Message> = if let Some((id, process, _)) = &self.tab_close_confirm {
             stack![root, self.tab_close_confirm_view(*id, process)].into()
+        } else {
+            root
+        };
+        // The file tree's own overlays: menu below the modals, deletion last
+        // (top-most) since it is the destructive one.
+        let root: Element<'_, Message> = if let Some(menu) = &self.sidebar_menu {
+            stack![root, self.sidebar_menu_view(menu)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(dialog) = &self.sidebar_dialog {
+            stack![root, self.sidebar_dialog_view(dialog)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(path) = &self.sidebar_delete_confirm {
+            stack![root, self.sidebar_delete_confirm_view(path)].into()
         } else {
             root
         };
@@ -16260,6 +16931,19 @@ impl Frost {
                 },
             ));
         }
+        // Same trick for the file-ops menu anchor: track the window-space
+        // pointer only while it is over the dock with the file tree showing,
+        // so motion elsewhere never rebuilds the view.
+        if self.sidebar_hovered && self.dock_open() && self.sidebar_panel == SidebarPanel::Files {
+            subs.push(iced::event::listen_with(
+                |event, _status, _id| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::SidebarPointerMoved(position))
+                    }
+                    _ => None,
+                },
+            ));
+        }
         if self.tab_drag_hover_since.is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(50))
@@ -16392,6 +17076,35 @@ fn sidebar_load_task(request: sidebar::DirectoryRequest) -> Task<Message> {
     Task::perform(
         async move { sidebar::load_directory(request) },
         Message::SidebarLoaded,
+    )
+}
+
+/// Run one sidebar file operation off the UI thread. The location and hosts
+/// snapshot travel with the op, so a config edit or location switch made
+/// while it runs cannot redirect it to another machine.
+fn sidebar_op_task(
+    location: remote_fs::FsLocation,
+    hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+    op: SidebarOp,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = match &op {
+                SidebarOp::CreateFile(path) => remote_fs::create_file(&location, &hosts, path),
+                SidebarOp::CreateDir(path) => remote_fs::create_dir(&location, &hosts, path),
+                SidebarOp::Rename { src, dst } | SidebarOp::Move { src, dst } => {
+                    remote_fs::rename(&location, &hosts, src, dst)
+                }
+                SidebarOp::Delete(path) => remote_fs::delete(&location, &hosts, path),
+                SidebarOp::Copy { src, dst } => remote_fs::copy(&location, &hosts, src, dst),
+            };
+            SidebarOpReport {
+                location,
+                op,
+                result: result.map_err(|error| error.to_string()),
+            }
+        },
+        Message::SidebarOpFinished,
     )
 }
 
