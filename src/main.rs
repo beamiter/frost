@@ -1200,6 +1200,136 @@ impl SidebarTransferUi {
     }
 }
 
+/// A drop burst is capped at this many paths; more is a mistake, not an import.
+const MAX_DROP_ITEMS: usize = 256;
+/// The size pre-walk of a dropped directory descends no deeper than this.
+const MAX_DROP_WALK_DEPTH: usize = 64;
+
+/// One item of a drop plan: source, destination, kind, and a pre-flight error
+/// (name collision or unreadable source) that skips it at execution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropItem {
+    src: std::path::PathBuf,
+    dst: std::path::PathBuf,
+    is_dir: bool,
+    error: Option<String>,
+}
+
+/// A planned drop: per-item plan plus the pre-summed byte total.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropPlan {
+    target_dir: std::path::PathBuf,
+    items: Vec<DropItem>,
+    total_bytes: u64,
+}
+
+/// Bounded size walk for one dropped item. Directories recurse to
+/// [`MAX_DROP_WALK_DEPTH`]; a symlinked directory is never followed — the
+/// link contributes its own size only (the local copier recreates it as a
+/// link, and `tar` archives it as one too).
+fn drop_item_size(path: &std::path::Path, depth: usize, max_bytes: u64) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(metadata.len());
+    }
+    if depth >= MAX_DROP_WALK_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is nested too deeply to import", path.display()),
+        ));
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(drop_item_size(&entry.path(), depth + 1, max_bytes)?);
+        if total > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is too large to import", path.display()),
+            ));
+        }
+    }
+    Ok(total)
+}
+
+/// Build the per-item plan for one drop burst, off the UI thread: only
+/// absolute local paths with a file name, at most [`MAX_DROP_ITEMS`] items,
+/// destinations never overwritten (a collision flags the item, never the
+/// whole drop), and a wholesale refusal when the bounded size walk passes
+/// [`remote_fs::MAX_TRANSFER_BYTES`].
+fn plan_drop(
+    paths: Vec<std::path::PathBuf>,
+    target_dir: std::path::PathBuf,
+) -> Result<DropPlan, String> {
+    plan_drop_with_caps(
+        paths,
+        target_dir,
+        MAX_DROP_ITEMS,
+        remote_fs::MAX_TRANSFER_BYTES,
+    )
+}
+
+/// [`plan_drop`] with the caps as parameters, so tests stay small and fast.
+fn plan_drop_with_caps(
+    paths: Vec<std::path::PathBuf>,
+    target_dir: std::path::PathBuf,
+    max_items: usize,
+    max_bytes: u64,
+) -> Result<DropPlan, String> {
+    if paths.is_empty() {
+        return Err("nothing to import".to_string());
+    }
+    if paths.len() > max_items {
+        return Err(format!("a drop is limited to {max_items} items"));
+    }
+    let mut items = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0u64;
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(format!("{} is not an absolute path", path.display()));
+        }
+        let Some(name) = path.file_name() else {
+            return Err(format!("{} has no file name to import", path.display()));
+        };
+        let dst = target_dir.join(name);
+        let mut error = None;
+        let mut is_dir = false;
+        match std::fs::symlink_metadata(&path) {
+            Err(problem) => error = Some(format!("cannot inspect {}: {problem}", path.display())),
+            Ok(metadata) => {
+                is_dir = metadata.is_dir();
+                if std::fs::symlink_metadata(&dst).is_ok() {
+                    error = Some(format!("{} already exists", dst.display()));
+                } else {
+                    match drop_item_size(&path, 0, max_bytes) {
+                        Ok(size) => {
+                            total_bytes = total_bytes.saturating_add(size);
+                            if total_bytes > max_bytes {
+                                return Err(format!(
+                                    "drop exceeds the {} limit",
+                                    remote_fs::format_bytes(max_bytes)
+                                ));
+                            }
+                        }
+                        Err(problem) => error = Some(problem.to_string()),
+                    }
+                }
+            }
+        }
+        items.push(DropItem {
+            src: path,
+            dst,
+            is_dir,
+            error,
+        });
+    }
+    Ok(DropPlan {
+        target_dir,
+        items,
+        total_bytes,
+    })
+}
+
 /// One filesystem mutation handed to a worker task. `Move` is the cut-paste
 /// case: it clears the clipboard on success, `Rename` does not. `Transfer` is
 /// a cross-location copy (download/upload/relay), `TransferMove` the
@@ -1235,18 +1365,25 @@ enum SidebarOp {
         dst: std::path::PathBuf,
         is_dir: bool,
     },
+    /// A drag-and-drop import: N local items into the current location,
+    /// executed item by item (local copy or upload), sharing one progress
+    /// handle so the cancel button stops the whole burst.
+    Import {
+        items: Vec<DropItem>,
+    },
 }
 
 /// Worker report for a finished [`SidebarOp`], matched back against the
 /// tree's current location before any refresh is issued. `location` is the
-/// tree the op changed (the destination for transfers). `warning` rides
-/// along an `Ok` for partial successes (a cut whose source would not delete).
+/// tree the op changed (the destination for transfers). `warning` is an
+/// optional post-op notice with a neutral/error styling flag: partial
+/// successes (a cut whose source would not delete), import summaries.
 /// `cancelled` is a neutral user abort — never styled as an error.
 #[derive(Clone, Debug)]
 struct SidebarOpReport {
     location: remote_fs::FsLocation,
     op: SidebarOp,
-    warning: Option<String>,
+    warning: Option<(String, bool)>,
     cancelled: bool,
     result: Result<(), String>,
 }
@@ -1978,6 +2115,17 @@ enum Message {
     SidebarTransferTick,
     /// The cancel button beside the transfer progress notice.
     SidebarTransferCancel,
+    /// Pointer entered/left a tree row (drives drag-and-drop hit-testing).
+    SidebarRowHover(Option<(std::path::PathBuf, bool)>),
+    /// A file was dropped on the window: over the files panel it accumulates
+    /// into the import burst; anywhere else it keeps the terminal behavior.
+    FileDropped(std::path::PathBuf),
+    /// Debounce tick closing a drop burst: plan it off the UI thread.
+    SidebarDropFlush,
+    /// A drop burst's plan is ready: dispatch the import.
+    SidebarDropPlanned(Result<DropPlan, String>),
+    /// Files hovered into / left the window (drives the import hint).
+    SidebarDropHover(bool),
     /// Press on a divider (identified by its owning split node + gap).
     DividerDragStart(DividerId),
     DividerDragMove(iced::Point),
@@ -2999,6 +3147,16 @@ struct Frost {
     sidebar_clipboard: Option<FsClipboard>,
     /// In-flight cross-location transfer (progress notice + cancel button).
     sidebar_transfer: Option<SidebarTransferUi>,
+    /// Tree row under the pointer right now (path, is_dir) — the drop target
+    /// hit-test runs against this, updated by the rows' enter/exit areas.
+    sidebar_hovered_row: Option<(std::path::PathBuf, bool)>,
+    /// Paths of the in-flight drop burst (iced delivers one event per path).
+    sidebar_drop_burst: Vec<std::path::PathBuf>,
+    /// Whether the burst's debounce task is already armed.
+    sidebar_drop_debounce_armed: bool,
+    /// Whether the current sidebar notice is the drop hint (cleared on
+    /// hover-out or drop flush; never clobbers a real notice).
+    sidebar_drop_hint: bool,
     /// Pointer-over-dock flag gating the window-space pointer tracker.
     sidebar_hovered: bool,
     /// Last window-space pointer position over the dock (menu anchor).
@@ -3221,6 +3379,10 @@ impl Frost {
             sidebar_delete_confirm: None,
             sidebar_clipboard: None,
             sidebar_transfer: None,
+            sidebar_hovered_row: None,
+            sidebar_drop_burst: Vec::new(),
+            sidebar_drop_debounce_armed: false,
+            sidebar_drop_hint: false,
             sidebar_hovered: false,
             sidebar_pointer: iced::Point::ORIGIN,
             sidebar_notice: None,
@@ -3779,6 +3941,26 @@ impl Frost {
             op,
             None,
         )
+    }
+
+    /// The directory a drop over the files panel imports into: a directory
+    /// row takes it itself, a file row its parent, anything else in the panel
+    /// the current root. `None` when the files panel is not the drop surface
+    /// (dock closed, another panel, pointer over the terminal) — those drops
+    /// keep the terminal's own drop behavior.
+    fn sidebar_drop_target(&self) -> Option<std::path::PathBuf> {
+        if !(self.dock_open() && self.sidebar_panel == SidebarPanel::Files && self.sidebar_hovered)
+        {
+            return None;
+        }
+        Some(match &self.sidebar_hovered_row {
+            Some((path, true)) => path.clone(),
+            Some((path, false)) => path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| self.sidebar.current_dir.clone()),
+            None => self.sidebar.current_dir.clone(),
+        })
     }
 
     /// Run the confirmed deletion. The one absolute rule (never `/`) is
@@ -10701,6 +10883,9 @@ impl Frost {
                 return sidebar_load_task(request);
             }
             Message::SidebarLoaded(result) => {
+                // Rows the result replaces may be gone; a stale hover must not
+                // become a drop target.
+                self.sidebar_hovered_row = None;
                 self.sidebar.apply_load(result);
             }
             Message::SidebarSetLocation(location) => {
@@ -10759,14 +10944,21 @@ impl Frost {
                 // Any transfer report retires the progress UI, success or not.
                 if matches!(
                     report.op,
-                    SidebarOp::Transfer { .. } | SidebarOp::TransferMove { .. }
+                    SidebarOp::Transfer { .. }
+                        | SidebarOp::TransferMove { .. }
+                        | SidebarOp::Import { .. }
                 ) {
                     self.sidebar_transfer = None;
                 }
                 if report.cancelled {
                     // Neutral abort, not an error; the clipboard survives a
-                    // cancelled cut so nothing is silently consumed.
-                    self.sidebar_notice = Some(("Transfer cancelled".to_string(), true));
+                    // cancelled cut so nothing is silently consumed. An import
+                    // brings its own "cancelled after k of N" summary.
+                    self.sidebar_notice = Some(
+                        report
+                            .warning
+                            .unwrap_or(("Transfer cancelled".to_string(), true)),
+                    );
                     if report.location == self.sidebar.location {
                         return sidebar_load_task(self.sidebar.refresh());
                     }
@@ -10783,7 +10975,7 @@ impl Frost {
                             ) {
                                 self.sidebar_clipboard = None;
                             }
-                            self.sidebar_notice = report.warning.map(|warning| (warning, false));
+                            self.sidebar_notice = report.warning;
                             // Refresh only when the tree still shows the
                             // location the op ran against — a switch mid-op
                             // must not yank the freshly switched tree away.
@@ -10807,6 +10999,114 @@ impl Frost {
                 // so cancel racing completion is a no-op.
                 if let Some(transfer) = &self.sidebar_transfer {
                     transfer.progress.cancel();
+                }
+            }
+            Message::SidebarRowHover(row) => {
+                self.sidebar_hovered_row = row;
+                // Keep the drop hint's target in step with the row under the
+                // pointer while files are dragged over the panel.
+                if self.sidebar_drop_hint && self.sidebar_transfer.is_none() {
+                    if let Some(target) = self.sidebar_drop_target() {
+                        self.sidebar_notice =
+                            Some((format!("Release to import into {}", target.display()), true));
+                    }
+                }
+            }
+            Message::FileDropped(path) => {
+                // Over the files panel a drop is an import; everywhere else it
+                // keeps today's terminal payload behavior.
+                if !(self.dock_open()
+                    && self.sidebar_panel == SidebarPanel::Files
+                    && self.sidebar_hovered)
+                {
+                    return self.update(Message::ImageDropped(path));
+                }
+                // iced delivers one FileDropped per path; a multi-file drop is
+                // one user action, so accumulate the burst and flush it after
+                // a short debounce.
+                self.sidebar_drop_burst.push(path);
+                if !self.sidebar_drop_debounce_armed {
+                    self.sidebar_drop_debounce_armed = true;
+                    return Task::perform(
+                        async move { std::thread::sleep(std::time::Duration::from_millis(120)) },
+                        |()| Message::SidebarDropFlush,
+                    );
+                }
+            }
+            Message::SidebarDropFlush => {
+                self.sidebar_drop_debounce_armed = false;
+                if self.sidebar_drop_hint {
+                    self.sidebar_drop_hint = false;
+                    self.sidebar_notice = None;
+                }
+                let paths = std::mem::take(&mut self.sidebar_drop_burst);
+                if paths.is_empty() {
+                    return Task::none();
+                }
+                // The drop was routed here only because it landed over the
+                // files panel; re-derive the target directory from the row
+                // under the pointer at flush time.
+                let Some(target_dir) = self.sidebar_drop_target() else {
+                    return Task::none();
+                };
+                return Task::perform(
+                    async move { plan_drop(paths, target_dir) },
+                    Message::SidebarDropPlanned,
+                );
+            }
+            Message::SidebarDropPlanned(plan) => {
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(problem) => {
+                        self.sidebar_notice = Some((problem, false));
+                        return Task::none();
+                    }
+                };
+                if self.sidebar_transfer.is_some() {
+                    self.sidebar_notice =
+                        Some(("A transfer is already running".to_string(), false));
+                    return Task::none();
+                }
+                let total_items = plan.items.len();
+                let target_dir = plan.target_dir.clone();
+                let handle = remote_fs::TransferProgress::new();
+                let ui = SidebarTransferUi {
+                    progress: handle.clone(),
+                    verb: "import".to_string(),
+                    name: format!(
+                        "{total_items} {} into {}",
+                        if total_items == 1 { "item" } else { "items" },
+                        target_dir.display()
+                    ),
+                    total: Some(plan.total_bytes),
+                };
+                self.sidebar_notice = Some((ui.status_text(), true));
+                self.sidebar_transfer = Some(ui);
+                return sidebar_op_task(
+                    self.sidebar.location.clone(),
+                    self.sidebar.hosts_snapshot().to_vec(),
+                    SidebarOp::Import { items: plan.items },
+                    Some(handle),
+                );
+            }
+            Message::SidebarDropHover(inside) => {
+                if inside && self.sidebar_drop_hint {
+                    // Hint already up; nothing to refresh (the target row
+                    // tracks the pointer through SidebarRowHover).
+                } else if inside
+                    && self.dock_open()
+                    && self.sidebar_panel == SidebarPanel::Files
+                    && self.sidebar_transfer.is_none()
+                {
+                    let target = self
+                        .sidebar_drop_target()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_else(|| self.sidebar.current_dir.display().to_string());
+                    self.sidebar_notice = Some((format!("Release to import into {target}"), true));
+                    self.sidebar_drop_hint = true;
+                } else if !inside && self.sidebar_drop_hint {
+                    self.sidebar_drop_hint = false;
+                    self.sidebar_notice = None;
                 }
             }
             Message::SearchToggleRegex => {
@@ -14021,10 +14321,18 @@ impl Frost {
             .padding([1, 2])
             .style(self.ghost_btn_style());
         // Left-click keeps its old meaning (toggle/insert); right-click opens
-        // the file-ops menu for this node.
+        // the file-ops menu for this node. Enter/exit track the row under the
+        // pointer so a file drop can be hit-tested without layout geometry —
+        // row rects aren't knowable at view-build time, but the widget tree
+        // knows exactly which row the pointer is over.
         out.push(
             mouse_area(row_button)
                 .on_right_press(Message::SidebarMenuOpen(node.path.clone(), node.is_dir))
+                .on_enter(Message::SidebarRowHover(Some((
+                    node.path.clone(),
+                    node.is_dir,
+                ))))
+                .on_exit(Message::SidebarRowHover(None))
                 .into(),
         );
         if node.is_dir && node.expanded {
@@ -17036,8 +17344,18 @@ impl Frost {
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+            // Drop routing lives in the handler: listen_with takes a plain fn
+            // pointer, so no state can be captured here.
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
-                Some(Message::ImageDropped(path))
+                Some(Message::FileDropped(path))
+            }
+            // Hovered files drive the import hint; the position the drop lands
+            // at comes from the row-hover tracking, these events carry none.
+            iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+                Some(Message::SidebarDropHover(true))
+            }
+            iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+                Some(Message::SidebarDropHover(false))
             }
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
             iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
@@ -17331,7 +17649,7 @@ fn run_sidebar_op(
     progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
 ) -> (
     remote_fs::FsLocation,
-    Option<String>,
+    Option<(String, bool)>,
     bool,
     std::io::Result<()>,
 ) {
@@ -17412,14 +17730,75 @@ fn run_sidebar_op(
                 Ok(()) => (dst_loc.clone(), None, false, Ok(())),
                 Err(error) => (
                     dst_loc.clone(),
-                    Some(format!(
-                        "Copied to {}, but deleting the source failed: {error}",
-                        dst.display()
+                    Some((
+                        format!(
+                            "Copied to {}, but deleting the source failed: {error}",
+                            dst.display()
+                        ),
+                        false,
                     )),
                     false,
                     Ok(()),
                 ),
             }
+        }
+        SidebarOp::Import { items } => {
+            // One drop is one user action: items run sequentially through the
+            // same copy/transfer machinery, sharing the burst's progress
+            // handle; a cancel stops the remaining items.
+            let total = items.len();
+            let mut done = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            for item in items {
+                if progress.is_some_and(|progress| progress.is_cancelled()) {
+                    return (
+                        location.clone(),
+                        Some((
+                            format!("Import cancelled after {done} of {total} items"),
+                            true,
+                        )),
+                        true,
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "transfer cancelled",
+                        )),
+                    );
+                }
+                if let Some(error) = &item.error {
+                    failures.push(error.clone());
+                    continue;
+                }
+                let result = if *location == remote_fs::FsLocation::Local {
+                    remote_fs::copy(location, hosts, &item.src, &item.dst)
+                } else {
+                    remote_fs::transfer(
+                        &remote_fs::FsLocation::Local,
+                        location,
+                        hosts,
+                        &item.src,
+                        &item.dst,
+                        item.is_dir,
+                        progress,
+                    )
+                };
+                match result {
+                    Ok(()) => done += 1,
+                    Err(error) => failures.push(format!("{}: {error}", item.src.display())),
+                }
+            }
+            let notice = if failures.is_empty() {
+                (format!("Imported {done} items"), true)
+            } else {
+                (
+                    format!(
+                        "{} of {total} items failed: {}",
+                        failures.len(),
+                        failures[0]
+                    ),
+                    false,
+                )
+            };
+            (location.clone(), Some(notice), false, Ok(()))
         }
     }
 }
@@ -20667,5 +21046,137 @@ mod tests {
             copy_path_payload(std::path::Path::new("/home/yj/some file.txt")),
             "/home/yj/some file.txt"
         );
+    }
+
+    fn drop_fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("frost-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("target")).expect("target dir");
+        std::fs::create_dir_all(root.join("adir").join("sub")).expect("drop dir");
+        std::fs::write(root.join("adir").join("sub").join("deep.txt"), b"deep").expect("write");
+        std::fs::write(root.join("a.txt"), b"aaa").expect("write");
+        std::fs::write(root.join("target").join("taken.txt"), b"x").expect("write");
+        root
+    }
+
+    #[test]
+    fn plan_drop_builds_per_item_plan_with_collision_flags() {
+        let root = drop_fixture();
+        // A burst of three: a file, a directory, and a name colliding at the
+        // target — only the collision is flagged, the rest stay importable.
+        let plan = plan_drop(
+            vec![
+                root.join("a.txt"),
+                root.join("adir"),
+                root.join("target").join("taken.txt"),
+            ],
+            root.join("target"),
+        )
+        .expect("plan");
+        assert_eq!(plan.items.len(), 3);
+        assert_eq!(plan.items[0].dst, root.join("target").join("a.txt"));
+        assert!(!plan.items[0].is_dir && plan.items[0].error.is_none());
+        assert!(plan.items[1].is_dir && plan.items[1].error.is_none());
+        assert!(plan.items[2].error.is_some(), "collision flags the item");
+        // Only importable items count: a.txt (3) + adir/sub/deep.txt (4); the
+        // colliding item is flagged and contributes nothing.
+        assert_eq!(plan.total_bytes, 7);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn plan_drop_refuses_bad_bursts_wholesale() {
+        let root = drop_fixture();
+        // Empty, over the item cap, and relative paths are all refused before
+        // anything is planned.
+        assert!(plan_drop_with_caps(vec![], root.join("target"), 4, 1024).is_err());
+        let many: Vec<std::path::PathBuf> = (0..5).map(|i| root.join(format!("f{i}"))).collect();
+        let error = plan_drop_with_caps(many, root.join("target"), 4, 1024).expect_err("cap");
+        assert!(error.contains("limited to 4"));
+        let error = plan_drop_with_caps(
+            vec![std::path::PathBuf::from("relative/file.txt")],
+            root.join("target"),
+            4,
+            1024,
+        )
+        .expect_err("relative");
+        assert!(error.contains("absolute"));
+        // Total size over the byte cap refuses the whole burst.
+        let error = plan_drop_with_caps(vec![root.join("a.txt")], root.join("target"), 4, 2)
+            .expect_err("oversize");
+        assert!(error.contains("limit"));
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn drop_item_size_is_bounded_and_never_follows_symlinked_dirs() {
+        let root = drop_fixture();
+        // Nested dir sums file bytes without following the symlink below.
+        std::os::unix::fs::symlink(root.join("adir"), root.join("linkdir")).expect("symlink");
+        let size = drop_item_size(&root.join("adir"), 0, 1024).expect("walk");
+        assert!(size >= 4, "at least deep.txt's bytes, got {size}");
+        let link_size = drop_item_size(&root.join("linkdir"), 0, 1024).expect("link walk");
+        let link_len = std::fs::symlink_metadata(root.join("linkdir"))
+            .expect("metadata")
+            .len();
+        assert_eq!(link_size, link_len, "a symlinked dir counts as the link");
+        // Depth cap: a chain deeper than the walk allows is refused.
+        let mut deep = root.join("deep-chain");
+        std::fs::create_dir(&deep).expect("deep chain");
+        for _ in 0..70 {
+            let next = deep.join("d");
+            std::fs::create_dir(&next).expect("deep dir");
+            deep = next;
+        }
+        let error =
+            drop_item_size(&root.join("deep-chain"), 0, 1024 * 1024).expect_err("depth cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn import_op_runs_items_sequentially_and_summarizes() {
+        use remote_fs::FsLocation;
+        let root = drop_fixture();
+        let plan = plan_drop(
+            vec![
+                root.join("a.txt"),
+                root.join("adir"),
+                root.join("target").join("taken.txt"),
+            ],
+            root.join("target"),
+        )
+        .expect("plan");
+        let op = SidebarOp::Import { items: plan.items };
+        let (changed, notice, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(result.is_ok());
+        assert!(!cancelled);
+        assert_eq!(changed, FsLocation::Local);
+        // Two landed, the colliding one is counted in the summary.
+        assert!(root.join("target").join("a.txt").exists());
+        assert!(root
+            .join("target")
+            .join("adir")
+            .join("sub")
+            .join("deep.txt")
+            .exists());
+        let (text, neutral) = notice.expect("summary notice");
+        assert!(text.starts_with("1 of 3 items failed"), "{text}");
+        assert!(!neutral);
+
+        // A pre-cancelled burst imports nothing and reports cancelled.
+        let root2 = drop_fixture();
+        let plan = plan_drop(vec![root2.join("a.txt")], root2.join("target")).expect("plan");
+        let progress = remote_fs::TransferProgress::new();
+        progress.cancel();
+        let op = SidebarOp::Import { items: plan.items };
+        let (_changed, notice, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(cancelled);
+        assert!(result.is_err());
+        assert!(!root2.join("target").join("a.txt").exists());
+        assert!(notice.expect("cancel summary").0.contains("cancelled"));
+        std::fs::remove_dir_all(root2).expect("remove test tree");
+        std::fs::remove_dir_all(root).expect("remove test tree");
     }
 }

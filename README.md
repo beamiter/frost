@@ -19,8 +19,10 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   标准 POSIX sh 探测脚本（经 `ssh` / `docker exec` 的 stdin 传入）。右键任意节点或空白区可打开
   文件操作菜单：新建文件/目录、重命名、删除（含确认框）、复制/剪切/粘贴、复制路径与刷新，
   本地与远程行为一致；跨位置粘贴即为上传/下载（远程⇄远程经本地临时中转），文件按流式传输、
-  目录经 tar 转发，实时显示传输进度（可随时取消，取消不会留下半截文件），
-  全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示
+  目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度（可随时取消，
+  取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
+  从系统文件管理器把文件/目录拖放到文件树即可导入：落在目录行上导入该目录、其余位置导入当前根目录，
+  远程位置走同一条上传通道；一次拖放最多 256 项、总量不超过传输上限，同名目标逐项拒绝
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 Block mode：完成命令、Background 输出和当前输入/运行区以主题相对卡片呈现（状态条、轻染色、圆角、状态/耗时徽标，支持普通与 Compact Block Spacing），空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
@@ -454,9 +456,14 @@ Paste and Refresh — that works identically locally and remotely. Paste also
 crosses locations: a remote entry pasted locally downloads, a local entry
 pasted to a remote host uploads, and remote→remote relays through a unique
 local temp path. Files stream (never buffered whole, 512 MiB cap, group-kill
-on timeout) and directories travel as tar; a cut across locations deletes
+on timeout) and directories travel as tar; the probe refuses an existing
+directory target before extracting, and a cut across locations deletes
 the source only after the copy completes. Transfers report live progress in
 the panel (uploads show bytes against the file's size) and can be cancelled
 from the same notice — a cancelled transfer never leaves a partial file in
-place. Remote failures surface inline in the panel rather than taking the
-tree down.
+place. Dropping files or folders from the OS file manager onto the tree
+imports them — onto a directory row into that directory, anywhere else into
+the current root; remote locations go through the same upload channel with
+progress and cancel. A drop is capped at 256 items and the transfer size
+limit, and existing names are refused per item, never overwritten. Remote
+failures surface inline in the panel rather than taking the tree down.

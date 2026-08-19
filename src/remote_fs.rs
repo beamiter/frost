@@ -49,25 +49,31 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// Remote-fs probe v2 — runs under `sh -s -- <op> [args...]`.
+/// Remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
 ///
 /// `list` stdout is NUL-separated pairs `"<t>\0<name>\0"`, t in {d,f,l}, names
 /// relative. Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir,
 /// 4 op failed, 17 target exists. Keep this string byte-for-byte in sync with
-/// the protocol the parser and the exit-code mapping below implement. v2 adds
-/// the streaming ops `cat` (file → stdout), `put` (stdin → new file, via a
-/// temp + optional declared-size re-check + mv, so a truncated or partial
-/// stream never lands on the target, with a trap cleaning the temp when the
-/// shell dies), and `tar`/`untar` (directory ⇄ tar stream); every v1 op is
+/// the protocol the parser and the exit-code mapping below implement. v2 added
+/// the streaming ops `cat` (file → stdout), `put` (stdin → new file of an
+/// optionally declared size; temp + count re-check + mv, so a truncated or
+/// partial stream never lands on the target, with a trap cleaning the temp
+/// when the shell dies), and `tar`/`untar` (directory ⇄ tar stream). v3 turns
+/// `untar` into `untar <dir> <name>`, refusing an existing `<dir>/<name>`
+/// with 17 BEFORE extracting (the microscopic check-extract window is
+/// documented at `upload`), and adds `stat <path>` printing one `<t> <size>`
+/// line for pre-checks. Every v1 op and v2's `cat`/`put`/`tar` stay
 /// byte-identical. The stdin-consuming ops print one `fsprobe-ready` line on
 /// stdout first: the client must not stream payload before it arrives,
 /// because the shell's own script buffering would otherwise eat payload bytes.
-const PROBE_SCRIPT: &str = r#"# remote-fs probe v2 — runs under `sh -s -- <op> [args...]`.
+const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 # put/untar print "fsprobe-ready" on stdout before reading stdin as payload;
 # stream only after the marker, or the shell's script buffering eats the bytes.
 # put takes an optional declared size ($3): a short stream fails 4, never commits.
+# untar takes <dir> <name> and refuses an existing <dir>/<name> with 17 up front.
+# stat prints "<t> <size>" (t in {d,f,l}; size is the byte count for f, 0 otherwise).
 set -u
 op=${1:-}
 case "$op" in
@@ -150,12 +156,25 @@ case "$op" in
     tar cf - -C "$parent" "${p##*/}" || exit 4
     ;;
   untar)
-    d=${2:-}
+    d=${2:-}; n=${3:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
+    case "$n" in ""|.|..|*/*) exit 2 ;; esac
     [ -d "$d" ] || exit 3
+    if [ -e "$d/$n" ] || [ -L "$d/$n" ]; then exit 17; fi
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not available" >&2; exit 4; }
     printf 'fsprobe-ready\n'
     tar xf - -C "$d" || exit 4
+    ;;
+  stat)
+    p=${2:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    if [ -d "$p" ]; then t=d
+    elif [ -L "$p" ]; then t=l
+    elif [ -e "$p" ]; then t=f
+    else exit 3
+    fi
+    if [ "$t" = f ]; then s=$(wc -c < "$p" | tr -d '[:space:]'); else s=0; fi
+    printf '%s %s\n' "$t" "$s"
     ;;
   *) exit 2 ;;
 esac
@@ -1329,17 +1348,53 @@ fn extract_tar(archive: &Path, dst_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Friendly pre-stream check: does `dst` already exist on this remote? The
-/// probe re-checks atomically where the protocol allows; this scan only makes
-/// the common collision cheap to report. Dotfile destinations are invisible
-/// to `list` and rely on the atomic re-check alone.
-fn remote_name_taken(loc: &FsLocation, hosts: &[RemoteHostConfig], dst: &Path) -> io::Result<bool> {
-    let (Some(parent), Some(name)) = (dst.parent(), dst.file_name()) else {
-        return Ok(false);
+/// One parsed `stat` probe line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeStat {
+    is_dir: bool,
+    size: u64,
+}
+
+/// `stat <path>` on a validated host: `<t> <size>`, `NotFound` on exit 3.
+fn remote_stat(host: &RemoteHostConfig, path: &Path) -> io::Result<ProbeStat> {
+    let stdout = run_probe(
+        host,
+        "stat",
+        &[remote_path(path)?],
+        LIST_TIMEOUT,
+        MAX_OP_BYTES,
+    )?;
+    let text = String::from_utf8_lossy(&stdout);
+    let mut fields = text.split_whitespace();
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unparseable stat reply: {}", text.trim()),
+        )
     };
-    let name = name.to_string_lossy();
-    let entries = list_dir(loc, hosts, parent)?;
-    Ok(entries.iter().any(|entry| entry.name == name))
+    let (Some(kind), Some(size), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(invalid());
+    };
+    let is_dir = match kind {
+        "d" => true,
+        "f" | "l" => false,
+        _ => return Err(invalid()),
+    };
+    let size = size.parse::<u64>().map_err(|_| invalid())?;
+    Ok(ProbeStat { is_dir, size })
+}
+
+/// Friendly pre-stream check: does `dst` already exist on this remote? `untar`
+/// re-refuses with 17 before extracting and `put` with 17 twice, so this scan
+/// only makes the common collision cheap to report — and unlike a `list` scan
+/// it sees dotfiles too.
+fn remote_name_taken(loc: &FsLocation, hosts: &[RemoteHostConfig], dst: &Path) -> io::Result<bool> {
+    let host = remote_host(loc, hosts)?;
+    match remote_stat(host, dst) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Directory tars carry the source's top-level name, so a directory transfer
@@ -1410,6 +1465,18 @@ pub fn download(
         let _ = std::fs::remove_file(&temp);
         Ok(())
     } else {
+        // `stat` up front: a friendly NotFound (or "is a directory") before
+        // one byte streams, and an expected size to verify the stream against
+        // — the download mirror of put's declared-size re-check.
+        let expected = match remote_stat(host, src)? {
+            ProbeStat { is_dir: true, .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is a directory", src.display()),
+                ));
+            }
+            ProbeStat { size, .. } => size,
+        };
         let temp = unique_staging_path(dst_parent, &name);
         let outcome = stream_argv_to_temp(
             &probe_argv(host, "cat", &[remote_path(src)?]),
@@ -1425,6 +1492,18 @@ pub fn download(
                 stdout: Vec::new(),
                 stderr: outcome.stderr,
             }));
+        }
+        let landed = std::fs::metadata(&temp).map(|metadata| metadata.len())?;
+        if landed != expected {
+            let _ = std::fs::remove_file(&temp);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "download truncated: expected {}, got {}",
+                    format_bytes(expected),
+                    format_bytes(landed)
+                ),
+            ));
         }
         finalize_download(&temp, dst)
     }
@@ -1445,8 +1524,11 @@ pub fn upload(
     if is_dir {
         require_same_name(src, dst)?;
         verify_local_tar()?;
-        // tar extraction cannot re-check atomically the way `put` does, so
-        // scan the remote parent before staging anything.
+        // The v3 `untar` refuses an existing `<dir>/<name>` with 17 before
+        // extracting; this scan only makes the common collision cheap to
+        // report. Between it and the extraction a third party could still
+        // create the path — tar would then extract INTO it, a documented
+        // microscopic TOCTOU window the protocol cannot close.
         if remote_name_taken(remote_loc, hosts, dst)? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -1459,11 +1541,18 @@ pub fn upload(
                 "destination has no parent directory",
             )
         })?;
+        let name = dst
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+            })?
+            .to_string_lossy()
+            .into_owned();
         let staged = stage_local_tar(src, MAX_TRANSFER_BYTES, progress)?;
         let result = stream_file_to_probe(
             host,
             "untar",
-            &[remote_path(remote_parent)?],
+            &[remote_path(remote_parent)?, &name],
             &staged,
             MAX_TRANSFER_BYTES,
             progress,
@@ -1832,7 +1921,7 @@ mod tests {
         assert!(packed.stdout.len() > 512);
         let unpacked = format!("{root_str}/unpacked");
         std::fs::create_dir(&unpacked).expect("create unpack dir");
-        probe_stream_in("untar", &[&unpacked], &packed.stdout).expect("untar");
+        probe_stream_in("untar", &[&unpacked, "nested"], &packed.stdout).expect("untar");
         assert_eq!(
             std::fs::read(root.join("unpacked").join("nested").join("blob.bin"))
                 .expect("read unpacked blob"),
@@ -1845,12 +1934,47 @@ mod tests {
                 .expect("read inner"),
             b"y"
         );
-        // Error paths: tar of a non-dir, untar into a missing dir.
+        // v3: an existing <dir>/<name> is refused with 17 before extracting.
+        let error = probe_stream_in("untar", &[&unpacked, "nested"], &packed.stdout)
+            .expect_err("collision");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        // A bogus name fails usage, a missing dir is 3, a non-dir tar is 3.
+        let bad_name = probe("untar", &[&unpacked, "a/b"]);
+        assert_eq!(bad_name.status.code(), Some(2));
+        let gone = format!("{root_str}/gone");
+        let error =
+            probe_stream_in("untar", &[&gone, "nested"], &packed.stdout).expect_err("missing dir");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
         let file = format!("{root_str}/file.txt");
         assert_eq!(probe("tar", &[&file]).status.code(), Some(3));
-        let gone = format!("{root_str}/gone");
-        let error = probe_stream_in("untar", &[&gone], &packed.stdout).expect_err("missing dir");
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn probe_stat_reports_type_and_size() {
+        let root = temp_tree();
+        let root_str = root.to_str().expect("utf-8 temp path").to_string();
+        let stat = probe("stat", &[&root_str]);
+        assert!(stat.status.success());
+        assert_eq!(String::from_utf8_lossy(&stat.stdout).trim(), "d 0");
+        let file = format!("{root_str}/file.txt");
+        let stat = probe("stat", &[&file]);
+        assert_eq!(String::from_utf8_lossy(&stat.stdout).trim(), "f 1");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(root.join("file.txt"), &link).expect("symlink");
+        let link_str = link.to_str().expect("utf-8 temp path").to_string();
+        let stat = probe("stat", &[&link_str]);
+        assert_eq!(String::from_utf8_lossy(&stat.stdout).trim(), "l 0");
+        // A dangling symlink is still `l`, a missing path is exit 3.
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(root.join("gone"), &dangling).expect("symlink");
+        let dangling_str = dangling.to_str().expect("utf-8 temp path").to_string();
+        let stat = probe("stat", &[&dangling_str]);
+        assert_eq!(String::from_utf8_lossy(&stat.stdout).trim(), "l 0");
+        let missing = format!("{root_str}/missing");
+        let stat = probe("stat", &[&missing]);
+        assert_eq!(stat.status.code(), Some(3));
+        assert_eq!(probe_status_error(&stat).kind(), io::ErrorKind::NotFound);
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
