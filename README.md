@@ -18,9 +18,12 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   `[[remote_hosts]]` 原生浏览 SSH 主机与运行中的 Docker 容器（无需 sshfs）：远程一侧只运行一段
   标准 POSIX sh 探测脚本（经 `ssh` / `docker exec` 的 stdin 传入）。右键任意节点或空白区可打开
   文件操作菜单：新建文件/目录、重命名、删除（含确认框）、复制/剪切/粘贴、复制路径与刷新，
-  本地与远程行为一致；跨位置粘贴即为上传/下载（远程⇄远程经本地临时中转），文件按流式传输、
-  目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度（可随时取消，
-  取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
+  本地与远程行为一致；`Ctrl+点击` 多选、`Shift+点击` 按可见顺序框选范围，多选后删除/复制/剪切/
+  复制路径按批处理（逐项失败不中断、末尾汇总；删除确认框列出数量与前几个路径）。标题栏的
+  ⌕ 按钮打开行内名称过滤：大小写无关子串匹配已加载的树（命中项与其祖先保留并强制展开，清空后
+  恢复原展开状态，不产生新的目录扫描）。跨位置粘贴即为上传/下载（远程⇄远程经本地临时中转），
+  文件按流式传输、目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度
+  （可随时取消，取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
   从系统文件管理器把文件/目录拖放到文件树即可导入：落在目录行上导入该目录、其余位置导入当前根目录，
   远程位置走同一条上传通道；一次拖放最多 256 项、总量不超过传输上限，同名目标逐项拒绝
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
@@ -452,7 +455,15 @@ sh probe script through `ssh` / `docker exec` stdin, with bounded output and
 hard timeouts. Right-clicking a node (or the empty area below the tree, which
 targets the root directory) opens a file-operations menu — New File, New
 Folder, Rename, Delete (with a full-path confirmation), Copy, Cut, Copy Path,
-Paste and Refresh — that works identically locally and remotely. Paste also
+Paste and Refresh — that works identically locally and remotely. Rows
+multi-select with Ctrl+click (toggle) and Shift+click (range in visible
+order); a right-click inside the selection applies Delete/Copy/Cut/Copy Paths
+to the whole selection as one batch job (per-item failures never stop the
+rest and are summarized; the delete confirmation lists the count and the
+first few paths). The ⌕ header button opens an inline name filter over the
+loaded tree — case-insensitive substring, matches keep their ancestors
+(force-expanded while filtering), expansion is exactly restored on clear, and
+no new directory scans happen. Paste also
 crosses locations: a remote entry pasted locally downloads, a local entry
 pasted to a remote host uploads, and remote→remote relays through a unique
 local temp path. Files stream (never buffered whole, 512 MiB cap, group-kill

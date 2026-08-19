@@ -558,6 +558,8 @@ static TAB_RENAME_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-rename-input"));
 static SIDEBAR_DIALOG_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-dialog-input"));
+static SIDEBAR_FILTER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-filter-input"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 
@@ -1133,13 +1135,15 @@ enum SidebarMenuAction {
     Refresh,
 }
 
-/// Open file-tree context menu: the right-clicked node plus the pointer
-/// position frozen at press time (the floating panel anchors to it).
+/// Open file-tree context menu: the right-clicked node, the pointer position
+/// frozen at press time, and the rows the actions apply to — the selection
+/// when the click landed inside it, otherwise just the clicked row.
 #[derive(Clone, Debug)]
 struct SidebarMenuState {
     path: std::path::PathBuf,
     is_dir: bool,
     at: iced::Point,
+    targets: Vec<(std::path::PathBuf, bool)>,
 }
 
 /// What the sidebar's modal text input is collecting a name for.
@@ -1161,13 +1165,13 @@ struct SidebarDialogState {
     error: Option<String>,
 }
 
-/// Location-scoped sidebar clipboard. Paste within the same location copies
-/// or moves; paste across locations downloads, uploads, or relays.
+/// Location-scoped sidebar clipboard: one or more items (path, is_dir).
+/// Paste within the same location copies or moves each item; paste across
+/// locations downloads, uploads, or relays them one by one.
 #[derive(Clone, Debug)]
 struct FsClipboard {
     loc: remote_fs::FsLocation,
-    path: std::path::PathBuf,
-    is_dir: bool,
+    items: Vec<(std::path::PathBuf, bool)>,
     cut: bool,
 }
 
@@ -1330,10 +1334,10 @@ fn plan_drop_with_caps(
     })
 }
 
-/// One filesystem mutation handed to a worker task. `Move` is the cut-paste
-/// case: it clears the clipboard on success, `Rename` does not. `Transfer` is
-/// a cross-location copy (download/upload/relay), `TransferMove` the
-/// cross-location cut: transfer first, then delete the source.
+/// One filesystem mutation handed to a worker task. Single-item creates and
+/// renames stay dedicated; everything multi-item (paste batches, drop
+/// imports, deletes) runs as one sequential job so failures continue past and
+/// summarize, and one shared progress handle covers the whole batch.
 #[derive(Clone, Debug)]
 enum SidebarOp {
     CreateFile(std::path::PathBuf),
@@ -1342,34 +1346,19 @@ enum SidebarOp {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
-    Delete(std::path::PathBuf),
-    Copy {
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-    },
-    Move {
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-    },
-    Transfer {
+    /// Batch delete: continue past per-item errors, summarize at the end.
+    DeleteBatch(Vec<std::path::PathBuf>),
+    /// N items from `src_loc` into the current location, item by item:
+    /// same-location copy, or rename for a same-location cut; cross-location
+    /// `transfer()` (download/upload/relay) with the batch progress handle,
+    /// deleting a cut item's source only after its copy landed. `verb` is the
+    /// summary's past-tense word ("Imported" for drops, "Pasted"/"Moved" for
+    /// paste).
+    BatchTransfer {
         src_loc: remote_fs::FsLocation,
-        dst_loc: remote_fs::FsLocation,
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-        is_dir: bool,
-    },
-    TransferMove {
-        src_loc: remote_fs::FsLocation,
-        dst_loc: remote_fs::FsLocation,
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-        is_dir: bool,
-    },
-    /// A drag-and-drop import: N local items into the current location,
-    /// executed item by item (local copy or upload), sharing one progress
-    /// handle so the cancel button stops the whole burst.
-    Import {
         items: Vec<DropItem>,
+        cut: bool,
+        verb: &'static str,
     },
 }
 
@@ -2084,7 +2073,6 @@ enum Message {
     SidebarDragStart,
     SidebarDragMove(iced::Point),
     SidebarDragEnd,
-    SidebarToggleNode(std::path::PathBuf),
     SidebarInsertPath(std::path::PathBuf),
     SidebarGoParent,
     SidebarRefresh,
@@ -2098,6 +2086,13 @@ enum Message {
     /// Window-space pointer position while hovering the dock; the file-ops
     /// menu anchors to the last one seen before the right-press.
     SidebarPointerMoved(iced::Point),
+    /// Left-click on a tree row: modifier-aware (Ctrl toggles selection,
+    /// Shift ranges from the anchor, plain keeps the old toggle/insert).
+    SidebarRowClick(std::path::PathBuf, bool),
+    /// Toggle the inline tree filter row.
+    SidebarFilterToggle,
+    /// Live edit of the tree filter query.
+    SidebarFilterInput(String),
     /// Right-press on a tree row: open the file-ops menu for that node
     /// (path, is_dir).
     SidebarMenuOpen(std::path::PathBuf, bool),
@@ -3141,8 +3136,9 @@ struct Frost {
     sidebar_menu: Option<SidebarMenuState>,
     /// Modal New File / New Folder / Rename input of the file tree.
     sidebar_dialog: Option<SidebarDialogState>,
-    /// Delete confirmation target; the modal shows the full path before dispatch.
-    sidebar_delete_confirm: Option<std::path::PathBuf>,
+    /// Delete confirmation targets; the modal shows the count and the first
+    /// few full paths before dispatch.
+    sidebar_delete_confirm: Option<Vec<std::path::PathBuf>>,
     /// Location-scoped clipboard for sidebar Copy/Cut/Paste.
     sidebar_clipboard: Option<FsClipboard>,
     /// In-flight cross-location transfer (progress notice + cancel button).
@@ -3150,6 +3146,12 @@ struct Frost {
     /// Tree row under the pointer right now (path, is_dir) — the drop target
     /// hit-test runs against this, updated by the rows' enter/exit areas.
     sidebar_hovered_row: Option<(std::path::PathBuf, bool)>,
+    /// Multi-select state: insertion-ordered selected rows plus the
+    /// shift-click anchor (the last plain/ctrl-clicked row).
+    sidebar_selection: Vec<std::path::PathBuf>,
+    sidebar_selection_anchor: Option<std::path::PathBuf>,
+    /// Inline tree filter: Some(query) while the filter row is open.
+    sidebar_filter: Option<String>,
     /// Paths of the in-flight drop burst (iced delivers one event per path).
     sidebar_drop_burst: Vec<std::path::PathBuf>,
     /// Whether the burst's debounce task is already armed.
@@ -3380,6 +3382,9 @@ impl Frost {
             sidebar_clipboard: None,
             sidebar_transfer: None,
             sidebar_hovered_row: None,
+            sidebar_selection: Vec::new(),
+            sidebar_selection_anchor: None,
+            sidebar_filter: None,
             sidebar_drop_burst: Vec::new(),
             sidebar_drop_debounce_armed: false,
             sidebar_drop_hint: false,
@@ -3832,28 +3837,35 @@ impl Frost {
                 iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
             }
             SidebarMenuAction::Delete => {
-                self.sidebar_delete_confirm = Some(menu.path);
+                let paths: Vec<std::path::PathBuf> =
+                    menu.targets.iter().map(|(path, _)| path.clone()).collect();
+                self.sidebar_delete_confirm = Some(paths);
                 Task::none()
             }
             SidebarMenuAction::Copy | SidebarMenuAction::Cut => {
                 self.sidebar_clipboard = Some(FsClipboard {
                     loc: self.sidebar.location.clone(),
-                    path: menu.path,
-                    is_dir: menu.is_dir,
+                    items: menu.targets,
                     cut: action == SidebarMenuAction::Cut,
                 });
                 Task::none()
             }
             SidebarMenuAction::CopyPath => {
-                // The row's full path as plain text — remote rows keep the
-                // bare remote path, no prefix.
-                iced::clipboard::write(copy_path_payload(&menu.path))
+                // The rows' full paths as plain text, newline-joined — remote
+                // rows keep the bare remote path, no prefix.
+                let text = menu
+                    .targets
+                    .iter()
+                    .map(|(path, _)| copy_path_payload(path))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                iced::clipboard::write(text)
             }
             SidebarMenuAction::Paste => {
                 let Some(clipboard) = self.sidebar_clipboard.clone() else {
                     return Task::none();
                 };
-                let op = match sidebar_paste_op(&clipboard, &self.sidebar.location, &target_dir) {
+                let op = match sidebar_paste_op(&clipboard, &target_dir) {
                     Ok(op) => op,
                     Err(problem) => {
                         self.sidebar_notice = Some((problem, false));
@@ -3872,20 +3884,24 @@ impl Frost {
                         return Task::none();
                     }
                     let handle = remote_fs::TransferProgress::new();
-                    let total =
-                        if clipboard.loc == remote_fs::FsLocation::Local && !clipboard.is_dir {
-                            std::fs::metadata(&clipboard.path).ok().map(|m| m.len())
-                        } else {
-                            None
-                        };
-                    let ui = SidebarTransferUi {
-                        progress: handle.clone(),
-                        verb: transfer_verb(&clipboard.loc, &self.sidebar.location, false),
-                        name: clipboard
-                            .path
+                    // Uploads know the local total only for a single file.
+                    let total = match clipboard.items.as_slice() {
+                        [(path, false)] if clipboard.loc == remote_fs::FsLocation::Local => {
+                            std::fs::metadata(path).ok().map(|m| m.len())
+                        }
+                        _ => None,
+                    };
+                    let name = match clipboard.items.as_slice() {
+                        [(path, _)] => path
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default(),
+                        items => format!("{} items", items.len()),
+                    };
+                    let ui = SidebarTransferUi {
+                        progress: handle.clone(),
+                        verb: transfer_verb(&clipboard.loc, &self.sidebar.location, false),
+                        name,
                         total,
                     };
                     self.sidebar_notice = Some((ui.status_text(), true));
@@ -3963,20 +3979,68 @@ impl Frost {
         })
     }
 
+    /// The rows the tree currently shows (filter applied), in display order —
+    /// the shared basis for shift-click ranges and menu target lists.
+    fn sidebar_visible_rows(&self) -> Vec<(std::path::PathBuf, bool)> {
+        let filter = self
+            .sidebar_filter
+            .as_deref()
+            .and_then(|query| filter_match_set(&self.sidebar.root, query));
+        let mut rows = Vec::new();
+        visible_row_list(&self.sidebar.root, filter.as_ref(), &mut rows);
+        rows
+    }
+
+    /// Modifier-aware row click: Ctrl toggles the row's selection membership,
+    /// Shift ranges from the anchor within the visible order, a plain click
+    /// collapses the selection to the row and keeps the classic behavior
+    /// (dirs toggle, files type their path). Modifier clicks never toggle or
+    /// insert.
+    fn sidebar_row_click(&mut self, path: std::path::PathBuf, is_dir: bool) -> Task<Message> {
+        if self.modifiers.control() {
+            selection_toggle(&mut self.sidebar_selection, &path);
+            self.sidebar_selection_anchor = Some(path);
+            return Task::none();
+        }
+        if self.modifiers.shift() {
+            let rows = self.sidebar_visible_rows();
+            let anchor = self
+                .sidebar_selection_anchor
+                .clone()
+                .unwrap_or_else(|| path.clone());
+            let range = selection_range(&rows, &anchor, &path);
+            if !range.is_empty() {
+                self.sidebar_selection = range;
+            }
+            return Task::none();
+        }
+        self.sidebar_selection = vec![path.clone()];
+        self.sidebar_selection_anchor = Some(path.clone());
+        if is_dir {
+            if let Some(request) = self.sidebar.toggle_node(&path) {
+                return sidebar_load_task(request);
+            }
+            return Task::none();
+        }
+        self.update(Message::SidebarInsertPath(path))
+    }
+
     /// Run the confirmed deletion. The one absolute rule (never `/`) is
-    /// re-checked here, at dispatch time, not only in the menu layer.
+    /// re-checked per path here, at dispatch time, not only in the menu layer.
     fn confirm_sidebar_delete(&mut self) -> Task<Message> {
-        let Some(path) = self.sidebar_delete_confirm.take() else {
+        let Some(paths) = self.sidebar_delete_confirm.take() else {
             return Task::none();
         };
-        if let Err(problem) = remote_fs::validate_delete_path(&path) {
-            self.sidebar_notice = Some((problem, false));
-            return Task::none();
+        for path in &paths {
+            if let Err(problem) = remote_fs::validate_delete_path(path) {
+                self.sidebar_notice = Some((problem, false));
+                return Task::none();
+            }
         }
         sidebar_op_task(
             self.sidebar.location.clone(),
             self.sidebar.hosts_snapshot().to_vec(),
-            SidebarOp::Delete(path),
+            SidebarOp::DeleteBatch(paths),
             None,
         )
     }
@@ -10083,6 +10147,15 @@ impl Frost {
                         }
                         return Task::none();
                     }
+                    // The tree filter is non-modal: while its input is
+                    // focused the input captures typing; only Esc belongs to
+                    // the filter itself (close + clear) wherever focus sits.
+                    if self.sidebar_filter.is_some()
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.sidebar_filter = None;
+                        return Task::none();
+                    }
                     // Apart from the rename editor (whose keys the focused text
                     // input captures before this point), the tab menu is
                     // pointer-driven; keep every other keypress out of the PTY
@@ -10848,11 +10921,6 @@ impl Frost {
                     self.apply_config();
                 }
             }
-            Message::SidebarToggleNode(path) => {
-                if let Some(request) = self.sidebar.toggle_node(&path) {
-                    return sidebar_load_task(request);
-                }
-            }
             Message::SidebarInsertPath(path) => {
                 // Type the (shell-quoted) path into the active terminal so the
                 // sidebar doubles as a path picker.
@@ -10890,6 +10958,9 @@ impl Frost {
             }
             Message::SidebarSetLocation(location) => {
                 if location != self.sidebar.location {
+                    // A new location invalidates the selection's paths.
+                    self.sidebar_selection.clear();
+                    self.sidebar_selection_anchor = None;
                     let generation = self.sidebar.begin_location_change(location.clone());
                     let hosts = self.sidebar.hosts_snapshot().to_vec();
                     return Task::perform(
@@ -10908,13 +10979,32 @@ impl Frost {
             }
             Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
             Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
+            Message::SidebarRowClick(path, is_dir) => {
+                return self.sidebar_row_click(path, is_dir);
+            }
             Message::SidebarMenuOpen(path, is_dir) => {
+                // A right-click inside the selection targets the selection
+                // (in visible order); anywhere else the selection collapses
+                // to the clicked row.
+                let targets = match menu_targets(
+                    &self.sidebar_selection,
+                    &self.sidebar_visible_rows(),
+                    &path,
+                ) {
+                    Some(targets) => targets,
+                    None => {
+                        self.sidebar_selection = vec![path.clone()];
+                        self.sidebar_selection_anchor = Some(path.clone());
+                        vec![(path.clone(), is_dir)]
+                    }
+                };
                 self.sidebar_menu = Some(SidebarMenuState {
                     path,
                     is_dir,
                     // Freeze the anchor now; the pointer moves on toward the
                     // panel as soon as it appears.
                     at: self.sidebar_pointer,
+                    targets,
                 });
             }
             Message::SidebarMenuOpenRoot => {
@@ -10922,6 +11012,7 @@ impl Frost {
                     path: self.sidebar.current_dir.clone(),
                     is_dir: true,
                     at: self.sidebar_pointer,
+                    targets: vec![(self.sidebar.current_dir.clone(), true)],
                 });
             }
             Message::SidebarMenuClose => self.sidebar_menu = None,
@@ -10942,17 +11033,12 @@ impl Frost {
             Message::SidebarDeleteCancel => self.sidebar_delete_confirm = None,
             Message::SidebarOpFinished(report) => {
                 // Any transfer report retires the progress UI, success or not.
-                if matches!(
-                    report.op,
-                    SidebarOp::Transfer { .. }
-                        | SidebarOp::TransferMove { .. }
-                        | SidebarOp::Import { .. }
-                ) {
+                if matches!(report.op, SidebarOp::BatchTransfer { .. }) {
                     self.sidebar_transfer = None;
                 }
                 if report.cancelled {
                     // Neutral abort, not an error; the clipboard survives a
-                    // cancelled cut so nothing is silently consumed. An import
+                    // cancelled cut so nothing is silently consumed. A batch
                     // brings its own "cancelled after k of N" summary.
                     self.sidebar_notice = Some(
                         report
@@ -10965,14 +11051,14 @@ impl Frost {
                 } else {
                     match report.result {
                         Ok(()) => {
-                            // A completed cut-paste consumes the clipboard;
-                            // copies stay reusable. That holds for a
-                            // cross-location cut even when the source delete
-                            // came back as a warning.
-                            if matches!(
-                                report.op,
-                                SidebarOp::Move { .. } | SidebarOp::TransferMove { .. }
-                            ) {
+                            // A completed cut-paste consumes the clipboard —
+                            // but only when every item landed: a batch with
+                            // failures (error-styled summary) keeps it so the
+                            // un-pasted sources remain retryable.
+                            let clean_cut_batch =
+                                matches!(&report.op, SidebarOp::BatchTransfer { cut: true, .. })
+                                    && report.warning.as_ref().is_none_or(|(_, neutral)| *neutral);
+                            if clean_cut_batch {
                                 self.sidebar_clipboard = None;
                             }
                             self.sidebar_notice = report.warning;
@@ -11012,6 +11098,15 @@ impl Frost {
                     }
                 }
             }
+            Message::SidebarFilterToggle => {
+                if self.sidebar_filter.is_some() {
+                    self.sidebar_filter = None;
+                } else {
+                    self.sidebar_filter = Some(String::new());
+                    return iced::widget::operation::focus(SIDEBAR_FILTER_INPUT_ID.clone());
+                }
+            }
+            Message::SidebarFilterInput(query) => self.sidebar_filter = Some(query),
             Message::FileDropped(path) => {
                 // Over the files panel a drop is an import; everywhere else it
                 // keeps today's terminal payload behavior.
@@ -11085,7 +11180,12 @@ impl Frost {
                 return sidebar_op_task(
                     self.sidebar.location.clone(),
                     self.sidebar.hosts_snapshot().to_vec(),
-                    SidebarOp::Import { items: plan.items },
+                    SidebarOp::BatchTransfer {
+                        src_loc: remote_fs::FsLocation::Local,
+                        items: plan.items,
+                        cut: false,
+                        verb: "Imported",
+                    },
                     Some(handle),
                 );
             }
@@ -11968,6 +12068,48 @@ impl Frost {
         }
     }
 
+    /// File-tree row: the ghost button look, with an accent wash for selected
+    /// rows (kept on hover, slightly deeper).
+    fn sidebar_row_style(
+        &self,
+        selected: bool,
+    ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+        let base = self.c_panel();
+        let accent = self.c_accent();
+        let text = self.c_text();
+        move |_t, status| {
+            let bg = if selected {
+                Some(
+                    blend(
+                        base,
+                        accent,
+                        if status == button::Status::Hovered {
+                            0.34
+                        } else {
+                            0.24
+                        },
+                    )
+                    .into(),
+                )
+            } else {
+                match status {
+                    button::Status::Hovered => Some(blend(base, accent, 0.16).into()),
+                    _ => None,
+                }
+            };
+            button::Style {
+                background: bg,
+                text_color: text,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
     /// Flat button (toggles, file rows, "+ New"): transparent, accent on hover.
     fn ghost_btn_style(&self) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
         let base = self.c_panel();
@@ -12368,7 +12510,9 @@ impl Frost {
 
     /// Floating file-ops menu opened by right-clicking a file-tree row (or the
     /// empty area below the tree, which targets the root dir). Placement is
-    /// the tab menu's: pointer-anchored and clamped into the window.
+    /// the tab menu's: pointer-anchored and clamped into the window. With a
+    /// multi-row selection the node-scoped actions apply to all targets and
+    /// Rename/New are disabled (they only make sense for one row).
     fn sidebar_menu_view(&self, state: &SidebarMenuState) -> Element<'_, Message> {
         let row_btn = |label: &str, action: SidebarMenuAction| {
             button(text(label.to_string()).size(13))
@@ -12377,29 +12521,59 @@ impl Frost {
                 .width(Length::Fill)
                 .style(self.ghost_btn_style())
         };
-        let target = state.path.display().to_string();
-        let mut menu = column![text(target).size(12).style(text::secondary)].spacing(2);
-        menu = menu.push(row_btn("New File", SidebarMenuAction::NewFile));
-        menu = menu.push(row_btn("New Folder", SidebarMenuAction::NewFolder));
-        menu = menu.push(row_btn("Rename", SidebarMenuAction::Rename));
-        menu = menu.push(row_btn("Delete", SidebarMenuAction::Delete));
+        let disabled_btn = |label: &str| {
+            button(text(label.to_string()).size(13).style(text::secondary))
+                .padding([4, 10])
+                .width(Length::Fill)
+                .style(self.ghost_btn_style())
+        };
+        let multi = state.targets.len();
+        let header = if multi > 1 {
+            format!("{multi} items selected")
+        } else {
+            state.path.display().to_string()
+        };
+        let mut menu = column![text(header).size(12).style(text::secondary)].spacing(2);
+        if multi > 1 {
+            menu = menu.push(disabled_btn("New File"));
+            menu = menu.push(disabled_btn("New Folder"));
+            menu = menu.push(disabled_btn("Rename"));
+        } else {
+            menu = menu.push(row_btn("New File", SidebarMenuAction::NewFile));
+            menu = menu.push(row_btn("New Folder", SidebarMenuAction::NewFolder));
+            menu = menu.push(row_btn("Rename", SidebarMenuAction::Rename));
+        }
+        menu = menu.push(row_btn(
+            &format!(
+                "Delete {multi} {}",
+                if multi == 1 { "item" } else { "items" }
+            ),
+            SidebarMenuAction::Delete,
+        ));
         menu = menu.push(row_btn("Copy", SidebarMenuAction::Copy));
         menu = menu.push(row_btn("Cut", SidebarMenuAction::Cut));
-        menu = menu.push(row_btn("Copy Path", SidebarMenuAction::CopyPath));
+        menu = menu.push(row_btn(
+            if multi > 1 { "Copy Paths" } else { "Copy Path" },
+            SidebarMenuAction::CopyPath,
+        ));
         // Paste is offered for any clipboard; within one location it copies
         // or moves, across locations it downloads/uploads (remote→remote via
         // a local relay). The label previews what the click would do.
         let paste_clip = self.sidebar_clipboard.as_ref();
         let paste_label = match paste_clip {
             Some(clip) => {
-                let name = clip
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let suffix = if clip.is_dir { "/" } else { "" };
                 let verb = transfer_verb(&clip.loc, &self.sidebar.location, clip.cut);
-                format!("Paste {name}{suffix} ({verb})")
+                match clip.items.as_slice() {
+                    [(path, is_dir)] => {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let suffix = if *is_dir { "/" } else { "" };
+                        format!("Paste {name}{suffix} ({verb})")
+                    }
+                    items => format!("Paste {} items ({verb})", items.len()),
+                }
             }
             None => "Paste".to_string(),
         };
@@ -12499,19 +12673,39 @@ impl Frost {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
-    /// Centered modal confirming one deletion with the full path spelled out.
-    /// There is no trash and no undo, locally or over ssh.
-    fn sidebar_delete_confirm_view(&self, path: &std::path::Path) -> Element<'_, Message> {
-        let body = column![
-            text("Delete permanently?").size(14),
-            text(path.display().to_string())
-                .size(12)
-                .wrapping(text::Wrapping::Word)
-                .style(text::secondary),
+    /// Centered modal confirming a deletion: the count up front, the first
+    /// few full paths spelled out. There is no trash and no undo, locally or
+    /// over ssh.
+    fn sidebar_delete_confirm_view(&self, paths: &[std::path::PathBuf]) -> Element<'_, Message> {
+        let count = paths.len();
+        let title = if count == 1 {
+            "Delete permanently?".to_string()
+        } else {
+            format!("Delete {count} items permanently?")
+        };
+        let mut body = column![text(title).size(14)].spacing(10);
+        for path in paths.iter().take(5) {
+            body = body.push(
+                text(path.display().to_string())
+                    .size(12)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
+            );
+        }
+        if count > 5 {
+            body = body.push(
+                text(format!("…and {} more", count - 5))
+                    .size(12)
+                    .style(text::secondary),
+            );
+        }
+        body = body.push(
             text("Directories are removed with everything inside them. This cannot be undone.")
                 .size(12)
                 .wrapping(text::Wrapping::Word)
                 .style(text::danger),
+        );
+        body = body.push(
             row![
                 button(text("Cancel").size(13))
                     .on_press(Message::SidebarDeleteCancel)
@@ -12525,8 +12719,7 @@ impl Frost {
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
-        ]
-        .spacing(10);
+        );
         let panel = container(body)
             .width(Length::Fixed(380.0))
             .padding(14)
@@ -14080,6 +14273,11 @@ impl Frost {
         if self.sidebar.current_dir.parent().is_some() {
             up = up.on_press(Message::SidebarGoParent);
         }
+        let filter_active = self.sidebar_filter.is_some();
+        let filter_btn = button(text("⌕").size(12))
+            .on_press(Message::SidebarFilterToggle)
+            .padding([2, 6])
+            .style(self.tab_btn_style(filter_active));
         let header = row![
             up,
             text(title)
@@ -14089,6 +14287,7 @@ impl Frost {
                     ..iced::Font::DEFAULT
                 })
                 .width(Length::Fill),
+            filter_btn,
             button(text("↻").size(12))
                 .on_press(Message::SidebarRefresh)
                 .padding([2, 6])
@@ -14097,6 +14296,20 @@ impl Frost {
         .spacing(4)
         .align_y(iced::Alignment::Center);
         let mut rows: Vec<Element<'_, Message>> = vec![container(header).padding([4, 6]).into()];
+        // The inline filter row: substring match over the loaded tree,
+        // local and remote alike; Esc or the toggle closes and clears it.
+        if let Some(query) = &self.sidebar_filter {
+            rows.push(
+                container(
+                    text_input("Filter names…", query)
+                        .id(SIDEBAR_FILTER_INPUT_ID.clone())
+                        .on_input(Message::SidebarFilterInput)
+                        .size(12),
+                )
+                .padding([2, 6])
+                .into(),
+            );
+        }
         // The location picker only exists once at least one remote host is
         // configured; with none, "Local" would be the only entry.
         if !self.config.remote_hosts.is_empty() {
@@ -14181,8 +14394,27 @@ impl Frost {
             ),
             _ => {}
         }
+        // The filter's match set is computed once per frame and shared by the
+        // row walk below; an empty match set under a non-empty query gets its
+        // own status row instead of a bare void.
+        let filter = self
+            .sidebar_filter
+            .as_deref()
+            .and_then(|query| filter_match_set(&self.sidebar.root, query));
+        if filter.as_ref().is_some_and(|set| set.is_empty()) {
+            rows.push(
+                container(text("No matches").size(11).style(text::secondary))
+                    .padding([4, 8])
+                    .into(),
+            );
+        }
         for child in &self.sidebar.root.children {
-            self.collect_sidebar_nodes(child, 0, &mut rows);
+            if let Some(set) = &filter {
+                if !set.contains(&child.path) {
+                    continue;
+                }
+            }
+            self.collect_sidebar_nodes(child, 0, filter.as_ref(), &mut rows);
         }
         let list = iced::widget::Column::with_children(rows).spacing(1);
         let list: Element<'_, Message> = scrollable(list).height(Length::Fill).into();
@@ -14281,13 +14513,22 @@ impl Frost {
             .into()
     }
 
-    /// Recursively flatten a file-tree node (and expanded descendants) into rows.
+    /// Recursively flatten a file-tree node (and expanded descendants) into
+    /// rows. With a filter match set, only matches and their (force-expanded)
+    /// ancestors render; expansion flags are never mutated, so clearing the
+    /// filter restores the pre-filter tree exactly.
+    /// rows. With a filter match set, only matches and their (force-expanded)
+    /// ancestors render; expansion flags are never mutated, so clearing the
+    /// filter restores the pre-filter tree exactly.
+    #[allow(clippy::too_many_arguments)]
     fn collect_sidebar_nodes<'a>(
         &self,
         node: &'a sidebar::FileTreeNode,
         depth: usize,
+        filter: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
         out: &mut Vec<Element<'a, Message>>,
     ) {
+        let filtering = filter.is_some();
         let indent = 6.0 + depth as f32 * 12.0;
         let icon = if !node.is_dir {
             "·"
@@ -14296,7 +14537,7 @@ impl Frost {
                 sidebar::DirectoryState::Loading => "◌",
                 sidebar::DirectoryState::Error(_) => "!",
                 sidebar::DirectoryState::Unloaded | sidebar::DirectoryState::Loaded => {
-                    if node.expanded {
+                    if node.expanded || filtering {
                         "▾"
                     } else {
                         "▸"
@@ -14310,21 +14551,17 @@ impl Frost {
             text(node.name.clone()).size(12),
         ]
         .align_y(iced::Alignment::Center);
-        let msg = if node.is_dir {
-            Message::SidebarToggleNode(node.path.clone())
-        } else {
-            Message::SidebarInsertPath(node.path.clone())
-        };
+        let selected = self.sidebar_selection.contains(&node.path);
         let row_button = button(label)
-            .on_press(msg)
+            .on_press(Message::SidebarRowClick(node.path.clone(), node.is_dir))
             .width(Length::Fill)
             .padding([1, 2])
-            .style(self.ghost_btn_style());
-        // Left-click keeps its old meaning (toggle/insert); right-click opens
-        // the file-ops menu for this node. Enter/exit track the row under the
-        // pointer so a file drop can be hit-tested without layout geometry —
-        // row rects aren't knowable at view-build time, but the widget tree
-        // knows exactly which row the pointer is over.
+            .style(self.sidebar_row_style(selected));
+        // Left-click is modifier-aware (selection / toggle / insert);
+        // right-click opens the file-ops menu for this node. Enter/exit track
+        // the row under the pointer so a file drop can be hit-tested without
+        // layout geometry — row rects aren't knowable at view-build time, but
+        // the widget tree knows exactly which row the pointer is over.
         out.push(
             mouse_area(row_button)
                 .on_right_press(Message::SidebarMenuOpen(node.path.clone(), node.is_dir))
@@ -14335,7 +14572,7 @@ impl Frost {
                 .on_exit(Message::SidebarRowHover(None))
                 .into(),
         );
-        if node.is_dir && node.expanded {
+        if node.is_dir && (node.expanded || filtering) {
             if let sidebar::DirectoryState::Error(error) = &node.state {
                 out.push(
                     container(
@@ -14349,7 +14586,12 @@ impl Frost {
                 );
             }
             for child in &node.children {
-                self.collect_sidebar_nodes(child, depth + 1, out);
+                if let Some(set) = filter {
+                    if !set.contains(&child.path) {
+                        continue;
+                    }
+                }
+                self.collect_sidebar_nodes(child, depth + 1, filter, out);
             }
         }
     }
@@ -17544,6 +17786,92 @@ fn sidebar_load_task(request: sidebar::DirectoryRequest) -> Task<Message> {
     )
 }
 
+/// The set of paths a filter query shows: rows whose name contains the query
+/// (case-insensitive), plus every ancestor of a match (ancestors are
+/// force-expanded while filtering). `None` for an empty query — identity, no
+/// filtering. Pure over the loaded tree; never scans the filesystem.
+fn filter_match_set(
+    root: &sidebar::FileTreeNode,
+    query: &str,
+) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    fn walk(
+        node: &sidebar::FileTreeNode,
+        query: &str,
+        ancestors: &mut Vec<std::path::PathBuf>,
+        set: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    ) {
+        for child in &node.children {
+            let hits = child.name.to_lowercase().contains(query);
+            if hits {
+                set.extend(ancestors.iter().cloned());
+                set.insert(child.path.clone());
+            }
+            if child.is_dir && !child.children.is_empty() {
+                ancestors.push(child.path.clone());
+                walk(child, query, ancestors, set);
+                ancestors.pop();
+            }
+        }
+    }
+    let mut set = std::collections::BTreeSet::new();
+    walk(root, &query, &mut Vec::new(), &mut set);
+    Some(set)
+}
+
+/// The rows the files panel shows under `node`, in display order: expanded
+/// directories recursed; while a filter is active, only the match set and
+/// force-expanded ancestors appear. Shared by rendering, range selection, and
+/// the menu's target list so all three agree on "visible order".
+fn visible_row_list(
+    node: &sidebar::FileTreeNode,
+    filter: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+    out: &mut Vec<(std::path::PathBuf, bool)>,
+) {
+    for child in &node.children {
+        if let Some(set) = filter {
+            if !set.contains(&child.path) {
+                continue;
+            }
+        }
+        out.push((child.path.clone(), child.is_dir));
+        if child.is_dir && (child.expanded || filter.is_some()) {
+            visible_row_list(child, filter, out);
+        }
+    }
+}
+
+/// Toggle one path in the (insertion-ordered) selection.
+fn selection_toggle(selection: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+    if let Some(index) = selection.iter().position(|entry| entry == path) {
+        selection.remove(index);
+    } else {
+        selection.push(path.to_path_buf());
+    }
+}
+
+/// The inclusive range between `anchor` and `target` within the visible row
+/// order — shift-click semantics. Empty when either endpoint is off-list.
+fn selection_range(
+    rows: &[(std::path::PathBuf, bool)],
+    anchor: &std::path::Path,
+    target: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let anchor_index = rows.iter().position(|(path, _)| path == anchor);
+    let target_index = rows.iter().position(|(path, _)| path == target);
+    let (Some(from), Some(to)) = (anchor_index, target_index) else {
+        return Vec::new();
+    };
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    rows[from..=to]
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// The menu/notice verb for a paste: copy/move within one location,
 /// download/upload (or a relay) across locations.
 fn transfer_verb(
@@ -17568,42 +17896,54 @@ fn transfer_verb(
 /// Turn the clipboard into the op a paste should run. Same-location keeps the
 /// copy/move semantics; cross-location becomes a download, an upload, or a
 /// remote→remote relay, with a cut meaning transfer-then-delete-source.
+/// Turn the clipboard into the op a paste should run: one batch job over the
+/// clipboard's items, dst = target_dir.join(name) per item. Same-location
+/// copies/renames and cross-location transfers share the sequential
+/// per-item machinery (per-item AlreadyExists refusal, continue past
+/// failures, summary at the end); a cut deletes a source only after its own
+/// copy landed.
 fn sidebar_paste_op(
     clipboard: &FsClipboard,
-    current: &remote_fs::FsLocation,
     target_dir: &std::path::Path,
 ) -> Result<SidebarOp, String> {
-    let Some(dst) = remote_fs::paste_destination(target_dir, &clipboard.path) else {
-        return Err("That source has no file name to paste".to_string());
-    };
-    let src = clipboard.path.clone();
-    if clipboard.loc == *current {
-        return Ok(if clipboard.cut {
-            SidebarOp::Move { src, dst }
-        } else {
-            SidebarOp::Copy { src, dst }
+    let mut items = Vec::with_capacity(clipboard.items.len());
+    for (src, is_dir) in &clipboard.items {
+        let Some(dst) = remote_fs::paste_destination(target_dir, src) else {
+            return Err("A clipboard source has no file name to paste".to_string());
+        };
+        items.push(DropItem {
+            src: src.clone(),
+            dst,
+            is_dir: *is_dir,
+            error: None,
         });
     }
-    let src_loc = clipboard.loc.clone();
-    let dst_loc = current.clone();
-    let is_dir = clipboard.is_dir;
-    Ok(if clipboard.cut {
-        SidebarOp::TransferMove {
-            src_loc,
-            dst_loc,
-            src,
-            dst,
-            is_dir,
-        }
-    } else {
-        SidebarOp::Transfer {
-            src_loc,
-            dst_loc,
-            src,
-            dst,
-            is_dir,
-        }
+    Ok(SidebarOp::BatchTransfer {
+        src_loc: clipboard.loc.clone(),
+        items,
+        cut: clipboard.cut,
+        verb: if clipboard.cut { "Moved" } else { "Pasted" },
     })
+}
+
+/// The rows a row-opened menu applies to: the selection (in visible order)
+/// when the click landed inside a multi-row selection, otherwise `None` and
+/// the caller collapses the selection to the clicked row.
+fn menu_targets(
+    selection: &[std::path::PathBuf],
+    visible: &[(std::path::PathBuf, bool)],
+    clicked: &std::path::Path,
+) -> Option<Vec<(std::path::PathBuf, bool)>> {
+    if selection.len() <= 1 || !selection.iter().any(|entry| entry == clicked) {
+        return None;
+    }
+    Some(
+        visible
+            .iter()
+            .filter(|(path, _)| selection.contains(path))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// The text "Copy Path" puts on the host clipboard: the row's full path,
@@ -17653,14 +17993,6 @@ fn run_sidebar_op(
     bool,
     std::io::Result<()>,
 ) {
-    /// A report counts as cancelled only when the user asked AND the transfer
-    /// actually failed because of it — cancel racing completion is a no-op.
-    fn was_cancelled(
-        progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
-        result: &std::io::Result<()>,
-    ) -> bool {
-        progress.is_some_and(|progress| progress.is_cancelled()) && result.is_err()
-    }
     match op {
         SidebarOp::CreateFile(path) => (
             location.clone(),
@@ -17674,78 +18006,48 @@ fn run_sidebar_op(
             false,
             remote_fs::create_dir(location, hosts, path),
         ),
-        SidebarOp::Rename { src, dst } | SidebarOp::Move { src, dst } => (
+        SidebarOp::Rename { src, dst } => (
             location.clone(),
             None,
             false,
             remote_fs::rename(location, hosts, src, dst),
         ),
-        SidebarOp::Delete(path) => (
-            location.clone(),
-            None,
-            false,
-            remote_fs::delete(location, hosts, path),
-        ),
-        SidebarOp::Copy { src, dst } => (
-            location.clone(),
-            None,
-            false,
-            remote_fs::copy(location, hosts, src, dst),
-        ),
-        SidebarOp::Transfer {
-            src_loc,
-            dst_loc,
-            src,
-            dst,
-            is_dir,
-        } => {
-            let result = remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir, progress);
-            let cancelled = was_cancelled(progress, &result);
-            if cancelled {
-                cleanup_after_cancel(dst_loc, hosts, dst, *is_dir);
-            }
-            (dst_loc.clone(), None, cancelled, result)
-        }
-        SidebarOp::TransferMove {
-            src_loc,
-            dst_loc,
-            src,
-            dst,
-            is_dir,
-        } => {
-            // Cut across locations = copy, then delete the source. A failed
-            // transfer never touches the source; a failed delete after a
-            // successful transfer is a partial success, reported as a warning.
-            if let Err(error) =
-                remote_fs::transfer(src_loc, dst_loc, hosts, src, dst, *is_dir, progress)
-            {
-                let result = Err(error);
-                let cancelled = was_cancelled(progress, &result);
-                if cancelled {
-                    cleanup_after_cancel(dst_loc, hosts, dst, *is_dir);
+        SidebarOp::DeleteBatch(paths) => {
+            // Continue past per-item errors; the summary names the first.
+            let total = paths.len();
+            let mut done = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            for path in paths {
+                match remote_fs::delete(location, hosts, path) {
+                    Ok(()) => done += 1,
+                    Err(error) => failures.push(format!("{}: {error}", path.display())),
                 }
-                return (dst_loc.clone(), None, cancelled, result);
             }
-            match remote_fs::delete(src_loc, hosts, src) {
-                Ok(()) => (dst_loc.clone(), None, false, Ok(())),
-                Err(error) => (
-                    dst_loc.clone(),
-                    Some((
-                        format!(
-                            "Copied to {}, but deleting the source failed: {error}",
-                            dst.display()
-                        ),
-                        false,
-                    )),
+            let notice = if failures.is_empty() {
+                (format!("Deleted {done} items"), true)
+            } else {
+                (
+                    format!(
+                        "{} of {total} items failed: {}",
+                        failures.len(),
+                        failures[0]
+                    ),
                     false,
-                    Ok(()),
-                ),
-            }
+                )
+            };
+            (location.clone(), Some(notice), false, Ok(()))
         }
-        SidebarOp::Import { items } => {
-            // One drop is one user action: items run sequentially through the
-            // same copy/transfer machinery, sharing the burst's progress
-            // handle; a cancel stops the remaining items.
+        SidebarOp::BatchTransfer {
+            src_loc,
+            items,
+            cut,
+            verb,
+        } => {
+            // Sequential per item: same-location copies (renames for a cut),
+            // cross-location transfers through the streaming machinery. A cut
+            // deletes a source only after its own copy landed; a cancel stops
+            // the remaining items and tidies the in-flight one.
+            let same_location = *src_loc == *location;
             let total = items.len();
             let mut done = 0usize;
             let mut failures: Vec<String> = Vec::new();
@@ -17753,10 +18055,7 @@ fn run_sidebar_op(
                 if progress.is_some_and(|progress| progress.is_cancelled()) {
                     return (
                         location.clone(),
-                        Some((
-                            format!("Import cancelled after {done} of {total} items"),
-                            true,
-                        )),
+                        Some((format!("Cancelled after {done} of {total} items"), true)),
                         true,
                         Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
@@ -17768,11 +18067,15 @@ fn run_sidebar_op(
                     failures.push(error.clone());
                     continue;
                 }
-                let result = if *location == remote_fs::FsLocation::Local {
-                    remote_fs::copy(location, hosts, &item.src, &item.dst)
+                let result = if same_location {
+                    if *cut {
+                        remote_fs::rename(location, hosts, &item.src, &item.dst)
+                    } else {
+                        remote_fs::copy(location, hosts, &item.src, &item.dst)
+                    }
                 } else {
                     remote_fs::transfer(
-                        &remote_fs::FsLocation::Local,
+                        src_loc,
                         location,
                         hosts,
                         &item.src,
@@ -17782,12 +18085,37 @@ fn run_sidebar_op(
                     )
                 };
                 match result {
-                    Ok(()) => done += 1,
-                    Err(error) => failures.push(format!("{}: {error}", item.src.display())),
+                    Ok(()) => {
+                        done += 1;
+                        // Cross-location cut: delete the source only now that
+                        // its copy is complete.
+                        if *cut && !same_location {
+                            if let Err(error) = remote_fs::delete(src_loc, hosts, &item.src) {
+                                failures.push(format!(
+                                    "{}: copied, but deleting the source failed: {error}",
+                                    item.src.display()
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if progress.is_some_and(|progress| progress.is_cancelled()) {
+                            // The watchdog killed this item's stream; tidy a
+                            // partial remote extraction if there is one.
+                            cleanup_after_cancel(location, hosts, &item.dst, item.is_dir);
+                            return (
+                                location.clone(),
+                                Some((format!("Cancelled after {done} of {total} items"), true)),
+                                true,
+                                Err(error),
+                            );
+                        }
+                        failures.push(format!("{}: {error}", item.src.display()));
+                    }
                 }
             }
             let notice = if failures.is_empty() {
-                (format!("Imported {done} items"), true)
+                (format!("{verb} {done} items"), true)
             } else {
                 (
                     format!(
@@ -20841,85 +21169,326 @@ mod tests {
 
     fn sidebar_clipboard(
         loc: remote_fs::FsLocation,
-        path: &std::path::Path,
-        is_dir: bool,
+        items: Vec<(&std::path::Path, bool)>,
         cut: bool,
     ) -> FsClipboard {
         FsClipboard {
             loc,
-            path: path.to_path_buf(),
-            is_dir,
+            items: items
+                .into_iter()
+                .map(|(path, is_dir)| (path.to_path_buf(), is_dir))
+                .collect(),
             cut,
         }
     }
 
     #[test]
-    fn sidebar_paste_op_dispatches_same_and_cross_location() {
+    fn sidebar_paste_op_builds_one_batch_per_clipboard() {
         use remote_fs::FsLocation;
         let dir = std::path::Path::new("/target");
-        // Same location keeps the copy/move semantics.
+        // Same- and cross-location both become one BatchTransfer; the same-vs-
+        // cross decision is the executor's (it compares src_loc to the tree's
+        // location at run time).
         let clip = sidebar_clipboard(
             FsLocation::Local,
-            std::path::Path::new("/a/file.txt"),
-            false,
+            vec![
+                (std::path::Path::new("/a/file.txt"), false),
+                (std::path::Path::new("/a/packed"), true),
+            ],
             false,
         );
-        match sidebar_paste_op(&clip, &FsLocation::Local, dir) {
-            Ok(SidebarOp::Copy { src, dst }) => {
-                assert_eq!(src, std::path::PathBuf::from("/a/file.txt"));
-                assert_eq!(dst, std::path::PathBuf::from("/target/file.txt"));
-            }
-            other => panic!("expected Copy, got {other:?}"),
-        }
-        let clip = sidebar_clipboard(
-            FsLocation::Local,
-            std::path::Path::new("/a/file.txt"),
-            false,
-            true,
-        );
-        assert!(matches!(
-            sidebar_paste_op(&clip, &FsLocation::Local, dir),
-            Ok(SidebarOp::Move { .. })
-        ));
-        // Cross-location becomes a transfer: upload, download, or relay,
-        // with a cut meaning transfer-then-delete-source.
-        match sidebar_paste_op(&clip, &FsLocation::Remote(0), dir) {
-            Ok(SidebarOp::TransferMove {
+        match sidebar_paste_op(&clip, dir) {
+            Ok(SidebarOp::BatchTransfer {
                 src_loc,
-                dst_loc,
-                dst,
-                is_dir,
+                items,
+                cut,
                 ..
             }) => {
                 assert_eq!(src_loc, FsLocation::Local);
-                assert_eq!(dst_loc, FsLocation::Remote(0));
-                assert_eq!(dst, std::path::PathBuf::from("/target/file.txt"));
-                assert!(!is_dir);
+                assert!(!cut);
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].dst, std::path::PathBuf::from("/target/file.txt"));
+                assert_eq!(items[1].dst, std::path::PathBuf::from("/target/packed"));
+                assert!(items[1].is_dir);
             }
-            other => panic!("expected TransferMove, got {other:?}"),
+            other => panic!("expected BatchTransfer, got {other:?}"),
         }
+        // Cut is carried through; a nameless source refuses the whole paste.
         let clip = sidebar_clipboard(
             FsLocation::Remote(1),
-            std::path::Path::new("/src/packed"),
+            vec![(std::path::Path::new("/src/packed"), true)],
             true,
+        );
+        match sidebar_paste_op(&clip, dir) {
+            Ok(SidebarOp::BatchTransfer { src_loc, cut, .. }) => {
+                assert_eq!(src_loc, FsLocation::Remote(1));
+                assert!(cut);
+            }
+            other => panic!("expected BatchTransfer, got {other:?}"),
+        }
+        let clip = sidebar_clipboard(
+            FsLocation::Local,
+            vec![(std::path::Path::new("/"), true)],
             false,
         );
-        match sidebar_paste_op(&clip, &FsLocation::Local, dir) {
-            Ok(SidebarOp::Transfer {
-                src_loc,
-                dst_loc,
-                is_dir,
-                ..
-            }) => {
-                assert_eq!(src_loc, FsLocation::Remote(1));
-                assert_eq!(dst_loc, FsLocation::Local);
-                assert!(is_dir);
-            }
-            other => panic!("expected Transfer, got {other:?}"),
+        assert!(sidebar_paste_op(&clip, dir).is_err());
+    }
+
+    #[test]
+    fn batch_transfer_cut_moves_items_and_keeps_failures() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&dst_dir).expect("create test tree");
+        std::fs::write(root.join("one.txt"), b"1").expect("write");
+        std::fs::write(root.join("two.txt"), b"2").expect("write");
+        // The second item's destination is taken: it fails, the first still
+        // moves, and a cut only ever removes a source that was copied first.
+        std::fs::write(dst_dir.join("two.txt"), b"taken").expect("write taken");
+        let items = vec![
+            DropItem {
+                src: root.join("one.txt"),
+                dst: dst_dir.join("one.txt"),
+                is_dir: false,
+                error: None,
+            },
+            DropItem {
+                src: root.join("two.txt"),
+                dst: dst_dir.join("two.txt"),
+                is_dir: false,
+                error: None,
+            },
+        ];
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items,
+            cut: true,
+            verb: "Moved",
+        };
+        let (changed, notice, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(result.is_ok());
+        assert!(!cancelled);
+        assert_eq!(changed, FsLocation::Local);
+        assert_eq!(
+            std::fs::read(dst_dir.join("one.txt")).expect("read moved"),
+            b"1"
+        );
+        assert!(!root.join("one.txt").exists(), "moved source is deleted");
+        assert_eq!(
+            std::fs::read(root.join("two.txt")).expect("source kept"),
+            b"2",
+            "a failed item keeps its source"
+        );
+        let (text, neutral) = notice.expect("summary");
+        assert!(text.starts_with("1 of 2 items failed"), "{text}");
+        assert!(!neutral);
+
+        // Cross-location cut against an unknown host fails the item and keeps
+        // the source — the delete only runs after a landed copy.
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Remote(9),
+            items: vec![DropItem {
+                src: std::path::PathBuf::from("/src/file.txt"),
+                dst: std::path::PathBuf::from("/dst/file.txt"),
+                is_dir: false,
+                error: None,
+            }],
+            cut: true,
+            verb: "Moved",
+        };
+        let (_changed, notice, cancelled, result) =
+            run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
+        assert!(result.is_ok(), "batch errors are per-item, not fatal");
+        assert!(!cancelled);
+        let (text, _) = notice.expect("summary");
+        assert!(text.starts_with("1 of 1 items failed"), "{text}");
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn batch_transfer_cancel_stops_the_remaining_items() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&dst_dir).expect("create test tree");
+        std::fs::write(root.join("one.txt"), b"1").expect("write");
+        let items = vec![DropItem {
+            src: root.join("one.txt"),
+            dst: dst_dir.join("one.txt"),
+            is_dir: false,
+            error: None,
+        }];
+        // A flag already set stops the batch before item one: cancelled, not
+        // failed, nothing copied.
+        let progress = remote_fs::TransferProgress::new();
+        progress.cancel();
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items,
+            cut: false,
+            verb: "Pasted",
+        };
+        let (_changed, notice, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(cancelled);
+        assert!(result.is_err());
+        assert!(!dst_dir.join("one.txt").exists());
+        assert!(notice.expect("cancel summary").0.contains("Cancelled"));
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn batch_delete_continues_past_errors_and_summarizes() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test tree");
+        std::fs::write(root.join("one.txt"), b"1").expect("write");
+        let op = SidebarOp::DeleteBatch(vec![
+            root.join("one.txt"),
+            root.join("gone.txt"),
+            root.join("two.txt"),
+        ]);
+        std::fs::write(root.join("two.txt"), b"2").expect("write");
+        let (changed, notice, cancelled, result) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(result.is_ok());
+        assert!(!cancelled);
+        assert_eq!(changed, FsLocation::Local);
+        assert!(!root.join("one.txt").exists());
+        assert!(!root.join("two.txt").exists());
+        let (text, neutral) = notice.expect("summary");
+        assert!(text.starts_with("1 of 3 items failed"), "{text}");
+        assert!(!neutral);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn selection_toggle_and_range_follow_the_visible_order() {
+        let path = |name: &str| std::path::PathBuf::from(format!("/r/{name}"));
+        let mut selection = vec![path("a")];
+        selection_toggle(&mut selection, &path("c"));
+        assert_eq!(selection, vec![path("a"), path("c")]);
+        selection_toggle(&mut selection, &path("a"));
+        assert_eq!(selection, vec![path("c")]);
+
+        let rows: Vec<(std::path::PathBuf, bool)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| (path(name), false))
+            .collect();
+        assert_eq!(
+            selection_range(&rows, &path("b"), &path("d")),
+            vec![path("b"), path("c"), path("d")]
+        );
+        // Backwards ranges normalize; an off-list endpoint yields nothing.
+        assert_eq!(
+            selection_range(&rows, &path("d"), &path("b")),
+            vec![path("b"), path("c"), path("d")]
+        );
+        assert!(selection_range(&rows, &path("x"), &path("b")).is_empty());
+    }
+
+    #[test]
+    fn menu_targets_the_selection_when_clicked_inside_it() {
+        let path = |name: &str| std::path::PathBuf::from(format!("/r/{name}"));
+        let selection = vec![path("b"), path("c")];
+        let visible: Vec<(std::path::PathBuf, bool)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| (path(n), false))
+            .collect();
+        // Inside: the selection, in visible (not insertion) order.
+        let targets = menu_targets(&selection, &visible, &path("c")).expect("inside the selection");
+        assert_eq!(targets, vec![(path("b"), false), (path("c"), false)]);
+        // Outside: just the clicked row.
+        assert_eq!(menu_targets(&selection, &visible, &path("a")), None);
+        // A one-row selection never counts as "the selection".
+        assert_eq!(menu_targets(&[path("b")], &visible, &path("b")), None);
+    }
+
+    /// A loaded tree: top.txt + b_dir/b.txt + a_dir/{sub.txt,deep/deep.txt}.
+    /// a_dir and deep start expanded; `collapse_a` re-collapses a_dir while
+    /// keeping its loaded children — the filter's force-expand case.
+    fn loaded_sidebar_tree(collapse_a: bool) -> (sidebar::Sidebar, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("frost-sel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("a_dir").join("deep")).expect("tree");
+        std::fs::create_dir_all(root.join("b_dir")).expect("tree");
+        std::fs::write(root.join("top.txt"), b"t").expect("write");
+        std::fs::write(root.join("a_dir").join("sub.txt"), b"s").expect("write");
+        std::fs::write(root.join("a_dir").join("deep").join("deep.txt"), b"d").expect("write");
+        std::fs::write(root.join("b_dir").join("b.txt"), b"b").expect("write");
+        let mut sidebar = sidebar::Sidebar::new();
+        let request = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(sidebar::load_directory(request)));
+        let request = sidebar
+            .toggle_node(&root.join("a_dir"))
+            .expect("expand a_dir");
+        assert!(sidebar.apply_load(sidebar::load_directory(request)));
+        let request = sidebar
+            .toggle_node(&root.join("a_dir").join("deep"))
+            .expect("expand deep");
+        assert!(sidebar.apply_load(sidebar::load_directory(request)));
+        if collapse_a {
+            assert!(sidebar.toggle_node(&root.join("a_dir")).is_none());
         }
-        // A nameless source ("/") can never be pasted anywhere.
-        let clip = sidebar_clipboard(FsLocation::Local, std::path::Path::new("/"), true, false);
-        assert!(sidebar_paste_op(&clip, &FsLocation::Local, dir).is_err());
+        (sidebar, root)
+    }
+
+    #[test]
+    fn filter_match_set_keeps_matches_and_ancestors() {
+        let (sidebar, root) = loaded_sidebar_tree(false);
+        // Case-insensitive substring; a deep match pulls its ancestors in.
+        let set = filter_match_set(&sidebar.root, "DEEP").expect("filtering");
+        assert!(set.contains(&root.join("a_dir")));
+        assert!(set.contains(&root.join("a_dir").join("deep")));
+        assert!(set.contains(&root.join("a_dir").join("deep").join("deep.txt")));
+        assert!(!set.contains(&root.join("a_dir").join("sub.txt")));
+        assert!(!set.contains(&root.join("b_dir")));
+        // Empty query is identity: no filtering at all.
+        assert!(filter_match_set(&sidebar.root, "").is_none());
+        assert!(filter_match_set(&sidebar.root, "  ").is_none());
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn visible_row_list_filters_and_force_expands_ancestors() {
+        let (sidebar, root) = loaded_sidebar_tree(false);
+        let mut rows = Vec::new();
+        visible_row_list(&sidebar.root, None, &mut rows);
+        let names: Vec<String> = rows
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a_dir", "deep", "deep.txt", "sub.txt", "b_dir", "top.txt"]
+        );
+        std::fs::remove_dir_all(root).expect("remove test tree");
+
+        // Filtered: only the match chain — a_dir is collapsed but loaded, and
+        // the filter force-expands it to surface the deep match.
+        let (sidebar, root) = loaded_sidebar_tree(true);
+        let set = filter_match_set(&sidebar.root, "deep");
+        let mut rows = Vec::new();
+        visible_row_list(&sidebar.root, set.as_ref(), &mut rows);
+        let names: Vec<String> = rows
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a_dir", "deep", "deep.txt"]);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn copy_path_payload_is_the_plain_full_path() {
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/var/log/syslog")),
+            "/var/log/syslog"
+        );
+        // Remote rows copy the bare remote path — no ssh:/docker: prefix.
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/home/yj/some file.txt")),
+            "/home/yj/some file.txt"
+        );
     }
 
     #[test]
@@ -20952,99 +21521,6 @@ mod tests {
         assert_eq!(
             transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, true),
             "download + delete"
-        );
-    }
-
-    #[test]
-    fn sidebar_transfer_move_copies_then_deletes_the_source() {
-        use remote_fs::FsLocation;
-        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
-        let dst_dir = root.join("dst");
-        std::fs::create_dir_all(&dst_dir).expect("create test tree");
-        let src = root.join("file.txt");
-        std::fs::write(&src, b"payload").expect("write source");
-        // Local→Local runs headlessly: the destination appears and the source
-        // is deleted only afterwards.
-        let op = SidebarOp::TransferMove {
-            src_loc: FsLocation::Local,
-            dst_loc: FsLocation::Local,
-            src: src.clone(),
-            dst: dst_dir.join("file.txt"),
-            is_dir: false,
-        };
-        let (changed, warning, cancelled, result) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, None);
-        assert!(result.is_ok(), "transfer move failed: {result:?}");
-        assert!(warning.is_none());
-        assert!(!cancelled);
-        assert_eq!(changed, FsLocation::Local);
-        assert_eq!(
-            std::fs::read(dst_dir.join("file.txt")).expect("read moved file"),
-            b"payload"
-        );
-        assert!(!src.exists(), "cut source must be deleted after the copy");
-
-        // A failed transfer must never touch the source.
-        let stranded = root.join("stranded.txt");
-        std::fs::write(&stranded, b"keep me").expect("write stranded");
-        let op = SidebarOp::TransferMove {
-            src_loc: FsLocation::Local,
-            dst_loc: FsLocation::Remote(9),
-            src: stranded.clone(),
-            dst: std::path::PathBuf::from("/tmp/stranded.txt"),
-            is_dir: false,
-        };
-        let (changed, _warning, cancelled, result) =
-            run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
-        assert!(result.is_err(), "unknown host must fail the transfer");
-        assert!(!cancelled);
-        assert_eq!(changed, FsLocation::Remote(9));
-        assert!(stranded.exists(), "source survives a failed transfer");
-        std::fs::remove_dir_all(root).expect("remove test tree");
-    }
-
-    #[test]
-    fn sidebar_cancel_after_completion_is_a_no_op() {
-        use remote_fs::FsLocation;
-        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
-        let dst_dir = root.join("dst");
-        std::fs::create_dir_all(&dst_dir).expect("create test tree");
-        let src = root.join("file.txt");
-        std::fs::write(&src, b"payload").expect("write source");
-        // A cancel flag set "after" the transfer completed (here: set up
-        // front, with a Local→Local op that never consults it) must not turn
-        // a successful result into a cancelled one.
-        let progress = remote_fs::TransferProgress::new();
-        progress.cancel();
-        let op = SidebarOp::TransferMove {
-            src_loc: FsLocation::Local,
-            dst_loc: FsLocation::Local,
-            src: src.clone(),
-            dst: dst_dir.join("file.txt"),
-            is_dir: false,
-        };
-        let (_changed, _warning, cancelled, result) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
-        assert!(
-            result.is_ok(),
-            "local op ignores the cancel flag: {result:?}"
-        );
-        assert!(!cancelled, "cancel racing completion is a no-op");
-        assert!(dst_dir.join("file.txt").exists());
-        assert!(!src.exists());
-        std::fs::remove_dir_all(root).expect("remove test tree");
-    }
-
-    #[test]
-    fn copy_path_payload_is_the_plain_full_path() {
-        assert_eq!(
-            copy_path_payload(std::path::Path::new("/var/log/syslog")),
-            "/var/log/syslog"
-        );
-        // Remote rows copy the bare remote path — no ssh:/docker: prefix.
-        assert_eq!(
-            copy_path_payload(std::path::Path::new("/home/yj/some file.txt")),
-            "/home/yj/some file.txt"
         );
     }
 
@@ -21134,7 +21610,7 @@ mod tests {
     }
 
     #[test]
-    fn import_op_runs_items_sequentially_and_summarizes() {
+    fn import_runs_items_sequentially_and_summarizes() {
         use remote_fs::FsLocation;
         let root = drop_fixture();
         let plan = plan_drop(
@@ -21146,7 +21622,12 @@ mod tests {
             root.join("target"),
         )
         .expect("plan");
-        let op = SidebarOp::Import { items: plan.items };
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items: plan.items,
+            cut: false,
+            verb: "Imported",
+        };
         let (changed, notice, cancelled, result) =
             run_sidebar_op(&FsLocation::Local, &[], &op, None);
         assert!(result.is_ok());
@@ -21169,13 +21650,18 @@ mod tests {
         let plan = plan_drop(vec![root2.join("a.txt")], root2.join("target")).expect("plan");
         let progress = remote_fs::TransferProgress::new();
         progress.cancel();
-        let op = SidebarOp::Import { items: plan.items };
+        let op = SidebarOp::BatchTransfer {
+            src_loc: FsLocation::Local,
+            items: plan.items,
+            cut: false,
+            verb: "Imported",
+        };
         let (_changed, notice, cancelled, result) =
             run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
         assert!(cancelled);
         assert!(result.is_err());
         assert!(!root2.join("target").join("a.txt").exists());
-        assert!(notice.expect("cancel summary").0.contains("cancelled"));
+        assert!(notice.expect("cancel summary").0.contains("Cancelled"));
         std::fs::remove_dir_all(root2).expect("remove test tree");
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
