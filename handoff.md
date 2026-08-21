@@ -253,7 +253,7 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   function are now direct public re-exports of the shared contract rather than
   local semantic mirrors; Frost's serializer adapters delegate to the shared
   stable snake-case vocabulary. `jterm_core` is pinned to
-  `23028d23af2fc1bfa9b7ef5efd50ed0ea4e0e736` (transitively jagent
+  `3e09b161a36e2ec30f730eee8f8d6702b2bacc35` (transitively jagent
   `d52002e4a18735e8cfec718da5fea8f0a5cfaaf8`). Claim-acquisition errors are
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
