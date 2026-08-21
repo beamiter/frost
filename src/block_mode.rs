@@ -1215,6 +1215,74 @@ pub const BLOCK_SEARCH_LINE_CHARS: usize = 200;
 /// Character cap of a hit's command preview.
 pub const BLOCK_SEARCH_COMMAND_CHARS: usize = 80;
 
+/// Maximum query payload accepted by cross-block search. Regex compilation is
+/// linear-time in `regex`, but an unbounded expression would still let a paste
+/// allocate an unexpectedly large automaton on the UI thread.
+pub const BLOCK_SEARCH_QUERY_MAX_BYTES: usize = 4 * 1024;
+
+/// Heap ceiling used by the regex compiler for one block-search expression.
+/// This is deliberately much smaller than the text index: a query is control
+/// input, while indexed output is already bounded independently.
+pub const BLOCK_SEARCH_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Bound the picker-owned query while retaining one complete UTF-8 scalar
+/// past the accepted limit. The sentinel preserves a visible `TooLong` error
+/// and Backspace recovery without keeping an arbitrary clipboard paste alive.
+pub fn bounded_block_search_query(query: String) -> String {
+    if query.len() <= BLOCK_SEARCH_QUERY_MAX_BYTES {
+        return query;
+    }
+    let mut end = BLOCK_SEARCH_QUERY_MAX_BYTES
+        .saturating_add(1)
+        .min(query.len());
+    while end < query.len() && !query.is_char_boundary(end) {
+        end += 1;
+    }
+    // Truncating in place retains the original allocation. Re-box the prefix
+    // so a huge paste cannot remain resident behind a 4 KiB visible query.
+    Box::<str>::from(&query[..end]).into_string()
+}
+
+/// Validate the original byte payload before trimming. Empty-query metadata
+/// browse paths use this too, closing the whitespace-only bypass.
+pub fn validated_block_search_query(query: &str) -> Result<&str, BlockSearchQueryError> {
+    if query.len() > BLOCK_SEARCH_QUERY_MAX_BYTES {
+        Err(BlockSearchQueryError::TooLong)
+    } else {
+        Ok(query.trim())
+    }
+}
+
+/// Matching controls for one cross-block query. The default preserves the
+/// original family behavior (case-insensitive literal substring search).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockSearchOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+}
+
+/// A query can fail before any block text is scanned. Keeping this separate
+/// from an empty result lets the picker explain invalid input instead of
+/// falsely claiming that no block matched it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockSearchQueryError {
+    TooLong,
+    InvalidRegex(String),
+}
+
+impl std::fmt::Display for BlockSearchQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong => write!(
+                formatter,
+                "Query is too long (maximum {} bytes)",
+                BLOCK_SEARCH_QUERY_MAX_BYTES
+            ),
+            Self::InvalidRegex(error) => write!(formatter, "Invalid regular expression: {error}"),
+        }
+    }
+}
+
 /// One row of the cross-block search picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockSearchHit {
@@ -1255,7 +1323,7 @@ impl BlockSearchSource {
         }
     }
 
-    fn resident_bytes(&self) -> usize {
+    fn payload_bytes(&self) -> usize {
         self.command.as_ref().map_or(0, String::capacity)
             + self.output.as_ref().map_or(0, String::capacity)
     }
@@ -1270,24 +1338,60 @@ pub struct BlockSearchSourceSnapshot {
     pub resident_bytes: usize,
 }
 
-/// Consume a lazy newest-first source stream until its heap payload budget is
-/// full. Laziness matters: callers may extract a zone from live terminal rows,
-/// and older zones beyond the budget must never be extracted speculatively.
+/// Consume a lazy newest-first source stream under the actual retained heap
+/// budget: the Vec allocation and every owned String capacity are counted.
+/// Laziness matters because older live rows must not be rendered into
+/// throwaway Strings after the first over-budget source.
 pub fn bounded_block_search_sources(
     sources_newest_first: impl IntoIterator<Item = BlockSearchSource>,
     max_bytes: usize,
 ) -> BlockSearchSourceSnapshot {
-    let mut snapshot = BlockSearchSourceSnapshot::default();
+    let mut sources = Vec::new();
+    let mut payload_bytes = 0usize;
+    let mut older_not_indexed = false;
     for source in sources_newest_first {
-        let bytes = source.resident_bytes();
-        if snapshot.resident_bytes.saturating_add(bytes) > max_bytes {
-            snapshot.older_not_indexed = true;
+        let minimum_vec_bytes = sources
+            .len()
+            .saturating_add(1)
+            .saturating_mul(std::mem::size_of::<BlockSearchSource>());
+        let Some(next_bytes) = payload_bytes
+            .checked_add(source.payload_bytes())
+            .and_then(|bytes| bytes.checked_add(minimum_vec_bytes))
+        else {
+            older_not_indexed = true;
+            break;
+        };
+        if next_bytes > max_bytes {
+            older_not_indexed = true;
             break;
         }
-        snapshot.resident_bytes += bytes;
-        snapshot.sources.push(source);
+        payload_bytes += source.payload_bytes();
+        sources.push(source);
     }
-    snapshot
+    sources = sources.into_boxed_slice().into_vec();
+    while payload_bytes.saturating_add(
+        sources
+            .capacity()
+            .saturating_mul(std::mem::size_of::<BlockSearchSource>()),
+    ) > max_bytes
+    {
+        let Some(removed) = sources.pop() else {
+            break;
+        };
+        payload_bytes = payload_bytes.saturating_sub(removed.payload_bytes());
+        older_not_indexed = true;
+        sources = sources.into_boxed_slice().into_vec();
+    }
+    let resident_bytes = payload_bytes.saturating_add(
+        sources
+            .capacity()
+            .saturating_mul(std::mem::size_of::<BlockSearchSource>()),
+    );
+    BlockSearchSourceSnapshot {
+        sources,
+        older_not_indexed,
+        resident_bytes,
+    }
 }
 
 /// One zone's precomputed text for [`search_blocks`] (ember's
@@ -1339,7 +1443,7 @@ impl CachedBlockSearchZone {
         }
     }
 
-    fn resident_bytes(&self) -> usize {
+    fn payload_bytes(&self) -> usize {
         self.command.as_ref().map_or(0, String::capacity)
             + self.command_lowercase.as_ref().map_or(0, String::capacity)
             + self.output.as_ref().map_or(0, String::capacity)
@@ -1380,7 +1484,7 @@ pub fn build_block_search_cache(
 
     for source in snapshot.sources {
         let zone = CachedBlockSearchZone::from_source(source);
-        let bytes = zone.resident_bytes();
+        let bytes = zone.payload_bytes();
         if build.resident_bytes.saturating_add(bytes) > max_bytes {
             build.older_not_indexed = true;
             break;
@@ -1441,6 +1545,62 @@ fn original_match_span(
     original_start.map(|start| start..original_end)
 }
 
+/// Convert a UTF-8 byte range returned by `regex` into the character-space
+/// range the renderer and reveal path expose. Regex boundaries are always
+/// valid UTF-8 boundaries, including a zero-width match.
+fn byte_match_span(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let start = text[..range.start].chars().count();
+    let end = start + text[range].chars().count();
+    start..end
+}
+
+enum BlockSearchMatcher {
+    LiteralSensitive(String),
+    LiteralInsensitive(String),
+    Regex(regex::Regex),
+}
+
+impl BlockSearchMatcher {
+    fn literal_insensitive(query: &str) -> Option<Self> {
+        let query = query.trim();
+        (!query.is_empty()).then(|| Self::LiteralInsensitive(query.to_lowercase()))
+    }
+
+    fn compile(
+        query: &str,
+        options: BlockSearchOptions,
+    ) -> Result<Option<Self>, BlockSearchQueryError> {
+        let query = validated_block_search_query(query)?;
+        if query.is_empty() {
+            return Ok(None);
+        }
+        if options.regex {
+            let regex = regex::RegexBuilder::new(query)
+                .case_insensitive(!options.case_sensitive)
+                .size_limit(BLOCK_SEARCH_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|error| BlockSearchQueryError::InvalidRegex(error.to_string()))?;
+            Ok(Some(Self::Regex(regex)))
+        } else if options.case_sensitive {
+            Ok(Some(Self::LiteralSensitive(query.to_string())))
+        } else {
+            Ok(Some(Self::LiteralInsensitive(query.to_lowercase())))
+        }
+    }
+
+    fn find(&self, text: &str, lowercase: Option<&str>) -> Option<std::ops::Range<usize>> {
+        match self {
+            Self::LiteralSensitive(needle) => text
+                .find(needle)
+                .map(|start| byte_match_span(text, start..start + needle.len())),
+            Self::LiteralInsensitive(needle) => original_match_span(text, lowercase?, needle),
+            Self::Regex(regex) => regex
+                .find(text)
+                .map(|matched| byte_match_span(text, matched.range())),
+        }
+    }
+}
+
 /// Clip a matching line around the match instead of blindly keeping its
 /// prefix. This guarantees a long-line result actually shows why it matched.
 fn clipped_around_match(
@@ -1498,26 +1658,66 @@ fn clipped_around_match(
 /// against the precomputed lowercase copies (ember's per-open cache design)
 /// — beyond the lowercased needle, allocations happen only for hits. A
 /// blank query matches nothing — an empty picker, not the whole history.
+#[allow(dead_code)] // Compatibility/default surface; the app uses explicit options.
 pub fn search_blocks(cache: &[CachedBlockSearchZone], query: &str) -> BlockSearchResults {
-    search_blocks_filtered(cache, query, |_| true)
+    search_blocks_with_matcher(
+        cache,
+        BlockSearchMatcher::literal_insensitive(query),
+        |_| true,
+    )
 }
 
 /// [`search_blocks`] with a zero-allocation zone predicate. The UI uses this
 /// for outcome/slow/bookmark filters without cloning cached multi-megabyte
 /// output strings or letting excluded newer zones consume the hit cap.
+#[allow(dead_code)] // Compatibility/default surface; the app uses explicit options.
 pub fn search_blocks_filtered(
     cache: &[CachedBlockSearchZone],
     query: &str,
+    include_zone: impl FnMut(u64) -> bool,
+) -> BlockSearchResults {
+    search_blocks_with_matcher(
+        cache,
+        BlockSearchMatcher::literal_insensitive(query),
+        include_zone,
+    )
+}
+
+/// Search with explicit case/regex controls. Regexes use Rust's linear-time
+/// engine, a bounded compiler, and one compilation per query rather than per
+/// line. Invalid/oversized queries are returned distinctly from zero hits.
+pub fn search_blocks_with_options(
+    cache: &[CachedBlockSearchZone],
+    query: &str,
+    options: BlockSearchOptions,
+) -> Result<BlockSearchResults, BlockSearchQueryError> {
+    let matcher = BlockSearchMatcher::compile(query, options)?;
+    Ok(search_blocks_with_matcher(cache, matcher, |_| true))
+}
+
+/// Option-aware counterpart of [`search_blocks_filtered`].
+pub fn search_blocks_with_options_filtered(
+    cache: &[CachedBlockSearchZone],
+    query: &str,
+    options: BlockSearchOptions,
+    include_zone: impl FnMut(u64) -> bool,
+) -> Result<BlockSearchResults, BlockSearchQueryError> {
+    let matcher = BlockSearchMatcher::compile(query, options)?;
+    Ok(search_blocks_with_matcher(cache, matcher, include_zone))
+}
+
+fn search_blocks_with_matcher(
+    cache: &[CachedBlockSearchZone],
+    matcher: Option<BlockSearchMatcher>,
     mut include_zone: impl FnMut(u64) -> bool,
 ) -> BlockSearchResults {
-    let needle = query.trim().to_lowercase();
     let mut results = BlockSearchResults {
         hits: Vec::new(),
         capped: false,
     };
-    if needle.is_empty() {
+    let Some(matcher) = matcher else {
         return results;
-    }
+    };
     'zones: for zone in cache.iter().rev() {
         if !include_zone(zone.zone_id) {
             continue;
@@ -1537,7 +1737,8 @@ pub fn search_blocks_filtered(
             .zip(zone.command.as_deref())
             .into_iter()
             .filter_map(|(lowercase, command)| {
-                original_match_span(command, lowercase, &needle)
+                matcher
+                    .find(command, Some(lowercase))
                     .map(|span| (false, 0usize, command, span))
             });
         let output_lines = zone.output.as_deref().into_iter().flat_map(str::lines);
@@ -1548,7 +1749,8 @@ pub fn search_blocks_filtered(
             .flat_map(str::lines);
         let output_hits = output_lines.zip(lowercase_lines).enumerate().filter_map(
             |(index, (line, lowercase))| {
-                original_match_span(line, lowercase, &needle)
+                matcher
+                    .find(line, Some(lowercase))
                     .map(|span| (true, index + 1, line, span))
             },
         );
@@ -2536,14 +2738,23 @@ mod tests {
         });
         let snapshot = bounded_block_search_sources(sources, BLOCK_SEARCH_SOURCE_MAX_BYTES);
 
-        assert_eq!(snapshot.sources.len(), 8);
+        assert_eq!(snapshot.sources.len(), 7);
         assert_eq!(snapshot.sources[0].zone_id, 9);
-        assert_eq!(snapshot.sources[7].zone_id, 2);
-        assert_eq!(snapshot.resident_bytes, BLOCK_SEARCH_SOURCE_MAX_BYTES);
+        assert_eq!(snapshot.sources[6].zone_id, 3);
+        assert_eq!(
+            snapshot.resident_bytes,
+            snapshot.sources.capacity() * std::mem::size_of::<BlockSearchSource>()
+                + snapshot
+                    .sources
+                    .iter()
+                    .map(BlockSearchSource::payload_bytes)
+                    .sum::<usize>()
+        );
+        assert!(snapshot.resident_bytes <= BLOCK_SEARCH_SOURCE_MAX_BYTES);
         assert!(snapshot.older_not_indexed);
         // The first over-budget zone is the only discarded source extracted;
         // an arbitrarily long iterator is never drained after the cap.
-        assert_eq!(extracted.get(), 9);
+        assert_eq!(extracted.get(), 8);
     }
 
     #[test]
@@ -2554,13 +2765,17 @@ mod tests {
             BlockSearchSource::new(1, Some("oldest".into()), Some("old output".into())),
         ];
         let snapshot = BlockSearchSourceSnapshot {
-            resident_bytes: sources.iter().map(BlockSearchSource::resident_bytes).sum(),
+            resident_bytes: sources.capacity() * std::mem::size_of::<BlockSearchSource>()
+                + sources
+                    .iter()
+                    .map(BlockSearchSource::payload_bytes)
+                    .sum::<usize>(),
             sources,
             older_not_indexed: false,
         };
         let newest = CachedBlockSearchZone::from_source(snapshot.sources[0].clone());
         let vec_bytes = snapshot.sources.len() * std::mem::size_of::<CachedBlockSearchZone>();
-        let budget = vec_bytes + newest.resident_bytes();
+        let budget = vec_bytes + newest.payload_bytes();
         let build = build_block_search_cache(snapshot, budget);
 
         assert_eq!(build.zones.len(), 1);
@@ -2573,7 +2788,7 @@ mod tests {
                 + build
                     .zones
                     .iter()
-                    .map(CachedBlockSearchZone::resident_bytes)
+                    .map(CachedBlockSearchZone::payload_bytes)
                     .sum::<usize>()
         );
         assert_eq!(
@@ -2590,7 +2805,11 @@ mod tests {
             BlockSearchSource::new(1, Some("one".into()), None),
         ];
         let snapshot = BlockSearchSourceSnapshot {
-            resident_bytes: sources.iter().map(BlockSearchSource::resident_bytes).sum(),
+            resident_bytes: sources.capacity() * std::mem::size_of::<BlockSearchSource>()
+                + sources
+                    .iter()
+                    .map(BlockSearchSource::payload_bytes)
+                    .sum::<usize>(),
             sources,
             older_not_indexed: false,
         };
@@ -2734,6 +2953,122 @@ mod tests {
         // points at the one original character which produced it.
         let partial = search_blocks(&cache, "i");
         assert_eq!(partial.hits[0].match_span, Some(2..3));
+        let full_expansion = search_blocks(&cache, "i\u{307}");
+        assert_eq!(full_expansion.hits[0].match_span, Some(2..3));
+    }
+
+    #[test]
+    fn search_options_support_case_sensitive_literal_and_bounded_regex() {
+        let cache = [source(
+            7,
+            Some("Cargo TEST"),
+            Some("error E42\nERROR e99\n界界İY"),
+        )];
+
+        let sensitive = search_blocks_with_options(
+            &cache,
+            "TEST",
+            BlockSearchOptions {
+                case_sensitive: true,
+                regex: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(sensitive.hits.len(), 1);
+        assert_eq!(sensitive.hits[0].match_span, Some(6..10));
+        assert!(search_blocks_with_options(
+            &cache,
+            "test",
+            BlockSearchOptions {
+                case_sensitive: true,
+                regex: false,
+            },
+        )
+        .unwrap()
+        .hits
+        .is_empty());
+
+        let regex = search_blocks_with_options(
+            &cache,
+            r"error\s+e\d+",
+            BlockSearchOptions {
+                case_sensitive: false,
+                regex: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(regex.hits.len(), 2);
+        assert_eq!(regex.hits[0].match_span, Some(0..9));
+        assert_eq!(regex.hits[1].match_span, Some(0..9));
+    }
+
+    #[test]
+    fn regex_match_spans_use_original_unicode_character_coordinates() {
+        let cache = [source(9, None, Some("界界İY tail"))];
+        let results = search_blocks_with_options(
+            &cache,
+            r"İ.",
+            BlockSearchOptions {
+                case_sensitive: true,
+                regex: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(results.hits[0].match_span, Some(2..4));
+    }
+
+    #[test]
+    fn invalid_or_oversized_regex_is_not_a_false_empty_result() {
+        let cache = [source(1, Some("cargo test"), None)];
+        assert!(matches!(
+            search_blocks_with_options(
+                &cache,
+                "(",
+                BlockSearchOptions {
+                    case_sensitive: false,
+                    regex: true,
+                },
+            ),
+            Err(BlockSearchQueryError::InvalidRegex(_))
+        ));
+        let oversized = "x".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
+        assert!(matches!(
+            search_blocks_with_options(
+                &cache,
+                &oversized,
+                BlockSearchOptions {
+                    case_sensitive: false,
+                    regex: true,
+                },
+            ),
+            Err(BlockSearchQueryError::TooLong)
+        ));
+        assert!(search_blocks(&cache, &oversized).hits.is_empty());
+        let oversized_whitespace = " ".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
+        assert!(matches!(
+            search_blocks_with_options(
+                &cache,
+                &oversized_whitespace,
+                BlockSearchOptions::default(),
+            ),
+            Err(BlockSearchQueryError::TooLong)
+        ));
+        let bounded = bounded_block_search_query(format!(
+            "{}🦀{}",
+            "x".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES),
+            "tail".repeat(1024)
+        ));
+        assert!(bounded.len() > BLOCK_SEARCH_QUERY_MAX_BYTES);
+        assert!(bounded.len() <= BLOCK_SEARCH_QUERY_MAX_BYTES + 4);
+        assert_eq!(bounded.capacity(), bounded.len());
+        assert!(bounded.is_char_boundary(bounded.len()));
+
+        let mut huge_capacity = String::with_capacity(2 * 1024 * 1024);
+        huge_capacity.push_str(&" ".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 32));
+        let compact = bounded_block_search_query(huge_capacity);
+        assert!(compact.len() > BLOCK_SEARCH_QUERY_MAX_BYTES);
+        assert_eq!(compact.capacity(), compact.len());
+        assert!(validated_block_search_query(&compact).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-21
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,29 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- Block Search 2.0 adds `Aa` case-sensitive and bounded Rust-regex matching to
+  the existing All/Failed/Slow/Bookmarked/Background picker. Invalid or
+  oversized expressions are query errors rather than false zero-hit results:
+  the last usable background-built index/hits remain intact but hidden and
+  non-activatable until correction. Query state is rebuilt into a compact
+  allocation retaining at most 4 KiB plus one complete UTF-8 overflow scalar,
+  and regex compilation has a 2 MiB heap limit,
+  including for whitespace-heavy pastes. Source accounting now includes its
+  Vec allocation and String capacities inside the 8 MiB UI-thread retained
+  ceiling; the 16 MiB worker-built retained cache counts its Vec plus original
+  and lowercase capacities. Rebuild drops old cache/hit allocations before
+  extracting source; the first rejected source (up to the roughly 1 MiB zone
+  cap) and one rejected lowercase candidate remain short-lived allocations
+  outside those retained ceilings. Only one worker generation runs at once;
+  zone churn is coalesced and a stale completed build is dropped before the
+  replacement snapshot is extracted. Literal case-fold expansions (`İ` → `i`
+  + combining dot) and regex byte ranges both map back to original Unicode
+  scalar spans, so
+  previews and soft-wrap row reveal never consume normalized-string offsets.
+  Activation additionally requires `!loading`, the current session/zone
+  version, and exact membership in the current hit list; queued stale clicks
+  remain inert.
 
 - Held-open task terminals (Agent CLI fallback and validation runs whose child
   exited but whose tab stays for transcript review) now behave as read-only

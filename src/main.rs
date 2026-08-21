@@ -881,6 +881,13 @@ struct BlockSearchState {
     /// Finalized-zone set represented by the current/in-flight cache.
     zone_version: BlockSearchZoneVersion,
     query: String,
+    /// Matching controls are pane-picker state, not global terminal search
+    /// settings. They survive index refreshes while the picker stays open.
+    case_sensitive: bool,
+    regex: bool,
+    /// Invalid/oversized queries leave the last valid hits and bounded index
+    /// intact, but disable activation until the query compiles again.
+    query_error: Option<String>,
     filter: BlockSearchFilter,
     /// Highlighted row among `hits` (all hits are drawn and navigable, in a
     /// scrollable list).
@@ -897,6 +904,30 @@ struct BlockSearchState {
 impl BlockSearchState {
     fn accepts_build(&self, identity: BlockSearchBuildIdentity) -> bool {
         self.session_id == identity.session_id && self.epoch == identity.epoch
+    }
+
+    fn accepts_hit(
+        &self,
+        hit: &block_mode::BlockSearchHit,
+        session_id: usize,
+        zone_version: BlockSearchZoneVersion,
+    ) -> bool {
+        !self.loading
+            && self.query_error.is_none()
+            && self.session_id == session_id
+            && self.zone_version == zone_version
+            && self.hits.iter().any(|current| current == hit)
+    }
+
+    fn release_index_for_rebuild(&mut self) {
+        // Assignment drops Vec allocations as well as their elements. Query,
+        // filter and matching controls intentionally survive the rebuild.
+        self.cache = Vec::new();
+        self.hits = Vec::new();
+        self.capped = false;
+        self.older_not_indexed = false;
+        self.query_error = None;
+        self.selected = 0;
     }
 
     fn select_next(&mut self) {
@@ -2218,6 +2249,9 @@ enum Message {
     BlockSearchInput(String),
     /// Restrict cross-block search/browse by block metadata.
     BlockSearchSetFilter(BlockSearchFilter),
+    /// Toggle literal/regex matching controls without rebuilding the index.
+    BlockSearchSetCaseSensitive(bool),
+    BlockSearchSetRegex(bool),
     /// Cancel the block search picker overlay.
     BlockSearchClose,
     /// A bounded background cache build completed. Session + monotonic epoch
@@ -6810,6 +6844,17 @@ impl Frost {
         let Some(session_id) = self.block_search.as_ref().map(|state| state.session_id) else {
             return Task::none();
         };
+        // One cache worker at a time. Finalized-zone churn while it runs is
+        // detected against the terminal when the result arrives, then one
+        // fresh rebuild is launched. This coalesces bursts without retaining
+        // several 8/16 MiB build generations concurrently.
+        if self
+            .block_search
+            .as_ref()
+            .is_some_and(|state| state.loading)
+        {
+            return Task::none();
+        }
         let Some(version) = self
             .sessions
             .get(self.active)
@@ -6828,12 +6873,10 @@ impl Frost {
         if let Some(state) = self.block_search.as_mut() {
             state.epoch = epoch;
             state.loading = true;
-            state.older_not_indexed = false;
             state.zone_version = version;
-            state.cache.clear();
-            state.hits.clear();
-            state.capped = false;
-            state.selected = 0;
+            // Drop allocations before the 8 MiB source snapshot is extracted:
+            // peak is old-or-(source+new), never old+source+new.
+            state.release_index_for_rebuild();
         }
         let Some(snapshot) = self
             .sessions
@@ -6914,61 +6957,86 @@ impl Frost {
         let Some(state) = self.block_search.as_mut() else {
             return;
         };
-        let results = if state.query.trim().is_empty() && filter != BlockSearchFilter::All {
-            let mut hits = Vec::new();
-            let mut capped = false;
-            for zone in state
-                .cache
-                .iter()
-                .rev()
-                .filter(|zone| eligible.contains(&zone.zone_id))
-            {
-                if hits.len() >= block_mode::BLOCK_SEARCH_HIT_CAP {
-                    capped = true;
-                    break;
-                }
-                let (line_text, is_output_line, line_no) = if let Some(command) = &zone.command {
-                    (command.clone(), false, 0)
-                } else if let Some(line) =
-                    zone.output.as_deref().and_then(|text| text.lines().next())
+        let results = match block_mode::validated_block_search_query(&state.query) {
+            Err(error) => Err(error),
+            Ok(validated) if validated.is_empty() && filter != BlockSearchFilter::All => {
+                let mut hits = Vec::new();
+                let mut capped = false;
+                for zone in state
+                    .cache
+                    .iter()
+                    .rev()
+                    .filter(|zone| eligible.contains(&zone.zone_id))
                 {
-                    (line.to_string(), true, 1)
-                } else {
-                    ("Background output".to_string(), false, 0)
-                };
-                let clip = |text: &str, cap: usize| {
-                    if text.chars().count() <= cap {
-                        text.to_string()
-                    } else {
-                        let mut clipped: String =
-                            text.chars().take(cap.saturating_sub(1)).collect();
-                        clipped.push('…');
-                        clipped
+                    if hits.len() >= block_mode::BLOCK_SEARCH_HIT_CAP {
+                        capped = true;
+                        break;
                     }
-                };
-                hits.push(block_mode::BlockSearchHit {
-                    zone_id: zone.zone_id,
-                    is_output_line,
-                    line_no,
-                    match_span: None,
-                    line_text: clip(&line_text, block_mode::BLOCK_SEARCH_LINE_CHARS),
-                    command_preview: clip(
-                        zone.command.as_deref().unwrap_or_default(),
-                        block_mode::BLOCK_SEARCH_COMMAND_CHARS,
-                    ),
-                });
+                    let (line_text, is_output_line, line_no) = if let Some(command) = &zone.command
+                    {
+                        (command.as_str(), false, 0)
+                    } else if let Some(line) =
+                        zone.output.as_deref().and_then(|text| text.lines().next())
+                    {
+                        (line, true, 1)
+                    } else {
+                        ("Background output", false, 0)
+                    };
+                    let clip = |text: &str, cap: usize| {
+                        if text.chars().count() <= cap {
+                            text.to_string()
+                        } else {
+                            let mut clipped: String =
+                                text.chars().take(cap.saturating_sub(1)).collect();
+                            clipped.push('…');
+                            clipped
+                        }
+                    };
+                    hits.push(block_mode::BlockSearchHit {
+                        zone_id: zone.zone_id,
+                        is_output_line,
+                        line_no,
+                        match_span: None,
+                        line_text: clip(line_text, block_mode::BLOCK_SEARCH_LINE_CHARS),
+                        command_preview: clip(
+                            zone.command.as_deref().unwrap_or_default(),
+                            block_mode::BLOCK_SEARCH_COMMAND_CHARS,
+                        ),
+                    });
+                }
+                Ok(block_mode::BlockSearchResults { hits, capped })
             }
-            block_mode::BlockSearchResults { hits, capped }
-        } else if filter == BlockSearchFilter::All {
-            block_mode::search_blocks(&state.cache, &state.query)
-        } else {
-            block_mode::search_blocks_filtered(&state.cache, &state.query, |zone_id| {
-                eligible.contains(&zone_id)
-            })
+            Ok(_) if filter == BlockSearchFilter::All => block_mode::search_blocks_with_options(
+                &state.cache,
+                &state.query,
+                block_mode::BlockSearchOptions {
+                    case_sensitive: state.case_sensitive,
+                    regex: state.regex,
+                },
+            ),
+            Ok(_) => block_mode::search_blocks_with_options_filtered(
+                &state.cache,
+                &state.query,
+                block_mode::BlockSearchOptions {
+                    case_sensitive: state.case_sensitive,
+                    regex: state.regex,
+                },
+                |zone_id| eligible.contains(&zone_id),
+            ),
         };
-        state.hits = results.hits;
-        state.capped = results.capped;
-        state.selected = 0;
+        match results {
+            Ok(results) => {
+                state.hits = results.hits;
+                state.capped = results.capped;
+                state.query_error = None;
+                state.selected = 0;
+            }
+            Err(error) => {
+                // Preserve the last valid result/index so correcting one
+                // character is cheap. The error gates Enter/click activation.
+                state.query_error = Some(error.to_string());
+            }
+        }
     }
 
     /// Keep the highlighted hit visible in the picker's scrollable list.
@@ -7036,6 +7104,9 @@ impl Frost {
                 return Some(Task::none());
             }
             Key::Named(Named::Enter) => {
+                if state.query_error.is_some() {
+                    return Some(Task::none());
+                }
                 let owner = state.session_id;
                 let target = state.hits.get(state.selected).cloned();
                 self.block_search = None;
@@ -7066,6 +7137,8 @@ impl Frost {
                 let printable: String = t.chars().filter(|c| !c.is_control()).collect();
                 if !printable.is_empty() {
                     state.query.push_str(&printable);
+                    state.query =
+                        block_mode::bounded_block_search_query(std::mem::take(&mut state.query));
                     self.block_search_recompute();
                     return Some(self.block_search_snap_task());
                 }
@@ -11742,6 +11815,21 @@ impl Frost {
                 if !accepts {
                     return Task::none();
                 }
+                let current_version = self
+                    .sessions
+                    .get(self.active)
+                    .filter(|session| session.id == identity.session_id)
+                    .map(|session| BlockSearchZoneVersion::from_terminal(&session.terminal));
+                let build_version = self.block_search.as_ref().map(|state| state.zone_version);
+                if current_version != build_version {
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.loading = false;
+                    }
+                    // Release the stale completed build before extracting a
+                    // replacement source snapshot; do not overlap generations.
+                    drop(result);
+                    return self.begin_block_search_rebuild();
+                }
                 match result {
                     Ok(build) => {
                         if let Some(state) = self.block_search.as_mut() {
@@ -11755,8 +11843,8 @@ impl Frost {
                     Err(error) => {
                         if let Some(state) = self.block_search.as_mut() {
                             state.loading = false;
-                            state.cache.clear();
-                            state.hits.clear();
+                            state.cache = Vec::new();
+                            state.hits = Vec::new();
                             state.capped = false;
                         }
                         log::warn!("{error}");
@@ -11769,7 +11857,7 @@ impl Frost {
             }
             Message::BlockSearchInput(query) => {
                 if let Some(state) = self.block_search.as_mut() {
-                    state.query = query;
+                    state.query = block_mode::bounded_block_search_query(query);
                 }
                 self.block_search_recompute();
                 // The result set changed and the highlight reset to the top:
@@ -11783,7 +11871,35 @@ impl Frost {
                 self.block_search_recompute();
                 return self.block_search_snap_task();
             }
+            Message::BlockSearchSetCaseSensitive(case_sensitive) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.case_sensitive = case_sensitive;
+                }
+                self.block_search_recompute();
+                return self.block_search_snap_task();
+            }
+            Message::BlockSearchSetRegex(regex) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.regex = regex;
+                }
+                self.block_search_recompute();
+                return self.block_search_snap_task();
+            }
             Message::BlockSearchAccept(hit) => {
+                let current = self.sessions.get(self.active).map(|session| {
+                    (
+                        session.id,
+                        BlockSearchZoneVersion::from_terminal(&session.terminal),
+                    )
+                });
+                let accepts = current.is_some_and(|(session_id, zone_version)| {
+                    self.block_search
+                        .as_ref()
+                        .is_some_and(|state| state.accepts_hit(&hit, session_id, zone_version))
+                });
+                if !accepts {
+                    return Task::none();
+                }
                 let owner = self.block_search.take().map(|state| state.session_id);
                 let target_is_live = owner.is_some_and(|session_id| {
                     self.block_search_target_is_live(session_id, hit.zone_id)
@@ -13216,7 +13332,23 @@ impl Frost {
             .on_input(Message::BlockSearchInput)
             .size(14)
             .into();
-        let query_line = row![text("⌕").size(16), query]
+        let case_toggle = button(text("Aa").size(11))
+            .on_press(Message::BlockSearchSetCaseSensitive(!state.case_sensitive))
+            .padding([3, 7])
+            .style(if state.case_sensitive {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let regex_toggle = button(text(".*").size(11))
+            .on_press(Message::BlockSearchSetRegex(!state.regex))
+            .padding([3, 7])
+            .style(if state.regex {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let query_line = row![text("⌕").size(16), query, case_toggle, regex_toggle]
             .spacing(8)
             .align_y(iced::Alignment::Center);
         let filter_btn = |label: &str, filter: BlockSearchFilter| {
@@ -13251,6 +13383,8 @@ impl Frost {
         let mut body = column![query_line, filters].spacing(8);
         if state.loading {
             body = body.push(text("Indexing blocks…").size(13).style(text::secondary));
+        } else if let Some(error) = &state.query_error {
+            body = body.push(text(error.clone()).size(12).style(text::danger));
         } else if state.query.trim().is_empty() && state.filter == BlockSearchFilter::All {
             let hint = if state.older_not_indexed {
                 "Type to search, or choose a filter · older blocks not indexed"
@@ -21093,6 +21227,62 @@ mod tests {
         let mut exhausted = u64::MAX;
         assert_eq!(next_block_search_epoch(&mut exhausted), None);
         assert_eq!(exhausted, u64::MAX);
+    }
+
+    #[test]
+    fn block_search_rebuild_release_drops_capacity_and_keeps_query_controls() {
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            filter: BlockSearchFilter::Failed,
+            query_error: Some("old".to_string()),
+            ..BlockSearchState::default()
+        };
+        state.cache.reserve(2048);
+        state.hits.reserve(2048);
+        assert!(state.cache.capacity() > 0 && state.hits.capacity() > 0);
+
+        state.release_index_for_rebuild();
+
+        assert_eq!(state.cache.capacity(), 0);
+        assert_eq!(state.hits.capacity(), 0);
+        assert_eq!(state.query, "needle");
+        assert!(state.case_sensitive && state.regex);
+        assert_eq!(state.filter, BlockSearchFilter::Failed);
+        assert!(state.query_error.is_none());
+    }
+
+    #[test]
+    fn block_search_accept_rejects_loading_stale_or_unlisted_clicks() {
+        let version = BlockSearchZoneVersion {
+            len: 1,
+            oldest: Some(7),
+            newest: Some(7),
+        };
+        let hit = block_search_hit(7);
+        let mut state = BlockSearchState {
+            session_id: 3,
+            zone_version: version,
+            hits: vec![hit.clone()],
+            ..BlockSearchState::default()
+        };
+        assert!(state.accepts_hit(&hit, 3, version));
+        assert!(!state.accepts_hit(&block_search_hit(8), 3, version));
+        assert!(!state.accepts_hit(&hit, 4, version));
+        assert!(!state.accepts_hit(
+            &hit,
+            3,
+            BlockSearchZoneVersion {
+                newest: Some(8),
+                ..version
+            }
+        ));
+        state.loading = true;
+        assert!(!state.accepts_hit(&hit, 3, version));
+        state.loading = false;
+        state.query_error = Some("invalid".to_string());
+        assert!(!state.accepts_hit(&hit, 3, version));
     }
 
     #[test]

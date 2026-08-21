@@ -188,16 +188,24 @@ Block Mode 关闭或进入 alternate screen 时会暂时绕过折叠视图，返
 `Ctrl+Shift+↑/↓` 定位到活动块顶部/底部，无选区时仍保留原提示符导航快捷键。
 
 块搜索支持 `All / Failed / Slow / Bookmarked / Background` 五种视图；空查询时可直接
-浏览筛选结果。文本查询保存完整逻辑行中的 Unicode 字符跨度，因此长行预览会围绕
-关键词截取，并能定位到 soft-wrap 后实际包含命中的物理行。若 scrollback 已淘汰但有
+浏览筛选结果。`Aa` 可切换大小写敏感，`.*` 可切换 Rust 正则；无效表达式明确报错、保留
+上一份可用索引但禁止激活旧结果。文本查询保存完整逻辑行中的 Unicode 字符跨度，因此
+长行预览会围绕关键词截取，并能定位到 soft-wrap 后实际包含命中的物理行。若 scrollback 已淘汰但有
 捕获快照，搜索与复制仍可用，定位会安全降级到逻辑行首或块首。Block Mode 关闭、命令运行中
 或全屏程序占用 alternate screen 时，物理 Block 快捷键会透传给前台程序，不会只弹
 提示后吞键；命令面板和右键菜单仍是明确的鼠标操作入口。
 
-搜索索引优先保留最新块：UI 线程最多提取 8 MiB 源文本，lowercase 在后台构建且常驻
-索引最多 16 MiB。索引期间可继续输入筛选条件；新命令完成、缺失 `D` 后由下一提示符
+搜索索引优先保留最新块：UI 线程的 source retained ceiling 为 8 MiB（计入 source Vec
+与 String capacity），lowercase 在后台构建，cache retained ceiling 为 16 MiB（计入 cache
+Vec、原文与折叠文本的实际 capacity）。重建会先释放旧 cache/hits，不会同时持有
+old+source+new 三份索引。惰性迭代器仍需先物化第一个被拒 source（单块输出上限约 1 MiB），
+cache admission 也会短暂构造一个随后被预算拒绝的 lowercase candidate；这两项瞬时分配不属于
+retained ceiling。同一 pane 同时只运行一个 cache worker；连续完成事件会合并，旧 worker
+返回后先释放 stale build 再启动一次最新版本重建。索引期间可继续输入筛选条件；新命令完成、缺失 `D` 后由下一提示符
 收束或产生 Background 块时会自动刷新。若预算省略了更老块，结果区会明确显示
-`older blocks not indexed`，不会把部分索引伪装成完整历史。
+`older blocks not indexed`，不会把部分索引伪装成完整历史。查询缓冲区（包括纯空白粘贴）
+限制为 4 KiB，正则编译器另有 2 MiB 上限；大小写折叠扩展（如 `İ` → `i` + combining dot）
+会映回原文 Unicode scalar span，不会把缓存坐标误用于跳转。
 
 完成来源与退出结果独立记录：匹配的 OSC 133 `C`/`D` 是 healthy；若 `D` 丢失，下一
 提示符只会将块标为 `inferred`，不会虚构退出码、耗时或完成时间。畸形或 id 不匹配的
