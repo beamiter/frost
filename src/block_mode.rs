@@ -5,6 +5,104 @@
 
 use std::collections::HashSet;
 
+/// Evidence that caused the frontend to close one command block.
+///
+/// This mirrors the family contract in `jterm_core` while Frost remains on a
+/// compatibility pin that predates that API; replace this mirror with a core
+/// re-export after a revision containing the shared types is published.
+/// Outcome and provenance stay
+/// orthogonal: an inferred boundary never invents an exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // Mirror includes future journal/unknown sources before the next published core pin.
+pub enum CompletionProvenance {
+    ShellReported,
+    JournalRecovered,
+    BoundaryInferred,
+    Unknown,
+}
+
+impl CompletionProvenance {
+    pub const fn schema_name(self) -> &'static str {
+        match self {
+            Self::ShellReported => "shell_reported",
+            Self::JournalRecovered => "journal_recovered",
+            Self::BoundaryInferred => "boundary_inferred",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Renderer-neutral confidence in the observed command lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockLifecycleHealth {
+    Healthy,
+    Recovered,
+    Degraded,
+    Incomplete,
+}
+
+impl BlockLifecycleHealth {
+    pub const fn schema_name(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Recovered => "recovered",
+            Self::Degraded => "degraded",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Assess lifecycle confidence independently of exit outcome.
+/// `start_mark_seen` means the matching OSC 133 `C` was observed.
+pub const fn assess_lifecycle(
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+) -> BlockLifecycleHealth {
+    match (start_mark_seen, provenance) {
+        (true, CompletionProvenance::ShellReported) => BlockLifecycleHealth::Healthy,
+        (_, CompletionProvenance::JournalRecovered) => BlockLifecycleHealth::Recovered,
+        (_, CompletionProvenance::BoundaryInferred)
+        | (false, CompletionProvenance::ShellReported) => BlockLifecycleHealth::Degraded,
+        (_, CompletionProvenance::Unknown) => BlockLifecycleHealth::Incomplete,
+    }
+}
+
+pub const fn lifecycle_badge_suffix(
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+) -> Option<&'static str> {
+    match (assess_lifecycle(start_mark_seen, provenance), provenance) {
+        (BlockLifecycleHealth::Healthy, _) => None,
+        (BlockLifecycleHealth::Recovered, _) => Some("recovered"),
+        (BlockLifecycleHealth::Degraded, CompletionProvenance::BoundaryInferred) => {
+            Some("inferred")
+        }
+        (BlockLifecycleHealth::Degraded, _) => Some("degraded"),
+        (BlockLifecycleHealth::Incomplete, _) => Some("incomplete"),
+    }
+}
+
+pub const fn lifecycle_detail(
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+) -> &'static str {
+    match (start_mark_seen, provenance) {
+        (true, CompletionProvenance::ShellReported) => {
+            "Completion confirmed by matching OSC 133 start/end marks"
+        }
+        (_, CompletionProvenance::JournalRecovered) => {
+            "Completion recovered from the execution journal"
+        }
+        (_, CompletionProvenance::BoundaryInferred) => {
+            "Completion inferred at the next shell boundary; exit status is unknown"
+        }
+        (false, CompletionProvenance::ShellReported) => {
+            "Shell end mark observed without a matching command-start mark"
+        }
+        (_, CompletionProvenance::Unknown) => "Command lifecycle is incomplete",
+    }
+}
+
 /// Pane-local bookmarks for retained command blocks.
 ///
 /// Bookmarks key on stable zone ids, just like [`BlockSelection`], but carry
@@ -432,6 +530,24 @@ pub fn badge_text(outcome: BlockOutcome, duration_ms: Option<u64>) -> Option<Str
     }
 }
 
+/// Final badge plus a compact lifecycle qualifier. Background output has no
+/// command start/end lifecycle, so its existing badge remains unchanged.
+pub fn badge_text_with_lifecycle(
+    outcome: BlockOutcome,
+    duration_ms: Option<u64>,
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+) -> Option<String> {
+    let mut text = badge_text(outcome, duration_ms)?;
+    if !matches!(outcome, BlockOutcome::Background) {
+        if let Some(suffix) = lifecycle_badge_suffix(start_mark_seen, provenance) {
+            text.push_str(" · ");
+            text.push_str(suffix);
+        }
+    }
+    Some(text)
+}
+
 /// Compact live badge for an OSC 133 command whose `C` arrived but whose
 /// `D` has not. Forge keeps an elapsed running header visible while a command
 /// executes; frost uses the same feedback in the command's prompt row, where
@@ -850,11 +966,37 @@ fn markdown_export(block: &MarkdownBlock<'_>) -> String {
 /// family's shared block fields. These notes keep a retained-but-incomplete
 /// OSC 133 lifecycle, a shell-truncated command, or output lost to both
 /// retention budgets from looking like complete data.
+#[cfg(test)]
 pub fn markdown_export_with_state(
     block: &MarkdownBlock<'_>,
     command_truncated: bool,
     output_unavailable: bool,
     completion_observed: bool,
+) -> String {
+    markdown_export_with_lifecycle(
+        block,
+        command_truncated,
+        output_unavailable,
+        !matches!(
+            classify(block.command, block.exit_code),
+            BlockOutcome::Background
+        ),
+        if completion_observed {
+            CompletionProvenance::ShellReported
+        } else {
+            CompletionProvenance::BoundaryInferred
+        },
+    )
+}
+
+/// Lifecycle-aware Markdown export used by live zones. The compatibility
+/// wrapper above preserves the previous boolean API for callers and tests.
+pub fn markdown_export_with_lifecycle(
+    block: &MarkdownBlock<'_>,
+    command_truncated: bool,
+    output_unavailable: bool,
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
 ) -> String {
     let background = matches!(
         classify(block.command, block.exit_code),
@@ -904,8 +1046,22 @@ pub fn markdown_export_with_state(
     // Background output was never a command lifecycle, so there is no command
     // completion marker to be missing. Keep this note for incomplete command
     // zones only.
-    if !background && !completion_observed {
-        meta.push_str("- Note: command completion not observed\n");
+    if !background {
+        match (start_mark_seen, provenance) {
+            (true, CompletionProvenance::ShellReported) => {}
+            (_, CompletionProvenance::JournalRecovered) => {
+                meta.push_str("- Completion: recovered from execution journal\n");
+            }
+            (_, CompletionProvenance::BoundaryInferred) => {
+                meta.push_str("- Completion: inferred at next shell boundary\n");
+            }
+            (false, CompletionProvenance::ShellReported) => {
+                meta.push_str("- Completion: shell end observed; start mark missing\n");
+            }
+            (_, CompletionProvenance::Unknown) => {
+                meta.push_str("- Completion: incomplete\n");
+            }
+        }
     }
     if !meta.is_empty() {
         out.push('\n');
@@ -1489,6 +1645,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lifecycle_health_is_independent_from_exit_outcome() {
+        use BlockLifecycleHealth::{Degraded, Healthy, Incomplete, Recovered};
+        use CompletionProvenance::{BoundaryInferred, JournalRecovered, ShellReported, Unknown};
+
+        for (start_seen, provenance, expected) in [
+            (true, ShellReported, Healthy),
+            (false, ShellReported, Degraded),
+            (true, JournalRecovered, Recovered),
+            (false, JournalRecovered, Recovered),
+            (true, BoundaryInferred, Degraded),
+            (false, BoundaryInferred, Degraded),
+            (true, Unknown, Incomplete),
+            (false, Unknown, Incomplete),
+        ] {
+            assert_eq!(assess_lifecycle(start_seen, provenance), expected);
+        }
+        assert_eq!(ShellReported.schema_name(), "shell_reported");
+        assert_eq!(JournalRecovered.schema_name(), "journal_recovered");
+        assert_eq!(BoundaryInferred.schema_name(), "boundary_inferred");
+        assert_eq!(Unknown.schema_name(), "unknown");
+        assert_eq!(Healthy.schema_name(), "healthy");
+        assert_eq!(Recovered.schema_name(), "recovered");
+        assert_eq!(Degraded.schema_name(), "degraded");
+        assert_eq!(Incomplete.schema_name(), "incomplete");
+
+        assert_eq!(classify(Some("false"), None), BlockOutcome::Unknown);
+        assert_eq!(
+            badge_text_with_lifecycle(BlockOutcome::Unknown, None, true, BoundaryInferred,)
+                .as_deref(),
+            Some("? exit:? · inferred")
+        );
+        assert_eq!(
+            badge_text_with_lifecycle(BlockOutcome::Background, None, false, BoundaryInferred,)
+                .as_deref(),
+            Some("↻ Background")
+        );
+    }
+
+    #[test]
     fn classification_never_promotes_a_missing_exit_to_success() {
         assert_eq!(classify(Some("ls"), Some(0)), BlockOutcome::Success);
         assert_eq!(classify(Some("ls"), Some(2)), BlockOutcome::Failed(2));
@@ -1989,7 +2184,7 @@ mod tests {
         let markdown = markdown_export_with_state(&block, true, true, false);
         assert!(markdown.contains("- Note: output unavailable (snapshot and scrollback evicted)\n"));
         assert!(markdown.contains("- Note: command truncated or unavailable\n"));
-        assert!(markdown.contains("- Note: command completion not observed\n"));
+        assert!(markdown.contains("- Completion: inferred at next shell boundary\n"));
         assert!(!markdown.contains("- Note: output truncated\n"));
     }
 

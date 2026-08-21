@@ -9172,7 +9172,7 @@ impl Frost {
             },
             |ms| (ms / 1000) as i64,
         ));
-        block_mode::markdown_export_with_state(
+        block_mode::markdown_export_with_lifecycle(
             &block_mode::MarkdownBlock {
                 command: zone.command.as_deref(),
                 output: &output,
@@ -9185,7 +9185,8 @@ impl Frost {
             },
             zone.command_truncated,
             output_unavailable,
-            zone.completion_observed,
+            zone.start_mark_seen,
+            zone.completion_provenance,
         )
     }
 
@@ -9464,14 +9465,22 @@ impl Frost {
                 // watching (focused window, active pane) never toasts.
                 if self.config.notify_long_blocks && !(self.focused && is_active_output) {
                     for completed in &completed_commands {
-                        if let Some(ms) = completed.duration_ms {
-                            if ms >= self.config.notify_long_block_threshold_ms {
-                                jterm_core::notify::long_block_finished(
-                                    &completed.command,
-                                    completed.exit_code.unwrap_or(0),
-                                    ms,
-                                );
-                            }
+                        if completed.completion_provenance
+                            != block_mode::CompletionProvenance::ShellReported
+                        {
+                            continue;
+                        }
+                        let (Some(ms), Some(exit_code)) =
+                            (completed.duration_ms, completed.exit_code)
+                        else {
+                            continue;
+                        };
+                        if ms >= self.config.notify_long_block_threshold_ms {
+                            jterm_core::notify::long_block_finished(
+                                &completed.command,
+                                exit_code,
+                                ms,
+                            );
                         }
                     }
                 }
@@ -9588,6 +9597,11 @@ impl Frost {
                 // Mirror captured command output into jsh's execution journal
                 // (no-op unless JSH_EXECUTION_JOURNAL is enabled).
                 for completed in &completed_commands {
+                    if completed.completion_provenance
+                        != block_mode::CompletionProvenance::ShellReported
+                    {
+                        continue;
+                    }
                     let Some(id) = completed.id.clone() else {
                         continue;
                     };
@@ -9625,9 +9639,20 @@ impl Frost {
                                 .ok()
                                 .and_then(|duration| u64::try_from(duration.as_millis()).ok());
                             for completed in &completed_commands {
+                                if completed.completion_provenance
+                                    != block_mode::CompletionProvenance::ShellReported
+                                {
+                                    continue;
+                                }
                                 let Some(command) =
                                     history_picker::sanitized_command(&completed.command)
                                 else {
+                                    continue;
+                                };
+                                let Some(exit_code) = completed.exit_code else {
+                                    // The shared history schema requires a
+                                    // concrete status. Missing OSC status is
+                                    // Unknown, never an implicit success.
                                     continue;
                                 };
                                 if let Err(error) = jterm_core::command_history::enqueue(
@@ -9635,7 +9660,7 @@ impl Frost {
                                     max_entries,
                                     command,
                                     cwd.as_deref(),
-                                    completed.exit_code.unwrap_or(0),
+                                    exit_code,
                                     end_time_ms,
                                 ) {
                                     log::warn!("command history: {error}");
@@ -13340,8 +13365,13 @@ impl Frost {
                 preview.push('…');
             }
             let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
-            let status = block_mode::badge_text(outcome, zone.duration_ms)
-                .unwrap_or_else(|| "Background output".to_string());
+            let status = block_mode::badge_text_with_lifecycle(
+                outcome,
+                zone.duration_ms,
+                zone.start_mark_seen,
+                zone.completion_provenance,
+            )
+            .unwrap_or_else(|| "Background output".to_string());
             let bookmarked = sess.block_bookmarks.contains(zone.id);
             let mut meta = status;
             if bookmarked {
@@ -13396,6 +13426,19 @@ impl Frost {
                 );
             if let Some(retention) = retention {
                 body = body.push(text(retention).size(11).style(text::warning));
+            }
+            if !matches!(outcome, block_mode::BlockOutcome::Background)
+                && block_mode::assess_lifecycle(zone.start_mark_seen, zone.completion_provenance)
+                    != block_mode::BlockLifecycleHealth::Healthy
+            {
+                body = body.push(
+                    text(block_mode::lifecycle_detail(
+                        zone.start_mark_seen,
+                        zone.completion_provenance,
+                    ))
+                    .size(11)
+                    .style(text::warning),
+                );
             }
             if sess.projection_policy.is_collapsed(zone.id) {
                 body = body.push(row_btn("Expand output", BlockMenuAction::ExpandOutput));
@@ -13863,7 +13906,12 @@ impl Frost {
             let row = &mut paint[top_view];
             row.separator = true;
             row.bookmarked = sess.block_bookmarks.contains(zone.id);
-            if let Some(plain) = block_mode::badge_text(outcome, zone.duration_ms) {
+            if let Some(plain) = block_mode::badge_text_with_lifecycle(
+                outcome,
+                zone.duration_ms,
+                zone.start_mark_seen,
+                zone.completion_provenance,
+            ) {
                 // The selected block's badge appends its LOCAL finish time.
                 // If the suffix no longer fits, retain the plain badge.
                 let suffixed = zone.finished_at_ms.filter(|_| active).map(|ms| {
@@ -19168,7 +19216,8 @@ mod tests {
             cwd: None,
             captured_output: None,
             captured_output_evicted: false,
-            completion_observed: true,
+            start_mark_seen: true,
+            completion_provenance: block_mode::CompletionProvenance::ShellReported,
             rows_evicted: false,
         });
         terminal.set_scroll_offset(terminal.scrollback_len());

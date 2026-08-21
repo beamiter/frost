@@ -2316,10 +2316,14 @@ pub struct CommandZone {
     /// by the aggregate byte budget. Scrollback trimming does not set this:
     /// retained snapshots remain authoritative after their live rows vanish.
     pub(crate) captured_output_evicted: bool,
-    /// `true` when OSC 133 `D` reported this completion. A zone finalized at
-    /// the next prompt because `D` was missing remains useful block history,
-    /// but is not an observed completion.
-    pub(crate) completion_observed: bool,
+    /// Whether the matching OSC 133 `C` command-start mark was observed.
+    /// Stored independently of row anchors so scrollback eviction cannot
+    /// downgrade lifecycle evidence.
+    pub(crate) start_mark_seen: bool,
+    /// Evidence that closed this zone. This is orthogonal to `exit_code`: a
+    /// boundary-inferred close stays unknown, while a shell-reported `D` may
+    /// itself omit an exit status.
+    pub(crate) completion_provenance: crate::block_mode::CompletionProvenance,
     /// The zone's rows were trimmed out of scrollback. The entry stays (id,
     /// metadata, snapshot — v2 dropped the whole zone here) but all row
     /// fields are meaningless: `prompt_start` is clamped to 0 and the
@@ -2356,6 +2360,8 @@ enum ZoneState {
 }
 
 const MAX_CAPTURED_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
+const MAX_CONSUMED_EXECUTION_IDS: usize = 256;
 const UNAVAILABLE_COMMAND_TEXT: &str = "<command unavailable>";
 
 /// Bounded command text reconstructed at OSC 133 `C`.
@@ -2672,6 +2678,7 @@ struct CompletedCommandMetadata {
     duration_ms: Option<u64>,
     execution_id: Option<String>,
     agent_generation: Option<u64>,
+    completion_provenance: crate::block_mode::CompletionProvenance,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2961,8 +2968,14 @@ pub struct TerminalState {
     current_command_id: Option<String>,
     /// Execution id carried specifically by OSC 133 `C`. Kept separate from
     /// [`Self::current_command_id`], which may have been announced earlier on
-    /// `A`/`B`, so only an actual C/D disagreement rejects completion.
+    /// `A`/`B`, so D correlation can prefer C and then fall back to the prompt
+    /// identity without accepting a stale id.
     current_command_start_id: Option<String>,
+    /// Recently consumed shell execution ids. Command zones retain a distinct
+    /// UI id, so this bounded tombstone deque prevents a delayed duplicate D
+    /// from being adopted by a later anonymous lifecycle after the original
+    /// completion has already been drained.
+    consumed_execution_ids: VecDeque<String>,
     /// When the currently executing command began (OSC 133 `C`), so the
     /// finished record can carry a wall-clock duration.
     current_command_started_at: Option<std::time::Instant>,
@@ -3001,6 +3014,9 @@ pub struct CompletedCommand {
     /// Wall-clock run time from OSC 133 `C` (execution start) to `D`. None
     /// when the shell never reported an execution phase.
     pub duration_ms: Option<u64>,
+    /// Evidence that closed the lifecycle. Consumers must not persist or
+    /// notify a boundary-inferred event as though the shell reported `D`.
+    pub completion_provenance: crate::block_mode::CompletionProvenance,
 }
 
 impl TerminalState {
@@ -3189,6 +3205,7 @@ impl TerminalState {
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
             current_command_start_id: None,
+            consumed_execution_ids: VecDeque::new(),
             current_command_started_at: None,
             current_command_cwd: None,
             current_command_truncated: false,
@@ -3827,6 +3844,25 @@ impl TerminalState {
         }
     }
 
+    fn execution_id_was_consumed(&self, id: &str) -> bool {
+        self.consumed_execution_ids
+            .iter()
+            .any(|consumed| consumed == id)
+    }
+
+    fn remember_consumed_execution_id(&mut self, id: Option<&str>) {
+        let Some(id) = id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if self.execution_id_was_consumed(id) {
+            return;
+        }
+        if self.consumed_execution_ids.len() >= MAX_CONSUMED_EXECUTION_IDS {
+            self.consumed_execution_ids.pop_front();
+        }
+        self.consumed_execution_ids.push_back(id.to_string());
+    }
+
     fn handle_osc_133(&mut self, value: &str) {
         const MAX_EXECUTION_ID_BYTES: usize = 192;
         const MAX_COMMAND_METADATA_BYTES: usize = 16 * 1024;
@@ -3849,6 +3885,7 @@ impl TerminalState {
             _ => return,
         };
         let mut mark_id = None;
+        let mut mark_id_present = false;
         let mut metadata_command: Option<CommandCapture> = None;
         let mut metadata_cwd = None;
         let mut metadata_duration_ms = None;
@@ -3858,8 +3895,8 @@ impl TerminalState {
         // where an unrelated later D could inherit it.
         for part in parts {
             if let Some((key, id)) = part.split_once('=') {
-                if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id") && !id.is_empty()
-                {
+                if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id") {
+                    mark_id_present = true;
                     mark_id = Self::decode_osc_metadata(id, MAX_EXECUTION_ID_BYTES)
                         .filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
                 } else if key == "cmdline_url" {
@@ -3904,6 +3941,7 @@ impl TerminalState {
                 }
                 self.finalize_stale_zone(absolute_row);
                 self.finalize_idle_background_output();
+                self.record_abandoned_armed_agent_command();
                 // Prompt start. Any leftover execution timestamp belongs to a
                 // command that never reported `D`; drop it so it cannot leak
                 // into a later command's duration.
@@ -4042,30 +4080,49 @@ impl TerminalState {
                             None => part.trim().parse::<i32>().ok(),
                         });
                 let d_mark_id = mark_id.clone();
-                // Correlate ordinary command lifecycles too, not only Agent
-                // executions. A stale/spoofed D must not close the live block
-                // or consume ids needed by the later matching completion.
-                if self
-                    .current_command_start_id
-                    .as_ref()
-                    .zip(d_mark_id.as_ref())
-                    .is_some_and(|(started, finished)| started != finished)
+                // An explicitly empty, malformed, control-bearing, or
+                // oversized id is not the same as an omitted id. It cannot
+                // authorize fallback to whichever execution happens to be
+                // current.
+                if mark_id_present && d_mark_id.is_none() {
+                    return;
+                }
+                if d_mark_id
+                    .as_deref()
+                    .is_some_and(|id| self.execution_id_was_consumed(id))
                 {
                     return;
+                }
+                // Correlate ordinary command lifecycles too, not only Agent
+                // executions. Prefer C's execution id; when C omitted one,
+                // retain the id already adopted from A/B. A stale/spoofed D
+                // must not close the live block or consume ids needed by the
+                // later matching completion.
+                if let Some(finished) = d_mark_id.as_ref() {
+                    let expected = self
+                        .current_command_start_id
+                        .as_ref()
+                        .or(self.current_command_id.as_ref());
+                    if expected.is_some_and(|expected| expected != finished) {
+                        return;
+                    }
                 }
                 // Once an approved command started with a real jsh execution
                 // id, only the D carrying that same id may consume it. A fake
                 // or stale D is ignored and cannot steal the approval.
-                if self.active_agent_execution.as_ref().is_some_and(|active| {
-                    active
-                        .execution_id
-                        .as_ref()
-                        .is_some_and(|expected| d_mark_id.as_ref() != Some(expected))
-                }) {
-                    return;
+                if let Some(active) = self.active_agent_execution.as_ref() {
+                    match active.execution_id.as_ref() {
+                        Some(expected) if d_mark_id.as_ref() != Some(expected) => return,
+                        // A reviewed command whose C had no id must complete
+                        // with the same anonymous D shape. A suddenly supplied
+                        // id could be a delayed completion from another run.
+                        None if d_mark_id.is_some() => return,
+                        _ => {}
+                    }
                 }
                 let started_id = self.current_command_id.take();
                 let finished_id = mark_id.or(started_id);
+                let consumed_id = finished_id.clone();
                 let agent_generation = self
                     .active_agent_execution
                     .take()
@@ -4113,7 +4170,8 @@ impl TerminalState {
                         output_start_col,
                     ),
                     captured_output_evicted: false,
-                    completion_observed: true,
+                    start_mark_seen: true,
+                    completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
                     rows_evicted: false,
                 };
                 self.push_command_zone_with_provenance(zone, provenance);
@@ -4126,8 +4184,11 @@ impl TerminalState {
                         duration_ms,
                         execution_id: finished_id,
                         agent_generation,
+                        completion_provenance:
+                            crate::block_mode::CompletionProvenance::ShellReported,
                     },
                 );
+                self.remember_consumed_execution_id(consumed_id.as_deref());
                 self.current_zone_state = ZoneState::Idle;
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
@@ -4460,7 +4521,8 @@ impl TerminalState {
                 cwd,
                 captured_output: Some(captured_output),
                 captured_output_evicted: false,
-                completion_observed: false,
+                start_mark_seen: false,
+                completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
                 rows_evicted,
             },
             provenance,
@@ -4492,10 +4554,10 @@ impl TerminalState {
     /// The finalized zone ends where the new prompt begins, keeps whatever
     /// the shell did report (command text captured at `C`, cwd,
     /// `cmd_truncated`) and invents nothing: no exit code (⇒ the existing
-    /// Unknown `?` badge), no duration, no finish timestamp. Deliberately
-    /// NOT queued to `record_completed_command`: that queue feeds command
-    /// history/journal/notifications, which all treat an entry as an
-    /// observed completion.
+    /// Unknown `?` badge), no duration, no finish timestamp. It does publish a
+    /// provenance-tagged completion event so a locally correlated Agent wait
+    /// can terminate cleanly; persistence and notifications explicitly accept
+    /// only `ShellReported` events.
     fn finalize_stale_zone(&mut self, boundary_row: usize) {
         let ZoneState::OutputStarted(prompt_start, cmd_start, out_start) = self.current_zone_state
         else {
@@ -4529,10 +4591,30 @@ impl TerminalState {
             cwd,
             captured_output: self.capture_zone_output(out_start, output_end, output_start_col),
             captured_output_evicted: false,
-            completion_observed: false,
+            start_mark_seen: true,
+            completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
             rows_evicted: false,
         };
         self.push_command_zone_with_provenance(zone, provenance);
+        let execution_id = self.current_command_id.take();
+        let consumed_id = execution_id.clone();
+        let agent_generation = self
+            .active_agent_execution
+            .take()
+            .map(|active| active.generation);
+        self.record_completed_command(
+            cmd_start,
+            out_start,
+            Some((out_start, output_end, output_start_col)),
+            CompletedCommandMetadata {
+                exit_code: None,
+                duration_ms: None,
+                execution_id,
+                agent_generation,
+                completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
+            },
+        );
+        self.remember_consumed_execution_id(consumed_id.as_deref());
     }
 
     /// Command line for a finished zone: the exact text captured at `C`
@@ -4733,7 +4815,7 @@ impl TerminalState {
 
     /// Look up a retained finalized zone by its stable id. This includes a
     /// lifecycle closed at the next prompt after `D` was lost; consult
-    /// [`CommandZone::completion_observed`] when that distinction matters.
+    /// [`CommandZone::completion_provenance`] when that distinction matters.
     /// `None` means the bounded zone deque no longer retains the id.
     pub fn zone_by_id(&self, id: u64) -> Option<&CommandZone> {
         self.command_zones.iter().find(|zone| zone.id == id)
@@ -5140,7 +5222,6 @@ impl TerminalState {
     ) {
         const MAX_COMMAND_BYTES: usize = 16 * 1024;
         const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-        const MAX_PENDING_COMPLETED: usize = 32;
         let command_capture_truncated = self.current_command_truncated;
         let command = self.current_command_text.take().unwrap_or_else(|| {
             self.rows_text(cmd_start, cmd_end, MAX_COMMAND_BYTES)
@@ -5161,7 +5242,7 @@ impl TerminalState {
                 self.rows_text_from_column(start, end, start_col, MAX_OUTPUT_BYTES)
             })
             .unwrap_or_default();
-        if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED {
+        if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED_COMMANDS {
             self.pending_completed_commands.pop_front();
         }
         let total_bytes = output.len();
@@ -5175,7 +5256,59 @@ impl TerminalState {
             truncated,
             total_bytes,
             duration_ms: metadata.duration_ms,
+            completion_provenance: metadata.completion_provenance,
         });
+    }
+
+    fn queue_agent_termination(
+        &mut self,
+        command: String,
+        generation: u64,
+        execution_id: Option<String>,
+    ) {
+        if self.pending_completed_commands.len() >= MAX_PENDING_COMPLETED_COMMANDS {
+            self.pending_completed_commands.pop_front();
+        }
+        self.pending_completed_commands.push_back(CompletedCommand {
+            command,
+            exit_code: None,
+            output: String::new(),
+            id: execution_id.clone(),
+            agent_generation: Some(generation),
+            output_available: false,
+            truncated: false,
+            total_bytes: 0,
+            duration_ms: None,
+            completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
+        });
+        self.remember_consumed_execution_id(execution_id.as_deref());
+    }
+
+    fn record_abandoned_armed_agent_command(&mut self) {
+        let Some(armed) = self.armed_agent_execution.take() else {
+            return;
+        };
+        let execution_id = self.current_command_id.clone();
+        self.queue_agent_termination(armed.command, armed.generation, execution_id);
+    }
+
+    /// Publish a lifecycle termination for a locally authorized Agent command
+    /// before RIS clears terminal state. Prefer an execution correlated at C;
+    /// otherwise seal an approval still armed at the prompt. Neither path
+    /// supplies an invented exit status or output.
+    fn record_reset_interrupted_agent_command(&mut self) {
+        if let Some(active) = self.active_agent_execution.take() {
+            let execution_id = active
+                .execution_id
+                .or_else(|| self.current_command_id.clone());
+            self.queue_agent_termination(
+                self.current_command_text.clone().unwrap_or_default(),
+                active.generation,
+                execution_id,
+            );
+        } else {
+            self.record_abandoned_armed_agent_command();
+        }
     }
 
     /// Drain commands finished since the last call (for the AI agent panel).
@@ -7696,6 +7829,7 @@ impl TerminalState {
         if self.use_alt_buffer {
             self.reset_mode(1049, true);
         }
+        self.record_reset_interrupted_agent_command();
         self.current_fg = Color::Default;
         self.current_bg = Color::Default;
         self.global_bg = Color::Default;
@@ -11066,6 +11200,127 @@ mod tests {
     }
 
     #[test]
+    fn explicit_invalid_d_ids_never_fall_back_to_the_live_command() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(
+            b"\x1b]133;A;id=run-1\x07$ \x1b]133;B;id=run-1\x07echo ok\r\n\x1b]133;C;id=run-1\x07ok\r\n",
+        );
+
+        for invalid in ["", "bad%ZZ"] {
+            terminal.process_input(format!("\x1b]133;D;0;id={invalid}\x07").as_bytes());
+            assert!(terminal.is_command_running(), "accepted {invalid:?}");
+            assert!(terminal.command_zones.is_empty());
+            assert!(terminal.take_completed_commands().is_empty());
+        }
+        let oversized = "x".repeat(193);
+        terminal.process_input(format!("\x1b]133;D;0;id={oversized}\x07").as_bytes());
+        assert!(terminal.is_command_running());
+        assert!(terminal.command_zones.is_empty());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+        assert_eq!(terminal.take_completed_commands().len(), 1);
+    }
+
+    #[test]
+    fn ordinary_d_id_falls_back_to_a_b_identity_when_c_omits_it() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A;id=run-7\x07$ \x1b]133;B;id=run-7\x07");
+        terminal.process_input(b"echo ok\r\n\x1b]133;C;cmdline_url=echo%20ok\x07ok\r\n");
+
+        terminal.process_input(b"\x1b]133;D;0;id=other\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        terminal.process_input(b"\x1b]133;D;0;id=run-7\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id.as_deref(), Some("run-7"));
+        assert_eq!(completed[0].agent_generation, None);
+    }
+
+    #[test]
+    fn agent_with_anonymous_c_rejects_even_the_a_b_id_until_anonymous_d() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A;id=run-8\x07$ \x1b]133;B;id=run-8\x07");
+        terminal
+            .arm_agent_execution(8, "echo ok")
+            .expect("fresh prompt is ready");
+        terminal.process_input(b"echo ok\r\n\x1b]133;C;cmdline_url=echo%20ok\x07ok\r\n");
+
+        terminal.process_input(b"\x1b]133;D;0;id=run-8\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id.as_deref(), Some("run-8"));
+        assert_eq!(completed[0].agent_generation, Some(8));
+    }
+
+    #[test]
+    fn consumed_d_id_cannot_be_adopted_by_a_later_anonymous_command() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(
+            b"\x1b]133;A;id=run-1\x07$ \x1b]133;B;id=run-1\x07one\r\n\x1b]133;C;id=run-1\x07one\x1b]133;D;0;id=run-1\x07",
+        );
+        assert_eq!(terminal.take_completed_commands().len(), 1);
+
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07two");
+        terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "two");
+        assert_eq!(completed[0].id, None);
+    }
+
+    #[test]
+    fn consumed_execution_id_authority_is_bounded_to_the_recent_window() {
+        let mut terminal = super::TerminalState::new(8, 2);
+        for index in 0..=super::MAX_CONSUMED_EXECUTION_IDS {
+            terminal.remember_consumed_execution_id(Some(&format!("run-{index}")));
+        }
+        assert_eq!(
+            terminal.consumed_execution_ids.len(),
+            super::MAX_CONSUMED_EXECUTION_IDS
+        );
+        assert!(!terminal.execution_id_was_consumed("run-0"));
+        assert!(terminal
+            .execution_id_was_consumed(&format!("run-{}", super::MAX_CONSUMED_EXECUTION_IDS)));
+    }
+
+    #[test]
+    fn anonymous_active_agent_rejects_a_late_named_d_and_keeps_its_generation() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(
+            b"\x1b]133;A;id=run-1\x07$ \x1b]133;B;id=run-1\x07one\r\n\x1b]133;C;id=run-1\x07one\x1b]133;D;0;id=run-1\x07",
+        );
+        terminal.take_completed_commands();
+
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal
+            .arm_agent_execution(8, "echo safe")
+            .expect("anonymous prompt is ready");
+        terminal.process_input(b"echo safe\r\n\x1b]133;C;cmdline_url=echo%20safe\x07safe");
+
+        terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.take_completed_commands().is_empty());
+
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "echo safe");
+        assert_eq!(completed[0].id, None);
+        assert_eq!(completed[0].agent_generation, Some(8));
+    }
+
+    #[test]
     fn osc_133_visible_command_capture_is_bounded_without_becoming_background() {
         fn run(command: &str) -> super::TerminalState {
             let mut terminal = super::TerminalState::new(40, 8);
@@ -11157,7 +11412,10 @@ mod tests {
             b"\x1b]133;A\x07$ \x1b]133;B\x07printf foo\r\n\x1b]133;C\x07foo\x1b]133;A\x07",
         );
         let zone = stale.command_zones.back().expect("stale block");
-        assert!(!zone.completion_observed);
+        assert_eq!(
+            zone.completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
         assert_eq!(stale.zone_output_text(zone.id).as_deref(), Some("foo"));
     }
 
@@ -11413,6 +11671,12 @@ mod tests {
         );
         assert_eq!(terminal.command_zones[0].exit_code, None);
         assert!(!terminal.is_command_running());
+        let inferred = terminal.take_completed_commands();
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(
+            inferred[0].completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
         terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
         terminal.process_input(b"\x1b]133;C\x07hi\r\n");
         terminal.process_input(b"\x1b]133;D;0\x07");
@@ -11554,6 +11818,7 @@ mod tests {
             duration_ms: None,
             execution_id: None,
             agent_generation: None,
+            completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
         };
 
         // The next whole row does not fit, so extraction is capped while the
@@ -11680,6 +11945,88 @@ mod tests {
         // The generation and zone were consumed by the first valid D.
         terminal.process_input(b"\x1b]133;D;0;id=jsh-41\x07");
         assert!(terminal.take_completed_commands().is_empty());
+    }
+
+    #[test]
+    fn ris_releases_an_active_agent_generation_as_boundary_inferred() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal
+            .arm_agent_execution(51, "printf '\\ec'")
+            .expect("fresh prompt is ready");
+        terminal.process_input(
+            b"printf '\\ec'\r\n\x1b]133;C;id=ris-51;cmdline_url=printf%20%27%5Cec%27\x07",
+        );
+
+        terminal.process_input(b"\x1bc");
+
+        assert!(!terminal.is_command_running());
+        assert!(
+            terminal.command_zones.is_empty(),
+            "RIS still clears history"
+        );
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "printf '\\ec'");
+        assert_eq!(completed[0].id.as_deref(), Some("ris-51"));
+        assert_eq!(completed[0].agent_generation, Some(51));
+        assert_eq!(completed[0].exit_code, None);
+        assert!(!completed[0].output_available);
+        assert_eq!(
+            completed[0].completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
+
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07next\r\n\x1b]133;C\x07next");
+        terminal.process_input(b"\x1b]133;D;0;id=ris-51\x07");
+        assert!(terminal.is_command_running());
+        assert!(terminal.take_completed_commands().is_empty());
+        terminal.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.take_completed_commands().len(), 1);
+    }
+
+    #[test]
+    fn fresh_prompt_releases_an_agent_approval_that_never_reached_c() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A;id=armed-61\x07$ \x1b]133;B;id=armed-61\x07");
+        terminal
+            .arm_agent_execution(61, "echo safe")
+            .expect("fresh prompt is ready");
+
+        terminal.process_input(b"\x1b]133;A;id=next\x07$ ");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "echo safe");
+        assert_eq!(completed[0].id.as_deref(), Some("armed-61"));
+        assert_eq!(completed[0].agent_generation, Some(61));
+        assert_eq!(completed[0].exit_code, None);
+        assert_eq!(
+            completed[0].completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
+    }
+
+    #[test]
+    fn ris_releases_an_agent_approval_that_never_reached_c() {
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A;id=armed-62\x07$ \x1b]133;B;id=armed-62\x07");
+        terminal
+            .arm_agent_execution(62, "echo safe")
+            .expect("fresh prompt is ready");
+
+        terminal.process_input(b"\x1bc");
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command, "echo safe");
+        assert_eq!(completed[0].id.as_deref(), Some("armed-62"));
+        assert_eq!(completed[0].agent_generation, Some(62));
+        assert_eq!(completed[0].exit_code, None);
+        assert_eq!(
+            completed[0].completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
     }
 
     #[test]
@@ -15677,7 +16024,10 @@ mod tests {
         assert!(full.duration_ms.is_some());
         assert!(full.finished_at_ms.is_some());
         assert_eq!(full.exit_code, Some(0));
-        assert!(full.completion_observed);
+        assert_eq!(
+            full.completion_provenance,
+            crate::block_mode::CompletionProvenance::ShellReported
+        );
         assert!(!full.captured_output_evicted);
 
         let background = &terminal.command_zones[1];
@@ -15690,7 +16040,10 @@ mod tests {
         assert_eq!(background.duration_ms, None);
         assert!(background.finished_at_ms.is_some());
         assert_eq!(background.exit_code, None);
-        assert!(!background.completion_observed);
+        assert_eq!(
+            background.completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
         assert_eq!(
             background.captured_output.as_ref().map(|v| v.0.as_str()),
             Some("\nworker done\n")
@@ -15994,7 +16347,10 @@ mod tests {
         // Nothing is invented: no fake duration, no fake finish instant.
         assert_eq!(zone.duration_ms, None);
         assert_eq!(zone.finished_at_ms, None);
-        assert!(!zone.completion_observed);
+        assert_eq!(
+            zone.completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
         // The Unknown badge (`?`) is exactly what an unreported exit shows.
         assert_eq!(
             crate::block_mode::classify(zone.command.as_deref(), zone.exit_code),
@@ -16002,10 +16358,15 @@ mod tests {
         );
         // Its output up to the new prompt row was still snapshotted.
         assert_eq!(zone.captured_output, Some(("building".to_string(), false)));
-        // Deliberately NOT queued as a completed command: that queue feeds
-        // history/journal/notifications, which treat entries as observed
-        // completions.
-        assert!(terminal.take_completed_commands().is_empty());
+        // A tagged event releases a strictly correlated Agent wait, while
+        // persistence and notifications filter it as non-shell evidence.
+        let inferred = terminal.take_completed_commands();
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].exit_code, None);
+        assert_eq!(
+            inferred[0].completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
 
         // The new lifecycle records cleanly after the forced close.
         terminal.process_input(b"\x1b]133;B\x07echo hi\r\n");
@@ -16049,7 +16410,10 @@ mod tests {
         assert_eq!(zone.command, None);
         assert_eq!(zone.exit_code, None);
         assert_eq!(zone.duration_ms, None);
-        assert!(!zone.completion_observed);
+        assert_eq!(
+            zone.completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+        );
         assert_eq!(zone.output_start_col, 2);
         assert_eq!(
             terminal.zone_output_text(zone.id).as_deref(),

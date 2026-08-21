@@ -875,6 +875,18 @@ impl AgentUi {
                     );
                     return;
                 }
+                if matches!(
+                    completed.completion_provenance,
+                    crate::block_mode::CompletionProvenance::BoundaryInferred
+                        | crate::block_mode::CompletionProvenance::Unknown
+                ) {
+                    let generation = pending.generation;
+                    self.execution_start_failed(
+                        generation,
+                        "Agent stopped: command completion was inferred at a later shell boundary; no trustworthy exit status was reported",
+                    );
+                    return;
+                }
                 let Some(exit_code) = completed.exit_code else {
                     let generation = pending.generation;
                     self.execution_start_failed(
@@ -900,6 +912,17 @@ impl AgentUi {
         if completed.agent_generation.is_some() {
             return;
         }
+        // The compatibility BlockContext requires a concrete exit code. An
+        // inferred/incomplete lifecycle must not be rewritten as exit 1 and
+        // attached to a later model request as a fabricated failure.
+        if matches!(
+            completed.completion_provenance,
+            crate::block_mode::CompletionProvenance::BoundaryInferred
+                | crate::block_mode::CompletionProvenance::Unknown
+        ) || completed.exit_code.is_none()
+        {
+            return;
+        }
         let Ok(reported) = crate::review_text::sanitize_untrusted_single_line(
             &completed.command,
             crate::review_text::MAX_HISTORY_COMMAND_BYTES,
@@ -910,7 +933,9 @@ impl AgentUi {
             cmd: reported,
             output: completed.output.clone(),
             cwd: None,
-            exit_code: completed.exit_code.unwrap_or(1),
+            exit_code: completed
+                .exit_code
+                .expect("completion provenance and status were checked above"),
             truncated: completed.output.len() >= MANUAL_OUTPUT_TRUNCATION_HINT,
         });
     }
@@ -1436,6 +1461,7 @@ mod tests {
             truncated: false,
             total_bytes: output.len(),
             duration_ms: None,
+            completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
         }
     }
 
@@ -1537,6 +1563,47 @@ mod tests {
             AgentState::Cancelled
         );
         assert!(agent.status.contains("no exit status"));
+    }
+
+    #[test]
+    fn inferred_completion_releases_a_correlated_agent_wait_with_diagnostic() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 7);
+        let session = agent.session.as_mut().unwrap();
+        session.submit_user("list files").unwrap();
+        let outcome = session
+            .accept_model_reply(r#"{"action":"run","command":"ls -la"}"#)
+            .unwrap();
+        let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
+            panic!("expected proposal");
+        };
+        let approved = agent.approve(id, None).expect("proposal approves");
+        let mut completion = completed("ls -la", 0, "partial", Some(approved.generation));
+        completion.exit_code = None;
+        completion.completion_provenance =
+            crate::block_mode::CompletionProvenance::BoundaryInferred;
+
+        agent.handle_completed(7, &completion);
+
+        assert!(agent.awaiting.is_none());
+        assert_eq!(
+            agent.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
+        assert!(agent.status.contains("inferred"));
+    }
+
+    #[test]
+    fn inferred_manual_completion_is_not_attached_as_a_fake_failure() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 7);
+        let mut completion = completed("mystery", 9, "partial", None);
+        completion.completion_provenance =
+            crate::block_mode::CompletionProvenance::BoundaryInferred;
+
+        agent.handle_completed(7, &completion);
+
+        assert!(agent.last_manual_completed.is_none());
     }
 
     #[test]

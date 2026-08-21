@@ -199,6 +199,14 @@ Block Mode 关闭或进入 alternate screen 时会暂时绕过折叠视图，返
 收束或产生 Background 块时会自动刷新。若预算省略了更老块，结果区会明确显示
 `older blocks not indexed`，不会把部分索引伪装成完整历史。
 
+完成来源与退出结果独立记录：匹配的 OSC 133 `C`/`D` 是 healthy；若 `D` 丢失，下一
+提示符只会将块标为 `inferred`，不会虚构退出码、耗时或完成时间。畸形或 id 不匹配的
+`D`，以及保留窗口内近期错序/重复的 id，不会关闭当前命令。推断事件可以解除本地严格
+关联的 Agent 等待，但不会进入桌面完成通知、执行日志或持久化命令历史；未知退出码也绝不会
+按 0 写成成功。卡片 badge 与
+右键面板会提示退化生命周期，Markdown/JSON 导出则明确携带 completion provenance 与
+lifecycle health；Background 输出不计入命令生命周期健康汇总。
+
 命令文本捕获有 16 KiB 上限；超过上限时保留 UTF-8 安全前缀并明确标为截断，复制与
 导出仍可使用，但 Recall/Reinput、Agent 和持久化历史不会把不完整命令当成可执行文本。
 若 OSC 133 已进入命令生命周期却无法恢复命令内容，会显示不可用占位而不会误归类为
@@ -207,7 +215,9 @@ Background。
 命令面板中的 **Export Session Blocks as Markdown/JSON** 会把当前 pane 仍保留的
 已定型块（最多 256 条，也包括缺失结束标记后由下一提示符收束的记录）写入
 `$XDG_DATA_HOME/frost/exports/`（通常是 `~/.local/share/frost/exports/`）。JSON 和
-Markdown 都会明确标记命令截断、输出已淘汰或未观察到完成；文件按本地时间命名，
+Markdown 都会明确标记命令截断、输出已淘汰及完成来源；JSON 继续保留兼容的
+`completion_observed`，并新增 `start_mark_seen`、`completion_provenance` 与
+`lifecycle_health`；文件按本地时间命名，
 同秒多次导出不覆盖，先私密暂存并原子发布，目录与文件权限分别为 `0700` / `0600`。
 JSON 使用版本化的 `frost.block-session` v1 envelope，记录 pane session、捕获时间、
 块顺序和截断/淘汰汇总，后续字段演进不再依赖无版本裸数组。

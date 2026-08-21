@@ -58,9 +58,37 @@ pub struct SessionExportBlock {
     pub tz_offset_secs: i32,
     pub cwd: Option<String>,
     pub command_truncated: bool,
+    /// Whether the OSC 133 `C` command-start mark was observed. Kept even
+    /// after row eviction so lifecycle health remains stable in exports.
+    pub start_mark_seen: bool,
+    #[serde(serialize_with = "serialize_completion_provenance")]
+    pub completion_provenance: block_mode::CompletionProvenance,
+    #[serde(serialize_with = "serialize_lifecycle_health")]
+    pub lifecycle_health: block_mode::BlockLifecycleHealth,
     /// `false` for a lifecycle recovered at the next prompt after OSC 133 `D`
-    /// was lost; such a retained block is useful but not a reported completion.
+    /// was lost. Retained for compatibility with the v1 boolean field; new
+    /// consumers should use `completion_provenance`.
     pub completion_observed: bool,
+}
+
+fn serialize_completion_provenance<S>(
+    value: &block_mode::CompletionProvenance,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.schema_name())
+}
+
+fn serialize_lifecycle_health<S>(
+    value: &block_mode::BlockLifecycleHealth,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.schema_name())
 }
 
 /// One immutable pane snapshot handed to the export worker. Keeping identity
@@ -81,6 +109,9 @@ struct SessionExportRetention {
     output_truncated: usize,
     output_unavailable: usize,
     completion_unobserved: usize,
+    lifecycle_degraded: usize,
+    lifecycle_recovered: usize,
+    lifecycle_incomplete: usize,
 }
 
 #[derive(Serialize)]
@@ -97,6 +128,13 @@ struct JsonSessionExport<'a> {
 
 impl SessionExportSnapshot {
     fn retention(&self) -> SessionExportRetention {
+        let is_command_block = |block: &&SessionExportBlock| {
+            block.command_truncated
+                || block
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty())
+        };
         SessionExportRetention {
             retained_blocks: self.blocks.len(),
             command_truncated: self
@@ -119,13 +157,37 @@ impl SessionExportSnapshot {
                 .iter()
                 .filter(|block| !block.completion_observed)
                 .count(),
+            lifecycle_degraded: self
+                .blocks
+                .iter()
+                .filter(is_command_block)
+                .filter(|block| {
+                    block.lifecycle_health == block_mode::BlockLifecycleHealth::Degraded
+                })
+                .count(),
+            lifecycle_recovered: self
+                .blocks
+                .iter()
+                .filter(is_command_block)
+                .filter(|block| {
+                    block.lifecycle_health == block_mode::BlockLifecycleHealth::Recovered
+                })
+                .count(),
+            lifecycle_incomplete: self
+                .blocks
+                .iter()
+                .filter(is_command_block)
+                .filter(|block| {
+                    block.lifecycle_health == block_mode::BlockLifecycleHealth::Incomplete
+                })
+                .count(),
         }
     }
 }
 
 impl SessionExportBlock {
     fn markdown(&self) -> String {
-        block_mode::markdown_export_with_state(
+        block_mode::markdown_export_with_lifecycle(
             &block_mode::MarkdownBlock {
                 command: self.command.as_deref(),
                 output: &self.output,
@@ -138,7 +200,8 @@ impl SessionExportBlock {
             },
             self.command_truncated,
             self.output_unavailable,
-            self.completion_observed,
+            self.start_mark_seen,
+            self.completion_provenance,
         )
     }
 }
@@ -195,7 +258,14 @@ fn snapshot_zone(
         tz_offset_secs: block_mode::local_offset_secs((offset_at / 1000) as i64),
         cwd: zone.cwd.clone(),
         command_truncated: zone.command_truncated,
-        completion_observed: zone.completion_observed,
+        start_mark_seen: zone.start_mark_seen,
+        completion_provenance: zone.completion_provenance,
+        lifecycle_health: block_mode::assess_lifecycle(
+            zone.start_mark_seen,
+            zone.completion_provenance,
+        ),
+        completion_observed: zone.completion_provenance
+            == block_mode::CompletionProvenance::ShellReported,
     })
 }
 
@@ -426,6 +496,9 @@ mod tests {
             tz_offset_secs: 0,
             cwd: Some("/tmp/project".to_string()),
             command_truncated: false,
+            start_mark_seen: true,
+            completion_provenance: block_mode::CompletionProvenance::ShellReported,
+            lifecycle_health: block_mode::BlockLifecycleHealth::Healthy,
             completion_observed: true,
         }
     }
@@ -493,6 +566,11 @@ mod tests {
         assert!(background.finished_at_ms.is_some());
         assert_eq!(background.cwd.as_deref(), Some("/tmp/background"));
         assert!(!background.command_truncated);
+        assert!(!background.start_mark_seen);
+        assert_eq!(
+            background.completion_provenance,
+            block_mode::CompletionProvenance::BoundaryInferred
+        );
         assert!(!background.completion_observed);
 
         let recovered = &snapshot.blocks[2];
@@ -506,7 +584,20 @@ mod tests {
         assert_eq!(recovered.finished_at_ms, None);
         assert_eq!(recovered.cwd.as_deref(), Some("/srv/work"));
         assert!(recovered.command_truncated);
+        assert!(recovered.start_mark_seen);
+        assert_eq!(
+            recovered.lifecycle_health,
+            block_mode::BlockLifecycleHealth::Degraded
+        );
         assert!(!recovered.completion_observed);
+
+        let json: serde_json::Value = serde_json::from_slice(
+            &serialize_session(&snapshot, SessionExportFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["retention"]["lifecycle_degraded"], 1);
+        assert_eq!(json["retention"]["lifecycle_recovered"], 0);
+        assert_eq!(json["retention"]["lifecycle_incomplete"], 0);
     }
 
     #[test]
@@ -561,6 +652,8 @@ mod tests {
         assert_eq!(json["blocks"][0]["output"], "ok");
         assert_eq!(json["blocks"][0]["output_unavailable"], false);
         assert_eq!(json["blocks"][0]["completion_observed"], true);
+        assert_eq!(json["blocks"][0]["completion_provenance"], "shell_reported");
+        assert_eq!(json["blocks"][0]["lifecycle_health"], "healthy");
     }
 
     #[test]
@@ -569,6 +662,8 @@ mod tests {
         retained.command_truncated = true;
         retained.output_unavailable = true;
         retained.completion_observed = false;
+        retained.completion_provenance = block_mode::CompletionProvenance::BoundaryInferred;
+        retained.lifecycle_health = block_mode::BlockLifecycleHealth::Degraded;
         let mut clipped = block(8, "large-output", "retained prefix");
         clipped.output_truncated = true;
 
@@ -578,7 +673,7 @@ mod tests {
                 .unwrap();
         assert!(markdown.contains("- Note: command truncated or unavailable"));
         assert!(markdown.contains("- Note: output unavailable"));
-        assert!(markdown.contains("- Note: command completion not observed"));
+        assert!(markdown.contains("- Completion: inferred at next shell boundary"));
 
         let json: serde_json::Value = serde_json::from_slice(
             &serialize_session(&snapshot, SessionExportFormat::Json).unwrap(),
@@ -588,9 +683,14 @@ mod tests {
         assert_eq!(json["retention"]["output_truncated"], 1);
         assert_eq!(json["retention"]["output_unavailable"], 1);
         assert_eq!(json["retention"]["completion_unobserved"], 1);
+        assert_eq!(json["retention"]["lifecycle_degraded"], 1);
         assert_eq!(json["blocks"][0]["command_truncated"], true);
         assert_eq!(json["blocks"][0]["output_unavailable"], true);
         assert_eq!(json["blocks"][0]["completion_observed"], false);
+        assert_eq!(
+            json["blocks"][0]["completion_provenance"],
+            "boundary_inferred"
+        );
     }
 
     #[test]
