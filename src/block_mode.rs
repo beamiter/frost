@@ -5,66 +5,19 @@
 
 use std::collections::HashSet;
 
-/// Evidence that caused the frontend to close one command block.
-///
-/// This mirrors the family contract in `jterm_core` while Frost remains on a
-/// compatibility pin that predates that API; replace this mirror with a core
-/// re-export after a revision containing the shared types is published.
-/// Outcome and provenance stay
-/// orthogonal: an inferred boundary never invents an exit status.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Mirror includes future journal/unknown sources before the next published core pin.
-pub enum CompletionProvenance {
-    ShellReported,
-    JournalRecovered,
-    BoundaryInferred,
-    Unknown,
+// Keep Frost's established paths while making jterm_core the sole owner of
+// lifecycle semantics and stable vocabulary. These free functions remain as
+// small serializer adapters around the shared inherent methods.
+pub use jterm_core::block_contract::{
+    assess_lifecycle, BlockLifecycleHealth, CompletionProvenance,
+};
+
+pub const fn completion_provenance_schema_name(value: CompletionProvenance) -> &'static str {
+    value.schema_name()
 }
 
-impl CompletionProvenance {
-    pub const fn schema_name(self) -> &'static str {
-        match self {
-            Self::ShellReported => "shell_reported",
-            Self::JournalRecovered => "journal_recovered",
-            Self::BoundaryInferred => "boundary_inferred",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// Renderer-neutral confidence in the observed command lifecycle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BlockLifecycleHealth {
-    Healthy,
-    Recovered,
-    Degraded,
-    Incomplete,
-}
-
-impl BlockLifecycleHealth {
-    pub const fn schema_name(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Recovered => "recovered",
-            Self::Degraded => "degraded",
-            Self::Incomplete => "incomplete",
-        }
-    }
-}
-
-/// Assess lifecycle confidence independently of exit outcome.
-/// `start_mark_seen` means the matching OSC 133 `C` was observed.
-pub const fn assess_lifecycle(
-    start_mark_seen: bool,
-    provenance: CompletionProvenance,
-) -> BlockLifecycleHealth {
-    match (start_mark_seen, provenance) {
-        (true, CompletionProvenance::ShellReported) => BlockLifecycleHealth::Healthy,
-        (_, CompletionProvenance::JournalRecovered) => BlockLifecycleHealth::Recovered,
-        (_, CompletionProvenance::BoundaryInferred)
-        | (false, CompletionProvenance::ShellReported) => BlockLifecycleHealth::Degraded,
-        (_, CompletionProvenance::Unknown) => BlockLifecycleHealth::Incomplete,
-    }
+pub const fn lifecycle_health_schema_name(value: BlockLifecycleHealth) -> &'static str {
+    value.schema_name()
 }
 
 pub const fn lifecycle_badge_suffix(
@@ -1645,22 +1598,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lifecycle_health_is_independent_from_exit_outcome() {
+    fn lifecycle_api_reexports_core_semantics_and_keeps_stable_schema_names() {
         use BlockLifecycleHealth::{Degraded, Healthy, Incomplete, Recovered};
         use CompletionProvenance::{BoundaryInferred, JournalRecovered, ShellReported, Unknown};
 
-        for (start_seen, provenance, expected) in [
-            (true, ShellReported, Healthy),
-            (false, ShellReported, Degraded),
-            (true, JournalRecovered, Recovered),
-            (false, JournalRecovered, Recovered),
-            (true, BoundaryInferred, Degraded),
-            (false, BoundaryInferred, Degraded),
-            (true, Unknown, Incomplete),
-            (false, Unknown, Incomplete),
-        ] {
-            assert_eq!(assess_lifecycle(start_seen, provenance), expected);
-        }
+        let shared = jterm_core::block_contract::CompletionProvenance::ShellReported;
+        assert_eq!(assess_lifecycle(true, shared), Healthy);
         assert_eq!(ShellReported.schema_name(), "shell_reported");
         assert_eq!(JournalRecovered.schema_name(), "journal_recovered");
         assert_eq!(BoundaryInferred.schema_name(), "boundary_inferred");
@@ -1669,6 +1612,11 @@ mod tests {
         assert_eq!(Recovered.schema_name(), "recovered");
         assert_eq!(Degraded.schema_name(), "degraded");
         assert_eq!(Incomplete.schema_name(), "incomplete");
+        assert_eq!(
+            completion_provenance_schema_name(ShellReported),
+            ShellReported.schema_name()
+        );
+        assert_eq!(lifecycle_health_schema_name(Healthy), Healthy.schema_name());
 
         assert_eq!(classify(Some("false"), None), BlockOutcome::Unknown);
         assert_eq!(

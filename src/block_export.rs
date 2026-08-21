@@ -78,7 +78,7 @@ fn serialize_completion_provenance<S>(
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(value.schema_name())
+    serializer.serialize_str(block_mode::completion_provenance_schema_name(*value))
 }
 
 fn serialize_lifecycle_health<S>(
@@ -88,7 +88,7 @@ fn serialize_lifecycle_health<S>(
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(value.schema_name())
+    serializer.serialize_str(block_mode::lifecycle_health_schema_name(*value))
 }
 
 /// One immutable pane snapshot handed to the export worker. Keeping identity

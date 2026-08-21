@@ -249,9 +249,12 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   serialized zone shape, while failed navigation, stepping, paint, and scrollbar
   markers share the same four-way result. A commandless zone with a raw non-zero
   status remains background, and a command without a reported status remains
-  unknown. `jterm_core` is pinned to
-  `48d25f155b960417609ffc85a98b7c9ba44c5772` (transitively jagent
-  `a09fd1563b862f96bed7047834720aeb31c163e2`). Claim-acquisition errors are
+  unknown. Completion provenance, lifecycle health, and their assessment
+  function are now direct public re-exports of the shared contract rather than
+  local semantic mirrors; Frost's serializer adapters delegate to the shared
+  stable snake-case vocabulary. `jterm_core` is pinned to
+  `23028d23af2fc1bfa9b7ef5efd50ed0ea4e0e736` (transitively jagent
+  `d52002e4a18735e8cfec718da5fea8f0a5cfaaf8`). Claim-acquisition errors are
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
 
