@@ -21,6 +21,12 @@ thread_local! {
     static PROJECTION_PLAN_BUILD_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Times a row trim or reflow rescanned `finished_output_provenance`
+    /// against the whole zone deque. Trims that evict no zone keep this at
+    /// zero regardless of how many zones or provenance entries are retained.
+    static PROVENANCE_ORPHAN_SCAN_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Character class for word selection boundaries.
@@ -4695,6 +4701,21 @@ impl TerminalState {
         }
     }
 
+    /// Drop captured-output provenance for zones that no longer own live
+    /// rows. Callers gate this on an actual eviction: provenance is orphaned
+    /// only when a zone flips `rows_evicted`, leaves the bounded deque, or the
+    /// deque is cleared outright, and those last two drop provenance
+    /// themselves.
+    fn drop_orphaned_output_provenance(&mut self) {
+        #[cfg(test)]
+        PROVENANCE_ORPHAN_SCAN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        self.finished_output_provenance.retain(|zone_id, _| {
+            self.command_zones
+                .iter()
+                .any(|zone| zone.id == *zone_id && !zone.rows_evicted)
+        });
+    }
+
     fn on_scrollback_rows_trimmed(&mut self, count: usize) {
         if count == 0 {
             return;
@@ -4704,12 +4725,18 @@ impl TerminalState {
         self.pending_saved_line_purge = self.pending_saved_line_purge.saturating_sub(count);
         self.bump_history_revision();
         self.kitty_graphics.on_buffer_rows_trimmed(count);
+        // Only a zone flipping to `rows_evicted` can orphan provenance, and a
+        // single-row trim flips at most one. Rescanning the whole deque on
+        // every trimmed row would be a fixed per-line tax on streaming output
+        // once scrollback is capped and zones have accumulated.
+        let mut evicted_any = false;
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
                 continue;
             }
             if zone.prompt_start < count {
                 zone.rows_evicted = true;
+                evicted_any = true;
                 zone.prompt_start = 0;
                 zone.command_start = None;
                 zone.output_start = None;
@@ -4729,11 +4756,9 @@ impl TerminalState {
                 *row = row.saturating_sub(count);
             }
         }
-        self.finished_output_provenance.retain(|zone_id, _| {
-            self.command_zones
-                .iter()
-                .any(|zone| zone.id == *zone_id && !zone.rows_evicted)
-        });
+        if evicted_any {
+            self.drop_orphaned_output_provenance();
+        }
         let live_prompt_trimmed = match self.current_zone_state {
             ZoneState::PromptStarted(prompt_start)
             | ZoneState::CommandStarted(prompt_start, _)
@@ -4795,6 +4820,15 @@ impl TerminalState {
             .filter(|zone| !zone.rows_evicted)
             .map(|zone| zone.prompt_start)
             .chain(active)
+    }
+
+    /// Whether this pane has seen any OSC 133 prompt mark at all.
+    ///
+    /// Distinguishes "your shell reports no prompts" from "there is no prompt
+    /// in that direction": both make the jump helpers return false, but only
+    /// the first is worth telling the user how to fix.
+    pub fn has_prompt_marks(&self) -> bool {
+        self.prompt_rows().next().is_some()
     }
 
     /// Plain text of the most recent completed command's output (OSC 133),
@@ -10854,12 +10888,16 @@ impl TerminalState {
         // zones and a live lifecycle still in the unchanged grid shift by the
         // new scrollback prefix length.
         self.clear_text_selection();
+        // Reflow evicts on a different boundary than a row trim, so this loop
+        // owns its own flag rather than sharing one with the trim path.
+        let mut evicted_any = false;
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
                 continue;
             }
             if zone.prompt_start < old_scrollback_len {
                 zone.rows_evicted = true;
+                evicted_any = true;
                 zone.prompt_start = 0;
                 zone.command_start = None;
                 zone.output_start = None;
@@ -10879,11 +10917,9 @@ impl TerminalState {
                 }
             }
         }
-        self.finished_output_provenance.retain(|zone_id, _| {
-            self.command_zones
-                .iter()
-                .any(|zone| zone.id == *zone_id && !zone.rows_evicted)
-        });
+        if evicted_any {
+            self.drop_orphaned_output_provenance();
+        }
         self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
             ZoneState::Idle => ZoneState::Idle,
             ZoneState::PromptStarted(prompt_start) => {
@@ -12785,6 +12821,83 @@ mod tests {
         assert!(text.contains("ijkl"));
         assert!(!text.contains('c'));
         assert!(!text.contains('g'));
+    }
+
+    #[test]
+    fn has_prompt_marks_separates_no_shell_integration_from_no_prompt_that_way() {
+        // A shell that never emits OSC 133: prompt navigation refuses, and the
+        // pane must be able to say the refusal is about shell integration.
+        let mut plain = TerminalState::new(20, 4);
+        plain.process_input(b"$ ls\r\nfile\r\n");
+        assert!(!plain.has_prompt_marks());
+        assert!(!plain.jump_to_prev_prompt());
+
+        // With marks present the same refusal means "no prompt that way",
+        // which is a different message.
+        let mut marked = TerminalState::new(20, 4);
+        marked.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07one\x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+        );
+        assert!(marked.has_prompt_marks());
+        // Already at the live view, so there is no earlier prompt above it.
+        assert!(!marked.jump_to_next_prompt());
+
+        // Marks survive their rows being trimmed only while a zone keeps live
+        // rows; an all-evicted pane reports no marks rather than pretending.
+        marked.set_max_scrollback(1);
+        for _ in 0..64 {
+            marked.process_input(b"filler\r\n");
+        }
+        assert!(marked.command_zones.iter().all(|zone| zone.rows_evicted));
+        assert!(!marked.has_prompt_marks());
+    }
+
+    #[test]
+    fn provenance_orphan_scan_runs_only_on_trims_that_evict_a_zone() {
+        // Two finished zones with captured-output provenance, then a small
+        // scrollback cap so every further line trims exactly one row.
+        let mut terminal = TerminalState::new(20, 2);
+        terminal.set_max_scrollback(8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07one\x1b]133;C\x07out1\r\n\x1b]133;D;0\x07",
+        );
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07two\x1b]133;C\x07out2\r\n\x1b]133;D;0\x07",
+        );
+        let zones: Vec<u64> = terminal.command_zones.iter().map(|zone| zone.id).collect();
+        assert_eq!(zones.len(), 2);
+        assert_eq!(terminal.finished_output_provenance.len(), 2);
+
+        // Fill scrollback to the cap without evicting either zone's rows.
+        while terminal.scrollback.len() < 8 {
+            terminal.process_input(b"filler\r\n");
+        }
+        assert!(terminal.command_zones.iter().all(|zone| !zone.rows_evicted));
+
+        // Steady state: every line now trims a row. Until a trim reaches a
+        // zone's prompt row the rescan must not run at all.
+        super::PROVENANCE_ORPHAN_SCAN_COUNT.with(|count| count.set(0));
+        let evicted_before = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| zone.rows_evicted)
+            .count();
+        terminal.process_input(b"filler\r\n");
+        let evicted_after = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| zone.rows_evicted)
+            .count();
+        let scans = super::PROVENANCE_ORPHAN_SCAN_COUNT.with(|count| count.get());
+        assert_eq!(scans, usize::from(evicted_after > evicted_before));
+
+        // Trim until both zones lose their rows; provenance is still dropped.
+        for _ in 0..32 {
+            terminal.process_input(b"filler\r\n");
+        }
+        assert!(terminal.command_zones.iter().all(|zone| zone.rows_evicted));
+        assert!(terminal.finished_output_provenance.is_empty());
+        assert!(super::PROVENANCE_ORPHAN_SCAN_COUNT.with(|count| count.get()) > 0);
     }
 
     #[test]

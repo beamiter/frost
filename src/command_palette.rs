@@ -64,6 +64,7 @@ pub enum PaletteAction {
     BlockFixWithAgent,
     BlockExplainWithAgent,
     BlockRetryFailed,
+    BlockToggleCollapse,
     CommandHistory,
     ClearScreen,
     InstallJsh,
@@ -413,6 +414,12 @@ impl PaletteState {
                 description: "Write retained finalized blocks to a private JSON file",
                 shortcut: "",
                 action: PaletteAction::BlockExportSessionJson,
+            },
+            PaletteItem {
+                name: "Collapse or Expand Block Output",
+                description: "Fold the selected block's output into a summary row, or unfold it",
+                shortcut: "Ctrl+Alt+Z",
+                action: PaletteAction::BlockToggleCollapse,
             },
             PaletteItem {
                 name: "Search Blocks",

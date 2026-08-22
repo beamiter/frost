@@ -89,6 +89,22 @@ fn chrome_height(bottom_bar: bool) -> f32 {
 
 /// Whether an existing block selection may consume plain navigation/Enter.
 /// Running and alternate-screen applications always retain their keyboard.
+/// The single exception to dropping keyboard events a widget captured.
+///
+/// A focused overlay text input captures Escape merely to blur itself, which
+/// left the overlay open until a second press. Re-delivering that one event
+/// fixes it; widening this predicate would hand the terminal keys the overlay
+/// already consumed, so it stays exactly "an Escape key press".
+fn captured_key_is_overlay_escape(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            ..
+        }
+    )
+}
+
 fn block_selection_owns_keys(
     block_mode: bool,
     has_selection: bool,
@@ -130,6 +146,21 @@ fn block_enter_reinputs_selection(
     prompt_status: terminal::AgentPromptStatus,
 ) -> bool {
     selection_owns_keys && prompt_status.is_ready()
+}
+
+/// Why an Enter carrying a live block selection could not reinput it.
+///
+/// `Ctrl+Shift+I` explains the same refusal with a toast, while Enter used to
+/// drop the selection and submit the typed line in silence — one chord
+/// explaining and its twin acting. Enter keeps submitting (that is what the
+/// user typed), but now says why the selection went unused.
+fn block_enter_blocked_reason(
+    selection_owns_keys: bool,
+    prompt_status: terminal::AgentPromptStatus,
+) -> Option<&'static str> {
+    selection_owns_keys
+        .then(|| block_prompt_replace_blocker(prompt_status))
+        .flatten()
 }
 
 /// Keyboard bookmark toggling is deliberately selection-only. Falling back to
@@ -457,6 +488,7 @@ fn command_requires_block_context(command: &keybindings::Command) -> bool {
             | C::BlockFixWithAgent
             | C::BlockExplainWithAgent
             | C::BlockRetryFailed
+            | C::BlockToggleCollapse
     )
 }
 
@@ -838,6 +870,31 @@ enum BlockSearchFilter {
     Background,
 }
 
+impl BlockSearchFilter {
+    /// Display order of the filter chips, which is also the order Tab walks.
+    const ORDER: [Self; 5] = [
+        Self::All,
+        Self::Failed,
+        Self::Slow,
+        Self::Bookmarked,
+        Self::Background,
+    ];
+
+    /// Next/previous filter, wrapping. Keyboard-only users could otherwise
+    /// never reach the chips: the overlay owns every key while it is open.
+    fn cycled(self, forward: bool) -> Self {
+        let order = Self::ORDER;
+        let at = order.iter().position(|&f| f == self).unwrap_or(0);
+        let len = order.len();
+        let next = if forward {
+            (at + 1) % len
+        } else {
+            (at + len - 1) % len
+        };
+        order[next]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlockSearchBuildIdentity {
     session_id: usize,
@@ -957,7 +1014,16 @@ impl BlockSearchState {
     fn count_label(&self) -> String {
         let count = self.hits.len();
         let noun = if count == 1 { "match" } else { "matches" };
-        let mut label = format!("{count} {noun}");
+        // Position, not just a total: walking a query's hits with the arrows
+        // otherwise gives no sense of how far through the list you are.
+        let mut label = if count == 0 {
+            format!("{count} {noun}")
+        } else {
+            format!(
+                "{} of {count} {noun}",
+                self.selected.saturating_add(1).min(count)
+            )
+        };
         if self.capped {
             label.push_str(" · older blocks not searched");
         }
@@ -2298,6 +2364,9 @@ enum Message {
     ),
     /// Select and reveal the clicked hit's zone (and close the picker).
     BlockSearchAccept(block_mode::BlockSearchHit),
+    /// An Escape press a focused overlay text input consumed for itself.
+    /// Carries the original event so the ordinary key path can re-handle it.
+    OverlayEscape(keyboard::Event),
     /// Dismiss or execute the completed-card action menu.
     BlockMenuClose,
     BlockMenuAction(BlockMenuAction),
@@ -4741,10 +4810,22 @@ impl Frost {
     fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         const TOAST_TTL_MS: u64 = 2400;
         const MAX_TOASTS: usize = 4;
+        let text = text.into();
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(TOAST_TTL_MS);
+        // Key auto-repeat — holding a chord that refuses, like prompt
+        // navigation at the oldest prompt — would otherwise stack four copies
+        // of one message and bury the terminal. Refresh the live duplicate
+        // instead of queueing another.
+        if let Some(last) = self.toasts.last_mut() {
+            if last.kind == kind && last.text == text {
+                last.expires_at = expires_at;
+                return;
+            }
+        }
         self.toasts.push(Toast {
-            text: text.into(),
+            text,
             kind,
-            expires_at: std::time::Instant::now() + std::time::Duration::from_millis(TOAST_TTL_MS),
+            expires_at,
         });
         // Drop oldest if we exceed cap so the stack never grows past MAX_TOASTS.
         if self.toasts.len() > MAX_TOASTS {
@@ -5867,14 +5948,9 @@ impl Frost {
                 self.palette_failed_block_agent_task(FailedBlockAgentIntent::Explain)
             }
             C::BlockRetryFailed => self.palette_failed_block_retry_task(),
+            C::BlockToggleCollapse => self.block_toggle_selected_collapse(),
             C::TerminalPromptPrev | C::TerminalPromptNext => {
-                if !self.ensure_block_action_available("Prompt navigation") {
-                    return Some(Task::none());
-                }
-                if let Some(sess) = self.sessions.get_mut(self.active) {
-                    sess.jump_prompt(matches!(cmd, C::TerminalPromptPrev));
-                }
-                Task::none()
+                self.jump_prompt_with_feedback(matches!(cmd, C::TerminalPromptPrev))
             }
             C::TerminalSplitVertical => {
                 self.split(Axis::Vertical);
@@ -6234,6 +6310,35 @@ impl Frost {
         iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
     }
 
+    /// Whether an on-screen overlay claims Escape for itself.
+    ///
+    /// Mirrors, in the same order, the overlays whose Escape arms live in the
+    /// `Message::Key` dispatch chain. It exists so a captured Escape — one a
+    /// focused text input swallowed to blur itself — can be re-delivered to
+    /// that chain without ever reaching the PTY fallthrough. The Agent panel
+    /// is deliberately absent: its input has no Escape owner, so forwarding
+    /// there would send a stray ESC to the foreground program.
+    fn overlay_owns_escape(&self) -> bool {
+        self.block_clear_confirm.is_some()
+            || self.tab_close_confirm.is_some()
+            || self.block_menu.is_some()
+            || self.sidebar_dialog.is_some()
+            || self.sidebar_delete_confirm.is_some()
+            || self.sidebar_menu.is_some()
+            || self.sidebar_filter.is_some()
+            || self.tab_menu.is_some()
+            || self.tab_switcher.is_some()
+            || self.remote_picker.is_some()
+            || self.history_picker.is_some()
+            || self.block_search.is_some()
+            || self.help_open
+            || self.debug_open
+            || self.config_panel_open
+            || self.palette.is_open
+            || self.search_replace.is_open
+            || self.search.is_open
+    }
+
     /// One gate for commands that act on block history. Block chrome is hidden
     /// in the alternate screen, so neither keybindings nor palette actions may
     /// mutate or read an invisible selection there.
@@ -6272,6 +6377,37 @@ impl Frost {
             return false;
         }
         true
+    }
+
+    /// Prompt-to-prompt navigation that says why nothing moved.
+    ///
+    /// The chord is consumed by the block-context preflight even on a pane
+    /// whose shell emits no OSC 133, so it used to scroll nothing, toast
+    /// nothing, and pass nothing through to the program — indistinguishable
+    /// from a broken key. The wording keys on whether any prompt mark exists
+    /// rather than on the move result, because a projected/collapsed row can
+    /// also refuse a move that has nothing to do with shell integration.
+    fn jump_prompt_with_feedback(&mut self, older: bool) -> Task<Message> {
+        if !self.ensure_block_action_available("Prompt navigation") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        if sess.jump_prompt(older) {
+            return Task::none();
+        }
+        let message = if sess.terminal.has_prompt_marks() {
+            if older {
+                "No earlier command prompt"
+            } else {
+                "Already at the newest command prompt"
+            }
+        } else {
+            "Prompt navigation needs OSC 133 shell integration"
+        };
+        self.push_toast(message, ToastKind::Info);
+        Task::none()
     }
 
     /// Reveal one edge of a finalized block without changing the current
@@ -6365,6 +6501,55 @@ impl Frost {
             },
             ToastKind::Success,
         );
+        Task::none()
+    }
+
+    /// Fold or unfold the selected block's output.
+    ///
+    /// The context menu folds the block under the pointer; a chord and the
+    /// palette have no pointer, so this targets the *selection* only. Reusing
+    /// the copy verbs' "newest block" fallback would let one keypress fold
+    /// output the user is reading, in a pane they may not even be looking at.
+    fn block_toggle_selected_collapse(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Collapse output") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        // Reconcile first: a selection the retention policy has since evicted
+        // is not a live target.
+        let selected = sess
+            .block_selection
+            .active()
+            .filter(|&id| sess.terminal.zone_by_id(id).is_some());
+        let decision = block_mode::collapse_toggle(
+            selected,
+            selected.is_some_and(|id| sess.projection_policy.is_collapsed(id)),
+            selected.is_some_and(|id| sess.terminal.finished_output_range(id).is_some()),
+        );
+        let changed = match (decision, selected) {
+            (block_mode::CollapseToggle::Collapse, Some(id)) => sess.projection_policy.collapse(id),
+            (block_mode::CollapseToggle::Expand, Some(id)) => sess.projection_policy.expand(id),
+            _ => false,
+        };
+        if changed {
+            sess.refresh();
+            self.refresh_active_context();
+            return Task::none();
+        }
+        match decision {
+            block_mode::CollapseToggle::NoSelection => self.push_toast(
+                "Select a block first (Ctrl+↑, or click its command line)",
+                ToastKind::Info,
+            ),
+            block_mode::CollapseToggle::NoRetainedOutput => self.push_toast(
+                "Nothing to collapse: this block has no retained output",
+                ToastKind::Info,
+            ),
+            // The policy already held the requested state.
+            block_mode::CollapseToggle::Collapse | block_mode::CollapseToggle::Expand => {}
+        }
         Task::none()
     }
 
@@ -7085,6 +7270,20 @@ impl Frost {
         }
     }
 
+    /// Recompute-and-snap, plus returning focus to the query input.
+    ///
+    /// Clicking a filter chip or the `Aa`/`.*` toggles moves widget focus onto
+    /// that button, which silently demotes the query box: caret movement,
+    /// selection and paste stop working and typed characters only append
+    /// through the overlay's fallback path. Every chip click therefore hands
+    /// focus straight back.
+    fn block_search_refocus_task(&self) -> Task<Message> {
+        Task::batch([
+            iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone()),
+            self.block_search_snap_task(),
+        ])
+    }
+
     /// Keep the highlighted hit visible in the picker's scrollable list.
     /// Rows are uniform, so snapping to `selected / (len - 1)` places the
     /// selected row at that same fraction of the viewport — always inside
@@ -7175,6 +7374,31 @@ impl Frost {
                 state.query.pop();
                 self.block_search_recompute();
                 return Some(self.block_search_snap_task());
+            }
+            // Tab walks the filter chips; the overlay owns every key while it
+            // is open, so without this they are mouse-only. Shift is checked
+            // first so Shift+Tab cannot fall through to the forward arm.
+            Key::Named(Named::Tab) => {
+                state.filter = state.filter.cycled(!mods.shift());
+                self.block_search_recompute();
+                return Some(self.block_search_snap_task());
+            }
+            // Same chords the find bar uses (Alt is the JWM window-manager
+            // modifier, so it stays clear here too).
+            Key::Character(c) if mods.control() => {
+                match c.chars().next().map(|c| c.to_ascii_lowercase()) {
+                    Some('r') => {
+                        state.regex = !state.regex;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('i') => {
+                        state.case_sensitive = !state.case_sensitive;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -8429,15 +8653,10 @@ impl Frost {
                 self.palette_failed_block_agent_task(FailedBlockAgentIntent::Explain)
             }
             PaletteAction::BlockRetryFailed => self.palette_failed_block_retry_task(),
+            PaletteAction::BlockToggleCollapse => self.block_toggle_selected_collapse(),
             PaletteAction::CommandHistory => self.open_history_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
-                if !self.ensure_block_action_available("Prompt navigation") {
-                    return Task::none();
-                }
-                if let Some(sess) = self.sessions.get_mut(self.active) {
-                    sess.jump_prompt(matches!(action, PaletteAction::PromptJumpPrev));
-                }
-                Task::none()
+                self.jump_prompt_with_feedback(matches!(action, PaletteAction::PromptJumpPrev))
             }
             PaletteAction::ClearScreen => {
                 if let Some(sess) = self.sessions.get_mut(self.active) {
@@ -9173,7 +9392,7 @@ impl Frost {
         if !self.ensure_block_action_available("Block selection") {
             return Task::none();
         }
-        let navigation = {
+        let (navigation, has_blocks) = {
             let Some(sess) = self.sessions.get_mut(self.active) else {
                 return Task::none();
             };
@@ -9183,8 +9402,12 @@ impl Frost {
                 .iter()
                 .map(|zone| zone.id)
                 .collect();
+            let has_blocks = !ids.is_empty();
             sess.block_selection.retain(&ids);
-            block_mode::selection_navigation(&ids, sess.block_selection.active(), older)
+            (
+                block_mode::selection_navigation(&ids, sess.block_selection.active(), older),
+                has_blocks,
+            )
         };
         match navigation {
             block_mode::SelectionNavigation::Select(target) => {
@@ -9196,7 +9419,21 @@ impl Frost {
                     sess.refresh();
                 }
             }
-            block_mode::SelectionNavigation::Passthrough => {}
+            // Two different causes, and they need different answers: the
+            // pane has no zones at all, or "newer" was asked with no live
+            // selection — deliberately unowned, because Up is the entry
+            // point. The contextual Ctrl+↑/↓ path resolves Passthrough
+            // separately and keeps ordinary scrolling; reaching it *here*
+            // means an explicit palette pick (or a user-bound chord), which
+            // has to say why nothing happened instead of doing nothing.
+            block_mode::SelectionNavigation::Passthrough => self.push_toast(
+                if has_blocks {
+                    "No block selected — select an older block first (Ctrl+↑)"
+                } else {
+                    "No command blocks to select (needs OSC 133 shell integration)"
+                },
+                ToastKind::Info,
+            ),
         }
         Task::none()
     }
@@ -10232,6 +10469,20 @@ impl Frost {
                     return self.close_session(index);
                 }
             }
+            Message::OverlayEscape(event) => {
+                // Re-deliver only while something on screen owns Escape; with
+                // no overlay open this must stay a no-op rather than falling
+                // through to `encode_key` and reaching the child process.
+                //
+                // Dispatched synchronously rather than through `Task::done`:
+                // a deferred re-delivery would re-enter the key chain a cycle
+                // after this gate ran, so an overlay closing in between could
+                // let the Escape fall through to the PTY after all. Recursion
+                // is one level deep — the key chain never emits OverlayEscape.
+                if self.overlay_owns_escape() {
+                    return self.update(Message::Key(event));
+                }
+            }
             Message::Key(event) => {
                 if let keyboard::Event::KeyPressed {
                     key,
@@ -10517,6 +10768,16 @@ impl Frost {
                                 // Dirty/untrusted prompt state: exit block
                                 // selection and let Enter follow the ordinary
                                 // keybinding/PTY path, preserving visible input.
+                                if let Some(reason) = prompt_status.and_then(|status| {
+                                    block_enter_blocked_reason(selection_owns_keys, status)
+                                }) {
+                                    self.push_toast(
+                                        format!(
+                                            "Selection cleared; commands not reinput: {reason}"
+                                        ),
+                                        ToastKind::Info,
+                                    );
+                                }
                                 if let Some(sess) = self.sessions.get_mut(self.active) {
                                     sess.block_selection.clear();
                                     sess.refresh();
@@ -11946,21 +12207,21 @@ impl Frost {
                     state.filter = filter;
                 }
                 self.block_search_recompute();
-                return self.block_search_snap_task();
+                return self.block_search_refocus_task();
             }
             Message::BlockSearchSetCaseSensitive(case_sensitive) => {
                 if let Some(state) = self.block_search.as_mut() {
                     state.case_sensitive = case_sensitive;
                 }
                 self.block_search_recompute();
-                return self.block_search_snap_task();
+                return self.block_search_refocus_task();
             }
             Message::BlockSearchSetRegex(regex) => {
                 if let Some(state) = self.block_search.as_mut() {
                     state.regex = regex;
                 }
                 self.block_search_recompute();
-                return self.block_search_snap_task();
+                return self.block_search_refocus_task();
             }
             Message::BlockSearchAccept(hit) => {
                 let current = self.sessions.get(self.active).map(|session| {
@@ -13482,6 +13743,34 @@ impl Frost {
         .align_y(iced::Alignment::Center);
         let filters = column![filters_top, filters_bottom].spacing(4);
 
+        // Outcome/duration for each hit's block, resolved once instead of
+        // rescanning the zone deque per drawn row.
+        let zone_badges: std::collections::HashMap<u64, String> = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id)
+            .map(|sess| {
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| {
+                        let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
+                        let badge = block_mode::badge_text_with_lifecycle(
+                            outcome,
+                            zone.duration_ms,
+                            zone.start_mark_seen,
+                            zone.completion_provenance,
+                        )
+                        .unwrap_or_default();
+                        (zone.id, badge)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A pane whose shell emits no OSC 133 has nothing to search; blaming
+        // the query for that sends the user off tweaking a working filter.
+        let pane_has_blocks = !zone_badges.is_empty();
+
         // The count line stays outside the scrollable so it is always
         // visible; EVERY hit is drawn inside it (ember renders the full hit
         // list in a scroll area) and keyboard navigation wraps across all of
@@ -13491,6 +13780,13 @@ impl Frost {
             body = body.push(text("Indexing blocks…").size(13).style(text::secondary));
         } else if let Some(error) = &state.query_error {
             body = body.push(text(error.clone()).size(12).style(text::danger));
+        } else if !pane_has_blocks {
+            body = body.push(
+                text("This pane has no command blocks yet — block capture needs OSC 133 shell integration")
+                    .size(13)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
+            );
         } else if state.query.trim().is_empty() && state.filter == BlockSearchFilter::All {
             let hint = if state.older_not_indexed {
                 "Type to search, or choose a filter · older blocks not indexed"
@@ -13510,16 +13806,27 @@ impl Frost {
             let mut list = column![].spacing(2);
             for (pos, hit) in state.hits.iter().enumerate() {
                 let selected = pos == state.selected;
-                let context = if hit.command_preview.is_empty() {
-                    "(no command)".to_string()
+                // On a command hit `line_text` already IS the command line,
+                // so repeating the preview here spent the only secondary line
+                // restating what is directly above it. Spend it on the
+                // block's outcome instead.
+                let mut context = if hit.is_output_line {
+                    let command = if hit.command_preview.is_empty() {
+                        "(no command)".to_string()
+                    } else {
+                        hit.command_preview.clone()
+                    };
+                    format!("{command} · L{}", hit.line_no)
                 } else {
-                    hit.command_preview.clone()
+                    "command".to_string()
                 };
-                let context = if hit.is_output_line {
-                    format!("{context} · L{}", hit.line_no)
-                } else {
-                    format!("{context} · command")
-                };
+                if let Some(badge) = zone_badges
+                    .get(&hit.zone_id)
+                    .filter(|badge| !badge.is_empty())
+                {
+                    context.push_str(" · ");
+                    context.push_str(badge);
+                }
                 let info = column![
                     text(hit.line_text.clone())
                         .size(13)
@@ -13556,6 +13863,14 @@ impl Frost {
                     .height(Length::Shrink),
             );
         }
+        // The overlay owns every key while it is open, so the chips and
+        // toggles above are otherwise reachable only with the mouse.
+        body = body.push(
+            text("Tab filter · Ctrl+I case · Ctrl+R regex · ↑↓ select · Enter reveal · Esc close")
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        );
 
         let panel_width = (self.win_size.width - 32.0).clamp(280.0, 720.0);
         let panel_height = (self.win_size.height - 32.0).clamp(180.0, 560.0);
@@ -13953,19 +14268,77 @@ impl Frost {
         }
     }
 
-    fn fitting_running_badge(&self, sess: &Session, viewport_row: usize) -> Option<(String, u64)> {
-        let elapsed_ms = sess.terminal.running_duration_ms()?;
+    /// Cells a right-aligned badge must keep clear of the scrollbar and the
+    /// card's right inset.
+    fn block_badge_inset(&self) -> usize {
+        ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0)).ceil() as usize
+    }
+
+    /// Absolute row span `[start, end)` of the live card — the running
+    /// command's rows, or the idle prompt's input area. Factored out of
+    /// [`Self::block_paint_rows`] so card painting and the badge anchor can
+    /// never disagree about where the live card is.
+    fn active_zone_span(terminal: &terminal::TerminalState) -> Option<(usize, usize)> {
+        let total = terminal.scrollback_len() + terminal.grid.rows();
+        let active_start = terminal
+            .running_zone_start()
+            .or_else(|| terminal.live_prompt_row())?;
+        let active_extent_row = terminal.active_app_extent_row().unwrap_or_else(|| {
+            terminal
+                .scrollback_len()
+                .saturating_add(terminal.get_cursor_pos().0)
+        });
+        let active_end = active_extent_row
+            .saturating_add(1)
+            .max(active_start.saturating_add(block_mode::MIN_INPUT_ROWS))
+            .min(total);
+        Some((active_start, active_end))
+    }
+
+    /// Viewport row that carries the live `▶ elapsed` chip, with the chip text
+    /// and the elapsed time that produced it.
+    ///
+    /// The chip used to be pinned to the running card's prompt row, so it
+    /// disappeared as soon as one screenful of output pushed that row above the
+    /// viewport — that is, on exactly the long commands whose elapsed time is
+    /// worth watching — and the redraw tick, sharing the same gate, went stale
+    /// with it. Anchor it instead to the topmost *visible* row of the running
+    /// card whose tail is blank, bounded by
+    /// [`block_mode::BADGE_ANCHOR_WINDOW`] so the chip stays on the card's top
+    /// edge rather than wandering down the screen as output streams. The fit
+    /// test stays per-frame: the chip must never be painted over real text.
+    fn running_badge_target(&self, sess: &Session) -> Option<(usize, String, u64)> {
+        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            return None;
+        }
+        let terminal = &sess.terminal;
+        // Idle prompts share the Active card kind but carry no elapsed time.
+        terminal.running_zone_start()?;
+        let (active_start, active_end) = Self::active_zone_span(terminal)?;
+        let elapsed_ms = terminal.running_duration_ms()?;
         let badge = block_mode::running_badge_text(elapsed_ms);
-        let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0)).ceil()
-            as usize;
-        let chars: Vec<char> = sess
-            .projection
-            .cells()
-            .get(viewport_row)?
-            .iter()
-            .map(Self::block_badge_cell_char)
+        let needed = badge.chars().count() + self.block_badge_inset();
+        let cells = sess.projection.cells();
+        let candidates: Vec<usize> = (0..cells.len())
+            .filter(|&view_row| {
+                sess.projection
+                    .view_row_absolute(view_row)
+                    .is_some_and(|row| row >= active_start && row < active_end)
+            })
+            .take(block_mode::BADGE_ANCHOR_WINDOW)
             .collect();
-        block_mode::badge_fits(&chars, badge.chars().count() + inset).then_some((badge, elapsed_ms))
+        let rows: Vec<Vec<char>> = candidates
+            .iter()
+            .map(|&view_row| {
+                cells[view_row]
+                    .iter()
+                    .map(Self::block_badge_cell_char)
+                    .collect()
+            })
+            .collect();
+        let borrowed: Vec<&[char]> = rows.iter().map(Vec::as_slice).collect();
+        let index = block_mode::first_fitting_badge_row(&borrowed, needed)?;
+        Some((candidates[index], badge, elapsed_ms))
     }
 
     /// Block-mode metadata for each of `sess`'s visible rows: card grouping,
@@ -14146,30 +14519,29 @@ impl Frost {
             let row = &mut paint[top_view];
             row.separator = true;
             row.bookmarked = sess.block_bookmarks.contains(zone.id);
-            if let Some(plain) = block_mode::badge_text_with_lifecycle(
+            // The selected block's badge appends its LOCAL finish time; when
+            // that no longer fits the ladder falls back through progressively
+            // shorter forms rather than dropping the badge altogether.
+            let clock = zone.finished_at_ms.filter(|_| active).map(|ms| {
+                let offset = block_mode::local_offset_secs((ms / 1000) as i64);
+                block_mode::clock_at_offset(ms, offset)
+            });
+            let inset = self.block_badge_inset();
+            let chars: Vec<char> = sess.projection.cells()[top_view]
+                .iter()
+                .map(Self::block_badge_cell_char)
+                .collect();
+            for badge in block_mode::badge_ladder(
                 outcome,
                 zone.duration_ms,
                 zone.start_mark_seen,
                 zone.completion_provenance,
+                clock,
             ) {
-                // The selected block's badge appends its LOCAL finish time.
-                // If the suffix no longer fits, retain the plain badge.
-                let suffixed = zone.finished_at_ms.filter(|_| active).map(|ms| {
-                    let offset = block_mode::local_offset_secs((ms / 1000) as i64);
-                    format!("{plain} · {}", block_mode::clock_at_offset(ms, offset))
-                });
-                let inset = ((terminal_view::SCROLLBAR_WIDTH + 16.0) / self.metrics.cell_w.max(1.0))
-                    .ceil() as usize;
-                let chars: Vec<char> = sess.projection.cells()[top_view]
-                    .iter()
-                    .map(Self::block_badge_cell_char)
-                    .collect();
-                for badge in suffixed.into_iter().chain(std::iter::once(plain)) {
-                    let needed = badge.chars().count() + inset;
-                    if block_mode::badge_fits(&chars, needed) {
-                        row.badge = Some((badge, color));
-                        break;
-                    }
+                let needed = badge.chars().count() + inset;
+                if block_mode::badge_fits(&chars, needed) {
+                    row.badge = Some((badge, color));
+                    break;
                 }
             }
         }
@@ -14178,16 +14550,7 @@ impl Frost {
         // card. Match the family's six-row input minimum and grow only through
         // the current output/cursor row, without changing Frost's PTY or cell
         // geometry.
-        if let Some(active_start) = running.or(live_prompt) {
-            let active_extent_row = terminal.active_app_extent_row().unwrap_or_else(|| {
-                terminal
-                    .scrollback_len()
-                    .saturating_add(terminal.get_cursor_pos().0)
-            });
-            let active_end = active_extent_row
-                .saturating_add(1)
-                .max(active_start.saturating_add(block_mode::MIN_INPUT_ROWS))
-                .min(total);
+        if let Some((active_start, active_end)) = Self::active_zone_span(terminal) {
             let active_top_view = terminal
                 .raw_row_id_at_absolute(active_start)
                 .and_then(|row| sess.projection.raw_row_view_bounds(row))
@@ -14209,12 +14572,13 @@ impl Frost {
                 }
             }
             if let Some(active_top_view) = active_top_view {
-                let row = &mut paint[active_top_view];
-                row.separator = true;
-                if running.is_some() {
-                    if let Some((badge, _)) = self.fitting_running_badge(sess, active_top_view) {
-                        row.badge = Some((badge, accent));
-                    }
+                paint[active_top_view].separator = true;
+            }
+            // Anchored independently of `active_top_view`: the chip must
+            // survive the card's own top row scrolling out of the viewport.
+            if let Some((badge_view_row, badge, _)) = self.running_badge_target(sess) {
+                if let Some(row) = paint.get_mut(badge_view_row) {
+                    row.badge = Some((badge, accent));
                 }
             }
         }
@@ -16443,6 +16807,13 @@ impl Frost {
                 "Ctrl+Shift+A / I / K",
                 "Select all / reinput / clear blocks"
             ),
+            kb("Ctrl+↑", "Start selecting from the newest block"),
+            kb("↑ / ↓", "Move the selection to the adjacent block"),
+            kb("Shift+↑ / ↓", "Grow or shrink the selected range"),
+            kb(
+                "Ctrl+Alt+Z",
+                "Collapse / expand the selected block's output"
+            ),
             kb("Ctrl+Shift+↑ / ↓", "Reveal selected block top / bottom"),
             kb("Command palette", "Block copy, search, export, navigation"),
             kb("Enter / Esc", "Reinput safe selection / clear selection"),
@@ -17911,7 +18282,15 @@ impl Frost {
             // consumes (typing, Backspace, cursor movement). Dropping captured
             // keyboard events here keeps them from also reaching the terminal,
             // so editing the search/palette query never double-inputs.
-            iced::Event::Keyboard(_) if status == iced::event::Status::Captured => None,
+            // ...except Escape. A focused iced text_input consumes Escape to
+            // blur itself and captures the event, so the first press never
+            // reached the overlay that should have closed — every panel took
+            // two presses, with the query input silently dead in between. The
+            // handler re-delivers this only while an overlay owns Escape, so
+            // it can never become a stray byte to the foreground program.
+            iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
+                captured_key_is_overlay_escape(&event).then_some(Message::OverlayEscape(event))
+            }
             iced::Event::Keyboard(k) => Some(Message::Key(k)),
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
@@ -18034,14 +18413,9 @@ impl Frost {
         // the normal idle terminal still has no extra redraw subscription.
         let pane_running_badge_interval = |index: usize| {
             self.sessions.get(index).and_then(|session| {
-                let terminal = &session.terminal;
-                if terminal.is_alt_buffer_active() {
-                    return None;
-                }
-                let row = terminal.running_zone_start()?;
-                let raw_row = terminal.raw_row_id_at_absolute(row)?;
-                let (view_row, _) = session.projection.raw_row_view_bounds(raw_row)?;
-                let (_, elapsed_ms) = self.fitting_running_badge(session, view_row)?;
+                // Exactly the paint-side gate, so the tick is armed if and
+                // only if a chip is actually on screen to animate.
+                let (_, _, elapsed_ms) = self.running_badge_target(session)?;
                 Some(if elapsed_ms < 3_600_000 {
                     std::time::Duration::from_secs(1)
                 } else {
@@ -19913,6 +20287,36 @@ mod tests {
             false,
             AgentPromptStatus::Ready
         ));
+
+        // Every status that refuses the reinput now carries a reason, so Enter
+        // can explain itself the way Ctrl+Shift+I already does instead of
+        // dropping the selection in silence.
+        assert_eq!(
+            block_enter_blocked_reason(true, AgentPromptStatus::Ready),
+            None
+        );
+        for status in [
+            AgentPromptStatus::Busy,
+            AgentPromptStatus::InputNotEmpty,
+            AgentPromptStatus::UnsafeCommand,
+            AgentPromptStatus::ShellIntegrationUnavailable,
+        ] {
+            assert!(
+                block_enter_reinputs_selection(true, status)
+                    != block_enter_blocked_reason(true, status).is_some(),
+                "{status:?} must either reinput or explain, never both or neither"
+            );
+            // Same wording the explicit reinput chord already uses.
+            assert_eq!(
+                block_enter_blocked_reason(true, status),
+                block_prompt_replace_blocker(status)
+            );
+        }
+        // With no selection the key was never block mode's to explain.
+        assert_eq!(
+            block_enter_blocked_reason(false, AgentPromptStatus::InputNotEmpty),
+            None
+        );
     }
 
     #[test]
@@ -21400,6 +21804,73 @@ mod tests {
     }
 
     #[test]
+    fn only_an_escape_press_survives_the_captured_key_drop() {
+        let pressed = |key: keyboard::Key| keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key.clone(),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        };
+
+        assert!(captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Named(Named::Escape)
+        )));
+        // Everything the overlay's own input consumed stays consumed: letting
+        // any of these through would double-input into the terminal.
+        assert!(!captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Character("a".into())
+        )));
+        assert!(!captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Named(Named::Enter)
+        )));
+        assert!(!captured_key_is_overlay_escape(&pressed(
+            keyboard::Key::Named(Named::Backspace)
+        )));
+        // The release half of the same key must not fire a second dismissal.
+        assert!(!captured_key_is_overlay_escape(
+            &keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(Named::Escape),
+                modified_key: keyboard::Key::Named(Named::Escape),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::default(),
+            }
+        ));
+    }
+
+    #[test]
+    fn block_search_filter_cycles_through_every_chip_in_both_directions() {
+        // Tab must reach all five chips: while the picker is open it owns the
+        // keyboard, so a chip the cycle skips is mouse-only.
+        let mut seen = Vec::new();
+        let mut filter = BlockSearchFilter::default();
+        for _ in 0..BlockSearchFilter::ORDER.len() {
+            seen.push(filter);
+            filter = filter.cycled(true);
+        }
+        assert_eq!(seen, BlockSearchFilter::ORDER.to_vec());
+        // Wraps rather than sticking at the last chip.
+        assert_eq!(filter, BlockSearchFilter::default());
+
+        // Shift+Tab is the exact inverse from every chip.
+        for &start in &BlockSearchFilter::ORDER {
+            assert_eq!(start.cycled(true).cycled(false), start);
+            assert_eq!(start.cycled(false).cycled(true), start);
+        }
+        assert_eq!(
+            BlockSearchFilter::All.cycled(false),
+            BlockSearchFilter::Background
+        );
+    }
+
+    #[test]
     fn block_search_rebuild_release_drops_capacity_and_keeps_query_controls() {
         let mut state = BlockSearchState {
             query: "needle".to_string(),
@@ -21562,18 +22033,35 @@ mod tests {
             hits: vec![block_search_hit(1)],
             ..BlockSearchState::default()
         };
-        assert_eq!(state.count_label(), "1 match");
+        // The label leads with the highlight's position, so stepping the
+        // arrows through a long hit list says how far through it you are.
+        assert_eq!(state.count_label(), "1 of 1 match");
         state.hits.push(block_search_hit(2));
-        assert_eq!(state.count_label(), "2 matches");
+        assert_eq!(state.count_label(), "1 of 2 matches");
+        state.selected = 1;
+        assert_eq!(state.count_label(), "2 of 2 matches");
+        // A selection left past the end by a shrinking hit list still reports
+        // a position inside it.
+        state.selected = 9;
+        assert_eq!(state.count_label(), "2 of 2 matches");
+        state.selected = 1;
         // The hit cap uses ember's wording: it means older blocks went
         // unscanned, not that more matches necessarily exist.
         state.capped = true;
-        assert_eq!(state.count_label(), "2 matches · older blocks not searched");
+        assert_eq!(
+            state.count_label(),
+            "2 of 2 matches · older blocks not searched"
+        );
         state.older_not_indexed = true;
         assert_eq!(
             state.count_label(),
-            "2 matches · older blocks not searched · older blocks not indexed"
+            "2 of 2 matches · older blocks not searched · older blocks not indexed"
         );
+        // An empty result set has no position to report.
+        state.hits.clear();
+        state.capped = false;
+        state.older_not_indexed = false;
+        assert_eq!(state.count_label(), "0 matches");
     }
 
     fn sidebar_clipboard(

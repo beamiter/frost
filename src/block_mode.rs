@@ -501,6 +501,182 @@ pub fn badge_text_with_lifecycle(
     Some(text)
 }
 
+/// What toggling collapse should do for the currently selected block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollapseToggle {
+    /// No block is selected, so a chord has no target to fold.
+    NoSelection,
+    /// The block is folded; unfold it.
+    Expand,
+    /// The block is unfolded and still owns retained output rows; fold it.
+    Collapse,
+    /// Unfolded, but its output rows are gone — folding would hide nothing
+    /// and would leave a summary row standing in for content that no longer
+    /// exists.
+    NoRetainedOutput,
+}
+
+/// Decide a collapse toggle from the selection and the block's current state.
+///
+/// Deliberately selection-driven: the context menu folds the block under the
+/// pointer, but a keyboard chord has no pointer, and reusing the copy verbs'
+/// "newest block" fallback would let a stray keypress fold output the user is
+/// reading.
+pub fn collapse_toggle(
+    selected: Option<u64>,
+    collapsed: bool,
+    has_retained_output: bool,
+) -> CollapseToggle {
+    if selected.is_none() {
+        return CollapseToggle::NoSelection;
+    }
+    if collapsed {
+        // Always recoverable, even when stale provenance made the fold
+        // ineffective — otherwise the state could not be undone.
+        return CollapseToggle::Expand;
+    }
+    if has_retained_output {
+        CollapseToggle::Collapse
+    } else {
+        CollapseToggle::NoRetainedOutput
+    }
+}
+
+/// Appended to a shortened badge whose block did not complete cleanly.
+///
+/// The shortening ladder drops the spelled-out `inferred` / `degraded` /
+/// `recovered` qualifier long before it drops the outcome glyph, so this
+/// one-character mark carries the warning the words would have. Without it a
+/// boundary-inferred completion would render exactly like a shell-reported
+/// one, which is the provenance confusion the block contract exists to avoid.
+pub const LIFECYCLE_SHORT_MARK: char = '~';
+
+const fn badge_glyph(outcome: BlockOutcome) -> &'static str {
+    match outcome {
+        BlockOutcome::Success => "✓",
+        BlockOutcome::Failed(_) => "✗",
+        BlockOutcome::Unknown => "?",
+        BlockOutcome::Background => "↻",
+    }
+}
+
+/// Progressively shorter renderings of one finished block's badge, longest
+/// first.
+///
+/// A badge is painted only over a row's blank tail, so a long command line
+/// leaves little room. Offering a single length meant the badge was dropped
+/// outright when it did not fit — and since failure badges are the longest
+/// (exit code, signal, duration, lifecycle qualifier), the outcome vanished
+/// from exactly the blocks worth triaging. Every rung still starts with the
+/// outcome glyph, so no shortened form can read as a different outcome, and a
+/// non-healthy lifecycle keeps [`LIFECYCLE_SHORT_MARK`].
+///
+/// Lazily produced: this runs per zone per frame up to the 256-zone cap, and
+/// the first rung normally fits, so the shorter forms are never built.
+pub fn badge_ladder(
+    outcome: BlockOutcome,
+    duration_ms: Option<u64>,
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+    clock: Option<String>,
+) -> BadgeLadder {
+    BadgeLadder {
+        outcome,
+        duration_ms,
+        start_mark_seen,
+        provenance,
+        clock,
+        step: 0,
+        last: None,
+    }
+}
+
+/// Iterator returned by [`badge_ladder`].
+pub struct BadgeLadder {
+    outcome: BlockOutcome,
+    duration_ms: Option<u64>,
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+    clock: Option<String>,
+    step: u8,
+    last: Option<String>,
+}
+
+impl BadgeLadder {
+    /// Background output has no command lifecycle, so it never carries the
+    /// short mark — matching [`badge_text_with_lifecycle`].
+    fn short_mark(&self) -> Option<char> {
+        (!matches!(self.outcome, BlockOutcome::Background)
+            && lifecycle_badge_suffix(self.start_mark_seen, self.provenance).is_some())
+        .then_some(LIFECYCLE_SHORT_MARK)
+    }
+
+    fn marked(&self, mut text: String) -> String {
+        if let Some(mark) = self.short_mark() {
+            text.push(mark);
+        }
+        text
+    }
+
+    fn rung(&self, step: u8) -> Option<String> {
+        match step {
+            // Full text plus the selected block's local finish time.
+            0 => {
+                let clock = self.clock.as_deref()?;
+                let full = badge_text_with_lifecycle(
+                    self.outcome,
+                    self.duration_ms,
+                    self.start_mark_seen,
+                    self.provenance,
+                )?;
+                Some(format!("{full} · {clock}"))
+            }
+            1 => badge_text_with_lifecycle(
+                self.outcome,
+                self.duration_ms,
+                self.start_mark_seen,
+                self.provenance,
+            ),
+            // Spell out less of the lifecycle, keep the mark and the duration.
+            2 => badge_text(self.outcome, self.duration_ms).map(|text| self.marked(text)),
+            // Drop the duration; the Slow filter and the menu still carry it.
+            3 => badge_text(self.outcome, None).map(|text| self.marked(text)),
+            // Failure core: glyph and exit code, without the signal name.
+            4 => match self.outcome {
+                BlockOutcome::Failed(code) => Some(self.marked(format!("✗ exit:{code}"))),
+                _ => None,
+            },
+            5 => Some(self.marked(badge_glyph(self.outcome).to_string())),
+            _ => None,
+        }
+    }
+}
+
+impl Iterator for BadgeLadder {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        loop {
+            let step = self.step;
+            if step > 5 {
+                return None;
+            }
+            self.step = step.saturating_add(1);
+            // Rungs collapse onto each other for short outcomes (a healthy
+            // success with no duration is the same string three times over);
+            // emitting a repeat would only re-run an identical fit test.
+            let Some(text) = self.rung(step) else {
+                continue;
+            };
+            if self.last.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            self.last = Some(text.clone());
+            return Some(text);
+        }
+    }
+}
+
 /// Compact live badge for an OSC 133 command whose `C` arrived but whose
 /// `D` has not. Forge keeps an elapsed running header visible while a command
 /// executes; frost uses the same feedback in the command's prompt row, where
@@ -1793,6 +1969,24 @@ pub fn badge_fits(row: &[char], needed: usize) -> bool {
         && row[row.len() - needed..]
             .iter()
             .all(|&ch| ch == ' ' || ch == '\0')
+}
+
+/// How far down a running card the live badge may be anchored when the card's
+/// own top row is scrolled off or already full. Kept short on purpose: the
+/// chip belongs on the card's top edge, where finished-block badges sit, and a
+/// long search would let it wander down the screen — and jump line to line —
+/// while output streams.
+pub const BADGE_ANCHOR_WINDOW: usize = 3;
+
+/// Index of the first row in `rows` whose blank tail can hold a right-aligned
+/// badge of `needed` cells, searching at most [`BADGE_ANCHOR_WINDOW`] rows.
+///
+/// `rows` is the visible part of one card in top-to-bottom order, so index 0
+/// is the card's own top row whenever that row is on screen.
+pub fn first_fitting_badge_row(rows: &[&[char]], needed: usize) -> Option<usize> {
+    rows.iter()
+        .take(BADGE_ANCHOR_WINDOW)
+        .position(|row| badge_fits(row, needed))
 }
 
 #[cfg(test)]
@@ -3089,6 +3283,172 @@ mod tests {
         assert!(!badge_fits(&blank_tail, 13)); // wider than the row
         let nul_tail: Vec<char> = vec!['x', '\0', '\0'];
         assert!(badge_fits(&nul_tail, 2));
+    }
+
+    #[test]
+    fn selection_navigation_passthrough_has_two_distinct_causes() {
+        // Passthrough is NOT a synonym for "this pane has no blocks". It also
+        // means "step toward the newer end with nothing selected", which is
+        // deliberately unowned because Up is the entry point. Callers that
+        // explain a refusal must tell the two apart, or they blame missing
+        // shell integration on a pane full of working blocks.
+        assert_eq!(
+            selection_navigation(&[], None, false),
+            SelectionNavigation::Passthrough
+        );
+        assert_eq!(
+            selection_navigation(&[], None, true),
+            SelectionNavigation::Passthrough
+        );
+
+        let ids = [10, 20, 30];
+        assert_eq!(
+            selection_navigation(&ids, None, false),
+            SelectionNavigation::Passthrough,
+            "newer-with-no-selection passes through on a populated pane"
+        );
+        // Up on the same populated pane enters at the newest block, which is
+        // why the refusal message can point the user at it.
+        assert_eq!(
+            selection_navigation(&ids, None, true),
+            SelectionNavigation::Select(30)
+        );
+        // A selection that no longer matches any live id behaves like none.
+        assert_eq!(
+            selection_navigation(&ids, Some(999), false),
+            SelectionNavigation::Passthrough
+        );
+    }
+
+    #[test]
+    fn collapse_toggle_refuses_without_a_selection_or_retained_output() {
+        use CollapseToggle::{Collapse, Expand, NoRetainedOutput, NoSelection};
+
+        // A chord has no pointer, so with nothing selected there is no target
+        // — never the newest block, which the copy verbs fall back to.
+        assert_eq!(collapse_toggle(None, false, true), NoSelection);
+        assert_eq!(collapse_toggle(None, true, true), NoSelection);
+
+        assert_eq!(collapse_toggle(Some(7), false, true), Collapse);
+        assert_eq!(collapse_toggle(Some(7), true, true), Expand);
+        // Folding a block whose output rows are gone would put a summary row
+        // in front of content that no longer exists.
+        assert_eq!(collapse_toggle(Some(7), false, false), NoRetainedOutput);
+        // Unfolding stays available even then, so a fold is always undoable.
+        assert_eq!(collapse_toggle(Some(7), true, false), Expand);
+    }
+
+    #[test]
+    fn badge_ladder_shortens_without_ever_changing_the_reported_outcome() {
+        let rungs = |outcome, duration, seen, provenance, clock: Option<&str>| -> Vec<String> {
+            badge_ladder(
+                outcome,
+                duration,
+                seen,
+                provenance,
+                clock.map(str::to_string),
+            )
+            .collect()
+        };
+
+        // A boundary-inferred kill is the longest badge there is, and the one
+        // that used to disappear entirely on a long command line.
+        let inferred = rungs(
+            BlockOutcome::Failed(137),
+            Some(92_000),
+            true,
+            CompletionProvenance::BoundaryInferred,
+            Some("14:03"),
+        );
+        assert!(inferred.len() >= 5, "{inferred:?}");
+        assert_eq!(
+            inferred.first().map(String::as_str),
+            Some("✗ exit:137 SIGKILL · 1m32s · inferred · 14:03")
+        );
+        assert_eq!(inferred.last().map(String::as_str), Some("✗~"));
+        // Monotonically shorter, so the fit test can stop at the first hit.
+        for pair in inferred.windows(2) {
+            assert!(
+                pair[1].chars().count() < pair[0].chars().count(),
+                "{pair:?} is not shorter"
+            );
+        }
+        // Every rung keeps the failure glyph, and none can be mistaken for a
+        // clean completion: the lifecycle mark outlives the spelled-out word.
+        for rung in &inferred {
+            assert!(rung.starts_with('✗'), "{rung}");
+            assert!(!rung.contains('✓'), "{rung}");
+            assert!(
+                rung.contains("inferred") || rung.ends_with(LIFECYCLE_SHORT_MARK),
+                "{rung} dropped every lifecycle warning"
+            );
+        }
+        // The exit code survives well past the point the old single-length
+        // badge would have been dropped.
+        assert!(inferred[inferred.len() - 2].contains("exit:137"));
+
+        // A healthy success carries no mark, and collapsed duplicate rungs are
+        // not emitted twice.
+        let healthy = rungs(
+            BlockOutcome::Success,
+            Some(1_500),
+            true,
+            CompletionProvenance::ShellReported,
+            None,
+        );
+        assert_eq!(healthy, vec!["✓ 1.5s".to_string(), "✓".to_string()]);
+
+        // Background output has no command lifecycle, so it never gains a mark.
+        let background = rungs(
+            BlockOutcome::Background,
+            None,
+            false,
+            CompletionProvenance::Unknown,
+            None,
+        );
+        assert_eq!(
+            background,
+            vec!["↻ Background".to_string(), "↻".to_string()]
+        );
+        for rung in &background {
+            assert!(!rung.ends_with(LIFECYCLE_SHORT_MARK), "{rung}");
+        }
+
+        // No clock suffix unless the block is selected and has a finish time.
+        let unselected = rungs(
+            BlockOutcome::Failed(1),
+            Some(500),
+            true,
+            CompletionProvenance::ShellReported,
+            None,
+        );
+        assert_eq!(
+            unselected.first().map(String::as_str),
+            Some("✗ exit:1 · 500ms")
+        );
+    }
+
+    #[test]
+    fn running_badge_anchors_to_the_first_fitting_row_within_a_short_window() {
+        let full: Vec<char> = "xxxxxxxxxxxx".chars().collect();
+        let free: Vec<char> = "ls -la      ".chars().collect();
+        fn rows<'a>(set: &[&'a Vec<char>]) -> Vec<&'a [char]> {
+            set.iter().map(|row| row.as_slice()).collect()
+        }
+
+        // The card's own top row wins whenever it can hold the badge.
+        assert_eq!(first_fitting_badge_row(&rows(&[&free, &free]), 5), Some(0));
+        // A full top row (long command, or an output line under it) hands the
+        // badge to the next visible card row instead of dropping it, which is
+        // what used to happen once the header scrolled off.
+        assert_eq!(first_fitting_badge_row(&rows(&[&full, &free]), 5), Some(1));
+        // The search is bounded, so the chip cannot wander down the screen.
+        let mut deep: Vec<&Vec<char>> = vec![&full; BADGE_ANCHOR_WINDOW];
+        deep.push(&free);
+        assert_eq!(first_fitting_badge_row(&rows(&deep), 5), None);
+        // No visible card rows, or none wide enough, paints nothing.
+        assert_eq!(first_fitting_badge_row(&[], 5), None);
+        assert_eq!(first_fitting_badge_row(&rows(&[&free, &free]), 13), None);
     }
 
     #[test]

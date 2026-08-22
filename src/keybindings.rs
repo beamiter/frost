@@ -80,6 +80,9 @@ pub enum Command {
     BlockFixWithAgent,
     BlockExplainWithAgent,
     BlockRetryFailed,
+    /// Fold/unfold the selected block's output. Ctrl+Alt+Z keeps it in the
+    /// same free Ctrl+Alt letter family as the other block chords.
+    BlockToggleCollapse,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -171,6 +174,7 @@ impl std::fmt::Display for Command {
             Command::BlockFixWithAgent => write!(f, "block:fix_with_agent"),
             Command::BlockExplainWithAgent => write!(f, "block:explain_with_agent"),
             Command::BlockRetryFailed => write!(f, "block:retry_failed"),
+            Command::BlockToggleCollapse => write!(f, "block:toggle_collapse"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -251,6 +255,7 @@ impl std::str::FromStr for Command {
             "block:fix_with_agent" => Ok(Command::BlockFixWithAgent),
             "block:explain_with_agent" => Ok(Command::BlockExplainWithAgent),
             "block:retry_failed" => Ok(Command::BlockRetryFailed),
+            "block:toggle_collapse" => Ok(Command::BlockToggleCollapse),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -483,6 +488,12 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+alt+t".to_string(), "block:retry_failed".to_string());
+        // Collapse/expand was right-click-only; Z is the remaining free letter
+        // in this family (ctrl+shift+z is pane zoom, ctrl+z is unbound).
+        bindings.bindings.insert(
+            "ctrl+alt+z".to_string(),
+            "block:toggle_collapse".to_string(),
+        );
 
         // 配置操作
         bindings
@@ -847,6 +858,7 @@ mod tests {
             ("ctrl+alt+x", Command::BlockFixWithAgent),
             ("ctrl+alt+e", Command::BlockExplainWithAgent),
             ("ctrl+alt+t", Command::BlockRetryFailed),
+            ("ctrl+alt+z", Command::BlockToggleCollapse),
         ];
         for (chord, expected) in cases {
             assert_eq!(bindings.get_command(chord), Some(expected), "{chord}");
@@ -891,6 +903,7 @@ mod tests {
             ("block:fix_with_agent", Command::BlockFixWithAgent),
             ("block:explain_with_agent", Command::BlockExplainWithAgent),
             ("block:retry_failed", Command::BlockRetryFailed),
+            ("block:toggle_collapse", Command::BlockToggleCollapse),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
@@ -970,6 +983,7 @@ mod tests {
                 "block:search",
                 "block:select_all",
                 "block:toggle_bookmark",
+                "block:toggle_collapse",
             ]
         );
     }
