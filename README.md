@@ -79,9 +79,19 @@ cargo build --release --locked
 ```
 
 `--binary` 适合发布压缩包、CI 产物和发行版打包：安装器不会调用 Rust 工具链，仍会用同一套
-受测路径安装二进制、desktop 文件、AppStream 元数据和图标。输入必须是可读的普通文件；目标
-二进制权限统一设为 `0755`。它可与 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR`
-组合使用。
+受测路径安装二进制、desktop 文件、AppStream 元数据和图标。输入必须是可读且非符号链接的
+普通文件；此路径要求 Linux 已挂载 `/proc/self/fd` 并提供 GNU `stat`，描述符固定不可用时会
+明确报错。这里的 Bash 实现并非原子的 no-follow open；只有在文件成功打开且路径名与描述符
+完成同一 inode 的身份复核后，之后再替换路径名才不会改变经该描述符复制的 inode。目标二进制
+权限统一设为 `0755`。目标同目录中的私有临时文件写完后，由 GNU `mv -T` 原子替换；复制失败
+或 rename 前退出会清理未提交临时文件并保留旧二进制。rename 是二进制提交点；之后资源安装
+失败不会回滚已提交的二进制。除上述条件外还需要 GNU coreutils 的 `mktemp`/`mv`。它可与
+`--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR` 组合使用。
+零字节预编译产物会在旧目标改变前被拒绝。desktop、AppStream、SVG 与 PNG 源文件都在
+构建/写入前预检，公共资源也以明确权限写入目标同目录临时文件后原子 rename。非根
+`DESTDIR` 会先折叠重复 `/` 和词法 `.` 段，再从 `/` 起检查完整既存组件链；任何
+符号链接都会在首次写入或删除前失败。该检查只描述预检时的状态，不承诺抵御之后的并发
+路径替换；正常主机 prefix 不套用这条策略。
 
 默认装到 `~/.local`（可用 `--prefix` / `--bin-dir` 覆盖，打包场景用 `DESTDIR`）：
 
@@ -97,6 +107,8 @@ cargo build --release --locked
 只覆盖二进制目录；之后卸载时也应传入同一个 `--bin-dir`。`DESTDIR` 只在这些
 运行时绝对路径前追加打包根目录，desktop 文件中的 `Exec=` 仍指向不含
 `DESTDIR` 的运行时路径。
+这些运行时绝对路径可包含空格、Unicode 和 `.` 段；空值、控制字符和词法 `..` 段会被拒绝。
+只有 `DESTDIR` 的拼写会按上文做词法规范化。
 
 旧版源码安装脚本曾错误地把无参数安装写到 `~/.cargo/bin/frost`。新脚本不会
 自动删除那个可能由用户显式管理的文件；若升级后 `command -v frost` 仍指向旧
@@ -448,6 +460,22 @@ belongs in `user`, never as `host = "root@box"`. An explicit list wins,
 The settings panel (Ctrl+Shift+O) has a Remote hosts section that adds,
 edits and removes these entries in place; changes auto-save into the same
 `[[remote_hosts]]` tables.
+
+Auto-save preserves invalid and temporarily incomplete drafts instead of
+deleting them while a field is being edited. A single application gate combines
+the shared grammar with byte budgets and visual-spoofing checks, and the picker,
+session launcher, and remote Files backend all re-run it before starting a
+process. Length, control-character, and visual-format checks run before shared
+semantic validation, so rejected `deploy` drafts never echo raw oversized or
+direction-changing text into UI diagnostics. The first 128 entries may be active; later entries still round-trip and
+remain editable but are shown as unavailable, while Add is disabled until the
+count drops below 128.
+The picker and Settings render a bounded 256-row prefix without truncating the
+stored list; entry 129 is therefore still visible and diagnosed, and any
+further drafts are explicitly reported as retained off-view. Arrow navigation
+skips invalid/inactive entries, active selectors expose only the first 128,
+and save feedback counts invalid active drafts separately from over-limit
+retained drafts.
 
 `deploy = "off"` (the default) connects plainly and runs `remote_shell`
 (default `jsh`) as found on the destination. `"persist"` and `"incognito"`

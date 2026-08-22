@@ -30,11 +30,19 @@ impl FsLocation {
         match self {
             FsLocation::Local => "Local".to_string(),
             FsLocation::Remote(index) => match hosts.get(*index) {
-                Some(host) => format!(
-                    "{}: {}",
-                    if host.docker { "docker" } else { "ssh" },
-                    host.display_name()
-                ),
+                Some(host) => {
+                    let unavailable =
+                        crate::config::validate_remote_host_at(hosts, *index).is_err();
+                    let mut label = format!(
+                        "{}: {}",
+                        if host.docker { "docker" } else { "ssh" },
+                        crate::config::remote_host_display_name(host, *index)
+                    );
+                    if unavailable {
+                        label.push_str(" (unavailable)");
+                    }
+                    label
+                }
                 None => format!("Remote #{index}"),
             },
         }
@@ -572,6 +580,7 @@ fn run_probe(
     timeout: Duration,
     max_out: usize,
 ) -> io::Result<Vec<u8>> {
+    validate_host_for_execution(host)?;
     let argv = if host.docker {
         docker_argv(host, op, args)
     } else {
@@ -595,22 +604,25 @@ fn remote_host<'a>(
             io::ErrorKind::InvalidInput,
             "local location has no remote host",
         )),
-        FsLocation::Remote(index) => {
-            let host = hosts.get(*index).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("remote host #{index} is not configured"),
-                )
-            })?;
-            host.validate().map_err(|problem| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("remote host {}: {problem}", host.display_name()),
-                )
-            })?;
-            Ok(host)
-        }
+        FsLocation::Remote(index) => crate::config::validate_remote_host_at(hosts, *index)
+            .map_err(|problem| io::Error::new(io::ErrorKind::InvalidInput, problem)),
     }
+}
+
+/// Defense-in-depth for private helpers that receive a host reference instead
+/// of its config index. Public entry points resolve through [`remote_host`]
+/// first (which also enforces the 128-entry boundary); this keeps future
+/// internal callers from turning an invalid retained draft into process argv.
+fn validate_host_for_execution(host: &RemoteHostConfig) -> io::Result<()> {
+    crate::config::validate_remote_host(host).map_err(|problem| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "remote host {}: {problem}",
+                crate::config::remote_host_runtime_label(host)
+            ),
+        )
+    })
 }
 
 /// A remote path argument: absolute and UTF-8 (argv and sh demand both).
@@ -969,6 +981,11 @@ fn probe_argv(host: &RemoteHostConfig, op: &str, args: &[&str]) -> Vec<String> {
     }
 }
 
+fn checked_probe_argv(host: &RemoteHostConfig, op: &str, args: &[&str]) -> io::Result<Vec<String>> {
+    validate_host_for_execution(host)?;
+    Ok(probe_argv(host, op, args))
+}
+
 /// A transfer overrun, sized to the cap that was actually in force.
 fn transfer_cap_error(cap: u64) -> io::Error {
     let limit = if cap >= 1024 * 1024 {
@@ -1104,7 +1121,12 @@ fn stream_file_to_probe(
     cap: u64,
     progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<()> {
-    stream_file_to_argv(&probe_argv(host, op, args), local_file, cap, progress)
+    stream_file_to_argv(
+        &checked_probe_argv(host, op, args)?,
+        local_file,
+        cap,
+        progress,
+    )
 }
 
 /// The one line the probe prints on stdout right before it consumes stdin as
@@ -1440,7 +1462,7 @@ pub fn download(
         verify_local_tar()?;
         let temp = unique_staging_path(dst_parent, &name);
         let outcome = stream_argv_to_temp(
-            &probe_argv(host, "tar", &[remote_path(src)?]),
+            &checked_probe_argv(host, "tar", &[remote_path(src)?])?,
             PROBE_SCRIPT.as_bytes(),
             &temp,
             MAX_TRANSFER_BYTES,
@@ -1479,7 +1501,7 @@ pub fn download(
         };
         let temp = unique_staging_path(dst_parent, &name);
         let outcome = stream_argv_to_temp(
-            &probe_argv(host, "cat", &[remote_path(src)?]),
+            &checked_probe_argv(host, "cat", &[remote_path(src)?])?,
             PROBE_SCRIPT.as_bytes(),
             &temp,
             MAX_TRANSFER_BYTES,
@@ -2387,6 +2409,39 @@ mod tests {
             listed.expect_err("invalid host").kind(),
             io::ErrorKind::InvalidInput
         );
+        let mut visually_deceptive = ssh_host();
+        visually_deceptive.name.push('\u{202e}');
+        let direct = run_probe(
+            &visually_deceptive,
+            "home",
+            &[],
+            Duration::from_secs(1),
+            MAX_OP_BYTES,
+        );
+        assert_eq!(
+            direct
+                .expect_err("private probe boundary must recheck the app gate")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let listed = list_dir(
+            &FsLocation::Remote(0),
+            &[visually_deceptive],
+            Path::new("/tmp"),
+        );
+        assert_eq!(
+            listed.expect_err("visual-spoofing host").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let over_limit = vec![ssh_host(); crate::config::MAX_REMOTE_HOSTS + 1];
+        let listed = list_dir(
+            &FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS),
+            &over_limit,
+            Path::new("/tmp"),
+        );
+        let error = listed.expect_err("129th host must remain inactive");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("active limit"));
         let relative = list_dir(&FsLocation::Remote(0), &hosts, Path::new("tmp"));
         assert_eq!(
             relative.expect_err("relative path").kind(),

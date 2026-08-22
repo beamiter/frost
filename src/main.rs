@@ -1457,6 +1457,42 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
     }
 }
 
+fn first_runnable_remote_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> Option<usize> {
+    hosts
+        .iter()
+        .take(config::MAX_REMOTE_HOST_UI_ROWS)
+        .enumerate()
+        .find_map(|(index, _)| {
+            config::validate_remote_host_at(hosts, index)
+                .is_ok()
+                .then_some(index)
+        })
+}
+
+fn next_runnable_remote_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    current: usize,
+    forward: bool,
+) -> Option<usize> {
+    let count = hosts.len().min(config::MAX_REMOTE_HOST_UI_ROWS);
+    if count == 0 {
+        return None;
+    }
+    for distance in 1..=count {
+        let index = if forward {
+            (current + distance) % count
+        } else {
+            (current + count - (distance % count)) % count
+        };
+        if config::validate_remote_host_at(hosts, index).is_ok() {
+            return Some(index);
+        }
+    }
+    None
+}
+
 fn last_session_index(session_count: usize) -> Option<usize> {
     session_count.checked_sub(1)
 }
@@ -5990,7 +6026,8 @@ impl Frost {
                 if self.remote_picker.is_some() {
                     self.remote_picker = None;
                 } else {
-                    self.remote_picker = Some(0);
+                    self.remote_picker =
+                        Some(first_runnable_remote_index(&self.config.remote_hosts).unwrap_or(0));
                 }
                 Some(Task::none())
             }
@@ -6014,7 +6051,11 @@ impl Frost {
             self.remote_picker = None;
             return Some(Task::none());
         }
-        let count = self.config.remote_hosts.len();
+        let count = self
+            .config
+            .remote_hosts
+            .len()
+            .min(config::MAX_REMOTE_HOST_UI_ROWS);
         let selected = self.remote_picker.as_mut()?;
         match key {
             Key::Named(Named::Escape) => {
@@ -6030,15 +6071,19 @@ impl Frost {
                 Some(Task::none())
             }
             Key::Named(Named::ArrowDown) if count > 0 => {
-                *selected = (*selected + 1) % count;
+                if let Some(next) =
+                    next_runnable_remote_index(&self.config.remote_hosts, *selected, true)
+                {
+                    *selected = next;
+                }
                 Some(Task::none())
             }
             Key::Named(Named::ArrowUp) if count > 0 => {
-                *selected = if *selected == 0 {
-                    count - 1
-                } else {
-                    *selected - 1
-                };
+                if let Some(next) =
+                    next_runnable_remote_index(&self.config.remote_hosts, *selected, false)
+                {
+                    *selected = next;
+                }
                 Some(Task::none())
             }
             _ => Some(Task::none()),
@@ -6050,16 +6095,20 @@ impl Frost {
     /// for it — lending the local jsh when that one is static — and a plain
     /// ssh / `docker exec` otherwise.
     fn connect_remote_host(&mut self, index: usize) {
-        let Some(host) = self.config.remote_hosts.get(index).cloned() else {
-            return;
+        let host = match config::validate_remote_host_at(&self.config.remote_hosts, index) {
+            Ok(host) => host.clone(),
+            Err(problem) => {
+                let name = self
+                    .config
+                    .remote_hosts
+                    .get(index)
+                    .map(|host| config::remote_host_display_name(host, index))
+                    .unwrap_or_else(|| format!("remote host #{}", index + 1));
+                self.push_toast(format!("Remote host {name}: {problem}"), ToastKind::Warning);
+                return;
+            }
         };
-        if let Err(problem) = host.validate() {
-            self.push_toast(
-                format!("Remote host {}: {problem}", host.display_name()),
-                ToastKind::Warning,
-            );
-            return;
-        }
+        let display_name = config::remote_host_display_name(&host, index);
         let (argv, degraded) = host.tab_argv();
         if let Some(error) = degraded {
             // The tab still opens — a plain connection beats no connection —
@@ -6067,10 +6116,7 @@ impl Frost {
             // either.
             log::warn!("cannot publish jsh-remote.sh: {error}; connecting without deployment");
             self.push_toast(
-                format!(
-                    "Deploy unavailable; connecting to {} plainly",
-                    host.display_name()
-                ),
+                format!("Deploy unavailable; connecting to {} plainly", display_name),
                 ToastKind::Warning,
             );
         }
@@ -9805,6 +9851,16 @@ impl Frost {
                 }
             }
             Message::RemoteHostAdd => {
+                if self.config.remote_hosts.len() >= config::MAX_REMOTE_HOSTS {
+                    self.push_toast(
+                        format!(
+                            "Remote host not added: the {}-host active limit is reached; existing entries were retained",
+                            config::MAX_REMOTE_HOSTS
+                        ),
+                        ToastKind::Warning,
+                    );
+                    return Task::none();
+                }
                 // Template the inline editor fills in. deploy "persist" so a
                 // fresh host brings jsh along by default; validation stays
                 // advisory until the host field is typed.
@@ -11614,7 +11670,28 @@ impl Frost {
                 } else {
                     match self.save_config_checked() {
                         Ok(()) => {
-                            self.push_toast("Config saved", ToastKind::Success);
+                            let (invalid, inactive) =
+                                config::remote_host_problem_counts(&self.config.remote_hosts);
+                            if invalid > 0 || inactive > 0 {
+                                let mut details = Vec::new();
+                                if invalid > 0 {
+                                    details.push(format!(
+                                        "{invalid} active remote draft(s) are invalid and cannot run"
+                                    ));
+                                }
+                                if inactive > 0 {
+                                    details.push(format!(
+                                        "{inactive} remote draft(s) beyond the {}-host limit remain retained",
+                                        config::MAX_REMOTE_HOSTS
+                                    ));
+                                }
+                                self.push_toast(
+                                    format!("Config saved: {}", details.join("; ")),
+                                    ToastKind::Warning,
+                                );
+                            } else {
+                                self.push_toast("Config saved", ToastKind::Success);
+                            }
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -12582,9 +12659,21 @@ impl Frost {
                 Message::TabMenuAction(TabMenuAction::CloseMarked),
             ));
         }
-        for (index, host) in self.config.remote_hosts.iter().enumerate() {
+        for (index, host) in self
+            .config
+            .remote_hosts
+            .iter()
+            .take(config::MAX_REMOTE_HOSTS)
+            .enumerate()
+        {
+            let unavailable =
+                config::validate_remote_host_at(&self.config.remote_hosts, index).is_err();
+            let mut label = config::remote_host_display_name(host, index);
+            if unavailable {
+                label.push_str(" (unavailable)");
+            }
             menu = menu.push(row_btn(
-                &format!("Remote: {}", host.display_name()),
+                &format!("Remote: {label}"),
                 Message::TabMenuAction(TabMenuAction::ConnectRemote(index)),
             ));
         }
@@ -12595,7 +12684,7 @@ impl Frost {
             + usize::from(!only_one)
             + usize::from(i < last_idx)
             + usize::from(marked_count > 0)
-            + self.config.remote_hosts.len();
+            + self.config.remote_hosts.len().min(config::MAX_REMOTE_HOSTS);
         self.float_tab_menu(menu, rows)
     }
 
@@ -13157,20 +13246,29 @@ impl Frost {
                 .style(text::secondary),
             );
         }
-        for (index, host) in self.config.remote_hosts.iter().enumerate() {
+        for (index, host) in self
+            .config
+            .remote_hosts
+            .iter()
+            .take(config::MAX_REMOTE_HOST_UI_ROWS)
+            .enumerate()
+        {
+            let validation = config::validate_remote_host_at(&self.config.remote_hosts, index);
             let transport = if host.docker { "docker" } else { "ssh" };
             let deploy = if host.deploy.is_empty() {
                 "off"
             } else {
                 host.deploy.as_str()
             };
-            match host.validate() {
-                Ok(()) => {
+            let deploy = jterm_core::review_input::safe_inline_display(deploy, 64);
+            let display_name = config::remote_host_display_name(host, index);
+            match validation {
+                Ok(_) => {
                     let info = row![
                         text(format!("{:>2}", index + 1))
                             .size(12)
                             .style(text::secondary),
-                        text(host.display_name().to_string()).size(13),
+                        text(display_name).size(13),
                         Space::new().width(Length::Fill),
                         text(format!("{transport} · deploy {deploy}"))
                             .size(12)
@@ -13200,9 +13298,7 @@ impl Frost {
                 Err(problem) => {
                     list = list.push(
                         row![
-                            text(host.display_name().to_string())
-                                .size(13)
-                                .style(text::secondary),
+                            text(display_name).size(13).style(text::secondary),
                             Space::new().width(Length::Fill),
                             text(problem).size(12).style(text::secondary),
                         ]
@@ -13211,6 +13307,16 @@ impl Frost {
                     );
                 }
             }
+        }
+        if self.config.remote_hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
+            list = list.push(
+                text(format!(
+                    "{} additional drafts remain saved but are omitted from this bounded view.",
+                    self.config.remote_hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS
+                ))
+                .size(11)
+                .style(text::secondary),
+            );
         }
         list = list.push(
             text("deploy off connects plainly; persist/incognito bring jsh along.")
@@ -14499,7 +14605,7 @@ impl Frost {
                 location: remote_fs::FsLocation::Local,
                 label: remote_fs::FsLocation::Local.label(&self.config.remote_hosts),
             }];
-            for index in 0..self.config.remote_hosts.len() {
+            for index in 0..self.config.remote_hosts.len().min(config::MAX_REMOTE_HOSTS) {
                 let location = remote_fs::FsLocation::Remote(index);
                 choices.push(SidebarLocationChoice {
                     label: location.label(&self.config.remote_hosts),
@@ -15997,17 +16103,26 @@ impl Frost {
                     .style(text::secondary),
             );
         }
-        for (i, host) in self.config.remote_hosts.iter().enumerate() {
+        for (i, host) in self
+            .config
+            .remote_hosts
+            .iter()
+            .take(config::MAX_REMOTE_HOST_UI_ROWS)
+            .enumerate()
+        {
+            let validation = config::validate_remote_host_at(&self.config.remote_hosts, i);
             let transport = if host.docker { "docker" } else { "ssh" };
             let deploy = if host.deploy.is_empty() {
                 "off"
             } else {
                 host.deploy.as_str()
             };
+            let deploy_label = jterm_core::review_input::safe_inline_display(deploy, 64);
+            let display_name = config::remote_host_display_name(host, i);
             let header = row![
-                text(host.display_name().to_string()).size(13),
+                text(display_name).size(13),
                 Space::new().width(Length::Fill),
-                text(format!("{transport} · deploy {deploy}"))
+                text(format!("{transport} · deploy {deploy_label}"))
                     .size(12)
                     .style(text::secondary),
                 button(text("Delete").size(12))
@@ -16041,7 +16156,7 @@ impl Frost {
                     "persist".to_string(),
                     "incognito".to_string(),
                 ],
-                Some(deploy.to_string()),
+                Some(deploy_label),
                 move |v| Message::RemoteHostDeploy(i, v),
             )
             .text_size(13)
@@ -16062,7 +16177,7 @@ impl Frost {
                 .into()
             };
             let mut entry = column![header, fields].spacing(6);
-            if let Err(problem) = host.validate() {
+            if let Err(problem) = validation {
                 entry = entry.push(text(problem).size(11).style(text::danger));
             }
             remote_hosts_section = remote_hosts_section.push(
@@ -16072,8 +16187,41 @@ impl Frost {
                     .style(container::bordered_box),
             );
         }
-        remote_hosts_section = remote_hosts_section
-            .push(button(text("Add host").size(13)).on_press(Message::RemoteHostAdd));
+        if self.config.remote_hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
+            remote_hosts_section = remote_hosts_section.push(
+                text(format!(
+                    "{} additional drafts remain in config.toml and will be saved unchanged; this panel renders only the first {}.",
+                    self.config.remote_hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS,
+                    config::MAX_REMOTE_HOST_UI_ROWS
+                ))
+                .size(11)
+                .style(text::danger),
+            );
+        }
+        let at_remote_host_capacity = self.config.remote_hosts.len() >= config::MAX_REMOTE_HOSTS;
+        let add_host = button(text("Add host").size(13));
+        let add_host = if at_remote_host_capacity {
+            add_host
+        } else {
+            add_host.on_press(Message::RemoteHostAdd)
+        };
+        remote_hosts_section = remote_hosts_section.push(add_host);
+        if at_remote_host_capacity {
+            let message = if self.config.remote_hosts.len() == config::MAX_REMOTE_HOSTS {
+                format!(
+                    "The {}-host active limit is reached; remove an entry before adding another.",
+                    config::MAX_REMOTE_HOSTS
+                )
+            } else {
+                format!(
+                    "All {} entries are retained, but only the first {} can be used; remove entries to re-enable Add.",
+                    self.config.remote_hosts.len(),
+                    config::MAX_REMOTE_HOSTS
+                )
+            };
+            remote_hosts_section =
+                remote_hosts_section.push(text(message).size(11).style(text::danger));
+        }
 
         let buttons = row![
             button(text("Save").size(13)).on_press(Message::ConfigSave),
@@ -19054,6 +19202,28 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn remote_picker_navigation_skips_invalid_and_inactive_drafts() {
+        let mut invalid = config::default_remote_hosts()[0].clone();
+        invalid.host.clear();
+        let mut first = config::default_remote_hosts()[0].clone();
+        first.name = "first".into();
+        let mut second = first.clone();
+        second.name = "second".into();
+        let hosts = vec![invalid.clone(), first, invalid, second];
+
+        assert_eq!(first_runnable_remote_index(&hosts), Some(1));
+        assert_eq!(next_runnable_remote_index(&hosts, 1, true), Some(3));
+        assert_eq!(next_runnable_remote_index(&hosts, 3, true), Some(1));
+        assert_eq!(next_runnable_remote_index(&hosts, 1, false), Some(3));
+
+        let mut over_limit = vec![config::default_remote_hosts()[0].clone(); 129];
+        for host in over_limit.iter_mut().take(128) {
+            host.host.clear();
+        }
+        assert_eq!(first_runnable_remote_index(&over_limit), None);
+    }
 
     #[test]
     fn block_badge_treats_wide_continuations_as_occupied() {
