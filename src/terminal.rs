@@ -1728,6 +1728,58 @@ impl ProjectionPlan {
         })
     }
 
+    /// Document row and column this stable endpoint occupies in *this* plan,
+    /// or `None` when it can no longer be placed safely.
+    ///
+    /// Fails closed on purpose, and deliberately has no summary fallback: the
+    /// scroll anchor may land on a collapsed block's summary row, but a
+    /// selection endpoint must not. Summary and padding rows carry no raw
+    /// slices, so an endpoint parked on one would either copy nothing or, with
+    /// both endpoints collapsing onto the same summary, silently yield an
+    /// empty clipboard.
+    fn selection_point_for_anchor(
+        &self,
+        anchor: ProjectedSelectionAnchor,
+    ) -> Option<(usize, usize)> {
+        match anchor {
+            ProjectedSelectionAnchor::Cell(origin) => {
+                if let Some(row) = self.raw_cell_document_row(origin) {
+                    return Some((row, origin.col));
+                }
+                // A live grid row carries an origin for every column, blanks
+                // included, but the same row in scrollback keeps slices only up
+                // to its real text. Without this arm an endpoint dropped past
+                // the end of a line — which is every triple-click line
+                // selection — would evaporate the moment that row scrolled.
+                let placement = self
+                    .raw_rows
+                    .iter()
+                    .find(|placement| placement.raw_row == origin.row)?;
+                let (first, last) = (placement.first_view_row?, placement.last_view_row?);
+                if first != last {
+                    // Soft-wrapped across several planned rows: which one holds
+                    // a column past the text is ambiguous, so refuse.
+                    return None;
+                }
+                self.row_is_raw(first)
+                    .then(|| (first, origin.col.min(self.cols.saturating_sub(1))))
+            }
+            ProjectedSelectionAnchor::Row { row, col } => {
+                let document_row = self.raw_row_document_row(row)?;
+                self.row_is_raw(document_row)
+                    .then(|| (document_row, col.min(self.cols.saturating_sub(1))))
+            }
+        }
+    }
+
+    /// Whether a planned row carries real content rather than a collapsed
+    /// summary or structural padding.
+    fn row_is_raw(&self, document_row: usize) -> bool {
+        self.rows
+            .get(document_row)
+            .is_some_and(|row| matches!(row.kind, ProjectedRowKind::Raw))
+    }
+
     fn raw_row_document_row(&self, raw_row: RawRowId) -> Option<usize> {
         self.raw_rows
             .iter()
@@ -2253,9 +2305,78 @@ pub struct Selection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectedSelection {
     plan_revision: u64,
-    anchor: (usize, usize),
-    active: (usize, usize),
+    /// Projected width the endpoints were minted at. A rebuild at a different
+    /// width rewraps every history group, so the rows *between* the endpoints
+    /// change shape even when both endpoints still resolve — re-anchoring
+    /// across a resize would silently select different characters.
+    plan_cols: usize,
+    /// Identity of the effectively-hidden set at mint time.
+    ///
+    /// This deliberately tracks the *effective* collapses rather than the
+    /// requested policy: a collapse can stop being effective with the policy
+    /// untouched (its recorded row range stops verifying), which would un-hide
+    /// rows between the endpoints and silently extend the highlight over text
+    /// the user never dragged across.
+    hidden: std::sync::Arc<BTreeSet<u64>>,
+    anchor: ProjectedSelectionEndpoint,
+    active: ProjectedSelectionEndpoint,
     mode: SelectionMode,
+}
+
+/// Stable identity of one projected selection endpoint.
+///
+/// Document rows are plan-relative and every rebuild renumbers them: once
+/// scrollback is at its cap, a single appended line trims the head and shifts
+/// every document row by one. An endpoint therefore remembers the retained raw
+/// cell it was placed on and is resolved again against each incoming plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectedSelectionAnchor {
+    /// The endpoint sits on a retained raw cell.
+    Cell(RawCellOrigin),
+    /// The endpoint names a retained physical row but no retained cell — a
+    /// logically blank row, or a column past the row's real text. `col` is a
+    /// projected column and is only meaningful at the minting width.
+    Row { row: RawRowId, col: usize },
+}
+
+/// One endpoint of a projected selection: where it sits in the plan in force
+/// right now, plus the identity used to place it again after a rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectedSelectionEndpoint {
+    /// `(document_row, projected_col)` against `ProjectedSelection::plan_revision`.
+    point: (usize, usize),
+    anchor: ProjectedSelectionAnchor,
+}
+
+impl ProjectedSelectionAnchor {
+    fn raw_row(self) -> RawRowId {
+        match self {
+            Self::Cell(origin) => origin.row,
+            Self::Row { row, .. } => row,
+        }
+    }
+
+    /// Re-aim this identity at another column of the same physical row.
+    ///
+    /// Word and line extension synthesize a column from the *other* endpoint,
+    /// which routinely lands past the row's real text, so the result is always
+    /// the row-scoped variant: it must never claim to be a retained cell that
+    /// does not exist.
+    fn with_col(self, col: usize) -> Self {
+        Self::Row {
+            row: self.raw_row(),
+            col,
+        }
+    }
+}
+
+impl ProjectedSelectionEndpoint {
+    fn with_col(self, row: usize, col: usize) -> Self {
+        Self {
+            point: (row, col),
+            anchor: self.anchor.with_col(col),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9597,7 +9718,7 @@ impl TerminalState {
         };
 
         if state.last_plan_key.as_ref() != Some(&plan_key) {
-            self.clear_text_selection();
+            self.reanchor_projected_selection(&plan);
             let max_start = plan.rows.len().saturating_sub(self.grid.rows());
             if state.follow_bottom {
                 state.offset_from_bottom = 0;
@@ -9903,10 +10024,93 @@ impl TerminalState {
             && key.provenance_count == self.finished_output_provenance.len()
     }
 
+    /// Carry a projected text selection across a plan rebuild instead of
+    /// destroying it.
+    ///
+    /// A rebuild renumbers every document row, so the stored coordinates go
+    /// stale — which is why this used to just clear. But the scroll position is
+    /// re-anchored across this very same rebuild a few lines below, through
+    /// `document_row_for_anchor`, and a selection can use the same trick: each
+    /// endpoint remembers the retained raw cell it was placed on and is
+    /// resolved again against the incoming plan. Without this, one line of
+    /// output while any block is collapsed wiped a drag-selection.
+    ///
+    /// Fails closed in every ambiguous case — the selection is dropped, which
+    /// is exactly the old behavior — and refuses outright in three cases where
+    /// surviving would be *worse* than dying:
+    ///
+    /// * Block (column) mode: only the endpoints are re-anchored, while the
+    ///   rows between them are re-planned. A live grid row spans the full
+    ///   width but the same row in scrollback stops at its real text, so the
+    ///   rectangle would silently cover different characters.
+    /// * A width change, which rewraps every history group for the same reason.
+    /// * A change to the effectively-hidden set, which would let rows that just
+    ///   became visible fall inside a selection the user never dragged over
+    ///   them.
+    ///
+    /// The raw (non-projected) selection stays cleared unconditionally: its
+    /// copy path reads scrollback directly with no collapse awareness, so it
+    /// must never be revived here.
+    fn reanchor_projected_selection(&mut self, plan: &ProjectionPlan) {
+        self.selection = None;
+        let Some(selection) = self.projected_selection.clone() else {
+            return;
+        };
+        if selection.mode == SelectionMode::Block
+            || selection.plan_cols != plan.cols
+            || selection.hidden.as_ref() != &plan.effective_collapsed
+        {
+            self.projected_selection = None;
+            return;
+        }
+        let (Some(anchor), Some(active)) = (
+            plan.selection_point_for_anchor(selection.anchor.anchor),
+            plan.selection_point_for_anchor(selection.active.anchor),
+        ) else {
+            self.projected_selection = None;
+            return;
+        };
+        self.projected_selection = Some(ProjectedSelection {
+            plan_revision: plan.plan_revision,
+            anchor: ProjectedSelectionEndpoint {
+                point: anchor,
+                ..selection.anchor
+            },
+            active: ProjectedSelectionEndpoint {
+                point: active,
+                ..selection.active
+            },
+            ..selection
+        });
+    }
+
+    /// Assemble a projected selection with the guards a later re-anchor needs:
+    /// the width the endpoints were minted at, and the identity of the
+    /// effectively-hidden set they were dragged across.
+    fn new_projected_selection(
+        projection: &ProjectedViewport,
+        plan_revision: u64,
+        anchor: ProjectedSelectionEndpoint,
+        active: ProjectedSelectionEndpoint,
+        mode: SelectionMode,
+    ) -> ProjectedSelection {
+        ProjectedSelection {
+            plan_revision,
+            plan_cols: projection.cells().first().map_or(0, |row| row.len()),
+            hidden: std::sync::Arc::clone(&projection.effective_collapsed),
+            anchor,
+            active,
+            mode,
+        }
+    }
+
+    /// Mint one selection endpoint from a viewport position: its document
+    /// coordinates in the current plan, plus the stable raw identity used to
+    /// place it again after the plan is rebuilt.
     fn projected_selection_point(
         projection: &ProjectedViewport,
         viewport_pos: (usize, usize),
-    ) -> Option<(usize, usize)> {
+    ) -> Option<ProjectedSelectionEndpoint> {
         let mut cell = ViewportCell {
             row: viewport_pos.0,
             col: viewport_pos.1,
@@ -9921,33 +10125,45 @@ impl TerminalState {
         {
             cell.col -= 1;
         }
-        if projection.view_to_raw(cell).is_none() {
-            let span_start = projection
-                .provenance
-                .origin_spans
-                .partition_point(|span| span.view_row < cell.row);
-            if projection.provenance.origin_spans[span_start..]
-                .first()
-                .is_some_and(|span| span.view_row == cell.row)
-            {
-                return None;
+        // The raw origin was already computed here and thrown away; it is
+        // exactly the identity the endpoint needs to survive a rebuild.
+        let anchor = match projection.view_to_raw(cell) {
+            Some(origin) => ProjectedSelectionAnchor::Cell(origin),
+            None => {
+                let span_start = projection
+                    .provenance
+                    .origin_spans
+                    .partition_point(|span| span.view_row < cell.row);
+                if projection.provenance.origin_spans[span_start..]
+                    .first()
+                    .is_some_and(|span| span.view_row == cell.row)
+                {
+                    return None;
+                }
+                let row_source = projection
+                    .provenance
+                    .row_sources
+                    .get(cell.row)
+                    .copied()
+                    .flatten()?;
+                if !row_source.raw_row.is_tracked()
+                    || !matches!(
+                        projection.row_kinds().get(cell.row),
+                        Some(ProjectedRowKind::Raw)
+                    )
+                {
+                    return None;
+                }
+                ProjectedSelectionAnchor::Row {
+                    row: row_source.raw_row,
+                    col: cell.col,
+                }
             }
-            let row_source = projection
-                .provenance
-                .row_sources
-                .get(cell.row)
-                .copied()
-                .flatten()?;
-            if !row_source.raw_row.is_tracked()
-                || !matches!(
-                    projection.row_kinds().get(cell.row),
-                    Some(ProjectedRowKind::Raw)
-                )
-            {
-                return None;
-            }
-        }
-        Some((projection.view_document_row(cell.row)?, cell.col))
+        };
+        Some(ProjectedSelectionEndpoint {
+            point: (projection.view_document_row(cell.row)?, cell.col),
+            anchor,
+        })
     }
 
     fn projected_row_real_column_bounds(
@@ -10014,12 +10230,13 @@ impl TerminalState {
                 return;
             };
             self.selection = None;
-            self.projected_selection = Some(ProjectedSelection {
+            self.projected_selection = Some(Self::new_projected_selection(
+                projection,
                 plan_revision,
-                anchor: point,
-                active: point,
+                point,
+                point,
                 mode,
-            });
+            ));
             return;
         }
         self.projected_selection = None;
@@ -10127,12 +10344,13 @@ impl TerminalState {
                 return;
             };
             self.selection = None;
-            self.projected_selection = Some(ProjectedSelection {
+            self.projected_selection = Some(Self::new_projected_selection(
+                projection,
                 plan_revision,
                 anchor,
                 active,
-                mode: SelectionMode::Normal,
-            });
+                SelectionMode::Normal,
+            ));
             return;
         }
         self.projected_selection = None;
@@ -10261,24 +10479,25 @@ impl TerminalState {
                 return;
             };
             let Some(selection) = self.projected_selection.as_mut() else {
-                self.projected_selection = Some(ProjectedSelection {
+                self.projected_selection = Some(Self::new_projected_selection(
+                    projection,
                     plan_revision,
-                    anchor: target_start,
-                    active: target_end,
-                    mode: SelectionMode::Normal,
-                });
+                    target_start,
+                    target_end,
+                    SelectionMode::Normal,
+                ));
                 return;
             };
             if selection.plan_revision != plan_revision {
                 self.clear_text_selection();
                 return;
             }
-            let (origin_start, origin_end) = if selection.anchor <= selection.active {
+            let (origin_start, origin_end) = if selection.anchor.point <= selection.active.point {
                 (selection.anchor, selection.active)
             } else {
                 (selection.active, selection.anchor)
             };
-            if target_start < origin_start {
+            if target_start.point < origin_start.point {
                 selection.anchor = origin_end;
                 selection.active = target_start;
             } else {
@@ -10383,12 +10602,14 @@ impl TerminalState {
                 self.clear_text_selection();
                 return;
             }
-            let origin_row = selection.anchor.0;
-            if target_start.0 < origin_row {
-                selection.anchor = (origin_row, selection.anchor.1.max(selection.active.1));
+            let origin_row = selection.anchor.point.0;
+            if target_start.point.0 < origin_row {
+                let col = selection.anchor.point.1.max(selection.active.point.1);
+                selection.anchor = selection.anchor.with_col(origin_row, col);
                 selection.active = target_start;
             } else {
-                selection.anchor = (origin_row, selection.anchor.1.min(selection.active.1));
+                let col = selection.anchor.point.1.min(selection.active.point.1);
+                selection.anchor = selection.anchor.with_col(origin_row, col);
                 selection.active = target_end;
             }
             selection.mode = SelectionMode::Normal;
@@ -10445,12 +10666,13 @@ impl TerminalState {
             return;
         };
         self.selection = None;
-        self.projected_selection = Some(ProjectedSelection {
+        self.projected_selection = Some(Self::new_projected_selection(
+            projection,
             plan_revision,
             anchor,
             active,
-            mode: SelectionMode::Normal,
-        });
+            SelectionMode::Normal,
+        ));
     }
 
     fn select_extended_token_span(
@@ -10550,10 +10772,10 @@ impl TerminalState {
         {
             return None;
         }
-        let (start, end) = if selection.anchor <= selection.active {
-            (selection.anchor, selection.active)
+        let (start, end) = if selection.anchor.point <= selection.active.point {
+            (selection.anchor.point, selection.active.point)
         } else {
-            (selection.active, selection.anchor)
+            (selection.active.point, selection.anchor.point)
         };
         if start.0 >= plan.rows.len() || end.0 >= plan.rows.len() {
             return None;
@@ -10566,8 +10788,8 @@ impl TerminalState {
             let planned = &plan.rows[document_row];
             let (selected_left, selected_right) = if selection.mode == SelectionMode::Block {
                 (
-                    selection.anchor.1.min(selection.active.1),
-                    selection.anchor.1.max(selection.active.1),
+                    selection.anchor.point.1.min(selection.active.point.1),
+                    selection.anchor.point.1.max(selection.active.point.1),
                 )
             } else {
                 (
@@ -11110,18 +11332,18 @@ impl TerminalState {
                 return None;
             }
             let document_row = projection.view_document_row(viewport_row)?;
-            let (start, end) = if selection.anchor <= selection.active {
-                (selection.anchor, selection.active)
+            let (start, end) = if selection.anchor.point <= selection.active.point {
+                (selection.anchor.point, selection.active.point)
             } else {
-                (selection.active, selection.anchor)
+                (selection.active.point, selection.anchor.point)
             };
             if document_row < start.0 || document_row > end.0 {
                 return None;
             }
             let (mut left, mut right) = if selection.mode == SelectionMode::Block {
                 (
-                    selection.anchor.1.min(selection.active.1),
-                    selection.anchor.1.max(selection.active.1),
+                    selection.anchor.point.1.min(selection.active.point.1),
+                    selection.anchor.point.1.max(selection.active.point.1),
                 )
             } else {
                 (
@@ -13398,6 +13620,152 @@ mod tests {
         let bypass = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
         assert_eq!(bypass.mode(), super::ProjectionMode::Bypass);
         assert_eq!(state.offset_from_bottom(), parked_offset);
+    }
+
+    #[test]
+    fn projected_selection_survives_output_while_a_block_is_collapsed() {
+        // Before re-anchoring, one scrolling output line rebuilt the plan and
+        // wiped the highlight — so a drag-selection could not survive a
+        // background job printing a single line while any block was folded.
+        let mut terminal = TerminalState::new(24, 8);
+        for (command, output) in [("one", "LEFT"), ("two", "SECRET"), ("three", "RIGHT")] {
+            terminal.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        let hidden_id = terminal.command_zones[1].id;
+        for i in 0..12 {
+            terminal.process_input(format!("F{i} filler\r\n").as_bytes());
+        }
+        terminal.process_input(b"MARKONE\r\nMARKTWO\r\n");
+        assert!(!terminal.scrollback.is_empty(), "fixture needs scrollback");
+
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let viewport = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let locate = |needle: char| {
+            viewport
+                .cells()
+                .iter()
+                .enumerate()
+                .find_map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .position(|cell| cell.character == needle)
+                        .map(|col| (row, col))
+                })
+                .expect("visible endpoint")
+        };
+        terminal.start_selection_in_projection(
+            &viewport,
+            locate('M'),
+            super::SelectionMode::Normal,
+        );
+        terminal.update_selection_in_projection(&viewport, locate('W'));
+        let before = terminal.copy_selection().expect("selection copies");
+        assert!(before.contains("MARKONE"));
+
+        // One ordinary output line, no keystroke, collapse still active.
+        super::PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+        terminal.process_input(b"tick\r\n");
+        let _ = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(
+            super::PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get()),
+            1,
+            "fixture must actually rebuild the plan"
+        );
+
+        assert!(
+            terminal.has_text_selection(),
+            "the highlight must survive a line of output"
+        );
+        let after = terminal.copy_selection().expect("selection still copies");
+        // Trailing blanks differ once a row migrates from the live grid into
+        // scrollback, so compare the text, not the padding.
+        assert!(
+            after
+                .lines()
+                .map(str::trim_end)
+                .eq(before.lines().map(str::trim_end)),
+            "re-anchored onto different text: {before:?} -> {after:?}"
+        );
+        // The collapsed block must stay hidden through the round trip.
+        assert!(!after.contains("SECRET"));
+    }
+
+    #[test]
+    fn projected_selection_reanchor_refuses_every_case_that_would_shift_it() {
+        let build = || {
+            let mut terminal = TerminalState::new(24, 8);
+            for (command, output) in [("one", "LEFT"), ("two", "SECRET"), ("three", "RIGHT")] {
+                terminal.process_input(
+                    format!(
+                        "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;0\x07"
+                    )
+                    .as_bytes(),
+                );
+            }
+            let hidden_id = terminal.command_zones[1].id;
+            for i in 0..12 {
+                terminal.process_input(format!("F{i} filler\r\n").as_bytes());
+            }
+            terminal.process_input(b"MARKONE\r\nMARKTWO\r\n");
+            (terminal, hidden_id)
+        };
+        let locate = |viewport: &super::ProjectedViewport, needle: char| {
+            viewport
+                .cells()
+                .iter()
+                .enumerate()
+                .find_map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .position(|cell| cell.character == needle)
+                        .map(|col| (row, col))
+                })
+                .expect("visible endpoint")
+        };
+
+        // Block (column) mode: only the endpoints would be re-anchored while
+        // the rows between them are re-planned, so the rectangle could cover
+        // characters that were never dragged over. Dropping is the safe answer.
+        let (mut terminal, hidden_id) = build();
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let viewport = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let (start, end) = (locate(&viewport, 'M'), locate(&viewport, 'W'));
+        terminal.start_selection_in_projection(&viewport, start, super::SelectionMode::Block);
+        terminal.update_selection_in_projection(&viewport, end);
+        assert!(terminal.has_text_selection());
+        terminal.process_input(b"tick\r\n");
+        let _ = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(
+            !terminal.has_text_selection(),
+            "a column selection must not be carried across a re-plan"
+        );
+
+        // Un-hiding a block would put rows the user never dragged over between
+        // the endpoints.
+        let (mut terminal, hidden_id) = build();
+        let mut policy = super::ProjectionPolicy::new();
+        assert!(policy.collapse(hidden_id));
+        let mut state = super::ProjectionViewState::new();
+        let viewport = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let (start, end) = (locate(&viewport, 'M'), locate(&viewport, 'W'));
+        terminal.start_selection_in_projection(&viewport, start, super::SelectionMode::Normal);
+        terminal.update_selection_in_projection(&viewport, end);
+        assert!(terminal.has_text_selection());
+        assert!(policy.expand(hidden_id));
+        let _ = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(
+            !terminal.has_text_selection(),
+            "changing what is hidden must drop the selection"
+        );
     }
 
     #[test]

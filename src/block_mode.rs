@@ -1480,6 +1480,54 @@ pub struct BlockSearchHit {
     pub command_preview: String,
 }
 
+/// Rows of the block-search hit list that are worth building widgets for.
+///
+/// The picker can hold [`BLOCK_SEARCH_HIT_CAP`] hits, but its panel shows on
+/// the order of a dozen. Rendering all of them rebuilt thousands of widgets on
+/// every redraw — including redraws driven by output in the pane *behind* the
+/// overlay — so a broad query made the picker sluggish in proportion to how
+/// many results it found.
+///
+/// The window is a page anchored on `selected` and is deliberately much larger
+/// than the visible area: the list stays inside a scrollable, so a page bigger
+/// than the viewport keeps the wheel and the drag scrollbar working normally
+/// and only shifts when the highlight leaves the page. Callers must map
+/// `selected` into the returned range before computing a scroll fraction —
+/// see [`block_search_window_offset`].
+pub fn block_search_view_window(
+    len: usize,
+    selected: usize,
+    max_rows: usize,
+) -> std::ops::Range<usize> {
+    if len == 0 || max_rows == 0 {
+        return 0..0;
+    }
+    if len <= max_rows {
+        return 0..len;
+    }
+    let selected = selected.min(len - 1);
+    // Center the highlight in the page, then clamp so the page always holds
+    // exactly `max_rows` rows and never runs past either end.
+    let half = max_rows / 2;
+    let start = selected.saturating_sub(half).min(len - max_rows);
+    start..start + max_rows
+}
+
+/// Scroll fraction that puts `selected` at the same relative position inside
+/// the rendered window that it occupies in the window's row span.
+///
+/// The list widget only contains the windowed rows, so a fraction computed
+/// against the full hit count would scroll to the wrong place — which is
+/// exactly what keeping the highlight visible depends on.
+pub fn block_search_window_offset(window: &std::ops::Range<usize>, selected: usize) -> f32 {
+    let rows = window.len();
+    if rows <= 1 {
+        return 0.0;
+    }
+    let local = selected.clamp(window.start, window.end - 1) - window.start;
+    local as f32 / (rows - 1) as f32
+}
+
 /// Owned, original-case input to the background block-search cache builder.
 /// The UI thread extracts only a bounded newest-first set; lowercasing happens
 /// after this value has moved to a worker.
@@ -3283,6 +3331,60 @@ mod tests {
         assert!(!badge_fits(&blank_tail, 13)); // wider than the row
         let nul_tail: Vec<char> = vec!['x', '\0', '\0'];
         assert!(badge_fits(&nul_tail, 2));
+    }
+
+    #[test]
+    fn block_search_window_follows_the_highlight_and_keeps_it_addressable() {
+        const MAX: usize = 48;
+
+        // Small result sets render whole — no windowing, no behavior change.
+        assert_eq!(block_search_view_window(0, 0, MAX), 0..0);
+        assert_eq!(block_search_view_window(10, 3, MAX), 0..10);
+        assert_eq!(block_search_view_window(MAX, MAX - 1, MAX), 0..MAX);
+
+        // Past the cap the page is exactly MAX rows and never runs off an end.
+        let len = BLOCK_SEARCH_HIT_CAP;
+        for selected in [0, 1, 23, 24, 200, len - 2, len - 1] {
+            let window = block_search_view_window(len, selected, MAX);
+            assert_eq!(window.len(), MAX, "selected={selected}");
+            assert!(window.end <= len, "selected={selected}");
+            assert!(
+                window.contains(&selected),
+                "selected={selected} fell outside {window:?}"
+            );
+        }
+        assert_eq!(block_search_view_window(len, 0, MAX).start, 0);
+        assert_eq!(block_search_view_window(len, len - 1, MAX).end, len);
+
+        // The page only shifts when the highlight leaves it, so stepping one
+        // row at a time does not re-page (and re-lay-out) on every keypress.
+        let a = block_search_view_window(len, 100, MAX);
+        let b = block_search_view_window(len, 101, MAX);
+        assert_eq!(b.start, a.start + 1);
+        assert_eq!(
+            block_search_view_window(len, 5, MAX),
+            block_search_view_window(len, 6, MAX)
+        );
+
+        // The scroll fraction is relative to the WINDOW, since the list widget
+        // holds only those rows; against the full count it would scroll to the
+        // wrong row and lose the highlight entirely.
+        let window = block_search_view_window(len, 300, MAX);
+        let offset = block_search_window_offset(&window, 300);
+        assert!((0.0..=1.0).contains(&offset), "{offset}");
+        assert_eq!(block_search_window_offset(&(0..1), 0), 0.0);
+        assert_eq!(block_search_window_offset(&(0..0), 0), 0.0);
+        assert_eq!(block_search_window_offset(&(10..20), 10), 0.0);
+        assert_eq!(block_search_window_offset(&(10..20), 19), 1.0);
+        // A selection outside the window clamps instead of producing a
+        // fraction outside the track.
+        assert_eq!(block_search_window_offset(&(10..20), 0), 0.0);
+        assert_eq!(block_search_window_offset(&(10..20), 999), 1.0);
+
+        // A stale selection past the end still yields an in-range page.
+        let clamped = block_search_view_window(len, len + 99, MAX);
+        assert_eq!(clamped.end, len);
+        assert_eq!(clamped.len(), MAX);
     }
 
     #[test]

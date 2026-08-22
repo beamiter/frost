@@ -582,6 +582,11 @@ static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
 static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));
+/// Hit rows the picker builds widgets for at once. Comfortably larger than
+/// the panel's visible area so the wheel and drag scrollbar still work inside
+/// the page; the page only shifts when the highlight leaves it.
+const BLOCK_SEARCH_VISIBLE_ROWS: usize = 48;
+
 static BLOCK_SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-input"));
 static BLOCK_SEARCH_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -979,12 +984,19 @@ impl BlockSearchState {
     fn release_index_for_rebuild(&mut self) {
         // Assignment drops Vec allocations as well as their elements. Query,
         // filter and matching controls intentionally survive the rebuild.
+        //
+        // The previous HITS survive too, so a background block closing (or the
+        // shell re-emitting its prompt cycle) no longer blanks an open picker
+        // to "Indexing blocks…" and throws the highlight back to the top. They
+        // are bounded by the 500-hit cap at
+        // [`block_mode::BLOCK_SEARCH_LINE_CHARS`] + `BLOCK_SEARCH_COMMAND_CHARS`
+        // per row — well under a megabyte — so retaining them does not disturb
+        // the cache/source memory-peak invariant, which is about the multi-MiB
+        // index. They are rendered as stale until the rebuild lands, and every
+        // path that ACTS on a hit is gated on `loading`.
         self.cache = Vec::new();
-        self.hits = Vec::new();
-        self.capped = false;
         self.older_not_indexed = false;
         self.query_error = None;
-        self.selected = 0;
     }
 
     fn select_next(&mut self) {
@@ -7292,10 +7304,15 @@ impl Frost {
         let Some(state) = self.block_search.as_ref() else {
             return Task::none();
         };
-        let y = match state.hits.len() {
-            0 | 1 => 0.0,
-            len => state.selected as f32 / (len - 1) as f32,
-        };
+        // The list widget holds only the windowed rows, so the fraction must
+        // be computed inside that window — against the full hit count it would
+        // scroll to the wrong row and lose the highlight.
+        let window = block_mode::block_search_view_window(
+            state.hits.len(),
+            state.selected,
+            BLOCK_SEARCH_VISIBLE_ROWS,
+        );
+        let y = block_mode::block_search_window_offset(&window, state.selected);
         iced::widget::operation::snap_to(
             BLOCK_SEARCH_LIST_ID.clone(),
             iced::widget::operation::RelativeOffset { x: 0.0, y },
@@ -7349,11 +7366,31 @@ impl Frost {
                 return Some(Task::none());
             }
             Key::Named(Named::Enter) => {
-                if state.query_error.is_some() {
+                // Unlike the click path, this indexes `hits` directly instead
+                // of going through `accepts_hit`, so it must carry that
+                // check's `loading` gate itself: while a rebuild is in flight
+                // the retained hits describe the PREVIOUS index and may no
+                // longer name a live zone/line.
+                if state.query_error.is_some() || state.loading {
                     return Some(Task::none());
                 }
                 let owner = state.session_id;
                 let target = state.hits.get(state.selected).cloned();
+                // Shift+Enter walks the result set in place. Plain Enter keeps
+                // the accept-and-close contract; without the stepping variant,
+                // visiting several matches of one query meant reopening the
+                // picker and retyping it for every single hit.
+                if mods.shift() {
+                    if let Some(hit) = target {
+                        if self.block_search_target_is_live(owner, hit.zone_id) {
+                            self.reveal_block_search_hit(&hit);
+                        }
+                    }
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.select_next();
+                    }
+                    return Some(self.block_search_snap_task());
+                }
                 self.block_search = None;
                 if let Some(hit) = target {
                     if self.block_search_target_is_live(owner, hit.zone_id) {
@@ -13776,7 +13813,7 @@ impl Frost {
         // list in a scroll area) and keyboard navigation wraps across all of
         // them, `block_search_snap_task` keeping the highlight in view.
         let mut body = column![query_line, filters].spacing(8);
-        if state.loading {
+        if state.loading && state.hits.is_empty() {
             body = body.push(text("Indexing blocks…").size(13).style(text::secondary));
         } else if let Some(error) = &state.query_error {
             body = body.push(text(error.clone()).size(12).style(text::danger));
@@ -13802,9 +13839,31 @@ impl Frost {
             };
             body = body.push(text(empty).size(13).style(text::secondary));
         } else {
-            body = body.push(text(state.count_label()).size(12).style(text::secondary));
+            // A rebuild in flight leaves the previous hits on screen so the
+            // picker does not blank out, but they must be unmistakably stale:
+            // every path that acts on one is refused until the rebuild lands.
+            body = body.push(
+                text(if state.loading {
+                    format!("{} · refreshing…", state.count_label())
+                } else {
+                    state.count_label()
+                })
+                .size(12)
+                .style(if state.loading {
+                    text::warning
+                } else {
+                    text::secondary
+                }),
+            );
+            let stale = state.loading;
+            let window = block_mode::block_search_view_window(
+                state.hits.len(),
+                state.selected,
+                BLOCK_SEARCH_VISIBLE_ROWS,
+            );
             let mut list = column![].spacing(2);
-            for (pos, hit) in state.hits.iter().enumerate() {
+            for (offset, hit) in state.hits[window.clone()].iter().enumerate() {
+                let pos = window.start + offset;
                 let selected = pos == state.selected;
                 // On a command hit `line_text` already IS the command line,
                 // so repeating the preview here spent the only secondary line
@@ -13830,7 +13889,12 @@ impl Frost {
                 let info = column![
                     text(hit.line_text.clone())
                         .size(13)
-                        .wrapping(text::Wrapping::None),
+                        .wrapping(text::Wrapping::None)
+                        .style(if stale {
+                            text::secondary
+                        } else {
+                            text::default
+                        }),
                     text(context)
                         .size(11)
                         .wrapping(text::Wrapping::None)
@@ -13866,10 +13930,13 @@ impl Frost {
         // The overlay owns every key while it is open, so the chips and
         // toggles above are otherwise reachable only with the mouse.
         body = body.push(
-            text("Tab filter · Ctrl+I case · Ctrl+R regex · ↑↓ select · Enter reveal · Esc close")
-                .size(11)
-                .wrapping(text::Wrapping::Word)
-                .style(text::secondary),
+            text(
+                "Tab filter · Ctrl+I case · Ctrl+R regex · ↑↓ select · Enter reveal · \
+                 Shift+Enter step · Esc close",
+            )
+            .size(11)
+            .wrapping(text::Wrapping::Word)
+            .style(text::secondary),
         );
 
         let panel_width = (self.win_size.width - 32.0).clamp(280.0, 720.0);
@@ -21881,17 +21948,25 @@ mod tests {
             ..BlockSearchState::default()
         };
         state.cache.reserve(2048);
-        state.hits.reserve(2048);
-        assert!(state.cache.capacity() > 0 && state.hits.capacity() > 0);
+        state.hits.push(block_search_hit(7));
+        state.selected = 0;
+        assert!(state.cache.capacity() > 0);
 
         state.release_index_for_rebuild();
 
+        // The multi-MiB index is what the memory-peak invariant is about, and
+        // it is released.
         assert_eq!(state.cache.capacity(), 0);
-        assert_eq!(state.hits.capacity(), 0);
         assert_eq!(state.query, "needle");
         assert!(state.case_sensitive && state.regex);
         assert_eq!(state.filter, BlockSearchFilter::Failed);
         assert!(state.query_error.is_none());
+        // The previous hits stay so an open picker is not blanked by a block
+        // finishing behind it. They are shown as stale, and every path that
+        // acts on one refuses while `loading` is set.
+        assert_eq!(state.hits.len(), 1);
+        state.loading = true;
+        assert!(!state.accepts_hit(&block_search_hit(7), state.session_id, state.zone_version));
     }
 
     #[test]
