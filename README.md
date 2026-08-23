@@ -276,6 +276,20 @@ JSON 使用版本化的 `frost.block-session` v1 envelope，记录 pane session�
 
 快捷键从 `$XDG_CONFIG_HOME/frost/keybindings.toml`（通常是 `~/.config/frost/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
 
+## Shell 集成（OSC 133）
+
+Block mode、提示符跳转、命令历史、长命令通知和失败块的 Agent 动作全部依赖 shell 通过
+**OSC 133** 汇报命令边界。frost 默认使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，
+它原生发送这些标记，因此开箱即用；找不到 jsh 时会退回 bash。
+
+如果当前 pane 的 shell 不发送 OSC 133，这些功能不会报错，而是**没有任何块可操作**：
+卡片、gutter、徽标、滚动条标记与块搜索都为空。此时相关操作会明确说明原因，并指向
+命令面板中的 **Install or update jsh**（`Ctrl+Shift+P`）。注意区分两种情况：shell 正常
+汇报但你确实还没有失败块时，提示只会说"本 pane 没有该类块"，不会误指集成缺失。
+
+想在自己的 bash/zsh 中启用，只需在提示符前后发送对应标记（`A` 提示符开始、`B` 提示符结束、
+`C` 命令开始、`D;<exit>` 命令结束）。frost 只依赖这四个标记，`cwd=` 等参数可选。
+
 ## 配置
 
 主配置位于 `$XDG_CONFIG_HOME/frost/config.toml`。设置面板中的修改会自动保存，外部编辑也会热重载。示例：

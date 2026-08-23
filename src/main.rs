@@ -6351,6 +6351,31 @@ impl Frost {
             || self.search.is_open
     }
 
+    fn active_pane_has_prompt_marks(&self) -> bool {
+        self.sessions
+            .get(self.active)
+            .is_some_and(|session| session.terminal.has_prompt_marks())
+    }
+
+    /// Explain a block action that found nothing to act on.
+    ///
+    /// These toasts used to name OSC 133 unconditionally, which is wrong in
+    /// both directions. On a shell that *does* emit marks it blamed shell
+    /// integration for what is really "this pane has no failed block yet". On
+    /// one that does not, it named a prerequisite without saying how to satisfy
+    /// it — and nothing else in the app or the README did either, so the whole
+    /// feature was a dead end for anyone not already running jsh.
+    fn block_absent_toast(&self, subject: &str) -> String {
+        if self.active_pane_has_prompt_marks() {
+            format!("No {subject} in this pane")
+        } else {
+            format!(
+                "No {subject}: this shell is not reporting commands — run \
+                 \"Install or update jsh\" from the command palette for shell integration"
+            )
+        }
+    }
+
     /// One gate for commands that act on block history. Block chrome is hidden
     /// in the alternate screen, so neither keybindings nor palette actions may
     /// mutate or read an invisible selection there.
@@ -6416,7 +6441,8 @@ impl Frost {
                 "Already at the newest command prompt"
             }
         } else {
-            "Prompt navigation needs OSC 133 shell integration"
+            "Prompt navigation needs shell integration — run \"Install or update jsh\" \
+             from the command palette"
         };
         self.push_toast(message, ToastKind::Info);
         Task::none()
@@ -7013,7 +7039,7 @@ impl Frost {
             }
             None => {
                 self.push_toast(
-                    "No failed command block (needs OSC 133 shell integration)".to_string(),
+                    self.block_absent_toast("failed command block"),
                     ToastKind::Info,
                 );
                 Task::none()
@@ -7027,7 +7053,7 @@ impl Frost {
             Some((session_id, zone_id)) => self.failed_block_retry_task(session_id, zone_id),
             None => {
                 self.push_toast(
-                    "No failed command block (needs OSC 133 shell integration)".to_string(),
+                    self.block_absent_toast("failed command block"),
                     ToastKind::Info,
                 );
                 Task::none()
@@ -8728,7 +8754,7 @@ impl Frost {
             }
             None => {
                 self.push_toast(
-                    "No command output to copy (needs OSC 133 shell integration)".to_string(),
+                    self.block_absent_toast("command output to copy"),
                     ToastKind::Info,
                 );
                 Task::none()
@@ -8807,7 +8833,7 @@ impl Frost {
         match target {
             Some(id) => self.select_and_reveal_block(id),
             None => self.push_toast(
-                "No failed command block (needs OSC 133 shell integration)".to_string(),
+                self.block_absent_toast("failed command block"),
                 ToastKind::Info,
             ),
         }
@@ -8843,7 +8869,7 @@ impl Frost {
             .collect();
         if !zones.iter().any(|&(_, failed)| failed) {
             self.push_toast(
-                "No failed command block (needs OSC 133 shell integration)".to_string(),
+                self.block_absent_toast("failed command block"),
                 ToastKind::Info,
             );
             return Task::none();
@@ -8987,7 +9013,7 @@ impl Frost {
             });
             if fallback.is_none() {
                 self.push_toast(
-                    format!("No block command to {verb} (needs OSC 133 shell integration)"),
+                    self.block_absent_toast(&format!("block command to {verb}")),
                     ToastKind::Info,
                 );
             }
@@ -9049,7 +9075,7 @@ impl Frost {
                 let fallback = sess.terminal.last_command_output_text();
                 if fallback.is_none() {
                     self.push_toast(
-                        "No block output to copy (needs OSC 133 shell integration)".to_string(),
+                        self.block_absent_toast("block output to copy"),
                         ToastKind::Info,
                     );
                 }
@@ -9145,7 +9171,7 @@ impl Frost {
             .collect();
         if ids.is_empty() {
             self.push_toast(
-                "No command blocks to select (needs OSC 133 shell integration)".to_string(),
+                self.block_absent_toast("command blocks to select"),
                 ToastKind::Info,
             );
             return Task::none();
@@ -9463,14 +9489,14 @@ impl Frost {
             // separately and keeps ordinary scrolling; reaching it *here*
             // means an explicit palette pick (or a user-bound chord), which
             // has to say why nothing happened instead of doing nothing.
-            block_mode::SelectionNavigation::Passthrough => self.push_toast(
-                if has_blocks {
-                    "No block selected — select an older block first (Ctrl+↑)"
+            block_mode::SelectionNavigation::Passthrough => {
+                let message = if has_blocks {
+                    "No block selected — select an older block first (Ctrl+↑)".to_string()
                 } else {
-                    "No command blocks to select (needs OSC 133 shell integration)"
-                },
-                ToastKind::Info,
-            ),
+                    self.block_absent_toast("command blocks to select")
+                };
+                self.push_toast(message, ToastKind::Info);
+            }
         }
         Task::none()
     }
@@ -9493,7 +9519,7 @@ impl Frost {
                 let newest = sess.terminal.command_zones.back().map(|zone| zone.id);
                 if newest.is_none() {
                     self.push_toast(
-                        format!("No block to {verb} (needs OSC 133 shell integration)"),
+                        self.block_absent_toast(&format!("block to {verb}")),
                         ToastKind::Info,
                     );
                 }
@@ -9748,11 +9774,8 @@ impl Frost {
             return Task::none();
         };
         if sess.terminal.command_zones.is_empty() {
-            self.push_toast(
-                "No retained command blocks to export (needs OSC 133 shell integration)"
-                    .to_string(),
-                ToastKind::Info,
-            );
+            let message = self.block_absent_toast("retained command blocks to export");
+            self.push_toast(message, ToastKind::Info);
             return Task::none();
         }
         let snapshot = match block_export::snapshot_session(&sess.terminal, sess.id) {
@@ -13819,10 +13842,14 @@ impl Frost {
             body = body.push(text(error.clone()).size(12).style(text::danger));
         } else if !pane_has_blocks {
             body = body.push(
-                text("This pane has no command blocks yet — block capture needs OSC 133 shell integration")
-                    .size(13)
-                    .wrapping(text::Wrapping::Word)
-                    .style(text::secondary),
+                text(
+                    "This pane has no command blocks yet — block capture needs a shell that \
+                     reports commands (OSC 133); run \"Install or update jsh\" from the \
+                     command palette",
+                )
+                .size(13)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
             );
         } else if state.query.trim().is_empty() && state.filter == BlockSearchFilter::All {
             let hint = if state.older_not_indexed {
@@ -16849,6 +16876,10 @@ impl Frost {
             kb("Drag", "Select text"),
             kb("Ctrl+Click", "Open link under cursor"),
             section("Command Blocks"),
+            kb(
+                "(needs OSC 133)",
+                "Blocks require a shell that reports commands, e.g. jsh"
+            ),
             kb("Header click", "Select one finalized block"),
             kb("Shift+Click", "Select a range from any card row"),
             kb("Ctrl+Shift+Click", "Toggle a block from any card row"),

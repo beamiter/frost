@@ -1169,6 +1169,18 @@ struct HideSegment {
 }
 
 #[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
+/// Per-group scratch reused across a whole plan build.
+///
+/// The group geometry is discarded as soon as the group's rows are emitted, so
+/// it does not need to be a fresh allocation each time — and an unwrapped
+/// history row forms a group by itself, which made this two `Vec` allocations
+/// for every row of scrollback on every rebuild.
+#[derive(Default)]
+struct GroupScratch {
+    logical_sources: Vec<(usize, RawSlice)>,
+    logical_wide_continuations: Vec<usize>,
+}
+
 impl ProjectionPlan {
     fn identity(
         history_layouts: impl IntoIterator<Item = RawRowLayout>,
@@ -1176,39 +1188,50 @@ impl ProjectionPlan {
         cols: usize,
     ) -> Self {
         debug_assert!(cols > 0);
-        let history_layouts: Vec<_> = history_layouts.into_iter().collect();
-        let grid_layouts: Vec<_> = grid_layouts.into_iter().collect();
-        let mut rows = Vec::new();
+        // Consume the layouts as streams and build `raw_rows` in the same
+        // walk. Collecting them first, then cloning each one out again, and
+        // then re-walking both to derive placements cost three passes and two
+        // document-sized vectors per rebuild — and this whole function runs
+        // once per appended output line while any block is collapsed.
+        let history_layouts = history_layouts.into_iter();
+        let grid_layouts = grid_layouts.into_iter();
+        let hint = history_layouts
+            .size_hint()
+            .0
+            .saturating_add(grid_layouts.size_hint().0);
+        let mut rows = Vec::with_capacity(hint);
+        let mut raw_rows = Vec::with_capacity(hint);
         let mut group = Vec::new();
+        // Reused across every group instead of allocated per group: a plain
+        // history row is its own group, so this was two allocations per row.
+        let mut scratch = GroupScratch::default();
+        let placement = |layout: &RawRowLayout| RawRowPlacement {
+            absolute_row: layout.absolute_row,
+            raw_row: layout.raw_row,
+            first_view_row: None,
+            last_view_row: None,
+        };
 
         // History is a reflowable logical document. The live grid is already
         // at display width and P0 appends each physical row without joining it
         // to a trailing wrapped scrollback row (or to adjacent grid rows).
-        for layout in history_layouts.iter().cloned() {
+        for layout in history_layouts {
+            raw_rows.push(placement(&layout));
             let wrapped = layout.wrapped;
             group.push(layout);
             if !wrapped {
-                Self::append_identity_group(&mut rows, &group, cols);
+                Self::append_identity_group(&mut rows, &group, cols, &mut scratch);
                 group.clear();
             }
         }
         if !group.is_empty() {
-            Self::append_identity_group(&mut rows, &group, cols);
+            Self::append_identity_group(&mut rows, &group, cols, &mut scratch);
         }
-        for layout in grid_layouts.iter().cloned() {
+        for layout in grid_layouts {
+            raw_rows.push(placement(&layout));
             Self::append_grid_row(&mut rows, layout, cols);
         }
 
-        let raw_rows = history_layouts
-            .iter()
-            .chain(&grid_layouts)
-            .map(|layout| RawRowPlacement {
-                absolute_row: layout.absolute_row,
-                raw_row: layout.raw_row,
-                first_view_row: None,
-                last_view_row: None,
-            })
-            .collect();
         let raw_slice_count = rows.iter().map(|row| row.raw_slices.len()).sum();
         let mut plan = Self {
             cols,
@@ -1258,6 +1281,7 @@ impl ProjectionPlan {
         output: &mut Vec<ProjectionPlanRow>,
         group: &[RawRowLayout],
         cols: usize,
+        scratch: &mut GroupScratch,
     ) {
         let group_first_source = group.first().and_then(|layout| {
             layout.raw_row.is_tracked().then_some(RowSource {
@@ -1326,8 +1350,12 @@ impl ProjectionPlan {
         // Temporary source geometry is linear in physical rows / wide glyphs
         // and is discarded once the plan has been emitted. Keeping cursors in
         // both vectors makes planning O(source rows + planned rows + slices).
-        let mut logical_sources = Vec::with_capacity(group.len());
-        let mut logical_wide_continuations = Vec::new();
+        let GroupScratch {
+            logical_sources,
+            logical_wide_continuations,
+        } = scratch;
+        logical_sources.clear();
+        logical_wide_continuations.clear();
         let mut source_start = 0usize;
         for layout in group {
             logical_wide_continuations.extend(
