@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-21
+Updated: 2026-08-24
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,15 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- Frost range navigation now protects the newest edge: a newer step on a
+  multi-block selection first contracts it to the active newest block, and only
+  the following step clears selection with explicit feedback.
+  This keeps one accidental keypress from destroying a reviewed range while
+  preserving the established single-block exit hatch. The shared core exact
+  pin advances to `0f47569eb7501d52abeee4130f1735b6ada7dfe0`, adding
+  current AI origin/credential validation without changing the completed-block
+  outcome/lifecycle contract.
 
 - Block Search 2.0 adds `Aa` case-sensitive and bounded Rust-regex matching to
   the existing All/Failed/Slow/Bookmarked/Background picker. Invalid or
@@ -276,8 +285,8 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   function are now direct public re-exports of the shared contract rather than
   local semantic mirrors; Frost's serializer adapters delegate to the shared
   stable snake-case vocabulary. `jterm_core` is pinned to
-  `3e09b161a36e2ec30f730eee8f8d6702b2bacc35` (transitively jagent
-  `d52002e4a18735e8cfec718da5fea8f0a5cfaaf8`). Claim-acquisition errors are
+  `0f47569eb7501d52abeee4130f1735b6ada7dfe0` (transitively jagent
+  `fcb9768bb832547988056baa38b2d4239341b361`). Claim-acquisition errors are
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
 

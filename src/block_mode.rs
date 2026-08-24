@@ -168,8 +168,12 @@ impl BlockSelection {
         self.selected.is_empty()
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// Number of retained blocks in the current selection.
+    ///
+    /// Navigation needs this independently of the active edge: moving newer
+    /// from a multi-block range at the newest edge first contracts the range
+    /// to that one block, and only the following step exits selection mode.
+    pub fn len(&self) -> usize {
         self.selected.len()
     }
 
@@ -1219,7 +1223,23 @@ pub enum SelectionNavigation {
     Clear,
 }
 
+#[cfg(test)]
 pub fn selection_navigation(ids: &[u64], current: Option<u64>, older: bool) -> SelectionNavigation {
+    selection_navigation_with_count(ids, current, usize::from(current.is_some()), older)
+}
+
+/// Range-aware block-selection navigation.
+///
+/// A plain newer step normally collapses a range onto the neighbouring block.
+/// At the newest edge there is no neighbour, but clearing a multi-selection in
+/// one keystroke is unexpectedly destructive. Contract it to the active block
+/// first; the next newer step then performs the ordinary exit.
+pub fn selection_navigation_with_count(
+    ids: &[u64],
+    current: Option<u64>,
+    selected_count: usize,
+    older: bool,
+) -> SelectionNavigation {
     let Some(&newest) = ids.last() else {
         return SelectionNavigation::Passthrough;
     };
@@ -1236,6 +1256,8 @@ pub fn selection_navigation(ids: &[u64], current: Option<u64>, older: bool) -> S
         SelectionNavigation::Select(ids[position.saturating_sub(1)])
     } else if position + 1 < ids.len() {
         SelectionNavigation::Select(ids[position + 1])
+    } else if selected_count > 1 {
+        SelectionNavigation::Select(newest)
     } else {
         // Moving down past the newest block exits selection mode, matching the
         // anvil/forge history-canvas contract.
@@ -2670,6 +2692,17 @@ mod tests {
         // No zones at all: nothing to select.
         assert_eq!(selection_navigation(&[], None, true), Passthrough);
         assert_eq!(selection_navigation(&[], Some(1), false), Passthrough);
+
+        // A whole range at the newest edge contracts to one active block
+        // before the following newer step exits selection mode.
+        assert_eq!(
+            selection_navigation_with_count(&ids, Some(30), 3, false),
+            Select(30)
+        );
+        assert_eq!(
+            selection_navigation_with_count(&ids, Some(30), 1, false),
+            Clear
+        );
     }
 
     #[test]

@@ -70,5 +70,16 @@ are numbered 11–30.
 30. **Documented bounded-draft contract** — README records render limits,
     navigation behavior, save diagnostics, and atomic public assets.
 
+Block Mode convergence continues with rounds 31–33:
+
+31. **Frost range-safe newest edge** — Frost's newer step at the end of a
+    multi-selection contracts to the active newest block before a later step
+    exits selection.
+32. **Explicit selection exit** — the eventual key-owned clear produces the
+    same feedback as Ember instead of making the highlight disappear silently.
+33. **Current shared security pin** — the exact `jterm_core` revision advances
+    to `0f47569`, adopting AI origin/credential/no-proxy validation without changing the
+    four-way completed-block or lifecycle-health contracts.
+
 Verification: `bash scripts/test-install-paths.sh`, Frost config tests, and the
 full formatting/check/Clippy/test gates.

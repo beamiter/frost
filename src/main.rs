@@ -124,11 +124,12 @@ fn ctrl_scroll_block_navigation(
     command_running: bool,
     ids: &[u64],
     current: Option<u64>,
+    selected_count: usize,
 ) -> block_mode::SelectionNavigation {
     if !block_mode || alt_screen || command_running || (!older && current.is_none()) {
         return block_mode::SelectionNavigation::Passthrough;
     }
-    block_mode::selection_navigation(ids, current, older)
+    block_mode::selection_navigation_with_count(ids, current, selected_count, older)
 }
 
 fn block_escape_owns_key(
@@ -5892,6 +5893,7 @@ impl Frost {
                             sess.terminal.is_command_running(),
                             &ids,
                             sess.block_selection.active(),
+                            sess.block_selection.len(),
                         )
                     },
                 );
@@ -5905,6 +5907,7 @@ impl Frost {
                             sess.block_selection.clear();
                             sess.refresh();
                         }
+                        self.push_toast("Block selection cleared".to_string(), ToastKind::Info);
                         return Some(Task::none());
                     }
                     block_mode::SelectionNavigation::Passthrough => {}
@@ -9468,7 +9471,12 @@ impl Frost {
             let has_blocks = !ids.is_empty();
             sess.block_selection.retain(&ids);
             (
-                block_mode::selection_navigation(&ids, sess.block_selection.active(), older),
+                block_mode::selection_navigation_with_count(
+                    &ids,
+                    sess.block_selection.active(),
+                    sess.block_selection.len(),
+                    older,
+                ),
                 has_blocks,
             )
         };
@@ -9481,6 +9489,7 @@ impl Frost {
                     sess.block_selection.clear();
                     sess.refresh();
                 }
+                self.push_toast("Block selection cleared".to_string(), ToastKind::Info);
             }
             // Two different causes, and they need different answers: the
             // pane has no zones at all, or "newer" was asked with no live
@@ -20423,38 +20432,43 @@ mod tests {
 
         let ids = [10, 20, 30];
         assert_eq!(
-            ctrl_scroll_block_navigation(true, true, false, false, &ids, None),
+            ctrl_scroll_block_navigation(true, true, false, false, &ids, None, 0),
             Select(30)
         );
         assert_eq!(
-            ctrl_scroll_block_navigation(true, false, false, false, &ids, None),
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, None, 0),
             Passthrough
         );
         assert_eq!(
-            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(20)),
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(20), 1),
             Select(30)
         );
         // Selection edges are owned: Up clamps, Down exits selection mode.
         assert_eq!(
-            ctrl_scroll_block_navigation(true, true, false, false, &ids, Some(10)),
+            ctrl_scroll_block_navigation(true, true, false, false, &ids, Some(10), 1),
             Select(10)
         );
         assert_eq!(
-            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(30)),
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(30), 1),
             Clear
         );
         assert_eq!(
-            ctrl_scroll_block_navigation(true, true, false, false, &[], None),
+            ctrl_scroll_block_navigation(true, true, false, false, &[], None, 0),
             Passthrough
         );
         // Running/full-screen programs retain Ctrl+Up too.
         assert_eq!(
-            ctrl_scroll_block_navigation(true, true, false, true, &ids, None),
+            ctrl_scroll_block_navigation(true, true, false, true, &ids, None, 0),
             Passthrough
         );
         assert_eq!(
-            ctrl_scroll_block_navigation(true, true, true, false, &ids, None),
+            ctrl_scroll_block_navigation(true, true, true, false, &ids, None, 0),
             Passthrough
+        );
+        // A range at the newest edge contracts before a second step exits.
+        assert_eq!(
+            ctrl_scroll_block_navigation(true, false, false, false, &ids, Some(30), 3),
+            Select(30)
         );
     }
 
