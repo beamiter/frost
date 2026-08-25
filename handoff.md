@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (shared Agent durability baseline)
+Updated: 2026-08-25 (single-interpretation native JSON boundaries)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -11,12 +11,26 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- **Single-interpretation native JSON boundaries (2026-08-25)**: after their
+  existing raw byte ceilings, the private `auth.json` reader and every Codex
+  app-server JSONL record now run through
+  `jterm_core::bounded_json::validate_no_duplicate_members` before typed or
+  `Value` decoding. Duplicate object members are rejected recursively,
+  including escaped-equivalent names and duplicates inside ignored/future
+  extension objects. The private serde_json RawValue sentinel is also reserved,
+  so feature-unified `Value` decoding cannot reparse unchecked embedded JSON.
+  An app-server frame therefore cannot select one `id`,
+  `method`, or nested result for request correlation while another decoder or
+  audit surface sees a different value; credential parsing likewise has one
+  structural interpretation. The shared preflight retains no decoded value
+  tree and never reflects the untrusted member name in its error.
+
 - Frost range navigation now protects the newest edge: a newer step on a
   multi-block selection first contracts it to the active newest block, and only
   the following step clears selection with explicit feedback.
   This keeps one accidental keypress from destroying a reviewed range while
   preserving the established single-block exit hatch. The shared core exact
-  pin advances to `852d33d197d3a46becc76a3b85c13f981506a61c`, adding
+  pin advances to `21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d`, adding
   core-owned Agent claim durability and jagent's recursive duplicate-member
   rejection without changing the completed-block outcome/lifecycle contract.
 
@@ -287,8 +301,8 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   function are now direct public re-exports of the shared contract rather than
   local semantic mirrors; Frost's serializer adapters delegate to the shared
   stable snake-case vocabulary. `jterm_core` is pinned to
-  `852d33d197d3a46becc76a3b85c13f981506a61c` (transitively jagent
-  `2570e5e9324d1fb6823e731b53e7ea9a6033177a`). Claim-acquisition errors are
+  `21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d` (transitively jagent
+  `a462ec81f3a4c6ad85a455780ced232172f127ea`). Claim-acquisition errors are
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
 
