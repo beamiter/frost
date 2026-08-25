@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-24
+Updated: 2026-08-25 (shared Agent durability baseline)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -16,9 +16,9 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   the following step clears selection with explicit feedback.
   This keeps one accidental keypress from destroying a reviewed range while
   preserving the established single-block exit hatch. The shared core exact
-  pin advances to `0f47569eb7501d52abeee4130f1735b6ada7dfe0`, adding
-  current AI origin/credential validation without changing the completed-block
-  outcome/lifecycle contract.
+  pin advances to `852d33d197d3a46becc76a3b85c13f981506a61c`, adding
+  core-owned Agent claim durability and jagent's recursive duplicate-member
+  rejection without changing the completed-block outcome/lifecycle contract.
 
 - Block Search 2.0 adds `Aa` case-sensitive and bounded Rust-regex matching to
   the existing All/Failed/Slow/Bookmarked/Background picker. Invalid or
@@ -240,6 +240,8 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 - Agent restore now consumes `jterm_core::agent::SessionClaim`, backed by one
   atomic no-replace rename rather than the former local hard-link/unlink pair.
+  Core syncs retirement of the public name before exposing a live session, so
+  a crash cannot replay an already consumed approval.
   Exactly one concurrent opener restores a valid snapshot; malformed, future,
   oversized, and semantically invalid evidence remains byte-identical at its
   private claim path. An empty or rejected local session still leaves the
@@ -285,8 +287,8 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   function are now direct public re-exports of the shared contract rather than
   local semantic mirrors; Frost's serializer adapters delegate to the shared
   stable snake-case vocabulary. `jterm_core` is pinned to
-  `0f47569eb7501d52abeee4130f1735b6ada7dfe0` (transitively jagent
-  `fcb9768bb832547988056baa38b2d4239341b361`). Claim-acquisition errors are
+  `852d33d197d3a46becc76a3b85c13f981506a61c` (transitively jagent
+  `2570e5e9324d1fb6823e731b53e7ea9a6033177a`). Claim-acquisition errors are
   logged with the public path and leave that path untouched; there is no
   best-effort fallback read or delete.
 
