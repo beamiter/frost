@@ -160,7 +160,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 查找替换（选中文本） | `Ctrl+Alt+R`（替换结果进剪贴板或回填提示符，从不改写 scrollback） |
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
-| 搜索命令块 | `Ctrl+Alt+F`（命令与输出统一搜索；可筛选失败/慢命令/书签/Background；Enter 定位匹配输出行） |
+| 搜索命令块 | `Ctrl+Alt+F`（`All / Cmd / Out` 选择全部文本、仅命令或仅输出，`Ctrl+O` 循环；`Aa` / `.*` / `W` 组合大小写、正则和 Unicode 整词匹配；`Ctrl+I` / `Ctrl+R` / `Ctrl+W` 键盘切换；可筛选失败/慢命令/书签/Background；Enter 定位匹配输出行） |
 | 添加/移除块书签 | `Ctrl+Shift+B`（仅作用于当前选择；无选择时按键继续交给 PTY；前后书签导航为 `Ctrl+,` / `Ctrl+.`） |
 | Agent 修复 / 解释失败命令块 | `Ctrl+Alt+X` / `Ctrl+Alt+E`（作用于选中的或最新的失败块，需 OSC 133） |
 | 重试失败命令块 | `Ctrl+Alt+T`（cwd 一致时原样重放该块命令） |
@@ -216,7 +216,9 @@ Block Mode 关闭或进入 alternate screen 时会暂时绕过折叠视图，返
 `Ctrl+,` / `Ctrl+.` 会循环跳到上一个/下一个书签；已有块选区时
 `Ctrl+Shift+↑/↓` 定位到活动块顶部/底部，无选区时仍保留原提示符导航快捷键。
 
-块搜索支持 `All / Failed / Slow / Bookmarked / Background` 五种视图；空查询时可直接
+块搜索的 `All / Cmd / Out` 范围可限制全部文本、仅命令或仅输出，`Ctrl+O` 循环切换；
+范围过滤在 500 条命中上限之前完成，不会被另一类文本挤占结果预算。另支持
+`All / Failed / Slow / Bookmarked / Background` 五种元数据视图；空查询时可直接
 浏览筛选结果。面板完全可键盘操作：`Tab` / `Shift+Tab` 循环筛选视图，`Ctrl+I` 切换大小写
 敏感，`Ctrl+R` 切换 Rust 正则（与查找栏同一套约定），`↑/↓` 选择、`Enter` 定位、`Esc` 关闭；
 点击筛选按钮或 `Aa` / `.*` 后焦点会立即交还查询框，不会让输入框静默失焦。`Shift+Enter`

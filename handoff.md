@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (single-interpretation native JSON boundaries)
+Updated: 2026-08-26 (Block Search 3.1)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,18 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.1 (2026-08-26)**: the picker now exposes `All / Cmd / Out`
+  surface scopes with a `Ctrl+O` cycle. Scope is enforced inside the bounded
+  matcher before the 500-hit cap, including empty-query metadata browsing, so
+  excluded command/output text cannot consume the requested surface's budget.
+
+- **Block Search 3.0 (2026-08-26)**: the bounded per-open index now supports
+  Unicode whole-word matching alongside `Aa` and regex, with `Ctrl+W` parity
+  for keyboard users. Whole-word literal and regex scans validate boundaries
+  without allocating per line; case-insensitive whole-word literals use the
+  linear regex engine so rejected prefixes cannot turn a long log line into a
+  quadratic rescan. Query errors and stale-result activation gates are unchanged.
 
 - **Single-interpretation native JSON boundaries (2026-08-25)**: after their
   existing raw byte ceilings, the private `auth.json` reader and every Codex

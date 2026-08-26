@@ -948,6 +948,9 @@ struct BlockSearchState {
     /// settings. They survive index refreshes while the picker stays open.
     case_sensitive: bool,
     regex: bool,
+    whole_word: bool,
+    /// Command/output surface restriction. Applied before the 500-hit cap.
+    scope: block_mode::BlockSearchScope,
     /// Invalid/oversized queries leave the last valid hits and bounded index
     /// intact, but disable activation until the query compiles again.
     query_error: Option<String>,
@@ -2367,6 +2370,8 @@ enum Message {
     /// Toggle literal/regex matching controls without rebuilding the index.
     BlockSearchSetCaseSensitive(bool),
     BlockSearchSetRegex(bool),
+    BlockSearchSetWholeWord(bool),
+    BlockSearchSetScope(block_mode::BlockSearchScope),
     /// Cancel the block search picker overlay.
     BlockSearchClose,
     /// A bounded background cache build completed. Session + monotonic epoch
@@ -7244,15 +7249,29 @@ impl Frost {
                         capped = true;
                         break;
                     }
-                    let (line_text, is_output_line, line_no) = if let Some(command) = &zone.command
-                    {
-                        (command.as_str(), false, 0)
-                    } else if let Some(line) =
-                        zone.output.as_deref().and_then(|text| text.lines().next())
-                    {
-                        (line, true, 1)
-                    } else {
-                        ("Background output", false, 0)
+                    let display = match state.scope {
+                        block_mode::BlockSearchScope::All => {
+                            if let Some(command) = &zone.command {
+                                Some((command.as_str(), false, 0))
+                            } else if let Some(line) =
+                                zone.output.as_deref().and_then(|text| text.lines().next())
+                            {
+                                Some((line, true, 1))
+                            } else {
+                                Some(("Background output", false, 0))
+                            }
+                        }
+                        block_mode::BlockSearchScope::Command => {
+                            zone.command.as_deref().map(|command| (command, false, 0))
+                        }
+                        block_mode::BlockSearchScope::Output => zone
+                            .output
+                            .as_deref()
+                            .and_then(|text| text.lines().next())
+                            .map(|line| (line, true, 1)),
+                    };
+                    let Some((line_text, is_output_line, line_no)) = display else {
+                        continue;
                     };
                     let clip = |text: &str, cap: usize| {
                         if text.chars().count() <= cap {
@@ -7278,21 +7297,15 @@ impl Frost {
                 }
                 Ok(block_mode::BlockSearchResults { hits, capped })
             }
-            Ok(_) if filter == BlockSearchFilter::All => block_mode::search_blocks_with_options(
+            Ok(_) => block_mode::search_blocks_with_options_filtered_in_scope(
                 &state.cache,
                 &state.query,
                 block_mode::BlockSearchOptions {
                     case_sensitive: state.case_sensitive,
                     regex: state.regex,
+                    whole_word: state.whole_word,
                 },
-            ),
-            Ok(_) => block_mode::search_blocks_with_options_filtered(
-                &state.cache,
-                &state.query,
-                block_mode::BlockSearchOptions {
-                    case_sensitive: state.case_sensitive,
-                    regex: state.regex,
-                },
+                state.scope,
                 |zone_id| eligible.contains(&zone_id),
             ),
         };
@@ -7460,6 +7473,16 @@ impl Frost {
                     }
                     Some('i') => {
                         state.case_sensitive = !state.case_sensitive;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('w') => {
+                        state.whole_word = !state.whole_word;
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('o') => {
+                        state.scope = state.scope.cycled();
                         self.block_search_recompute();
                         return Some(self.block_search_snap_task());
                     }
@@ -12292,6 +12315,20 @@ impl Frost {
                 self.block_search_recompute();
                 return self.block_search_refocus_task();
             }
+            Message::BlockSearchSetWholeWord(whole_word) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.whole_word = whole_word;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
+            Message::BlockSearchSetScope(scope) => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.scope = scope;
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
             Message::BlockSearchAccept(hit) => {
                 let current = self.sessions.get(self.active).map(|session| {
                     (
@@ -13784,9 +13821,41 @@ impl Frost {
             } else {
                 button::secondary
             });
-        let query_line = row![text("⌕").size(16), query, case_toggle, regex_toggle]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
+        let whole_word_toggle = button(text("W").size(11))
+            .on_press(Message::BlockSearchSetWholeWord(!state.whole_word))
+            .padding([3, 7])
+            .style(if state.whole_word {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let query_line = row![
+            text("⌕").size(16),
+            query,
+            case_toggle,
+            regex_toggle,
+            whole_word_toggle
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        let scope_btn = |label: &str, scope: block_mode::BlockSearchScope| {
+            button(text(label.to_string()).size(11))
+                .on_press(Message::BlockSearchSetScope(scope))
+                .padding([3, 7])
+                .style(if state.scope == scope {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+        };
+        let scopes = row![
+            text("Scope").size(11),
+            scope_btn("All", block_mode::BlockSearchScope::All),
+            scope_btn("Cmd", block_mode::BlockSearchScope::Command),
+            scope_btn("Out", block_mode::BlockSearchScope::Output),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
         let filter_btn = |label: &str, filter: BlockSearchFilter| {
             button(text(label.to_string()).size(11))
                 .on_press(Message::BlockSearchSetFilter(filter))
@@ -13810,7 +13879,7 @@ impl Frost {
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center);
-        let filters = column![filters_top, filters_bottom].spacing(4);
+        let filters = column![scopes, filters_top, filters_bottom].spacing(4);
 
         // Outcome/duration for each hit's block, resolved once instead of
         // rescanning the zone deque per drawn row.
@@ -13967,7 +14036,7 @@ impl Frost {
         // toggles above are otherwise reachable only with the mouse.
         body = body.push(
             text(
-                "Tab filter · Ctrl+I case · Ctrl+R regex · ↑↓ select · Enter reveal · \
+                "Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · ↑↓ select · Enter reveal · \
                  Shift+Enter step · Esc close",
             )
             .size(11)
@@ -21988,6 +22057,8 @@ mod tests {
             query: "needle".to_string(),
             case_sensitive: true,
             regex: true,
+            whole_word: true,
+            scope: block_mode::BlockSearchScope::Output,
             filter: BlockSearchFilter::Failed,
             query_error: Some("old".to_string()),
             ..BlockSearchState::default()
@@ -22003,7 +22074,8 @@ mod tests {
         // it is released.
         assert_eq!(state.cache.capacity(), 0);
         assert_eq!(state.query, "needle");
-        assert!(state.case_sensitive && state.regex);
+        assert!(state.case_sensitive && state.regex && state.whole_word);
+        assert_eq!(state.scope, block_mode::BlockSearchScope::Output);
         assert_eq!(state.filter, BlockSearchFilter::Failed);
         assert!(state.query_error.is_none());
         // The previous hits stay so an open picker is not blanked by a block
