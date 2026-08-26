@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.3)
+Updated: 2026-08-26 (Block Search 3.9)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,21 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.9 (2026-08-26)**: the picker now exposes a fully labelled
+  **Refresh** button with an explanatory tooltip; clicking it and pressing bare
+  `F5` share the same bounded rebuild path. The currently configured
+  `block:search` chord wins if remapped onto F5; other modified F5 chords remain
+  inert under the input-owning overlay. Iced key-repeat events are rejected, so
+  one physical F5 press starts at most one refresh; button refresh remains
+  repeatable and returns focus to the query. Invalid-query refreshes fail fast
+  without hiding their diagnostic or starting a worker, and repeated requests
+  while a worker is busy coalesce into at most one follow-up build. If the
+  current intent becomes invalid or an unfiltered empty query before the first
+  worker lands, its now-useless follow-up is cancelled; real finalized-zone
+  version churn still takes priority and rebuilds the latest snapshot. A
+  repeated edge from the physical toggle chord that opened the picker is now
+  consumed without closing it; a fresh non-repeat chord still closes normally.
 
 - **Block Search 3.3 (2026-08-26)**: Enter and Shift+Enter now close or
   advance only after the selected zone is revalidated and actually revealed.

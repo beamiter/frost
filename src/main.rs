@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use config::Config;
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, row, scrollable, slider, stack,
-    text, text_input, Space,
+    text, text_input, tooltip, Space,
 };
 use iced::{keyboard, Color, Element, Length, Size, Subscription, Task};
 use pty::{Pty, ReaderPoll};
@@ -103,6 +103,50 @@ fn captured_key_is_overlay_escape(event: &keyboard::Event) -> bool {
             ..
         }
     )
+}
+
+/// The Block Search refresh shortcut is deliberately the unmodified F5 key.
+/// Modified or auto-repeated function-key events remain ordinary overlay-owned
+/// no-ops instead of silently forcing a potentially expensive index rebuild.
+fn block_search_manual_refresh_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+) -> bool {
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::F5))
+        && !repeat
+        && !modifiers.shift()
+        && !modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchToggleKeyRoute {
+    NotToggle,
+    Close,
+    SuppressRepeat,
+}
+
+/// Route the configurable picker toggle while the picker already owns input.
+/// The non-repeated press is an intentional close; an auto-repeat from the
+/// physical press that opened the picker is consumed without flashing it shut.
+fn block_search_toggle_key_route(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    bindings: &keybindings::KeyBindings,
+) -> BlockSearchToggleKeyRoute {
+    let is_toggle = key_to_binding_string(key, modifiers)
+        .and_then(|binding| bindings.get_command(&binding))
+        == Some(keybindings::Command::BlockSearch);
+    if !is_toggle {
+        BlockSearchToggleKeyRoute::NotToggle
+    } else if repeat {
+        BlockSearchToggleKeyRoute::SuppressRepeat
+    } else {
+        BlockSearchToggleKeyRoute::Close
+    }
 }
 
 fn block_selection_owns_keys(
@@ -1092,6 +1136,12 @@ impl BlockSearchState {
     }
 
     fn request_manual_refresh(&mut self) -> bool {
+        // Preserve the visible diagnostic and the last valid result set. The
+        // same invalid expression would only fail again after rebuilding the
+        // multi-megabyte cache, so an explicit refresh is a bounded no-op.
+        if self.query_error.is_some() {
+            return false;
+        }
         if self.loading {
             self.manual_refresh_pending = true;
             false
@@ -1099,6 +1149,34 @@ impl BlockSearchState {
             self.manual_refresh_pending = false;
             true
         }
+    }
+
+    /// Consume one coalesced request after the current worker has produced a
+    /// version-current cache. A changed finalized-zone version is handled
+    /// before this decision and always rebuilds; here a second manual snapshot
+    /// is useful only when the current intent can actually inspect an index.
+    fn take_manual_refresh_followup(&mut self) -> bool {
+        if !std::mem::take(&mut self.manual_refresh_pending) {
+            return false;
+        }
+        let Ok(query) = block_mode::validated_block_search_query(&self.query) else {
+            return false;
+        };
+        if query.is_empty() && self.filter == BlockSearchFilter::All {
+            return false;
+        }
+        block_mode::search_blocks_with_options_filtered_in_scope(
+            &[],
+            &self.query,
+            block_mode::BlockSearchOptions {
+                case_sensitive: self.case_sensitive,
+                regex: self.regex,
+                whole_word: self.whole_word,
+            },
+            self.scope,
+            |_| true,
+        )
+        .is_ok()
     }
 
     fn reset_intent(&mut self) {
@@ -2540,6 +2618,8 @@ enum Message {
     BlockSearchSetRegex(bool),
     BlockSearchSetWholeWord(bool),
     BlockSearchSetScope(block_mode::BlockSearchScope),
+    /// Force a fresh bounded block index while preserving matching intent.
+    BlockSearchRefresh,
     /// Cancel the block search picker overlay.
     BlockSearchClose,
     /// A bounded background cache build completed. Session + monotonic epoch
@@ -7574,6 +7654,7 @@ impl Frost {
         key: &keyboard::Key,
         mods: keyboard::Modifiers,
         text: Option<&str>,
+        repeat: bool,
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
@@ -7589,15 +7670,17 @@ impl Frost {
             self.close_block_search();
             return None;
         }
-        // The (configurable) toggle chord closes the picker from inside.
-        if key_to_binding_string(key, mods)
-            .and_then(|binding| self.keybindings.get_command(&binding))
-            == Some(keybindings::Command::BlockSearch)
-        {
-            self.close_block_search();
-            return Some(Task::none());
+        // A fresh configurable toggle chord closes from inside; key repeat
+        // from the press that opened the picker is owned but cannot close it.
+        match block_search_toggle_key_route(key, mods, repeat, &self.keybindings) {
+            BlockSearchToggleKeyRoute::Close => {
+                self.close_block_search();
+                return Some(Task::none());
+            }
+            BlockSearchToggleKeyRoute::SuppressRepeat => return Some(Task::none()),
+            BlockSearchToggleKeyRoute::NotToggle => {}
         }
-        if matches!(key, Key::Named(Named::F5)) {
+        if block_search_manual_refresh_key(key, mods, repeat) {
             return Some(self.force_block_search_rebuild());
         }
         let state = self.block_search.as_mut()?;
@@ -10817,6 +10900,7 @@ impl Frost {
                     location,
                     modifiers,
                     text,
+                    repeat,
                     ..
                 } = event
                 {
@@ -10936,7 +11020,7 @@ impl Frost {
                     // never do that.
                     if self.block_search.is_some() {
                         if let Some(task) =
-                            self.handle_block_search_key(&key, modifiers, text.as_deref())
+                            self.handle_block_search_key(&key, modifiers, text.as_deref(), repeat)
                         {
                             return task;
                         }
@@ -12469,6 +12553,13 @@ impl Frost {
                 }
             }
             Message::HistoryPickerClose => self.history_picker = None,
+            Message::BlockSearchRefresh => {
+                let rebuild = self.force_block_search_rebuild();
+                return Task::batch([
+                    rebuild,
+                    iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone()),
+                ]);
+            }
             Message::BlockSearchClose => self.close_block_search(),
             Message::BlockSearchCacheBuilt(identity, result) => {
                 let accepts = self
@@ -12498,8 +12589,8 @@ impl Frost {
                 }
                 if self
                     .block_search
-                    .as_ref()
-                    .is_some_and(|state| state.manual_refresh_pending)
+                    .as_mut()
+                    .is_some_and(BlockSearchState::take_manual_refresh_followup)
                 {
                     if let Some(state) = self.block_search.as_mut() {
                         state.loading = false;
@@ -14092,16 +14183,26 @@ impl Frost {
             .on_press(Message::BlockSearchReset)
             .padding([3, 7])
             .style(button::secondary);
-        let query_line = row![
-            text("⌕").size(16),
-            query,
-            case_toggle,
-            regex_toggle,
-            whole_word_toggle,
-            reset
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
+        let refresh = tooltip(
+            button(text("Refresh").size(11))
+                .on_press(Message::BlockSearchRefresh)
+                .padding([3, 7])
+                .style(button::secondary),
+            container(text("Rebuild the index from the latest completed blocks (F5)").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        // Keep the input useful at the 280 px panel minimum. The panel has
+        // 24 px horizontal padding, leaving roughly 256 px for content; the
+        // compact matching/actions row fits that width without squeezing the
+        // query down to a token-sized field.
+        let query_line = row![text("⌕").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+        let matching_actions = row![case_toggle, regex_toggle, whole_word_toggle, refresh, reset]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
         let scope_btn = |label: &str, scope: block_mode::BlockSearchScope| {
             button(text(label.to_string()).size(11))
                 .on_press(Message::BlockSearchSetScope(scope))
@@ -14177,7 +14278,7 @@ impl Frost {
         // visible; EVERY hit is drawn inside it (ember renders the full hit
         // list in a scroll area) and keyboard navigation wraps across all of
         // them, `block_search_snap_task` keeping the highlight in view.
-        let mut body = column![query_line, filters].spacing(8);
+        let mut body = column![query_line, matching_actions, filters].spacing(8);
         if state.loading && state.hits.is_empty() {
             body = body.push(text("Indexing blocks…").size(13).style(text::secondary));
         } else if let Some(error) = &state.query_error {
@@ -22366,7 +22467,25 @@ mod tests {
             state.take_refresh_selection_anchor().is_none(),
             "an intent edit during the worker build must restart at the top"
         );
+    }
 
+    #[test]
+    fn block_search_manual_refresh_fails_fast_on_errors_and_coalesces_while_busy() {
+        let mut state = BlockSearchState {
+            query: "[".to_string(),
+            query_error: Some("invalid regex".to_string()),
+            hits: vec![block_search_hit(7)],
+            selected: 0,
+            ..BlockSearchState::default()
+        };
+
+        assert!(!state.request_manual_refresh());
+        assert!(!state.loading);
+        assert!(!state.manual_refresh_pending);
+        assert_eq!(state.query_error.as_deref(), Some("invalid regex"));
+        assert_eq!(state.hits, vec![block_search_hit(7)]);
+
+        state.query_error = None;
         state.loading = true;
         assert!(!state.request_manual_refresh());
         assert!(state.manual_refresh_pending);
@@ -22374,6 +22493,116 @@ mod tests {
         state.loading = false;
         assert!(state.request_manual_refresh());
         assert!(!state.manual_refresh_pending);
+    }
+
+    #[test]
+    fn block_search_busy_followup_skips_invalid_or_empty_unfiltered_intent() {
+        let mut state = BlockSearchState {
+            manual_refresh_pending: true,
+            query: "needle".to_string(),
+            ..BlockSearchState::default()
+        };
+        assert!(state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        state.manual_refresh_pending = true;
+        state.query.clear();
+        state.filter = BlockSearchFilter::All;
+        assert!(!state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        // Empty-query metadata browsing still consumes the cache, so a
+        // coalesced request remains meaningful for every non-All filter.
+        state.manual_refresh_pending = true;
+        state.filter = BlockSearchFilter::Failed;
+        assert!(state.take_manual_refresh_followup());
+
+        state.manual_refresh_pending = true;
+        state.query = "[".to_string();
+        state.regex = true;
+        assert!(!state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        state.manual_refresh_pending = true;
+        state.query = "x".repeat(block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
+        assert!(!state.take_manual_refresh_followup());
+        assert!(!state.manual_refresh_pending);
+
+        state.query = "valid".to_string();
+        state.regex = false;
+        assert!(!state.take_manual_refresh_followup(), "no pending request");
+    }
+
+    #[test]
+    fn block_search_manual_refresh_key_accepts_only_bare_f5() {
+        let f5 = keyboard::Key::Named(Named::F5);
+        let flags = [
+            keyboard::Modifiers::SHIFT,
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ];
+
+        for repeat in [false, true] {
+            for mask in 0u8..(1 << flags.len()) {
+                let modifiers = flags
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .fold(keyboard::Modifiers::NONE, |mods, (_, flag)| mods | *flag);
+                assert_eq!(
+                    block_search_manual_refresh_key(&f5, modifiers, repeat),
+                    mask == 0 && !repeat,
+                    "unexpected F5 decision for modifiers {modifiers:?}, repeat={repeat}",
+                );
+            }
+        }
+
+        assert!(!block_search_manual_refresh_key(
+            &keyboard::Key::Named(Named::F6),
+            keyboard::Modifiers::NONE,
+            false,
+        ));
+    }
+
+    #[test]
+    fn block_search_toggle_repeat_is_consumed_without_closing_the_picker() {
+        let bindings = keybindings::KeyBindings::default_bindings();
+        let key = keyboard::Key::Character("f".into());
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        assert_eq!(
+            block_search_toggle_key_route(&key, modifiers, false, &bindings),
+            BlockSearchToggleKeyRoute::Close
+        );
+        assert_eq!(
+            block_search_toggle_key_route(&key, modifiers, true, &bindings),
+            BlockSearchToggleKeyRoute::SuppressRepeat
+        );
+        assert_eq!(
+            block_search_toggle_key_route(
+                &keyboard::Key::Named(Named::F5),
+                keyboard::Modifiers::NONE,
+                true,
+                &bindings,
+            ),
+            BlockSearchToggleKeyRoute::NotToggle
+        );
+
+        let mut custom = keybindings::KeyBindings::new();
+        custom
+            .bindings
+            .insert("ctrl+shift+g".to_string(), "block:search".to_string());
+        let custom_modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        assert_eq!(
+            block_search_toggle_key_route(
+                &keyboard::Key::Character("g".into()),
+                custom_modifiers,
+                true,
+                &custom,
+            ),
+            BlockSearchToggleKeyRoute::SuppressRepeat,
+            "runtime-remapped toggle chords need the same repeat guard"
+        );
     }
 
     #[test]
