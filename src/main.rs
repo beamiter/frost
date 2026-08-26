@@ -1030,6 +1030,17 @@ struct BlockSearchState {
 }
 
 impl BlockSearchState {
+    fn reset_intent(&mut self) {
+        self.query.clear();
+        self.case_sensitive = false;
+        self.regex = false;
+        self.whole_word = false;
+        self.scope = block_mode::BlockSearchScope::default();
+        self.filter = BlockSearchFilter::default();
+        self.query_error = None;
+        self.selected = 0;
+    }
+
     fn accepts_build(&self, identity: BlockSearchBuildIdentity) -> bool {
         self.session_id == identity.session_id && self.epoch == identity.epoch
     }
@@ -2448,6 +2459,8 @@ enum Message {
     HistoryPickerAccept(String),
     /// Query text changed in the block search picker.
     BlockSearchInput(String),
+    /// Reset query, matching controls, scope, and metadata filter to defaults.
+    BlockSearchReset,
     /// Restrict cross-block search/browse by block metadata.
     BlockSearchSetFilter(BlockSearchFilter),
     /// Toggle literal/regex matching controls without rebuilding the index.
@@ -7603,7 +7616,11 @@ impl Frost {
                         return Some(self.block_search_snap_task());
                     }
                     Some('u') => {
-                        state.query.clear();
+                        if mods.shift() {
+                            state.reset_intent();
+                        } else {
+                            state.query.clear();
+                        }
                         self.block_search_recompute();
                         return Some(self.block_search_snap_task());
                     }
@@ -12418,6 +12435,13 @@ impl Frost {
                 // bring the list back to the top with it.
                 return self.block_search_snap_task();
             }
+            Message::BlockSearchReset => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.reset_intent();
+                }
+                self.block_search_recompute();
+                return self.block_search_refocus_task();
+            }
             Message::BlockSearchSetFilter(filter) => {
                 if let Some(state) = self.block_search.as_mut() {
                     state.filter = filter;
@@ -13954,12 +13978,17 @@ impl Frost {
             } else {
                 button::secondary
             });
+        let reset = button(text("Reset").size(11))
+            .on_press(Message::BlockSearchReset)
+            .padding([3, 7])
+            .style(button::secondary);
         let query_line = row![
             text("⌕").size(16),
             query,
             case_toggle,
             regex_toggle,
-            whole_word_toggle
+            whole_word_toggle,
+            reset
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
@@ -14162,7 +14191,7 @@ impl Frost {
         body = body.push(
             text(
                 "Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · ↑↓ select · Enter reveal · \
-                 Shift+Enter step · Esc close",
+                 Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close",
             )
             .size(11)
             .wrapping(text::Wrapping::Word)
@@ -22149,6 +22178,30 @@ mod tests {
         assert!(memory.case_sensitive);
         assert_eq!(memory.scope, block_mode::BlockSearchScope::Command);
         assert_eq!(memory.filter, BlockSearchFilter::Failed);
+    }
+
+    #[test]
+    fn block_search_reset_returns_every_intent_control_to_default() {
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: block_mode::BlockSearchScope::Output,
+            filter: BlockSearchFilter::Bookmarked,
+            query_error: Some("old".to_string()),
+            selected: 9,
+            hits: vec![block_search_hit(42)],
+            ..BlockSearchState::default()
+        };
+        state.reset_intent();
+        assert!(state.query.is_empty());
+        assert!(!state.case_sensitive && !state.regex && !state.whole_word);
+        assert_eq!(state.scope, block_mode::BlockSearchScope::All);
+        assert_eq!(state.filter, BlockSearchFilter::All);
+        assert!(state.query_error.is_none());
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.hits.len(), 1, "recompute owns result replacement");
     }
 
     #[test]
