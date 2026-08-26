@@ -1060,6 +1060,8 @@ struct BlockSearchState {
     /// restoration when the asynchronous cache result lands: edits made while
     /// loading are a new intent and must start at the first result.
     refresh_intent: Option<BlockSearchIntent>,
+    /// One coalesced F5 request made while the cache worker was already busy.
+    manual_refresh_pending: bool,
 }
 
 impl BlockSearchState {
@@ -1087,6 +1089,16 @@ impl BlockSearchState {
                     })
             })
             .flatten()
+    }
+
+    fn request_manual_refresh(&mut self) -> bool {
+        if self.loading {
+            self.manual_refresh_pending = true;
+            false
+        } else {
+            self.manual_refresh_pending = false;
+            true
+        }
     }
 
     fn reset_intent(&mut self) {
@@ -7307,6 +7319,7 @@ impl Frost {
         if let Some(state) = self.block_search.as_mut() {
             state.epoch = epoch;
             state.loading = true;
+            state.manual_refresh_pending = false;
             state.zone_version = version;
             if state.refresh_intent.is_none() {
                 state.refresh_intent = Some(state.intent());
@@ -7338,6 +7351,20 @@ impl Frost {
             },
             move |result| Message::BlockSearchCacheBuilt(identity, result),
         )
+    }
+
+    /// Force a rebuild even when finalized-zone identity is unchanged.
+    /// Repeated F5 presses while a worker runs coalesce into one follow-up.
+    fn force_block_search_rebuild(&mut self) -> Task<Message> {
+        let should_start = self
+            .block_search
+            .as_mut()
+            .is_some_and(BlockSearchState::request_manual_refresh);
+        if should_start {
+            self.begin_block_search_rebuild()
+        } else {
+            Task::none()
+        }
     }
 
     /// Close the block search picker because the session landscape changed
@@ -7569,6 +7596,9 @@ impl Frost {
         {
             self.close_block_search();
             return Some(Task::none());
+        }
+        if matches!(key, Key::Named(Named::F5)) {
+            return Some(self.force_block_search_rebuild());
         }
         let state = self.block_search.as_mut()?;
         match key {
@@ -12466,6 +12496,20 @@ impl Frost {
                     drop(result);
                     return self.begin_block_search_rebuild();
                 }
+                if self
+                    .block_search
+                    .as_ref()
+                    .is_some_and(|state| state.manual_refresh_pending)
+                {
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.loading = false;
+                    }
+                    // F5 was pressed after this source snapshot began. Drop
+                    // the older generation before taking exactly one fresh
+                    // snapshot; begin_block_search_rebuild clears the flag.
+                    drop(result);
+                    return self.begin_block_search_rebuild();
+                }
                 match result {
                     Ok(build) => {
                         if let Some(state) = self.block_search.as_mut() {
@@ -14256,7 +14300,7 @@ impl Frost {
         // toggles above are otherwise reachable only with the mouse.
         body = body.push(
             text(
-                "Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · ↑↓ select · Enter reveal · \
+                "F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · ↑↓ select · Enter reveal · \
                  Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close",
             )
             .size(11)
@@ -22322,6 +22366,14 @@ mod tests {
             state.take_refresh_selection_anchor().is_none(),
             "an intent edit during the worker build must restart at the top"
         );
+
+        state.loading = true;
+        assert!(!state.request_manual_refresh());
+        assert!(state.manual_refresh_pending);
+        assert!(!state.request_manual_refresh(), "repeat F5 stays coalesced");
+        state.loading = false;
+        assert!(state.request_manual_refresh());
+        assert!(!state.manual_refresh_pending);
     }
 
     #[test]
