@@ -220,7 +220,8 @@ Block Mode 关闭或进入 alternate screen 时会暂时绕过折叠视图，返
 范围过滤在 500 条命中上限之前完成，不会被另一类文本挤占结果预算。另支持
 `All / Failed / Slow / Bookmarked / Background` 五种元数据视图；空查询时可直接
 浏览筛选结果。面板完全可键盘操作：`Tab` / `Shift+Tab` 循环筛选视图，`Ctrl+I` 切换大小写
-敏感，`Ctrl+R` 切换 Rust 正则（与查找栏同一套约定），`↑/↓` 选择、`Enter` 定位、`Esc` 关闭；
+敏感，`Ctrl+R` 切换 Rust 正则（与查找栏同一套约定），`↑/↓` 循环选择，`Home/End` 跳到
+首尾，`PageUp/PageDown` 每次移动十条，`Enter` 定位、`Esc` 关闭；
 点击筛选按钮或 `Aa` / `.*` 后焦点会立即交还查询框，不会让输入框静默失焦。`Shift+Enter`
 就地跳到下一个命中而**不关闭面板**，因此顺着一条查询逐个查看结果不必反复重开面板重打查询；
 `Enter` 仍是"定位并关闭"。结果行显示所属

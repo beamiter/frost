@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.1)
+Updated: 2026-08-26 (Block Search 3.2)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,11 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.2 (2026-08-26)**: Home/End and ten-row PageUp/PageDown
+  navigation now complement the existing wrapping arrows and position label.
+  Every move keeps the selected virtual window visible, and stale out-of-range
+  selection state is clamped before navigation rather than producing a bad row.
 
 - **Block Search 3.1 (2026-08-26)**: the picker now exposes `All / Cmd / Out`
   surface scopes with a `Ctrl+O` cycle. Scope is enforced inside the bounded

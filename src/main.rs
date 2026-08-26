@@ -587,6 +587,7 @@ static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
 /// the panel's visible area so the wheel and drag scrollbar still work inside
 /// the page; the page only shifts when the highlight leaves it.
 const BLOCK_SEARCH_VISIBLE_ROWS: usize = 48;
+const BLOCK_SEARCH_PAGE_STEP: usize = 10;
 
 static BLOCK_SEARCH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-block-search-input"));
@@ -1008,18 +1009,39 @@ impl BlockSearchState {
         self.selected = if len == 0 {
             0
         } else {
-            (self.selected + 1) % len
+            (self.selected.min(len - 1) + 1) % len
         };
     }
 
     fn select_prev(&mut self) {
         let len = self.hits.len();
-        self.selected = if len == 0 {
-            0
-        } else if self.selected == 0 {
-            len - 1
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(len - 1);
+        self.selected = if current == 0 { len - 1 } else { current - 1 };
+    }
+
+    fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    fn select_last(&mut self) {
+        self.selected = self.hits.len().saturating_sub(1);
+    }
+
+    fn select_page(&mut self, forward: bool) {
+        let len = self.hits.len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(len - 1);
+        self.selected = if forward {
+            current.saturating_add(BLOCK_SEARCH_PAGE_STEP).min(len - 1)
         } else {
-            self.selected - 1
+            current.saturating_sub(BLOCK_SEARCH_PAGE_STEP)
         };
     }
 
@@ -7447,6 +7469,22 @@ impl Frost {
             }
             Key::Named(Named::ArrowUp) => {
                 state.select_prev();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::Home) => {
+                state.select_first();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::End) => {
+                state.select_last();
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::PageUp) => {
+                state.select_page(false);
+                return Some(self.block_search_snap_task());
+            }
+            Key::Named(Named::PageDown) => {
+                state.select_page(true);
                 return Some(self.block_search_snap_task());
             }
             Key::Named(Named::Backspace) => {
@@ -22212,10 +22250,30 @@ mod tests {
             state.select_next();
         }
         assert_eq!(state.selected, 39);
+        state.select_first();
+        assert_eq!(state.selected, 0);
+        state.select_page(true);
+        assert_eq!(state.selected, 10);
+        state.select_page(true);
+        assert_eq!(state.selected, 20);
+        state.select_page(false);
+        assert_eq!(state.selected, 10);
+        state.select_last();
+        assert_eq!(state.selected, 39);
+        state.select_page(true);
+        assert_eq!(state.selected, 39, "page-down clamps at the final hit");
+        state.selected = usize::MAX;
+        state.select_prev();
+        assert_eq!(
+            state.selected, 38,
+            "stale selection is clamped before moving"
+        );
         // Empty hits pin the selection at 0 in both directions.
         let mut empty = BlockSearchState::default();
         empty.select_next();
         empty.select_prev();
+        empty.select_last();
+        empty.select_page(true);
         assert_eq!(empty.selected, 0);
     }
 
