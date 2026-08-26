@@ -128,6 +128,68 @@ enum BlockSearchToggleKeyRoute {
     SuppressRepeat,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchBookmarkKeyRoute {
+    NotBookmark,
+    Toggle,
+    SuppressRepeat,
+}
+
+fn block_search_is_bookmark_key(key: &keyboard::Key) -> bool {
+    matches!(
+        key,
+        keyboard::Key::Character(character) if character.eq_ignore_ascii_case("b")
+    )
+}
+
+/// The in-picker bookmark shortcut is deliberately exact. The configurable
+/// picker-toggle chord is routed first, so a user mapping that collides with
+/// Ctrl+Shift+B still closes the picker instead of mutating a bookmark.
+fn block_search_bookmark_key_route(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    held: &mut bool,
+    claimed: &mut bool,
+) -> BlockSearchBookmarkKeyRoute {
+    if !block_search_is_bookmark_key(key) {
+        return BlockSearchBookmarkKeyRoute::NotBookmark;
+    }
+    // Freeze the first physical press's route. An exact action stays consumed
+    // through modifier release; an ineligible/plain B stays ordinary input
+    // even if its modifiers later become the exact chord.
+    if *held {
+        return if *claimed {
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        } else {
+            BlockSearchBookmarkKeyRoute::NotBookmark
+        };
+    }
+    let exact_modifiers = modifiers == (keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT);
+    *held = true;
+    *claimed = exact_modifiers;
+    if exact_modifiers && !repeat {
+        BlockSearchBookmarkKeyRoute::Toggle
+    } else if exact_modifiers {
+        BlockSearchBookmarkKeyRoute::SuppressRepeat
+    } else {
+        BlockSearchBookmarkKeyRoute::NotBookmark
+    }
+}
+
+fn block_search_bookmark_key_release(
+    key: &keyboard::Key,
+    held: &mut bool,
+    claimed: &mut bool,
+) -> bool {
+    if !block_search_is_bookmark_key(key) {
+        return false;
+    }
+    *held = false;
+    *claimed = false;
+    true
+}
+
 /// Route the configurable picker toggle while the picker already owns input.
 /// The non-repeated press is an intentional close; an auto-repeat from the
 /// physical press that opened the picker is consumed without flashing it shut.
@@ -1021,6 +1083,35 @@ struct BlockSearchSelectionAnchor {
     index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchBookmarkPlan {
+    Toggle(u64),
+    Busy,
+    NoSelection,
+    RejectStale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchBookmarkNotice {
+    Bookmarked,
+    Removed,
+    Busy,
+    NoSelection,
+    Stale,
+}
+
+impl BlockSearchBookmarkNotice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bookmarked => "Bookmarked block ★",
+            Self::Removed => "Removed block bookmark ☆",
+            Self::Busy => "Bookmarks are disabled while the index refreshes",
+            Self::NoSelection => "No search result selected",
+            Self::Stale => "Search result is no longer available",
+        }
+    }
+}
+
 fn block_search_refresh_selection_index(
     hits: &[block_mode::BlockSearchHit],
     anchor: Option<&BlockSearchSelectionAnchor>,
@@ -1106,6 +1197,15 @@ struct BlockSearchState {
     refresh_intent: Option<BlockSearchIntent>,
     /// One coalesced F5 request made while the cache worker was already busy.
     manual_refresh_pending: bool,
+    /// Short picker-local feedback for star clicks and Ctrl+Shift+B. Toasts
+    /// can sit behind the modal, so the result is also reported in its footer.
+    bookmark_notice: Option<BlockSearchBookmarkNotice>,
+    /// Physical-B latch. The first edge freezes whether this press belongs to
+    /// Ctrl+Shift+B until B itself is released.
+    bookmark_key_held: bool,
+    /// Whether the first press in the current physical-B lifetime was the
+    /// exact picker bookmark chord. Later modifier changes cannot alter it.
+    bookmark_key_claimed: bool,
 }
 
 impl BlockSearchState {
@@ -1191,6 +1291,14 @@ impl BlockSearchState {
         self.refresh_intent = None;
     }
 
+    fn apply_query_input(&mut self, query: String) -> bool {
+        if self.bookmark_key_claimed {
+            return false;
+        }
+        self.query = block_mode::bounded_block_search_query(query);
+        true
+    }
+
     fn accepts_build(&self, identity: BlockSearchBuildIdentity) -> bool {
         self.session_id == identity.session_id && self.epoch == identity.epoch
     }
@@ -1206,6 +1314,24 @@ impl BlockSearchState {
             && self.session_id == session_id
             && self.zone_version == zone_version
             && self.hits.iter().any(|current| current == hit)
+    }
+
+    fn bookmark_plan(
+        &self,
+        requested: Option<&block_mode::BlockSearchHit>,
+        session_id: usize,
+        zone_version: BlockSearchZoneVersion,
+    ) -> BlockSearchBookmarkPlan {
+        if self.loading {
+            return BlockSearchBookmarkPlan::Busy;
+        }
+        let Some(hit) = requested else {
+            return BlockSearchBookmarkPlan::NoSelection;
+        };
+        if !self.accepts_hit(hit, session_id, zone_version) {
+            return BlockSearchBookmarkPlan::RejectStale;
+        }
+        BlockSearchBookmarkPlan::Toggle(hit.zone_id)
     }
 
     fn release_index_for_rebuild(&mut self) {
@@ -2630,6 +2756,9 @@ enum Message {
     ),
     /// Select and reveal the clicked hit's zone (and close the picker).
     BlockSearchAccept(block_mode::BlockSearchHit),
+    /// Toggle one result's block bookmark without selecting/revealing it or
+    /// closing the picker.
+    BlockSearchToggleBookmark(block_mode::BlockSearchHit),
     /// An Escape press a focused overlay text input consumed for itself.
     /// Carries the original event so the ordinary key path can re-handle it.
     OverlayEscape(keyboard::Event),
@@ -7471,9 +7600,20 @@ impl Frost {
     /// Never re-extracts terminal output; while a worker is loading, edits are
     /// retained and the matching completed build performs the recompute.
     fn block_search_recompute(&mut self) {
-        let Some(open) = self.block_search.as_ref() else {
+        self.block_search_recompute_with_anchor(None);
+    }
+
+    /// Recompute while optionally preserving an explicit result/rank anchor.
+    /// Bookmark removal uses this to let a Bookmarked row remove every hit for
+    /// its zone while keeping the highlight at the closest surviving rank.
+    fn block_search_recompute_with_anchor(
+        &mut self,
+        selection_anchor: Option<BlockSearchSelectionAnchor>,
+    ) {
+        let Some(open) = self.block_search.as_mut() else {
             return;
         };
+        open.bookmark_notice = None;
         if open.loading {
             return;
         }
@@ -7508,7 +7648,7 @@ impl Frost {
         let Some(state) = self.block_search.as_mut() else {
             return;
         };
-        let selection_anchor = state.take_refresh_selection_anchor();
+        let selection_anchor = selection_anchor.or_else(|| state.take_refresh_selection_anchor());
         let results = match block_mode::validated_block_search_query(&state.query) {
             Err(error) => Err(error),
             Ok(validated) if validated.is_empty() && filter != BlockSearchFilter::All => {
@@ -7520,55 +7660,14 @@ impl Frost {
                     .rev()
                     .filter(|zone| eligible.contains(&zone.zone_id))
                 {
+                    let Some(hit) = block_mode::metadata_block_search_hit(zone, state.scope) else {
+                        continue;
+                    };
                     if hits.len() >= block_mode::BLOCK_SEARCH_HIT_CAP {
                         capped = true;
                         break;
                     }
-                    let display = match state.scope {
-                        block_mode::BlockSearchScope::All => {
-                            if let Some(command) = &zone.command {
-                                Some((command.as_str(), false, 0))
-                            } else if let Some(line) =
-                                zone.output.as_deref().and_then(|text| text.lines().next())
-                            {
-                                Some((line, true, 1))
-                            } else {
-                                Some(("Background output", false, 0))
-                            }
-                        }
-                        block_mode::BlockSearchScope::Command => {
-                            zone.command.as_deref().map(|command| (command, false, 0))
-                        }
-                        block_mode::BlockSearchScope::Output => zone
-                            .output
-                            .as_deref()
-                            .and_then(|text| text.lines().next())
-                            .map(|line| (line, true, 1)),
-                    };
-                    let Some((line_text, is_output_line, line_no)) = display else {
-                        continue;
-                    };
-                    let clip = |text: &str, cap: usize| {
-                        if text.chars().count() <= cap {
-                            text.to_string()
-                        } else {
-                            let mut clipped: String =
-                                text.chars().take(cap.saturating_sub(1)).collect();
-                            clipped.push('…');
-                            clipped
-                        }
-                    };
-                    hits.push(block_mode::BlockSearchHit {
-                        zone_id: zone.zone_id,
-                        is_output_line,
-                        line_no,
-                        match_span: None,
-                        line_text: clip(line_text, block_mode::BLOCK_SEARCH_LINE_CHARS),
-                        command_preview: clip(
-                            zone.command.as_deref().unwrap_or_default(),
-                            block_mode::BLOCK_SEARCH_COMMAND_CHARS,
-                        ),
-                    });
+                    hits.push(hit);
                 }
                 Ok(block_mode::BlockSearchResults { hits, capped })
             }
@@ -7643,6 +7742,109 @@ impl Frost {
         })
     }
 
+    /// Toggle the bookmark for a picker hit without activating the row. Both
+    /// pointer and keyboard entry points use the same generation/list checks,
+    /// so a queued click cannot mutate a recycled zone id after a rebuild.
+    fn toggle_block_search_hit_bookmark(
+        &mut self,
+        requested: Option<block_mode::BlockSearchHit>,
+    ) -> Task<Message> {
+        let current = self.sessions.get(self.active).map(|session| {
+            (
+                session.id,
+                BlockSearchZoneVersion::from_terminal(&session.terminal),
+            )
+        });
+        let plan = match current {
+            Some((session_id, zone_version)) => self
+                .block_search
+                .as_ref()
+                .map(|state| state.bookmark_plan(requested.as_ref(), session_id, zone_version))
+                .unwrap_or(BlockSearchBookmarkPlan::RejectStale),
+            None => BlockSearchBookmarkPlan::RejectStale,
+        };
+        let zone_id = match plan {
+            BlockSearchBookmarkPlan::Toggle(zone_id) => zone_id,
+            BlockSearchBookmarkPlan::Busy => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.bookmark_notice = Some(BlockSearchBookmarkNotice::Busy);
+                }
+                return Task::none();
+            }
+            BlockSearchBookmarkPlan::NoSelection => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.bookmark_notice = Some(BlockSearchBookmarkNotice::NoSelection);
+                }
+                return Task::none();
+            }
+            BlockSearchBookmarkPlan::RejectStale => {
+                if let Some(state) = self.block_search.as_mut() {
+                    state.bookmark_notice = Some(BlockSearchBookmarkNotice::Stale);
+                }
+                return Task::none();
+            }
+        };
+        if !self.block_action_available() {
+            if let Some(state) = self.block_search.as_mut() {
+                state.bookmark_notice = Some(BlockSearchBookmarkNotice::Stale);
+            }
+            return Task::none();
+        }
+
+        let (filter, selection_anchor, owner) =
+            self.block_search
+                .as_ref()
+                .map(|state| {
+                    (
+                        state.filter,
+                        state.hits.get(state.selected).cloned().map(|hit| {
+                            BlockSearchSelectionAnchor {
+                                hit,
+                                index: state.selected,
+                            }
+                        }),
+                        state.session_id,
+                    )
+                })
+                .expect("bookmark plan requires an open block-search picker");
+        let bookmarked = self
+            .sessions
+            .get_mut(self.active)
+            .filter(|session| session.id == owner)
+            .and_then(|session| {
+                let ids: Vec<u64> = session
+                    .terminal
+                    .command_zones
+                    .iter()
+                    .map(|zone| zone.id)
+                    .collect();
+                session.block_bookmarks.retain(&ids);
+                ids.contains(&zone_id).then(|| {
+                    let bookmarked = session.block_bookmarks.toggle(zone_id);
+                    session.refresh();
+                    bookmarked
+                })
+            });
+        let Some(bookmarked) = bookmarked else {
+            if let Some(state) = self.block_search.as_mut() {
+                state.bookmark_notice = Some(BlockSearchBookmarkNotice::Stale);
+            }
+            return Task::none();
+        };
+
+        if filter == BlockSearchFilter::Bookmarked {
+            self.block_search_recompute_with_anchor(selection_anchor);
+        }
+        if let Some(state) = self.block_search.as_mut() {
+            state.bookmark_notice = Some(if bookmarked {
+                BlockSearchBookmarkNotice::Bookmarked
+            } else {
+                BlockSearchBookmarkNotice::Removed
+            });
+        }
+        self.block_search_refocus_task()
+    }
+
     /// Block search picker key handling, mirroring
     /// [`Self::handle_history_picker_key`]: typed text edits the query,
     /// arrows move the selection, Enter selects and reveals the highlighted
@@ -7682,6 +7884,28 @@ impl Frost {
         }
         if block_search_manual_refresh_key(key, mods, repeat) {
             return Some(self.force_block_search_rebuild());
+        }
+        let bookmark_route = {
+            let state = self.block_search.as_mut()?;
+            block_search_bookmark_key_route(
+                key,
+                mods,
+                repeat,
+                &mut state.bookmark_key_held,
+                &mut state.bookmark_key_claimed,
+            )
+        };
+        match bookmark_route {
+            BlockSearchBookmarkKeyRoute::Toggle => {
+                let selected = self
+                    .block_search
+                    .as_ref()
+                    .and_then(|state| state.hits.get(state.selected))
+                    .cloned();
+                return Some(self.toggle_block_search_hit_bookmark(selected));
+            }
+            BlockSearchBookmarkKeyRoute::SuppressRepeat => return Some(Task::none()),
+            BlockSearchBookmarkKeyRoute::NotBookmark => {}
         }
         let state = self.block_search.as_mut()?;
         match key {
@@ -10895,6 +11119,17 @@ impl Frost {
                 }
             }
             Message::Key(event) => {
+                if let keyboard::Event::KeyReleased { key, .. } = &event {
+                    if self.block_search.as_mut().is_some_and(|state| {
+                        block_search_bookmark_key_release(
+                            key,
+                            &mut state.bookmark_key_held,
+                            &mut state.bookmark_key_claimed,
+                        )
+                    }) {
+                        return Task::none();
+                    }
+                }
                 if let keyboard::Event::KeyPressed {
                     key,
                     location,
@@ -11442,6 +11677,10 @@ impl Frost {
                     self.cancel_layout_drags();
                     self.hovered_tab = None;
                     self.terminal_mouse_gestures = [None; 3];
+                    if let Some(state) = self.block_search.as_mut() {
+                        state.bookmark_key_held = false;
+                        state.bookmark_key_claimed = false;
+                    }
                 }
                 self.focused = f;
                 // The blink tick stops while unfocused; leave the cursor solid so
@@ -12628,8 +12867,14 @@ impl Frost {
                 }
             }
             Message::BlockSearchInput(query) => {
-                if let Some(state) = self.block_search.as_mut() {
-                    state.query = block_mode::bounded_block_search_query(query);
+                let accepted = self.block_search.as_mut().is_some_and(|state| {
+                    // A focused text input may capture the plain-B repeats
+                    // produced after Ctrl/Shift are released. The physical-B
+                    // latch is the only reliable cross-event signal here.
+                    state.apply_query_input(query)
+                });
+                if !accepted {
+                    return Task::none();
                 }
                 self.block_search_recompute();
                 // The result set changed and the highlight reset to the top:
@@ -12701,6 +12946,9 @@ impl Frost {
                 if target_is_live && self.ensure_block_action_available("Block search") {
                     self.reveal_block_search_hit(&hit);
                 }
+            }
+            Message::BlockSearchToggleBookmark(hit) => {
+                return self.toggle_block_search_hit_bookmark(Some(hit));
             }
             Message::BlockMenuClose => self.block_menu = None,
             Message::BlockMenuAction(action) => {
@@ -14248,12 +14496,16 @@ impl Frost {
 
         // Outcome/duration for each hit's block, resolved once instead of
         // rescanning the zone deque per drawn row.
-        let zone_badges: std::collections::HashMap<u64, String> = self
+        let (zone_badges, bookmarked_zone_ids): (
+            std::collections::HashMap<u64, String>,
+            std::collections::HashSet<u64>,
+        ) = self
             .sessions
             .iter()
             .find(|sess| sess.id == state.session_id)
             .map(|sess| {
-                sess.terminal
+                let badges = sess
+                    .terminal
                     .command_zones
                     .iter()
                     .map(|zone| {
@@ -14267,7 +14519,15 @@ impl Frost {
                         .unwrap_or_default();
                         (zone.id, badge)
                     })
-                    .collect()
+                    .collect();
+                let bookmarks = sess
+                    .terminal
+                    .command_zones
+                    .iter()
+                    .filter(|zone| sess.block_bookmarks.contains(zone.id))
+                    .map(|zone| zone.id)
+                    .collect();
+                (badges, bookmarks)
             })
             .unwrap_or_default();
         // A pane whose shell emits no OSC 133 has nothing to search; blaming
@@ -14302,10 +14562,27 @@ impl Frost {
             };
             body = body.push(text(hint).size(13).style(text::secondary));
         } else if state.hits.is_empty() {
-            let empty = if state.older_not_indexed {
-                "No matching indexed blocks · older blocks not indexed"
+            let empty = if state.query.trim().is_empty()
+                && state.filter == BlockSearchFilter::Bookmarked
+                && bookmarked_zone_ids.is_empty()
+            {
+                "No bookmarked blocks — use ☆ or Ctrl+Shift+B to add one".to_string()
+            } else if state.query.trim().is_empty() {
+                let surface = match state.scope {
+                    block_mode::BlockSearchScope::All => "command or output",
+                    block_mode::BlockSearchScope::Command => "command",
+                    block_mode::BlockSearchScope::Output => "output",
+                };
+                format!("Matching blocks have no indexed {surface} text")
+            } else if state.older_not_indexed {
+                "No matching indexed blocks · older blocks not indexed".to_string()
             } else {
-                "No matching blocks"
+                "No matching blocks".to_string()
+            };
+            let empty = if state.older_not_indexed && !empty.ends_with("older blocks not indexed") {
+                format!("{empty} · older blocks not indexed")
+            } else {
+                empty
             };
             body = body.push(text(empty).size(13).style(text::secondary));
         } else {
@@ -14372,24 +14649,56 @@ impl Frost {
                 ]
                 .spacing(1)
                 .width(Length::Fill);
+                let bookmarked = bookmarked_zone_ids.contains(&hit.zone_id);
+                let bookmark_symbol = if bookmarked { "★" } else { "☆" };
+                let bookmark_help = if stale {
+                    "Bookmarks are disabled while the index refreshes"
+                } else if bookmarked {
+                    "Remove bookmark (Ctrl+Shift+B)"
+                } else {
+                    "Bookmark block (Ctrl+Shift+B)"
+                };
+                let bookmark_button = button(text(bookmark_symbol).size(15))
+                    .padding([5, 8])
+                    .style(button::text);
+                let bookmark_button = if stale {
+                    bookmark_button
+                } else {
+                    bookmark_button.on_press(Message::BlockSearchToggleBookmark(hit.clone()))
+                };
+                let bookmark_button = tooltip(
+                    bookmark_button,
+                    container(text(bookmark_help).size(11))
+                        .padding(6)
+                        .style(container::rounded_box),
+                    tooltip::Position::Left,
+                );
                 let accent = self.c_accent();
-                let row_body = container(info).width(Length::Fill).padding([3, 8]).style(
-                    move |_t: &iced::Theme| container::Style {
-                        background: if selected {
-                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
-                        } else {
-                            None
-                        },
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            ..Default::default()
-                        },
+                let jump_target = mouse_area(container(info).width(Length::Fill).padding([3, 8]));
+                let jump_target = if stale {
+                    jump_target
+                } else {
+                    jump_target.on_press(Message::BlockSearchAccept(hit.clone()))
+                };
+                let row_body = container(
+                    row![jump_target, bookmark_button]
+                        .width(Length::Fill)
+                        .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .style(move |_t: &iced::Theme| container::Style {
+                    background: if selected {
+                        Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                    } else {
+                        None
+                    },
+                    border: iced::Border {
+                        radius: 4.0.into(),
                         ..Default::default()
                     },
-                );
-                let row_btn =
-                    mouse_area(row_body).on_press(Message::BlockSearchAccept(hit.clone()));
-                list = list.push(row_btn);
+                    ..Default::default()
+                });
+                list = list.push(row_body);
             }
             body = body.push(
                 scrollable(list)
@@ -14399,10 +14708,16 @@ impl Frost {
         }
         // The overlay owns every key while it is open, so the chips and
         // toggles above are otherwise reachable only with the mouse.
+        if let Some(notice) = state.bookmark_notice {
+            body = body.push(text(notice.label()).size(11).style(match notice {
+                BlockSearchBookmarkNotice::Busy | BlockSearchBookmarkNotice::Stale => text::warning,
+                _ => text::secondary,
+            }));
+        }
         body = body.push(
             text(
-                "F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · ↑↓ select · Enter reveal · \
-                 Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close",
+                "Ctrl+Shift+B bookmark · F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · \
+                 ↑↓ select · Enter reveal · Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close",
             )
             .size(11)
             .wrapping(text::Wrapping::Word)
@@ -18830,7 +19145,20 @@ impl Frost {
             // handler re-delivers this only while an overlay owns Escape, so
             // it can never become a stray byte to the foreground program.
             iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
-                captured_key_is_overlay_escape(&event).then_some(Message::OverlayEscape(event))
+                if captured_key_is_overlay_escape(&event) {
+                    Some(Message::OverlayEscape(event))
+                } else if matches!(
+                    &event,
+                    keyboard::Event::KeyReleased { key, .. }
+                        if block_search_is_bookmark_key(key)
+                ) {
+                    // The focused query can capture B's release. Always
+                    // forward it; Message::Key only consumes it when the
+                    // block-search latch actually exists.
+                    Some(Message::Key(event))
+                } else {
+                    None
+                }
             }
             iced::Event::Keyboard(k) => Some(Message::Key(k)),
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
@@ -22470,6 +22798,44 @@ mod tests {
     }
 
     #[test]
+    fn block_search_bookmarked_self_removal_keeps_the_closest_original_rank() {
+        let mut first_duplicate = block_search_hit(9);
+        first_duplicate.is_output_line = true;
+        first_duplicate.line_no = 1;
+        first_duplicate.line_text = "first".to_string();
+        let mut selected_duplicate = first_duplicate.clone();
+        selected_duplicate.line_no = 2;
+        selected_duplicate.line_text = "second".to_string();
+        let anchor = BlockSearchSelectionAnchor {
+            hit: selected_duplicate,
+            index: 2,
+        };
+
+        // Unbookmarking zone 9 removes both of its duplicate query hits. The
+        // original rank remains selected when one exists, then clamps only at
+        // the tail — never jumping back to the first row.
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[
+                    block_search_hit(10),
+                    block_search_hit(8),
+                    block_search_hit(7),
+                ],
+                Some(&anchor),
+            ),
+            2
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[block_search_hit(10), block_search_hit(8)],
+                Some(&anchor),
+            ),
+            1
+        );
+        assert_eq!(block_search_refresh_selection_index(&[], Some(&anchor)), 0);
+    }
+
+    #[test]
     fn block_search_manual_refresh_fails_fast_on_errors_and_coalesces_while_busy() {
         let mut state = BlockSearchState {
             query: "[".to_string(),
@@ -22602,6 +22968,203 @@ mod tests {
             ),
             BlockSearchToggleKeyRoute::SuppressRepeat,
             "runtime-remapped toggle chords need the same repeat guard"
+        );
+    }
+
+    #[test]
+    fn block_search_bookmark_chord_is_exact_and_latched_until_b_release() {
+        let lower = keyboard::Key::Character("b".into());
+        let upper = keyboard::Key::Character("B".into());
+        let chord = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let mut held = false;
+        let mut claimed = false;
+
+        assert_eq!(
+            block_search_bookmark_key_route(&lower, chord, false, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::Toggle
+        );
+        assert!(held && claimed);
+        // Ctrl/Shift can be released before B. Both repeated and anomalous
+        // non-repeat presses remain consumed while the physical key is held.
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &lower,
+                keyboard::Modifiers::NONE,
+                true,
+                &mut held,
+                &mut claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        );
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &upper,
+                keyboard::Modifiers::NONE,
+                false,
+                &mut held,
+                &mut claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        );
+
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            bookmark_key_held: held,
+            bookmark_key_claimed: claimed,
+            ..BlockSearchState::default()
+        };
+        assert!(!state.apply_query_input("needleb".to_string()));
+        assert_eq!(
+            state.query, "needle",
+            "captured text-input repeat is dropped"
+        );
+        assert!(block_search_bookmark_key_release(
+            &lower,
+            &mut state.bookmark_key_held,
+            &mut state.bookmark_key_claimed,
+        ));
+        assert!(!state.bookmark_key_held && !state.bookmark_key_claimed);
+        assert!(state.apply_query_input("needleb".to_string()));
+        assert_eq!(state.query, "needleb");
+
+        for modifiers in [
+            keyboard::Modifiers::NONE,
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::SHIFT,
+            chord | keyboard::Modifiers::ALT,
+            chord | keyboard::Modifiers::LOGO,
+        ] {
+            let mut held = false;
+            let mut claimed = false;
+            assert_eq!(
+                block_search_bookmark_key_route(&lower, modifiers, false, &mut held, &mut claimed,),
+                BlockSearchBookmarkKeyRoute::NotBookmark,
+                "non-exact modifiers {modifiers:?} must not toggle"
+            );
+            assert!(held, "every first physical B press is latched");
+            assert!(!claimed);
+        }
+
+        // An ineligible first edge freezes this whole physical press as
+        // pass-through: releasing Alt or later adding Ctrl+Shift cannot turn
+        // its repeats into a newly eligible action.
+        let mut held = false;
+        let mut claimed = false;
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &lower,
+                chord | keyboard::Modifiers::ALT,
+                false,
+                &mut held,
+                &mut claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::NotBookmark
+        );
+        assert!(held && !claimed);
+        assert_eq!(
+            block_search_bookmark_key_route(&lower, chord, true, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::NotBookmark,
+            "dropping Alt mid-press must not create a toggle"
+        );
+        assert_eq!(
+            block_search_bookmark_key_route(&lower, chord, false, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::NotBookmark,
+            "eligibility stays frozen even if a repeat flag is missing"
+        );
+        let mut ordinary = BlockSearchState {
+            query: "a".to_string(),
+            bookmark_key_held: held,
+            bookmark_key_claimed: claimed,
+            ..BlockSearchState::default()
+        };
+        assert!(ordinary.apply_query_input("ab".to_string()));
+        assert_eq!(ordinary.query, "ab", "unclaimed B remains ordinary input");
+        assert!(block_search_bookmark_key_release(
+            &lower,
+            &mut ordinary.bookmark_key_held,
+            &mut ordinary.bookmark_key_claimed,
+        ));
+        assert_eq!(
+            block_search_bookmark_key_route(
+                &upper,
+                chord,
+                false,
+                &mut ordinary.bookmark_key_held,
+                &mut ordinary.bookmark_key_claimed,
+            ),
+            BlockSearchBookmarkKeyRoute::Toggle,
+            "only a new B press may re-evaluate chord eligibility"
+        );
+
+        let mut held = false;
+        let mut claimed = false;
+        assert_eq!(
+            block_search_bookmark_key_route(&upper, chord, true, &mut held, &mut claimed,),
+            BlockSearchBookmarkKeyRoute::SuppressRepeat
+        );
+        assert!(
+            held && claimed,
+            "even a first observed repeat owns B until release"
+        );
+        assert!(!block_search_bookmark_key_release(
+            &keyboard::Key::Character("x".into()),
+            &mut held,
+            &mut claimed,
+        ));
+        assert!(held && claimed);
+    }
+
+    #[test]
+    fn block_search_bookmark_plan_rejects_busy_stale_and_unlisted_hits() {
+        let version = BlockSearchZoneVersion {
+            len: 1,
+            oldest: Some(7),
+            newest: Some(7),
+        };
+        let hit = block_search_hit(7);
+        let mut state = BlockSearchState {
+            session_id: 3,
+            zone_version: version,
+            hits: vec![hit.clone()],
+            ..BlockSearchState::default()
+        };
+        assert_eq!(
+            state.bookmark_plan(Some(&hit), 3, version),
+            BlockSearchBookmarkPlan::Toggle(7)
+        );
+        assert_eq!(
+            state.bookmark_plan(None, 3, version),
+            BlockSearchBookmarkPlan::NoSelection
+        );
+        assert_eq!(
+            state.bookmark_plan(Some(&block_search_hit(8)), 3, version),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        assert_eq!(
+            state.bookmark_plan(Some(&hit), 4, version),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        assert_eq!(
+            state.bookmark_plan(
+                Some(&hit),
+                3,
+                BlockSearchZoneVersion {
+                    newest: Some(8),
+                    ..version
+                },
+            ),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        state.query_error = Some("invalid".to_string());
+        assert_eq!(
+            state.bookmark_plan(Some(&hit), 3, version),
+            BlockSearchBookmarkPlan::RejectStale
+        );
+        state.loading = true;
+        assert_eq!(
+            state.bookmark_plan(None, 3, version),
+            BlockSearchBookmarkPlan::Busy,
+            "loading owns even an empty/stale retained selection"
         );
     }
 

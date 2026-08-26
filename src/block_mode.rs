@@ -1793,6 +1793,56 @@ fn clipped(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+}
+
+/// Build the one representative row used when an empty query browses a
+/// metadata-filtered block list. Only real, non-blank text may become a row:
+/// command scope never borrows output, output scope never borrows a command,
+/// and a commandless/outputless background record is not a synthetic hit.
+///
+/// Output line numbers retain their position in the captured text even when
+/// leading blank lines are skipped, so revealing a browse row still lands on
+/// the line that supplied its preview.
+pub fn metadata_block_search_hit(
+    zone: &CachedBlockSearchZone,
+    scope: BlockSearchScope,
+) -> Option<BlockSearchHit> {
+    let command = zone
+        .command
+        .as_deref()
+        .and_then(|text| first_meaningful_line(text).map(|(_, line)| line));
+    let output = zone
+        .output
+        .as_deref()
+        .and_then(first_meaningful_line)
+        .map(|(index, line)| (line, index + 1));
+    let (line_text, is_output_line, line_no) = match scope {
+        BlockSearchScope::All => command
+            .map(|line| (line, false, 0))
+            .or_else(|| output.map(|(line, line_no)| (line, true, line_no)))?,
+        BlockSearchScope::Command => (command?, false, 0),
+        BlockSearchScope::Output => {
+            let (line, line_no) = output?;
+            (line, true, line_no)
+        }
+    };
+    Some(BlockSearchHit {
+        zone_id: zone.zone_id,
+        is_output_line,
+        line_no,
+        match_span: None,
+        line_text: clipped(line_text, BLOCK_SEARCH_LINE_CHARS),
+        command_preview: clipped(
+            zone.command.as_deref().unwrap_or_default(),
+            BLOCK_SEARCH_COMMAND_CHARS,
+        ),
+    })
+}
+
 /// Convert a UTF-8 byte range returned by `regex` into the character-space
 /// range the renderer and reveal path expose. Regex boundaries are always
 /// valid UTF-8 boundaries, including a zero-width match.
@@ -3109,6 +3159,59 @@ mod tests {
         assert_eq!(background.command_lowercase, None);
         assert_eq!(background.output, None);
         assert_eq!(background.output_lowercase, None);
+    }
+
+    #[test]
+    fn block_search_metadata_browse_uses_real_text_and_honors_scope() {
+        let zone = source(
+            7,
+            Some("\n  \t\nmake check"),
+            Some("\n \t\nfirst output\nsecond output"),
+        );
+
+        let all = metadata_block_search_hit(&zone, BlockSearchScope::All).unwrap();
+        assert!(!all.is_output_line);
+        assert_eq!(all.line_no, 0);
+        assert_eq!(all.line_text, "make check");
+
+        let command = metadata_block_search_hit(&zone, BlockSearchScope::Command).unwrap();
+        assert!(!command.is_output_line);
+        assert_eq!(command.line_text, "make check");
+
+        let output = metadata_block_search_hit(&zone, BlockSearchScope::Output).unwrap();
+        assert!(output.is_output_line);
+        assert_eq!(output.line_no, 3, "leading blank lines retain their rank");
+        assert_eq!(output.line_text, "first output");
+    }
+
+    #[test]
+    fn block_search_metadata_browse_background_rows_require_meaningful_output() {
+        let background = source(8, None, Some("\n\t\nworker ready"));
+        assert_eq!(
+            classify(background.command.as_deref(), None),
+            BlockOutcome::Background,
+            "browse-row omission must not change background classification"
+        );
+        let all = metadata_block_search_hit(&background, BlockSearchScope::All).unwrap();
+        assert!(all.is_output_line);
+        assert_eq!(all.line_no, 3);
+        assert_eq!(all.line_text, "worker ready");
+        assert!(metadata_block_search_hit(&background, BlockSearchScope::Command).is_none());
+        assert_eq!(
+            metadata_block_search_hit(&background, BlockSearchScope::Output),
+            Some(all)
+        );
+
+        for output in [None, Some(""), Some("\n  \t\n")] {
+            let textless = source(9, None, output);
+            for scope in [
+                BlockSearchScope::All,
+                BlockSearchScope::Command,
+                BlockSearchScope::Output,
+            ] {
+                assert!(metadata_block_search_hit(&textless, scope).is_none());
+            }
+        }
     }
 
     #[test]

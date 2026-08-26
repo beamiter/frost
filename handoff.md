@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.9)
+Updated: 2026-08-26 (Block Search 4.3)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,17 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.3 (2026-08-26)**: picker rows now expose in-place `☆`/`★`
+  bookmark actions, with exact physical `Ctrl+Shift+B` latched for the full B
+  key lifetime so repeats and modifier-release ordering cannot double-toggle or
+  leak text into the query. Loading and stale rows remain non-actionable and
+  fail closed with picker-local feedback; toggles preserve the closest stable
+  selection anchor, synchronize duplicate hits for the same zone, and
+  immediately recompute the active Bookmarked view. Empty-query metadata
+  browsing now emits only real, meaningful command/output text in the selected
+  scope, never synthetic or blank rows. Validation passed the full 849-test
+  suite plus 23 targeted Block Search checks.
 
 - **Block Search 3.9 (2026-08-26)**: the picker now exposes a fully labelled
   **Refresh** button with an explanatory tooltip; clicking it and pressing bare
