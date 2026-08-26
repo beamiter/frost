@@ -22360,6 +22360,19 @@ mod tests {
 
     #[test]
     fn block_search_zone_version_changes_only_when_finalized_zones_change() {
+        let before_rotation = BlockSearchZoneVersion {
+            len: 3,
+            oldest: Some(7),
+            newest: Some(9),
+        };
+        let after_rotation = BlockSearchZoneVersion {
+            len: 3,
+            oldest: Some(8),
+            newest: Some(10),
+        };
+        assert_eq!(before_rotation.len, after_rotation.len);
+        assert_ne!(before_rotation, after_rotation);
+
         let mut completed = terminal::TerminalState::new(40, 8);
         let empty = BlockSearchZoneVersion::from_terminal(&completed);
         completed.process_input(
