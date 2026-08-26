@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.3)
+Updated: 2026-08-26 (Block Search 4.4)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,19 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.4 (2026-08-26)**: result-local bookmark controls now carry
+  visible action labels (`☆ Bookmark` / `★ Remove`) and honest row-local
+  tooltips; the footer alone documents that `Ctrl+Shift+B` acts on the
+  highlighted result. Bookmarked zero-result states distinguish an empty
+  bookmark set, missing indexed text in the selected scope, and a real query
+  miss, including non-empty queries when the selected scope has no bookmarked
+  text. The empty-set guidance now gives a reachable path — choose the **All**
+  filter and search for a block before adding a bookmark — instead of
+  suggesting a shortcut with no selected result. Pure copy/reason tests lock
+  these pointer-versus-selection semantics;
+  validation passed all 851 tests, all 25 Block Search tests, `cargo check`, and
+  warning-denied Clippy across every target.
 
 - **Block Search 4.3 (2026-08-26)**: picker rows now expose in-place `☆`/`★`
   bookmark actions, with exact physical `Ctrl+Shift+B` latched for the full B

@@ -1112,6 +1112,79 @@ impl BlockSearchBookmarkNotice {
     }
 }
 
+/// Visible and hover text for a result-local bookmark action. The keyboard
+/// chord deliberately does not appear here: Ctrl+Shift+B acts on the
+/// highlighted result, which may differ from the row whose pointer button is
+/// focused or hovered.
+fn block_search_bookmark_button_text(bookmarked: bool) -> &'static str {
+    if bookmarked {
+        "★ Remove"
+    } else {
+        "☆ Bookmark"
+    }
+}
+
+fn block_search_bookmark_button_help(bookmarked: bool, stale: bool) -> &'static str {
+    if stale {
+        "Bookmarks are disabled while the index refreshes"
+    } else if bookmarked {
+        "Remove the bookmark from this block"
+    } else {
+        "Bookmark this block"
+    }
+}
+
+const BLOCK_SEARCH_KEYBOARD_HELP: &str =
+    "Ctrl+Shift+B toggle bookmark on selected result · F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · \
+     ↑↓ select · Enter reveal · Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close";
+
+fn block_search_bookmarks_have_indexed_text(
+    cache: &[block_mode::CachedBlockSearchZone],
+    bookmarked_zone_ids: &std::collections::HashSet<u64>,
+    scope: block_mode::BlockSearchScope,
+) -> bool {
+    cache.iter().any(|zone| {
+        bookmarked_zone_ids.contains(&zone.zone_id)
+            && block_mode::metadata_block_search_hit(zone, scope).is_some()
+    })
+}
+
+/// Explain a valid search/browse intent that produced no hits. In particular,
+/// an empty Bookmarked view must not tell the user to press Ctrl+Shift+B while
+/// there is no selected row for that shortcut to act on.
+fn block_search_empty_message(
+    query: &str,
+    filter: BlockSearchFilter,
+    scope: block_mode::BlockSearchScope,
+    has_live_bookmarks: bool,
+    has_bookmarked_indexed_text: bool,
+    older_not_indexed: bool,
+) -> String {
+    let surface = match scope {
+        block_mode::BlockSearchScope::All => "command or output",
+        block_mode::BlockSearchScope::Command => "command",
+        block_mode::BlockSearchScope::Output => "output",
+    };
+    let query_is_empty = query.trim().is_empty();
+    let message = if filter == BlockSearchFilter::Bookmarked && !has_live_bookmarks {
+        "No bookmarked blocks — choose the All filter and search for a block, then use ☆ or Ctrl+Shift+B on the selected result"
+            .to_string()
+    } else if filter == BlockSearchFilter::Bookmarked && !has_bookmarked_indexed_text {
+        format!("Bookmarked blocks have no indexed {surface} text")
+    } else if filter == BlockSearchFilter::Bookmarked {
+        "No matches in bookmarked blocks".to_string()
+    } else if query_is_empty {
+        format!("Matching blocks have no indexed {surface} text")
+    } else {
+        "No matching blocks".to_string()
+    };
+    if older_not_indexed {
+        format!("{message} · older blocks not indexed")
+    } else {
+        message
+    }
+}
+
 fn block_search_refresh_selection_index(
     hits: &[block_mode::BlockSearchHit],
     anchor: Option<&BlockSearchSelectionAnchor>,
@@ -14562,28 +14635,19 @@ impl Frost {
             };
             body = body.push(text(hint).size(13).style(text::secondary));
         } else if state.hits.is_empty() {
-            let empty = if state.query.trim().is_empty()
-                && state.filter == BlockSearchFilter::Bookmarked
-                && bookmarked_zone_ids.is_empty()
-            {
-                "No bookmarked blocks — use ☆ or Ctrl+Shift+B to add one".to_string()
-            } else if state.query.trim().is_empty() {
-                let surface = match state.scope {
-                    block_mode::BlockSearchScope::All => "command or output",
-                    block_mode::BlockSearchScope::Command => "command",
-                    block_mode::BlockSearchScope::Output => "output",
-                };
-                format!("Matching blocks have no indexed {surface} text")
-            } else if state.older_not_indexed {
-                "No matching indexed blocks · older blocks not indexed".to_string()
-            } else {
-                "No matching blocks".to_string()
-            };
-            let empty = if state.older_not_indexed && !empty.ends_with("older blocks not indexed") {
-                format!("{empty} · older blocks not indexed")
-            } else {
-                empty
-            };
+            let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
+                &state.cache,
+                &bookmarked_zone_ids,
+                state.scope,
+            );
+            let empty = block_search_empty_message(
+                &state.query,
+                state.filter,
+                state.scope,
+                !bookmarked_zone_ids.is_empty(),
+                has_bookmarked_indexed_text,
+                state.older_not_indexed,
+            );
             body = body.push(text(empty).size(13).style(text::secondary));
         } else {
             // A rebuild in flight leaves the previous hits on screen so the
@@ -14650,17 +14714,11 @@ impl Frost {
                 .spacing(1)
                 .width(Length::Fill);
                 let bookmarked = bookmarked_zone_ids.contains(&hit.zone_id);
-                let bookmark_symbol = if bookmarked { "★" } else { "☆" };
-                let bookmark_help = if stale {
-                    "Bookmarks are disabled while the index refreshes"
-                } else if bookmarked {
-                    "Remove bookmark (Ctrl+Shift+B)"
-                } else {
-                    "Bookmark block (Ctrl+Shift+B)"
-                };
-                let bookmark_button = button(text(bookmark_symbol).size(15))
-                    .padding([5, 8])
-                    .style(button::text);
+                let bookmark_help = block_search_bookmark_button_help(bookmarked, stale);
+                let bookmark_button =
+                    button(text(block_search_bookmark_button_text(bookmarked)).size(12))
+                        .padding([5, 8])
+                        .style(button::text);
                 let bookmark_button = if stale {
                     bookmark_button
                 } else {
@@ -14715,13 +14773,10 @@ impl Frost {
             }));
         }
         body = body.push(
-            text(
-                "Ctrl+Shift+B bookmark · F5 refresh · Tab filter · Ctrl+I case · Ctrl+R regex · Ctrl+W whole word · \
-                 ↑↓ select · Enter reveal · Shift+Enter step · Ctrl+U clear · Ctrl+Shift+U reset · Esc close",
-            )
-            .size(11)
-            .wrapping(text::Wrapping::Word)
-            .style(text::secondary),
+            text(BLOCK_SEARCH_KEYBOARD_HELP)
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
         );
 
         let panel_width = (self.win_size.width - 32.0).clamp(280.0, 720.0);
@@ -23166,6 +23221,106 @@ mod tests {
             BlockSearchBookmarkPlan::Busy,
             "loading owns even an empty/stale retained selection"
         );
+    }
+
+    #[test]
+    fn block_search_bookmark_copy_distinguishes_row_actions_from_selected_shortcut() {
+        assert_eq!(block_search_bookmark_button_text(false), "☆ Bookmark");
+        assert_eq!(block_search_bookmark_button_text(true), "★ Remove");
+        assert_eq!(
+            block_search_bookmark_button_help(false, false),
+            "Bookmark this block"
+        );
+        assert_eq!(
+            block_search_bookmark_button_help(true, false),
+            "Remove the bookmark from this block"
+        );
+        assert_eq!(
+            block_search_bookmark_button_help(false, true),
+            "Bookmarks are disabled while the index refreshes"
+        );
+        assert!(BLOCK_SEARCH_KEYBOARD_HELP.contains("toggle bookmark on selected result"));
+        assert!(
+            !block_search_bookmark_button_help(false, false).contains("Ctrl+Shift+B"),
+            "a row-local pointer action must not claim the selected-row shortcut"
+        );
+    }
+
+    #[test]
+    fn block_search_bookmarked_empty_state_gives_reachable_next_steps() {
+        let no_bookmarks = block_search_empty_message(
+            "needle",
+            BlockSearchFilter::Bookmarked,
+            block_mode::BlockSearchScope::All,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            no_bookmarks,
+            "No bookmarked blocks — choose the All filter and search for a block, then use ☆ or Ctrl+Shift+B on the selected result"
+        );
+        assert!(no_bookmarks.contains("choose the All filter and search for a block"));
+
+        assert_eq!(
+            block_search_empty_message(
+                "needle",
+                BlockSearchFilter::Bookmarked,
+                block_mode::BlockSearchScope::Output,
+                true,
+                false,
+                false,
+            ),
+            "Bookmarked blocks have no indexed output text"
+        );
+        assert_eq!(
+            block_search_empty_message(
+                "needle",
+                BlockSearchFilter::Bookmarked,
+                block_mode::BlockSearchScope::Command,
+                true,
+                true,
+                true,
+            ),
+            "No matches in bookmarked blocks · older blocks not indexed"
+        );
+        assert_eq!(
+            block_search_empty_message(
+                "",
+                BlockSearchFilter::Failed,
+                block_mode::BlockSearchScope::Command,
+                false,
+                false,
+                false,
+            ),
+            "Matching blocks have no indexed command text"
+        );
+
+        let cache = vec![
+            block_mode::CachedBlockSearchZone::new(1, Some("build"), Some("\n\n".to_string())),
+            block_mode::CachedBlockSearchZone::new(
+                2,
+                Some("test"),
+                Some("\nmeaningful output".to_string()),
+            ),
+        ];
+        let command_only = std::collections::HashSet::from([1]);
+        assert!(block_search_bookmarks_have_indexed_text(
+            &cache,
+            &command_only,
+            block_mode::BlockSearchScope::Command,
+        ));
+        assert!(!block_search_bookmarks_have_indexed_text(
+            &cache,
+            &command_only,
+            block_mode::BlockSearchScope::Output,
+        ));
+        let output_bookmark = std::collections::HashSet::from([2]);
+        assert!(block_search_bookmarks_have_indexed_text(
+            &cache,
+            &output_bookmark,
+            block_mode::BlockSearchScope::Output,
+        ));
     }
 
     #[test]
