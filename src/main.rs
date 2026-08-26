@@ -961,6 +961,35 @@ struct BlockSearchMemory {
     filter: BlockSearchFilter,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockSearchIntent {
+    query: String,
+    case_sensitive: bool,
+    regex: bool,
+    whole_word: bool,
+    scope: block_mode::BlockSearchScope,
+    filter: BlockSearchFilter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockSearchSelectionAnchor {
+    hit: block_mode::BlockSearchHit,
+    index: usize,
+}
+
+fn block_search_refresh_selection_index(
+    hits: &[block_mode::BlockSearchHit],
+    anchor: Option<&BlockSearchSelectionAnchor>,
+) -> usize {
+    if hits.is_empty() {
+        return 0;
+    }
+    anchor
+        .and_then(|anchor| hits.iter().position(|hit| hit == &anchor.hit))
+        .or_else(|| anchor.map(|anchor| anchor.index.min(hits.len() - 1)))
+        .unwrap_or(0)
+}
+
 impl BlockSearchMemory {
     fn capture(&mut self, state: &BlockSearchState) {
         self.query = if state.query.len() <= block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES {
@@ -1027,9 +1056,39 @@ struct BlockSearchState {
     /// Bounded cache the hits are computed from, oldest zone first (the zone
     /// deque's order). Rebuilt only when the finalized-zone version changes.
     cache: Vec<block_mode::CachedBlockSearchZone>,
+    /// Matching intent at the start of a version rebuild. It gates selection
+    /// restoration when the asynchronous cache result lands: edits made while
+    /// loading are a new intent and must start at the first result.
+    refresh_intent: Option<BlockSearchIntent>,
 }
 
 impl BlockSearchState {
+    fn intent(&self) -> BlockSearchIntent {
+        BlockSearchIntent {
+            query: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            regex: self.regex,
+            whole_word: self.whole_word,
+            scope: self.scope,
+            filter: self.filter,
+        }
+    }
+
+    fn take_refresh_selection_anchor(&mut self) -> Option<BlockSearchSelectionAnchor> {
+        let current_intent = self.intent();
+        (self.refresh_intent.take().as_ref() == Some(&current_intent))
+            .then(|| {
+                self.hits
+                    .get(self.selected)
+                    .cloned()
+                    .map(|hit| BlockSearchSelectionAnchor {
+                        hit,
+                        index: self.selected,
+                    })
+            })
+            .flatten()
+    }
+
     fn reset_intent(&mut self) {
         self.query.clear();
         self.case_sensitive = false;
@@ -1039,6 +1098,7 @@ impl BlockSearchState {
         self.filter = BlockSearchFilter::default();
         self.query_error = None;
         self.selected = 0;
+        self.refresh_intent = None;
     }
 
     fn accepts_build(&self, identity: BlockSearchBuildIdentity) -> bool {
@@ -7248,6 +7308,9 @@ impl Frost {
             state.epoch = epoch;
             state.loading = true;
             state.zone_version = version;
+            if state.refresh_intent.is_none() {
+                state.refresh_intent = Some(state.intent());
+            }
             // Drop allocations before the 8 MiB source snapshot is extracted:
             // peak is old-or-(source+new), never old+source+new.
             state.release_index_for_rebuild();
@@ -7338,6 +7401,7 @@ impl Frost {
         let Some(state) = self.block_search.as_mut() else {
             return;
         };
+        let selection_anchor = state.take_refresh_selection_anchor();
         let results = match block_mode::validated_block_search_query(&state.query) {
             Err(error) => Err(error),
             Ok(validated) if validated.is_empty() && filter != BlockSearchFilter::All => {
@@ -7415,10 +7479,11 @@ impl Frost {
         };
         match results {
             Ok(results) => {
+                state.selected =
+                    block_search_refresh_selection_index(&results.hits, selection_anchor.as_ref());
                 state.hits = results.hits;
                 state.capped = results.capped;
                 state.query_error = None;
-                state.selected = 0;
             }
             Err(error) => {
                 // Preserve the last valid result/index so correcting one
@@ -12417,6 +12482,7 @@ impl Frost {
                             state.cache = Vec::new();
                             state.hits = Vec::new();
                             state.capped = false;
+                            state.refresh_intent = None;
                         }
                         log::warn!("{error}");
                         self.push_toast(
@@ -22202,6 +22268,60 @@ mod tests {
         assert!(state.query_error.is_none());
         assert_eq!(state.selected, 0);
         assert_eq!(state.hits.len(), 1, "recompute owns result replacement");
+    }
+
+    #[test]
+    fn block_search_refresh_preserves_identity_then_nearest_rank() {
+        let selected = block_search_hit(2);
+        let anchor = BlockSearchSelectionAnchor {
+            hit: selected.clone(),
+            index: 1,
+        };
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[block_search_hit(4), block_search_hit(3), selected],
+                Some(&anchor),
+            ),
+            2,
+            "a stable hit follows its identity when new rows shift it"
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(
+                &[block_search_hit(4), block_search_hit(3)],
+                Some(&anchor),
+            ),
+            1,
+            "an evicted hit falls back to its closest surviving rank"
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(&[block_search_hit(4)], Some(&anchor)),
+            0
+        );
+        assert_eq!(
+            block_search_refresh_selection_index(&[block_search_hit(4)], None),
+            0
+        );
+        assert_eq!(block_search_refresh_selection_index(&[], Some(&anchor)), 0);
+
+        let mut state = BlockSearchState {
+            query: "needle".to_string(),
+            hits: vec![block_search_hit(1), block_search_hit(2)],
+            selected: 1,
+            ..BlockSearchState::default()
+        };
+        state.refresh_intent = Some(state.intent());
+        let captured = state
+            .take_refresh_selection_anchor()
+            .expect("unchanged refresh intent preserves the live highlight");
+        assert_eq!(captured.hit.zone_id, 2);
+        assert_eq!(captured.index, 1);
+
+        state.refresh_intent = Some(state.intent());
+        state.query.push('x');
+        assert!(
+            state.take_refresh_selection_anchor().is_none(),
+            "an intent edit during the worker build must restart at the top"
+        );
     }
 
     #[test]
