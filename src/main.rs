@@ -948,6 +948,50 @@ fn block_search_activation(target_is_live: bool, continuous_review: bool) -> Blo
     }
 }
 
+/// Window-lifetime search intent. This deliberately excludes pane identity,
+/// cache generations, hits and selection, and is never part of session/config
+/// persistence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BlockSearchMemory {
+    query: String,
+    case_sensitive: bool,
+    regex: bool,
+    whole_word: bool,
+    scope: block_mode::BlockSearchScope,
+    filter: BlockSearchFilter,
+}
+
+impl BlockSearchMemory {
+    fn capture(&mut self, state: &BlockSearchState) {
+        self.query = if state.query.len() <= block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES {
+            state.query.clone()
+        } else {
+            // The one-scalar sentinel exists only to show TooLong and support
+            // Backspace recovery while open; it must not become remembered
+            // state that immediately reopens on an error.
+            String::new()
+        };
+        self.case_sensitive = state.case_sensitive;
+        self.regex = state.regex;
+        self.whole_word = state.whole_word;
+        self.scope = state.scope;
+        self.filter = state.filter;
+    }
+
+    fn state_for(&self, session_id: usize) -> BlockSearchState {
+        BlockSearchState {
+            session_id,
+            query: self.query.clone(),
+            case_sensitive: self.case_sensitive,
+            regex: self.regex,
+            whole_word: self.whole_word,
+            scope: self.scope,
+            filter: self.filter,
+            ..BlockSearchState::default()
+        }
+    }
+}
+
 #[derive(Default)]
 struct BlockSearchState {
     /// Pane identity owning the cache. Zone ids are only pane-local.
@@ -3421,6 +3465,9 @@ struct Frost {
     history_picker: Option<history_picker::HistoryPickerState>,
     /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
     block_search: Option<BlockSearchState>,
+    /// Last matching intent for this window. Memory-only: cache/results and
+    /// pane identity are rebuilt fresh whenever the picker opens.
+    block_search_memory: BlockSearchMemory,
     /// Window-wide monotonic source for async block-search build identities.
     /// It deliberately survives picker close/reopen within the same pane.
     next_block_search_epoch: u64,
@@ -3609,6 +3656,7 @@ impl Frost {
             remote_picker: None,
             history_picker: None,
             block_search: None,
+            block_search_memory: BlockSearchMemory::default(),
             next_block_search_epoch: 0,
             block_menu: None,
             block_clear_confirm: None,
@@ -3690,7 +3738,7 @@ impl Frost {
     /// re-resolve the theme, rebuild metrics, and regrid every session.
     fn apply_config(&mut self) {
         if !self.config.block_mode {
-            self.block_search = None;
+            self.close_block_search();
             self.block_menu = None;
             self.block_clear_confirm = None;
             for sess in &mut self.sessions {
@@ -7116,7 +7164,7 @@ impl Frost {
     /// searches remain synchronous but only rescan that bounded cache.
     fn toggle_block_search(&mut self) -> Task<Message> {
         if self.block_search.is_some() {
-            self.block_search = None;
+            self.close_block_search();
             return Task::none();
         }
         if !self.ensure_block_action_available("Block search") {
@@ -7125,10 +7173,7 @@ impl Frost {
         let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) else {
             return Task::none();
         };
-        self.block_search = Some(BlockSearchState {
-            session_id,
-            ..BlockSearchState::default()
-        });
+        self.block_search = Some(self.block_search_memory.state_for(session_id));
         let build = self.begin_block_search_rebuild();
         Task::batch(vec![
             iced::widget::operation::focus(BLOCK_SEARCH_INPUT_ID.clone()),
@@ -7177,12 +7222,12 @@ impl Frost {
             .filter(|sess| sess.id == session_id)
             .map(|sess| BlockSearchZoneVersion::from_terminal(&sess.terminal))
         else {
-            self.block_search = None;
+            self.close_block_search();
             return Task::none();
         };
         let Some(epoch) = next_block_search_epoch(&mut self.next_block_search_epoch) else {
             log::error!("block-search epoch space exhausted; closing picker");
-            self.block_search = None;
+            self.close_block_search();
             return Task::none();
         };
         let identity = BlockSearchBuildIdentity { session_id, epoch };
@@ -7200,7 +7245,7 @@ impl Frost {
             .filter(|sess| sess.id == session_id)
             .map(Self::block_search_source_snapshot)
         else {
-            self.block_search = None;
+            self.close_block_search();
             return Task::none();
         };
 
@@ -7225,11 +7270,18 @@ impl Frost {
     /// ids restart at 0 per session, and session indices shift on close —
     /// resolving a held hit afterwards could silently select a block of the
     /// WRONG session. Dropping the whole state (query, hits, cache) is the
-    /// reset; a closed picker cannot hold stale hits.
+    /// reset; a closed picker cannot hold stale hits. Matching intent is kept
+    /// separately and is safe to apply to the newly active session.
     fn close_block_search_on_session_change(&mut self) {
-        self.block_search = None;
+        self.close_block_search();
         self.block_menu = None;
         self.block_clear_confirm = None;
+    }
+
+    fn close_block_search(&mut self) {
+        if let Some(state) = self.block_search.take() {
+            self.block_search_memory.capture(&state);
+        }
     }
 
     /// Re-run the block search over the bounded cache with the current query.
@@ -7429,7 +7481,7 @@ impl Frost {
             // The overlay may have been open when asynchronous PTY output
             // entered the alternate screen. Drop it and let this very key
             // continue to the foreground application.
-            self.block_search = None;
+            self.close_block_search();
             return None;
         }
         // The (configurable) toggle chord closes the picker from inside.
@@ -7437,13 +7489,13 @@ impl Frost {
             .and_then(|binding| self.keybindings.get_command(&binding))
             == Some(keybindings::Command::BlockSearch)
         {
-            self.block_search = None;
+            self.close_block_search();
             return Some(Task::none());
         }
         let state = self.block_search.as_mut()?;
         match key {
             Key::Named(Named::Escape) => {
-                self.block_search = None;
+                self.close_block_search();
                 return Some(Task::none());
             }
             Key::Named(Named::Enter) => {
@@ -7477,7 +7529,7 @@ impl Frost {
                     }
                     BlockSearchActivation::Close => {
                         self.reveal_block_search_hit(&hit);
-                        self.block_search = None;
+                        self.close_block_search();
                         return Some(Task::none());
                     }
                     BlockSearchActivation::Advance => {
@@ -7547,6 +7599,11 @@ impl Frost {
                     }
                     Some('o') => {
                         state.scope = state.scope.cycled();
+                        self.block_search_recompute();
+                        return Some(self.block_search_snap_task());
+                    }
+                    Some('u') => {
+                        state.query.clear();
                         self.block_search_recompute();
                         return Some(self.block_search_snap_task());
                     }
@@ -7822,6 +7879,7 @@ impl Frost {
             let Some(sess) = self.sessions.get_mut(source) else {
                 return Task::none();
             };
+            let close_block_search = action == BlockMouseAction::Menu;
             let ids: Vec<u64> = sess
                 .terminal
                 .command_zones
@@ -7840,7 +7898,6 @@ impl Frost {
                         zone_id: id,
                         anchor: iced::Point::new(x, y),
                     });
-                    self.block_search = None;
                 }
             }
             if action != BlockMouseAction::Menu {
@@ -7851,6 +7908,9 @@ impl Frost {
             // stale highlight over the block selection the user just made.
             sess.terminal.clear_text_selection();
             sess.refresh();
+            if close_block_search {
+                self.close_block_search();
+            }
             return Task::none();
         }
 
@@ -9362,7 +9422,7 @@ impl Frost {
         sess.terminal.clear_text_selection();
         sess.refresh();
 
-        self.block_search = None;
+        self.close_block_search();
         self.search.close();
         self.search.matches.clear();
         self.search.current_match_index = 0;
@@ -9937,7 +9997,7 @@ impl Frost {
                         .get(self.active)
                         .is_some_and(|session| session.terminal.is_alt_buffer_active())
                 {
-                    self.block_search = None;
+                    self.close_block_search();
                     self.block_menu = None;
                     self.block_clear_confirm = None;
                 }
@@ -12297,7 +12357,7 @@ impl Frost {
                 }
             }
             Message::HistoryPickerClose => self.history_picker = None,
-            Message::BlockSearchClose => self.block_search = None,
+            Message::BlockSearchClose => self.close_block_search(),
             Message::BlockSearchCacheBuilt(identity, result) => {
                 let accepts = self
                     .block_search
@@ -12408,7 +12468,8 @@ impl Frost {
                 if !accepts {
                     return Task::none();
                 }
-                let owner = self.block_search.take().map(|state| state.session_id);
+                let owner = self.block_search.as_ref().map(|state| state.session_id);
+                self.close_block_search();
                 let target_is_live = owner.is_some_and(|session_id| {
                     self.block_search_target_is_live(session_id, hit.zone_id)
                 });
@@ -22046,6 +22107,48 @@ mod tests {
         let mut exhausted = u64::MAX;
         assert_eq!(next_block_search_epoch(&mut exhausted), None);
         assert_eq!(exhausted, u64::MAX);
+    }
+
+    #[test]
+    fn block_search_memory_restores_only_bounded_matching_intent() {
+        let state = BlockSearchState {
+            session_id: 7,
+            epoch: 9,
+            query: "needle".to_string(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+            scope: block_mode::BlockSearchScope::Output,
+            filter: BlockSearchFilter::Bookmarked,
+            selected: 4,
+            hits: vec![block_search_hit(42)],
+            ..BlockSearchState::default()
+        };
+        let mut memory = BlockSearchMemory::default();
+        memory.capture(&state);
+        let restored = memory.state_for(99);
+        assert_eq!(restored.session_id, 99);
+        assert_eq!(restored.query, "needle");
+        assert!(restored.case_sensitive && restored.regex && restored.whole_word);
+        assert_eq!(restored.scope, block_mode::BlockSearchScope::Output);
+        assert_eq!(restored.filter, BlockSearchFilter::Bookmarked);
+        assert_eq!(restored.epoch, 0);
+        assert_eq!(restored.selected, 0);
+        assert!(restored.hits.is_empty());
+        assert!(restored.cache.is_empty());
+
+        let oversized = BlockSearchState {
+            query: "x".repeat(block_mode::BLOCK_SEARCH_QUERY_MAX_BYTES + 1),
+            case_sensitive: true,
+            scope: block_mode::BlockSearchScope::Command,
+            filter: BlockSearchFilter::Failed,
+            ..BlockSearchState::default()
+        };
+        memory.capture(&oversized);
+        assert!(memory.query.is_empty());
+        assert!(memory.case_sensitive);
+        assert_eq!(memory.scope, block_mode::BlockSearchScope::Command);
+        assert_eq!(memory.filter, BlockSearchFilter::Failed);
     }
 
     #[test]
