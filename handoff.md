@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.2)
+Updated: 2026-08-26 (Block Search 3.3)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,11 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.3 (2026-08-26)**: Enter and Shift+Enter now close or
+  advance only after the selected zone is revalidated and actually revealed.
+  A result evicted between paint and activation keeps the picker open, refreshes
+  the hit list, and reports the stale target instead of silently stepping.
 
 - **Block Search 3.2 (2026-08-26)**: Home/End and ten-row PageUp/PageDown
   navigation now complement the existing wrapping arrows and position label.

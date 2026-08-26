@@ -931,6 +931,23 @@ fn next_block_search_epoch(epoch: &mut u64) -> Option<u64> {
     Some(next)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSearchActivation {
+    RejectStale,
+    Close,
+    Advance,
+}
+
+fn block_search_activation(target_is_live: bool, continuous_review: bool) -> BlockSearchActivation {
+    if !target_is_live {
+        BlockSearchActivation::RejectStale
+    } else if continuous_review {
+        BlockSearchActivation::Advance
+    } else {
+        BlockSearchActivation::Close
+    }
+}
+
 #[derive(Default)]
 struct BlockSearchState {
     /// Pane identity owning the cache. Zone ids are only pane-local.
@@ -7440,28 +7457,37 @@ impl Frost {
                 }
                 let owner = state.session_id;
                 let target = state.hits.get(state.selected).cloned();
-                // Shift+Enter walks the result set in place. Plain Enter keeps
-                // the accept-and-close contract; without the stepping variant,
-                // visiting several matches of one query meant reopening the
-                // picker and retyping it for every single hit.
-                if mods.shift() {
-                    if let Some(hit) = target {
-                        if self.block_search_target_is_live(owner, hit.zone_id) {
-                            self.reveal_block_search_hit(&hit);
-                        }
+                let Some(hit) = target else {
+                    return Some(Task::none());
+                };
+                match block_search_activation(
+                    self.block_search_target_is_live(owner, hit.zone_id),
+                    mods.shift(),
+                ) {
+                    BlockSearchActivation::RejectStale => {
+                        // Recompute against the current zone set and keep the
+                        // picker open. Never advance from a result we did not
+                        // actually reveal.
+                        self.block_search_recompute();
+                        self.push_toast(
+                            "Search result is no longer available".to_string(),
+                            ToastKind::Info,
+                        );
+                        return Some(self.block_search_snap_task());
                     }
-                    if let Some(state) = self.block_search.as_mut() {
-                        state.select_next();
-                    }
-                    return Some(self.block_search_snap_task());
-                }
-                self.block_search = None;
-                if let Some(hit) = target {
-                    if self.block_search_target_is_live(owner, hit.zone_id) {
+                    BlockSearchActivation::Close => {
                         self.reveal_block_search_hit(&hit);
+                        self.block_search = None;
+                        return Some(Task::none());
+                    }
+                    BlockSearchActivation::Advance => {
+                        self.reveal_block_search_hit(&hit);
+                        if let Some(state) = self.block_search.as_mut() {
+                            state.select_next();
+                        }
+                        return Some(self.block_search_snap_task());
                     }
                 }
-                return Some(Task::none());
             }
             Key::Named(Named::ArrowDown) => {
                 state.select_next();
@@ -22020,6 +22046,26 @@ mod tests {
         let mut exhausted = u64::MAX;
         assert_eq!(next_block_search_epoch(&mut exhausted), None);
         assert_eq!(exhausted, u64::MAX);
+    }
+
+    #[test]
+    fn block_search_continuous_review_advances_only_after_a_live_reveal() {
+        assert_eq!(
+            block_search_activation(true, false),
+            BlockSearchActivation::Close
+        );
+        assert_eq!(
+            block_search_activation(true, true),
+            BlockSearchActivation::Advance
+        );
+        assert_eq!(
+            block_search_activation(false, false),
+            BlockSearchActivation::RejectStale
+        );
+        assert_eq!(
+            block_search_activation(false, true),
+            BlockSearchActivation::RejectStale
+        );
     }
 
     #[test]
