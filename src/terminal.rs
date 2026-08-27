@@ -5647,14 +5647,35 @@ impl TerminalState {
         // OSC 52 format: <selection>;<base64-data>
         // selection: c=clipboard, p=primary, s=select (we treat all as clipboard)
         // data: ? means query, base64 means set
+        //
+        // Cap on payload size: a remote process should not be able to push
+        // arbitrary multi-MB blobs into the host clipboard. xterm uses 100 KB
+        // by default; we match that.
+        const OSC52_MAX_BYTES: usize = 100 * 1024;
         if let Some((_sel, data)) = value.split_once(';') {
             if data == "?" {
                 // Query: signal main loop to read clipboard and respond
                 self.pending_osc52_clipboard_query = true;
             } else if !data.is_empty() {
+                if data.len() > OSC52_MAX_BYTES.saturating_mul(4) / 3 + 8 {
+                    // Reject before even attempting to decode.
+                    crate::debug_log!(
+                        "[OSC52] rejecting clipboard set: encoded {} bytes exceeds limit",
+                        data.len()
+                    );
+                    return;
+                }
                 // Set: decode base64 and store for main loop to apply
                 if let Some(decoded) = Self::decode_base64(data) {
-                    self.pending_osc52_clipboard_set = Some(decoded);
+                    if decoded.len() <= OSC52_MAX_BYTES {
+                        self.pending_osc52_clipboard_set = Some(decoded);
+                    } else {
+                        crate::debug_log!(
+                            "[OSC52] rejecting clipboard set: decoded {} bytes exceeds {}",
+                            decoded.len(),
+                            OSC52_MAX_BYTES
+                        );
+                    }
                 }
             }
         }
@@ -6891,6 +6912,45 @@ impl TerminalState {
         }
     }
 
+    /// Consume a UTF-8 lead byte together with its continuation bytes.
+    ///
+    /// - Not enough bytes left in this read: stash the lead byte and wait for
+    ///   the next batch.
+    /// - Continuation bytes all present: decode and print the character; if
+    ///   the sequence is well-formed in shape but invalid in content
+    ///   (overlong encoding, surrogate), print U+FFFD instead.
+    /// - A non-continuation byte inside the expected span: the sequence is
+    ///   malformed, so print U+FFFD and consume only the lead byte, leaving
+    ///   the offending byte to be processed normally.
+    fn consume_utf8_lead(&mut self, byte: u8, expected: u8, data: &[u8], i: &mut usize) {
+        let need = expected as usize;
+        if *i + need > data.len() {
+            // Incomplete: stash the lead byte and wait for the next batch.
+            self.utf8_buf[0] = byte;
+            self.utf8_len = 1;
+            self.utf8_expected = expected;
+            *i += 1;
+            return;
+        }
+
+        let all_continuation = (1..need).all(|k| (data[*i + k] & 0xC0) == 0x80);
+        if all_continuation {
+            match std::str::from_utf8(&data[*i..*i + need]) {
+                Ok(s) => {
+                    if let Some(ch) = s.chars().next() {
+                        self.put_char(ch, true);
+                    }
+                }
+                Err(_) => self.put_char('\u{FFFD}', true),
+            }
+            *i += need;
+        } else {
+            // Lead byte directly followed by a non-continuation byte.
+            self.put_char('\u{FFFD}', true);
+            *i += 1;
+        }
+    }
+
     pub fn process_input(&mut self, input: &[u8]) {
         // A fragmented kitty APC streams against its own bounded buffer; this
         // must run before the pending_escape merge so the APC never pays the
@@ -6925,6 +6985,16 @@ impl TerminalState {
             let token_start = i;
             let capture_idle_background = self.idle_background_capture_active();
             let byte = data_slice[i];
+
+            // A pending multi-byte UTF-8 sequence interrupted by a
+            // non-continuation byte is malformed: emit the U+FFFD replacement
+            // character per Unicode guidance and reset, then process the
+            // current byte normally so the partial sequence is neither
+            // silently dropped nor allowed to swallow later bytes.
+            if self.utf8_len > 0 && (byte & 0xC0) != 0x80 {
+                self.put_char('\u{FFFD}', true);
+                self.utf8_len = 0;
+            }
 
             match byte {
                 b'\x08' => {
@@ -7386,83 +7456,43 @@ impl TerminalState {
                 }
                 // UTF-8 multi-byte sequences: try to consume all bytes eagerly
                 0xC2..=0xDF => {
-                    let expected: u8 = 2;
-                    if i + 1 < data_slice.len() && (data_slice[i + 1] & 0xC0) == 0x80 {
-                        let buf = [byte, data_slice[i + 1], 0, 0];
-                        if let Ok(s) = std::str::from_utf8(&buf[..2]) {
-                            if let Some(ch) = s.chars().next() {
-                                self.put_char(ch, true);
-                            }
-                        }
-                        i += 2;
-                    } else {
-                        self.utf8_buf[0] = byte;
-                        self.utf8_len = 1;
-                        self.utf8_expected = expected;
-                        i += 1;
-                    }
+                    self.consume_utf8_lead(byte, 2, data_slice, &mut i);
                 }
                 0xE0..=0xEF => {
-                    let expected: u8 = 3;
-                    if i + 2 < data_slice.len()
-                        && (data_slice[i + 1] & 0xC0) == 0x80
-                        && (data_slice[i + 2] & 0xC0) == 0x80
-                    {
-                        let buf = [byte, data_slice[i + 1], data_slice[i + 2], 0];
-                        if let Ok(s) = std::str::from_utf8(&buf[..3]) {
-                            if let Some(ch) = s.chars().next() {
-                                self.put_char(ch, true);
-                            }
-                        }
-                        i += 3;
-                    } else {
-                        self.utf8_buf[0] = byte;
-                        self.utf8_len = 1;
-                        self.utf8_expected = expected;
-                        i += 1;
-                    }
+                    self.consume_utf8_lead(byte, 3, data_slice, &mut i);
                 }
                 0xF0..=0xF4 => {
-                    let expected: u8 = 4;
-                    if i + 3 < data_slice.len()
-                        && (data_slice[i + 1] & 0xC0) == 0x80
-                        && (data_slice[i + 2] & 0xC0) == 0x80
-                        && (data_slice[i + 3] & 0xC0) == 0x80
-                    {
-                        let buf = [
-                            byte,
-                            data_slice[i + 1],
-                            data_slice[i + 2],
-                            data_slice[i + 3],
-                        ];
-                        if let Ok(s) = std::str::from_utf8(&buf[..4]) {
-                            if let Some(ch) = s.chars().next() {
-                                self.put_char(ch, true);
-                            }
-                        }
-                        i += 4;
-                    } else {
-                        self.utf8_buf[0] = byte;
-                        self.utf8_len = 1;
-                        self.utf8_expected = expected;
-                        i += 1;
-                    }
+                    self.consume_utf8_lead(byte, 4, data_slice, &mut i);
                 }
                 _ => {
+                    // Reaching here, byte is either a continuation byte (the
+                    // abandoned-sequence check above guarantees a sequence is
+                    // really pending) or an invalid UTF-8 lead byte
+                    // (0xC0/0xC1/0xF5..=0xFF), or an unhandled C0 control.
                     if self.utf8_len > 0 && (byte & 0xC0) == 0x80 {
                         self.utf8_buf[self.utf8_len as usize] = byte;
                         self.utf8_len += 1;
                         if self.utf8_len == self.utf8_expected {
-                            if let Ok(s) =
-                                std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize])
+                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize])
                             {
-                                if let Some(ch) = s.chars().next() {
-                                    self.put_char(ch, true);
+                                Ok(s) => {
+                                    if let Some(ch) = s.chars().next() {
+                                        self.put_char(ch, true);
+                                    }
                                 }
+                                // Full length but invalid content (overlong
+                                // encoding / surrogate): emit U+FFFD.
+                                Err(_) => self.put_char('\u{FFFD}', true),
                             }
                             self.utf8_len = 0;
                         }
                     } else {
+                        // Orphan continuation bytes and invalid lead bytes are
+                        // malformed UTF-8 and get U+FFFD; unhandled C0
+                        // controls stay ignored.
+                        if byte >= 0x80 {
+                            self.put_char('\u{FFFD}', true);
+                        }
                         self.utf8_len = 0;
                     }
                     i += 1;
@@ -15138,6 +15168,106 @@ mod tests {
         assert!(terminal.grid[0][2].flags.wide());
         assert!(terminal.grid[0][3].flags.wide_continuation());
         assert_eq!(terminal.cursor_col, 4);
+    }
+
+    #[test]
+    fn malformed_utf8_bytes_emit_replacement_character() {
+        let mut terminal = TerminalState::new(20, 2);
+
+        // Invalid lead byte (0xFF) and orphan continuation byte (0x80):
+        // one U+FFFD each.
+        terminal.process_input(b"\xff\x80");
+        assert_eq!(terminal.grid[0][0].character, '\u{FFFD}');
+        assert_eq!(terminal.grid[0][1].character, '\u{FFFD}');
+        assert_eq!(terminal.cursor_col, 2);
+    }
+
+    #[test]
+    fn malformed_utf8_sequence_emits_replacement_without_swallowing_text() {
+        let mut terminal = TerminalState::new(20, 2);
+
+        // Lead byte directly followed by ASCII: U+FFFD for the lead byte,
+        // then the ASCII byte is printed normally.
+        terminal.process_input(b"\xc3A");
+        assert_eq!(terminal.grid[0][0].character, '\u{FFFD}');
+        assert_eq!(terminal.grid[0][1].character, 'A');
+
+        // Full length but invalid content (overlong encoding): a single
+        // U+FFFD for the whole sequence.
+        terminal.process_input(b"\xe0\x80\x80");
+        assert_eq!(terminal.grid[0][2].character, '\u{FFFD}');
+
+        // Encoded surrogate half: likewise a single U+FFFD.
+        terminal.process_input(b"\xed\xa0\x80");
+        assert_eq!(terminal.grid[0][3].character, '\u{FFFD}');
+        assert_eq!(terminal.cursor_col, 4);
+    }
+
+    #[test]
+    fn truncated_utf8_sequence_across_reads_emits_one_replacement() {
+        let mut terminal = TerminalState::new(20, 2);
+
+        // A valid sequence split across reads still decodes.
+        terminal.process_input(b"\xe4\xb8");
+        terminal.process_input(b"\xad");
+        assert_eq!(terminal.grid[0][0].character, '中');
+
+        // A pending sequence abandoned by the next read emits a single
+        // U+FFFD (not one per buffered byte), and the buffered bytes can no
+        // longer combine with a later continuation byte into a spurious char.
+        terminal.process_input(b"\xe4\xb8");
+        terminal.process_input(b"X\xa9");
+        assert_eq!(terminal.grid[0][2].character, '\u{FFFD}');
+        assert_eq!(terminal.grid[0][3].character, 'X');
+        assert_eq!(terminal.grid[0][4].character, '\u{FFFD}');
+        assert_eq!(terminal.cursor_col, 5);
+    }
+
+    #[test]
+    fn osc52_set_accepts_payload_at_the_100kib_boundary() {
+        use base64::Engine as _;
+        let mut terminal = TerminalState::new(8, 2);
+
+        let payload = base64::engine::general_purpose::STANDARD.encode("x".repeat(100 * 1024));
+        terminal.process_input(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        assert_eq!(
+            terminal.take_osc52_clipboard_set().map(|text| text.len()),
+            Some(100 * 1024)
+        );
+    }
+
+    #[test]
+    fn osc52_set_rejects_payload_above_the_100kib_cap() {
+        use base64::Engine as _;
+        let mut terminal = TerminalState::new(8, 2);
+
+        // 100 KiB + 1 passes the encoded-length pre-check (its base64 size
+        // matches the boundary payload) but exceeds the decoded cap.
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode("x".repeat(100 * 1024 + 1));
+        terminal.process_input(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        assert_eq!(terminal.take_osc52_clipboard_set(), None);
+    }
+
+    #[test]
+    fn osc52_set_rejects_oversized_base64_before_decoding() {
+        use base64::Engine as _;
+        let mut terminal = TerminalState::new(8, 2);
+
+        // Encoded length beyond the pre-check limit: rejected without
+        // decoding, leaving no pending clipboard write.
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode("x".repeat(200 * 1024));
+        terminal.process_input(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        assert_eq!(terminal.take_osc52_clipboard_set(), None);
+
+        // Ordinary small writes and the query path are unaffected by the cap.
+        let small = base64::engine::general_purpose::STANDARD.encode("hello");
+        terminal.process_input(format!("\x1b]52;c;{small}\x07").as_bytes());
+        assert_eq!(terminal.take_osc52_clipboard_set().as_deref(), Some("hello"));
+
+        terminal.process_input(b"\x1b]52;c;?\x07");
+        assert!(terminal.take_osc52_clipboard_query());
     }
 
     #[test]
