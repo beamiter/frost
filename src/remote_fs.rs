@@ -365,6 +365,13 @@ const OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// A `list` larger than this is almost certainly a mistake (or an attack on
 /// the parser); fail closed instead of buffering unboundedly.
 const MAX_LIST_BYTES: usize = 4 * 1024 * 1024;
+/// One directory renders at most this many entries. The byte cap above bounds
+/// the probe read, but the parsed tree is capped too so a huge remote
+/// directory cannot fill the sidebar with an unbounded listing.
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+/// Skipped pairs (dotfiles, unknown kinds) still cost a loop iteration, so
+/// scanning also stops once far more pairs than the entry cap were seen.
+const MAX_SCANNED_PAIRS: usize = MAX_DIRECTORY_ENTRIES * 4;
 /// `home`/`mkdir`/`mv`/`cp` print next to nothing on stdout.
 const MAX_OP_BYTES: usize = 64 * 1024;
 /// Local recursive copies refuse to descend deeper than this.
@@ -830,11 +837,19 @@ fn sort_entries(entries: &mut [Entry]) {
 /// Parse a `list` probe buffer: NUL-separated `"<t>\0<name>\0"` pairs. `d` is
 /// a directory, `f`/`l` are files (symlinks are never expanded into dirs).
 /// Non-UTF-8 names are kept lossy; dotfiles are dropped here so remote and
-/// local listings share one hidden-file policy.
+/// local listings share one hidden-file policy. At most MAX_DIRECTORY_ENTRIES
+/// entries are kept, and scanning stops after MAX_SCANNED_PAIRS pairs, so a
+/// hostile or enormous listing cannot grow the tree (or the parse work)
+/// without bound.
 fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut fields = bytes.split(|byte| *byte == 0);
+    let mut scanned = 0usize;
     while let (Some(kind), Some(name)) = (fields.next(), fields.next()) {
+        scanned += 1;
+        if scanned > MAX_SCANNED_PAIRS || entries.len() >= MAX_DIRECTORY_ENTRIES {
+            break;
+        }
         if name.is_empty() || name == b"." || name == b".." {
             continue;
         }
@@ -2479,6 +2494,33 @@ mod tests {
         let entries = parse_list(&bytes, dir);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["Alpha", "beta", "apple", "Zulu"]);
+    }
+
+    #[test]
+    fn parse_list_caps_entries_at_max() {
+        let dir = Path::new("/base");
+        let mut bytes = Vec::new();
+        for index in 0..MAX_DIRECTORY_ENTRIES + 50 {
+            bytes.extend_from_slice(format!("f\0file-{index:06}\0").as_bytes());
+        }
+        let entries = parse_list(&bytes, dir);
+        // Parsing stays bounded; the tree never sees more than the cap.
+        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+    }
+
+    #[test]
+    fn parse_list_stops_scanning_past_the_pair_bound() {
+        let dir = Path::new("/base");
+        let mut bytes = Vec::new();
+        // Skipped pairs (here dotfiles) must not keep the loop alive forever:
+        // after MAX_SCANNED_PAIRS of them the parse stops, so the visible
+        // entries behind them are never reached.
+        for index in 0..MAX_SCANNED_PAIRS + 10 {
+            bytes.extend_from_slice(format!("f\0.hidden-{index:06}\0").as_bytes());
+        }
+        bytes.extend_from_slice(b"f\0visible\0");
+        let entries = parse_list(&bytes, dir);
+        assert!(entries.is_empty());
     }
 
     // ── Validation ──────────────────────────────────────────────────────
