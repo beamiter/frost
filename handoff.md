@@ -33,7 +33,7 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   login. A startup race receives
   one bounded automatic retry, followed by an exact-command Retry action in
   Files. The shared core is pinned
-  at `063af5d33f66e449336e06319096c90463c33938`; all 867 tests and
+  at `1f5f0fbcfd91a084da9216392fe5ab26a5994adc`; all 867 tests and
   warning-denied Clippy pass.
 
 - **Files remote-target safety (2026-08-27)**: the Files header now exposes a
