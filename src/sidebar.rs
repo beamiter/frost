@@ -130,6 +130,35 @@ impl Sidebar {
         self.generation
     }
 
+    /// Whether an asynchronous location/home probe still belongs to the
+    /// currently selected tree. Callers use this before turning a failed
+    /// remote probe into a Local fallback; a late failure from an older
+    /// selection must not pull a newer tree back to this machine.
+    pub fn accepts_generation(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    /// Stamp non-load work (for example an off-thread drop preflight) with the
+    /// same tree identity used by directory requests.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Invalidate the current remote/root identity and start loading a known
+    /// local directory. The UI pairs this with clearing path-scoped intent.
+    pub fn reset_to_local(&mut self, path: PathBuf) -> DirectoryRequest {
+        self.location = FsLocation::Local;
+        self.set_current_dir(path)
+    }
+
+    /// A proven-identical remote profile moved to another config slot. Keep
+    /// its path, but invalidate the old index-stamped load and immediately
+    /// issue a replacement against the new host snapshot.
+    pub fn rebind_location_and_refresh(&mut self, location: FsLocation) -> DirectoryRequest {
+        self.location = location;
+        self.refresh()
+    }
+
     /// Apply an asynchronously resolved start directory for a pending
     /// location change. Returns `None` for stale resolutions and for failures
     /// (the root then shows the error instead of a tree).
@@ -330,6 +359,8 @@ mod tests {
         let first = sidebar.begin_location_change(FsLocation::Remote(0));
         let second = sidebar.begin_location_change(FsLocation::Local);
         assert_ne!(first, second);
+        assert!(!sidebar.accepts_generation(first));
+        assert!(sidebar.accepts_generation(second));
         // A stale resolution for the older change is dropped, the current one
         // re-roots the tree at the resolved start directory.
         assert!(sidebar.resolve_location(first, Ok(root.clone())).is_none());
@@ -348,6 +379,74 @@ mod tests {
         assert!(matches!(sidebar.root.state, DirectoryState::Error(_)));
 
         std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn delayed_file_intent_expires_when_tree_identity_changes() {
+        let mut sidebar = Sidebar::new();
+        let menu_generation = sidebar.generation();
+        assert!(sidebar.accepts_generation(menu_generation));
+
+        sidebar.begin_location_change(FsLocation::Remote(0));
+        assert!(
+            !sidebar.accepts_generation(menu_generation),
+            "an old menu/dialog cannot act after a location switch"
+        );
+
+        let remote_generation = sidebar.generation();
+        sidebar.set_current_dir(PathBuf::from("/tmp"));
+        assert!(
+            !sidebar.accepts_generation(remote_generation),
+            "an old root-scoped action cannot act after rerooting"
+        );
+    }
+
+    #[test]
+    fn remote_home_failure_can_recover_to_a_loaded_local_root() {
+        let root = temp_tree();
+        let mut sidebar = Sidebar::new();
+        let failed_probe = sidebar.begin_location_change(FsLocation::Remote(0));
+        assert!(sidebar.accepts_generation(failed_probe));
+
+        let request = sidebar.reset_to_local(root.clone());
+        assert_eq!(sidebar.location, FsLocation::Local);
+        assert!(!sidebar.accepts_generation(failed_probe));
+        assert!(sidebar.apply_load(load_directory(request)));
+        assert_eq!(sidebar.root.path, root);
+        assert_eq!(sidebar.root.state, DirectoryState::Loaded);
+
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn exact_profile_reindex_replaces_pending_load_without_sticking() {
+        let mut first = crate::config::default_remote_hosts()[0].clone();
+        first.name = "first".to_string();
+        let mut second = first.clone();
+        second.name = "second".to_string();
+
+        let mut sidebar = Sidebar::new();
+        sidebar.set_hosts(vec![first.clone(), second.clone()]);
+        sidebar.location = FsLocation::Remote(0);
+        let pending = sidebar.set_current_dir(PathBuf::from("/remote/home"));
+
+        sidebar.set_hosts(vec![second, first]);
+        let replacement = sidebar.rebind_location_and_refresh(FsLocation::Remote(1));
+        assert_ne!(pending.generation, replacement.generation);
+        assert_eq!(replacement.location, FsLocation::Remote(1));
+        assert_eq!(replacement.hosts, sidebar.hosts_snapshot());
+
+        assert!(!sidebar.apply_load(DirectoryResult {
+            generation: pending.generation,
+            path: pending.path,
+            entries: Ok(Vec::new()),
+        }));
+        assert!(sidebar.apply_load(DirectoryResult {
+            generation: replacement.generation,
+            path: replacement.path,
+            entries: Ok(Vec::new()),
+        }));
+        assert_eq!(sidebar.root.state, DirectoryState::Loaded);
     }
 
     #[test]

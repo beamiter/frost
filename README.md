@@ -25,7 +25,12 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   文件按流式传输、目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度
   （可随时取消，取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
   从系统文件管理器把文件/目录拖放到文件树即可导入：落在目录行上导入该目录、其余位置导入当前根目录，
-  远程位置走同一条上传通道；一次拖放最多 256 项、总量不超过传输上限，同名目标逐项拒绝
+  远程位置走同一条上传通道；一次拖放最多 256 项、总量不超过传输上限，同名目标逐项拒绝。
+  Files 标题区的 **Terminal here** 会从当前本地树根新建标签；远端时入口明确显示
+  **Remote terminal (default dir)**，复用同一 profile 连接并进入其默认目录。远端 profile 列表
+  编辑或热重载后，活动位置只在旧 profile 的完整身份于新列表中恰有一个匹配时重映射；删除、修改或
+  重复身份都会安全回到 Local，并作废旧选择、文件剪贴板、对话框、拖放计划与传输。远端 home 探测
+  失败也会回到可用的 Local 树并保留内联错误，可直接重新选择 profile 重试。
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 Block mode：完成命令、Background 输出和当前输入/运行区以主题相对卡片呈现（状态条、轻染色、圆角、状态/耗时徽标，支持普通与 Compact Block Spacing），空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间——
@@ -593,4 +598,19 @@ imports them — onto a directory row into that directory, anywhere else into
 the current root; remote locations go through the same upload channel with
 progress and cancel. A drop is capped at 256 items and the transfer size
 limit, and existing names are refused per item, never overwritten. Remote
-failures surface inline in the panel rather than taking the tree down.
+operation failures surface inline in the panel rather than taking the tree
+down. The Files header also offers **Terminal here**, which opens a new local
+session at the visible tree root. On a remote tree it becomes **Remote terminal
+(default dir)** and uses that same current profile's normal connection path,
+which starts in the profile's default directory rather than pretending the
+sidebar path can be transferred to a shell.
+
+Remote-host config edits and hot reloads never reinterpret a saved numeric
+index. The current tree and file clipboard are rebound only when the complete
+old profile has exactly one active match in the new list. A removed, edited, or
+duplicate/ambiguous identity fails closed to Local and invalidates old
+selection, dialogs, delete confirmations, clipboard, drop plans, and transfer
+feedback. Delayed file actions carry the tree generation and are rejected
+after any root/location change. If the initial remote-home probe fails, the
+panel returns to a usable Local tree, shows the bounded error inline, and lets
+the profile be selected again for a retry.

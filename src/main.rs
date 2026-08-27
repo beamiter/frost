@@ -1700,6 +1700,12 @@ struct SidebarMenuState {
     is_dir: bool,
     at: iced::Point,
     targets: Vec<(std::path::PathBuf, bool)>,
+    /// File-tree identity at the right press. Root/location changes make this
+    /// menu and every dialog derived from it inert.
+    generation: u64,
+    /// Exact Copy/Cut intent visible when the menu opened. Paste must not
+    /// silently substitute a newer clipboard, even when its payload is equal.
+    clipboard_id: Option<u64>,
 }
 
 /// What the sidebar's modal text input is collecting a name for.
@@ -1719,6 +1725,13 @@ struct SidebarDialogState {
     path: std::path::PathBuf,
     input: String,
     error: Option<String>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarDeleteConfirmation {
+    paths: Vec<std::path::PathBuf>,
+    generation: u64,
 }
 
 /// Location-scoped sidebar clipboard: one or more items (path, is_dir).
@@ -1726,9 +1739,112 @@ struct SidebarDialogState {
 /// locations downloads, uploads, or relays them one by one.
 #[derive(Clone, Debug)]
 struct FsClipboard {
+    id: u64,
     loc: remote_fs::FsLocation,
     items: Vec<(std::path::PathBuf, bool)>,
     cut: bool,
+}
+
+fn next_sidebar_clipboard_id(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
+fn next_sidebar_context_epoch(current: Option<u64>) -> Option<u64> {
+    current.and_then(|epoch| epoch.checked_add(1))
+}
+
+/// Retire only sources that the backend proved were moved, renamed, or
+/// deleted, and only from the exact Copy/Cut intent the worker observed when
+/// dispatching. A later intent survives even if it has an identical payload.
+/// Invalidating a directory also invalidates any explicitly selected
+/// descendants.
+fn settle_sidebar_clipboard_sources(
+    clipboard: &mut Option<FsClipboard>,
+    consumed_id: Option<u64>,
+    consumed_paths: &[std::path::PathBuf],
+) {
+    let Some(consumed_id) = consumed_id else {
+        return;
+    };
+    let Some(active) = clipboard.as_mut() else {
+        return;
+    };
+    if active.id != consumed_id || consumed_paths.is_empty() {
+        return;
+    }
+    active.items.retain(|(path, _)| {
+        !consumed_paths
+            .iter()
+            .any(|consumed| path == consumed || path.starts_with(consumed))
+    });
+    if active.items.is_empty() {
+        *clipboard = None;
+    }
+}
+
+fn sidebar_menu_clipboard_is_current(
+    opened_clipboard_id: Option<u64>,
+    live_clipboard_id: Option<u64>,
+) -> bool {
+    opened_clipboard_id == live_clipboard_id
+}
+
+fn sidebar_clipboard_id_at_location(
+    clipboard: Option<&FsClipboard>,
+    location: &remote_fs::FsLocation,
+) -> Option<u64> {
+    clipboard
+        .filter(|clipboard| &clipboard.loc == location)
+        .map(|clipboard| clipboard.id)
+}
+
+/// Rebind one location across a remote-host config replacement by the complete
+/// old profile identity, never by its numeric slot. Exactly one active match is
+/// required: removal, any profile edit, an out-of-range old slot, or duplicate
+/// identities all fail closed.
+fn unique_active_remote_profile_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    expected: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> Option<usize> {
+    config::validate_remote_host(expected).ok()?;
+    let mut matches = hosts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, profile)| (profile == expected).then_some(index));
+    let only = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    config::validate_remote_host_at(hosts, only).ok()?;
+    Some(only)
+}
+
+fn remap_sidebar_location(
+    old_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    new_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    location: &remote_fs::FsLocation,
+) -> Option<remote_fs::FsLocation> {
+    match location {
+        remote_fs::FsLocation::Local => Some(remote_fs::FsLocation::Local),
+        remote_fs::FsLocation::Remote(old_index) => {
+            let old_profile = config::validate_remote_host_at(old_hosts, *old_index).ok()?;
+            unique_active_remote_profile_index(new_hosts, old_profile)
+                .map(remote_fs::FsLocation::Remote)
+        }
+    }
+}
+
+fn sidebar_terminal_entry_copy(location: &remote_fs::FsLocation) -> (&'static str, &'static str) {
+    match location {
+        remote_fs::FsLocation::Local => (
+            "Terminal here",
+            "Open a new local terminal at the current tree root",
+        ),
+        remote_fs::FsLocation::Remote(_) => (
+            "Remote terminal\n(default dir)",
+            "Open a new remote terminal for this profile at its default directory",
+        ),
+    }
 }
 
 /// UI state for one in-flight sidebar transfer: the shared byte/cancel handle
@@ -1926,11 +2042,49 @@ enum SidebarOp {
 /// `cancelled` is a neutral user abort — never styled as an error.
 #[derive(Clone, Debug)]
 struct SidebarOpReport {
+    context_epoch: u64,
     location: remote_fs::FsLocation,
+    location_profile: Option<jterm_core::jsh_remote::RemoteHostConfig>,
+    consumed_clipboard_id: Option<u64>,
+    /// Sources the backend proved no longer exist at their old path: completed
+    /// cut moves plus successful explicit Rename/Delete items. This can retire
+    /// dangling Copy as well as Cut entries and is settled before the report's
+    /// UI-context gate.
+    consumed_paths: Vec<std::path::PathBuf>,
     op: SidebarOp,
     warning: Option<(String, bool)>,
     cancelled: bool,
     result: Result<(), String>,
+}
+
+type SidebarWorkerOutcome = (
+    remote_fs::FsLocation,
+    Option<(String, bool)>,
+    bool,
+    std::io::Result<()>,
+    Vec<std::path::PathBuf>,
+);
+
+fn sidebar_op_report_matches_context(
+    report_epoch: u64,
+    report_location: &remote_fs::FsLocation,
+    report_profile: Option<&jterm_core::jsh_remote::RemoteHostConfig>,
+    current_epoch: Option<u64>,
+    current_location: &remote_fs::FsLocation,
+    current_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> bool {
+    if Some(report_epoch) != current_epoch {
+        return false;
+    }
+    match (report_location, current_location, report_profile) {
+        (remote_fs::FsLocation::Local, remote_fs::FsLocation::Local, None) => true,
+        (
+            remote_fs::FsLocation::Remote(_report_index),
+            remote_fs::FsLocation::Remote(current_index),
+            Some(profile),
+        ) => unique_active_remote_profile_index(current_hosts, profile) == Some(*current_index),
+        _ => false,
+    }
 }
 
 /// One entry of the file tree's location picker: a location plus the label
@@ -2666,11 +2820,14 @@ enum Message {
     SidebarDragMove(iced::Point),
     SidebarDragEnd,
     SidebarInsertPath(std::path::PathBuf),
+    /// Open a new terminal from the Files header. Local starts at the visible
+    /// tree root; Remote opens the selected profile at its default directory.
+    SidebarOpenTerminal(u64),
     SidebarGoParent,
     SidebarRefresh,
     SidebarLoaded(sidebar::DirectoryResult),
     /// Switch the file tree between Local and a configured remote host.
-    SidebarSetLocation(remote_fs::FsLocation),
+    SidebarSetLocation(u64, remote_fs::FsLocation),
     /// Async start-directory resolution for a location switch (generation-guarded).
     SidebarLocationResolved(u64, Result<std::path::PathBuf, String>),
     /// Pointer enter/exit on the dock gates the menu-anchor tracking below.
@@ -2680,16 +2837,16 @@ enum Message {
     SidebarPointerMoved(iced::Point),
     /// Left-click on a tree row: modifier-aware (Ctrl toggles selection,
     /// Shift ranges from the anchor, plain keeps the old toggle/insert).
-    SidebarRowClick(std::path::PathBuf, bool),
+    SidebarRowClick(u64, std::path::PathBuf, bool),
     /// Toggle the inline tree filter row.
     SidebarFilterToggle,
     /// Live edit of the tree filter query.
     SidebarFilterInput(String),
     /// Right-press on a tree row: open the file-ops menu for that node
     /// (path, is_dir).
-    SidebarMenuOpen(std::path::PathBuf, bool),
+    SidebarMenuOpen(u64, std::path::PathBuf, bool),
     /// Right-press on the empty area below the tree: menu for the root dir.
-    SidebarMenuOpenRoot,
+    SidebarMenuOpenRoot(u64),
     SidebarMenuClose,
     SidebarMenuAction(SidebarMenuAction),
     SidebarDialogInput(String),
@@ -2697,20 +2854,20 @@ enum Message {
     SidebarDialogCancel,
     SidebarDeleteConfirm,
     SidebarDeleteCancel,
-    SidebarOpFinished(SidebarOpReport),
+    SidebarOpFinished(Box<SidebarOpReport>),
     /// 250 ms poll of the in-flight transfer's byte counter.
     SidebarTransferTick,
     /// The cancel button beside the transfer progress notice.
     SidebarTransferCancel,
     /// Pointer entered/left a tree row (drives drag-and-drop hit-testing).
-    SidebarRowHover(Option<(std::path::PathBuf, bool)>),
+    SidebarRowHover(u64, Option<(std::path::PathBuf, bool)>),
     /// A file was dropped on the window: over the files panel it accumulates
     /// into the import burst; anywhere else it keeps the terminal behavior.
     FileDropped(std::path::PathBuf),
     /// Debounce tick closing a drop burst: plan it off the UI thread.
-    SidebarDropFlush,
+    SidebarDropFlush(u64),
     /// A drop burst's plan is ready: dispatch the import.
-    SidebarDropPlanned(Result<DropPlan, String>),
+    SidebarDropPlanned(u64, Result<DropPlan, String>),
     /// Files hovered into / left the window (drives the import hint).
     SidebarDropHover(bool),
     /// Press on a divider (identified by its owning split node + gap).
@@ -3745,9 +3902,12 @@ struct Frost {
     sidebar_dialog: Option<SidebarDialogState>,
     /// Delete confirmation targets; the modal shows the count and the first
     /// few full paths before dispatch.
-    sidebar_delete_confirm: Option<Vec<std::path::PathBuf>>,
+    sidebar_delete_confirm: Option<SidebarDeleteConfirmation>,
     /// Location-scoped clipboard for sidebar Copy/Cut/Paste.
     sidebar_clipboard: Option<FsClipboard>,
+    /// Monotonic identity for real Copy/Cut replacements. A completed old cut
+    /// may retire only the exact clipboard generation it started from.
+    sidebar_next_clipboard_id: u64,
     /// In-flight cross-location transfer (progress notice + cancel button).
     sidebar_transfer: Option<SidebarTransferUi>,
     /// Tree row under the pointer right now (path, is_dir) — the drop target
@@ -3761,8 +3921,8 @@ struct Frost {
     sidebar_filter: Option<String>,
     /// Paths of the in-flight drop burst (iced delivers one event per path).
     sidebar_drop_burst: Vec<std::path::PathBuf>,
-    /// Whether the burst's debounce task is already armed.
-    sidebar_drop_debounce_armed: bool,
+    /// Tree generation whose drop burst owns the armed debounce task.
+    sidebar_drop_debounce_generation: Option<u64>,
     /// Whether the current sidebar notice is the drop hint (cleared on
     /// hover-out or drop flush; never clobbers a real notice).
     sidebar_drop_hint: bool,
@@ -3773,6 +3933,15 @@ struct Frost {
     /// Transient status line under the files header (op failures/success);
     /// the flag marks neutral (progress/cancelled) vs error styling.
     sidebar_notice: Option<(String, bool)>,
+    /// Monotonic identity of the sidebar's remote-host snapshot. Picker
+    /// messages rendered against an older list are refused rather than having
+    /// their numeric index reinterpreted.
+    sidebar_hosts_epoch: u64,
+    /// Changes only when a remote context is forcibly invalidated. File-op
+    /// reports stamped before that boundary are ignored when they arrive.
+    /// `None` is a fail-closed terminal state if the identity space is ever
+    /// exhausted; it can never alias an earlier worker report.
+    sidebar_context_epoch: Option<u64>,
     /// Divider being dragged, identified by its owning split node's path + gap.
     dragging_divider: Option<DividerId>,
     /// Divider under the pointer (drives its hover highlight).
@@ -3990,17 +4159,20 @@ impl Frost {
             sidebar_dialog: None,
             sidebar_delete_confirm: None,
             sidebar_clipboard: None,
+            sidebar_next_clipboard_id: 0,
             sidebar_transfer: None,
             sidebar_hovered_row: None,
             sidebar_selection: Vec::new(),
             sidebar_selection_anchor: None,
             sidebar_filter: None,
             sidebar_drop_burst: Vec::new(),
-            sidebar_drop_debounce_armed: false,
+            sidebar_drop_debounce_generation: None,
             sidebar_drop_hint: false,
             sidebar_hovered: false,
             sidebar_pointer: iced::Point::ORIGIN,
             sidebar_notice: None,
+            sidebar_hosts_epoch: 0,
+            sidebar_context_epoch: Some(0),
             dragging_divider: None,
             hovered_divider: None,
             last_divider_press: None,
@@ -4147,11 +4319,6 @@ impl Frost {
         if resized {
             self.refresh_active_context();
         }
-        // Keep the file tree's remote-host snapshot aligned with the config;
-        // requests and file ops travel with this copy, never a live borrow.
-        if self.sidebar.hosts_snapshot() != self.config.remote_hosts.as_slice() {
-            self.sidebar.set_hosts(self.config.remote_hosts.clone());
-        }
     }
 
     fn sync_tab_position_ui(&mut self) {
@@ -4264,17 +4431,17 @@ impl Frost {
     /// revisions detect changes even on filesystems with coarse mtimes. Dirty
     /// local state is never merged or overwritten silently: it stays live and
     /// writes are blocked until the user explicitly resets/resolves it.
-    fn reload_config_if_changed(&mut self) {
+    fn reload_config_if_changed(&mut self) -> Option<sidebar::DirectoryRequest> {
         let disk_revision = match Config::config_revision() {
             Ok(revision) => revision,
             Err(error) => {
                 self.block_config_writes(error);
-                return;
+                return None;
             }
         };
         let changed = self.config_revision.as_ref() != Some(&disk_revision);
         if !changed && !self.config_write_blocked {
-            return;
+            return None;
         }
         if self.config_dirty {
             if changed {
@@ -4284,19 +4451,19 @@ impl Frost {
                         .to_string(),
                 );
             }
-            return;
+            return None;
         }
         // Preserve the panel's stable editing surface. With no local dirty
         // state there is nothing to save, so deferring the reload is safe.
         if self.config_panel_open {
-            return;
+            return None;
         }
 
         let path = match Config::config_path() {
             Ok(path) => path,
             Err(error) => {
                 self.block_config_writes(error.to_string());
-                return;
+                return None;
             }
         };
         self.config_revision = Some(disk_revision.clone());
@@ -4316,11 +4483,16 @@ impl Frost {
                 self.config_write_blocked = false;
                 self.sync_tab_position_ui();
                 self.apply_config();
+                let sidebar_request = self.reconcile_sidebar_remote_hosts();
                 if recovered {
                     self.push_toast("Config fixed and reloaded", ToastKind::Success);
                 }
+                sidebar_request
             }
-            Err(error) => self.block_config_writes(error),
+            Err(error) => {
+                self.block_config_writes(error);
+                None
+            }
         }
     }
 
@@ -4373,6 +4545,134 @@ impl Frost {
             && self.sidebar_delete_confirm.is_none()
     }
 
+    fn local_sidebar_fallback_root(&self) -> std::path::PathBuf {
+        self.sessions
+            .get(self.active)
+            .and_then(|session| session.cwd_cache.clone().or_else(|| session.cwd()))
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    }
+
+    fn clear_sidebar_tree_intent(&mut self) {
+        self.sidebar_menu = None;
+        self.sidebar_dialog = None;
+        self.sidebar_delete_confirm = None;
+        self.sidebar_hovered_row = None;
+        self.sidebar_drop_burst.clear();
+        self.sidebar_drop_debounce_generation = None;
+        self.sidebar_drop_hint = false;
+    }
+
+    /// Retire asynchronous/multi-step work before changing which host a numeric
+    /// location denotes. Reports stamped before this boundary become inert.
+    fn invalidate_sidebar_pending_work(&mut self) {
+        self.sidebar_context_epoch = next_sidebar_context_epoch(self.sidebar_context_epoch);
+        self.clear_sidebar_tree_intent();
+        if let Some(transfer) = self.sidebar_transfer.take() {
+            transfer.progress.cancel();
+        }
+    }
+
+    /// Drop every target that was interpreted inside the old remote tree.
+    /// Worker requests already carry immutable host snapshots, while their
+    /// generation/location guards prevent results from refreshing this new
+    /// Local view. Transfers additionally expose cancellation and are stopped.
+    fn clear_sidebar_remote_context(&mut self) {
+        self.invalidate_sidebar_pending_work();
+        self.sidebar_clipboard = None;
+        self.sidebar_selection.clear();
+        self.sidebar_selection_anchor = None;
+        self.sidebar_filter = None;
+    }
+
+    /// Return the Files panel to a known local root and invalidate every load
+    /// issued for the old location. The caller schedules the returned request.
+    fn reset_sidebar_to_local(&mut self, notice: String) -> sidebar::DirectoryRequest {
+        self.clear_sidebar_remote_context();
+        let request = self
+            .sidebar
+            .reset_to_local(self.local_sidebar_fallback_root());
+        self.sidebar_notice = Some((notice, false));
+        request
+    }
+
+    /// Reconcile the file tree's immutable host snapshot after a config
+    /// replacement. Numeric indices are never trusted across snapshots: the
+    /// complete old profile must have exactly one active match in the new one.
+    /// A selected profile that cannot be proved identical falls back to Local.
+    fn reconcile_sidebar_remote_hosts(&mut self) -> Option<sidebar::DirectoryRequest> {
+        let old_hosts = self.sidebar.hosts_snapshot().to_vec();
+        if old_hosts == self.config.remote_hosts {
+            return None;
+        }
+        let new_hosts = self.config.remote_hosts.clone();
+        let old_location = self.sidebar.location.clone();
+        let rebound = remap_sidebar_location(&old_hosts, &new_hosts, &self.sidebar.location);
+        let clipboard_rebound = self
+            .sidebar_clipboard
+            .as_ref()
+            .map(|clipboard| remap_sidebar_location(&old_hosts, &new_hosts, &clipboard.loc));
+        self.sidebar_hosts_epoch = self.sidebar_hosts_epoch.wrapping_add(1);
+        self.sidebar.set_hosts(new_hosts);
+
+        let Some(location) = rebound else {
+            return Some(self.reset_sidebar_to_local(
+                "Remote profile changed or is ambiguous; Files returned to Local. Choose a destination again."
+                .to_string(),
+            ));
+        };
+        let reindexed = location != old_location;
+        if !reindexed {
+            self.sidebar.location = location.clone();
+        }
+
+        if let Some(remapped) = clipboard_rebound {
+            match remapped {
+                Some(location) => {
+                    if let Some(clipboard) = self.sidebar_clipboard.as_mut() {
+                        clipboard.loc = location;
+                    }
+                }
+                None => {
+                    self.sidebar_clipboard = None;
+                    self.sidebar_notice = Some((
+                        "File clipboard cleared because its remote profile changed or became ambiguous"
+                            .to_string(),
+                        false,
+                    ));
+                }
+            }
+        }
+        if reindexed {
+            // The exact profile survived but moved to another numeric slot.
+            // Old filesystem requests still own a safe immutable snapshot, but
+            // proactively replacing them prevents a policy change from ever
+            // leaving this tree in Loading and makes all later ops use the new
+            // slot immediately. File workers keep their exact old profile
+            // identity and may still report against the unique new slot.
+            self.clear_sidebar_tree_intent();
+            return Some(self.sidebar.rebind_location_and_refresh(location));
+        }
+        None
+    }
+
+    fn open_sidebar_terminal(&mut self) {
+        match self.sidebar.location.clone() {
+            remote_fs::FsLocation::Local => {
+                let Some(cwd) = self.sidebar.current_dir.to_str().map(ToOwned::to_owned) else {
+                    self.push_toast(
+                        "Cannot open a terminal here: the directory name is not valid UTF-8",
+                        ToastKind::Warning,
+                    );
+                    return;
+                };
+                self.new_session_at(Some(&cwd));
+            }
+            remote_fs::FsLocation::Remote(index) => self.connect_remote_host(index),
+        }
+    }
+
     /// Toggle the left dock and refresh its file root when it becomes visible.
     /// Keeping this in one place makes the toolbar, shortcut, and command
     /// palette behave identically.
@@ -4409,6 +4709,13 @@ impl Frost {
         menu: SidebarMenuState,
         action: SidebarMenuAction,
     ) -> Task<Message> {
+        if !self.sidebar.accepts_generation(menu.generation) {
+            self.sidebar_notice = Some((
+                "Files changed; reopen the menu before modifying anything".to_string(),
+                false,
+            ));
+            return Task::none();
+        }
         let target_dir = if menu.is_dir {
             menu.path.clone()
         } else {
@@ -4428,6 +4735,7 @@ impl Frost {
                     path: target_dir,
                     input: String::new(),
                     error: None,
+                    generation: menu.generation,
                 });
                 iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
             }
@@ -4444,17 +4752,32 @@ impl Frost {
                     path: menu.path,
                     input,
                     error: None,
+                    generation: menu.generation,
                 });
                 iced::widget::operation::focus(SIDEBAR_DIALOG_INPUT_ID.clone())
             }
             SidebarMenuAction::Delete => {
                 let paths: Vec<std::path::PathBuf> =
                     menu.targets.iter().map(|(path, _)| path.clone()).collect();
-                self.sidebar_delete_confirm = Some(paths);
+                self.sidebar_delete_confirm = Some(SidebarDeleteConfirmation {
+                    paths,
+                    generation: menu.generation,
+                });
                 Task::none()
             }
             SidebarMenuAction::Copy | SidebarMenuAction::Cut => {
+                let Some(next_id) = next_sidebar_clipboard_id(self.sidebar_next_clipboard_id)
+                else {
+                    self.sidebar_notice = Some((
+                        "Files clipboard identity exhausted; restart Frost before copying again"
+                            .to_string(),
+                        false,
+                    ));
+                    return Task::none();
+                };
+                self.sidebar_next_clipboard_id = next_id;
                 self.sidebar_clipboard = Some(FsClipboard {
+                    id: next_id,
                     loc: self.sidebar.location.clone(),
                     items: menu.targets,
                     cut: action == SidebarMenuAction::Cut,
@@ -4473,6 +4796,17 @@ impl Frost {
                 iced::clipboard::write(text)
             }
             SidebarMenuAction::Paste => {
+                let live_clipboard_id = self
+                    .sidebar_clipboard
+                    .as_ref()
+                    .map(|clipboard| clipboard.id);
+                if !sidebar_menu_clipboard_is_current(menu.clipboard_id, live_clipboard_id) {
+                    self.sidebar_notice = Some((
+                        "Files clipboard changed; reopen the menu before pasting".to_string(),
+                        false,
+                    ));
+                    return Task::none();
+                }
                 let Some(clipboard) = self.sidebar_clipboard.clone() else {
                     return Task::none();
                 };
@@ -4482,6 +4816,14 @@ impl Frost {
                         self.sidebar_notice = Some((problem, false));
                         return Task::none();
                     }
+                };
+                let Some(context_epoch) = self.sidebar_context_epoch else {
+                    self.sidebar_notice = Some((
+                        "Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(),
+                        false,
+                    ));
+                    return Task::none();
                 };
                 // Cross-location transfers can run long: give them a progress
                 // handle, a live notice, and a cancel button. One at a time:
@@ -4520,10 +4862,12 @@ impl Frost {
                     progress = Some(handle);
                 }
                 sidebar_op_task(
+                    context_epoch,
                     self.sidebar.location.clone(),
                     self.sidebar.hosts_snapshot().to_vec(),
                     op,
                     progress,
+                    clipboard.cut.then_some(clipboard.id),
                 )
             }
             SidebarMenuAction::Refresh => sidebar_load_task(self.sidebar.refresh()),
@@ -4536,12 +4880,28 @@ impl Frost {
         let Some(dialog) = self.sidebar_dialog.clone() else {
             return Task::none();
         };
+        if !self.sidebar.accepts_generation(dialog.generation) {
+            self.sidebar_dialog = None;
+            self.sidebar_notice = Some((
+                "Files changed; reopen the action before modifying anything".to_string(),
+                false,
+            ));
+            return Task::none();
+        }
         if let Err(problem) = remote_fs::validate_new_name(&dialog.input) {
             if let Some(current) = self.sidebar_dialog.as_mut() {
                 current.error = Some(problem);
             }
             return Task::none();
         }
+        let Some(context_epoch) = self.sidebar_context_epoch else {
+            self.sidebar_notice = Some((
+                "Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(),
+                false,
+            ));
+            return Task::none();
+        };
         self.sidebar_dialog = None;
         let op = match dialog.kind {
             SidebarDialogKind::NewFile => SidebarOp::CreateFile(dialog.path.join(&dialog.input)),
@@ -4562,11 +4922,21 @@ impl Frost {
                 }
             }
         };
+        let consumed_clipboard_id = if matches!(&op, SidebarOp::Rename { .. }) {
+            sidebar_clipboard_id_at_location(
+                self.sidebar_clipboard.as_ref(),
+                &self.sidebar.location,
+            )
+        } else {
+            None
+        };
         sidebar_op_task(
+            context_epoch,
             self.sidebar.location.clone(),
             self.sidebar.hosts_snapshot().to_vec(),
             op,
             None,
+            consumed_clipboard_id,
         )
     }
 
@@ -4639,20 +5009,42 @@ impl Frost {
     /// Run the confirmed deletion. The one absolute rule (never `/`) is
     /// re-checked per path here, at dispatch time, not only in the menu layer.
     fn confirm_sidebar_delete(&mut self) -> Task<Message> {
-        let Some(paths) = self.sidebar_delete_confirm.take() else {
+        let Some(confirmation) = self.sidebar_delete_confirm.take() else {
             return Task::none();
         };
+        if !self.sidebar.accepts_generation(confirmation.generation) {
+            self.sidebar_notice = Some((
+                "Files changed; select the items again before deleting".to_string(),
+                false,
+            ));
+            return Task::none();
+        }
+        let paths = confirmation.paths;
         for path in &paths {
             if let Err(problem) = remote_fs::validate_delete_path(path) {
                 self.sidebar_notice = Some((problem, false));
                 return Task::none();
             }
         }
+        let Some(context_epoch) = self.sidebar_context_epoch else {
+            self.sidebar_notice = Some((
+                "Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(),
+                false,
+            ));
+            return Task::none();
+        };
+        let consumed_clipboard_id = sidebar_clipboard_id_at_location(
+            self.sidebar_clipboard.as_ref(),
+            &self.sidebar.location,
+        );
         sidebar_op_task(
+            context_epoch,
             self.sidebar.location.clone(),
             self.sidebar.hosts_snapshot().to_vec(),
             SidebarOp::DeleteBatch(paths),
             None,
+            consumed_clipboard_id,
         )
     }
 
@@ -4927,13 +5319,14 @@ impl Frost {
 
     fn new_session(&mut self) {
         let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
-        match Session::spawn(
-            &self.config,
-            self.next_id,
-            self.cols,
-            self.rows,
-            cwd.as_deref(),
-        ) {
+        self.new_session_at(cwd.as_deref());
+    }
+
+    /// Open an ordinary local shell at an explicit directory. Keeping this
+    /// shared with `new_session` makes the Files-header action differ only in
+    /// its cwd source, not tab placement, diagnostics, or persistence.
+    fn new_session_at(&mut self, cwd: Option<&str>) {
+        match Session::spawn(&self.config, self.next_id, self.cols, self.rows, cwd) {
             Ok(session) => {
                 self.session_diagnostic = None;
                 self.next_id += 1;
@@ -10768,12 +11161,18 @@ impl Frost {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     host.name = name;
                     self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::RemoteHostHost(index, value) => {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     host.host = value;
                     self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::RemoteHostUser(index, user) => {
@@ -10781,18 +11180,27 @@ impl Frost {
                     // Blank clears the login/exec user rather than storing "".
                     host.user = Some(user).filter(|u| !u.trim().is_empty());
                     self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::RemoteHostDocker(index, docker) => {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     host.docker = docker;
                     self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::RemoteHostDeploy(index, deploy) => {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     host.deploy = deploy;
                     self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::RemoteHostAdd => {
@@ -10823,11 +11231,17 @@ impl Frost {
                         deploy_artifact: None,
                     });
                 self.config_dirty = true;
+                if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                    return sidebar_load_task(request);
+                }
             }
             Message::RemoteHostRemove(index) => {
                 if index < self.config.remote_hosts.len() {
                     self.config.remote_hosts.remove(index);
                     self.config_dirty = true;
+                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
@@ -12074,6 +12488,11 @@ impl Frost {
                 // to whatever command the user is composing.)
                 return self.type_into_active_pane(quoted);
             }
+            Message::SidebarOpenTerminal(generation) => {
+                if self.sidebar.accepts_generation(generation) {
+                    self.open_sidebar_terminal();
+                }
+            }
             Message::SidebarGoParent => {
                 if let Some(parent) = self
                     .sidebar
@@ -12095,9 +12514,17 @@ impl Frost {
                 self.sidebar_hovered_row = None;
                 self.sidebar.apply_load(result);
             }
-            Message::SidebarSetLocation(location) => {
+            Message::SidebarSetLocation(hosts_epoch, location) => {
+                if hosts_epoch != self.sidebar_hosts_epoch {
+                    self.sidebar_notice = Some((
+                        "Remote profiles changed; choose the destination again".to_string(),
+                        false,
+                    ));
+                    return Task::none();
+                }
                 if location != self.sidebar.location {
                     // A new location invalidates the selection's paths.
+                    self.invalidate_sidebar_pending_work();
                     self.sidebar_selection.clear();
                     self.sidebar_selection_anchor = None;
                     let generation = self.sidebar.begin_location_change(location.clone());
@@ -12112,16 +12539,40 @@ impl Frost {
                 }
             }
             Message::SidebarLocationResolved(generation, start) => {
-                if let Some(request) = self.sidebar.resolve_location(generation, start) {
-                    return sidebar_load_task(request);
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
+                match start {
+                    Ok(start) => {
+                        if let Some(request) = self.sidebar.resolve_location(generation, Ok(start))
+                        {
+                            return sidebar_load_task(request);
+                        }
+                    }
+                    Err(error) => {
+                        let location = self.sidebar.location.label(self.sidebar.hosts_snapshot());
+                        let error = jterm_core::review_input::safe_inline_display(&error, 192);
+                        let request = self.reset_sidebar_to_local(format!(
+                            "Could not open {location}: {error}. Returned to Local; choose the remote profile to retry."
+                        ));
+                        return sidebar_load_task(request);
+                    }
                 }
             }
             Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
             Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
-            Message::SidebarRowClick(path, is_dir) => {
+            Message::SidebarRowClick(generation, path, is_dir) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    self.sidebar_notice =
+                        Some(("Files changed; select the item again".to_string(), false));
+                    return Task::none();
+                }
                 return self.sidebar_row_click(path, is_dir);
             }
-            Message::SidebarMenuOpen(path, is_dir) => {
+            Message::SidebarMenuOpen(generation, path, is_dir) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
                 // A right-click inside the selection targets the selection
                 // (in visible order); anywhere else the selection collapses
                 // to the clicked row.
@@ -12144,14 +12595,27 @@ impl Frost {
                     // panel as soon as it appears.
                     at: self.sidebar_pointer,
                     targets,
+                    generation,
+                    clipboard_id: self
+                        .sidebar_clipboard
+                        .as_ref()
+                        .map(|clipboard| clipboard.id),
                 });
             }
-            Message::SidebarMenuOpenRoot => {
+            Message::SidebarMenuOpenRoot(generation) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
                 self.sidebar_menu = Some(SidebarMenuState {
                     path: self.sidebar.current_dir.clone(),
                     is_dir: true,
                     at: self.sidebar_pointer,
                     targets: vec![(self.sidebar.current_dir.clone(), true)],
+                    generation,
+                    clipboard_id: self
+                        .sidebar_clipboard
+                        .as_ref()
+                        .map(|clipboard| clipboard.id),
                 });
             }
             Message::SidebarMenuClose => self.sidebar_menu = None,
@@ -12171,6 +12635,26 @@ impl Frost {
             Message::SidebarDeleteConfirm => return self.confirm_sidebar_delete(),
             Message::SidebarDeleteCancel => self.sidebar_delete_confirm = None,
             Message::SidebarOpFinished(report) => {
+                let report = *report;
+                // Clipboard settlement is backend state, not UI feedback. Do
+                // it first so a safe profile reorder/location switch cannot
+                // resurrect already-moved cut sources. Exact-token matching
+                // still protects every newer Copy/Cut intent.
+                settle_sidebar_clipboard_sources(
+                    &mut self.sidebar_clipboard,
+                    report.consumed_clipboard_id,
+                    &report.consumed_paths,
+                );
+                if !sidebar_op_report_matches_context(
+                    report.context_epoch,
+                    &report.location,
+                    report.location_profile.as_ref(),
+                    self.sidebar_context_epoch,
+                    &self.sidebar.location,
+                    self.sidebar.hosts_snapshot(),
+                ) {
+                    return Task::none();
+                }
                 // Any transfer report retires the progress UI, success or not.
                 if matches!(report.op, SidebarOp::BatchTransfer { .. }) {
                     self.sidebar_transfer = None;
@@ -12184,29 +12668,15 @@ impl Frost {
                             .warning
                             .unwrap_or(("Transfer cancelled".to_string(), true)),
                     );
-                    if report.location == self.sidebar.location {
-                        return sidebar_load_task(self.sidebar.refresh());
-                    }
+                    return sidebar_load_task(self.sidebar.refresh());
                 } else {
                     match report.result {
                         Ok(()) => {
-                            // A completed cut-paste consumes the clipboard —
-                            // but only when every item landed: a batch with
-                            // failures (error-styled summary) keeps it so the
-                            // un-pasted sources remain retryable.
-                            let clean_cut_batch =
-                                matches!(&report.op, SidebarOp::BatchTransfer { cut: true, .. })
-                                    && report.warning.as_ref().is_none_or(|(_, neutral)| *neutral);
-                            if clean_cut_batch {
-                                self.sidebar_clipboard = None;
-                            }
                             self.sidebar_notice = report.warning;
-                            // Refresh only when the tree still shows the
-                            // location the op ran against — a switch mid-op
-                            // must not yank the freshly switched tree away.
-                            if report.location == self.sidebar.location {
-                                return sidebar_load_task(self.sidebar.refresh());
-                            }
+                            // The context gate above proved this is the same
+                            // Local target or the one unique exact profile,
+                            // even if that profile moved to another index.
+                            return sidebar_load_task(self.sidebar.refresh());
                         }
                         Err(error) => self.sidebar_notice = Some((error, false)),
                     }
@@ -12226,7 +12696,10 @@ impl Frost {
                     transfer.progress.cancel();
                 }
             }
-            Message::SidebarRowHover(row) => {
+            Message::SidebarRowHover(generation, row) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
                 self.sidebar_hovered_row = row;
                 // Keep the drop hint's target in step with the row under the
                 // pointer while files are dragged over the panel.
@@ -12257,18 +12730,32 @@ impl Frost {
                 }
                 // iced delivers one FileDropped per path; a multi-file drop is
                 // one user action, so accumulate the burst and flush it after
-                // a short debounce.
+                // a short debounce. A rerooted tree starts a fresh burst; the
+                // old timer is allowed to arrive but cannot consume it.
+                let generation = self.sidebar.generation();
+                if self.sidebar_drop_debounce_generation != Some(generation) {
+                    self.sidebar_drop_burst.clear();
+                    self.sidebar_drop_debounce_generation = None;
+                }
                 self.sidebar_drop_burst.push(path);
-                if !self.sidebar_drop_debounce_armed {
-                    self.sidebar_drop_debounce_armed = true;
+                if self.sidebar_drop_debounce_generation.is_none() {
+                    self.sidebar_drop_debounce_generation = Some(generation);
                     return Task::perform(
                         async move { std::thread::sleep(std::time::Duration::from_millis(120)) },
-                        |()| Message::SidebarDropFlush,
+                        move |()| Message::SidebarDropFlush(generation),
                     );
                 }
             }
-            Message::SidebarDropFlush => {
-                self.sidebar_drop_debounce_armed = false;
+            Message::SidebarDropFlush(generation) => {
+                if self.sidebar_drop_debounce_generation != Some(generation) {
+                    return Task::none();
+                }
+                if !self.sidebar.accepts_generation(generation) {
+                    self.sidebar_drop_debounce_generation = None;
+                    self.sidebar_drop_burst.clear();
+                    return Task::none();
+                }
+                self.sidebar_drop_debounce_generation = None;
                 if self.sidebar_drop_hint {
                     self.sidebar_drop_hint = false;
                     self.sidebar_notice = None;
@@ -12283,12 +12770,15 @@ impl Frost {
                 let Some(target_dir) = self.sidebar_drop_target() else {
                     return Task::none();
                 };
-                return Task::perform(
-                    async move { plan_drop(paths, target_dir) },
-                    Message::SidebarDropPlanned,
-                );
+                let generation = self.sidebar.generation();
+                return Task::perform(async move { plan_drop(paths, target_dir) }, move |plan| {
+                    Message::SidebarDropPlanned(generation, plan)
+                });
             }
-            Message::SidebarDropPlanned(plan) => {
+            Message::SidebarDropPlanned(generation, plan) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(problem) => {
@@ -12301,6 +12791,14 @@ impl Frost {
                         Some(("A transfer is already running".to_string(), false));
                     return Task::none();
                 }
+                let Some(context_epoch) = self.sidebar_context_epoch else {
+                    self.sidebar_notice = Some((
+                        "Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(),
+                        false,
+                    ));
+                    return Task::none();
+                };
                 let total_items = plan.items.len();
                 let target_dir = plan.target_dir.clone();
                 let handle = remote_fs::TransferProgress::new();
@@ -12317,6 +12815,7 @@ impl Frost {
                 self.sidebar_notice = Some((ui.status_text(), true));
                 self.sidebar_transfer = Some(ui);
                 return sidebar_op_task(
+                    context_epoch,
                     self.sidebar.location.clone(),
                     self.sidebar.hosts_snapshot().to_vec(),
                     SidebarOp::BatchTransfer {
@@ -12326,6 +12825,7 @@ impl Frost {
                         verb: "Imported",
                     },
                     Some(handle),
+                    None,
                 );
             }
             Message::SidebarDropHover(inside) => {
@@ -12690,6 +13190,7 @@ impl Frost {
                 // Stage and durably persist first: a failed reset must not say
                 // "applied" while only mutating this process's memory.
                 let reset = Config::default();
+                let mut sidebar_request = None;
                 match reset.save_force_revision() {
                     Ok(revision) => {
                         let old_scale = self.scale_factor();
@@ -12706,6 +13207,7 @@ impl Frost {
                         self.ai_temperature_draft.clear();
                         self.sync_tab_position_ui();
                         self.apply_config();
+                        sidebar_request = self.reconcile_sidebar_remote_hosts();
                         self.push_toast("Config reset to defaults", ToastKind::Info);
                     }
                     Err(error) => {
@@ -12727,6 +13229,7 @@ impl Frost {
                             self.ai_temperature_draft.clear();
                             self.sync_tab_position_ui();
                             self.apply_config();
+                            sidebar_request = self.reconcile_sidebar_remote_hosts();
                             self.push_toast(
                                 format!(
                                     "Config reset is visible but needs a durability retry: {error}"
@@ -12741,11 +13244,14 @@ impl Frost {
                         }
                     }
                 }
+                if let Some(request) = sidebar_request {
+                    return sidebar_load_task(request);
+                }
             }
             Message::ConfigTick => {
                 // Reconcile external writers before local auto-save so a dirty
                 // instance cannot erase a newer file without noticing it.
-                self.reload_config_if_changed();
+                let sidebar_reload_request = self.reload_config_if_changed();
                 self.persist_live_config();
 
                 let keybindings_changed = keybindings::KeyBindings::config_revision()
@@ -12800,6 +13306,9 @@ impl Frost {
                     sess.git_meta_cache = if want_git { sess.git_meta() } else { None };
                 }
                 self.expire_toasts();
+                if let Some(request) = sidebar_reload_request {
+                    return sidebar_load_task(request);
+                }
             }
             Message::TabMenuOpen(id) => {
                 // The menu is keyed on the tab id the strip handed out, not on
@@ -15854,7 +16363,25 @@ impl Frost {
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center);
-        let mut rows: Vec<Element<'_, Message>> = vec![container(header).padding([4, 6]).into()];
+        let (terminal_label, terminal_help) = sidebar_terminal_entry_copy(&self.sidebar.location);
+        let terminal_entry = tooltip(
+            button(text(terminal_label).size(11))
+                .on_press(Message::SidebarOpenTerminal(self.sidebar.generation()))
+                .padding([3, 7])
+                .width(Length::Fill)
+                .style(self.ghost_btn_style()),
+            container(text(terminal_help).size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            container(header).padding([4, 6]).into(),
+            container(terminal_entry)
+                .padding([2, 6])
+                .width(Length::Fill)
+                .into(),
+        ];
         // The inline filter row: substring match over the loaded tree,
         // local and remote alike; Esc or the toggle closes and clears it.
         if let Some(query) = &self.sidebar_filter {
@@ -15888,8 +16415,9 @@ impl Frost {
                 .find(|choice| choice.location == self.sidebar.location)
                 .cloned()
                 .or_else(|| choices.first().cloned());
-            let picker = pick_list(choices, selected, |choice| {
-                Message::SidebarSetLocation(choice.location)
+            let hosts_epoch = self.sidebar_hosts_epoch;
+            let picker = pick_list(choices, selected, move |choice| {
+                Message::SidebarSetLocation(hosts_epoch, choice.location)
             })
             .text_size(12)
             .width(Length::Fill);
@@ -15980,7 +16508,7 @@ impl Frost {
         // Right-press on the empty area below the tree targets the root dir;
         // row menus are captured by the rows' own mouse areas first.
         mouse_area(list)
-            .on_right_press(Message::SidebarMenuOpenRoot)
+            .on_right_press(Message::SidebarMenuOpenRoot(self.sidebar.generation()))
             .into()
     }
 
@@ -16111,8 +16639,13 @@ impl Frost {
         ]
         .align_y(iced::Alignment::Center);
         let selected = self.sidebar_selection.contains(&node.path);
+        let generation = self.sidebar.generation();
         let row_button = button(label)
-            .on_press(Message::SidebarRowClick(node.path.clone(), node.is_dir))
+            .on_press(Message::SidebarRowClick(
+                generation,
+                node.path.clone(),
+                node.is_dir,
+            ))
             .width(Length::Fill)
             .padding([1, 2])
             .style(self.sidebar_row_style(selected));
@@ -16123,12 +16656,16 @@ impl Frost {
         // the widget tree knows exactly which row the pointer is over.
         out.push(
             mouse_area(row_button)
-                .on_right_press(Message::SidebarMenuOpen(node.path.clone(), node.is_dir))
-                .on_enter(Message::SidebarRowHover(Some((
+                .on_right_press(Message::SidebarMenuOpen(
+                    generation,
                     node.path.clone(),
                     node.is_dir,
-                ))))
-                .on_exit(Message::SidebarRowHover(None))
+                ))
+                .on_enter(Message::SidebarRowHover(
+                    generation,
+                    Some((node.path.clone(), node.is_dir)),
+                ))
+                .on_exit(Message::SidebarRowHover(generation, None))
                 .into(),
         );
         if node.is_dir && (node.expanded || filtering) {
@@ -16704,8 +17241,8 @@ impl Frost {
         } else {
             root
         };
-        let root: Element<'_, Message> = if let Some(path) = &self.sidebar_delete_confirm {
-            stack![root, self.sidebar_delete_confirm_view(path)].into()
+        let root: Element<'_, Message> = if let Some(confirmation) = &self.sidebar_delete_confirm {
+            stack![root, self.sidebar_delete_confirm_view(&confirmation.paths)].into()
         } else {
             root
         };
@@ -19585,28 +20122,41 @@ fn copy_path_payload(path: &std::path::Path) -> String {
 /// while it runs cannot redirect it to another machine. Transfers also carry
 /// their progress handle (byte counter + cancellation flag).
 fn sidebar_op_task(
+    context_epoch: u64,
     location: remote_fs::FsLocation,
     hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
     op: SidebarOp,
     progress: Option<std::sync::Arc<remote_fs::TransferProgress>>,
+    consumed_clipboard_id: Option<u64>,
 ) -> Task<Message> {
+    let location_profile = match &location {
+        remote_fs::FsLocation::Local => None,
+        remote_fs::FsLocation::Remote(index) => config::validate_remote_host_at(&hosts, *index)
+            .ok()
+            .cloned(),
+    };
     Task::perform(
         async move {
-            let (report_location, warning, cancelled, result) =
+            let (report_location, warning, cancelled, result, consumed_paths) =
                 run_sidebar_op(&location, &hosts, &op, progress.as_ref());
             SidebarOpReport {
+                context_epoch,
                 location: report_location,
+                location_profile,
+                consumed_clipboard_id,
+                consumed_paths,
                 op,
                 warning,
                 cancelled,
                 result: result.map_err(|error| error.to_string()),
             }
         },
-        Message::SidebarOpFinished,
+        |report| Message::SidebarOpFinished(Box::new(report)),
     )
 }
 
-/// Execute one op and report `(changed_location, warning, cancelled, result)`.
+/// Execute one op and report
+/// `(changed_location, warning, cancelled, result, invalidated_sources)`.
 /// Factored out of the task so the ordering (transfer first, delete source
 /// after; cancel is neutral and only counts when the transfer failed) is
 /// testable headlessly.
@@ -19615,39 +20165,43 @@ fn run_sidebar_op(
     hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
     op: &SidebarOp,
     progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
-) -> (
-    remote_fs::FsLocation,
-    Option<(String, bool)>,
-    bool,
-    std::io::Result<()>,
-) {
+) -> SidebarWorkerOutcome {
     match op {
         SidebarOp::CreateFile(path) => (
             location.clone(),
             None,
             false,
             remote_fs::create_file(location, hosts, path),
+            Vec::new(),
         ),
         SidebarOp::CreateDir(path) => (
             location.clone(),
             None,
             false,
             remote_fs::create_dir(location, hosts, path),
+            Vec::new(),
         ),
-        SidebarOp::Rename { src, dst } => (
-            location.clone(),
-            None,
-            false,
-            remote_fs::rename(location, hosts, src, dst),
-        ),
+        SidebarOp::Rename { src, dst } => {
+            let result = remote_fs::rename(location, hosts, src, dst);
+            let consumed_paths = result
+                .as_ref()
+                .ok()
+                .map(|()| vec![src.clone()])
+                .unwrap_or_default();
+            (location.clone(), None, false, result, consumed_paths)
+        }
         SidebarOp::DeleteBatch(paths) => {
             // Continue past per-item errors; the summary names the first.
             let total = paths.len();
             let mut done = 0usize;
             let mut failures: Vec<String> = Vec::new();
+            let mut consumed_paths = Vec::new();
             for path in paths {
                 match remote_fs::delete(location, hosts, path) {
-                    Ok(()) => done += 1,
+                    Ok(()) => {
+                        done += 1;
+                        consumed_paths.push(path.clone());
+                    }
                     Err(error) => failures.push(format!("{}: {error}", path.display())),
                 }
             }
@@ -19663,7 +20217,13 @@ fn run_sidebar_op(
                     false,
                 )
             };
-            (location.clone(), Some(notice), false, Ok(()))
+            (
+                location.clone(),
+                Some(notice),
+                false,
+                Ok(()),
+                consumed_paths,
+            )
         }
         SidebarOp::BatchTransfer {
             src_loc,
@@ -19679,6 +20239,7 @@ fn run_sidebar_op(
             let total = items.len();
             let mut done = 0usize;
             let mut failures: Vec<String> = Vec::new();
+            let mut consumed_paths = Vec::new();
             for item in items {
                 if progress.is_some_and(|progress| progress.is_cancelled()) {
                     return (
@@ -19689,6 +20250,7 @@ fn run_sidebar_op(
                             std::io::ErrorKind::Interrupted,
                             "transfer cancelled",
                         )),
+                        consumed_paths,
                     );
                 }
                 if let Some(error) = &item.error {
@@ -19723,7 +20285,11 @@ fn run_sidebar_op(
                                     "{}: copied, but deleting the source failed: {error}",
                                     item.src.display()
                                 ));
+                            } else {
+                                consumed_paths.push(item.src.clone());
                             }
+                        } else if *cut {
+                            consumed_paths.push(item.src.clone());
                         }
                     }
                     Err(error) => {
@@ -19736,6 +20302,7 @@ fn run_sidebar_op(
                                 Some((format!("Cancelled after {done} of {total} items"), true)),
                                 true,
                                 Err(error),
+                                consumed_paths,
                             );
                         }
                         failures.push(format!("{}: {error}", item.src.display()));
@@ -19754,7 +20321,13 @@ fn run_sidebar_op(
                     false,
                 )
             };
-            (location.clone(), Some(notice), false, Ok(()))
+            (
+                location.clone(),
+                Some(notice),
+                false,
+                Ok(()),
+                consumed_paths,
+            )
         }
     }
 }
@@ -20500,6 +21073,269 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    fn sidebar_remote_profile(name: &str, host: &str) -> jterm_core::jsh_remote::RemoteHostConfig {
+        let mut profile = config::default_remote_hosts()[0].clone();
+        profile.name = name.to_string();
+        profile.host = host.to_string();
+        profile
+    }
+
+    #[test]
+    fn sidebar_remote_location_rebinds_only_one_complete_profile_identity() {
+        use remote_fs::FsLocation;
+
+        let alpha = sidebar_remote_profile("alpha", "alpha.example");
+        let beta = sidebar_remote_profile("beta", "beta.example");
+        let old = vec![alpha.clone(), beta.clone()];
+
+        assert_eq!(
+            remap_sidebar_location(&old, &[beta.clone(), alpha.clone()], &FsLocation::Remote(0)),
+            Some(FsLocation::Remote(1)),
+            "a unique unchanged profile follows a safe reorder"
+        );
+        assert_eq!(
+            remap_sidebar_location(&old, std::slice::from_ref(&beta), &FsLocation::Remote(0)),
+            None,
+            "a removed profile cannot inherit its old numeric slot"
+        );
+
+        let mut edited = alpha.clone();
+        edited.user = Some("different-login".to_string());
+        assert_eq!(
+            remap_sidebar_location(&old, &[edited, beta], &FsLocation::Remote(0)),
+            None,
+            "every profile field participates in identity"
+        );
+        assert_eq!(
+            remap_sidebar_location(
+                &old,
+                &[alpha.clone(), alpha.clone()],
+                &FsLocation::Remote(0),
+            ),
+            None,
+            "duplicate identities are ambiguous"
+        );
+        let mut duplicate_beyond_active = vec![old[0].clone()];
+        duplicate_beyond_active.extend((1..config::MAX_REMOTE_HOSTS).map(|index| {
+            sidebar_remote_profile(
+                &format!("filler-{index}"),
+                &format!("filler-{index}.example"),
+            )
+        }));
+        duplicate_beyond_active.push(old[0].clone());
+        assert_eq!(
+            remap_sidebar_location(&old, &duplicate_beyond_active, &FsLocation::Remote(0)),
+            None,
+            "a retained inactive duplicate still makes the full identity ambiguous"
+        );
+        assert_eq!(
+            remap_sidebar_location(&old, &[], &FsLocation::Local),
+            Some(FsLocation::Local)
+        );
+        assert_eq!(
+            remap_sidebar_location(&old, &old, &FsLocation::Remote(99)),
+            None
+        );
+
+        let mut invalid = alpha.clone();
+        invalid.host.clear();
+        assert_eq!(
+            remap_sidebar_location(
+                std::slice::from_ref(&invalid),
+                std::slice::from_ref(&invalid),
+                &FsLocation::Remote(0)
+            ),
+            None,
+            "an invalid old identity cannot authorize a remap"
+        );
+        assert_eq!(
+            unique_active_remote_profile_index(std::slice::from_ref(&invalid), &invalid),
+            None,
+            "an exact but invalid candidate is not runnable authority"
+        );
+    }
+
+    #[test]
+    fn stale_sidebar_op_report_cannot_mutate_a_new_transfer_context() {
+        use remote_fs::FsLocation;
+
+        let alpha = sidebar_remote_profile("alpha", "alpha.example");
+        let beta = sidebar_remote_profile("beta", "beta.example");
+        let reordered = vec![beta.clone(), alpha.clone()];
+
+        assert!(
+            sidebar_op_report_matches_context(
+                7,
+                &FsLocation::Remote(0),
+                Some(&alpha),
+                Some(7),
+                &FsLocation::Remote(1),
+                &reordered,
+            ),
+            "one exact profile may finish after a safe index reorder"
+        );
+        assert!(sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(1),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            6,
+            &FsLocation::Remote(0),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(0),
+            Some(&beta),
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Local,
+            None,
+            Some(7),
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(1),
+            Some(&alpha),
+            None,
+            &FsLocation::Remote(1),
+            &reordered,
+        ));
+
+        let mut invalid = alpha.clone();
+        invalid.host.clear();
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Remote(0),
+            Some(&invalid),
+            Some(7),
+            &FsLocation::Remote(0),
+            std::slice::from_ref(&invalid),
+        ));
+    }
+
+    #[test]
+    fn cut_settlement_is_exact_partial_and_aba_safe() {
+        let a = std::path::PathBuf::from("/src/a");
+        let nested = a.join("nested");
+        let b = std::path::PathBuf::from("/src/b");
+        let original = FsClipboard {
+            id: 7,
+            loc: remote_fs::FsLocation::Local,
+            items: vec![(a.clone(), true), (nested, false), (b.clone(), false)],
+            cut: true,
+        };
+        assert_eq!(
+            sidebar_clipboard_id_at_location(Some(&original), &remote_fs::FsLocation::Local),
+            Some(7)
+        );
+        assert_eq!(
+            sidebar_clipboard_id_at_location(Some(&original), &remote_fs::FsLocation::Remote(0)),
+            None,
+            "same path text in another backend must not authorize retirement"
+        );
+
+        let mut active = Some(original.clone());
+        settle_sidebar_clipboard_sources(&mut active, Some(7), std::slice::from_ref(&a));
+        assert_eq!(
+            active.as_ref().map(|clipboard| &clipboard.items),
+            Some(&vec![(b.clone(), false)]),
+            "only the moved source and its descendants retire"
+        );
+
+        let mut replacement = original.clone();
+        replacement.id = 8;
+        let mut active = Some(replacement.clone());
+        settle_sidebar_clipboard_sources(&mut active, Some(7), &[a, b]);
+        assert_eq!(
+            active.as_ref().map(|clipboard| clipboard.id),
+            Some(8),
+            "a newer same-payload Copy/Cut survives the old completion"
+        );
+
+        let mut copied = original;
+        copied.cut = false;
+        let mut active = Some(copied);
+        settle_sidebar_clipboard_sources(
+            &mut active,
+            Some(7),
+            &[std::path::PathBuf::from("/src/a")],
+        );
+        assert_eq!(
+            active.as_ref().map(|clipboard| clipboard.items.len()),
+            Some(1),
+            "rename/delete evidence also retires dangling Copy sources"
+        );
+
+        assert_eq!(next_sidebar_clipboard_id(0), Some(1));
+        assert_eq!(next_sidebar_clipboard_id(u64::MAX), None);
+        assert_eq!(next_sidebar_context_epoch(Some(0)), Some(1));
+        assert_eq!(next_sidebar_context_epoch(Some(u64::MAX)), None);
+        assert_eq!(next_sidebar_context_epoch(None), None);
+    }
+
+    #[test]
+    fn sidebar_menu_paste_rejects_a_new_same_payload_clipboard_intent() {
+        let first = FsClipboard {
+            id: 7,
+            loc: remote_fs::FsLocation::Local,
+            items: vec![(std::path::PathBuf::from("/same.txt"), false)],
+            cut: true,
+        };
+        let mut replacement = first.clone();
+        replacement.id = next_sidebar_clipboard_id(first.id).expect("fresh identity");
+
+        assert_eq!(replacement.loc, first.loc);
+        assert_eq!(replacement.items, first.items);
+        assert_eq!(replacement.cut, first.cut);
+        assert!(sidebar_menu_clipboard_is_current(
+            Some(first.id),
+            Some(first.id)
+        ));
+        assert!(
+            !sidebar_menu_clipboard_is_current(Some(first.id), Some(replacement.id)),
+            "payload equality must not let an old Paste row adopt a new Copy/Cut intent"
+        );
+    }
+
+    #[test]
+    fn sidebar_menu_opened_without_a_clipboard_cannot_adopt_one_later() {
+        assert!(sidebar_menu_clipboard_is_current(None, None));
+        assert!(
+            !sidebar_menu_clipboard_is_current(None, Some(1)),
+            "a disabled Paste row must not become authority for a later clipboard"
+        );
+        assert!(
+            !sidebar_menu_clipboard_is_current(Some(1), None),
+            "clearing the clipboard also expires the open Paste row"
+        );
+    }
+
+    #[test]
+    fn files_terminal_entry_states_its_real_start_directory() {
+        let (local_label, local_help) = sidebar_terminal_entry_copy(&remote_fs::FsLocation::Local);
+        assert!(local_label.contains("here"));
+        assert!(local_help.contains("current tree root"));
+
+        let (remote_label, remote_help) =
+            sidebar_terminal_entry_copy(&remote_fs::FsLocation::Remote(3));
+        assert!(remote_label.contains("default dir"));
+        assert!(remote_help.contains("default directory"));
+    }
 
     #[test]
     fn remote_picker_navigation_skips_invalid_and_inactive_drafts() {
@@ -23654,6 +24490,7 @@ mod tests {
         cut: bool,
     ) -> FsClipboard {
         FsClipboard {
+            id: 1,
             loc,
             items: items
                 .into_iter()
@@ -23746,11 +24583,12 @@ mod tests {
             cut: true,
             verb: "Moved",
         };
-        let (changed, notice, cancelled, result) =
+        let (changed, notice, cancelled, result, consumed) =
             run_sidebar_op(&FsLocation::Local, &[], &op, None);
         assert!(result.is_ok());
         assert!(!cancelled);
         assert_eq!(changed, FsLocation::Local);
+        assert_eq!(consumed, vec![root.join("one.txt")]);
         assert_eq!(
             std::fs::read(dst_dir.join("one.txt")).expect("read moved"),
             b"1"
@@ -23778,10 +24616,11 @@ mod tests {
             cut: true,
             verb: "Moved",
         };
-        let (_changed, notice, cancelled, result) =
+        let (_changed, notice, cancelled, result, consumed) =
             run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
         assert!(result.is_ok(), "batch errors are per-item, not fatal");
         assert!(!cancelled);
+        assert!(consumed.is_empty());
         let (text, _) = notice.expect("summary");
         assert!(text.starts_with("1 of 1 items failed"), "{text}");
         std::fs::remove_dir_all(root).expect("remove test tree");
@@ -23810,10 +24649,11 @@ mod tests {
             cut: false,
             verb: "Pasted",
         };
-        let (_changed, notice, cancelled, result) =
+        let (_changed, notice, cancelled, result, consumed) =
             run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
         assert!(cancelled);
         assert!(result.is_err());
+        assert!(consumed.is_empty());
         assert!(!dst_dir.join("one.txt").exists());
         assert!(notice.expect("cancel summary").0.contains("Cancelled"));
         std::fs::remove_dir_all(root).expect("remove test tree");
@@ -23831,16 +24671,51 @@ mod tests {
             root.join("two.txt"),
         ]);
         std::fs::write(root.join("two.txt"), b"2").expect("write");
-        let (changed, notice, cancelled, result) =
+        let (changed, notice, cancelled, result, consumed) =
             run_sidebar_op(&FsLocation::Local, &[], &op, None);
         assert!(result.is_ok());
         assert!(!cancelled);
         assert_eq!(changed, FsLocation::Local);
+        assert_eq!(
+            consumed,
+            vec![root.join("one.txt"), root.join("two.txt")],
+            "only successfully deleted sources invalidate clipboard entries"
+        );
         assert!(!root.join("one.txt").exists());
         assert!(!root.join("two.txt").exists());
         let (text, neutral) = notice.expect("summary");
         assert!(text.starts_with("1 of 3 items failed"), "{text}");
         assert!(!neutral);
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn rename_reports_source_only_after_backend_success() {
+        use remote_fs::FsLocation;
+        let root = std::env::temp_dir().join(format!("frost-op-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test tree");
+        let src = root.join("before.txt");
+        let dst = root.join("after.txt");
+        std::fs::write(&src, b"data").expect("write source");
+
+        let op = SidebarOp::Rename {
+            src: src.clone(),
+            dst: dst.clone(),
+        };
+        let (_changed, _notice, _cancelled, result, consumed) =
+            run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(result.is_ok());
+        assert_eq!(consumed, vec![src.clone()]);
+
+        let failed = SidebarOp::Rename {
+            src: src.clone(),
+            dst: root.join("never.txt"),
+        };
+        let (_changed, _notice, _cancelled, result, consumed) =
+            run_sidebar_op(&FsLocation::Local, &[], &failed, None);
+        assert!(result.is_err());
+        assert!(consumed.is_empty());
+        assert!(dst.exists());
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
@@ -24109,11 +24984,12 @@ mod tests {
             cut: false,
             verb: "Imported",
         };
-        let (changed, notice, cancelled, result) =
+        let (changed, notice, cancelled, result, consumed) =
             run_sidebar_op(&FsLocation::Local, &[], &op, None);
         assert!(result.is_ok());
         assert!(!cancelled);
         assert_eq!(changed, FsLocation::Local);
+        assert!(consumed.is_empty());
         // Two landed, the colliding one is counted in the summary.
         assert!(root.join("target").join("a.txt").exists());
         assert!(root
@@ -24137,10 +25013,11 @@ mod tests {
             cut: false,
             verb: "Imported",
         };
-        let (_changed, notice, cancelled, result) =
+        let (_changed, notice, cancelled, result, consumed) =
             run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
         assert!(cancelled);
         assert!(result.is_err());
+        assert!(consumed.is_empty());
         assert!(!root2.join("target").join("a.txt").exists());
         assert!(notice.expect("cancel summary").0.contains("Cancelled"));
         std::fs::remove_dir_all(root2).expect("remove test tree");

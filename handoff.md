@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.4)
+Updated: 2026-08-27 (Files remote-target safety)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,42 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Files remote-target safety (2026-08-27)**: the Files header now exposes a
+  keyboard-reachable terminal action. Local opens a normal new session at the
+  visible tree root; Remote explicitly says **default dir** and reuses the
+  selected profile's connection path. Remote-host config replacement no longer
+  lets a numeric index silently redirect the tree or an old file clipboard:
+  only one exact, complete old-profile identity may rebind across the active
+  list. Missing, edited, out-of-range, or duplicate identities fail closed to
+  Local, cancel/retire remote transfer state, and clear old selection, menus,
+  dialogs, delete confirmation, clipboard, hover/filter state, and drop work.
+  Menu-derived create/rename/delete intents additionally carry the tree
+  generation and revalidate immediately before dispatch; off-thread drop plans
+  and file-op reports carry equivalent stale-result guards. File-op reports
+  validate both context epoch and location before clearing even transfer UI,
+  so a late cancelled job cannot erase a newer transfer. A unique exact-profile
+  index move invalidates old tree intents/drop work and immediately reloads the
+  same root with the new index; the old directory result is generation-stale,
+  so the panel cannot remain stuck in Loading. Already-dispatched file work
+  carries the complete destination profile and can finish against that one
+  unique new slot. Copy/Cut replacements have checked monotonic identities, so
+  exhaustion fails closed and an old completion can never alias or retire a
+  newer Copy/Cut. Backend-confirmed clipboard settlement runs before the
+  stale-UI gate: partial/cancelled cuts retire only sources actually moved and
+  deleted, while successful Rename/Delete retires matching dangling Copy/Cut
+  paths and their descendants. Dispatch also binds the source filesystem, so
+  equal path text on Local and a remote profile cannot cross-retire entries. An
+  open Paste menu freezes that identity and visibly requires reopening instead
+  of substituting a later clipboard. A failed
+  remote home probe now returns to a loaded Local root with bounded inline
+  feedback,
+  so the user can select the profile again instead of being trapped refreshing
+  an old path. Pure remap/copy tests cover reorder, full-identity change,
+  duplicate ambiguity (including inactive retained duplicates), and
+  Local/Remote entry wording; sidebar tests cover generation expiry and
+  reindex-load replacement. Validation passed all 861 tests, `cargo check`, and
+  warning-denied Clippy across every target.
 
 - **Block Search 4.4 (2026-08-26)**: result-local bookmark controls now carry
   visible action labels (`☆ Bookmark` / `★ Remove`) and honest row-local
