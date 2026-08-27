@@ -1819,6 +1819,41 @@ fn unique_active_remote_profile_index(
     Some(only)
 }
 
+fn same_ssh_files_transport(
+    configured: &jterm_core::jsh_remote::RemoteHostConfig,
+    observed: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> bool {
+    !configured.docker && !observed.docker && remote_fs::same_files_transport(configured, observed)
+}
+
+fn unique_active_ssh_transport_index(
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    observed: &jterm_core::jsh_remote::RemoteHostConfig,
+) -> Option<usize> {
+    let mut matches = hosts
+        .iter()
+        .take(config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, configured)| {
+            (config::validate_remote_host_at(hosts, index).is_ok()
+                && same_ssh_files_transport(configured, observed))
+            .then_some(index)
+        });
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
+}
+
+fn interactive_ssh_argv(profile: &jterm_core::jsh_remote::RemoteHostConfig) -> Vec<String> {
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(profile.ssh_args.iter().cloned());
+    argv.push("--".to_string());
+    argv.push(match &profile.user {
+        Some(user) => format!("{user}@{}", profile.host),
+        None => profile.host.clone(),
+    });
+    argv
+}
+
 fn remap_sidebar_location(
     old_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
     new_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
@@ -1831,19 +1866,33 @@ fn remap_sidebar_location(
             unique_active_remote_profile_index(new_hosts, old_profile)
                 .map(remote_fs::FsLocation::Remote)
         }
+        remote_fs::FsLocation::Transient(profile) => config::validate_remote_host(profile)
+            .ok()
+            .map(|()| remote_fs::FsLocation::Transient(profile.clone())),
     }
 }
 
-fn sidebar_terminal_entry_copy(location: &remote_fs::FsLocation) -> (&'static str, &'static str) {
+fn sidebar_terminal_entry_copy(location: &remote_fs::FsLocation) -> (String, String) {
     match location {
         remote_fs::FsLocation::Local => (
-            "Terminal here",
-            "Open a new local terminal at the current tree root",
+            "Terminal here".to_string(),
+            "Open a new local terminal at the current tree root".to_string(),
         ),
         remote_fs::FsLocation::Remote(_) => (
-            "Remote terminal\n(default dir)",
-            "Open a new remote terminal for this profile at its default directory",
+            "Remote terminal\n(default dir)".to_string(),
+            "Open a new remote terminal for this profile at its default directory".to_string(),
         ),
+        remote_fs::FsLocation::Transient(profile) => {
+            let endpoint = match &profile.user {
+                Some(user) => format!("{user}@{}", profile.host),
+                None => profile.host.clone(),
+            };
+            let endpoint = jterm_core::review_input::safe_inline_display(&endpoint, 256);
+            (
+                "SSH terminal\n(login shell)".to_string(),
+                format!("Open a plain interactive SSH login to {endpoint}; current SSH options are retained"),
+            )
+        }
     }
 }
 
@@ -2083,6 +2132,11 @@ fn sidebar_op_report_matches_context(
             remote_fs::FsLocation::Remote(current_index),
             Some(profile),
         ) => unique_active_remote_profile_index(current_hosts, profile) == Some(*current_index),
+        (
+            remote_fs::FsLocation::Transient(report_profile),
+            remote_fs::FsLocation::Transient(current_profile),
+            Some(profile),
+        ) => report_profile == profile && current_profile == profile,
         _ => false,
     }
 }
@@ -2093,6 +2147,62 @@ fn sidebar_op_report_matches_context(
 struct SidebarLocationChoice {
     location: remote_fs::FsLocation,
     label: String,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarRemoteFollow {
+    token: u64,
+    intent_epoch: u64,
+    session_id: usize,
+    source_argv: Vec<String>,
+    source_profile: jterm_core::jsh_remote::RemoteHostConfig,
+    source_control_path: Option<String>,
+    attempt: u8,
+    target_location: remote_fs::FsLocation,
+    preserve_loaded_tree: bool,
+    hosts_epoch: u64,
+    tree_generation: u64,
+    tree_location: remote_fs::FsLocation,
+    tree_root: std::path::PathBuf,
+    sidebar_open: bool,
+    sidebar_panel: SidebarPanel,
+}
+
+fn sidebar_remote_follow_tree_is_current(
+    pending: &SidebarRemoteFollow,
+    sidebar: &sidebar::Sidebar,
+    sidebar_open: bool,
+    sidebar_panel: SidebarPanel,
+) -> bool {
+    sidebar.generation() == pending.tree_generation
+        && sidebar.location == pending.tree_location
+        && sidebar.current_dir == pending.tree_root
+        && sidebar_open == pending.sidebar_open
+        && sidebar_panel == pending.sidebar_panel
+}
+
+fn sidebar_remote_follow_context_is_current(
+    pending: &SidebarRemoteFollow,
+    sidebar: &sidebar::Sidebar,
+    sidebar_open: bool,
+    sidebar_panel: SidebarPanel,
+    hosts_epoch: u64,
+    intent_epoch: Option<u64>,
+    files_busy: bool,
+) -> bool {
+    sidebar_remote_follow_tree_is_current(pending, sidebar, sidebar_open, sidebar_panel)
+        && hosts_epoch == pending.hosts_epoch
+        && intent_epoch == Some(pending.intent_epoch)
+        && !files_busy
+}
+
+fn suppress_armed_sidebar_retry(
+    observed: &mut Option<(usize, Vec<String>)>,
+    retry_once: &mut Option<(usize, Vec<String>)>,
+) {
+    if let Some(retry) = retry_once.take() {
+        *observed = Some(retry);
+    }
 }
 
 impl std::fmt::Display for SidebarLocationChoice {
@@ -2830,6 +2940,12 @@ enum Message {
     SidebarSetLocation(u64, remote_fs::FsLocation),
     /// Async start-directory resolution for a location switch (generation-guarded).
     SidebarLocationResolved(u64, Result<std::path::PathBuf, String>),
+    /// Staged home probe for an SSH process observed through `/proc`. The
+    /// existing tree remains visible until this succeeds and is revalidated.
+    SidebarRemoteFollowResolved(u64, Result<std::path::PathBuf, String>),
+    /// Explicitly re-probe the exact still-running SSH command named by the
+    /// current Files failure notice.
+    SidebarRemoteFollowRetry,
     /// Pointer enter/exit on the dock gates the menu-anchor tracking below.
     SidebarHover(bool),
     /// Window-space pointer position while hovering the dock; the file-ops
@@ -3124,6 +3240,10 @@ struct Session {
     /// Host clipboard access is asynchronous. Limit PTY-originated reads to one
     /// per session so a hostile child cannot accumulate work across UI batches.
     clipboard_read_in_flight: bool,
+    /// True for a connection Frost launched from its own remote picker. The
+    /// automatic Files follower targets SSH typed inside an ordinary local
+    /// shell and must not open a duplicate sidecar for managed remote tabs.
+    managed_remote: bool,
 }
 
 fn agent_prompt_status_with_foreground(
@@ -3256,6 +3376,7 @@ impl Session {
             queued_write_bytes: 0,
             queued_response_bytes: 0,
             clipboard_read_in_flight: false,
+            managed_remote: false,
         })
     }
 
@@ -3358,6 +3479,10 @@ impl Session {
             return None;
         }
         Some(comm)
+    }
+
+    fn observed_ssh_command(&self) -> Option<jterm_core::process::ObservedSshCommand> {
+        jterm_core::process::observed_ssh_command(self.master_fd, self.pty.get_child_pid())
     }
 
     /// Agent approval requires both a trusted terminal-state boundary and the
@@ -3942,6 +4067,21 @@ struct Frost {
     /// `None` is a fail-closed terminal state if the identity space is ever
     /// exhausted; it can never alias an earlier worker report.
     sidebar_context_epoch: Option<u64>,
+    /// User pane/sidebar/file-operation intent. A staged automatic follow may
+    /// commit only if this value is unchanged; A→B→A UI movement therefore
+    /// cannot look current merely because its final values happen to match.
+    sidebar_follow_intent_epoch: Option<u64>,
+    /// Last real SSH argv seen in the active local pane. Keeping the structured
+    /// argv suppresses repeat probes without ever trusting terminal text.
+    sidebar_follow_observed: Option<(usize, Vec<String>)>,
+    /// One automatic retry for the startup race where jsh's shared SSH master
+    /// is still being created when the first non-interactive probe runs.
+    sidebar_follow_retry_once: Option<(usize, Vec<String>)>,
+    /// After the bounded automatic retry, keep one exact live-command identity
+    /// behind the Files notice's explicit Retry action.
+    sidebar_follow_retry_available: Option<(usize, Vec<String>)>,
+    sidebar_follow_pending: Option<SidebarRemoteFollow>,
+    sidebar_follow_next_token: u64,
     /// Divider being dragged, identified by its owning split node's path + gap.
     dragging_divider: Option<DividerId>,
     /// Divider under the pointer (drives its hover highlight).
@@ -4173,6 +4313,12 @@ impl Frost {
             sidebar_notice: None,
             sidebar_hosts_epoch: 0,
             sidebar_context_epoch: Some(0),
+            sidebar_follow_intent_epoch: Some(0),
+            sidebar_follow_observed: None,
+            sidebar_follow_retry_once: None,
+            sidebar_follow_retry_available: None,
+            sidebar_follow_pending: None,
+            sidebar_follow_next_token: 0,
             dragging_divider: None,
             hovered_divider: None,
             last_divider_press: None,
@@ -4322,6 +4468,13 @@ impl Frost {
     }
 
     fn sync_tab_position_ui(&mut self) {
+        let (next_open, next_panel) = match self.config.tab_position {
+            config::TabPosition::Side => (true, SidebarPanel::Tabs),
+            config::TabPosition::Top => (false, SidebarPanel::Files),
+        };
+        if self.sidebar_open != next_open || self.sidebar_panel != next_panel {
+            self.invalidate_sidebar_remote_follow_intent();
+        }
         match self.config.tab_position {
             config::TabPosition::Side => {
                 self.sidebar_open = true;
@@ -4579,6 +4732,7 @@ impl Frost {
     /// generation/location guards prevent results from refreshing this new
     /// Local view. Transfers additionally expose cancellation and are stopped.
     fn clear_sidebar_remote_context(&mut self) {
+        self.invalidate_sidebar_remote_follow_intent();
         self.invalidate_sidebar_pending_work();
         self.sidebar_clipboard = None;
         self.sidebar_selection.clear();
@@ -4595,6 +4749,314 @@ impl Frost {
             .reset_to_local(self.local_sidebar_fallback_root());
         self.sidebar_notice = Some((notice, false));
         request
+    }
+
+    fn cancel_sidebar_remote_follow(&mut self) {
+        self.sidebar_follow_pending = None;
+    }
+
+    fn invalidate_sidebar_remote_follow_intent(&mut self) {
+        self.cancel_sidebar_remote_follow();
+        // If an automatic retry was armed, convert it back into the observed
+        // dedupe key before cancelling. A user action during that short wait
+        // must not accidentally turn the same SSH command into a fresh probe.
+        suppress_armed_sidebar_retry(
+            &mut self.sidebar_follow_observed,
+            &mut self.sidebar_follow_retry_once,
+        );
+        self.sidebar_follow_retry_available = None;
+        self.sidebar_follow_intent_epoch =
+            next_sidebar_context_epoch(self.sidebar_follow_intent_epoch);
+    }
+
+    fn active_session_changed_for_remote_follow(&mut self) {
+        self.invalidate_sidebar_remote_follow_intent();
+        // Returning A→B→A is a new active-session intent. The old A probe may
+        // not commit (epoch above), but the real still-running A command should
+        // be eligible for a fresh staged follow instead of being deduped away.
+        self.sidebar_follow_observed = None;
+    }
+
+    /// Poll the active pane's real foreground argv. OSC 133 command text is
+    /// deliberately ignored: a remote program can print terminal escapes, but
+    /// it cannot forge `/proc/<pid>/cmdline` for a local foreground process.
+    fn poll_sidebar_remote_follow(&mut self) -> Task<Message> {
+        let observed = self.sessions.get(self.active).and_then(|session| {
+            (!session.managed_remote && !session.transcript_read_only())
+                .then(|| {
+                    session
+                        .observed_ssh_command()
+                        .map(|command| (session.id, command))
+                })
+                .flatten()
+        });
+        let Some((session_id, command)) = observed else {
+            self.sidebar_follow_observed = None;
+            self.sidebar_follow_retry_once = None;
+            self.sidebar_follow_retry_available = None;
+            self.cancel_sidebar_remote_follow();
+            return Task::none();
+        };
+
+        let argv = command.argv;
+        let parsed = command.target;
+        let control_path = command.reusable_control_path;
+        if matches!(parsed, jterm_core::jsh_remote::ObservedSshTarget::NotSsh) {
+            self.sidebar_follow_observed = None;
+            self.sidebar_follow_retry_once = None;
+            self.sidebar_follow_retry_available = None;
+            self.cancel_sidebar_remote_follow();
+            return Task::none();
+        }
+        let retry_attempt = self
+            .sidebar_follow_retry_once
+            .as_ref()
+            .is_some_and(|retry| retry.0 == session_id && retry.1 == argv);
+        if !retry_attempt
+            && self
+                .sidebar_follow_observed
+                .as_ref()
+                .is_some_and(|observed| observed.0 == session_id && observed.1 == argv)
+        {
+            return Task::none();
+        }
+        let attempt = if retry_attempt {
+            self.sidebar_follow_retry_once = None;
+            1
+        } else {
+            self.sidebar_follow_retry_once = None;
+            self.sidebar_follow_retry_available = None;
+            0
+        };
+        self.sidebar_follow_observed = Some((session_id, argv));
+        self.cancel_sidebar_remote_follow();
+
+        let profile = match parsed {
+            jterm_core::jsh_remote::ObservedSshTarget::Target(profile) => profile,
+            jterm_core::jsh_remote::ObservedSshTarget::Unsupported(reason) => {
+                self.push_toast(
+                    format!(
+                        "Files did not follow SSH: {reason}. Add a saved remote profile to connect manually."
+                    ),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+            jterm_core::jsh_remote::ObservedSshTarget::NotSsh => return Task::none(),
+        };
+
+        let target_location =
+            unique_active_ssh_transport_index(self.sidebar.hosts_snapshot(), &profile)
+                .map(remote_fs::FsLocation::Remote)
+                .unwrap_or_else(|| remote_fs::FsLocation::Transient(profile.clone()));
+
+        // A ControlPath belongs to this live connection, not the saved target
+        // identity. Preserve an explicit `-S`/`-o ControlPath` from a direct
+        // command, or overlay the provenance-checked path derived for jsh's
+        // launcher, while keeping ordinary saved profiles stable.
+        let observed_has_control_path = remote_fs::has_control_path_argument(&profile.ssh_args);
+        let execution_profile = if observed_has_control_path {
+            profile.clone()
+        } else {
+            match &target_location {
+                remote_fs::FsLocation::Remote(index) => self
+                    .sidebar
+                    .hosts_snapshot()
+                    .get(*index)
+                    .cloned()
+                    .unwrap_or_else(|| profile.clone()),
+                remote_fs::FsLocation::Transient(profile) => profile.clone(),
+                remote_fs::FsLocation::Local => profile.clone(),
+            }
+        };
+        let execution_profile =
+            remote_fs::with_reusable_control_path(&execution_profile, control_path.as_deref());
+        let target_location = if control_path.is_some() || observed_has_control_path {
+            remote_fs::FsLocation::Transient(execution_profile)
+        } else {
+            target_location
+        };
+
+        let current_profile =
+            remote_fs::remote_host(&self.sidebar.location, self.sidebar.hosts_snapshot()).ok();
+        let same_target =
+            current_profile.is_some_and(|current| same_ssh_files_transport(current, &profile));
+        let live_execution_requested = observed_has_control_path || control_path.is_some();
+        let same_execution = current_profile.is_some_and(|current| {
+            remote_fs::remote_host(&target_location, self.sidebar.hosts_snapshot())
+                .is_ok_and(|target| remote_fs::same_files_execution(current, target))
+        });
+        // If the new command offers a live socket, reveal an existing tree
+        // only when it already uses that exact route. Otherwise stage a probe
+        // and upgrade future operations without throwing away loaded rows.
+        let already_following = same_target && (!live_execution_requested || same_execution);
+        let preserve_loaded_tree = same_target
+            && !already_following
+            && self.sidebar.root.state == sidebar::DirectoryState::Loaded;
+        if already_following {
+            self.sidebar_open = true;
+            self.sidebar_panel = SidebarPanel::Files;
+            self.sidebar_notice = Some((
+                format!(
+                    "Following {}",
+                    self.sidebar.location.label(self.sidebar.hosts_snapshot())
+                ),
+                true,
+            ));
+            self.apply_config();
+            return Task::none();
+        }
+
+        let Some(intent_epoch) = self.sidebar_follow_intent_epoch else {
+            self.push_toast(
+                "Automatic SSH Files follow is unavailable until Frost restarts",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        };
+
+        let Some(token) = self.sidebar_follow_next_token.checked_add(1) else {
+            self.push_toast(
+                "Automatic SSH Files follow is unavailable until Frost restarts",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        };
+        self.sidebar_follow_next_token = token;
+        self.sidebar_follow_pending = Some(SidebarRemoteFollow {
+            token,
+            intent_epoch,
+            session_id,
+            source_argv: self
+                .sidebar_follow_observed
+                .as_ref()
+                .map(|observed| observed.1.clone())
+                .unwrap_or_default(),
+            source_profile: profile,
+            source_control_path: control_path,
+            attempt,
+            target_location: target_location.clone(),
+            preserve_loaded_tree,
+            hosts_epoch: self.sidebar_hosts_epoch,
+            tree_generation: self.sidebar.generation(),
+            tree_location: self.sidebar.location.clone(),
+            tree_root: self.sidebar.current_dir.clone(),
+            sidebar_open: self.sidebar_open,
+            sidebar_panel: self.sidebar_panel,
+        });
+
+        let hosts = self.sidebar.hosts_snapshot().to_vec();
+        Task::perform(
+            async move {
+                remote_fs::start_dir(&target_location, &hosts).map_err(|error| error.to_string())
+            },
+            move |result| Message::SidebarRemoteFollowResolved(token, result),
+        )
+    }
+
+    fn resolve_sidebar_remote_follow(
+        &mut self,
+        token: u64,
+        start: Result<std::path::PathBuf, String>,
+    ) -> Task<Message> {
+        if self
+            .sidebar_follow_pending
+            .as_ref()
+            .is_none_or(|pending| pending.token != token)
+        {
+            return Task::none();
+        }
+        let pending = self
+            .sidebar_follow_pending
+            .take()
+            .expect("matching pending SSH follow");
+
+        let source_still_matches = self
+            .sessions
+            .get(self.active)
+            .filter(|session| session.id == pending.session_id && !session.managed_remote)
+            .and_then(Session::observed_ssh_command)
+            .is_some_and(|command| {
+                command.argv == pending.source_argv
+                    && command.reusable_control_path == pending.source_control_path
+                    && matches!(
+                        command.target,
+                        jterm_core::jsh_remote::ObservedSshTarget::Target(profile)
+                            if profile == pending.source_profile
+                    )
+            });
+        let files_busy = self.sidebar_transfer.is_some()
+            || self.sidebar_menu.is_some()
+            || self.sidebar_dialog.is_some()
+            || self.sidebar_delete_confirm.is_some()
+            || !self.sidebar_drop_burst.is_empty();
+        let tree_still_matches = sidebar_remote_follow_context_is_current(
+            &pending,
+            &self.sidebar,
+            self.sidebar_open,
+            self.sidebar_panel,
+            self.sidebar_hosts_epoch,
+            self.sidebar_follow_intent_epoch,
+            files_busy,
+        );
+        if !source_still_matches || !tree_still_matches {
+            return Task::none();
+        }
+
+        let start = match start {
+            Ok(start) => start,
+            Err(error) => {
+                let detail = jterm_core::review_input::safe_inline_display(&error, 160);
+                let retrying = pending.attempt == 0;
+                let suffix = if retrying {
+                    " Frost will retry once while the SSH control socket settles."
+                } else {
+                    " Fix authentication if needed, then select Retry without leaving SSH."
+                };
+                let message = format!(
+                    "Files could not join {}: {detail}. Non-interactive SSH needs a key, agent, or reusable control socket; the current tree was kept.{suffix}",
+                    pending.source_profile.display_name()
+                );
+                self.sidebar_notice = Some((message.clone(), false));
+                self.push_toast(message, ToastKind::Warning);
+                if retrying {
+                    self.sidebar_follow_retry_once =
+                        Some((pending.session_id, pending.source_argv));
+                    self.sidebar_follow_observed = None;
+                } else {
+                    self.sidebar_follow_retry_available =
+                        Some((pending.session_id, pending.source_argv));
+                }
+                return Task::none();
+            }
+        };
+
+        let label = pending.target_location.label(self.sidebar.hosts_snapshot());
+        self.invalidate_sidebar_remote_follow_intent();
+        self.invalidate_sidebar_pending_work();
+        if pending.preserve_loaded_tree
+            && self
+                .sidebar
+                .rebind_same_namespace_preserving_tree(pending.target_location.clone())
+        {
+            self.sidebar_open = true;
+            self.sidebar_panel = SidebarPanel::Files;
+            self.sidebar_notice = Some((format!("Following {label}"), true));
+            self.apply_config();
+            return Task::none();
+        }
+
+        self.sidebar_selection.clear();
+        self.sidebar_selection_anchor = None;
+        let generation = self.sidebar.begin_location_change(pending.target_location);
+        let Some(request) = self.sidebar.resolve_location(generation, Ok(start)) else {
+            return Task::none();
+        };
+        self.sidebar_open = true;
+        self.sidebar_panel = SidebarPanel::Files;
+        self.sidebar_notice = Some((format!("Following {label}"), true));
+        self.apply_config();
+        sidebar_load_task(request)
     }
 
     /// Reconcile the file tree's immutable host snapshot after a config
@@ -4614,6 +5076,10 @@ impl Frost {
             .as_ref()
             .map(|clipboard| remap_sidebar_location(&old_hosts, &new_hosts, &clipboard.loc));
         self.sidebar_hosts_epoch = self.sidebar_hosts_epoch.wrapping_add(1);
+        self.invalidate_sidebar_remote_follow_intent();
+        // Config identity really did change, so let the still-live command be
+        // reconsidered against the new saved-profile set on the next tick.
+        self.sidebar_follow_observed = None;
         self.sidebar.set_hosts(new_hosts);
 
         let Some(location) = rebound else {
@@ -4670,6 +5136,9 @@ impl Frost {
                 self.new_session_at(Some(&cwd));
             }
             remote_fs::FsLocation::Remote(index) => self.connect_remote_host(index),
+            remote_fs::FsLocation::Transient(profile) => {
+                self.connect_remote_profile(profile, "temporary SSH target".to_string(), true)
+            }
         }
     }
 
@@ -4677,6 +5146,7 @@ impl Frost {
     /// Keeping this in one place makes the toolbar, shortcut, and command
     /// palette behave identically.
     fn toggle_sidebar(&mut self) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
         self.sidebar_open = !self.sidebar_open;
         // The cwd follow is local-only, exactly as in SetSidebarPanel.
         let follow_local = self.sidebar.location == remote_fs::FsLocation::Local;
@@ -4709,6 +5179,7 @@ impl Frost {
         menu: SidebarMenuState,
         action: SidebarMenuAction,
     ) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(menu.generation) {
             self.sidebar_notice = Some((
                 "Files changed; reopen the menu before modifying anything".to_string(),
@@ -4830,7 +5301,11 @@ impl Frost {
                 // the cancel affordance addresses exactly one handle, so a
                 // second transfer is refused while one runs.
                 let mut progress = None;
-                if clipboard.loc != self.sidebar.location {
+                if !remote_fs::same_files_location(
+                    &clipboard.loc,
+                    &self.sidebar.location,
+                    self.sidebar.hosts_snapshot(),
+                ) {
                     if self.sidebar_transfer.is_some() {
                         self.sidebar_notice =
                             Some(("A transfer is already running".to_string(), false));
@@ -4853,7 +5328,12 @@ impl Frost {
                     };
                     let ui = SidebarTransferUi {
                         progress: handle.clone(),
-                        verb: transfer_verb(&clipboard.loc, &self.sidebar.location, false),
+                        verb: transfer_verb(
+                            &clipboard.loc,
+                            &self.sidebar.location,
+                            self.sidebar.hosts_snapshot(),
+                            false,
+                        ),
                         name,
                         total,
                     };
@@ -4880,6 +5360,7 @@ impl Frost {
         let Some(dialog) = self.sidebar_dialog.clone() else {
             return Task::none();
         };
+        self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(dialog.generation) {
             self.sidebar_dialog = None;
             self.sidebar_notice = Some((
@@ -4978,6 +5459,7 @@ impl Frost {
     /// (dirs toggle, files type their path). Modifier clicks never toggle or
     /// insert.
     fn sidebar_row_click(&mut self, path: std::path::PathBuf, is_dir: bool) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
         if self.modifiers.control() {
             selection_toggle(&mut self.sidebar_selection, &path);
             self.sidebar_selection_anchor = Some(path);
@@ -5012,6 +5494,7 @@ impl Frost {
         let Some(confirmation) = self.sidebar_delete_confirm.take() else {
             return Task::none();
         };
+        self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(confirmation.generation) {
             self.sidebar_notice = Some((
                 "Files changed; select the items again before deleting".to_string(),
@@ -5477,6 +5960,7 @@ impl Frost {
         if index >= self.sessions.len() {
             return Task::none();
         }
+        self.invalidate_sidebar_remote_follow_intent();
         // Session removal can invalidate a tab/pane drag source or target and
         // reindex every remaining leaf. Cancel while all stable identities are
         // still resolvable, then perform the close from a clean UI state.
@@ -5988,6 +6472,7 @@ impl Frost {
 
         if focused_session != self.active {
             self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
         }
         self.active_tab = target_tab;
         self.active = focused_session;
@@ -6047,6 +6532,7 @@ impl Frost {
 
         if focused_session != self.active {
             self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
         }
         self.active_tab = new_tab;
         self.active = focused_session;
@@ -6079,6 +6565,7 @@ impl Frost {
             // Alt+arrows, `focus_session`, the tab switcher): the block
             // search picker must not survive the active session changing.
             self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
         }
         self.active = session;
         let idx = self.active_tab.min(self.tabs.len() - 1);
@@ -6147,6 +6634,9 @@ impl Frost {
     fn activate_tab(&mut self, tab: usize) {
         if tab >= self.tabs.len() {
             return;
+        }
+        if self.active_tab != tab || self.tabs[tab].focus != self.active {
+            self.active_session_changed_for_remote_follow();
         }
         self.active_tab = tab;
         self.tabs[tab].repair_focus();
@@ -6250,6 +6740,7 @@ impl Frost {
             // New-tab activation bypasses `set_focus`; the block search
             // picker must not survive the active session changing.
             self.close_block_search_on_session_change();
+            self.active_session_changed_for_remote_follow();
         }
         let at = new_unpinned_tab_index(&self.tabs, self.active_tab);
         let id = self.next_tab_id;
@@ -7052,7 +7543,27 @@ impl Frost {
             }
         };
         let display_name = config::remote_host_display_name(&host, index);
-        let (argv, degraded) = host.tab_argv();
+        self.connect_remote_profile(host, display_name, false);
+    }
+
+    fn connect_remote_profile(
+        &mut self,
+        host: jterm_core::jsh_remote::RemoteHostConfig,
+        display_name: String,
+        plain_interactive: bool,
+    ) {
+        if let Err(problem) = config::validate_remote_host(&host) {
+            self.push_toast(
+                format!("Remote host {display_name}: {problem}"),
+                ToastKind::Warning,
+            );
+            return;
+        }
+        let (argv, degraded) = if plain_interactive && !host.docker {
+            (interactive_ssh_argv(&host), None)
+        } else {
+            host.tab_argv()
+        };
         if let Some(error) = degraded {
             // The tab still opens — a plain connection beats no connection —
             // but quietly pretending jsh was deployed would be worse than
@@ -7071,7 +7582,8 @@ impl Frost {
             None,
             Some(&argv),
         ) {
-            Ok(session) => {
+            Ok(mut session) => {
+                session.managed_remote = true;
                 self.session_diagnostic = None;
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
@@ -12445,6 +12957,9 @@ impl Frost {
             }
             Message::ToggleSidebar => return self.toggle_sidebar(),
             Message::SetSidebarPanel(panel) => {
+                if self.sidebar_panel != panel {
+                    self.invalidate_sidebar_remote_follow_intent();
+                }
                 self.sidebar_panel = panel;
                 // Opening the file tree should reflect the active tab's cwd.
                 // That follow is a local-filesystem notion only: with a remote
@@ -12475,6 +12990,7 @@ impl Frost {
                 }
             }
             Message::SidebarInsertPath(path) => {
+                self.invalidate_sidebar_remote_follow_intent();
                 // Type the (shell-quoted) path into the active terminal so the
                 // sidebar doubles as a path picker.
                 // Trailing space so the picked path is ready to extend.
@@ -12490,6 +13006,7 @@ impl Frost {
             }
             Message::SidebarOpenTerminal(generation) => {
                 if self.sidebar.accepts_generation(generation) {
+                    self.invalidate_sidebar_remote_follow_intent();
                     self.open_sidebar_terminal();
                 }
             }
@@ -12500,11 +13017,13 @@ impl Frost {
                     .parent()
                     .map(std::path::Path::to_path_buf)
                 {
+                    self.invalidate_sidebar_remote_follow_intent();
                     let request = self.sidebar.set_current_dir(parent);
                     return sidebar_load_task(request);
                 }
             }
             Message::SidebarRefresh => {
+                self.invalidate_sidebar_remote_follow_intent();
                 let request = self.sidebar.refresh();
                 return sidebar_load_task(request);
             }
@@ -12523,6 +13042,7 @@ impl Frost {
                     return Task::none();
                 }
                 if location != self.sidebar.location {
+                    self.invalidate_sidebar_remote_follow_intent();
                     // A new location invalidates the selection's paths.
                     self.invalidate_sidebar_pending_work();
                     self.sidebar_selection.clear();
@@ -12559,6 +13079,18 @@ impl Frost {
                     }
                 }
             }
+            Message::SidebarRemoteFollowResolved(token, start) => {
+                return self.resolve_sidebar_remote_follow(token, start);
+            }
+            Message::SidebarRemoteFollowRetry => {
+                let Some(retry) = self.sidebar_follow_retry_available.take() else {
+                    return Task::none();
+                };
+                self.invalidate_sidebar_remote_follow_intent();
+                self.sidebar_follow_retry_once = Some(retry);
+                self.sidebar_follow_observed = None;
+                return self.poll_sidebar_remote_follow();
+            }
             Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
             Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
             Message::SidebarRowClick(generation, path, is_dir) => {
@@ -12573,6 +13105,7 @@ impl Frost {
                 if !self.sidebar.accepts_generation(generation) {
                     return Task::none();
                 }
+                self.invalidate_sidebar_remote_follow_intent();
                 // A right-click inside the selection targets the selection
                 // (in visible order); anywhere else the selection collapses
                 // to the clicked row.
@@ -12606,6 +13139,7 @@ impl Frost {
                 if !self.sidebar.accepts_generation(generation) {
                     return Task::none();
                 }
+                self.invalidate_sidebar_remote_follow_intent();
                 self.sidebar_menu = Some(SidebarMenuState {
                     path: self.sidebar.current_dir.clone(),
                     is_dir: true,
@@ -12711,6 +13245,7 @@ impl Frost {
                 }
             }
             Message::SidebarFilterToggle => {
+                self.invalidate_sidebar_remote_follow_intent();
                 if self.sidebar_filter.is_some() {
                     self.sidebar_filter = None;
                 } else {
@@ -12718,7 +13253,10 @@ impl Frost {
                     return iced::widget::operation::focus(SIDEBAR_FILTER_INPUT_ID.clone());
                 }
             }
-            Message::SidebarFilterInput(query) => self.sidebar_filter = Some(query),
+            Message::SidebarFilterInput(query) => {
+                self.invalidate_sidebar_remote_follow_intent();
+                self.sidebar_filter = Some(query);
+            }
             Message::FileDropped(path) => {
                 // Over the files panel a drop is an import; everywhere else it
                 // keeps today's terminal payload behavior.
@@ -12728,6 +13266,7 @@ impl Frost {
                 {
                     return self.update(Message::ImageDropped(path));
                 }
+                self.invalidate_sidebar_remote_follow_intent();
                 // iced delivers one FileDropped per path; a multi-file drop is
                 // one user action, so accumulate the burst and flush it after
                 // a short debounce. A rerooted tree starts a fresh burst; the
@@ -12779,6 +13318,7 @@ impl Frost {
                 if !self.sidebar.accepts_generation(generation) {
                     return Task::none();
                 }
+                self.invalidate_sidebar_remote_follow_intent();
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(problem) => {
@@ -13305,10 +13845,12 @@ impl Frost {
                     sess.fg_proc_cache = sess.fg_proc();
                     sess.git_meta_cache = if want_git { sess.git_meta() } else { None };
                 }
+                let remote_follow_task = self.poll_sidebar_remote_follow();
                 self.expire_toasts();
                 if let Some(request) = sidebar_reload_request {
-                    return sidebar_load_task(request);
+                    return Task::batch([sidebar_load_task(request), remote_follow_task]);
                 }
+                return remote_follow_task;
             }
             Message::TabMenuOpen(id) => {
                 // The menu is keyed on the tab id the strip handed out, not on
@@ -14339,7 +14881,12 @@ impl Frost {
         let paste_clip = self.sidebar_clipboard.as_ref();
         let paste_label = match paste_clip {
             Some(clip) => {
-                let verb = transfer_verb(&clip.loc, &self.sidebar.location, clip.cut);
+                let verb = transfer_verb(
+                    &clip.loc,
+                    &self.sidebar.location,
+                    self.sidebar.hosts_snapshot(),
+                    clip.cut,
+                );
                 match clip.items.as_slice() {
                     [(path, is_dir)] => {
                         let name = path
@@ -16370,8 +16917,9 @@ impl Frost {
                 .padding([3, 7])
                 .width(Length::Fill)
                 .style(self.ghost_btn_style()),
-            container(text(terminal_help).size(11))
+            container(text(terminal_help).size(11).wrapping(text::Wrapping::Word))
                 .padding(6)
+                .max_width(360)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
@@ -16398,13 +16946,22 @@ impl Frost {
         }
         // The location picker only exists once at least one remote host is
         // configured; with none, "Local" would be the only entry.
-        if !self.config.remote_hosts.is_empty() {
+        if !self.config.remote_hosts.is_empty()
+            || matches!(self.sidebar.location, remote_fs::FsLocation::Transient(_))
+        {
             let mut choices = vec![SidebarLocationChoice {
                 location: remote_fs::FsLocation::Local,
                 label: remote_fs::FsLocation::Local.label(&self.config.remote_hosts),
             }];
             for index in 0..self.config.remote_hosts.len().min(config::MAX_REMOTE_HOSTS) {
                 let location = remote_fs::FsLocation::Remote(index);
+                choices.push(SidebarLocationChoice {
+                    label: location.label(&self.config.remote_hosts),
+                    location,
+                });
+            }
+            if let remote_fs::FsLocation::Transient(profile) = &self.sidebar.location {
+                let location = remote_fs::FsLocation::Transient(profile.clone());
                 choices.push(SidebarLocationChoice {
                     label: location.label(&self.config.remote_hosts),
                     location,
@@ -16426,13 +16983,20 @@ impl Frost {
         // Transient op feedback (validation failures, ssh errors) lives in the
         // panel itself, where the user is looking; progress and cancellation
         // get the neutral style, errors the danger one. A running transfer
-        // adds a cancel button beside its notice.
+        // adds Cancel; an SSH join that exhausted its automatic retry keeps a
+        // bounded explicit Retry action while that exact command remains live.
         if let Some((notice, neutral)) = &self.sidebar_notice {
             let transferring = self.sidebar_transfer.is_some();
-            let cancel: Element<'_, Message> = if transferring {
+            let notice_action: Element<'_, Message> = if transferring {
                 button(text("×").size(11))
                     .on_press(Message::SidebarTransferCancel)
                     .padding([0, 5])
+                    .style(self.ghost_btn_style())
+                    .into()
+            } else if self.sidebar_follow_retry_available.is_some() {
+                button(text("Retry").size(11))
+                    .on_press(Message::SidebarRemoteFollowRetry)
+                    .padding([1, 6])
                     .style(self.ghost_btn_style())
                     .into()
             } else {
@@ -16450,7 +17014,7 @@ impl Frost {
                             } else {
                                 text::danger
                             }),
-                        cancel,
+                        notice_action,
                     ]
                     .align_y(iced::Alignment::Center),
                 )
@@ -18532,6 +19096,7 @@ impl Frost {
             return;
         }
         let showing = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
+        self.invalidate_sidebar_remote_follow_intent();
         if showing {
             self.sidebar_open = false;
         } else {
@@ -18639,6 +19204,7 @@ impl Frost {
         match agent_task_ui::begin_worktree_creation(context, agent_task::AgentProvider::Codex) {
             Ok(pending) => {
                 self.task_panel.pending_creation = Some(pending);
+                self.invalidate_sidebar_remote_follow_intent();
                 self.sidebar_open = true;
                 self.sidebar_panel = SidebarPanel::Tasks;
                 self.push_toast(
@@ -20042,13 +20608,16 @@ fn selection_range(
 fn transfer_verb(
     src_loc: &remote_fs::FsLocation,
     dst_loc: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
     cut: bool,
 ) -> String {
-    use remote_fs::FsLocation;
-    let transport = match (src_loc, dst_loc) {
-        (FsLocation::Local, FsLocation::Remote(_)) => "upload",
-        (FsLocation::Remote(_), FsLocation::Local) => "download",
-        (FsLocation::Remote(i), FsLocation::Remote(j)) if i != j => "relay",
+    let same_remote = src_loc.is_remote()
+        && dst_loc.is_remote()
+        && remote_fs::same_files_location(src_loc, dst_loc, hosts);
+    let transport = match (src_loc.is_remote(), dst_loc.is_remote()) {
+        (false, true) => "upload",
+        (true, false) => "download",
+        (true, true) if !same_remote => "relay",
         _ => return if cut { "move" } else { "copy" }.to_string(),
     };
     if cut {
@@ -20134,6 +20703,7 @@ fn sidebar_op_task(
         remote_fs::FsLocation::Remote(index) => config::validate_remote_host_at(&hosts, *index)
             .ok()
             .cloned(),
+        remote_fs::FsLocation::Transient(profile) => Some(profile.clone()),
     };
     Task::perform(
         async move {
@@ -20235,7 +20805,11 @@ fn run_sidebar_op(
             // cross-location transfers through the streaming machinery. A cut
             // deletes a source only after its own copy landed; a cancel stops
             // the remaining items and tidies the in-flight one.
-            let same_location = *src_loc == *location;
+            let same_location = remote_fs::same_files_location(src_loc, location, hosts);
+            let same_location_execution = same_location.then(|| {
+                remote_fs::preferred_same_files_execution_location(src_loc, location, hosts)
+                    .expect("same namespace has an execution route")
+            });
             let total = items.len();
             let mut done = 0usize;
             let mut failures: Vec<String> = Vec::new();
@@ -20258,10 +20832,12 @@ fn run_sidebar_op(
                     continue;
                 }
                 let result = if same_location {
+                    let execution =
+                        same_location_execution.expect("same namespace has an execution route");
                     if *cut {
-                        remote_fs::rename(location, hosts, &item.src, &item.dst)
+                        remote_fs::rename(execution, hosts, &item.src, &item.dst)
                     } else {
-                        remote_fs::copy(location, hosts, &item.src, &item.dst)
+                        remote_fs::copy(execution, hosts, &item.src, &item.dst)
                     }
                 } else {
                     remote_fs::transfer(
@@ -20344,7 +20920,7 @@ fn cleanup_after_cancel(
     dst: &std::path::Path,
     is_dir: bool,
 ) {
-    if is_dir && matches!(dst_loc, remote_fs::FsLocation::Remote(_)) {
+    if is_dir && dst_loc.is_remote() {
         let _ = remote_fs::delete(dst_loc, hosts, dst);
     }
 }
@@ -21154,6 +21730,104 @@ mod tests {
             None,
             "an exact but invalid candidate is not runnable authority"
         );
+
+        let transient = FsLocation::Transient(alpha.clone());
+        assert_eq!(
+            remap_sidebar_location(&old, &[], &transient),
+            Some(transient),
+            "an observed session target is independent of configured profile indices"
+        );
+    }
+
+    #[test]
+    fn observed_ssh_prefers_one_saved_transport_but_not_an_ambiguous_pair() {
+        let mut observed = sidebar_remote_profile("root@box", "box.example");
+        observed.user = Some("root".to_string());
+        observed.deploy = "off".to_string();
+
+        let mut saved = observed.clone();
+        saved.name = "production".to_string();
+        saved.remote_shell = "bash".to_string();
+        saved.deploy = "persist".to_string();
+        assert_eq!(
+            unique_active_ssh_transport_index(std::slice::from_ref(&saved), &observed),
+            Some(0),
+            "display and terminal-launch policy do not change Files transport identity"
+        );
+
+        let mut other_port = saved.clone();
+        other_port.ssh_args = vec!["-p".to_string(), "2200".to_string()];
+        assert_eq!(
+            unique_active_ssh_transport_index(&[other_port, saved.clone()], &observed),
+            Some(1)
+        );
+        assert_eq!(
+            unique_active_ssh_transport_index(&[saved.clone(), saved], &observed),
+            None,
+            "duplicate saved transports fall back to an explicit transient target"
+        );
+    }
+
+    #[test]
+    fn long_dsw_ssh_and_jsh_wrapper_keep_one_files_target() {
+        use jterm_core::jsh_remote::{observed_ssh_target, ObservedSshTarget};
+
+        const HOST: &str = "dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc-0jlbz3pri2042fd5xw2ov.instance-forward.dsw.cn-wulanchabu.aliyuncs.com";
+        let direct = vec![
+            "ssh".to_string(),
+            format!("root@{HOST}"),
+            "-p".to_string(),
+            "22".to_string(),
+        ];
+        let ObservedSshTarget::Target(profile) = observed_ssh_target(&direct) else {
+            panic!("the reported DSW command must be a safe interactive SSH target");
+        };
+        assert_eq!(profile.host, HOST);
+        assert_eq!(profile.user.as_deref(), Some("root"));
+        assert_eq!(profile.ssh_args, ["-p", "22"]);
+        assert_eq!(
+            interactive_ssh_argv(&profile),
+            ["ssh", "-p", "22", "--", &format!("root@{HOST}")]
+        );
+
+        let wrapper = vec![
+            "/bin/sh".to_string(),
+            "/home/root/.cache/jsh/jsh-remote.sh".to_string(),
+            "--persist".to_string(),
+            "--local-jsh".to_string(),
+            "/usr/local/bin/jsh".to_string(),
+            format!("root@{HOST}"),
+            "--".to_string(),
+            "-p".to_string(),
+            "22".to_string(),
+        ];
+        let ObservedSshTarget::Target(wrapped) = observed_ssh_target(&wrapper) else {
+            panic!("the jsh launcher must preserve the same Files target");
+        };
+        assert!(same_ssh_files_transport(&profile, &wrapped));
+    }
+
+    #[test]
+    fn live_control_path_is_execution_metadata_and_plain_login_stays_plain() {
+        let base = sidebar_remote_profile("production", "box.example");
+        let mut observed = base.clone();
+        observed.name = "root@box.example".to_string();
+        observed
+            .ssh_args
+            .extend(["-S".to_string(), "/run/user/1000/jsh/cm-%C".to_string()]);
+
+        assert!(same_ssh_files_transport(&base, &observed));
+        assert_eq!(
+            unique_active_ssh_transport_index(std::slice::from_ref(&base), &observed),
+            Some(0),
+            "a live socket must not fork stable Files identity"
+        );
+        let argv = interactive_ssh_argv(&observed);
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-S", "/run/user/1000/jsh/cm-%C"]));
+        assert!(!argv.iter().any(|argument| argument == "jsh"));
     }
 
     #[test]
@@ -21226,6 +21900,111 @@ mod tests {
             &FsLocation::Remote(0),
             std::slice::from_ref(&invalid),
         ));
+
+        assert!(sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Transient(alpha.clone()),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Transient(alpha.clone()),
+            &[],
+        ));
+        assert!(!sidebar_op_report_matches_context(
+            7,
+            &FsLocation::Transient(alpha.clone()),
+            Some(&alpha),
+            Some(7),
+            &FsLocation::Transient(beta),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn staged_ssh_follow_never_overrides_newer_file_tree_or_chrome_intent() {
+        let profile = sidebar_remote_profile("observed", "observed.example");
+        let mut sidebar = sidebar::Sidebar::new();
+        let pending = SidebarRemoteFollow {
+            token: 1,
+            intent_epoch: 0,
+            session_id: 3,
+            source_argv: vec!["ssh".to_string(), "observed.example".to_string()],
+            source_profile: profile.clone(),
+            source_control_path: None,
+            attempt: 0,
+            target_location: remote_fs::FsLocation::Transient(profile),
+            preserve_loaded_tree: false,
+            hosts_epoch: 0,
+            tree_generation: sidebar.generation(),
+            tree_location: sidebar.location.clone(),
+            tree_root: sidebar.current_dir.clone(),
+            sidebar_open: false,
+            sidebar_panel: SidebarPanel::Tabs,
+        };
+        assert!(sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Tabs,
+        ));
+        assert!(sidebar_remote_follow_context_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Tabs,
+            0,
+            Some(0),
+            false,
+        ));
+        assert!(
+            !sidebar_remote_follow_context_is_current(
+                &pending,
+                &sidebar,
+                false,
+                SidebarPanel::Tabs,
+                0,
+                Some(2),
+                false,
+            ),
+            "A→B→A chrome values still carry a newer intent epoch"
+        );
+        assert!(
+            !sidebar_remote_follow_context_is_current(
+                &pending,
+                &sidebar,
+                false,
+                SidebarPanel::Tabs,
+                0,
+                Some(0),
+                true,
+            ),
+            "a file operation started after the probe owns the tree"
+        );
+        assert!(!sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            true,
+            SidebarPanel::Tabs,
+        ));
+        assert!(!sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Files,
+        ));
+        let _newer = sidebar.refresh();
+        assert!(!sidebar_remote_follow_tree_is_current(
+            &pending,
+            &sidebar,
+            false,
+            SidebarPanel::Tabs,
+        ));
+
+        let retry = (3, vec!["ssh".to_string(), "observed.example".to_string()]);
+        let mut observed = None;
+        let mut retry_once = Some(retry.clone());
+        suppress_armed_sidebar_retry(&mut observed, &mut retry_once);
+        assert_eq!(observed, Some(retry));
+        assert_eq!(retry_once, None);
     }
 
     #[test]
@@ -21335,6 +22114,17 @@ mod tests {
             sidebar_terminal_entry_copy(&remote_fs::FsLocation::Remote(3));
         assert!(remote_label.contains("default dir"));
         assert!(remote_help.contains("default directory"));
+
+        let mut transient = sidebar_remote_profile(
+            "temporary",
+            "dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc.example.com",
+        );
+        transient.user = Some("root".to_string());
+        let (transient_label, transient_help) =
+            sidebar_terminal_entry_copy(&remote_fs::FsLocation::Transient(transient));
+        assert!(transient_label.contains("login shell"));
+        assert!(transient_help.contains("root@dsw-notebook"));
+        assert!(transient_help.contains("SSH options are retained"));
     }
 
     #[test]
@@ -24850,33 +25640,59 @@ mod tests {
     #[test]
     fn transfer_verb_names_the_transport() {
         use remote_fs::FsLocation;
+        let hosts = vec![
+            sidebar_remote_profile("one", "one.example"),
+            sidebar_remote_profile("two", "two.example"),
+        ];
         assert_eq!(
-            transfer_verb(&FsLocation::Local, &FsLocation::Local, false),
+            transfer_verb(&FsLocation::Local, &FsLocation::Local, &hosts, false),
             "copy"
         );
         assert_eq!(
-            transfer_verb(&FsLocation::Local, &FsLocation::Local, true),
+            transfer_verb(&FsLocation::Local, &FsLocation::Local, &hosts, true),
             "move"
         );
         assert_eq!(
-            transfer_verb(&FsLocation::Remote(0), &FsLocation::Remote(0), false),
+            transfer_verb(
+                &FsLocation::Remote(0),
+                &FsLocation::Remote(0),
+                &hosts,
+                false,
+            ),
             "copy"
         );
         assert_eq!(
-            transfer_verb(&FsLocation::Local, &FsLocation::Remote(0), false),
+            transfer_verb(&FsLocation::Local, &FsLocation::Remote(0), &hosts, false,),
             "upload"
         );
         assert_eq!(
-            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, false),
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, &hosts, false,),
             "download"
         );
         assert_eq!(
-            transfer_verb(&FsLocation::Remote(0), &FsLocation::Remote(1), false),
+            transfer_verb(
+                &FsLocation::Remote(0),
+                &FsLocation::Remote(1),
+                &hosts,
+                false,
+            ),
             "relay"
         );
         assert_eq!(
-            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, true),
+            transfer_verb(&FsLocation::Remote(0), &FsLocation::Local, &hosts, true,),
             "download + delete"
+        );
+        let overlaid =
+            remote_fs::with_reusable_control_path(&hosts[0], Some("/run/user/1000/cm-%C"));
+        assert_eq!(
+            transfer_verb(
+                &FsLocation::Remote(0),
+                &FsLocation::Transient(overlaid),
+                &hosts,
+                false,
+            ),
+            "copy",
+            "a live ControlPath overlay does not turn one host into a relay"
         );
     }
 

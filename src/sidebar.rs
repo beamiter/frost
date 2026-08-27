@@ -159,6 +159,29 @@ impl Sidebar {
         self.refresh()
     }
 
+    /// Swap only the execution route after the caller has proved it names the
+    /// same remote filesystem and successfully probed the replacement route.
+    /// Loaded rows/root/expansion stay visible; old in-flight node loads are
+    /// retired by the generation bump and can be explicitly reopened.
+    pub fn rebind_same_namespace_preserving_tree(&mut self, location: FsLocation) -> bool {
+        if self.root.state != DirectoryState::Loaded {
+            return false;
+        }
+        fn retire_loading(node: &mut FileTreeNode) {
+            if node.state == DirectoryState::Loading {
+                node.state = DirectoryState::Unloaded;
+            }
+            for child in &mut node.children {
+                retire_loading(child);
+            }
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+        self.location = location;
+        retire_loading(&mut self.root);
+        true
+    }
+
     /// Apply an asynchronously resolved start directory for a pending
     /// location change. Returns `None` for stale resolutions and for failures
     /// (the root then shows the error instead of a tree).
@@ -447,6 +470,25 @@ mod tests {
             entries: Ok(Vec::new()),
         }));
         assert_eq!(sidebar.root.state, DirectoryState::Loaded);
+    }
+
+    #[test]
+    fn same_namespace_route_upgrade_preserves_loaded_tree_and_retires_old_loads() {
+        let root = temp_tree();
+        let mut sidebar = Sidebar::new();
+        let request = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(load_directory(request)));
+        let old_generation = sidebar.generation();
+        let old_children = sidebar.root.children.len();
+
+        assert!(sidebar.rebind_same_namespace_preserving_tree(FsLocation::Remote(0)));
+        assert_eq!(sidebar.location, FsLocation::Remote(0));
+        assert_eq!(sidebar.current_dir, root);
+        assert_eq!(sidebar.root.children.len(), old_children);
+        assert_eq!(sidebar.root.state, DirectoryState::Loaded);
+        assert!(!sidebar.accepts_generation(old_generation));
+
+        std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
     #[test]

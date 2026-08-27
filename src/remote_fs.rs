@@ -22,6 +22,31 @@ pub enum FsLocation {
     Local,
     /// Index into `config.remote_hosts`.
     Remote(usize),
+    /// An SSH destination observed from the active terminal process. It lives
+    /// only for this app session and never mutates the saved host list.
+    Transient(RemoteHostConfig),
+}
+
+const REMOTE_LOCATION_LABEL_CHARS: usize = 56;
+
+fn compact_remote_display_name(value: &str) -> String {
+    let safe = jterm_core::review_input::safe_inline_display(value, 2_048);
+    if safe.is_empty() {
+        return "unnamed".to_string();
+    }
+    let count = safe.chars().count();
+    if count <= REMOTE_LOCATION_LABEL_CHARS {
+        return safe;
+    }
+    let content = REMOTE_LOCATION_LABEL_CHARS.saturating_sub(1);
+    let head_chars = content * 3 / 5;
+    let tail_chars = content.saturating_sub(head_chars);
+    let head: String = safe.chars().take(head_chars).collect();
+    let tail: String = safe
+        .chars()
+        .skip(count.saturating_sub(tail_chars))
+        .collect();
+    format!("{head}…{tail}")
 }
 
 impl FsLocation {
@@ -33,10 +58,11 @@ impl FsLocation {
                 Some(host) => {
                     let unavailable =
                         crate::config::validate_remote_host_at(hosts, *index).is_err();
+                    let display = crate::config::remote_host_display_name(host, *index);
                     let mut label = format!(
                         "{}: {}",
                         if host.docker { "docker" } else { "ssh" },
-                        crate::config::remote_host_display_name(host, *index)
+                        compact_remote_display_name(&display)
                     );
                     if unavailable {
                         label.push_str(" (unavailable)");
@@ -45,7 +71,151 @@ impl FsLocation {
                 }
                 None => format!("Remote #{index}"),
             },
+            FsLocation::Transient(host) => {
+                format!(
+                    "ssh: {} (temporary)",
+                    compact_remote_display_name(host.display_name())
+                )
+            }
         }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Self::Local)
+    }
+}
+
+fn ssh_args_without_control_path(args: &[String]) -> Vec<&str> {
+    let mut normalized = Vec::with_capacity(args.len());
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if argument == "-S" && args.get(index + 1).is_some() {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("-S") && argument.len() > 2 {
+            index += 1;
+            continue;
+        }
+        if argument == "-o" {
+            if args.get(index + 1).is_some_and(|option| {
+                option
+                    .split_once('=')
+                    .map_or(option.as_str(), |(key, _)| key)
+                    .eq_ignore_ascii_case("controlpath")
+            }) {
+                index += 2;
+                continue;
+            }
+        } else if argument.strip_prefix("-o").is_some_and(|option| {
+            option
+                .split_once('=')
+                .map_or(option, |(key, _)| key)
+                .eq_ignore_ascii_case("controlpath")
+        }) {
+            index += 1;
+            continue;
+        }
+        normalized.push(argument);
+        index += 1;
+    }
+    normalized
+}
+
+pub(crate) fn has_control_path_argument(args: &[String]) -> bool {
+    ssh_args_without_control_path(args).len() != args.len()
+}
+
+pub(crate) fn with_reusable_control_path(
+    profile: &RemoteHostConfig,
+    control_path: Option<&str>,
+) -> RemoteHostConfig {
+    let Some(control_path) = control_path else {
+        return profile.clone();
+    };
+    let mut overlaid = profile.clone();
+    // A provenance-checked path derived from the currently running jsh
+    // connection is fresher than a socket stored in a saved profile. Replace
+    // only ControlPath syntax; every other reachability/auth option remains.
+    overlaid.ssh_args = ssh_args_without_control_path(&profile.ssh_args)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    overlaid.ssh_args.push("-S".to_string());
+    overlaid.ssh_args.push(control_path.to_string());
+    if crate::config::validate_remote_host(&overlaid).is_ok() {
+        overlaid
+    } else {
+        profile.clone()
+    }
+}
+
+/// Whether two profiles name the same Files namespace. Display/deployment
+/// policy and a jsh ControlMaster socket do not change the remote filesystem;
+/// reachability/authentication/destination options still must match exactly.
+pub(crate) fn same_files_transport(left: &RemoteHostConfig, right: &RemoteHostConfig) -> bool {
+    left.docker == right.docker
+        && left.host == right.host
+        && left.user == right.user
+        && (left.docker
+            || ssh_args_without_control_path(&left.ssh_args)
+                == ssh_args_without_control_path(&right.ssh_args))
+}
+
+/// Exact runtime route for file probes. Unlike [`same_files_transport`], this
+/// includes the live SSH argument vector so a new ControlPath can upgrade an
+/// already visible tree before it is treated as fully joined.
+pub(crate) fn same_files_execution(left: &RemoteHostConfig, right: &RemoteHostConfig) -> bool {
+    left.docker == right.docker
+        && left.host == right.host
+        && left.user == right.user
+        && (left.docker || left.ssh_args == right.ssh_args)
+}
+
+/// Whether two runtime locations address one filesystem namespace. This is
+/// intentionally broader than enum equality: a saved profile and its
+/// temporary ControlPath overlay are the same host, so copy/move can run
+/// directly through the currently active execution profile.
+pub(crate) fn same_files_location(
+    left: &FsLocation,
+    right: &FsLocation,
+    hosts: &[RemoteHostConfig],
+) -> bool {
+    match (left.is_remote(), right.is_remote()) {
+        (false, false) => true,
+        (true, true) => remote_host(left, hosts)
+            .and_then(|left| {
+                remote_host(right, hosts).map(|right| same_files_transport(left, right))
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Pick the runtime route for an operation inside one namespace. A temporary
+/// observed route carrying a live ControlPath wins from either direction;
+/// otherwise the destination/current tree is the least surprising choice.
+pub(crate) fn preferred_same_files_execution_location<'a>(
+    source: &'a FsLocation,
+    destination: &'a FsLocation,
+    hosts: &[RemoteHostConfig],
+) -> Option<&'a FsLocation> {
+    if !same_files_location(source, destination, hosts) {
+        return None;
+    }
+    let source_has_socket = remote_host(source, hosts)
+        .ok()
+        .is_some_and(|profile| has_control_path_argument(&profile.ssh_args));
+    let destination_has_socket = remote_host(destination, hosts)
+        .ok()
+        .is_some_and(|profile| has_control_path_argument(&profile.ssh_args));
+    let source_is_live = matches!(source, FsLocation::Transient(_));
+    let destination_is_live = matches!(destination, FsLocation::Transient(_));
+    if source_has_socket && (!destination_has_socket || (source_is_live && !destination_is_live)) {
+        Some(source)
+    } else {
+        Some(destination)
     }
 }
 
@@ -595,8 +765,8 @@ fn run_probe(
 
 /// Resolve and validate the host a remote location points at. Out-of-range
 /// indices and grammar violations fail closed before any process is spawned.
-fn remote_host<'a>(
-    loc: &FsLocation,
+pub(crate) fn remote_host<'a>(
+    loc: &'a FsLocation,
     hosts: &'a [RemoteHostConfig],
 ) -> io::Result<&'a RemoteHostConfig> {
     match loc {
@@ -606,6 +776,10 @@ fn remote_host<'a>(
         )),
         FsLocation::Remote(index) => crate::config::validate_remote_host_at(hosts, *index)
             .map_err(|problem| io::Error::new(io::ErrorKind::InvalidInput, problem)),
+        FsLocation::Transient(host) => {
+            validate_host_for_execution(host)?;
+            Ok(host)
+        }
     }
 }
 
@@ -722,7 +896,7 @@ pub fn list_dir(
 ) -> io::Result<Vec<Entry>> {
     match loc {
         FsLocation::Local => local_list_dir(dir),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             let stdout = run_probe(
                 host,
@@ -742,7 +916,7 @@ pub fn list_dir(
 pub fn start_dir(loc: &FsLocation, hosts: &[RemoteHostConfig]) -> io::Result<PathBuf> {
     match loc {
         FsLocation::Local => Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             let stdout = run_probe(host, "home", &[], LIST_TIMEOUT, MAX_OP_BYTES)?;
             let text = String::from_utf8_lossy(&stdout);
@@ -762,7 +936,7 @@ pub fn start_dir(loc: &FsLocation, hosts: &[RemoteHostConfig]) -> io::Result<Pat
 pub fn create_dir(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::Result<()> {
     match loc {
         FsLocation::Local => std::fs::create_dir(path),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             run_probe(
                 host,
@@ -784,7 +958,7 @@ pub fn create_file(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) ->
             .create_new(true)
             .open(path)
             .map(|_| ()),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             run_probe(
                 host,
@@ -840,7 +1014,7 @@ pub fn delete(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::
                 std::fs::remove_file(path)
             }
         }
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             run_probe(host, "rm", &[remote_path(path)?], OP_TIMEOUT, MAX_OP_BYTES)?;
             Ok(())
@@ -860,7 +1034,7 @@ pub fn rename(
             ensure_absent(dst)?;
             std::fs::rename(src, dst)
         }
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             run_probe(
                 host,
@@ -887,7 +1061,7 @@ pub fn copy(
             ensure_absent(dst)?;
             copy_recursive(src, dst, 0)
         }
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             run_probe(
                 host,
@@ -1605,9 +1779,9 @@ pub fn upload(
 
 /// Copy `src` to `dst` across locations, streaming with hard byte and time
 /// bounds. Local→Local is the plain recursive copy; Local⇄Remote is
-/// upload/download; Remote(i)→Remote(j) (i≠j) relays through a unique local
-/// temp path — download, upload, clean up — which falls straight out of the
-/// two primitives.
+/// upload/download; two distinct remote namespaces relay through a unique
+/// local temp path — download, upload, clean up. Saved/temporary routes to one
+/// namespace instead execute directly through the live ControlPath side.
 pub fn transfer(
     src_loc: &FsLocation,
     dst_loc: &FsLocation,
@@ -1617,16 +1791,16 @@ pub fn transfer(
     is_dir: bool,
     progress: Option<&std::sync::Arc<TransferProgress>>,
 ) -> io::Result<()> {
-    match (src_loc, dst_loc) {
-        (FsLocation::Local, FsLocation::Local) => copy(src_loc, hosts, src, dst),
-        (FsLocation::Local, FsLocation::Remote(_)) => {
-            upload(dst_loc, hosts, src, dst, is_dir, progress)
+    match (src_loc.is_remote(), dst_loc.is_remote()) {
+        (false, false) => copy(src_loc, hosts, src, dst),
+        (false, true) => upload(dst_loc, hosts, src, dst, is_dir, progress),
+        (true, false) => download(src_loc, hosts, src, dst, is_dir, progress),
+        (true, true) if same_files_location(src_loc, dst_loc, hosts) => {
+            let execution = preferred_same_files_execution_location(src_loc, dst_loc, hosts)
+                .expect("same namespace has an execution route");
+            copy(execution, hosts, src, dst)
         }
-        (FsLocation::Remote(_), FsLocation::Local) => {
-            download(src_loc, hosts, src, dst, is_dir, progress)
-        }
-        (FsLocation::Remote(i), FsLocation::Remote(j)) if i == j => copy(src_loc, hosts, src, dst),
-        (FsLocation::Remote(_), FsLocation::Remote(_)) => {
+        (true, true) => {
             let relay = unique_staging_path(&std::env::temp_dir(), "frost-relay");
             let (staged, is_relay_dir) = if is_dir {
                 // A directory's tar carries its name, so the relay download
@@ -2494,5 +2668,79 @@ mod tests {
         assert_eq!(FsLocation::Remote(0).label(&hosts), "ssh: dev");
         assert_eq!(FsLocation::Remote(1).label(&hosts), "docker: myubuntu");
         assert_eq!(FsLocation::Remote(9).label(&hosts), "Remote #9");
+        let transient = FsLocation::Transient(hosts[0].clone());
+        assert_eq!(
+            transient.label(&[]),
+            "ssh: dev (temporary)",
+            "an observed target stays visible without becoming saved config"
+        );
+        assert_eq!(remote_host(&transient, &[]).unwrap(), &hosts[0]);
+
+        let mut invalid = hosts[0].clone();
+        invalid.host.clear();
+        assert!(remote_host(&FsLocation::Transient(invalid), &[]).is_err());
+
+        let mut dsw = hosts[0].clone();
+        dsw.name = "root@dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc-0jlbz3pri2042fd5xw2ov.instance-forward.dsw.cn-wulanchabu.aliyuncs.com".to_string();
+        let compact = FsLocation::Transient(dsw).label(&[]);
+        assert!(compact.starts_with("ssh: root@dsw-notebook"));
+        assert!(compact.contains('…'));
+        assert!(compact.ends_with("aliyuncs.com (temporary)"));
+    }
+
+    #[test]
+    fn reusable_control_path_does_not_change_files_identity() {
+        let base = ssh_host();
+        let overlaid = with_reusable_control_path(&base, Some("/run/user/1000/jsh/cm-%C"));
+        assert_eq!(
+            overlaid.ssh_args,
+            ["-p", "22", "-S", "/run/user/1000/jsh/cm-%C"]
+        );
+        assert!(same_files_transport(&base, &overlaid));
+        assert!(!same_files_execution(&base, &overlaid));
+        assert!(same_files_execution(&overlaid, &overlaid));
+        assert!(same_files_location(
+            &FsLocation::Remote(0),
+            &FsLocation::Transient(overlaid.clone()),
+            std::slice::from_ref(&base),
+        ));
+
+        let mut explicit = base.clone();
+        explicit
+            .ssh_args
+            .extend(["-o".to_string(), "ControlPath=/tmp/existing-%C".to_string()]);
+        let replaced = with_reusable_control_path(&explicit, Some("/tmp/replacement-%C"));
+        assert!(replaced
+            .ssh_args
+            .windows(2)
+            .any(|pair| pair == ["-S", "/tmp/replacement-%C"]));
+        assert!(!replaced
+            .ssh_args
+            .iter()
+            .any(|argument| argument.contains("existing-%C")));
+        assert!(same_files_transport(&base, &explicit));
+
+        let saved = FsLocation::Remote(0);
+        let live = FsLocation::Transient(overlaid);
+        assert_eq!(
+            preferred_same_files_execution_location(&saved, &live, std::slice::from_ref(&base)),
+            Some(&live)
+        );
+        assert_eq!(
+            preferred_same_files_execution_location(&live, &saved, std::slice::from_ref(&base)),
+            Some(&live),
+            "the live socket wins even when it is the clipboard source"
+        );
+
+        let saved_with_old_socket = with_reusable_control_path(&base, Some("/tmp/saved-old-%C"));
+        assert_eq!(
+            preferred_same_files_execution_location(
+                &live,
+                &saved,
+                std::slice::from_ref(&saved_with_old_socket),
+            ),
+            Some(&live),
+            "an observed temporary socket is fresher than a saved socket"
+        );
     }
 }

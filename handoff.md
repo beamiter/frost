@@ -11,6 +11,31 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- **Foreground SSH → Files follow (2026-08-27)**: the 1.5 s process heartbeat
+  now recognizes a plain interactive SSH command from the active local PTY's
+  NUL-delimited `/proc` argv and prefers one uniquely matching saved Files
+  profile, otherwise staging a transient location without persisting it as
+  config. A shared conservative parser accepts the common
+  `ssh user@host -p 22` shape while rejecting remote commands and options that
+  could replay local code; terminal output and OSC command text are never
+  treated as launch authority. The remote-home probe leaves the current tree
+  visible, and its completion must still match the active session, exact live
+  SSH profile, tree generation/location/root, and sidebar chrome intent before
+  it can reveal Files. Failure keeps the old tree and explains the
+  key/agent/control-socket requirement of non-interactive probes. Transient
+  identity is carried through picker labels, file operations, clipboard,
+  transfers, config reconciliation, and the Remote terminal action; SSH exit
+  deliberately does not throw the remote tree away. Provenance-checked jsh
+  launchers contribute only a live ControlPath execution overlay (never saved
+  identity); same-namespace copy/move prefers that overlay in either direction,
+  while a same-target socket upgrade preserves the current root and loaded
+  expansion state. The temporary Terminal action opens a plain interactive
+  login. A startup race receives
+  one bounded automatic retry, followed by an exact-command Retry action in
+  Files. The shared core is pinned
+  at `063af5d33f66e449336e06319096c90463c33938`; all 867 tests and
+  warning-denied Clippy pass.
+
 - **Files remote-target safety (2026-08-27)**: the Files header now exposes a
   keyboard-reachable terminal action. Local opens a normal new session at the
   visible tree root; Remote explicitly says **default dir** and reuses the

@@ -21,16 +21,23 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   本地与远程行为一致；`Ctrl+点击` 多选、`Shift+点击` 按可见顺序框选范围，多选后删除/复制/剪切/
   复制路径按批处理（逐项失败不中断、末尾汇总；删除确认框列出数量与前几个路径）。标题栏的
   ⌕ 按钮打开行内名称过滤：大小写无关子串匹配已加载的树（命中项与其祖先保留并强制展开，清空后
-  恢复原展开状态，不产生新的目录扫描）。跨位置粘贴即为上传/下载（远程⇄远程经本地临时中转），
+  恢复原展开状态，不产生新的目录扫描）。跨位置粘贴即为上传/下载（不同远端文件系统经本地临时中转；
+  同一主机的保存 profile 与临时 live socket 直接复制/移动），
   文件按流式传输、目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度
   （可随时取消，取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
   从系统文件管理器把文件/目录拖放到文件树即可导入：落在目录行上导入该目录、其余位置导入当前根目录，
   远程位置走同一条上传通道；一次拖放最多 256 项、总量不超过传输上限，同名目标逐项拒绝。
   Files 标题区的 **Terminal here** 会从当前本地树根新建标签；远端时入口明确显示
   **Remote terminal (default dir)**，复用同一 profile 连接并进入其默认目录。远端 profile 列表
-  编辑或热重载后，活动位置只在旧 profile 的完整身份于新列表中恰有一个匹配时重映射；删除、修改或
+  之外，直接在本地 pane 输入 `ssh user@host -p 22`（包括 jsh 实际生成的受信 launcher）也会自动识别
+  真实前台进程：优先切到唯一匹配的已保存 profile，否则建立该会话专属的临时远端树；连接探测
+  成功前保留原树，SSH 退出后远端树仍可继续使用。受信 jsh 连接会复用其 ControlMaster socket；
+  二次探测失败后 Files 内可直接 Retry。终端输出或 OSC 文本不能
+  触发连接，带远程命令或会重复执行本地 helper 的 SSH 参数会安全跳过；密码连接无法供无交互文件
+  探针复用时会提示配置 key、agent 或 control socket，而不是清空当前树。远端 profile 列表编辑或
+  热重载后，活动位置只在旧 profile 的完整身份于新列表中恰有一个匹配时重映射；删除、修改或
   重复身份都会安全回到 Local，并作废旧选择、文件剪贴板、对话框、拖放计划与传输。远端 home 探测
-  失败也会回到可用的 Local 树并保留内联错误，可直接重新选择 profile 重试。
+  在手动切换 profile 时失败会回到可用的 Local 树并保留内联错误，可直接重新选择 profile 重试。
 - 自动保存标签工作目录并恢复会话；多实例之间不会互相覆盖恢复数据
 - OSC 10/11/12 动态颜色、OSC 52/5522 剪贴板和桌面通知
 - OSC 133 Block mode：完成命令、Background 输出和当前输入/运行区以主题相对卡片呈现（状态条、轻染色、圆角、状态/耗时徽标，支持普通与 Compact Block Spacing），空闲提示符处、用户编辑前的异步输出会形成 Background 块，运行中块实时显示已用时间——
@@ -571,7 +578,23 @@ no configuration at all.
 The file sidebar (Ctrl+\, Files panel) browses these hosts natively — no
 sshfs, nothing to install on the far side. A location picker above the tree
 switches between Local and every configured entry (`ssh: …` / `docker: …`);
-a remote tree is read one directory level at a time by running a small POSIX
+a plain interactive `ssh user@host -p 22` launched in a local pane is also
+observed from the real foreground process argv and, after a successful staged
+home probe, opens Files on one unique matching saved profile or a session-only
+`temporary` target. For jsh's SSH launcher, Files reuses its verified
+ControlMaster socket; a direct command's explicit ControlPath is likewise kept
+as live execution metadata rather than saved profile identity. Joining a new
+socket for the already visible host upgrades that route in place, retaining
+the current root, loaded rows and expansion state. The old tree
+stays intact while that probe runs or if it fails, and leaving SSH does not
+discard the useful remote tree. Terminal/OSC text is never connection
+authority; remote-command forms and options that could replay a local helper
+are refused. Password-only authentication gets an actionable key/agent/control
+socket notice because file probes are deliberately non-interactive. The
+temporary tree's Terminal action starts a plain interactive SSH login instead
+of injecting Frost's configured remote helper. A startup race gets one bounded
+automatic retry; a still-live command then exposes Retry in the Files notice.
+A remote tree is read one directory level at a time by running a small POSIX
 sh probe script through `ssh` / `docker exec` stdin, with bounded output and
 hard timeouts. Right-clicking a node (or the empty area below the tree, which
 targets the root directory) opens a file-operations menu — New File, New
@@ -586,8 +609,9 @@ loaded tree — case-insensitive substring, matches keep their ancestors
 (force-expanded while filtering), expansion is exactly restored on clear, and
 no new directory scans happen. Paste also
 crosses locations: a remote entry pasted locally downloads, a local entry
-pasted to a remote host uploads, and remote→remote relays through a unique
-local temp path. Files stream (never buffered whole, 512 MiB cap, group-kill
+pasted to a remote host uploads, and distinct remote filesystems relay through
+a unique local temp path; saved and temporary live routes to one namespace
+copy/move directly through the live socket. Files stream (never buffered whole, 512 MiB cap, group-kill
 on timeout) and directories travel as tar; the probe refuses an existing
 directory target before extracting, and a cut across locations deletes
 the source only after the copy completes. Transfers report live progress in
