@@ -29,6 +29,12 @@ const MAX_LEGAL_RESTORED_TEXT_BYTES: usize = MAX_RESTORED_SESSIONS * MAX_RESTORE
 const MAX_RESTORED_TEXT_BYTES: usize = 160 * 1024;
 const _: () = assert!(MAX_LEGAL_RESTORED_TEXT_BYTES <= MAX_RESTORED_TEXT_BYTES);
 
+/// 单实例锁竞争的有界重试窗口：PTY 子进程在 fork 后会立即 close 继承来的锁
+/// 描述符，但在上一个实例的 fork→exec 窗口内启动的新实例仍会短暂看到那份
+/// 继承的 flock；直接失败会把这次无害的过渡误判成"已有实例在运行"。
+const INSTANCE_LOCK_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+const INSTANCE_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// `load` 的结果。必须把“没有快照”和“快照读不动”分开：后者的字节还在磁盘上，
 /// 而恢复失败之后几秒内定时自动保存就会覆盖同一个路径，所以调用方要先隔离。
 pub enum SnapshotLoad {
@@ -1086,6 +1092,26 @@ fn decode_tree(
     decode_tree_node(raw, budget, &mut TreeBudget::new(), 0)
 }
 
+/// Unicode Cf 双向/格式控制符：不是 `char::is_control`（Cc）覆盖的范围，
+/// 但能在标签栏里不可见地重排或隐藏文字。与 `terminal.rs` 实时 OSC 标题
+/// 路径 `sanitized_title` 过滤的是同一组。
+fn is_bidi_display_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// 剥掉 Cf 双向控制符后的展示文本。恢复的标签标题与实时 OSC 标题走同一
+/// 处置（剥离而非整体拒绝），同一个标题在保存→重启往返后看起来一致。
+fn strip_bidi_display_controls(value: &str) -> String {
+    value.chars().filter(|&ch| !is_bidi_display_control(ch)).collect()
+}
+
 /// Optional title validation mirrors `sanitize`: invalid text becomes `None`
 /// and does not invalidate an otherwise usable tab.
 struct TitleSeed<'a> {
@@ -1143,6 +1169,11 @@ impl serde::de::Visitor<'_> for TitleValueVisitor<'_> {
     }
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        // Cf bidi overrides/isolates are not Cc, so `is_control` lets them
+        // through; strip them (like the live OSC-title path) before the
+        // usual bounds instead of letting them reach the tab strip.
+        let stripped = strip_bidi_display_controls(value);
+        let value = stripped.as_str();
         if value.trim().is_empty()
             || value.len() > MAX_RESTORED_TAB_TITLE_BYTES
             || value.chars().any(char::is_control)
@@ -1620,9 +1651,14 @@ impl SessionsSnapshot {
         self.tabs
             .retain_mut(|tab| sanitize_tree_shape(&mut tab.tree));
         // 标题是自由文本，会原样出现在标签栏上：控制字符和超长串在这里就
-        // 丢弃，而不是等到渲染时才发现。
+        // 丢弃，而不是等到渲染时才发现。Cf 双向控制符不在 Cc 之内，与实时
+        // OSC 标题路径一样剥离；剥完为空的标题按无效处理。
         let mut invalid_titles = 0usize;
         for tab in &mut self.tabs {
+            if let Some(title) = tab.title.as_mut() {
+                let stripped = strip_bidi_display_controls(title);
+                *title = stripped;
+            }
             if tab.title.as_ref().is_some_and(|title| {
                 title.trim().is_empty()
                     || title.len() > MAX_RESTORED_TAB_TITLE_BYTES
@@ -1826,11 +1862,12 @@ fn sanitize_tree_shape(tree: &mut PaneTreeSnapshot) -> bool {
     visit(tree, 0, &mut 0, &mut 0)
 }
 
-/// 尝试获取单实例锁。成功返回持锁的 `File`（需在进程生命周期内持有），
+/// 尝试获取单实例锁。成功返回持锁守卫（需在进程生命周期内持有），
 /// 失败（已有实例运行）返回 `None`。端口自 ember `try_acquire_instance_lock`。
-pub fn try_acquire_instance_lock() -> Option<std::fs::File> {
+pub fn try_acquire_instance_lock() -> Option<InstanceLock> {
     let lock_path = dirs::config_dir()?.join("frost").join("instance.lock");
-    try_acquire_instance_lock_at(&lock_path)
+    let file = try_acquire_instance_lock_at(&lock_path)?;
+    InstanceLock::register(file)
 }
 
 fn try_acquire_instance_lock_at(lock_path: &Path) -> Option<std::fs::File> {
@@ -1839,12 +1876,28 @@ fn try_acquire_instance_lock_at(lock_path: &Path) -> Option<std::fs::File> {
     // The old create(true) open followed a pre-positioned instance.lock
     // symlink and later truncated its target. The shared hardened opener uses
     // O_NOFOLLOW, 0600, owner/nlink validation and CLOEXEC before flocking.
-    let mut file = match crate::persistence::try_acquire_process_lock(lock_path) {
-        Ok(Some(file)) => file,
-        Ok(None) => return None,
-        Err(error) => {
-            log::warn!("Cannot acquire instance lock: {error}");
-            return None;
+    //
+    // PTY children explicitly close the registered inherited descriptor
+    // immediately after fork, so application-spawned children cannot extend
+    // the lock lifetime. Retain a small bounded retry for the transient
+    // fork→exec window where an inherited flock is still visible.
+    let retry_deadline = std::time::Instant::now() + INSTANCE_LOCK_RETRY_WINDOW;
+    let mut file = loop {
+        match crate::persistence::try_acquire_process_lock(lock_path) {
+            Ok(Some(file)) => break file,
+            Ok(None) => {
+                let now = std::time::Instant::now();
+                if now >= retry_deadline {
+                    return None;
+                }
+                std::thread::sleep(
+                    INSTANCE_LOCK_RETRY_INTERVAL.min(retry_deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => {
+                log::warn!("Cannot acquire instance lock: {error}");
+                return None;
+            }
         }
     };
     // Truncate only after owning the lock. A losing second instance must not
@@ -1862,6 +1915,67 @@ fn try_acquire_instance_lock_at(lock_path: &Path) -> Option<std::fs::File> {
         return None;
     }
     Some(file)
+}
+
+/// flock 绑定在继承的 open-file description 上，而不只是当前进程：fork 之后、
+/// execve 之前锁仍然持有，一个卡住的 pre-exec 子进程可能比主进程活得更久并
+/// 继续占着单实例锁。注册描述符让 PTY 子进程能在 fork 后立即 close 自己那份
+/// 继承拷贝；仅有 `FD_CLOEXEC` 不足以覆盖这个窗口。
+#[cfg(unix)]
+const NO_INSTANCE_LOCK_FD: i32 = -1;
+#[cfg(unix)]
+static INSTANCE_LOCK_FD: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(NO_INSTANCE_LOCK_FD);
+
+/// Capture before `fork`; the child must only use the returned integer with
+/// async-signal-safe `close(2)`.
+#[cfg(unix)]
+pub(crate) fn inherited_instance_lock_fd() -> i32 {
+    INSTANCE_LOCK_FD.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Owns the primary-instance lock and publishes its descriptor so a freshly
+/// forked PTY child can close its inherited copy before doing any other work.
+pub struct InstanceLock {
+    // On unix the descriptor is published for PTY children and read back in
+    // Drop; elsewhere the file only needs to stay alive.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    file: std::fs::File,
+}
+
+impl InstanceLock {
+    fn register(file: std::fs::File) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if INSTANCE_LOCK_FD
+                .compare_exchange(
+                    NO_INSTANCE_LOCK_FD,
+                    file.as_raw_fd(),
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                log::warn!("[SessionPersistence] an instance lock descriptor is already registered");
+                return None;
+            }
+        }
+        Some(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        let _ = INSTANCE_LOCK_FD.compare_exchange(
+            self.file.as_raw_fd(),
+            NO_INSTANCE_LOCK_FD,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2056,6 +2170,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn transient_inherited_lock_is_retried_until_exec_style_release() {
+        let root = scratch("transient-inheritance");
+        let path = root.join("instance.lock");
+        let owner = try_acquire_instance_lock_at(&path).expect("first owner acquires lock");
+        // A duplicated descriptor shares the open-file description — and its
+        // flock — exactly like a forked pre-exec child would.
+        let inherited = owner.try_clone().unwrap();
+        drop(owner);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(inherited);
+        });
+
+        let replacement = try_acquire_instance_lock_at(&path)
+            .expect("a transient inherited descriptor should be retried");
+
+        releaser.join().unwrap();
+        drop(replacement);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    struct ForkChild(libc::pid_t);
+
+    #[cfg(unix)]
+    impl Drop for ForkChild {
+        fn drop(&mut self) {
+            // SAFETY: the stored PID was returned by fork in this test. SIGKILL
+            // guarantees a child blocked in pause exits, and waitpid reaps it.
+            unsafe {
+                let _ = libc::kill(self.0, libc::SIGKILL);
+                let mut status = 0;
+                while libc::waitpid(self.0, &mut status, 0) < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forked_child_can_close_its_registered_instance_lock_copy() {
+        let root = scratch("fork-inheritance");
+        let path = root.join("instance.lock");
+        let file = try_acquire_instance_lock_at(&path).expect("first owner acquires lock");
+        let owner = InstanceLock::register(file).expect("register the instance lock");
+        let inherited_fd = inherited_instance_lock_fd();
+        assert!(inherited_fd >= 0);
+
+        let mut ready_pipe = [-1; 2];
+        // SAFETY: ready_pipe points to two writable integers.
+        assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+        // SAFETY: both branches below restrict their post-fork work to raw
+        // async-signal-safe syscalls until the child exits.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            // SAFETY: these descriptors are inherited from the parent and the
+            // child never returns into Rust or runs destructors.
+            unsafe {
+                libc::close(ready_pipe[0]);
+                libc::close(inherited_fd);
+                let marker = [1u8];
+                libc::write(
+                    ready_pipe[1],
+                    marker.as_ptr().cast::<libc::c_void>(),
+                    marker.len(),
+                );
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let _child = ForkChild(child_pid);
+
+        // SAFETY: the parent owns both pipe descriptors after a successful
+        // fork and waits for the child's one-byte close acknowledgement.
+        unsafe {
+            libc::close(ready_pipe[1]);
+            let mut marker = [0u8];
+            let read = loop {
+                let result = libc::read(
+                    ready_pipe[0],
+                    marker.as_mut_ptr().cast::<libc::c_void>(),
+                    marker.len(),
+                );
+                if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break result;
+            };
+            libc::close(ready_pipe[0]);
+            assert_eq!(read, 1);
+        }
+
+        drop(owner);
+        assert_eq!(
+            inherited_instance_lock_fd(),
+            NO_INSTANCE_LOCK_FD,
+            "dropping the parent guard must clear the published descriptor"
+        );
+        let replacement = try_acquire_instance_lock_at(&path)
+            .expect("the live forked child must not retain the lock");
+        drop(replacement);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn snapshots_without_split_field_still_deserialize() {
         let legacy = r#"{"version":1,"sessions":[{"cwd":"/tmp"}],"active_index":0}"#;
@@ -2242,6 +2468,48 @@ mod tests {
         assert!(restored.tabs[1].marked);
         assert_eq!(restored.tabs[2].title, None);
         assert_eq!(restored.tabs[3].title, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Cf bidi overrides/isolates are not Cc, so the `is_control` check lets
+    /// them through. Restored titles get the same stripping as the live
+    /// OSC-title path: the invisible marks never reach the tab strip, while
+    /// the visible text around them survives.
+    #[test]
+    fn restored_tab_titles_strip_bidi_formatting_characters() {
+        let root = scratch("tab-titles-bidi");
+        let path = root.join("session_history.json");
+        let tab = |title: Option<&str>| TabSnapshot {
+            tree: PaneTreeSnapshot::Leaf { session: 0 },
+            focus: Some(0),
+            title: title.map(str::to_string),
+            pinned: false,
+            marked: false,
+            private_title: false,
+        };
+        let snapshot = SessionsSnapshot {
+            version: 2,
+            sessions: vec![SessionSnapshot { cwd: None }],
+            active_index: Some(0),
+            split: None,
+            tree: None,
+            tabs: vec![
+                tab(Some("bu\u{202e}ild")),
+                tab(Some("\u{2066}\u{2067}\u{2068}\u{2069}\u{061c}\u{200e}\u{200f}")),
+                tab(Some("\u{202a}build\u{202c}")),
+            ],
+            active_tab: Some(0),
+        };
+        write_private(&path, serde_json::to_vec(&snapshot).unwrap());
+
+        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+            panic!("bounded valid JSON should load");
+        };
+        assert_eq!(restored.tabs[0].title.as_deref(), Some("build"));
+        // A title that was nothing but bidi marks is empty after stripping
+        // and falls back to the session's own label.
+        assert_eq!(restored.tabs[1].title, None);
+        assert_eq!(restored.tabs[2].title.as_deref(), Some("build"));
         let _ = std::fs::remove_dir_all(root);
     }
 

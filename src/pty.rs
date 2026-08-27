@@ -864,6 +864,11 @@ mod unix_pty {
                 // small fork→prctl race where the parent dies before PDEATHSIG is
                 // installed.
                 let parent_pid = libc::getpid();
+                // Capture process-global state before fork so the child branch
+                // only needs the returned integer with async-signal-safe
+                // close(2).
+                let inherited_instance_lock_fd =
+                    crate::session_persistence::inherited_instance_lock_fd();
                 let fork_result = libc::fork();
 
                 if fork_result < 0 {
@@ -876,6 +881,14 @@ mod unix_pty {
 
                 if fork_result == 0 {
                     // ===== 子进程分支：以下只允许 async-signal-safe 调用 =====
+                    // A flock is bound to the inherited open-file description,
+                    // not to this process. Close the inherited single-instance
+                    // lock copy before anything that could stall, so a stuck
+                    // pre-exec child can never outlive the primary process
+                    // while retaining the lock.
+                    if inherited_instance_lock_fd >= 0 {
+                        libc::close(inherited_instance_lock_fd);
+                    }
                     libc::close(startup_read);
                     libc::close(master);
 
@@ -1102,6 +1115,116 @@ mod unix_pty {
             self.exit_code_cached
         }
 
+        /// Observe a child's exit status without consuming it (`waitid` with
+        /// `WNOWAIT`). `Ok(None)` means still running; `Ok(Some(code))` means
+        /// exited — decoded like a wait status, negative for `-signal` — while
+        /// remaining reappable by the owning [`Pty`]. Keeping the exited
+        /// leader as a zombie preserves ownership of its numeric
+        /// PID/process-group identity until group cleanup has run; reaping
+        /// first would make a later `kill(-pid, ...)` vulnerable to PID/PGID
+        /// reuse. The PTY reader thread uses this to probe liveness without
+        /// ever becoming a second reaper.
+        pub fn observe_child_exit(child_pid: i32) -> std::io::Result<Option<i32>> {
+            loop {
+                // `waitid` may leave siginfo unspecified after EINTR. Start
+                // from a zeroed record on every attempt so WNOHANG's no-event
+                // result remains zero.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: `info` is writable, P_PID scopes the observation to
+                // our forked child, and WNOWAIT explicitly preserves its wait
+                // status for the cleanup/reap step in `finish_observed_exit`.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child_pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                // SAFETY: a successful waitid initializes siginfo. With
+                // WNOHANG, si_pid == 0 means the selected child has not
+                // changed state.
+                if unsafe { info.si_pid() } != child_pid {
+                    return Ok(None);
+                }
+                let code = match info.si_code {
+                    libc::CLD_EXITED => unsafe { info.si_status() },
+                    libc::CLD_KILLED | libc::CLD_DUMPED => -unsafe { info.si_status() },
+                    _ => -1,
+                };
+                return Ok(Some(code));
+            }
+        }
+
+        /// The direct child is known to be exited but deliberately unreaped.
+        /// Kill its still-owned private process group first — background jobs
+        /// the shell left behind must not survive a natural leader exit — then
+        /// consume the original leader status exactly once. SIGKILL cannot
+        /// change a status that is already waitable, so a successful exit
+        /// keeps its real code.
+        fn finish_observed_exit(&mut self) -> std::io::Result<i32> {
+            if let Some(code) = self.exit_code_cached {
+                return Ok(code);
+            }
+            // SAFETY: WNOWAIT kept child_pid unreaped, so its process-group ID
+            // cannot be recycled between this signal and the waitpid below.
+            let killed = unsafe { libc::kill(-self.child_pid, libc::SIGKILL) };
+            if killed < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    // Preserve the zombie ownership anchor and retry rather
+                    // than publishing completion while a group we failed to
+                    // terminate may still be active.
+                    return Err(error);
+                }
+            }
+
+            let mut status = 0;
+            let result = loop {
+                // SAFETY: the observed child is waitable and still owned by
+                // this Pty. is_alive/terminate serialize on `&mut self`, and
+                // the detached reaper only runs after TerminationStarted, so
+                // no other path can wait on this child concurrently.
+                let result = unsafe { libc::waitpid(self.child_pid, &mut status, 0) };
+                if result >= 0 {
+                    break result;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    // Already reaped elsewhere despite the anchor; the status
+                    // is unknown and must not masquerade as a clean exit.
+                    self.exit_code_cached = Some(-1);
+                    self.lifecycle = ChildLifecycle::Reaped;
+                    return Ok(-1);
+                }
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(error);
+                }
+            };
+            if result != self.child_pid {
+                return Err(std::io::Error::other(
+                    "waitpid returned no status for an observed PTY exit",
+                ));
+            }
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status) as i32
+            } else if libc::WIFSIGNALED(status) {
+                -(libc::WTERMSIG(status) as i32)
+            } else {
+                -1
+            };
+            self.exit_code_cached = Some(code);
+            self.lifecycle = ChildLifecycle::Reaped;
+            Ok(code)
+        }
+
         pub fn is_alive(&mut self) -> bool {
             // A detached reaper owns TerminationStarted children. Never issue a
             // second waitpid (or later signal) for a pid once teardown begins.
@@ -1109,40 +1232,27 @@ mod unix_pty {
                 return false;
             }
 
-            // SAFETY: waitpid 使用 WNOHANG 非阻塞检查子进程状态。
-            // status 是有效的栈变量，child_pid 是有效的进程 ID。
-            unsafe {
-                let mut status = 0;
-                let result = loop {
-                    let result = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-                    if result >= 0
-                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                    {
-                        break result;
+            match Self::observe_child_exit(self.child_pid) {
+                Ok(None) => true,
+                Ok(Some(_)) => match self.finish_observed_exit() {
+                    Ok(_) => false,
+                    Err(error) => {
+                        log::warn!("[PTY] could not finish observed PTY child exit: {error}");
+                        true
                     }
-                };
-                if result == 0 {
-                    // Still running.
-                    true
-                } else if result > 0 {
-                    // The child changed state and we just reaped it — decode and
-                    // cache the real exit status here so it isn't lost.
-                    let code = if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status) as i32
-                    } else if libc::WIFSIGNALED(status) {
-                        -(libc::WTERMSIG(status) as i32)
-                    } else {
-                        -1
-                    };
-                    self.exit_code_cached = Some(code);
-                    self.lifecycle = ChildLifecycle::Reaped;
-                    false
-                } else {
-                    // waitpid error (typically ECHILD: already reaped elsewhere).
-                    // Treat as dead so callers stop polling.
+                },
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                    // Already reaped elsewhere. Treat as dead so callers stop
+                    // polling.
                     self.exit_code_cached = Some(0);
                     self.lifecycle = ChildLifecycle::Reaped;
                     false
+                }
+                Err(error) => {
+                    // Conservatively keep the process live: an unrelated
+                    // waitid failure is not evidence that the PID was reaped.
+                    log::warn!("[PTY] waitid(WNOWAIT) failed while checking PTY child: {error}");
+                    true
                 }
             }
         }
@@ -1349,6 +1459,80 @@ mod unix_pty {
 
             pty.terminate().expect("repeated terminate is a no-op");
             assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+        }
+
+        #[test]
+        fn exited_leader_cannot_leave_same_group_descendants_running() {
+            let root = std::env::temp_dir().join(format!(
+                "frost-pty-descendant-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let escaped_marker = root.join("descendant-escaped");
+            let argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "(trap '' HUP TERM; sleep 0.6; printf escaped > \"$1\") & exit 0".to_string(),
+                "frost-descendant-test".to_string(),
+                escaped_marker.to_string_lossy().into_owned(),
+            ];
+            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+                .expect("spawn descendant test shell");
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pty.is_alive() {
+                assert!(Instant::now() < deadline, "leader did not exit in time");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Observing the natural exit killed the group and reaped the
+            // leader exactly once, preserving its real status.
+            assert_eq!(pty.exited_code(), Some(0));
+            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
+
+            // The old reap-first path published the exit while the background
+            // child remained alive. Give that child enough time to prove it
+            // escaped; the cleaned private process group can never create
+            // this marker.
+            std::thread::sleep(Duration::from_millis(850));
+            assert!(!escaped_marker.exists());
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn observe_child_exit_never_consumes_the_wait_status() {
+            let argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 0.2; exit 7".to_string(),
+            ];
+            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+                .expect("spawn observe test shell");
+            let child_pid = pty.get_child_pid();
+
+            // While the child runs, observation reports liveness without
+            // disturbing a later reap.
+            assert_eq!(Pty::observe_child_exit(child_pid).unwrap(), None);
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let observed = loop {
+                match Pty::observe_child_exit(child_pid).unwrap() {
+                    Some(code) => break code,
+                    None => {
+                        assert!(Instant::now() < deadline, "child did not exit in time");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            };
+            assert_eq!(observed, 7);
+
+            // WNOWAIT left the status in place: is_alive still reaps the real
+            // code instead of finding an empty wait queue.
+            assert!(!pty.is_alive());
+            assert_eq!(pty.exited_code(), Some(7));
         }
     }
 }

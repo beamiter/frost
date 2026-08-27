@@ -874,13 +874,19 @@ fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
     entries
 }
 
-/// Local one-level listing with the same policy (dotfiles hidden, same sort)
-/// and the same error wording the sidebar has always produced.
+/// Local one-level listing with the same policy (dotfiles hidden, same sort,
+/// same caps) and the same error wording the sidebar has always produced.
+/// Like parse_list, at most MAX_DIRECTORY_ENTRIES entries are kept and
+/// scanning stops after MAX_SCANNED_PAIRS entries, so a huge local directory
+/// cannot grow the tree without bound.
 fn local_list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
     let entries = std::fs::read_dir(dir)
         .map_err(|error| io::Error::other(format!("Cannot read {}: {error}", dir.display())))?;
     let mut nodes = Vec::new();
-    for entry in entries {
+    for (scanned, entry) in entries.enumerate() {
+        if scanned >= MAX_SCANNED_PAIRS || nodes.len() >= MAX_DIRECTORY_ENTRIES {
+            break;
+        }
         let entry = entry
             .map_err(|error| io::Error::other(format!("Cannot read {}: {error}", dir.display())))?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2521,6 +2527,19 @@ mod tests {
         bytes.extend_from_slice(b"f\0visible\0");
         let entries = parse_list(&bytes, dir);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn local_list_dir_caps_entries_at_max() {
+        let root = std::env::temp_dir().join(format!("frost-remote-fs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test tree");
+        for index in 0..MAX_DIRECTORY_ENTRIES + 50 {
+            std::fs::write(root.join(format!("file-{index:06}")), b"x").expect("write test file");
+        }
+        let entries = local_list_dir(&root).expect("list dir");
+        // The local listing is bounded by the same cap as the remote one.
+        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+        std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
     // ── Validation ──────────────────────────────────────────────────────

@@ -102,6 +102,11 @@ const MAX_OSC8_ID_BYTES: usize = 256;
 /// Cell keys are `u16`, but a much smaller terminal-local cap bounds retained
 /// URI/id memory even when a child emits a fresh id for every character.
 const MAX_OSC8_HYPERLINKS: usize = 4 * 1024;
+/// Cap on one buffered unfinished escape/string sequence carried across PTY
+/// reads. Generous enough for legitimate large payloads (e.g. OSC 52
+/// clipboard); kitty graphics APCs stream against the same cap via
+/// `pending_apc` instead of being dropped wholesale.
+const MAX_PENDING_ESCAPE: usize = 1 << 20; // 1 MiB
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
@@ -2988,6 +2993,19 @@ pub struct TerminalState {
     // Incomplete escape sequence buffer across PTY reads
     pending_escape: Vec<u8>,
 
+    // Unterminated kitty APC (`ESC _ ... ESC \`) carried across PTY reads.
+    // Unlike `pending_escape` (re-scanned from its start each read), the APC
+    // buffer streams: `pending_apc_scan_from` marks where the terminator scan
+    // resumes, so multi-read image transfers stay O(n) instead of O(n^2), and
+    // an oversized packet is rejected + discarded through its ST rather than
+    // dropped wholesale (which used to parse the base64 tail as plain input).
+    pending_apc: Vec<u8>,
+    pending_apc_scan_from: usize,
+    // An oversized APC is being discarded: consume bytes without buffering
+    // until its ST arrives, tracking a trailing ESC that may precede it.
+    discarding_oversized_apc: bool,
+    discarding_apc_prev_escape: bool,
+
     g0_charset: Charset,
     g1_charset: Charset,
     active_charset: Charset,
@@ -3292,6 +3310,10 @@ impl TerminalState {
             utf8_len: 0,
             utf8_expected: 0,
             pending_escape: Vec::new(),
+            pending_apc: Vec::new(),
+            pending_apc_scan_from: 0,
+            discarding_oversized_apc: false,
+            discarding_apc_prev_escape: false,
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: Charset::Ascii,
@@ -6679,6 +6701,152 @@ impl TerminalState {
         }
     }
 
+    /// Begin buffering an unterminated APC (`ESC _` through the end of the
+    /// current read). A first fragment that already exceeds the cap is
+    /// rejected without being retained; the parser then discards through ST.
+    fn begin_pending_apc(&mut self, tail: &[u8]) {
+        if tail.len() > MAX_PENDING_ESCAPE {
+            if let Some(payload) = tail.strip_prefix(b"\x1b_") {
+                if jterm_core::kitty_graphics::is_graphics_payload(payload) {
+                    self.kitty_graphics.reject_graphics_payload(
+                        payload,
+                        "Kitty graphics APC exceeded the parser size limit",
+                    );
+                    let responses = self.kitty_graphics.take_responses();
+                    if !responses.is_empty() {
+                        self.output_buffer.extend_from_slice(&responses);
+                    }
+                }
+            }
+            self.pending_apc.clear();
+            self.pending_apc_scan_from = 0;
+            self.discarding_oversized_apc = true;
+            self.discarding_apc_prev_escape = tail.last() == Some(&0x1b);
+            return;
+        }
+        self.pending_apc.clear();
+        self.pending_apc.extend_from_slice(tail);
+        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
+    }
+
+    /// Answer a buffered kitty APC that is being abandoned: echo a bounded
+    /// control prefix (identifier + quiet level) in the rejection so an
+    /// addressed client sees EINVAL instead of a timeout. `suffix` carries
+    /// the fragment that tripped the limit, in case fragmentation split the
+    /// control section unusually early.
+    fn reject_buffered_kitty_apc_with_suffix(&mut self, suffix: &[u8], error: &str) {
+        let Some(payload) = self.pending_apc.strip_prefix(b"\x1b_") else {
+            return;
+        };
+        if !jterm_core::kitty_graphics::is_graphics_payload(payload) {
+            return;
+        }
+
+        let limit = jterm_core::kitty_graphics::MAX_CONTROL_BYTES;
+        let mut recovery =
+            Vec::with_capacity(limit.min(payload.len().saturating_add(suffix.len())));
+        recovery.extend_from_slice(&payload[..payload.len().min(limit)]);
+        if recovery.len() < limit && !recovery.contains(&b';') {
+            recovery.extend_from_slice(&suffix[..suffix.len().min(limit - recovery.len())]);
+        }
+        self.kitty_graphics.reject_graphics_payload(&recovery, error);
+        let responses = self.kitty_graphics.take_responses();
+        if !responses.is_empty() {
+            self.output_buffer.extend_from_slice(&responses);
+        }
+    }
+
+    /// Resume a fragmented kitty APC. Returns true when this function consumed
+    /// the input (including any bytes after the ST, processed recursively).
+    fn resume_pending_apc(&mut self, input: &[u8]) -> bool {
+        if self.discarding_oversized_apc {
+            let mut previous_escape = self.discarding_apc_prev_escape;
+            for (index, byte) in input.iter().copied().enumerate() {
+                if previous_escape && byte == b'\\' {
+                    self.discarding_oversized_apc = false;
+                    self.discarding_apc_prev_escape = false;
+                    if index + 1 < input.len() {
+                        self.process_input(&input[index + 1..]);
+                    }
+                    return true;
+                }
+                previous_escape = byte == 0x1b;
+            }
+            self.discarding_apc_prev_escape = previous_escape;
+            return true;
+        }
+
+        if self.pending_apc.is_empty() {
+            return false;
+        }
+
+        // Everything before pending_apc_scan_from was proved not to contain
+        // ST in the previous call. A new terminator can therefore only
+        // straddle the old/new boundary or live entirely in input. Search the
+        // new bytes once before doing the capacity check: bytes after ST are
+        // normal terminal input and must not be charged to the APC size limit.
+        let scan_from = self
+            .pending_apc_scan_from
+            .min(self.pending_apc.len().saturating_sub(1));
+        let terminator = if scan_from + 1 == self.pending_apc.len()
+            && self.pending_apc[scan_from] == 0x1b
+            && input.first() == Some(&b'\\')
+        {
+            Some((scan_from, 1))
+        } else {
+            input
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .map(|offset| (self.pending_apc.len() + offset, offset + 2))
+        };
+
+        if let Some((terminator, consumed)) = terminator {
+            let packet_len = self.pending_apc.len().saturating_add(consumed);
+            if packet_len > MAX_PENDING_ESCAPE {
+                self.reject_buffered_kitty_apc_with_suffix(
+                    &input[..consumed],
+                    "Kitty graphics APC exceeded the parser size limit",
+                );
+                self.pending_apc.clear();
+                self.pending_apc_scan_from = 0;
+            } else {
+                self.pending_apc.extend_from_slice(&input[..consumed]);
+                let packet = std::mem::take(&mut self.pending_apc);
+                self.pending_apc_scan_from = 0;
+                if packet.starts_with(b"\x1b_")
+                    && jterm_core::kitty_graphics::is_graphics_payload(&packet[2..terminator])
+                {
+                    self.handle_kitty_graphics_apc(&packet[2..terminator]);
+                }
+            }
+            if consumed < input.len() {
+                self.process_input(&input[consumed..]);
+            }
+            return true;
+        }
+
+        if self.pending_apc.len().saturating_add(input.len()) > MAX_PENDING_ESCAPE {
+            let previous_escape = input
+                .last()
+                .copied()
+                .or_else(|| self.pending_apc.last().copied())
+                == Some(0x1b);
+            self.reject_buffered_kitty_apc_with_suffix(
+                input,
+                "Kitty graphics APC exceeded the parser size limit",
+            );
+            self.pending_apc.clear();
+            self.pending_apc_scan_from = 0;
+            self.discarding_oversized_apc = true;
+            self.discarding_apc_prev_escape = previous_escape;
+            return true;
+        }
+
+        self.pending_apc.extend_from_slice(input);
+        self.pending_apc_scan_from = self.pending_apc.len().saturating_sub(1);
+        true
+    }
+
     /// Check if sync output timed out (>1s) and auto-clear if so
     pub fn check_sync_output_timeout(&mut self) {
         if self.sync_output_active {
@@ -6724,12 +6892,17 @@ impl TerminalState {
     }
 
     pub fn process_input(&mut self, input: &[u8]) {
+        // A fragmented kitty APC streams against its own bounded buffer; this
+        // must run before the pending_escape merge so the APC never pays the
+        // O(n^2) re-scan and its tail is never parsed as ordinary input.
+        if self.resume_pending_apc(input) {
+            return;
+        }
         // Guard against an unterminated OSC/DCS/escape sequence. Such a sequence
         // is buffered into `pending_escape` and re-scanned from its start on every
         // read, which is both O(n^2) in CPU and unbounded in memory. Once the
         // buffered prefix exceeds this cap, abandon the partial sequence. The cap
         // is generous enough for legitimate large payloads (e.g. OSC 52 clipboard).
-        const MAX_PENDING_ESCAPE: usize = 1 << 20; // 1 MiB
         if self.pending_escape.len() > MAX_PENDING_ESCAPE {
             self.pending_escape.clear();
         }
@@ -7010,8 +7183,15 @@ impl TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape
-                                    .extend_from_slice(&data_slice[esc_start..]);
+                                if is_apc {
+                                    // Kitty transfers stream against their
+                                    // own bounded buffer instead of the
+                                    // re-scanning pending_escape.
+                                    self.begin_pending_apc(&data_slice[esc_start..]);
+                                } else {
+                                    self.pending_escape
+                                        .extend_from_slice(&data_slice[esc_start..]);
+                                }
                                 break;
                             }
                         }
@@ -8077,8 +8257,13 @@ impl TerminalState {
         self.osc8_hyperlinks.clear();
         self.osc8_hyperlink_keys.clear();
         // RIS resets the graphics namespace with the text screen: neither a
-        // visible placement nor a half-finished upload may survive it.
+        // visible placement nor a half-finished upload may survive it. The
+        // parser-side state of an in-flight transfer goes with it.
         self.kitty_graphics.clear();
+        self.pending_apc.clear();
+        self.pending_apc_scan_from = 0;
+        self.discarding_oversized_apc = false;
+        self.discarding_apc_prev_escape = false;
         self.clear_screen();
     }
 
@@ -12372,7 +12557,7 @@ mod tests {
     use super::{
         AgentPromptStatus, ClipboardReadKind, Color, CursorShape, IdleBackgroundOutput,
         ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_OSC8_ID_BYTES,
-        MAX_OSC8_URI_BYTES, MAX_TERMINAL_TITLE_CHARS,
+        MAX_OSC8_URI_BYTES, MAX_PENDING_ESCAPE, MAX_TERMINAL_TITLE_CHARS,
     };
 
     fn osc8_spans(terminal: &mut TerminalState) -> Vec<crate::link::Link> {
@@ -15549,6 +15734,95 @@ mod tests {
         terminal.process_input(b"\x1b_Gm=0;BA==\x1b\\");
 
         assert!(terminal.kitty_graphics.get_image(34).is_none());
+    }
+
+    #[test]
+    fn fragmented_kitty_apc_advances_its_scan_cursor_and_stays_bounded() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.process_input(b"\x1b_Gi=52,f=32,s=1,v=1;");
+        assert_eq!(
+            terminal.pending_apc_scan_from,
+            terminal.pending_apc.len().saturating_sub(1)
+        );
+
+        for fragment in [
+            b"AQ".as_slice(),
+            b"ID".as_slice(),
+            b"BA".as_slice(),
+            b"==".as_slice(),
+        ] {
+            let old_len = terminal.pending_apc.len();
+            terminal.process_input(fragment);
+            assert_eq!(terminal.pending_apc.len(), old_len + fragment.len());
+            assert_eq!(
+                terminal.pending_apc_scan_from,
+                terminal.pending_apc.len().saturating_sub(1),
+                "unterminated fragments must resume scanning at the previous tail"
+            );
+        }
+        terminal.process_input(b"\x1b\\");
+        assert!(terminal.pending_apc.is_empty());
+        assert!(terminal.kitty_graphics.get_image(52).is_some());
+        let _ = terminal.get_output();
+
+        // An oversized packet is rejected with a bounded response and then
+        // discarded through its ST — never buffered wholesale and never
+        // parsed as ordinary input afterwards.
+        let mut oversized = b"\x1b_Ga=p,i=53,q=0;".to_vec();
+        oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+        terminal.process_input(&oversized);
+        assert!(terminal.pending_apc.is_empty());
+        assert!(terminal.discarding_oversized_apc);
+        let response = terminal.get_output();
+        assert!(
+            response.starts_with(b"\x1b_Gi=53;EINVAL:"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(response.len() < 256);
+
+        // Discard through ST without allocating the oversized packet, then
+        // resume ordinary terminal parsing on the same input batch.
+        terminal.process_input(b"\x1b\\Z");
+        assert!(!terminal.discarding_oversized_apc);
+        assert_eq!(terminal.grid[0][0].character, 'Z');
+
+        // The bytes after ST belong to the normal stream, not the APC. Even
+        // when they make the whole read exceed the cap, a packet whose
+        // terminator is itself within the cap must be completed and the
+        // remainder preserved.
+        let mut near_limit = b"\x1b_Gi=55,f=32,s=1,v=1,q=2;".to_vec();
+        near_limit.resize(MAX_PENDING_ESCAPE - 2, b'A');
+        terminal.process_input(&near_limit);
+        terminal.process_input(b"\x1b\\Y");
+        assert!(!terminal.discarding_oversized_apc);
+        assert!(terminal.pending_apc.is_empty());
+        assert_eq!(terminal.grid[0][1].character, 'Y');
+    }
+
+    #[test]
+    fn a_kitty_apc_split_across_reads_is_never_dropped_wholesale() {
+        // Regression coverage for the old behavior: a transfer larger than
+        // the coalesced read size used to land in pending_escape, get cleared
+        // at the 1 MiB cap, and have its base64 tail parsed as text.
+        let payload = b"\x1b_Gf=32,s=1,v=1,a=t,i=56;AQIDBA==\x1b\\";
+        for split_at in 1..payload.len() {
+            let mut terminal = TerminalState::new(8, 2);
+            terminal.process_input(&payload[..split_at]);
+            assert!(
+                terminal.kitty_graphics.get_image(56).is_none(),
+                "incomplete APC was applied at split {split_at}"
+            );
+            terminal.process_input(&payload[split_at..]);
+            assert!(
+                terminal.kitty_graphics.get_image(56).is_some(),
+                "APC was lost at input split {split_at}"
+            );
+            assert_eq!(
+                terminal.grid[0][0].character, ' ',
+                "APC bytes leaked onto the grid at split {split_at}"
+            );
+        }
     }
 
     #[test]

@@ -3151,6 +3151,11 @@ struct PtySubscriptionKey {
     id: usize,
     master_fd: RawFd,
     reader_fd: Arc<OwnedFd>,
+    /// The session leader's pid. The reader thread probes it to tell a closed
+    /// slave stream (a possibly transient hangup) apart from a real child
+    /// exit — observing only, never reaping: reaping stays with the
+    /// session's `Pty`.
+    child_pid: i32,
 }
 
 struct PtyWriteChunk {
@@ -4168,7 +4173,9 @@ struct Frost {
     /// Held for the process lifetime to enforce single-instance behavior. When
     /// `None`, another instance already holds the lock and this one runs fresh
     /// (no session restore, no snapshot writes) to avoid clobbering its history.
-    _instance_lock: Option<std::fs::File>,
+    /// The guard also publishes its descriptor so freshly forked PTY children
+    /// close their inherited copies immediately.
+    _instance_lock: Option<session_persistence::InstanceLock>,
     is_first_instance: bool,
 }
 
@@ -20285,6 +20292,7 @@ impl Frost {
                     id: s.id,
                     master_fd: s.master_fd,
                     reader_fd: Arc::clone(&s.reader_fd),
+                    child_pid: s.pty.get_child_pid(),
                 })
             })
             .collect();
@@ -21101,6 +21109,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                 }
             };
             let reader_fd = key.reader_fd;
+            let child_pid = key.child_pid;
             let spawn_result = std::thread::Builder::new()
                 .name(format!("frost-pty-{id}"))
                 .spawn(move || {
@@ -21120,7 +21129,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                             Ok(ReaderPoll::Timeout) => continue,
                             Ok(ReaderPoll::Data) => {
                                 let mut acc: Vec<u8> = Vec::new();
-                                let mut exited = false;
+                                let mut hangup = false;
                                 let mut errored = false;
                                 loop {
                                     let n = unsafe {
@@ -21136,7 +21145,9 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                                             break;
                                         }
                                     } else if n == 0 {
-                                        exited = true;
+                                        // read(2) == 0 on a PTY master is a
+                                        // hangup, the same class as EIO below.
+                                        hangup = true;
                                         break;
                                     } else {
                                         let err = std::io::Error::last_os_error();
@@ -21145,6 +21156,15 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                                         }
                                         if err.raw_os_error() == Some(libc::EINTR) {
                                             continue;
+                                        }
+                                        // Linux PTY masters report EIO (rather
+                                        // than read(2) == 0) once the final
+                                        // slave fd closes. The child may still
+                                        // be alive; never fabricate an exit
+                                        // from the fd state alone.
+                                        if err.raw_os_error() == Some(libc::EIO) {
+                                            hangup = true;
+                                            break;
                                         }
                                         errored = true;
                                         break;
@@ -21158,17 +21178,24 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                                 {
                                     break;
                                 }
-                                if exited {
-                                    let _ = iced::futures::executor::block_on(
-                                        tx.send(Message::PtyExited(id, fd, 0)),
-                                    );
-                                    break;
-                                }
                                 if errored {
                                     let _ = iced::futures::executor::block_on(
                                         tx.send(Message::PtyExited(id, fd, -1)),
                                     );
                                     break;
+                                }
+                                if hangup {
+                                    match wait_out_hangup(
+                                        id,
+                                        fd,
+                                        reader_raw,
+                                        shutdown_raw,
+                                        child_pid,
+                                        &mut tx,
+                                    ) {
+                                        HangupOutcome::Recovered => continue,
+                                        HangupOutcome::Exited | HangupOutcome::Shutdown => break,
+                                    }
                                 }
                             }
                             Err(_) => {
@@ -21194,6 +21221,122 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
             }
         },
     )
+}
+
+/// Outcome of riding out a PTY hangup in the reader thread.
+enum HangupOutcome {
+    /// The slave side is open again (or data arrived); resume normal reading.
+    Recovered,
+    /// The child is actually gone, or the stream is genuinely broken; the
+    /// exit message has been queued.
+    Exited,
+    /// The session was closed while probing; leave quietly.
+    Shutdown,
+}
+
+/// Ride out a PTY hangup (Linux EIO, or `read(2) == 0` elsewhere): the slave
+/// stream is closed, but the child may still be alive — a daemonized
+/// program, or one that did setsid and closed its ctty — and may even reopen
+/// /dev/tty later. Probe with bounded backoff (50→250 ms) and declare exit
+/// only once waitid says the child is gone, never from the fd state alone.
+/// The backoff wait is paced by the shutdown pipe so session close stays
+/// prompt; an EIO master stays permanently readable and cannot pace it.
+fn wait_out_hangup(
+    id: usize,
+    fd: RawFd,
+    reader_raw: RawFd,
+    shutdown_raw: RawFd,
+    child_pid: i32,
+    tx: &mut iced::futures::channel::mpsc::Sender<Message>,
+) -> HangupOutcome {
+    use iced::futures::SinkExt;
+
+    const PROBE_DELAY_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+    let mut probe_delay = std::time::Duration::from_millis(50);
+    let mut buf = vec![0u8; 65536];
+    loop {
+        // Recovery probe: a live child may have reopened /dev/tty since the
+        // hangup. Data or WouldBlock both mean the slave side lives again.
+        let n = loop {
+            let n = unsafe {
+                libc::read(reader_raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break n;
+        };
+        if n > 0 {
+            let data = buf[..n as usize].to_vec();
+            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data)))
+                .is_err()
+            {
+                return HangupOutcome::Shutdown;
+            }
+            return HangupOutcome::Recovered;
+        }
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return HangupOutcome::Recovered;
+            }
+            if error.raw_os_error() != Some(libc::EIO) {
+                // A genuine read error keeps the pre-hangup behavior.
+                let _ =
+                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
+                return HangupOutcome::Exited;
+            }
+        }
+        // Still hung up (read(2) == 0 or EIO). Declare exit only when the
+        // child is actually gone; WNOWAIT leaves the real status for the
+        // session's Pty to reap, so task terminals keep their true code.
+        match Pty::observe_child_exit(child_pid) {
+            Ok(Some(code)) => {
+                let _ = iced::futures::executor::block_on(
+                    tx.send(Message::PtyExited(id, fd, code)),
+                );
+                return HangupOutcome::Exited;
+            }
+            Ok(None) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                // Reaped elsewhere (session teardown won the race): gone.
+                let _ =
+                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
+                return HangupOutcome::Exited;
+            }
+            Err(error) => {
+                // Unknown is not evidence of exit; keep probing.
+                log::warn!("[PTY] waitid(WNOWAIT) failed while probing PTY child: {error}");
+            }
+        }
+        // Pace the next probe through the shutdown pipe alone.
+        let mut shutdown_poll = libc::pollfd {
+            fd: shutdown_raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = loop {
+            // SAFETY: shutdown_poll is a valid stack pollfd and shutdown_raw
+            // is owned by the caller for the duration of this wait.
+            let ready =
+                unsafe { libc::poll(&mut shutdown_poll, 1, probe_delay.as_millis() as i32) };
+            if ready >= 0 {
+                break ready;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return HangupOutcome::Shutdown;
+            }
+        };
+        if ready > 0
+            && shutdown_poll.revents
+                & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0
+        {
+            return HangupOutcome::Shutdown;
+        }
+        probe_delay = PROBE_DELAY_MAX.min(probe_delay.saturating_mul(2));
+    }
 }
 
 /// Build the canonical binding string (e.g. `"ctrl+shift+t"`) for a key event
@@ -25838,5 +25981,98 @@ mod tests {
         assert!(notice.expect("cancel summary").0.contains("Cancelled"));
         std::fs::remove_dir_all(root2).expect("remove test tree");
         std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_pty_hangup_waits_for_real_exit_and_recovers_output() {
+        use iced::futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "frost-pty-hangup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let script_path = std::env::temp_dir().join(unique);
+        std::fs::write(
+            &script_path,
+            b"#!/bin/sh\nexec 0>&- 1>&- 2>&-\nsleep 0.25\nexec 0</dev/tty 1>/dev/tty 2>/dev/tty\nprintf recovered\nsleep 0.05\nexit 7\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+
+        let script = script_path.to_string_lossy().into_owned();
+        let argv = vec![script];
+        let pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+            .expect("spawn hangup test shell");
+        let (shutdown_r, shutdown_w) = Pty::make_shutdown_pipe().unwrap();
+        let _shutdown_guard = shutdown_w;
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel(2);
+        let id = 77;
+        let fd = pty.master_fd();
+
+        // Observe the initial hangup the way the reader loop does: poll the
+        // master until the child has closed every slave fd (Linux EIO).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut probe = [0u8; 4096];
+        loop {
+            let n =
+                unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never closed its slave fds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // The old implementation emitted PtyExited(-1) here, causing the live
+        // child to be dropped and killed before it could reopen /dev/tty.
+        let outcome = wait_out_hangup(id, fd, fd, shutdown_r, pty.get_child_pid(), &mut tx);
+        assert!(matches!(outcome, HangupOutcome::Recovered));
+        let output = match iced::futures::executor::block_on(rx.next()) {
+            Some(Message::PtyOutput(msg_id, msg_fd, bytes)) => {
+                assert_eq!((msg_id, msg_fd), (id, fd));
+                bytes
+            }
+            other => panic!("expected recovered PTY output, got {other:?}"),
+        };
+        assert_eq!(output, b"recovered");
+
+        // The child then exits for real. Wait for the second hangup the same
+        // way, then the probe must report the genuine status — never a
+        // fabricated exit while the child was still alive.
+        loop {
+            let n =
+                unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never exited after recovery"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let outcome = wait_out_hangup(id, fd, fd, shutdown_r, pty.get_child_pid(), &mut tx);
+        assert!(matches!(outcome, HangupOutcome::Exited));
+        match iced::futures::executor::block_on(rx.next()) {
+            Some(Message::PtyExited(msg_id, msg_fd, code)) => {
+                assert_eq!((msg_id, msg_fd), (id, fd));
+                assert_eq!(code, 7);
+            }
+            other => panic!("expected a real PTY exit, got {other:?}"),
+        }
+
+        drop(pty);
+        let _ = std::fs::remove_file(script_path);
     }
 }
