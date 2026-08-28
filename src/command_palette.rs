@@ -68,6 +68,7 @@ pub enum PaletteAction {
     BlockRetryFailed,
     BlockToggleCollapse,
     CommandHistory,
+    OpenWorkflows,
     ClearScreen,
     InstallJsh,
 }
@@ -484,6 +485,12 @@ impl PaletteState {
                 action: PaletteAction::CommandHistory,
             },
             PaletteItem {
+                name: "Workflows",
+                description: "Pick a parameterized workflow, fill its arguments, and type the rendered command into the prompt",
+                shortcut: "Ctrl+Shift+M",
+                action: PaletteAction::OpenWorkflows,
+            },
+            PaletteItem {
                 name: "Clear Screen",
                 description: "Clear the terminal screen",
                 shortcut: "",
@@ -641,6 +648,7 @@ mod tests {
             (PaletteAction::PromptJumpNext, "Ctrl+Shift+Down"),
             (PaletteAction::CopyLastOutput, "Ctrl+Shift+G"),
             (PaletteAction::CommandHistory, "Ctrl+Shift+H"),
+            (PaletteAction::OpenWorkflows, "Ctrl+Shift+M"),
             (PaletteAction::OpenSearchReplace, "Ctrl+Alt+R"),
             (PaletteAction::BlockSearch, "Ctrl+Alt+F"),
             (PaletteAction::BlockSelectAll, "Ctrl+Shift+A"),

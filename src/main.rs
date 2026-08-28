@@ -34,6 +34,8 @@ mod sidebar;
 mod terminal;
 mod terminal_view;
 mod theme;
+mod workflow_picker;
+mod workflows;
 
 use std::hash::Hash;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -702,6 +704,12 @@ static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
 static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));
+static WORKFLOW_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-workflow-picker-input"));
+/// The first argument input of the workflow form; Tab/Shift+Tab traverse the
+/// remaining fields from here.
+static WORKFLOW_ARG_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-workflow-arg-input"));
 /// Hit rows the picker builds widgets for at once. Comfortably larger than
 /// the panel's visible area so the wheel and drag scrollbar still work inside
 /// the page; the page only shifts when the highlight leaves it.
@@ -2234,6 +2242,7 @@ enum ChromeShortcut {
     TabSwitcher,
     HistoryPicker,
     RemoteHosts,
+    Workflows,
     Debug,
 }
 
@@ -2258,6 +2267,8 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
         'h' => Some(ChromeShortcut::HistoryPicker),
         // Same chord as the rest of the family's remote host picker.
         's' => Some(ChromeShortcut::RemoteHosts),
+        // Same chord as anvil/forge's workflow picker.
+        'm' => Some(ChromeShortcut::Workflows),
         _ => None,
     }
 }
@@ -3131,6 +3142,18 @@ enum Message {
     HistoryPickerClose,
     /// Type the clicked command into the active pane's prompt (and close).
     HistoryPickerAccept(String),
+    /// Filter text changed in the workflow picker.
+    WorkflowPickerInput(String),
+    /// Cancel the workflow overlay (picker or argument form).
+    WorkflowOverlayClose,
+    /// Accept the workflow at this position in the current filtered list:
+    /// render+insert it when it takes no arguments, otherwise open its
+    /// argument form.
+    WorkflowPickerAccept(usize),
+    /// Edit of one argument value in the workflow form (args index, new text).
+    WorkflowArgInput(usize, String),
+    /// Render the workflow form's current values and insert for review.
+    WorkflowArgSubmit,
     /// Query text changed in the block search picker.
     BlockSearchInput(String),
     /// Reset query, matching controls, scope, and metadata filter to defaults.
@@ -4233,6 +4256,10 @@ struct Frost {
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
+    /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
+    /// files, then a per-argument form before the rendered command is typed
+    /// into the active pane for review (never executed).
+    workflow_overlay: Option<workflow_picker::WorkflowOverlay>,
     /// Cross-block search picker overlay (`block:search`, Ctrl+Alt+F).
     block_search: Option<BlockSearchState>,
     /// Last matching intent for this window. Memory-only: cache/results and
@@ -4438,6 +4465,7 @@ impl Frost {
             tab_switcher: None,
             remote_picker: None,
             history_picker: None,
+            workflow_overlay: None,
             block_search: None,
             block_search_memory: BlockSearchMemory::default(),
             next_block_search_epoch: 0,
@@ -4766,6 +4794,7 @@ impl Frost {
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
             && self.history_picker.is_none()
+            && self.workflow_overlay.is_none()
             && self.block_search.is_none()
             && self.block_menu.is_none()
             && self.block_clear_confirm.is_none()
@@ -4787,6 +4816,7 @@ impl Frost {
             && self.tab_menu.is_none()
             && self.tab_switcher.is_none()
             && self.history_picker.is_none()
+            && self.workflow_overlay.is_none()
             && self.block_search.is_none()
             && self.block_menu.is_none()
             && self.block_clear_confirm.is_none()
@@ -7592,6 +7622,13 @@ impl Frost {
                 }
                 Some(Task::none())
             }
+            ChromeShortcut::Workflows => {
+                if self.workflow_overlay.is_some() {
+                    self.workflow_overlay = None;
+                    return Some(Task::none());
+                }
+                Some(self.open_workflow_picker())
+            }
             ChromeShortcut::Debug => {
                 self.debug_open = !self.debug_open;
                 Some(Task::none())
@@ -7836,6 +7873,7 @@ impl Frost {
             || self.tab_switcher.is_some()
             || self.remote_picker.is_some()
             || self.history_picker.is_some()
+            || self.workflow_overlay.is_some()
             || self.block_search.is_some()
             || self.help_open
             || self.debug_open
@@ -9318,6 +9356,152 @@ impl Frost {
         Some(Task::none())
     }
 
+    /// Open the workflow picker over the current search path
+    /// (`~/.config/frost/workflows/`, `FROST_WORKFLOW_DIR`, XDG data dirs,
+    /// then the bundled examples). Shared by Ctrl+Shift+M and the command
+    /// palette so both entry points behave identically. The load is bounded
+    /// and synchronous, the same seam as `open_history_picker`.
+    fn open_workflow_picker(&mut self) -> Task<Message> {
+        self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Picker(Box::new(
+            workflow_picker::WorkflowPickerState::load(),
+        )));
+        iced::widget::operation::focus(WORKFLOW_PICKER_INPUT_ID.clone())
+    }
+
+    /// Picker-stage acceptance, shared by Enter and mouse click. A workflow
+    /// without arguments renders and inserts immediately; one with arguments
+    /// moves the overlay to its per-argument form (anvil's parameter dialog).
+    fn accept_workflow_at(&mut self, index: usize) -> Task<Message> {
+        let workflow = match self.workflow_overlay.as_ref() {
+            Some(workflow_picker::WorkflowOverlay::Picker(state)) => {
+                state.workflow_at_filtered(index).cloned()
+            }
+            _ => None,
+        };
+        let Some(workflow) = workflow else {
+            return Task::none();
+        };
+        self.accept_workflow(workflow)
+    }
+
+    /// Render-and-insert or open the argument form for one chosen workflow.
+    fn accept_workflow(&mut self, workflow: workflows::Workflow) -> Task<Message> {
+        if workflow.args.is_empty() {
+            self.workflow_overlay = None;
+            return match workflows::render(&workflow, &std::collections::HashMap::new()) {
+                Ok(command) => self.recall_into_active_pane(command),
+                Err(error) => {
+                    log::warn!("workflow render failed: {error}");
+                    self.push_toast(
+                        format!("Workflow could not be rendered: {error}"),
+                        ToastKind::Warning,
+                    );
+                    Task::none()
+                }
+            };
+        }
+        self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Args(Box::new(
+            workflow_picker::WorkflowArgsState::new(workflow),
+        )));
+        iced::widget::operation::focus(WORKFLOW_ARG_INPUT_ID.clone())
+    }
+
+    /// The argument form's primary action ("Insert command" / Enter in any
+    /// field). The rendered command is typed at the prompt for review through
+    /// the shared recall boundary; it never submits. A render error stays
+    /// inline on the form, like anvil's dialog error label.
+    fn submit_workflow_args(&mut self) -> Task<Message> {
+        let rendered = match self.workflow_overlay.as_mut() {
+            Some(workflow_picker::WorkflowOverlay::Args(form)) => match form.render() {
+                Ok(command) => command,
+                Err(error) => {
+                    log::warn!("workflow render failed: {error}");
+                    form.feedback = Some(format!("Workflow could not be rendered: {error}"));
+                    return Task::none();
+                }
+            },
+            _ => return Task::none(),
+        };
+        self.workflow_overlay = None;
+        self.recall_into_active_pane(rendered)
+    }
+
+    /// Workflow overlay key handling. The picker stage mirrors
+    /// `handle_history_picker_key` (typed text filters, arrows move, Enter
+    /// accepts, Esc/Ctrl+Shift+M dismisses). The argument stage is driven by
+    /// real text inputs: they capture typing, Enter submits through
+    /// `on_submit`, Tab/Shift+Tab move focus between fields, and Escape closes.
+    fn handle_workflow_overlay_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        if chrome_shortcut(key, mods) == Some(ChromeShortcut::Workflows) {
+            self.workflow_overlay = None;
+            return Some(Task::none());
+        }
+        match self.workflow_overlay.as_mut()? {
+            workflow_picker::WorkflowOverlay::Args(_) => match key {
+                Key::Named(Named::Escape) => {
+                    self.workflow_overlay = None;
+                    Some(Task::none())
+                }
+                Key::Named(Named::Tab) if mods.shift() => {
+                    Some(iced::widget::operation::focus_previous())
+                }
+                Key::Named(Named::Tab) => Some(iced::widget::operation::focus_next()),
+                Key::Named(Named::Enter) => Some(self.submit_workflow_args()),
+                // Everything else belongs to the focused argument input (or is
+                // a harmless no-op); none of it may reach the terminal.
+                _ => Some(Task::none()),
+            },
+            workflow_picker::WorkflowOverlay::Picker(state) => {
+                match key {
+                    Key::Named(Named::Escape) => {
+                        self.workflow_overlay = None;
+                        return Some(Task::none());
+                    }
+                    Key::Named(Named::Enter) => {
+                        let workflow = state.selected_workflow().cloned();
+                        return Some(match workflow {
+                            Some(workflow) => self.accept_workflow(workflow),
+                            None => Task::none(),
+                        });
+                    }
+                    Key::Named(Named::ArrowDown) => {
+                        state.select_next();
+                        return Some(Task::none());
+                    }
+                    Key::Named(Named::ArrowUp) => {
+                        state.select_prev();
+                        return Some(Task::none());
+                    }
+                    Key::Named(Named::Backspace) => {
+                        state.query.pop();
+                        state.selected = 0;
+                        return Some(Task::none());
+                    }
+                    _ => {}
+                }
+                if !mods.control() && !mods.alt() {
+                    if let Some(t) = text {
+                        let printable: String = t.chars().filter(|c| !c.is_control()).collect();
+                        if !printable.is_empty() {
+                            state.query.push_str(&printable);
+                            state.selected = 0;
+                            return Some(Task::none());
+                        }
+                    }
+                }
+                // Swallow all other keys while the overlay owns the keyboard.
+                Some(Task::none())
+            }
+        }
+    }
+
     /// Stable id of the finalized block covering viewport `row` in the pane
     /// identified by `session_id`. Running/live-prompt rows deliberately have
     /// no target. Mouse events retain this stable identity across focus moves.
@@ -10407,6 +10591,7 @@ impl Frost {
             PaletteAction::BlockRetryFailed => self.palette_failed_block_retry_task(),
             PaletteAction::BlockToggleCollapse => self.block_toggle_selected_collapse(),
             PaletteAction::CommandHistory => self.open_history_picker(),
+            PaletteAction::OpenWorkflows => self.open_workflow_picker(),
             PaletteAction::PromptJumpPrev | PaletteAction::PromptJumpNext => {
                 self.jump_prompt_with_feedback(matches!(action, PaletteAction::PromptJumpPrev))
             }
@@ -12492,6 +12677,16 @@ impl Frost {
                             return task;
                         }
                     }
+                    // The workflow overlay owns the keyboard the same way
+                    // (picker: Enter accepts, Esc/Ctrl+Shift+M dismisses;
+                    // argument form: Tab traverses, Enter submits, Esc closes).
+                    if self.workflow_overlay.is_some() {
+                        if let Some(task) =
+                            self.handle_workflow_overlay_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
                     // The block search picker owns the keyboard the same way
                     // (Enter selects and reveals the hit's zone, Esc/
                     // Ctrl+Alt+F dismiss). It MUST consume keys before the
@@ -14349,6 +14544,24 @@ impl Frost {
                 self.history_picker = None;
                 return self.recall_into_active_pane(command);
             }
+            Message::WorkflowPickerInput(q) => {
+                if let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    state.query = q;
+                    state.selected = 0;
+                }
+            }
+            Message::WorkflowOverlayClose => self.workflow_overlay = None,
+            Message::WorkflowPickerAccept(index) => return self.accept_workflow_at(index),
+            Message::WorkflowArgInput(index, value) => {
+                if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    form.set_value(index, value);
+                }
+            }
+            Message::WorkflowArgSubmit => return self.submit_workflow_args(),
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
             }
@@ -15682,6 +15895,199 @@ impl Frost {
                 .height(Length::Fill),
         )
         .on_press(Message::RemotePickerClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// Ctrl+Shift+M workflow overlay (palette-style), the iced mirror of
+    /// anvil's palette workflow tier plus parameter dialog. Accepting a
+    /// workflow types the rendered command into the active pane for review;
+    /// nothing executes.
+    fn workflow_overlay_view(
+        &self,
+        overlay: &workflow_picker::WorkflowOverlay,
+    ) -> Element<'_, Message> {
+        match overlay {
+            workflow_picker::WorkflowOverlay::Picker(state) => self.workflow_picker_view(state),
+            workflow_picker::WorkflowOverlay::Args(form) => self.workflow_args_view(form),
+        }
+    }
+
+    /// The picker's searchable workflow list. Rows show the name, the first
+    /// tags, and the description; the command template stays visible in the
+    /// argument form that follows.
+    fn workflow_picker_view(
+        &self,
+        state: &workflow_picker::WorkflowPickerState,
+    ) -> Element<'_, Message> {
+        let filtered = state.filtered();
+
+        let query: Element<'_, Message> = text_input("Run a workflow…", &state.query)
+            .id(WORKFLOW_PICKER_INPUT_ID.clone())
+            .on_input(Message::WorkflowPickerInput)
+            .size(14)
+            .into();
+        let query_line = row![text("⚙").size(16), query]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        if filtered.is_empty() {
+            let hint = if state.is_empty() {
+                "No workflows found (~/.config/frost/workflows/, FROST_WORKFLOW_DIR, or bundled examples)"
+            } else {
+                "No workflows match"
+            };
+            list = list.push(text(hint).size(13).style(text::secondary));
+        } else {
+            for (pos, workflow) in filtered.iter().enumerate() {
+                let selected = pos == state.selected;
+                let mut info = row![text(workflow.name.clone()).size(13)]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center);
+                if !workflow.args.is_empty() {
+                    info = info.push(
+                        text(format!("{} args", workflow.args.len()))
+                            .size(11)
+                            .style(text::secondary),
+                    );
+                }
+                info = info.push(Space::new().width(Length::Fill));
+                for tag in workflow.tags.iter().take(3) {
+                    info = info.push(text(tag.clone()).size(11).style(text::secondary));
+                }
+                let mut rows = column![info].spacing(2);
+                if !workflow.description.is_empty() {
+                    rows = rows.push(
+                        text(workflow.description.clone())
+                            .size(11)
+                            .style(text::secondary),
+                    );
+                }
+                let accent = self.c_accent();
+                let body = container(rows).width(Length::Fill).padding([3, 8]).style(
+                    move |_t: &iced::Theme| container::Style {
+                        background: if selected {
+                            Some(iced::Background::Color(Color { a: 0.28, ..accent }))
+                        } else {
+                            None
+                        },
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let row_btn = mouse_area(body).on_press(Message::WorkflowPickerAccept(pos));
+                list = list.push(row_btn);
+            }
+        }
+
+        let body = column![query_line, list].spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(560.0))
+            .max_height(480.0)
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::WorkflowOverlayClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
+    /// One workflow's argument form (anvil's parameter dialog): description,
+    /// the command template for review, one input per declared argument
+    /// prefilled with its default, and explicit Insert/Cancel actions.
+    fn workflow_args_view(
+        &self,
+        form: &workflow_picker::WorkflowArgsState,
+    ) -> Element<'_, Message> {
+        let header = row![
+            text(format!("Workflow: {}", form.workflow.name)).size(14),
+            Space::new().width(Length::Fill),
+            button(text("✕").size(12))
+                .style(button::secondary)
+                .on_press(Message::WorkflowOverlayClose),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let mut card = column![header].spacing(8);
+        if !form.workflow.description.is_empty() {
+            card = card.push(
+                text(form.workflow.description.clone())
+                    .size(12)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
+            );
+        }
+        card = card.push(
+            text(crate::review_text::visible_bounded(
+                &form.workflow.command,
+                4 * 1024,
+            ))
+            .size(12)
+            .font(iced::Font::MONOSPACE)
+            .wrapping(text::Wrapping::Word),
+        );
+
+        for (index, arg) in form.workflow.args.iter().enumerate() {
+            let value = form.values.get(index).cloned().unwrap_or_default();
+            let input = text_input(&arg.name, &value)
+                .on_input(move |value| Message::WorkflowArgInput(index, value))
+                .on_submit(Message::WorkflowArgSubmit)
+                .size(13)
+                .font(iced::Font::MONOSPACE);
+            // The stable id sits on the first field so opening the form can
+            // focus it; Tab/Shift+Tab traverse the rest.
+            let input = if index == 0 {
+                input.id(WORKFLOW_ARG_INPUT_ID.clone())
+            } else {
+                input
+            };
+            let mut label = arg.name.clone();
+            if !arg.description.is_empty() {
+                label = format!("{label} — {}", arg.description);
+            }
+            card =
+                card.push(column![text(label).size(11).style(text::secondary), input,].spacing(2));
+        }
+
+        if let Some(feedback) = form.feedback.as_deref() {
+            card = card.push(text(feedback.to_string()).size(11).style(text::danger));
+        }
+
+        let actions = row![
+            button(text("Insert command").size(12))
+                .style(button::primary)
+                .on_press(Message::WorkflowArgSubmit),
+            button(text("Cancel").size(12))
+                .style(button::secondary)
+                .on_press(Message::WorkflowOverlayClose),
+        ]
+        .spacing(6);
+        card = card.push(actions);
+
+        let panel = container(card)
+            .width(Length::Fixed(560.0))
+            .max_height(480.0)
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::WorkflowOverlayClose);
         let centered = container(panel)
             .center_x(Length::Fill)
             .center_y(Length::Fill);
@@ -18097,6 +18503,11 @@ impl Frost {
         } else {
             root
         };
+        let root: Element<'_, Message> = if let Some(s) = &self.workflow_overlay {
+            stack![root, self.workflow_overlay_view(s)].into()
+        } else {
+            root
+        };
         let root: Element<'_, Message> = if let Some(s) = &self.block_search {
             stack![root, self.block_search_view(s)].into()
         } else {
@@ -19125,6 +19536,10 @@ impl Frost {
             kb(
                 "Ctrl+Shift+H",
                 "Command history picker (types into the prompt)"
+            ),
+            kb(
+                "Ctrl+Shift+M",
+                "Workflow picker (fill args, types into the prompt)"
             ),
             kb("Drag", "Select text"),
             kb("Ctrl+Click", "Open link under cursor"),
@@ -23776,6 +24191,10 @@ mod tests {
         assert_eq!(
             chrome_shortcut(&character("h"), ctrl_shift),
             Some(ChromeShortcut::HistoryPicker)
+        );
+        assert_eq!(
+            chrome_shortcut(&character("m"), ctrl_shift),
+            Some(ChromeShortcut::Workflows)
         );
         assert_eq!(
             chrome_shortcut(&keyboard::Key::Named(Named::F12), keyboard::Modifiers::NONE),
