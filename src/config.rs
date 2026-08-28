@@ -174,6 +174,13 @@ pub struct Config {
     #[serde(default)]
     pub ai_share_command_context: bool,
 
+    /// Offer a review-first correction card when a Block-mode command fails
+    /// with a narrowly classified cause (default off; requires `ai_enabled`).
+    /// Verified local evidence never needs a provider; the strict-JSON AI
+    /// fallback is skipped entirely when none is configured.
+    #[serde(default)]
+    pub command_correction_enabled: bool,
+
     /// Show the provider-neutral Tasks dashboard. This is independent from
     /// cloud-AI consent because local Agent CLIs and task bookkeeping do not
     /// inherently send terminal context off-machine.
@@ -594,6 +601,7 @@ impl Default for Config {
             ai_api_key_file: None,
             agent_max_turns: default_agent_max_turns(),
             ai_share_command_context: false,
+            command_correction_enabled: false,
             experimental_task_sidebar: false,
             font_size: default_font_size(),
             font_family: default_font_family(),

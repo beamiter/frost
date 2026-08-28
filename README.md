@@ -383,6 +383,10 @@ ai_stream = true
 # 向非本地 AI provider 发送命令上下文（命令、cwd、捕获输出）的显式授权。
 # 直连本机回环 Ollama 不需要此项；继承的 HTTP 代理会取消该豁免。
 ai_share_command_context = false
+# 失败命令的评审式纠正卡片（需先开启 ai_enabled）：本机 PATH/APT 证据优先，
+# 未配置 provider 时跳过严格 JSON 的 AI 兜底；卡片上可编辑，确认后才运行或
+# 插入提示符（未验证或编辑过的候选仅插入，仍需自己按回车）。
+command_correction_enabled = false
 # 实验性 Tasks 面板（侧栏 "Tasks" 页）：为失败命令块创建独立 Git worktree
 # 任务，并可选地运行原生 Codex 会话。与云端 AI 授权相互独立。
 experimental_task_sidebar = false

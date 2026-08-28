@@ -13,6 +13,7 @@ mod ansi;
 mod block_export;
 mod block_mode;
 mod color;
+mod command_correction;
 mod command_palette;
 mod config;
 mod debug;
@@ -634,6 +635,17 @@ fn block_retry_policy() -> PastePolicy {
         ..block_reinput_policy()
     }
 }
+
+/// A verified, unchanged correction runs after one explicit card action with
+/// the Agent-approval payload's de-fanging: controls stripped, prompt line
+/// cleared first, and the submitting CR outside the bracketed frame. The
+/// insert path uses [`block_reinput_policy`] instead (never submits).
+fn correction_run_policy() -> PastePolicy {
+    PastePolicy {
+        submit: true,
+        ..PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim)
+    }
+}
 /// Height of the status strip above each pane while split. A single pane has
 /// no strip: the tab bar and status bar already name it, and the row would
 /// only cost a terminal line.
@@ -708,6 +720,8 @@ static SIDEBAR_FILTER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-filter-input"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
+static CORRECTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-correction-input"));
 
 /// Toast kind drives the accent color of the floating notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2835,6 +2849,20 @@ enum Message {
     AgentNewTask,
     AgentClearContext,
     AgentClose,
+    // Review-first command correction for failed Block-mode commands.
+    /// A pane's correction worker resolved (stale generations dropped).
+    CommandCorrectionResolved(
+        usize,
+        u64,
+        Result<Option<command_correction::CorrectionCandidate>, String>,
+    ),
+    /// Edit of the correction card's command draft.
+    CommandCorrectionInput(String),
+    /// The card's primary action: run when verified and unchanged, else insert.
+    CommandCorrectionAccept,
+    CommandCorrectionDismiss,
+    /// Settings toggle for review-first command correction.
+    SetCommandCorrectionEnabled(bool),
     // Experimental Tasks dashboard (native Codex runtime + isolated worktrees).
     TaskPanelToggle,
     TaskSelect(agent_task::TaskId),
@@ -4009,6 +4037,9 @@ struct Frost {
     /// a repeated shortcut cannot queue unbounded copies of terminal output.
     block_export_in_flight: bool,
     agent: agent::AgentUi,
+    /// Review-first command-correction requests and presented cards, keyed by
+    /// stable terminal-session id (per-pane, generation-guarded).
+    command_corrections: command_correction::CorrectionRegistry,
     /// Provider-neutral task lifecycle reducer for the experimental Tasks
     /// dashboard (runtime-only metadata; nothing is persisted).
     task_manager: agent_task::TaskManager,
@@ -4323,6 +4354,7 @@ impl Frost {
             palette: command_palette::PaletteState::new(),
             block_export_in_flight: false,
             agent: agent::AgentUi::new(),
+            command_corrections: command_correction::CorrectionRegistry::default(),
             task_manager: agent_task::TaskManager::new(),
             agent_runtime: agent_task::AgentRuntimeManager::new(),
             task_panel: agent_task_ui::TaskPanel::new(),
@@ -6054,6 +6086,9 @@ impl Frost {
         self.task_manager
             .handle_terminal_session_closed(&agent_task_ui::terminal_session_id(closed_id));
         self.history_reflow_sessions.remove(&closed_id);
+        // A closed pane's correction request/card goes with it (cancels any
+        // in-flight probe or AI call for that pane).
+        self.command_corrections.close(closed_id);
         // The strip's transient state is keyed by tab id; a closed tab is
         // dropped from it in `prune_closed_pane` once we know whether the tab
         // itself went away.
@@ -7808,6 +7843,7 @@ impl Frost {
             || self.palette.is_open
             || self.search_replace.is_open
             || self.search.is_open
+            || self.correction_card_visible()
     }
 
     fn active_pane_has_prompt_marks(&self) -> bool {
@@ -11783,6 +11819,13 @@ impl Frost {
                 if let Some(task) = self.agent_drive_task() {
                     tasks.push(task);
                 }
+                // Review-first command correction: a shell-reported, non-Agent
+                // failure may resolve into a proposal card for that pane.
+                for completed in &completed_commands {
+                    if let Some(task) = self.maybe_start_command_correction(id, completed) {
+                        tasks.push(task);
+                    }
+                }
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
                 }
@@ -11897,6 +11940,60 @@ impl Frost {
             }
             Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
             Message::AgentClose => self.agent.close(),
+            Message::CommandCorrectionResolved(session_id, generation, result) => {
+                // The toggle or an Agent session may have changed mid-flight;
+                // re-check the gate before presenting anything.
+                if !command_correction::correction_monitor_enabled(
+                    self.config.ai_enabled,
+                    self.config.command_correction_enabled,
+                    self.agent.is_open,
+                ) {
+                    self.command_corrections.dismiss(session_id, generation);
+                    return Task::none();
+                }
+                match result {
+                    Ok(Some(candidate)) => {
+                        if self
+                            .command_corrections
+                            .present(session_id, generation, candidate)
+                        {
+                            // Take keyboard focus only for the active pane with a
+                            // clean, idle prompt; a prompt the user is already
+                            // typing into must keep its keystrokes.
+                            let focusable =
+                                self.sessions.get_mut(self.active).is_some_and(|sess| {
+                                    sess.id == session_id && sess.agent_prompt_status().is_ready()
+                                });
+                            if focusable {
+                                return iced::widget::operation::focus(CORRECTION_INPUT_ID.clone());
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        self.command_corrections.dismiss(session_id, generation);
+                    }
+                    Err(error) => {
+                        log::warn!("command correction failed: {error}");
+                        self.command_corrections.dismiss(session_id, generation);
+                    }
+                }
+            }
+            Message::CommandCorrectionInput(draft) => {
+                if let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) {
+                    if let Some(session) = self.command_corrections.get_mut(session_id) {
+                        if let Some(proposal) = session.proposal.as_mut() {
+                            proposal.draft = draft;
+                            proposal.feedback = None;
+                        }
+                    }
+                }
+            }
+            Message::CommandCorrectionAccept => return self.accept_command_correction(),
+            Message::CommandCorrectionDismiss => self.dismiss_active_correction(),
+            Message::SetCommandCorrectionEnabled(enabled) => {
+                self.config.command_correction_enabled = enabled;
+                self.config_dirty = true;
+            }
             Message::TaskPanelToggle => {
                 self.toggle_task_panel();
             }
@@ -12344,6 +12441,16 @@ impl Frost {
                         && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
                     {
                         self.sidebar_filter = None;
+                        return Task::none();
+                    }
+                    // A visible correction card is likewise non-modal: Escape
+                    // dismisses it (the GTK siblings scope this to the card's
+                    // focus; here the visible card owns the one Escape), and
+                    // every other key reaches the terminal or the focused draft.
+                    if self.correction_card_visible()
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.dismiss_active_correction();
                         return Task::none();
                     }
                     // Apart from the rename editor (whose keys the focused text
@@ -17921,6 +18028,13 @@ impl Frost {
         } else {
             body
         };
+        // The correction card is scoped to the active pane and floats above
+        // the terminal at the same layer as the Agent panel.
+        let body: Element<'_, Message> = if let Some(card) = self.correction_card() {
+            stack![body, card].into()
+        } else {
+            body
+        };
         let body: Element<'_, Message> = if self.help_open {
             stack![body, self.help_panel()].into()
         } else if self.debug_open {
@@ -18656,6 +18770,15 @@ impl Frost {
                 .on_toggle(Message::SetAiShareCommandContext)
                 .into(),
         );
+        let ai_correction_row = responsive_control_row(
+            compact,
+            "Corrections",
+            checkbox(self.config.command_correction_enabled)
+                .label("Suggest corrections for failed commands (reviewed before running)")
+                .text_size(13)
+                .on_toggle(Message::SetCommandCorrectionEnabled)
+                .into(),
+        );
         let task_sidebar_row = responsive_control_row(
             compact,
             "Tasks",
@@ -18859,6 +18982,7 @@ impl Frost {
             ai_redact_row,
             ai_stream_row,
             ai_share_row,
+            ai_correction_row,
             task_sidebar_row,
             agent_turns_row,
             remote_hosts_section,
@@ -19296,6 +19420,172 @@ impl Frost {
         }
         sess.refresh();
         self.agent_drive_task()
+    }
+
+    // ===== Review-first command correction (command_correction) =====
+
+    /// Offer a review-first correction after a narrowly classified Block-mode
+    /// failure in the session `id`. Mirrors anvil's
+    /// `maybe_start_command_correction`: any finished command first retires the
+    /// pane's previous card/request, then verified local evidence wins over the
+    /// strict-JSON AI fallback, and nothing runs without an explicit card
+    /// action. Returns the worker task when a request was started.
+    fn maybe_start_command_correction(
+        &mut self,
+        session_id: usize,
+        completed: &terminal::CompletedCommand,
+    ) -> Option<Task<Message>> {
+        // A newly finished command makes any visible card or in-flight request
+        // for this pane stale before this failure is even classified.
+        self.command_corrections.close(session_id);
+        // Only a shell-reported completion is failure evidence; a
+        // boundary-inferred one may not correspond to a real command exit.
+        if completed.completion_provenance != block_mode::CompletionProvenance::ShellReported {
+            return None;
+        }
+        // Agent-approved commands already went through review; correcting them
+        // would compete with the Agent session's own loop.
+        if completed.agent_generation.is_some() {
+            return None;
+        }
+        // A shell that reported no exit status gives no failure signal, and
+        // inventing one would put a "did you mean" card under a command that
+        // may well have succeeded.
+        let exit_code = completed.exit_code?;
+        let enabled = command_correction::correction_monitor_enabled(
+            self.config.ai_enabled,
+            self.config.command_correction_enabled,
+            self.agent.is_open,
+        );
+        if !enabled {
+            return None;
+        }
+        let output = command_correction::sample_output(&completed.output);
+        let kind = command_correction::classify_failure(&completed.command, exit_code, &output)?;
+        let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
+        let remote = sess.managed_remote;
+        let cwd = sess
+            .cwd_cache
+            .clone()
+            .or_else(|| sess.cwd())
+            .filter(|cwd| cwd.len() <= command_correction::MAX_CORRECTION_CWD_BYTES)
+            .unwrap_or_default();
+        let deadline = std::time::Instant::now() + command_correction::CORRECTION_REQUEST_TIMEOUT;
+        let (generation, token) = self.command_corrections.begin(
+            session_id,
+            completed.command.clone(),
+            exit_code,
+            deadline,
+        );
+        // A missing credential disables only the AI fallback inside the
+        // worker; the verified local resolvers run regardless.
+        let client = agent::client_from_config(&self.config).ok();
+        let original = completed.command.clone();
+        Some(Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    command_correction::resolve_correction_blocking(
+                        &original,
+                        exit_code,
+                        &output,
+                        if cwd.is_empty() { "." } else { &cwd },
+                        &kind,
+                        remote,
+                        client.as_ref(),
+                        &token,
+                        deadline,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("command correction worker failed: {error}")),
+                }
+            },
+            move |result| Message::CommandCorrectionResolved(session_id, generation, result),
+        ))
+    }
+
+    /// The card is scoped to the active pane: only Escape belongs to it
+    /// (dismiss); every other key keeps flowing to the terminal, or to the
+    /// card's focused draft input through widget capture.
+    fn correction_card_visible(&self) -> bool {
+        self.sessions
+            .get(self.active)
+            .and_then(|sess| self.command_corrections.get(sess.id))
+            .is_some_and(|session| session.proposal.is_some())
+    }
+
+    fn dismiss_active_correction(&mut self) {
+        if let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) {
+            if let Some(session) = self.command_corrections.get(session_id) {
+                let generation = session.generation();
+                self.command_corrections.dismiss(session_id, generation);
+            }
+        }
+    }
+
+    /// The card's primary action. A verified proposal the user left unchanged
+    /// (and that is not dangerous) runs after this one explicit action; an
+    /// unverified or edited draft is inserted at the prompt for review and the
+    /// user still presses Enter.
+    fn accept_command_correction(&mut self) -> Task<Message> {
+        let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) else {
+            return Task::none();
+        };
+        let prepared = {
+            let Some(session) = self.command_corrections.get_mut(session_id) else {
+                return Task::none();
+            };
+            let Some(proposal) = session.proposal.as_mut() else {
+                return Task::none();
+            };
+            match crate::review_text::validate_single_line(
+                &proposal.draft,
+                command_correction::MAX_CORRECTION_COMMAND_BYTES,
+            ) {
+                Ok(command) => {
+                    let run = command_correction::verified_run_allowed(
+                        proposal.evidence,
+                        &proposal.command,
+                        command,
+                    );
+                    Ok((command.to_string(), run))
+                }
+                Err(error) => {
+                    proposal.feedback = Some(format!("Cannot accept correction: {error}"));
+                    Err(())
+                }
+            }
+        };
+        let Ok((command, run)) = prepared else {
+            return Task::none();
+        };
+        // Final prompt-ownership check at the write boundary, same as recall
+        // and guarded retry: the prompt that was clean when the card appeared
+        // may have received input or entered a foreground program since.
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            if let Some(session) = self.command_corrections.get_mut(session_id) {
+                if let Some(proposal) = session.proposal.as_mut() {
+                    proposal.feedback = Some(format!("Cannot accept correction: {reason}"));
+                }
+            }
+            return Task::none();
+        }
+        let written = if run {
+            self.write_paste_to_session(session_id, &command, correction_run_policy(), true)
+        } else {
+            self.write_paste_to_session(session_id, &command, block_reinput_policy(), true)
+        };
+        if written {
+            self.dismiss_active_correction();
+        } else if let Some(session) = self.command_corrections.get_mut(session_id) {
+            if let Some(proposal) = session.proposal.as_mut() {
+                proposal.feedback =
+                    Some("The target prompt changed before the command could be queued.".into());
+            }
+        }
+        Task::none()
     }
 
     // ===== Experimental Tasks dashboard (agent_task) =====
@@ -20489,6 +20779,94 @@ impl Frost {
             .align_top(Length::Fill)
             .padding(10)
             .into()
+    }
+
+    /// The review-first correction card for the active pane, using the Agent
+    /// approval card idiom: evidence badge, reason, an editable command draft,
+    /// and explicit primary/dismiss actions. The draft input is the same
+    /// single-line review gate as every other command entry; editing a
+    /// verified proposal downgrades the primary action from "Run verified
+    /// command" to "Insert for review".
+    fn correction_card(&self) -> Option<Element<'_, Message>> {
+        let session_id = self.sessions.get(self.active).map(|sess| sess.id)?;
+        let session = self.command_corrections.get(session_id)?;
+        let proposal = session.proposal.as_ref()?;
+        let direct_run = command_correction::verified_run_allowed(
+            proposal.evidence,
+            &proposal.command,
+            &proposal.draft,
+        );
+
+        let header = row![
+            text(proposal.evidence.title()).size(14),
+            Space::new().width(Length::Fill),
+            text(format!(
+                "exit {} · {}",
+                session.exit_code,
+                proposal.evidence.label()
+            ))
+            .size(11)
+            .style(text::secondary),
+            button(text("✕").size(12))
+                .style(button::secondary)
+                .on_press(Message::CommandCorrectionDismiss),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let description = text(format!(
+            "{}\nFailed command: {}",
+            proposal.message,
+            command_correction::compact_one_line(&session.original_command, 160)
+        ))
+        .size(12)
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
+
+        let draft = text_input("corrected command", &proposal.draft)
+            .id(CORRECTION_INPUT_ID.clone())
+            .on_input(Message::CommandCorrectionInput)
+            .on_submit(Message::CommandCorrectionAccept)
+            .size(13)
+            .font(iced::Font::MONOSPACE);
+
+        let actions = row![
+            button(
+                text(if direct_run {
+                    "Run verified command"
+                } else {
+                    "Insert for review"
+                })
+                .size(12)
+            )
+            .style(if direct_run {
+                button::primary
+            } else {
+                button::secondary
+            })
+            .on_press(Message::CommandCorrectionAccept),
+            button(text("Dismiss").size(12))
+                .style(button::secondary)
+                .on_press(Message::CommandCorrectionDismiss),
+        ]
+        .spacing(6);
+
+        let mut card = column![header, description, draft, actions].spacing(8);
+        if let Some(feedback) = proposal.feedback.as_deref() {
+            card = card.push(text(feedback.to_string()).size(11).style(text::danger));
+        }
+
+        let inner = container(card)
+            .width(Length::Fixed(560.0))
+            .padding(12)
+            .style(container::dark);
+        Some(
+            container(inner)
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill)
+                .padding(10)
+                .into(),
+        )
     }
 
     fn subscription(&self) -> Subscription<Message> {
