@@ -1251,6 +1251,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "cosmic-text",
  "crossbeam-channel",
  "dirs",
  "env_logger",

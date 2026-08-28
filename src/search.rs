@@ -1,7 +1,8 @@
 /// 搜索功能模块
-use crate::terminal::{Color, TerminalCell};
+use crate::terminal::{Color, SearchLine, TerminalCell};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
@@ -237,7 +238,8 @@ impl SearchEngine {
         regex_cache: &mut Option<RegexCache>,
     ) -> (Vec<SearchMatch>, Option<String>) {
         Self::search_lines(
-            grid.iter().map(|line| Cow::Borrowed(line.as_slice())),
+            grid.iter()
+                .map(|line| SearchLine::Cells(Cow::Borrowed(line.as_slice()))),
             query,
             use_regex,
             case_sensitive,
@@ -246,10 +248,11 @@ impl SearchEngine {
     }
 
     /// Search an arbitrary terminal buffer without first cloning every row.
-    /// Callers can mix borrowed live-grid rows with owned decompressed history
-    /// rows through [`Cow`]. Match row indices follow iterator order.
+    /// Plain scrollback rows arrive as borrowed text with an identity
+    /// character→column map; everything else arrives as cells. Match row
+    /// indices follow iterator order.
     pub fn search_lines<'a>(
-        lines: impl IntoIterator<Item = Cow<'a, [TerminalCell]>>,
+        lines: impl IntoIterator<Item = SearchLine<'a>>,
         query: &str,
         use_regex: bool,
         case_sensitive: bool,
@@ -269,7 +272,7 @@ impl SearchEngine {
 
     /// 普通文本搜索
     fn search_plaintext<'a>(
-        lines: impl IntoIterator<Item = Cow<'a, [TerminalCell]>>,
+        lines: impl IntoIterator<Item = SearchLine<'a>>,
         query: &str,
         case_sensitive: bool,
     ) -> (Vec<SearchMatch>, bool) {
@@ -284,44 +287,91 @@ impl SearchEngine {
 
         let query_chars = search_query.chars().count();
         'lines: for (line_idx, line) in lines.into_iter().enumerate() {
-            let (search_line, columns) = Self::line_text_and_columns(&line, !case_sensitive);
-
-            let mut start_byte = 0;
-            while let Some(rel) = search_line[start_byte..].find(&search_query) {
-                let match_byte = start_byte + rel;
-                let char_start = search_line[..match_byte].chars().count();
-                let char_end = char_start + query_chars;
-                if let (Some(&(col_start, _)), Some(&(_, col_end))) = (
-                    columns.get(char_start),
-                    columns.get(char_end.saturating_sub(1)),
-                ) {
-                    matches.push(SearchMatch {
-                        line: line_idx,
-                        col_start,
-                        col_end,
-                    });
-                    if matches.len() >= MAX_SEARCH_MATCHES {
-                        truncated = true;
-                        break 'lines;
-                    }
+            let hit_cap = match line {
+                SearchLine::Text(text) if case_sensitive => Self::collect_plaintext_line(
+                    line_idx,
+                    text,
+                    &search_query,
+                    query_chars,
+                    Self::identity_span,
+                    &mut matches,
+                ),
+                SearchLine::Text(text) => {
+                    let (folded, columns) = Self::fold_plain_text(text);
+                    Self::collect_plaintext_line(
+                        line_idx,
+                        &folded,
+                        &search_query,
+                        query_chars,
+                        |char_index| columns.get(char_index).copied(),
+                        &mut matches,
+                    )
                 }
-                // Advance one char past the match start, staying on a UTF-8
-                // boundary (a raw +1 would panic inside a multi-byte char).
-                let step = search_line[match_byte..]
-                    .chars()
-                    .next()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(1);
-                start_byte = match_byte + step;
+                SearchLine::Cells(cells) => {
+                    let (search_line, columns) =
+                        Self::line_text_and_columns(&cells, !case_sensitive);
+                    Self::collect_plaintext_line(
+                        line_idx,
+                        &search_line,
+                        &search_query,
+                        query_chars,
+                        |char_index| columns.get(char_index).copied(),
+                        &mut matches,
+                    )
+                }
+            };
+            if hit_cap {
+                truncated = true;
+                break 'lines;
             }
         }
 
         (matches, truncated)
     }
 
+    /// Find every occurrence of `search_query` in one row's text, mapping the
+    /// matched character span back to terminal cells through `span_at`.
+    /// Returns true when the match cap stopped the scan inside this row.
+    fn collect_plaintext_line(
+        line_idx: usize,
+        search_line: &str,
+        search_query: &str,
+        query_chars: usize,
+        mut span_at: impl FnMut(usize) -> Option<(usize, usize)>,
+        matches: &mut Vec<SearchMatch>,
+    ) -> bool {
+        let mut start_byte = 0;
+        while let Some(rel) = search_line[start_byte..].find(search_query) {
+            let match_byte = start_byte + rel;
+            let char_start = search_line[..match_byte].chars().count();
+            let char_end = char_start + query_chars;
+            if let (Some((col_start, _)), Some((_, col_end))) =
+                (span_at(char_start), span_at(char_end.saturating_sub(1)))
+            {
+                matches.push(SearchMatch {
+                    line: line_idx,
+                    col_start,
+                    col_end,
+                });
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    return true;
+                }
+            }
+            // Advance one char past the match start, staying on a UTF-8
+            // boundary (a raw +1 would panic inside a multi-byte char).
+            let step = search_line[match_byte..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            start_byte = match_byte + step;
+        }
+        false
+    }
+
     /// 正则表达式搜索
     fn search_regex<'a>(
-        lines: impl IntoIterator<Item = Cow<'a, [TerminalCell]>>,
+        lines: impl IntoIterator<Item = SearchLine<'a>>,
         pattern: &str,
         case_sensitive: bool,
         cache: &mut Option<RegexCache>,
@@ -358,32 +408,87 @@ impl SearchEngine {
         let mut truncated = false;
 
         'lines: for (line_idx, line) in lines.into_iter().enumerate() {
-            let (line_str, columns) = Self::line_text_and_columns(&line, false);
-
-            for mat in regex.find_iter(&line_str) {
-                if mat.is_empty() {
-                    continue;
+            let hit_cap = match line {
+                SearchLine::Text(text) => Self::collect_regex_line(
+                    line_idx,
+                    text,
+                    regex,
+                    Self::identity_span,
+                    &mut matches,
+                ),
+                SearchLine::Cells(cells) => {
+                    let (line_str, columns) = Self::line_text_and_columns(&cells, false);
+                    Self::collect_regex_line(
+                        line_idx,
+                        &line_str,
+                        regex,
+                        |char_index| columns.get(char_index).copied(),
+                        &mut matches,
+                    )
                 }
-                let char_start = line_str[..mat.start()].chars().count();
-                let char_end = line_str[..mat.end()].chars().count();
-                if let (Some(&(col_start, _)), Some(&(_, col_end))) = (
-                    columns.get(char_start),
-                    columns.get(char_end.saturating_sub(1)),
-                ) {
-                    matches.push(SearchMatch {
-                        line: line_idx,
-                        col_start,
-                        col_end,
-                    });
-                    if matches.len() >= MAX_SEARCH_MATCHES {
-                        truncated = true;
-                        break 'lines;
-                    }
-                }
+            };
+            if hit_cap {
+                truncated = true;
+                break 'lines;
             }
         }
 
         (matches, truncated.then(|| MATCH_LIMIT_MESSAGE.to_string()))
+    }
+
+    /// Find every regex match in one row's text, mapping the matched
+    /// character span back to terminal cells through `span_at`. Returns true
+    /// when the match cap stopped the scan inside this row.
+    fn collect_regex_line(
+        line_idx: usize,
+        line_str: &str,
+        regex: &Regex,
+        mut span_at: impl FnMut(usize) -> Option<(usize, usize)>,
+        matches: &mut Vec<SearchMatch>,
+    ) -> bool {
+        for mat in regex.find_iter(line_str) {
+            if mat.is_empty() {
+                continue;
+            }
+            let char_start = line_str[..mat.start()].chars().count();
+            let char_end = line_str[..mat.end()].chars().count();
+            if let (Some((col_start, _)), Some((_, col_end))) =
+                (span_at(char_start), span_at(char_end.saturating_sub(1)))
+            {
+                matches.push(SearchMatch {
+                    line: line_idx,
+                    col_start,
+                    col_end,
+                });
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Character→cell span for borrowed plain rows. Their cells are narrow
+    /// by construction (see `ScrollbackLine::search_text`), so the character
+    /// index is the terminal column; match-derived indices are always in
+    /// range, keeping this equivalent to the explicit column vectors below.
+    fn identity_span(char_index: usize) -> Option<(usize, usize)> {
+        Some((char_index, char_index + 1))
+    }
+
+    /// Case-fold borrowed plain text, keeping the identity character→column
+    /// map: fold expansions (e.g. `İ` → `i` + combining dot) still point at
+    /// their source cell, exactly like the per-cell fold below.
+    fn fold_plain_text(text: &str) -> (String, Vec<(usize, usize)>) {
+        let mut folded = String::with_capacity(text.len());
+        let mut columns = Vec::with_capacity(text.len());
+        for (column, ch) in text.chars().enumerate() {
+            for lower in ch.to_lowercase() {
+                folded.push(lower);
+                columns.push((column, column + 1));
+            }
+        }
+        (folded, columns)
     }
 
     /// Build searchable text and a character-to-cell mapping. Wide-character
@@ -543,5 +648,141 @@ mod tests {
 
         assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
         assert_eq!(warning.as_deref(), Some(MATCH_LIMIT_MESSAGE));
+    }
+
+    #[test]
+    fn borrowed_plain_text_uses_identity_columns() {
+        let lines = vec![SearchLine::Text("alpha beta alpha")];
+        let mut cache = None;
+
+        let (matches, error) =
+            SearchEngine::search_lines(lines, "alpha", false, true, &mut cache);
+
+        assert!(error.is_none());
+        assert_eq!(
+            matches,
+            vec![
+                SearchMatch {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 5,
+                },
+                SearchMatch {
+                    line: 0,
+                    col_start: 11,
+                    col_end: 16,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn borrowed_plain_text_case_fold_keeps_source_columns() {
+        // `İ` folds to `i` + combining dot: the expansion still maps back to
+        // its source cell, exactly like the per-cell fold.
+        let lines = vec![SearchLine::Text("İB")];
+        let mut cache = None;
+
+        let (matches, _) =
+            SearchEngine::search_lines(lines, "i\u{307}b", false, false, &mut cache);
+
+        assert_eq!(matches[0].col_start, 0);
+        assert_eq!(matches[0].col_end, 2);
+    }
+
+    #[test]
+    fn mixed_borrowed_and_cell_rows_keep_line_indices_and_wide_spans() {
+        let mut wide = vec![TerminalCell::default(); 4];
+        wide[0].character = '中';
+        wide[0].flags.set_wide(true);
+        wide[1].flags.set_wide_continuation(true);
+        wide[2].character = 'x';
+        let lines = vec![
+            SearchLine::Text("find me"),
+            SearchLine::Cells(Cow::Borrowed(wide.as_slice())),
+            SearchLine::Text("find again"),
+        ];
+        let mut cache = None;
+
+        let (matches, _) = SearchEngine::search_lines(lines, "find", false, true, &mut cache);
+        assert_eq!(
+            matches,
+            vec![
+                SearchMatch {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 4,
+                },
+                SearchMatch {
+                    line: 2,
+                    col_start: 0,
+                    col_end: 4,
+                },
+            ]
+        );
+
+        // A match starting on a wide character spans its continuation cell,
+        // while the borrowed rows around it keep identity columns.
+        let mut wide = vec![TerminalCell::default(); 4];
+        wide[0].character = '中';
+        wide[0].flags.set_wide(true);
+        wide[1].flags.set_wide_continuation(true);
+        wide[2].character = 'x';
+        let lines = vec![
+            SearchLine::Text("top"),
+            SearchLine::Cells(Cow::Borrowed(wide.as_slice())),
+        ];
+        let (matches, _) = SearchEngine::search_lines(lines, "中x", false, true, &mut cache);
+        assert_eq!(
+            matches,
+            vec![SearchMatch {
+                line: 1,
+                col_start: 0,
+                col_end: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn borrowed_text_match_count_is_bounded() {
+        let line = "A".repeat(MAX_SEARCH_MATCHES + 1000);
+        let lines = vec![SearchLine::Text(line.as_str())];
+        let mut cache = None;
+
+        let (matches, warning) =
+            SearchEngine::search_lines(lines, "A", false, true, &mut cache);
+
+        assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
+        assert_eq!(warning.as_deref(), Some(MATCH_LIMIT_MESSAGE));
+    }
+
+    #[test]
+    fn regex_search_borrows_plain_text_with_identity_columns() {
+        let lines = vec![
+            SearchLine::Text("error: first"),
+            SearchLine::Text("no problem"),
+            SearchLine::Text("error: second"),
+        ];
+        let mut cache = None;
+
+        let (matches, error) =
+            SearchEngine::search_lines(lines, r"error: \w+", true, true, &mut cache);
+
+        assert!(error.is_none());
+        assert_eq!(
+            matches,
+            vec![
+                SearchMatch {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 12,
+                },
+                SearchMatch {
+                    line: 2,
+                    col_start: 0,
+                    col_end: 13,
+                },
+            ]
+        );
     }
 }

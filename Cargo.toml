@@ -15,6 +15,9 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "wgpu"] }
+# Direct handle on the shaper iced embeds (same locked version), used to
+# measure the primary font's real advance for the terminal grid.
+cosmic-text = "0.15"
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
 jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "1f5f0fbcfd91a084da9216392fe5ab26a5994adc" }

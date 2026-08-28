@@ -632,6 +632,10 @@ pub struct Metrics {
     pub cell_h: f32,
     pub padding: f32,
     pub block_gutter: bool,
+    /// `cell_w` is the primary font's real measured advance, so a run of
+    /// primary-font narrow ASCII glyphs shaped together lands exactly on the
+    /// grid. False with the heuristic width: glyphs must be emitted per cell.
+    pub mono_advance_exact: bool,
 }
 
 impl Metrics {
@@ -644,7 +648,28 @@ impl Metrics {
             cell_h,
             padding,
             block_gutter,
+            mono_advance_exact: false,
         }
+    }
+
+    /// Metrics whose cell width is the primary font's measured advance
+    /// (cosmic-text, the same shaper iced renders with), which enables
+    /// run-batched glyph emission. Falls back to the heuristic width — and
+    /// per-cell emission — whenever the font cannot be measured or is not
+    /// uniformly monospaced across printable ASCII.
+    pub fn with_font(
+        font: iced::Font,
+        font_size: f32,
+        line_spacing: f32,
+        padding: f32,
+        block_gutter: bool,
+    ) -> Self {
+        let mut metrics = Self::new(font_size, line_spacing, padding, block_gutter);
+        if let Some(advance) = measure_mono_ascii_advance(font, font_size) {
+            metrics.cell_w = advance;
+            metrics.mono_advance_exact = true;
+        }
+        metrics
     }
 
     fn block_gutter_width(&self) -> f32 {
@@ -1065,6 +1090,108 @@ fn should_use_cjk_fallback_font(ch: char) -> bool {
     )
 }
 
+/// The primary font's advance width for printable ASCII at `font_size`,
+/// measured through cosmic-text — the same library and version iced's
+/// renderers shape with. Returns `None` when the font cannot be resolved or
+/// the per-glyph advances are not exactly uniform: the caller then keeps the
+/// heuristic cell width and per-cell glyph emission, so a mismatched
+/// measurement can never shift the grid.
+fn measure_mono_ascii_advance(font: iced::Font, font_size: f32) -> Option<f32> {
+    use cosmic_text::{Attrs, Buffer, Family, Metrics as TextMetrics, Shaping, Stretch, Style, Weight};
+
+    if !(font_size.is_finite() && font_size > 0.0) {
+        return None;
+    }
+    let family = match font.family {
+        iced::font::Family::Name(name) => Family::Name(name),
+        iced::font::Family::Serif => Family::Serif,
+        iced::font::Family::SansSerif => Family::SansSerif,
+        iced::font::Family::Cursive => Family::Cursive,
+        iced::font::Family::Fantasy => Family::Fantasy,
+        iced::font::Family::Monospace => Family::Monospace,
+    };
+    let weight = match font.weight {
+        iced::font::Weight::Thin => 100,
+        iced::font::Weight::ExtraLight => 200,
+        iced::font::Weight::Light => 300,
+        iced::font::Weight::Normal => 400,
+        iced::font::Weight::Medium => 500,
+        iced::font::Weight::Semibold => 600,
+        iced::font::Weight::Bold => 700,
+        iced::font::Weight::ExtraBold => 800,
+        iced::font::Weight::Black => 900,
+    };
+    let stretch = match font.stretch {
+        iced::font::Stretch::UltraCondensed => Stretch::UltraCondensed,
+        iced::font::Stretch::ExtraCondensed => Stretch::ExtraCondensed,
+        iced::font::Stretch::Condensed => Stretch::Condensed,
+        iced::font::Stretch::SemiCondensed => Stretch::SemiCondensed,
+        iced::font::Stretch::Normal => Stretch::Normal,
+        iced::font::Stretch::SemiExpanded => Stretch::SemiExpanded,
+        iced::font::Stretch::Expanded => Stretch::Expanded,
+        iced::font::Stretch::ExtraExpanded => Stretch::ExtraExpanded,
+        iced::font::Stretch::UltraExpanded => Stretch::UltraExpanded,
+    };
+    let style = match font.style {
+        iced::font::Style::Normal => Style::Normal,
+        iced::font::Style::Italic => Style::Italic,
+        iced::font::Style::Oblique => Style::Oblique,
+    };
+
+    thread_local! {
+        // FontSystem::new scans the system font database once; reuse it
+        // across font-size zooms. It lives on the UI thread, like iced's own.
+        static FONT_SYSTEM: std::cell::RefCell<Option<cosmic_text::FontSystem>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    FONT_SYSTEM.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let font_system = slot.get_or_insert_with(cosmic_text::FontSystem::new);
+        let mut buffer = Buffer::new(font_system, TextMetrics::new(font_size, font_size));
+        buffer.set_size(font_system, Some(4096.0), Some(font_size * 2.0));
+        let attrs = Attrs::new()
+            .family(family)
+            .weight(Weight(weight))
+            .stretch(stretch)
+            .style(style);
+        // Printable ASCII in one Basic-shaping pass: advances there are raw
+        // hmtx advances (no kerning or ligatures), identical to what iced's
+        // Basic shaper produces for the same run.
+        const PROBE: &str = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        buffer.set_text(font_system, PROBE, &attrs, Shaping::Basic, None);
+        buffer.shape_until_scroll(font_system, false);
+        let mut advance: Option<f32> = None;
+        let mut glyphs = 0usize;
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                if !(glyph.w.is_finite() && glyph.w > 0.0) {
+                    return None;
+                }
+                if advance.is_some_and(|a| a != glyph.w) {
+                    return None;
+                }
+                advance = Some(glyph.w);
+                glyphs += 1;
+            }
+        }
+        let advance = advance.filter(|_| glyphs == PROBE.chars().count())?;
+        // Plausibility bound: a real monospace advance sits well inside
+        // [0.3, 1.0] of the em size. Anything else means a different face was
+        // resolved than the renderer will use; do not let it shift the grid.
+        (advance >= font_size * 0.3 && advance <= font_size).then_some(advance)
+    })
+}
+
+/// One narrow glyph may join the pending run only when the cell width IS the
+/// primary font's measured advance: a shared shape pass then lands every
+/// glyph exactly on its column. Fallback fonts (italics included) and
+/// non-ASCII cells keep per-cell emission. Selection and inverse-video enter
+/// through `fg`, so run-flush on `fg` change covers those boundaries;
+/// backgrounds are painted per cell in their own pass and never break a run.
+fn glyph_joins_run(metrics: Metrics, glyph: char, glyph_font: iced::Font, primary: iced::Font) -> bool {
+    metrics.mono_advance_exact && glyph.is_ascii() && glyph_font == primary
+}
+
 fn terminal_glyph_font(
     ch: char,
     primary: iced::Font,
@@ -1119,8 +1246,8 @@ mod tests {
     use super::{
         app_mouse_surface_eligible, block_card_geometry, block_card_hover_contains,
         block_card_segments, block_card_shadow, block_card_stripe_bounds, block_card_visual,
-        block_mouse_action, clipped_block_card_border_bounds, ctrl_link_eligible, glyph_shaping,
-        link_surface_eligible, owns_mouse_release, should_use_cjk_fallback_font,
+        block_mouse_action, clipped_block_card_border_bounds, ctrl_link_eligible, glyph_joins_run,
+        glyph_shaping, link_surface_eligible, owns_mouse_release, should_use_cjk_fallback_font,
         should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
         should_use_symbol_fallback_font, stable_summary_activation, terminal_glyph_font,
         BlockCardKind, BlockCardSegment, BlockMouseAction, BlockPaintRow, CollapsedSummaryPaint,
@@ -1632,6 +1759,46 @@ mod tests {
         assert_eq!(font_for('𝟏', true), math);
         assert_eq!(font_for('\u{e0b0}', true), nerd);
         assert_eq!(font_for('A', true), italic_primary);
+    }
+
+    #[test]
+    fn glyph_runs_require_measured_advance_primary_font_and_ascii() {
+        let mut metrics = Metrics::new(10.0, 1.0, 2.0, false);
+        let primary = iced::Font::with_name("Primary");
+        let fallback = iced::Font::with_name("Fallback");
+        let italic_primary = iced::Font {
+            style: iced::font::Style::Italic,
+            ..primary
+        };
+
+        // Heuristic width: nothing batches (today's per-cell behavior).
+        assert!(!metrics.mono_advance_exact);
+        assert!(!glyph_joins_run(metrics, 'A', primary, primary));
+
+        // Measured width: only primary-font narrow ASCII joins a run.
+        metrics.mono_advance_exact = true;
+        assert!(glyph_joins_run(metrics, 'A', primary, primary));
+        assert!(glyph_joins_run(metrics, '~', primary, primary));
+        assert!(!glyph_joins_run(metrics, 'A', fallback, primary));
+        assert!(!glyph_joins_run(metrics, 'A', italic_primary, primary));
+        assert!(!glyph_joins_run(metrics, '中', primary, primary));
+        assert!(!glyph_joins_run(metrics, 'é', primary, primary));
+    }
+
+    #[test]
+    fn with_font_keeps_a_sane_cell_width_in_any_environment() {
+        // On a fontless system the measurement returns None and the metrics
+        // keep the heuristic width; on a normal desktop the real advance is
+        // adopted. Either way the grid must stay sane.
+        let heuristic = Metrics::new(10.0, 1.0, 2.0, false);
+        let measured = Metrics::with_font(iced::Font::MONOSPACE, 10.0, 1.0, 2.0, false);
+        assert!(measured.cell_w >= 1.0);
+        assert_eq!(measured.cell_h, heuristic.cell_h);
+        if !measured.mono_advance_exact {
+            assert_eq!(measured.cell_w, heuristic.cell_w);
+        } else {
+            assert!(measured.cell_w >= 3.0 && measured.cell_w <= 10.0);
+        }
     }
 }
 
@@ -2276,10 +2443,13 @@ where
                 }
             }
 
-            // Glyphs + decorations. Shape each narrow glyph as a one-cell run at
-            // its exact grid origin. A font's measured advance can differ slightly
-            // from `cell_w`; shaping multiple cells together would accumulate that
-            // difference and make later glyphs drift away from the terminal grid.
+            // Glyphs + decorations. When `cell_w` is the primary font's
+            // measured advance (`Metrics::with_font`), consecutive same-font/
+            // same-fg narrow ASCII glyphs shape as one run that lands exactly
+            // on the grid; everything else stays one cell per fill_text. With
+            // the heuristic width a font's real advance can differ slightly
+            // from `cell_w`; shaping multiple cells together would accumulate
+            // that difference and make later glyphs drift away from the grid.
             let font = self.mono;
             let font_size = self.metrics.font_size;
             // Cells covered by the active selection draw their glyphs in the
@@ -2381,13 +2551,44 @@ where
                 let printable = glyph != ' ' && glyph != '\0' && !blink_hidden;
 
                 if printable && !is_wide {
-                    // Start a one-cell run. The defensive flush keeps this correct
-                    // if a future branch ever leaves a run pending.
-                    if run_len != 0
-                        && (fg != run_fg
-                            || glyph_font != run_font
-                            || col_idx != run_start + run_len)
-                    {
+                    if glyph_joins_run(self.metrics, glyph, glyph_font, font) {
+                        // Accumulate into the pending run; flush at any fg or
+                        // column-continuity boundary. The font boundary is
+                        // covered by `glyph_joins_run` itself.
+                        if run_len != 0 && (fg != run_fg || col_idx != run_start + run_len) {
+                            emit_run(
+                                renderer,
+                                &mut run_text,
+                                &mut run_len,
+                                run_start,
+                                run_fg,
+                                run_font,
+                            );
+                        }
+                        if run_len == 0 {
+                            run_start = col_idx;
+                            run_fg = fg;
+                            run_font = glyph_font;
+                        }
+                        run_text.push(glyph);
+                        run_len += 1;
+                    } else {
+                        // Fallback fonts, italics and non-ASCII cells keep
+                        // per-cell emission: flush any pending batch, then
+                        // draw this cell as a one-cell run exactly as before.
+                        emit_run(
+                            renderer,
+                            &mut run_text,
+                            &mut run_len,
+                            run_start,
+                            run_fg,
+                            run_font,
+                        );
+                        run_start = col_idx;
+                        run_fg = fg;
+                        run_font = glyph_font;
+                        run_text.push(glyph);
+                        run_len += 1;
                         emit_run(
                             renderer,
                             &mut run_text,
@@ -2397,21 +2598,6 @@ where
                             run_font,
                         );
                     }
-                    if run_len == 0 {
-                        run_start = col_idx;
-                        run_fg = fg;
-                        run_font = glyph_font;
-                    }
-                    run_text.push(glyph);
-                    run_len += 1;
-                    emit_run(
-                        renderer,
-                        &mut run_text,
-                        &mut run_len,
-                        run_start,
-                        run_fg,
-                        run_font,
-                    );
                 } else {
                     // Spaces and wide glyphs end any pending run; wide glyphs are
                     // drawn individually, centered over their two-cell span.

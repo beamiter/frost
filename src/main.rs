@@ -3236,6 +3236,12 @@ struct Session {
     /// Pane-local bookmarks for important finalized blocks. Reconciled against
     /// the bounded zone deque before paint/navigation and cleared with blocks.
     block_bookmarks: block_mode::BlockBookmarks,
+    /// Frame cache for the block-chrome builders (paint rows + scrollbar
+    /// markers). The view pass is `&self`, so the cache lives behind a
+    /// `RefCell`; it is only borrowed inside `App::block_chrome` for one key
+    /// comparison or refill. The key covers every builder input, so a hit is
+    /// identical to a fresh build.
+    block_chrome_cache: std::cell::RefCell<Option<BlockChromeCache>>,
     /// Non-blocking PTY writes may be partial. Keep the remainder here and let a
     /// short-lived timer drain it without ever stalling iced's UI thread.
     write_queue: std::collections::VecDeque<PtyWriteChunk>,
@@ -3249,6 +3255,33 @@ struct Session {
     /// automatic Files follower targets SSH typed inside an ordinary local
     /// shell and must not open a duplicate sidecar for managed remote tabs.
     managed_remote: bool,
+}
+
+/// Cached output of the per-frame block-chrome builders, stored per session.
+struct BlockChromeCache {
+    key: BlockChromeKey,
+    paint: Vec<terminal_view::BlockPaintRow>,
+    failed_markers: Vec<f32>,
+    bookmark_markers: Vec<f32>,
+}
+
+/// Complete input identity of the block-chrome builders. Everything
+/// `App::build_block_paint_rows` and the marker builders read is either a
+/// field here or rides on one (zone data and row identities move with the
+/// projection's source revisions).
+struct BlockChromeKey {
+    projection: terminal::ProjectionKey,
+    /// Theme RGBs the chrome consumes: ANSI 1/2/3 outcome stripes + the
+    /// accent. Keyed on the data rather than the theme name so a config
+    /// reload with an unchanged palette still hits.
+    theme_rgbs: [[u8; 3]; 4],
+    /// Badge-inset input (`metrics.cell_w`); font changes must repaint.
+    cell_w_bits: u32,
+    selection: block_mode::BlockSelection,
+    bookmarks: block_mode::BlockBookmarks,
+    /// Live `▶ elapsed` chip text; a change here alone must repaint the
+    /// chip, and it is the only wall-clock input of the builders.
+    running_badge: Option<String>,
 }
 
 fn agent_prompt_status_with_foreground(
@@ -3376,6 +3409,7 @@ impl Session {
             last_duration_ms: None,
             block_selection: block_mode::BlockSelection::default(),
             block_bookmarks: block_mode::BlockBookmarks::default(),
+            block_chrome_cache: std::cell::RefCell::new(None),
             write_queue: std::collections::VecDeque::new(),
             write_queue_offset: 0,
             queued_write_bytes: 0,
@@ -4190,7 +4224,9 @@ impl Frost {
             .map(|t| format!("{t}"))
             .unwrap_or_default();
         let theme = Theme::get_theme(&config.theme).unwrap_or_default();
-        let metrics = Metrics::new(
+        let mono = resolve_mono_font(&config.font_family);
+        let metrics = Metrics::with_font(
+            mono,
             config.font_size,
             config.line_spacing,
             config.padding,
@@ -4210,7 +4246,6 @@ impl Frost {
             eprintln!("[SessionPersistence] Another instance is running, starting fresh");
         }
 
-        let mono = resolve_mono_font(&config.font_family);
         let cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
         let symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
         let math_symbol = resolve_optional_font(Config::math_symbol_font_family());
@@ -4443,7 +4478,8 @@ impl Frost {
         self.symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
         self.math_symbol = resolve_optional_font(Config::math_symbol_font_family());
         self.nerd_symbol = resolve_optional_font(Config::nerd_symbol_font_family());
-        self.metrics = Metrics::new(
+        self.metrics = Metrics::with_font(
+            self.mono,
             self.effective_font_size(),
             self.config.line_spacing,
             self.config.padding,
@@ -9703,6 +9739,14 @@ impl Frost {
 
     /// Re-run the search over the active session's full scrollback + live grid.
     /// Match rows remain absolute, so scrolling does not invalidate them.
+    ///
+    /// This stays a full re-scan rather than an incremental tail scan on
+    /// purpose: PTY output can rewrite already-searched grid rows in place
+    /// (`\r` progress lines, cursor-addressed redraws), and no cheap revision
+    /// signal distinguishes pure appends from those rewrites, so a tail-only
+    /// refresh could leave stale matches behind indefinitely. The 300 ms
+    /// `SearchRefreshTick` debounce plus the zero-copy `search_lines` text
+    /// keep the full refresh cheap enough.
     fn recompute_search(&mut self) {
         self.search_dirty = false;
         if !self.search.is_open {
@@ -16311,12 +16355,79 @@ impl Frost {
         Some((candidates[index], badge, elapsed_ms))
     }
 
+    /// Block chrome for `sess`'s visible rows, cached per session: the
+    /// builders below rebuild ~8 collections on every `pane_view` pass —
+    /// every PTY batch during streaming plus every blink/mouse/elapsed
+    /// tick — while their inputs change far less often. The key covers
+    /// every input, so a cache hit is identical to a fresh build. One
+    /// approximation: the finished-clock badge's local timezone offset is
+    /// treated as run-constant, so a mid-session tz change shows up only
+    /// with the next key change.
+    fn block_chrome(
+        &self,
+        sess: &Session,
+    ) -> (Vec<terminal_view::BlockPaintRow>, Vec<f32>, Vec<f32>) {
+        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let projection_key = sess.projection.key();
+        let theme_rgbs = [
+            self.theme.terminal.ansi_colors[1],
+            self.theme.terminal.ansi_colors[2],
+            self.theme.terminal.ansi_colors[3],
+            self.theme.tabbar.active_border,
+        ];
+        let cell_w_bits = self.metrics.cell_w.to_bits();
+        let running_badge = sess
+            .terminal
+            .running_duration_ms()
+            .map(block_mode::running_badge_text);
+        {
+            let cache = sess.block_chrome_cache.borrow();
+            if let Some(cached) = cache.as_ref() {
+                let key = &cached.key;
+                if key.projection == projection_key
+                    && key.theme_rgbs == theme_rgbs
+                    && key.cell_w_bits == cell_w_bits
+                    && key.selection == sess.block_selection
+                    && key.bookmarks == sess.block_bookmarks
+                    && key.running_badge == running_badge
+                {
+                    return (
+                        cached.paint.clone(),
+                        cached.failed_markers.clone(),
+                        cached.bookmark_markers.clone(),
+                    );
+                }
+            }
+        }
+        let paint = self.build_block_paint_rows(sess);
+        let failed_markers = self.block_marker_fractions(sess);
+        let bookmark_markers = self.block_bookmark_marker_fractions(sess);
+        *sess.block_chrome_cache.borrow_mut() = Some(BlockChromeCache {
+            key: BlockChromeKey {
+                projection: projection_key,
+                theme_rgbs,
+                cell_w_bits,
+                selection: sess.block_selection.clone(),
+                bookmarks: sess.block_bookmarks.clone(),
+                running_badge,
+            },
+            paint: paint.clone(),
+            failed_markers: failed_markers.clone(),
+            bookmark_markers: bookmark_markers.clone(),
+        });
+        (paint, failed_markers, bookmark_markers)
+    }
+
     /// Block-mode metadata for each of `sess`'s visible rows: card grouping,
     /// real (not viewport-clipped) edges, state/tint, outcome stripes and
     /// first-row badges. Raw zone anchors enter the snapshot only through exact
     /// projected origins; structural padding and stale rows fail closed.
     /// Empty when the feature is off or a full-screen app owns the grid.
-    fn block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+    ///
+    /// Callers go through [`Self::block_chrome`], which caches this build.
+    fn build_block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
         use block_mode::BlockOutcome;
 
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
@@ -16557,9 +16668,9 @@ impl Frost {
 
     /// Scrollbar-track fractions of each FAILED zone's first row, for the red
     /// failure markers painted along the scrollbar. Same gates as
-    /// [`Self::block_paint_rows`] (feature off / alt screen → empty), and the
+    /// [`Self::build_block_paint_rows`] (feature off / alt screen → empty), and the
     /// same red as the Failed stripe. The 256-zone cap keeps this scan
-    /// trivial.
+    /// trivial. Called only on a [`Self::block_chrome`] cache miss.
     fn block_marker_fractions(&self, sess: &Session) -> Vec<f32> {
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
@@ -16585,6 +16696,8 @@ impl Frost {
         block_mode::marker_fractions(&failed, total)
     }
 
+    /// Bookmark-notch scrollbar fractions for bookmarked zones. Called only
+    /// on a [`Self::block_chrome`] cache miss.
     fn block_bookmark_marker_fractions(&self, sess: &Session) -> Vec<f32> {
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
@@ -16655,7 +16768,7 @@ impl Frost {
         } else {
             Vec::new()
         };
-        let blocks = self.block_paint_rows(sess);
+        let (blocks, block_markers, block_bookmark_markers) = self.block_chrome(sess);
         let app_mouse_full_grid = app_mouse_uses_full_grid(
             self.config.block_mode,
             sess.terminal.is_alt_buffer_active(),
@@ -16691,8 +16804,8 @@ impl Frost {
         .blocks(blocks)
         .app_mouse_full_grid(app_mouse_full_grid)
         .block_compact(self.config.block_compact)
-        .block_markers(self.block_marker_fractions(sess))
-        .block_bookmark_markers(self.block_bookmark_marker_fractions(sess))
+        .block_markers(block_markers)
+        .block_bookmark_markers(block_bookmark_markers)
         .links(links, sess.projection.view_revision())
         .dynamic_palette(&sess.terminal.dynamic_palette)
         .dynamic_defaults(
@@ -20481,8 +20594,11 @@ impl Frost {
             );
         }
         if self.search.is_open && self.search_dirty {
+            // Live search refreshes are debounced to 300 ms (ember's
+            // LIVE_SEARCH_REFRESH_INTERVAL) instead of re-running the
+            // full-buffer search every 50 ms during streaming output.
             subs.push(
-                iced::time::every(std::time::Duration::from_millis(50))
+                iced::time::every(std::time::Duration::from_millis(300))
                     .map(|_| Message::SearchRefreshTick),
             );
         }

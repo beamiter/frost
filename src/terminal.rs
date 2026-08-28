@@ -584,6 +584,14 @@ enum CompressedLineData {
     Encoded(Vec<u8>),
 }
 
+/// One searchable buffer row: either borrowed narrow text with an identity
+/// character→column map (the common all-default-attributes scrollback row),
+/// or full cell data that still needs the wide/continuation-aware mapping.
+pub enum SearchLine<'a> {
+    Text(&'a str),
+    Cells(Cow<'a, [TerminalCell]>),
+}
+
 /// Allocation-free geometry needed to plan a projected history document.
 ///
 /// `active_len` is exactly the prefix retained by P0's
@@ -741,6 +749,19 @@ impl ScrollbackLine {
                 cells
             }
             CompressedLineData::Encoded(data) => Self::decode_cells(data, self.cols as usize),
+        }
+    }
+
+    /// Searchable text for this retained row without materializing cells.
+    /// `Plain` rows are borrowed directly: their active cells are narrow
+    /// with default attributes by construction, so the character index is
+    /// the terminal column and trailing blanks stay unsearchable exactly
+    /// like the decompressed path's structural-padding trim. `Encoded` rows
+    /// fall back to decompressing for the wide/continuation-aware mapping.
+    pub fn search_text(&self) -> SearchLine<'_> {
+        match &self.data {
+            CompressedLineData::Plain(text, _) => SearchLine::Text(text),
+            CompressedLineData::Encoded(_) => SearchLine::Cells(Cow::Owned(self.decompress())),
         }
     }
 
@@ -2990,8 +3011,22 @@ pub struct TerminalState {
     utf8_len: u8,
     utf8_expected: u8,
 
-    // Incomplete escape sequence buffer across PTY reads
+    // Incomplete escape sequence buffer across PTY reads. Only short
+    // CSI/charset/lone-ESC prefixes land here; the unbounded string states
+    // (OSC/DCS/SOS/PM/APC) stream against their own buffers below.
     pending_escape: Vec<u8>,
+
+    // Unterminated OSC (`ESC ]` … BEL/ST) and DCS/SOS/PM (`ESC P`/`ESC X`/
+    // `ESC ^` … ST) carried across PTY reads. Like the APC buffer they
+    // stream: the scan cursor marks where the terminator scan resumes, so a
+    // string split across many reads stays O(n) instead of re-scanning from
+    // byte 0 on every read. Overflow keeps the old `pending_escape`
+    // semantics exactly: a buffered prefix past the 1 MiB cap is abandoned
+    // wholesale and the next read is parsed as ordinary input.
+    pending_osc: Vec<u8>,
+    pending_osc_scan_from: usize,
+    pending_dcs: Vec<u8>,
+    pending_dcs_scan_from: usize,
 
     // Unterminated kitty APC (`ESC _ ... ESC \`) carried across PTY reads.
     // Unlike `pending_escape` (re-scanned from its start each read), the APC
@@ -3310,6 +3345,10 @@ impl TerminalState {
             utf8_len: 0,
             utf8_expected: 0,
             pending_escape: Vec::new(),
+            pending_osc: Vec::new(),
+            pending_osc_scan_from: 0,
+            pending_dcs: Vec::new(),
+            pending_dcs_scan_from: 0,
             pending_apc: Vec::new(),
             pending_apc_scan_from: 0,
             discarding_oversized_apc: false,
@@ -4038,6 +4077,78 @@ impl TerminalState {
             self.consumed_execution_ids.pop_front();
         }
         self.consumed_execution_ids.push_back(id.to_string());
+    }
+
+    /// Dispatch a completed OSC payload (`ESC ]` and the BEL/ST terminator
+    /// already stripped), shared by the in-buffer parse and the fragmented
+    /// `pending_osc` resume path.
+    fn handle_osc_payload(&mut self, payload_bytes: &[u8]) {
+        if let Ok(payload) = std::str::from_utf8(payload_bytes) {
+            let (command, value) = payload.split_once(';').unwrap_or((payload, ""));
+            if !command.is_empty() {
+                if command == "0" {
+                    let title = Self::sanitized_title(value);
+                    self.icon_title.clone_from(&title);
+                    self.window_title = title;
+                } else if command == "1" {
+                    self.icon_title = Self::sanitized_title(value);
+                } else if command == "2" {
+                    self.window_title = Self::sanitized_title(value);
+                } else if command == "7" {
+                    // OSC 7 — the child reporting its cwd
+                    // as `file://host/%-encoded-path`, or
+                    // a bare path. Only overwrite on a
+                    // payload we accept: a rejected
+                    // remote path must leave the last
+                    // known local directory alone rather
+                    // than blanking it.
+                    if let Some(cwd) = Self::decode_osc7_cwd(value) {
+                        self.current_working_dir = Some(cwd);
+                    }
+                } else if command == "8" {
+                    // OSC 8 - Hyperlinks
+                    // Format: ESC ] 8 ; params ; URI ST
+                    self.handle_osc8(value);
+                } else if command == "4" {
+                    self.handle_osc_palette(value);
+                } else if command == "10" || command == "11" || command == "12" {
+                    self.handle_osc_color(command, value);
+                } else if command == "110" || command == "111" || command == "112" {
+                    self.reset_osc_color(command);
+                } else if command == "104" {
+                    self.reset_osc_palette(value);
+                } else if command == "9" {
+                    // Desktop notification (iTerm2/ConEmu)
+                    if self.pending_notifications.len() < 8 {
+                        let title = "frost".to_string();
+                        let body = value.chars().take(256).collect();
+                        self.pending_notifications.push((title, body));
+                    }
+                } else if command == "777" {
+                    // rxvt notification: 777;notify;title;body
+                    let parts: Vec<&str> = value.splitn(3, ';').collect();
+                    if parts.len() >= 2 && parts[0] == "notify" {
+                        let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
+                        let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                        if self.pending_notifications.len() < 8 {
+                            self.pending_notifications.push((title, body));
+                        }
+                    }
+                } else if command == "133" {
+                    self.handle_osc_133(value);
+                } else if command == "52" {
+                    self.handle_osc_52(value);
+                } else if command == "5522" {
+                    let (metadata, osc_payload) =
+                        if let Some((metadata, osc_payload)) = value.split_once(';') {
+                            (metadata, Some(osc_payload))
+                        } else {
+                            (value, None)
+                        };
+                    self.handle_osc_5522(metadata, osc_payload);
+                }
+            }
+        }
     }
 
     fn handle_osc_133(&mut self, value: &str) {
@@ -6868,6 +6979,142 @@ impl TerminalState {
         true
     }
 
+    /// Begin buffering an unterminated OSC (`ESC ]` through the end of the
+    /// current read). Like the old `pending_escape` stash there is no size
+    /// check here: a prefix that grows past the cap is abandoned by the
+    /// entry check in `resume_pending_osc` on the next read.
+    fn begin_pending_osc(&mut self, tail: &[u8]) {
+        self.pending_osc.clear();
+        self.pending_osc.extend_from_slice(tail);
+        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
+    }
+
+    /// Resume a fragmented OSC (`ESC ]` … BEL/ST). Returns true when this
+    /// function consumed the input (including any bytes after the
+    /// terminator, processed recursively).
+    fn resume_pending_osc(&mut self, input: &[u8]) -> bool {
+        if self.pending_osc.is_empty() {
+            return false;
+        }
+
+        // Mirror the old `pending_escape` entry check exactly: a buffered
+        // prefix past the cap is abandoned wholesale and this read is parsed
+        // as ordinary input (payload tail prints, BEL is a plain bell).
+        if self.pending_osc.len() > MAX_PENDING_ESCAPE {
+            self.pending_osc.clear();
+            self.pending_osc_scan_from = 0;
+            return false;
+        }
+
+        // Everything before pending_osc_scan_from was proved not to contain
+        // BEL or ST in the previous call. A terminator can therefore only
+        // straddle the old/new boundary (ESC at the stashed tail, `\` here)
+        // or live entirely in input. Scan the new bytes once, before any
+        // capacity concern: like the merged re-parse, a packet whose
+        // terminator shows up is dispatched regardless of its size.
+        let scan_from = self
+            .pending_osc_scan_from
+            .min(self.pending_osc.len().saturating_sub(1));
+        let straddled_st = scan_from + 1 == self.pending_osc.len()
+            && self.pending_osc[scan_from] == 0x1b
+            && input.first() == Some(&b'\\');
+        let terminator = if straddled_st {
+            Some((scan_from, 1))
+        } else {
+            let bel = input.iter().position(|&byte| byte == 0x07);
+            let st = input.windows(2).position(|window| window == b"\x1b\\");
+            match (bel, st) {
+                (Some(bel), Some(st)) if bel < st => {
+                    Some((self.pending_osc.len() + bel, bel + 1))
+                }
+                (Some(_), Some(st)) => Some((self.pending_osc.len() + st, st + 2)),
+                (Some(bel), None) => Some((self.pending_osc.len() + bel, bel + 1)),
+                (None, Some(st)) => Some((self.pending_osc.len() + st, st + 2)),
+                (None, None) => None,
+            }
+        };
+
+        if let Some((payload_end, consumed)) = terminator {
+            let capture_idle_background = self.idle_background_capture_active();
+            self.pending_osc.extend_from_slice(&input[..consumed]);
+            let packet = std::mem::take(&mut self.pending_osc);
+            self.pending_osc_scan_from = 0;
+            self.handle_osc_payload(&packet[2..payload_end]);
+            if capture_idle_background && self.idle_background_capture_active() {
+                self.append_idle_background_bytes(&packet);
+            }
+            if consumed < input.len() {
+                self.process_input(&input[consumed..]);
+            }
+            return true;
+        }
+
+        self.pending_osc.extend_from_slice(input);
+        self.pending_osc_scan_from = self.pending_osc.len().saturating_sub(1);
+        true
+    }
+
+    /// Begin buffering an unterminated DCS/SOS/PM (`ESC P`/`ESC X`/`ESC ^`
+    /// through the end of the current read). Same streaming and overflow
+    /// rules as `begin_pending_osc`.
+    fn begin_pending_dcs(&mut self, tail: &[u8]) {
+        self.pending_dcs.clear();
+        self.pending_dcs.extend_from_slice(tail);
+        self.pending_dcs_scan_from = self.pending_dcs.len().saturating_sub(1);
+    }
+
+    /// Resume a fragmented DCS/SOS/PM. Only ST terminates these strings; the
+    /// payload itself is dropped, exactly like the merged re-parse did.
+    /// Returns true when this function consumed the input.
+    fn resume_pending_dcs(&mut self, input: &[u8]) -> bool {
+        if self.pending_dcs.is_empty() {
+            return false;
+        }
+
+        // Same overflow rule as the OSC path (old `pending_escape` entry
+        // check): abandon the prefix wholesale, parse this read fresh.
+        if self.pending_dcs.len() > MAX_PENDING_ESCAPE {
+            self.pending_dcs.clear();
+            self.pending_dcs_scan_from = 0;
+            return false;
+        }
+
+        // See resume_pending_osc: only the stashed tail ESC can straddle the
+        // boundary into an ST; every earlier byte was proved clean.
+        let scan_from = self
+            .pending_dcs_scan_from
+            .min(self.pending_dcs.len().saturating_sub(1));
+        let consumed = if scan_from + 1 == self.pending_dcs.len()
+            && self.pending_dcs[scan_from] == 0x1b
+            && input.first() == Some(&b'\\')
+        {
+            Some(1)
+        } else {
+            input
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .map(|offset| offset + 2)
+        };
+
+        if let Some(consumed) = consumed {
+            let capture_idle_background = self.idle_background_capture_active();
+            self.pending_dcs.extend_from_slice(&input[..consumed]);
+            let packet = std::mem::take(&mut self.pending_dcs);
+            self.pending_dcs_scan_from = 0;
+            if capture_idle_background && self.idle_background_capture_active() {
+                self.append_idle_background_bytes(&packet);
+            }
+            if consumed < input.len() {
+                self.process_input(&input[consumed..]);
+            }
+            return true;
+        }
+
+        self.pending_dcs.extend_from_slice(input);
+        self.pending_dcs_scan_from = self.pending_dcs.len().saturating_sub(1);
+        true
+    }
+
     /// Check if sync output timed out (>1s) and auto-clear if so
     pub fn check_sync_output_timeout(&mut self) {
         if self.sync_output_active {
@@ -6958,11 +7205,23 @@ impl TerminalState {
         if self.resume_pending_apc(input) {
             return;
         }
-        // Guard against an unterminated OSC/DCS/escape sequence. Such a sequence
+        // Fragmented OSC and DCS/SOS/PM strings stream the same way: at most
+        // one string state can be in flight, so whichever buffer is non-empty
+        // owns the input until its terminator (or the overflow abandon).
+        if self.resume_pending_osc(input) {
+            return;
+        }
+        if self.resume_pending_dcs(input) {
+            return;
+        }
+        // Guard against an unterminated escape sequence. Such a sequence
         // is buffered into `pending_escape` and re-scanned from its start on every
         // read, which is both O(n^2) in CPU and unbounded in memory. Once the
         // buffered prefix exceeds this cap, abandon the partial sequence. The cap
         // is generous enough for legitimate large payloads (e.g. OSC 52 clipboard).
+        // Only short CSI/charset prefixes still land in `pending_escape` — the
+        // unbounded OSC/DCS/SOS/PM string states stream against their own
+        // scan-cursor buffers above.
         if self.pending_escape.len() > MAX_PENDING_ESCAPE {
             self.pending_escape.clear();
         }
@@ -7122,8 +7381,10 @@ impl TerminalState {
                             }
 
                             if !terminated {
-                                self.pending_escape
-                                    .extend_from_slice(&data_slice[esc_start..]);
+                                // Fragmented OSC: stream against its own
+                                // bounded buffer instead of re-scanning
+                                // pending_escape from byte 0 each read.
+                                self.begin_pending_osc(&data_slice[esc_start..]);
                                 break;
                             }
 
@@ -7133,93 +7394,7 @@ impl TerminalState {
                                 i - 2
                             };
                             if payload_end >= payload_start {
-                                if let Ok(payload) =
-                                    std::str::from_utf8(&data_slice[payload_start..payload_end])
-                                {
-                                    let (command, value) =
-                                        payload.split_once(';').unwrap_or((payload, ""));
-                                    if !command.is_empty() {
-                                        if command == "0" {
-                                            let title = Self::sanitized_title(value);
-                                            self.icon_title.clone_from(&title);
-                                            self.window_title = title;
-                                        } else if command == "1" {
-                                            self.icon_title = Self::sanitized_title(value);
-                                        } else if command == "2" {
-                                            self.window_title = Self::sanitized_title(value);
-                                        } else if command == "7" {
-                                            // OSC 7 — the child reporting its cwd
-                                            // as `file://host/%-encoded-path`, or
-                                            // a bare path. Only overwrite on a
-                                            // payload we accept: a rejected
-                                            // remote path must leave the last
-                                            // known local directory alone rather
-                                            // than blanking it.
-                                            if let Some(cwd) = Self::decode_osc7_cwd(value) {
-                                                self.current_working_dir = Some(cwd);
-                                            }
-                                        } else if command == "8" {
-                                            // OSC 8 - Hyperlinks
-                                            // Format: ESC ] 8 ; params ; URI ST
-                                            self.handle_osc8(value);
-                                        } else if command == "4" {
-                                            self.handle_osc_palette(value);
-                                        } else if command == "10"
-                                            || command == "11"
-                                            || command == "12"
-                                        {
-                                            self.handle_osc_color(command, value);
-                                        } else if command == "110"
-                                            || command == "111"
-                                            || command == "112"
-                                        {
-                                            self.reset_osc_color(command);
-                                        } else if command == "104" {
-                                            self.reset_osc_palette(value);
-                                        } else if command == "9" {
-                                            // Desktop notification (iTerm2/ConEmu)
-                                            if self.pending_notifications.len() < 8 {
-                                                let title = "frost".to_string();
-                                                let body = value.chars().take(256).collect();
-                                                self.pending_notifications.push((title, body));
-                                            }
-                                        } else if command == "777" {
-                                            // rxvt notification: 777;notify;title;body
-                                            let parts: Vec<&str> = value.splitn(3, ';').collect();
-                                            if parts.len() >= 2 && parts[0] == "notify" {
-                                                let title = parts
-                                                    .get(1)
-                                                    .unwrap_or(&"")
-                                                    .chars()
-                                                    .take(256)
-                                                    .collect();
-                                                let body = parts
-                                                    .get(2)
-                                                    .unwrap_or(&"")
-                                                    .chars()
-                                                    .take(256)
-                                                    .collect();
-                                                if self.pending_notifications.len() < 8 {
-                                                    self.pending_notifications.push((title, body));
-                                                }
-                                            }
-                                        } else if command == "133" {
-                                            self.handle_osc_133(value);
-                                        } else if command == "52" {
-                                            self.handle_osc_52(value);
-                                        } else if command == "5522" {
-                                            let (metadata, osc_payload) =
-                                                if let Some((metadata, osc_payload)) =
-                                                    value.split_once(';')
-                                                {
-                                                    (metadata, Some(osc_payload))
-                                                } else {
-                                                    (value, None)
-                                                };
-                                            self.handle_osc_5522(metadata, osc_payload);
-                                        }
-                                    }
-                                }
+                                self.handle_osc_payload(&data_slice[payload_start..payload_end]);
                             }
                         }
                         b'P' | b'X' | b'^' | b'_' => {
@@ -7259,8 +7434,9 @@ impl TerminalState {
                                     // re-scanning pending_escape.
                                     self.begin_pending_apc(&data_slice[esc_start..]);
                                 } else {
-                                    self.pending_escape
-                                        .extend_from_slice(&data_slice[esc_start..]);
+                                    // DCS/SOS/PM stream the same way; their
+                                    // payload stays dropped on completion.
+                                    self.begin_pending_dcs(&data_slice[esc_start..]);
                                 }
                                 break;
                             }
@@ -8294,6 +8470,11 @@ impl TerminalState {
         self.pending_apc_scan_from = 0;
         self.discarding_oversized_apc = false;
         self.discarding_apc_prev_escape = false;
+        // The other in-flight string states go with the reset as well.
+        self.pending_osc.clear();
+        self.pending_osc_scan_from = 0;
+        self.pending_dcs.clear();
+        self.pending_dcs_scan_from = 0;
         self.clear_screen();
     }
 
@@ -8614,13 +8795,18 @@ impl TerminalState {
     }
 
     /// Iterate over the complete searchable buffer in absolute row order.
-    /// History rows are decompressed lazily while live-grid rows stay borrowed,
-    /// avoiding a second full-buffer allocation for every search keystroke.
-    pub fn search_lines(&self) -> impl Iterator<Item = Cow<'_, [TerminalCell]>> + '_ {
+    /// Plain history rows are borrowed as text (no cell materialization),
+    /// encoded history rows are decompressed lazily, and live-grid rows stay
+    /// borrowed — a full-buffer search no longer rebuilds every row.
+    pub fn search_lines(&self) -> impl Iterator<Item = SearchLine<'_>> + '_ {
         self.scrollback
             .iter()
-            .map(|line| Cow::Owned(line.decompress()))
-            .chain(self.grid.iter().map(Cow::Borrowed))
+            .map(ScrollbackLine::search_text)
+            .chain(
+                self.grid
+                    .iter()
+                    .map(|row| SearchLine::Cells(Cow::Borrowed(row))),
+            )
     }
 
     /// Absolute buffer row represented by viewport row zero.
@@ -15956,6 +16142,150 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_osc_advances_its_scan_cursor_and_sets_the_title() {
+        let mut terminal = TerminalState::new(16, 2);
+        terminal.process_input(b"\x1b]0;ti");
+        assert_eq!(
+            terminal.pending_osc_scan_from,
+            terminal.pending_osc.len().saturating_sub(1)
+        );
+
+        for fragment in [b"tl".as_slice(), b"e-".as_slice(), b"x".as_slice()] {
+            let old_len = terminal.pending_osc.len();
+            terminal.process_input(fragment);
+            assert_eq!(terminal.pending_osc.len(), old_len + fragment.len());
+            assert_eq!(
+                terminal.pending_osc_scan_from,
+                terminal.pending_osc.len().saturating_sub(1),
+                "unterminated fragments must resume scanning at the previous tail"
+            );
+        }
+        assert_eq!(terminal.window_title, "");
+        terminal.process_input(b"\x07Z");
+        assert!(terminal.pending_osc.is_empty());
+        assert_eq!(terminal.window_title, "title-x");
+        // Bytes after the BEL are ordinary input again.
+        assert_eq!(terminal.grid[0][0].character, 'Z');
+    }
+
+    #[test]
+    fn fragmented_osc_st_terminator_straddles_the_read_boundary() {
+        let mut terminal = TerminalState::new(16, 2);
+        // The ESC introducing ST ends one read; the `\` opens the next.
+        terminal.process_input(b"\x1b]2;win\x1b");
+        assert_eq!(
+            terminal.pending_osc_scan_from,
+            terminal.pending_osc.len().saturating_sub(1)
+        );
+        terminal.process_input(b"\\Y");
+        assert!(terminal.pending_osc.is_empty());
+        assert_eq!(terminal.window_title, "win");
+        assert_eq!(terminal.grid[0][0].character, 'Y');
+
+        // An ESC not followed by `\` stays payload, even across reads.
+        let mut terminal = TerminalState::new(16, 2);
+        terminal.process_input(b"\x1b]0;a\x1b");
+        terminal.process_input(b"Xb\x07");
+        assert_eq!(terminal.window_title, "aXb");
+        assert_eq!(terminal.grid[0][0].character, ' ');
+    }
+
+    #[test]
+    fn an_osc_split_across_reads_is_never_dropped_wholesale() {
+        // Same regression shape as the kitty APC split test: every split
+        // point must deliver the title exactly once and leak nothing.
+        for payload in [
+            b"\x1b]0;split-title\x07".as_slice(),
+            b"\x1b]0;split-title\x1b\\".as_slice(),
+        ] {
+            for split_at in 1..payload.len() {
+                let mut terminal = TerminalState::new(16, 2);
+                terminal.process_input(&payload[..split_at]);
+                assert_eq!(
+                    terminal.window_title, "",
+                    "incomplete OSC was applied at split {split_at}"
+                );
+                terminal.process_input(&payload[split_at..]);
+                assert_eq!(
+                    terminal.window_title, "split-title",
+                    "OSC was lost at input split {split_at}"
+                );
+                assert_eq!(
+                    terminal.grid[0][0].character, ' ',
+                    "OSC bytes leaked onto the grid at split {split_at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_osc_keeps_the_old_pending_escape_overflow_semantics() {
+        let mut terminal = TerminalState::new(64, 2);
+
+        // A terminator inside the read that crosses the cap still completes
+        // the packet, exactly like the old merged re-parse did.
+        terminal.process_input(b"\x1b]0;huge");
+        let mut crossing = Vec::new();
+        crossing.resize(MAX_PENDING_ESCAPE + 8, b'A');
+        crossing.extend_from_slice(b"\x07");
+        terminal.process_input(&crossing);
+        assert!(terminal.pending_osc.is_empty());
+        assert!(terminal.window_title.starts_with("huge"));
+
+        // Without a terminator the prefix is retained past the cap, then
+        // abandoned wholesale on the next read; that read parses as ordinary
+        // input (the old pending_escape clear behavior).
+        let mut terminal = TerminalState::new(64, 2);
+        let mut oversized = b"\x1b]0;never".to_vec();
+        oversized.resize(MAX_PENDING_ESCAPE + 8, b'A');
+        terminal.process_input(&oversized);
+        assert!(!terminal.pending_osc.is_empty());
+        terminal.process_input(b"tail\x07");
+        assert!(terminal.pending_osc.is_empty());
+        assert_eq!(terminal.window_title, "");
+        assert_eq!(terminal.grid[0][0].character, 't');
+        assert_eq!(terminal.grid[0][1].character, 'a');
+        assert_eq!(terminal.grid[0][2].character, 'i');
+        assert_eq!(terminal.grid[0][3].character, 'l');
+    }
+
+    #[test]
+    fn fragmented_dcs_streams_and_drops_its_payload() {
+        let mut terminal = TerminalState::new(16, 2);
+        terminal.process_input(b"\x1bP1$r");
+        assert_eq!(
+            terminal.pending_dcs_scan_from,
+            terminal.pending_dcs.len().saturating_sub(1)
+        );
+        terminal.process_input(b"more-payload\x1b");
+        terminal.process_input(b"\\Q");
+        assert!(terminal.pending_dcs.is_empty());
+        // The DCS payload is dropped; only the byte after ST lands.
+        assert_eq!(terminal.grid[0][0].character, 'Q');
+
+        // SOS and PM share the DCS shape: ST-terminated, payload dropped.
+        let mut terminal = TerminalState::new(16, 2);
+        terminal.process_input(b"\x1bXsos-payload");
+        terminal.process_input(b"\x1b\\");
+        assert!(terminal.pending_dcs.is_empty());
+        terminal.process_input(b"\x1b^pm-payload\x1b");
+        terminal.process_input(b"\\W");
+        assert!(terminal.pending_dcs.is_empty());
+        assert_eq!(terminal.grid[0][0].character, 'W');
+
+        // BEL does not terminate a DCS, and an oversized prefix is abandoned
+        // on the next read just like the OSC path.
+        let mut terminal = TerminalState::new(64, 2);
+        let mut oversized = b"\x1bPpayload-with-bel\x07".to_vec();
+        oversized.resize(MAX_PENDING_ESCAPE + 8, b'A');
+        terminal.process_input(&oversized);
+        assert!(!terminal.pending_dcs.is_empty());
+        terminal.process_input(b"S");
+        assert!(terminal.pending_dcs.is_empty());
+        assert_eq!(terminal.grid[0][0].character, 'S');
+    }
+
+    #[test]
     fn primary_and_secondary_device_attributes_are_reported() {
         let mut terminal = TerminalState::new(8, 2);
 
@@ -16700,13 +17030,82 @@ mod tests {
         terminal.process_input(b"\x1b]133;D;0\x07");
     }
 
+    /// Text content of one `search_lines` row, mirroring a raw cell scan.
+    fn search_line_text(line: super::SearchLine<'_>) -> String {
+        match line {
+            super::SearchLine::Text(text) => text.to_string(),
+            super::SearchLine::Cells(cells) => {
+                cells.iter().map(|cell| cell.character).collect()
+            }
+        }
+    }
+
     /// Text content of an absolute buffer row (scrollback + live grid).
     fn buffer_row_text(terminal: &TerminalState, row: usize) -> String {
         terminal
             .search_lines()
             .nth(row)
-            .map(|line| line.iter().map(|cell| cell.character).collect())
+            .map(search_line_text)
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn search_lines_borrows_plain_scrollback_and_decodes_wide_rows() {
+        let mut terminal = TerminalState::new(32, 4);
+        terminal.process_input(b"plain alpha row\r\n");
+        terminal.process_input("wide 中x row\r\n".as_bytes());
+        terminal.process_input(b"\x1b[31mstyled beta row\x1b[m\r\n");
+        terminal.process_input(b"filler one\r\nfiller two\r\nfiller three\r\n");
+
+        // The first three rows scrolled into history: plain text stays a
+        // borrowed string while styled/wide rows keep encoded cell data.
+        assert!(matches!(
+            &terminal.scrollback[0].data,
+            super::CompressedLineData::Plain(..)
+        ));
+        assert!(matches!(
+            &terminal.scrollback[1].data,
+            super::CompressedLineData::Encoded(_)
+        ));
+        assert!(matches!(
+            &terminal.scrollback[2].data,
+            super::CompressedLineData::Encoded(_)
+        ));
+
+        let mut cache = None;
+        let (matches, _) = crate::search::SearchEngine::search_lines(
+            terminal.search_lines(),
+            "alpha",
+            false,
+            true,
+            &mut cache,
+        );
+        assert_eq!(
+            matches,
+            vec![crate::search::SearchMatch {
+                line: 0,
+                col_start: 6,
+                col_end: 11,
+            }]
+        );
+
+        // Wide characters in encoded rows still span their continuation
+        // cell when the rows around them are borrowed text.
+        let (matches, _) = crate::search::SearchEngine::search_lines(
+            terminal.search_lines(),
+            "中x",
+            false,
+            true,
+            &mut cache,
+        );
+        assert_eq!(
+            matches,
+            vec![crate::search::SearchMatch {
+                line: 1,
+                col_start: 5,
+                col_end: 8,
+            }]
+        );
     }
 
     #[test]
@@ -16812,7 +17211,7 @@ mod tests {
         );
         let retained: String = terminal
             .search_lines()
-            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .map(search_line_text)
             .collect();
         assert!(
             retained.contains("$ draft"),
@@ -16845,7 +17244,7 @@ mod tests {
         assert_eq!(terminal.running_zone_start(), Some(0));
         let retained: String = terminal
             .search_lines()
-            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .map(search_line_text)
             .collect();
         assert!(
             retained.contains("sleep 5"),
@@ -16908,14 +17307,14 @@ mod tests {
         terminal.process_input(b"plain text");
         let before: String = terminal
             .search_lines()
-            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .map(search_line_text)
             .collect();
 
         assert_eq!(terminal.clear_completed_blocks(), 0);
 
         let after: String = terminal
             .search_lines()
-            .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+            .map(search_line_text)
             .collect();
         assert_eq!(after, before);
     }
