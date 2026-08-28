@@ -581,6 +581,7 @@ fn command_requires_block_context(command: &keybindings::Command) -> bool {
             | C::BlockRecallCommand
             | C::BlockSelectAll
             | C::BlockClear
+            | C::BlockUndoClear
             | C::BlockSelectPrev
             | C::BlockSelectNext
             | C::BlockReinputSelectedCommands
@@ -1600,6 +1601,7 @@ enum BlockMenuAction {
     CreateTask,
     Retry,
     Clear,
+    UndoClear,
 }
 
 /// Which fresh Agent task a failed block starts (ember's Fix/Explain).
@@ -2334,6 +2336,28 @@ fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapsh
             ratios: ratios.clone(),
             children: children.iter().map(pane_tree_to_snapshot).collect(),
         },
+    }
+}
+
+/// Reset every divider in the tree so each split's children share evenly,
+/// recursing into nested splits (ember's `equalize_splits`: the whole tab's
+/// tree, not just the focused subtree). Returns whether any ratio moved.
+fn equalize_pane_tree(node: &mut PaneTree) -> bool {
+    match node {
+        PaneTree::Leaf(_) => false,
+        PaneTree::Split { children, ratios, .. } => {
+            let even = 1.0 / children.len().max(1) as f32;
+            let mut changed = ratios
+                .iter()
+                .any(|ratio| (*ratio - even).abs() > f32::EPSILON);
+            for ratio in ratios.iter_mut() {
+                *ratio = even;
+            }
+            for child in children.iter_mut() {
+                changed |= equalize_pane_tree(child);
+            }
+            changed
+        }
     }
 }
 
@@ -7094,6 +7118,26 @@ impl Frost {
         self.swap_pane_sessions(self.active, other);
     }
 
+    /// Reset every split divider in the focused tab to an even share (ember's
+    /// Pane Equalize). Like the divider double-click and drag paths, this only
+    /// relayouts; frost persists ratio changes with the usual session-dirty
+    /// flow rather than saving here.
+    fn equalize_panes(&mut self) {
+        if equalize_pane_tree(self.layout_mut()) {
+            self.relayout();
+            self.refresh_active_context();
+            self.push_toast(
+                "Pane dividers reset to 50/50".to_string(),
+                ToastKind::Success,
+            );
+        } else {
+            self.push_toast(
+                "Pane dividers are already equal".to_string(),
+                ToastKind::Info,
+            );
+        }
+    }
+
     /// Close the focused pane's session; the remaining panes keep the split
     /// (which collapses on its own once only one pane is left).
     fn close_focused_pane(&mut self) -> Task<Message> {
@@ -7314,6 +7358,7 @@ impl Frost {
             C::BlockRecallCommand => self.block_recall_command_task(),
             C::BlockSelectAll => self.block_select_all(),
             C::BlockClear => self.request_block_clear(),
+            C::BlockUndoClear => self.undo_block_clear(),
             C::BlockSelectPrev => self.block_select_step(true),
             C::BlockSelectNext => self.block_select_step(false),
             C::BlockReinputSelectedCommands => self.block_reinput_selected_commands_task(),
@@ -7408,6 +7453,10 @@ impl Frost {
             }
             C::PaneSwap => {
                 self.swap_panes();
+                Task::none()
+            }
+            C::PaneEqualize => {
+                self.equalize_panes();
                 Task::none()
             }
             C::ConfigOpen => {
@@ -8148,6 +8197,7 @@ impl Frost {
                 Task::none()
             }
             BlockMenuAction::Clear => self.request_block_clear(),
+            BlockMenuAction::UndoClear => self.undo_block_clear(),
             // Returned by the stable-id dispatch above, before the focus-bound
             // liveness check these remaining actions require.
             BlockMenuAction::FixWithAgent
@@ -10219,6 +10269,10 @@ impl Frost {
                 self.swap_panes();
                 Task::none()
             }
+            PaletteAction::EqualizePanes => {
+                self.equalize_panes();
+                Task::none()
+            }
             PaletteAction::ClosePane => self.close_focused_pane(),
             PaletteAction::ToggleSidebar => self.toggle_sidebar(),
             PaletteAction::ToggleAgent => {
@@ -10290,6 +10344,7 @@ impl Frost {
             PaletteAction::BlockRecallCommand => self.block_recall_command_task(),
             PaletteAction::BlockSelectAll => self.block_select_all(),
             PaletteAction::BlockClear => self.request_block_clear(),
+            PaletteAction::BlockUndoClear => self.undo_block_clear(),
             PaletteAction::BlockSelectPrev => self.block_select_step(true),
             PaletteAction::BlockSelectNext => self.block_select_step(false),
             PaletteAction::BlockReinputSelectedCommands => {
@@ -10886,6 +10941,39 @@ impl Frost {
             format!(
                 "Cleared {cleared} command block{}",
                 if cleared == 1 { "" } else { "s" }
+            ),
+            ToastKind::Success,
+        );
+        Task::none()
+    }
+
+    /// Restore the blocks removed by the active pane's most recent Clear
+    /// Blocks (anvil/forge's Undo Clear Blocks). The stash is pane-local and
+    /// single-level: restored blocks re-enter above anything produced since,
+    /// while the selection and bookmarks the clear discarded stay discarded.
+    fn undo_block_clear(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Undo Clear Blocks") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let restored = sess.terminal.undo_clear_completed_blocks();
+        if restored == 0 {
+            self.push_toast(
+                "No cleared command blocks to restore".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        sess.refresh();
+        self.links_cache_key = None;
+        self.links.clear();
+        self.refresh_kitty_handles();
+        self.push_toast(
+            format!(
+                "Restored {restored} command block{}",
+                if restored == 1 { "" } else { "s" }
             ),
             ToastKind::Success,
         );
@@ -16144,6 +16232,13 @@ impl Frost {
                         .padding([5, 9])
                         .width(Length::Fill)
                         .style(button::danger),
+                )
+                .push(
+                    button(text("Undo clear blocks").size(12))
+                        .on_press(Message::BlockMenuAction(BlockMenuAction::UndoClear))
+                        .padding([5, 9])
+                        .width(Length::Fill)
+                        .style(self.ghost_btn_style()),
                 );
         } else {
             body = body
@@ -23021,6 +23116,7 @@ mod tests {
             C::BlockJumpPrevBookmark,
             C::BlockCopyOutput,
             C::BlockClear,
+            C::BlockUndoClear,
             C::BlockReinputSelectedCommands,
             C::TerminalPromptPrev,
             C::TerminalCopyLastOutput,
@@ -23434,6 +23530,61 @@ mod tests {
         assert!(valid_restored_layout(&back, 3));
         // Out-of-range session indices are rejected.
         assert!(!valid_restored_layout(&back, 2));
+    }
+
+    /// ember's `equalize_resets_every_nested_divider` seam: every split in the
+    /// tab's tree goes even, including nested ones, and a second pass is a
+    /// no-op.
+    #[test]
+    fn equalize_pane_tree_resets_every_nested_divider() {
+        let mut tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                PaneTree::Leaf(0),
+                PaneTree::Split {
+                    axis: Axis::Horizontal,
+                    children: vec![PaneTree::Leaf(1), PaneTree::Leaf(2)],
+                    ratios: vec![0.7, 0.3],
+                },
+            ],
+            ratios: vec![0.8, 0.2],
+        };
+
+        assert!(equalize_pane_tree(&mut tree));
+        let PaneTree::Split {
+            children, ratios, ..
+        } = &tree
+        else {
+            panic!("expected a split root");
+        };
+        assert!(ratios.iter().all(|r| (*r - 0.5).abs() <= f32::EPSILON));
+        let PaneTree::Split {
+            ratios: nested, ..
+        } = &children[1]
+        else {
+            panic!("expected the nested split to survive");
+        };
+        assert!(nested.iter().all(|r| (*r - 0.5).abs() <= f32::EPSILON));
+
+        // Equalized geometry really splits the area evenly along both axes.
+        let area = pane_layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 212.0,
+            height: 120.0,
+        };
+        let mut rects = Vec::new();
+        collect_pane_rects(&tree, area, DIVIDER, &mut rects);
+        assert_eq!(rects.len(), 3);
+        let left = rects.iter().find(|p| p.session == 0).unwrap();
+        let right_top = rects.iter().find(|p| p.session == 1).unwrap();
+        let right_bottom = rects.iter().find(|p| p.session == 2).unwrap();
+        assert!((left.rect.width - right_top.rect.width).abs() < 1e-3);
+        assert!((right_top.rect.height - right_bottom.rect.height).abs() < 1e-3);
+
+        // Already even: nothing left to move. A lone leaf has no divider.
+        assert!(!equalize_pane_tree(&mut tree));
+        assert!(!equalize_pane_tree(&mut PaneTree::Leaf(0)));
     }
 
     fn split_tab(id: usize, sessions: &[usize]) -> Tab {

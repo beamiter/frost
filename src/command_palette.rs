@@ -26,6 +26,7 @@ pub enum PaletteAction {
     ClosePane,
     ZoomPane,
     SwapPanes,
+    EqualizePanes,
     ToggleSidebar,
     ToggleAgent,
     ToggleTasks,
@@ -50,6 +51,7 @@ pub enum PaletteAction {
     BlockRecallCommand,
     BlockSelectAll,
     BlockClear,
+    BlockUndoClear,
     BlockSelectPrev,
     BlockSelectNext,
     BlockReinputSelectedCommands,
@@ -224,6 +226,12 @@ impl PaletteState {
                 action: PaletteAction::SwapPanes,
             },
             PaletteItem {
+                name: "Equalize Panes",
+                description: "Reset every pane divider to an even split",
+                shortcut: "",
+                action: PaletteAction::EqualizePanes,
+            },
+            PaletteItem {
                 name: "Close Focused Pane",
                 description: "Close the current pane, or its tab when unsplit",
                 shortcut: "Ctrl+Shift+W",
@@ -372,6 +380,12 @@ impl PaletteState {
                 description: "Remove every retained finished block from the current pane",
                 shortcut: "Ctrl+Shift+K",
                 action: PaletteAction::BlockClear,
+            },
+            PaletteItem {
+                name: "Undo Clear Blocks",
+                description: "Restore the blocks removed by the most recent Clear Blocks",
+                shortcut: "",
+                action: PaletteAction::BlockUndoClear,
             },
             PaletteItem {
                 name: "Select Previous Block",

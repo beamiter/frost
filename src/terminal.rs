@@ -1,4 +1,4 @@
-use crate::kitty_graphics::KittyGraphicsState;
+use crate::kitty_graphics::{KittyGraphicsState, KittyImage, KittyPlacement};
 use base64::Engine;
 use jterm_core::click_cursor;
 use smallvec::SmallVec;
@@ -2540,9 +2540,37 @@ enum ZoneState {
     OutputStarted(usize, usize, usize),
 }
 
+/// Everything [`TerminalState::clear_completed_blocks`] removed, kept so an
+/// explicit undo can rebuild it. Single-level: only a clear that actually
+/// removed blocks replaces the stash, so a reflexive second Clear Blocks
+/// cannot destroy the snapshot (anvil's cleared-stash rule). The bounds are
+/// the buffer's own caps: at most [`MAX_COMMAND_ZONES`] zones,
+/// `max_scrollback` retained rows, one grid of blanked rows, and the Kitty
+/// cache's image-memory budget.
+struct ClearedBlocksSnapshot {
+    /// Drained scrollback prefix in original row order, keeping each row's
+    /// [`RawRowId`] so restored output provenance still validates.
+    scrollback: Vec<ScrollbackLine>,
+    /// Blanked grid rows as compressed lines (original row ids, top to
+    /// bottom). Undo prepends them as scrollback rather than rewriting grid
+    /// cells that output produced since the clear may already occupy.
+    grid_rows: Vec<ScrollbackLine>,
+    zones: VecDeque<CommandZone>,
+    provenance: HashMap<u64, FinishedOutputProvenance>,
+    captured_output_bytes: usize,
+    /// Placements anchored before the live lifecycle at clear time, plus the
+    /// image data they referenced. Both return with their original absolute
+    /// rows, which name the same text again once the rows are back.
+    placements: Vec<KittyPlacement>,
+    images: Vec<(u32, KittyImage)>,
+}
+
 const MAX_CAPTURED_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
 const MAX_CONSUMED_EXECUTION_IDS: usize = 256;
+/// Bound on retained finalized OSC 133 zones; the push path and the
+/// undo-clear restore both evict the oldest beyond it.
+const MAX_COMMAND_ZONES: usize = 256;
 const UNAVAILABLE_COMMAND_TEXT: &str = "<command unavailable>";
 
 /// Bounded command text reconstructed at OSC 133 `C`.
@@ -3197,6 +3225,10 @@ pub struct TerminalState {
     /// kept under [`Self::MAX_CAPTURED_OUTPUT_BYTES`] by
     /// [`Self::enforce_captured_output_budget`].
     captured_output_bytes: usize,
+    /// Blocks removed by the most recent [`Self::clear_completed_blocks`],
+    /// kept as data so an explicit undo can rebuild them. Single-level:
+    /// replaced by the next clear that removes blocks; consumed by undo.
+    cleared_blocks: Option<ClearedBlocksSnapshot>,
 }
 
 /// One OSC 133 command lifecycle captured for the AI agent: the typed
@@ -3426,6 +3458,7 @@ impl TerminalState {
             current_command_cwd: None,
             current_command_truncated: false,
             captured_output_bytes: 0,
+            cleared_blocks: None,
         }
     }
 
@@ -4548,7 +4581,7 @@ impl TerminalState {
                 .map_or(0, |(text, _)| text.len()),
         );
         self.command_zones.push_back(zone);
-        if self.command_zones.len() > 256 {
+        if self.command_zones.len() > MAX_COMMAND_ZONES {
             if let Some(evicted) = self.command_zones.pop_front() {
                 self.finished_output_provenance.remove(&evicted.id);
                 self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
@@ -5088,6 +5121,57 @@ impl TerminalState {
         }
     }
 
+    /// Inverse of [`Self::on_scrollback_rows_trimmed`] for undo-clear: `count`
+    /// rows came back at the front of the buffer, so every anchor into
+    /// post-clear rows shifts up to stay on the same text. The restored
+    /// structures keep their pre-clear anchors, which name the same rows again
+    /// once the prefix is back. `pending_saved_line_purge` deliberately does
+    /// not grow: a deferred ED 3 counted rows the application wanted gone,
+    /// and an explicit user undo does not re-enlist the restored rows.
+    fn on_scrollback_rows_inserted(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        for zone in &mut self.command_zones {
+            if zone.rows_evicted {
+                continue;
+            }
+            zone.prompt_start = zone.prompt_start.saturating_add(count);
+            for row in [
+                zone.command_start.as_mut(),
+                zone.output_start.as_mut(),
+                zone.output_end.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *row = row.saturating_add(count);
+            }
+        }
+        self.current_zone_state = match std::mem::take(&mut self.current_zone_state) {
+            ZoneState::Idle => ZoneState::Idle,
+            ZoneState::PromptStarted(p) => ZoneState::PromptStarted(p.saturating_add(count)),
+            ZoneState::CommandStarted(p, c) => {
+                ZoneState::CommandStarted(p.saturating_add(count), c.saturating_add(count))
+            }
+            ZoneState::OutputStarted(p, c, o) => ZoneState::OutputStarted(
+                p.saturating_add(count),
+                c.saturating_add(count),
+                o.saturating_add(count),
+            ),
+        };
+        self.current_command_extent_row = self
+            .current_command_extent_row
+            .map(|row| row.saturating_add(count));
+        self.current_output_extent_row = self
+            .current_output_extent_row
+            .map(|row| row.saturating_add(count));
+        if let Some(pending) = self.idle_background_output.as_mut() {
+            pending.start_row = pending.start_row.saturating_add(count);
+            pending.last_row = pending.last_row.saturating_add(count);
+        }
+    }
+
     /// Absolute buffer row of every known shell prompt (OSC 133), oldest
     /// first, including the prompt of a command that is still running.
     fn prompt_rows(&self) -> impl Iterator<Item = usize> + '_ {
@@ -5203,6 +5287,9 @@ impl TerminalState {
     /// rebase the lifecycle's absolute row anchors by the removed scrollback.
     /// The zone id counter remains monotonic so a stale UI id can never target
     /// a block created after the clear.
+    ///
+    /// Everything removed is stashed in [`Self::cleared_blocks`] so
+    /// [`Self::undo_clear_completed_blocks`] can rebuild it.
     pub fn clear_completed_blocks(&mut self) -> usize {
         let cleared = self.command_zones.len();
         if cleared == 0 {
@@ -5222,24 +5309,68 @@ impl TerminalState {
         let retained_scrollback_start = live_start
             .map(|start| start.min(old_scrollback_len))
             .unwrap_or(old_scrollback_len);
-        self.kitty_graphics
-            .retain_placements_from_buffer_row(live_start);
-        self.scrollback.drain(..retained_scrollback_start);
-
-        self.command_zones.clear();
-        self.finished_output_provenance.clear();
-        self.captured_output_bytes = 0;
-        self.on_scrollback_rows_trimmed(retained_scrollback_start);
-
         let completed_grid_rows = live_start
             .map(|start| start.saturating_sub(old_scrollback_len))
             .unwrap_or(self.grid.rows())
             .min(self.grid.rows());
+
+        // Stash everything the clear removes. The stash is single-level: only
+        // a clear that actually removed blocks replaces it, so a reflexive
+        // second Clear Blocks cannot destroy the snapshot (anvil's rule).
+        let stashed_placements: Vec<KittyPlacement> = self
+            .kitty_graphics
+            .get_placements()
+            .iter()
+            .filter(|placement| !live_start.is_some_and(|start| placement.buffer_row >= start))
+            .cloned()
+            .collect();
+        let mut stashed_image_ids: Vec<u32> = stashed_placements
+            .iter()
+            .map(|placement| placement.image_id)
+            .collect();
+        stashed_image_ids.sort_unstable();
+        stashed_image_ids.dedup();
+        let stashed_images: Vec<(u32, KittyImage)> = stashed_image_ids
+            .into_iter()
+            .filter_map(|id| {
+                self.kitty_graphics
+                    .get_image(id)
+                    .map(|image| (id, image.clone()))
+            })
+            .collect();
+        // Blanked grid rows keep their original row identities in the stash so
+        // restored output provenance still validates; the blank rows left on
+        // the grid get fresh identities below, since a dead row's id must not
+        // alias when the row is reused (the scroll/erase rule).
+        let stashed_grid_rows: Vec<ScrollbackLine> = (0..completed_grid_rows)
+            .map(|row| {
+                ScrollbackLine::compress_with_raw_row_id(
+                    &self.grid[row],
+                    self.grid.row_wrapped[row],
+                    self.grid.row_ids[row],
+                )
+            })
+            .collect();
+        self.cleared_blocks = Some(ClearedBlocksSnapshot {
+            scrollback: self.scrollback.drain(..retained_scrollback_start).collect(),
+            grid_rows: stashed_grid_rows,
+            zones: std::mem::take(&mut self.command_zones),
+            provenance: std::mem::take(&mut self.finished_output_provenance),
+            captured_output_bytes: std::mem::take(&mut self.captured_output_bytes),
+            placements: stashed_placements,
+            images: stashed_images,
+        });
+
+        self.kitty_graphics
+            .retain_placements_from_buffer_row(live_start);
+        self.on_scrollback_rows_trimmed(retained_scrollback_start);
+
         if completed_grid_rows > 0 {
             let blank = TerminalCell::default();
             for row in 0..completed_grid_rows {
                 self.grid[row].fill(blank);
                 self.grid.row_wrapped[row] = false;
+                self.grid.row_ids[row] = RawRowId::fresh();
             }
             self.mark_rows_dirty(0, completed_grid_rows - 1);
         } else {
@@ -5253,6 +5384,75 @@ impl TerminalState {
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
         cleared
+    }
+
+    /// Rebuild the blocks removed by the most recent
+    /// [`Self::clear_completed_blocks`]. They are older than anything produced
+    /// since, so their rows are prepended to scrollback and their zones
+    /// re-enter ahead of the current ones under their original absolute
+    /// anchors; zones created after the clear and the live lifecycle shift up
+    /// by the reinserted row count. Returns how many zones were restored.
+    ///
+    /// Single-level: the stash is consumed on the way out. While an
+    /// alt-screen app owns the viewport the stash is kept instead, so undo
+    /// still works after it exits (anvil's rule).
+    pub fn undo_clear_completed_blocks(&mut self) -> usize {
+        if self.use_alt_buffer {
+            return 0;
+        }
+        let Some(snapshot) = self.cleared_blocks.take() else {
+            return 0;
+        };
+        let restored_rows = snapshot.scrollback.len() + snapshot.grid_rows.len();
+        if restored_rows > 0 {
+            self.on_scrollback_rows_inserted(restored_rows);
+            for line in snapshot.grid_rows.into_iter().rev() {
+                self.scrollback.push_front(line);
+            }
+            for line in snapshot.scrollback.into_iter().rev() {
+                self.scrollback.push_front(line);
+            }
+        }
+        self.kitty_graphics.restore_cleared_placements(
+            restored_rows,
+            snapshot.placements,
+            snapshot.images,
+        );
+
+        self.captured_output_bytes = self
+            .captured_output_bytes
+            .saturating_add(snapshot.captured_output_bytes);
+        self.finished_output_provenance.extend(snapshot.provenance);
+        let mut restored = snapshot.zones.len();
+        for zone in snapshot.zones.into_iter().rev() {
+            self.command_zones.push_front(zone);
+        }
+
+        // The combined history can exceed the buffer's own caps. Evict from
+        // the oldest (the restored prefix) first, mirroring anvil's retention
+        // plan on restore with the push path's cap bookkeeping.
+        while self.command_zones.len() > MAX_COMMAND_ZONES {
+            if let Some(evicted) = self.command_zones.pop_front() {
+                self.finished_output_provenance.remove(&evicted.id);
+                self.captured_output_bytes = self.captured_output_bytes.saturating_sub(
+                    evicted
+                        .captured_output
+                        .as_ref()
+                        .map_or(0, |(text, _)| text.len()),
+                );
+                restored = restored.saturating_sub(1);
+            }
+        }
+        while self.scrollback.len() > self.max_scrollback {
+            self.scrollback.pop_front();
+            self.on_scrollback_rows_trimmed(1);
+        }
+        self.enforce_captured_output_budget(Self::MAX_CAPTURED_OUTPUT_BYTES);
+
+        self.bump_history_revision();
+        self.grid_version = self.grid_version.wrapping_add(1);
+        self.visible_cells_cache = None;
+        restored
     }
 
     /// Plain text of one zone's output (same trimming and 1 MiB cap as
@@ -8426,6 +8626,9 @@ impl TerminalState {
         self.command_zones.clear();
         self.finished_output_provenance.clear();
         self.captured_output_bytes = 0;
+        // RIS destroys the rows the undo stash points at; it cannot rebuild
+        // blocks whose text is gone.
+        self.cleared_blocks = None;
         self.current_zone_state = ZoneState::default();
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
@@ -12772,8 +12975,8 @@ mod tests {
 
     use super::{
         AgentPromptStatus, ClipboardReadKind, Color, CursorShape, IdleBackgroundOutput,
-        ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_OSC8_ID_BYTES,
-        MAX_OSC8_URI_BYTES, MAX_PENDING_ESCAPE, MAX_TERMINAL_TITLE_CHARS,
+        ScrollbackLine, TerminalCell, TerminalState, ZoneOutputExport, MAX_COMMAND_ZONES,
+        MAX_OSC8_ID_BYTES, MAX_OSC8_URI_BYTES, MAX_PENDING_ESCAPE, MAX_TERMINAL_TITLE_CHARS,
     };
 
     fn osc8_spans(terminal: &mut TerminalState) -> Vec<crate::link::Link> {
@@ -17317,6 +17520,232 @@ mod tests {
             .map(search_line_text)
             .collect();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_restores_zones_rows_and_live_prompt() {
+        let mut terminal = TerminalState::new(40, 6);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07draft");
+        let next_id = terminal.next_zone_id;
+        let output_before: Vec<Option<String>> = terminal
+            .command_zones
+            .iter()
+            .map(|zone| terminal.zone_output_text(zone.id))
+            .collect();
+        let captured_before = terminal.captured_output_bytes;
+        assert!(captured_before > 0);
+        assert!(terminal
+            .command_zones
+            .iter()
+            .all(|zone| terminal.finished_output_range(zone.id).is_some()));
+
+        assert_eq!(terminal.clear_completed_blocks(), 2);
+        assert!(terminal.command_zones.is_empty());
+
+        assert_eq!(terminal.undo_clear_completed_blocks(), 2);
+
+        // Zones return with their ids, commands, outputs, and provenance.
+        assert_eq!(terminal.command_zones.len(), 2);
+        assert_eq!(terminal.captured_output_bytes, captured_before);
+        for (index, zone) in terminal.command_zones.iter().enumerate() {
+            assert_eq!(zone.id, index as u64);
+            assert_eq!(
+                zone.command.as_deref(),
+                Some(format!("$ cmd{index}").as_str())
+            );
+            assert!(
+                buffer_row_text(&terminal, zone.prompt_start).contains(&format!("cmd{index}")),
+                "restored prompt row for cmd{index}"
+            );
+            assert_eq!(
+                terminal.zone_output_text(zone.id),
+                output_before[index],
+                "restored output for cmd{index}"
+            );
+            assert!(
+                terminal.finished_output_range(zone.id).is_some(),
+                "restored output provenance for cmd{index}"
+            );
+        }
+        // The live draft prompt still owns the bottom of the buffer, and the
+        // stash was consumed on the way out.
+        let prompt_row = terminal.live_prompt_row().expect("live prompt");
+        assert!(buffer_row_text(&terminal, prompt_row).contains("$ draft"));
+        assert_eq!(terminal.undo_clear_completed_blocks(), 0);
+
+        // Completing the still-live editor appends after the restored zones
+        // with the monotonic id a stale pre-clear id cannot alias.
+        terminal.process_input(b"\r\n\x1b]133;C\x07new output\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 3);
+        let last = terminal.command_zones.back().expect("new zone");
+        assert_eq!(last.id, next_id);
+        assert_eq!(last.command.as_deref(), Some("draft"));
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_restores_a_running_block_boundary_exactly() {
+        let mut terminal = TerminalState::new(32, 4);
+        emit_zone(&mut terminal, 0);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 5\r\n\x1b]133;C\x07start\r\nline2\r\nline3\r\nline4\r\n",
+        );
+        let start_before = terminal.running_zone_start().expect("running block");
+        // The live lifecycle reached scrollback, so no grid rows are blanked
+        // and undo restores the exact pre-clear buffer.
+        assert!(start_before < terminal.scrollback_len());
+        let buffer_before: String = terminal
+            .search_lines()
+            .map(search_line_text)
+            .collect();
+
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+        assert_eq!(terminal.undo_clear_completed_blocks(), 1);
+
+        assert_eq!(terminal.running_zone_start(), Some(start_before));
+        let buffer_after: String = terminal
+            .search_lines()
+            .map(search_line_text)
+            .collect();
+        assert_eq!(buffer_after, buffer_before);
+
+        terminal.process_input(b"done\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones.len(), 2);
+        assert_eq!(
+            terminal
+                .zone_output_text(terminal.command_zones[1].id)
+                .as_deref(),
+            Some("start\nline2\nline3\nline4\ndone")
+        );
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_is_single_level_and_survives_an_empty_clear() {
+        let mut terminal = TerminalState::new(40, 6);
+        // Nothing stashed yet: undo is a no-op.
+        assert_eq!(terminal.undo_clear_completed_blocks(), 0);
+
+        emit_zone(&mut terminal, 0);
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+        // A clear that removes nothing keeps the stash (anvil's reflexive
+        // second Ctrl+Shift+K rule).
+        assert_eq!(terminal.clear_completed_blocks(), 0);
+        assert_eq!(terminal.undo_clear_completed_blocks(), 1);
+        assert_eq!(terminal.command_zones.len(), 1);
+        // Single-level: consumed by the first undo.
+        assert_eq!(terminal.undo_clear_completed_blocks(), 0);
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_waits_out_the_alt_screen() {
+        let mut terminal = TerminalState::new(40, 6);
+        emit_zone(&mut terminal, 0);
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+
+        terminal.process_input(b"\x1b[?1049h");
+        assert_eq!(terminal.undo_clear_completed_blocks(), 0);
+        assert!(terminal.command_zones.is_empty());
+
+        terminal.process_input(b"\x1b[?1049l");
+        assert_eq!(terminal.undo_clear_completed_blocks(), 1);
+        assert_eq!(terminal.command_zones.len(), 1);
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_restores_finished_graphics() {
+        let mut terminal = TerminalState::new(30, 8);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07image old\r\n\x1b]133;C\x07\x1b_Gf=32,s=1,v=1,a=T,i=51;AQIDBA==\x1b\\\r\n\x1b]133;D;0\x07",
+        );
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07image live\r\n\x1b]133;C\x07\x1b_Gf=32,s=1,v=1,a=T,i=52;BQYHCA==\x1b\\",
+        );
+        let stats_before = terminal.kitty_graphics.get_stats();
+        let old_buffer_row = terminal.kitty_graphics.get_placements()[0].buffer_row;
+
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+        assert_eq!(terminal.kitty_graphics.get_placements().len(), 1);
+        assert!(terminal.kitty_graphics.get_image(51).is_none());
+
+        assert_eq!(terminal.undo_clear_completed_blocks(), 1);
+
+        let placements = terminal.kitty_graphics.get_placements();
+        assert_eq!(placements.len(), 2);
+        // The finished placement returns with its original absolute row and
+        // its image data re-admitted against the memory budget; the live one
+        // stays anchored to its (rebased) text.
+        assert_eq!(placements[0].image_id, 51);
+        assert_eq!(placements[0].buffer_row, old_buffer_row);
+        assert_eq!(placements[1].image_id, 52);
+        assert!(terminal.kitty_graphics.get_image(51).is_some());
+        assert_eq!(terminal.kitty_graphics.image_count(), 2);
+        assert_eq!(terminal.kitty_graphics.get_stats(), stats_before);
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_trims_the_restored_prefix_to_the_scrollback_cap() {
+        let mut terminal = TerminalState::new(40, 6);
+        emit_zone(&mut terminal, 0);
+        emit_zone(&mut terminal, 1);
+        emit_zone(&mut terminal, 2);
+        // Idle prompt: every row belongs to history, so the stash holds the
+        // whole scrollback plus the blanked grid rows.
+        let restored_rows = terminal.scrollback_len() + 6;
+        let cap = 8;
+        let trimmed = restored_rows - cap;
+        let survivors: Vec<u64> = terminal
+            .command_zones
+            .iter()
+            .filter(|zone| zone.prompt_start >= trimmed)
+            .map(|zone| zone.id)
+            .collect();
+        assert!(!survivors.is_empty());
+
+        assert_eq!(terminal.clear_completed_blocks(), 3);
+        terminal.set_max_scrollback(cap);
+
+        // All three zones come back, but rows beyond the cap are evicted from
+        // the oldest (the restored prefix), flipping their zones to
+        // rows_evicted exactly like an ordinary trim.
+        assert_eq!(terminal.undo_clear_completed_blocks(), 3);
+        assert_eq!(terminal.command_zones.len(), 3);
+        assert_eq!(terminal.scrollback_len(), cap);
+        for zone in &terminal.command_zones {
+            assert_eq!(zone.rows_evicted, !survivors.contains(&zone.id));
+        }
+        let newest = terminal.command_zones.back().expect("newest zone");
+        assert!(!newest.rows_evicted);
+        assert!(buffer_row_text(&terminal, newest.prompt_start).contains("cmd2"));
+    }
+
+    #[test]
+    fn undo_clear_completed_blocks_evicts_the_restored_prefix_at_the_zone_cap() {
+        let mut terminal = TerminalState::new(40, 8);
+        for index in 0..(MAX_COMMAND_ZONES + 4) {
+            emit_zone(&mut terminal, index);
+        }
+        assert_eq!(terminal.command_zones.len(), MAX_COMMAND_ZONES);
+        let front_id = terminal.command_zones[0].id;
+
+        assert_eq!(terminal.clear_completed_blocks(), MAX_COMMAND_ZONES);
+        for index in 0..4 {
+            emit_zone(&mut terminal, MAX_COMMAND_ZONES + 4 + index);
+        }
+        assert_eq!(terminal.command_zones.len(), 4);
+
+        // The combined history exceeds the cap by four: the four oldest
+        // restored zones are evicted, the post-clear zones stay at the back.
+        assert_eq!(
+            terminal.undo_clear_completed_blocks(),
+            MAX_COMMAND_ZONES - 4
+        );
+        assert_eq!(terminal.command_zones.len(), MAX_COMMAND_ZONES);
+        assert_eq!(terminal.command_zones[0].id, front_id + 4);
+        assert_eq!(
+            terminal.command_zones.back().expect("newest zone").id,
+            (MAX_COMMAND_ZONES + 8 - 1) as u64
+        );
     }
 
     #[test]

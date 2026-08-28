@@ -64,6 +64,9 @@ pub enum Command {
     BlockRecallCommand,
     BlockSelectAll,
     BlockClear,
+    /// Restore the blocks removed by the most recent Clear Blocks. Like
+    /// anvil/forge it ships palette-only (no default chord) but stays bindable.
+    BlockUndoClear,
     BlockSelectPrev,
     BlockSelectNext,
     BlockReinputSelectedCommands,
@@ -100,6 +103,9 @@ pub enum Command {
     PaneResizeDown,
     PaneZoomToggle,
     PaneSwap,
+    /// Reset every split divider in the focused tab to an even share. ember
+    /// ships this palette-only too, so no default chord here.
+    PaneEqualize,
 
     // === 窗口操作 ===
     WindowClose,
@@ -156,6 +162,7 @@ impl std::fmt::Display for Command {
             Command::BlockRecallCommand => write!(f, "block:recall_command"),
             Command::BlockSelectAll => write!(f, "block:select_all"),
             Command::BlockClear => write!(f, "block:clear"),
+            Command::BlockUndoClear => write!(f, "block:undo_clear"),
             Command::BlockSelectPrev => write!(f, "block:select_prev"),
             Command::BlockSelectNext => write!(f, "block:select_next"),
             Command::BlockReinputSelectedCommands => {
@@ -190,6 +197,7 @@ impl std::fmt::Display for Command {
             Command::PaneResizeDown => write!(f, "pane:resize_down"),
             Command::PaneZoomToggle => write!(f, "pane:zoom_toggle"),
             Command::PaneSwap => write!(f, "pane:swap"),
+            Command::PaneEqualize => write!(f, "pane:equalize"),
             Command::WindowClose => write!(f, "window:close"),
             Command::ConfigOpen => write!(f, "config:open"),
             Command::ConfigClose => write!(f, "config:close"),
@@ -241,6 +249,7 @@ impl std::str::FromStr for Command {
             "block:recall_command" => Ok(Command::BlockRecallCommand),
             "block:select_all" => Ok(Command::BlockSelectAll),
             "block:clear" => Ok(Command::BlockClear),
+            "block:undo_clear" => Ok(Command::BlockUndoClear),
             "block:select_prev" => Ok(Command::BlockSelectPrev),
             "block:select_next" => Ok(Command::BlockSelectNext),
             "block:reinput_selected_commands" => Ok(Command::BlockReinputSelectedCommands),
@@ -271,6 +280,7 @@ impl std::str::FromStr for Command {
             "pane:resize_down" => Ok(Command::PaneResizeDown),
             "pane:zoom_toggle" => Ok(Command::PaneZoomToggle),
             "pane:swap" => Ok(Command::PaneSwap),
+            "pane:equalize" => Ok(Command::PaneEqualize),
             "window:close" => Ok(Command::WindowClose),
             "config:open" => Ok(Command::ConfigOpen),
             "config:close" => Ok(Command::ConfigClose),
@@ -737,6 +747,10 @@ mod tests {
         let cmd: Command = "sidebar:toggle".parse().unwrap();
         assert_eq!(cmd, Command::SidebarToggle);
 
+        let cmd: Command = "pane:equalize".parse().unwrap();
+        assert_eq!(cmd, Command::PaneEqualize);
+        assert_eq!(cmd.to_string(), "pane:equalize");
+
         let cmd: Command = "edit:copy_block_output".parse().unwrap();
         assert_eq!(cmd, Command::EditCopyBlockOutput);
         assert_eq!(cmd.to_string(), "edit:copy_block_output");
@@ -883,6 +897,7 @@ mod tests {
             ("block:recall_command", Command::BlockRecallCommand),
             ("block:select_all", Command::BlockSelectAll),
             ("block:clear", Command::BlockClear),
+            ("block:undo_clear", Command::BlockUndoClear),
             ("block:select_prev", Command::BlockSelectPrev),
             ("block:select_next", Command::BlockSelectNext),
             (

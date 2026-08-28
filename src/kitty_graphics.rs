@@ -777,6 +777,45 @@ impl KittyGraphicsState {
         before - self.placements.len()
     }
 
+    /// Inverse of [`Self::retain_placements_from_buffer_row`] for undo-clear,
+    /// called after `inserted_rows` rows came back at the buffer front:
+    /// surviving anchors shift up to stay on their text, then the stashed
+    /// placements return with their original absolute rows. An image id still
+    /// referenced keeps its current data; only absent images are re-admitted
+    /// (and re-accounted against the memory budget).
+    pub fn restore_cleared_placements(
+        &mut self,
+        inserted_rows: usize,
+        placements: Vec<KittyPlacement>,
+        images: Vec<(u32, KittyImage)>,
+    ) {
+        if inserted_rows > 0 {
+            for placement in &mut self.placements {
+                placement.buffer_row = placement.buffer_row.saturating_add(inserted_rows);
+            }
+            for request in self.pending_placements.values_mut() {
+                request.buffer_row = request.buffer_row.saturating_add(inserted_rows);
+            }
+        }
+        for (image_id, image) in images {
+            if self.images.contains_key(&image_id) {
+                continue;
+            }
+            self.total_image_memory = self
+                .total_image_memory
+                .saturating_add(image.data.len() as u64);
+            self.access_order.push_back(image_id);
+            self.images.insert(image_id, image);
+        }
+        // The stash predates the survivors; keeping it ahead of them preserves
+        // arrival paint order for equal z-indexes under the stable re-sort.
+        let mut combined = placements;
+        combined.append(&mut self.placements);
+        self.placements = combined;
+        self.placements.sort_by_key(|placement| placement.z_index);
+        self.enforce_image_limits();
+    }
+
     /// Keep placement buffer anchors aligned when physical rows fall off the
     /// top of scrollback. Placements whose own anchor disappeared are removed;
     /// surviving grid/history placements shift with the text.
