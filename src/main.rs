@@ -12576,8 +12576,8 @@ impl Frost {
                 if let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) {
                     if let Some(session) = self.command_corrections.get_mut(session_id) {
                         if let Some(proposal) = session.proposal.as_mut() {
-                            proposal.draft = draft;
-                            proposal.feedback = None;
+                            *proposal.draft_mut() = draft;
+                            proposal.set_feedback(None);
                         }
                     }
                 }
@@ -20821,11 +20821,11 @@ impl Frost {
     // ===== Review-first command correction (command_correction) =====
 
     /// Offer a review-first correction after a narrowly classified Block-mode
-    /// failure in the session `id`. Mirrors anvil's
-    /// `maybe_start_command_correction`: any finished command first retires the
-    /// pane's previous card/request, then verified local evidence wins over the
-    /// strict-JSON AI fallback, and nothing runs without an explicit card
-    /// action. Returns the worker task when a request was started.
+    /// failure in the session `id`. Any finished command first retires the
+    /// pane's previous card/request; the shared engine then decides whether
+    /// this failure is one it reacts to at all, verified local evidence wins
+    /// over the strict-JSON AI fallback, and nothing runs without an explicit
+    /// card action. Returns the worker task when a request was started.
     fn maybe_start_command_correction(
         &mut self,
         session_id: usize,
@@ -20834,59 +20834,75 @@ impl Frost {
         // A newly finished command makes any visible card or in-flight request
         // for this pane stale before this failure is even classified.
         self.command_corrections.close(session_id);
-        // Only a shell-reported completion is failure evidence; a
-        // boundary-inferred one may not correspond to a real command exit.
-        if completed.completion_provenance != block_mode::CompletionProvenance::ShellReported {
-            return None;
-        }
-        // Agent-approved commands already went through review; correcting them
-        // would compete with the Agent session's own loop.
-        if completed.agent_generation.is_some() {
-            return None;
-        }
-        // A shell that reported no exit status gives no failure signal, and
-        // inventing one would put a "did you mean" card under a command that
-        // may well have succeeded.
-        let exit_code = completed.exit_code?;
         let enabled = command_correction::correction_monitor_enabled(
             self.config.ai_enabled,
             self.config.command_correction_enabled,
             self.agent.is_open,
         );
+        // `should_start` re-checks this, and it is the engine that owns every
+        // other refusal. Answering frost's own composite gate first is purely
+        // about the clone below: `CompletionFacts` takes the block output by
+        // value, this runs for every finished command, and a block holds up to
+        // `MAX_CAPTURED_OUTPUT_BYTES` — so with the toggle off (the default)
+        // that would be an 8 MiB copy per `ls` for a feature that is not on.
+        // Pre-sampling instead would be wrong: the engine samples, and
+        // sampling a sample elides real content a second time.
         if !enabled {
             return None;
         }
-        let output = command_correction::sample_output(&completed.output);
-        let kind = command_correction::classify_failure(&completed.command, exit_code, &output)?;
         let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
-        let remote = sess.managed_remote;
-        let cwd = sess
-            .cwd_cache
-            .clone()
-            .or_else(|| sess.cwd())
-            .filter(|cwd| cwd.len() <= command_correction::MAX_CORRECTION_CWD_BYTES)
-            .unwrap_or_default();
+        let facts = command_correction::CompletionFacts {
+            command: completed.command.clone(),
+            // A shell that reported no exit status gives no failure signal,
+            // and inventing one would put a "did you mean" card under a
+            // command that may well have succeeded.
+            exit_code: completed.exit_code,
+            // Whole, not sampled: `should_start` reduces this to the engine's
+            // own bounded head/tail sample before anything classifies it, and
+            // sampling twice elides real content out of the middle of the
+            // first sample.
+            output: completed.output.clone(),
+            cwd: sess
+                .cwd_cache
+                .clone()
+                .or_else(|| sess.cwd())
+                .filter(|cwd| cwd.len() <= command_correction::MAX_CORRECTION_CWD_BYTES),
+            remote: sess.managed_remote,
+            // Agent-approved commands already went through review; correcting
+            // them would compete with the Agent session's own loop.
+            agent_issued: completed.agent_generation.is_some(),
+            // Only a shell-reported completion is failure evidence: a
+            // boundary-inferred one attributes stale scrollback and a guessed
+            // status to a command, so the classifier would read "command not
+            // found" out of the *previous* command's output.
+            trusted_completion: completed.completion_provenance
+                == block_mode::CompletionProvenance::ShellReported,
+        };
+        // The whole trigger is one decision in the engine — the toggles, the
+        // two refusals above, the missing status, the output sample and the
+        // narrow classifier — so no copy of this surface can forget one of
+        // them again.
+        let request = command_correction::should_start(enabled, facts)?;
         let deadline = std::time::Instant::now() + command_correction::CORRECTION_REQUEST_TIMEOUT;
         let (generation, token) = self.command_corrections.begin(
             session_id,
-            completed.command.clone(),
-            exit_code,
+            request.command().to_string(),
+            request.exit_code(),
             deadline,
         );
         // A missing credential disables only the AI fallback inside the
         // worker; the verified local resolvers run regardless.
         let client = agent::client_from_config(&self.config).ok();
-        let original = completed.command.clone();
+        // Stated per request, because `ai_share_command_context` is a live
+        // config value: with it off the local resolvers still run and the
+        // provider is never contacted.
+        let policy = command_correction::correction_policy(self.config.ai_share_command_context);
         Some(Task::perform(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
                     command_correction::resolve_correction_blocking(
-                        &original,
-                        exit_code,
-                        &output,
-                        if cwd.is_empty() { "." } else { &cwd },
-                        &kind,
-                        remote,
+                        &policy,
+                        &request,
                         client.as_ref(),
                         &token,
                         deadline,
@@ -20929,33 +20945,24 @@ impl Frost {
         let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) else {
             return Task::none();
         };
-        let prepared = {
+        let accepted = {
             let Some(session) = self.command_corrections.get_mut(session_id) else {
                 return Task::none();
             };
             let Some(proposal) = session.proposal.as_mut() else {
                 return Task::none();
             };
-            match crate::review_text::validate_single_line(
-                &proposal.draft,
-                command_correction::MAX_CORRECTION_COMMAND_BYTES,
-            ) {
-                Ok(command) => {
-                    let run = command_correction::verified_run_allowed(
-                        proposal.evidence,
-                        &proposal.command,
-                        command,
-                    );
-                    Ok((command.to_string(), run))
-                }
+            // The engine re-validates the edited draft against this surface's
+            // own 16 KiB single-line budget and decides run-versus-insert from
+            // that same validated string, so the button's label and what this
+            // path submits cannot disagree.
+            match proposal.accept() {
+                Ok(accepted) => accepted,
                 Err(error) => {
-                    proposal.feedback = Some(format!("Cannot accept correction: {error}"));
-                    Err(())
+                    proposal.set_feedback(Some(format!("Cannot accept correction: {error}")));
+                    return Task::none();
                 }
             }
-        };
-        let Ok((command, run)) = prepared else {
-            return Task::none();
         };
         // Final prompt-ownership check at the write boundary, same as recall
         // and guarded retry: the prompt that was clean when the card appeared
@@ -20963,22 +20970,24 @@ impl Frost {
         if let Err(reason) = self.session_prompt_replace_ready(session_id) {
             if let Some(session) = self.command_corrections.get_mut(session_id) {
                 if let Some(proposal) = session.proposal.as_mut() {
-                    proposal.feedback = Some(format!("Cannot accept correction: {reason}"));
+                    proposal.set_feedback(Some(format!("Cannot accept correction: {reason}")));
                 }
             }
             return Task::none();
         }
-        let written = if run {
-            self.write_paste_to_session(session_id, &command, correction_run_policy(), true)
+        let policy = if accepted.run_directly {
+            correction_run_policy()
         } else {
-            self.write_paste_to_session(session_id, &command, block_reinput_policy(), true)
+            block_reinput_policy()
         };
+        let written = self.write_paste_to_session(session_id, &accepted.command, policy, true);
         if written {
             self.dismiss_active_correction();
         } else if let Some(session) = self.command_corrections.get_mut(session_id) {
             if let Some(proposal) = session.proposal.as_mut() {
-                proposal.feedback =
-                    Some("The target prompt changed before the command could be queued.".into());
+                proposal.set_feedback(Some(
+                    "The target prompt changed before the command could be queued.".into(),
+                ));
             }
         }
         Task::none()
@@ -22530,22 +22539,18 @@ impl Frost {
         let session_id = self.sessions.get(self.active).map(|sess| sess.id)?;
         let session = self.command_corrections.get(session_id)?;
         let proposal = session.proposal.as_ref()?;
-        let direct_run = command_correction::verified_run_allowed(
-            proposal.evidence,
-            &proposal.command,
-            &proposal.draft,
-        );
+        let candidate = proposal.candidate();
+        // Recomputed against the live draft on every keystroke: any edit
+        // downgrades even a verified proposal to insert-only, and the engine
+        // answers this about exactly the string `accept()` would submit.
+        let direct_run = proposal.run_allowed();
 
         let header = row![
-            text(proposal.evidence.title()).size(14),
+            text(candidate.display_title()).size(14),
             Space::new().width(Length::Fill),
-            text(format!(
-                "exit {} · {}",
-                session.exit_code,
-                proposal.evidence.label()
-            ))
-            .size(11)
-            .style(text::secondary),
+            text(candidate.display_badge(session.exit_code))
+                .size(11)
+                .style(text::secondary),
             button(text("✕").size(12))
                 .style(button::secondary)
                 .on_press(Message::CommandCorrectionDismiss),
@@ -22553,16 +22558,16 @@ impl Frost {
         .spacing(10)
         .align_y(iced::Alignment::Center);
 
-        let description = text(format!(
-            "{}\nFailed command: {}",
-            proposal.message,
-            command_correction::compact_one_line(&session.original_command, 160)
-        ))
-        .size(12)
-        .wrapping(text::Wrapping::Word)
-        .style(text::secondary);
+        // Both halves are pre-sanitised by the engine, which keeps no raw
+        // model prose at all: this card used to interpolate a
+        // provider-controlled message straight into a label sitting directly
+        // above an editable, pre-filled, auto-focused command field.
+        let description = text(candidate.display_description(&session.original_command))
+            .size(12)
+            .wrapping(text::Wrapping::Word)
+            .style(text::secondary);
 
-        let draft = text_input("corrected command", &proposal.draft)
+        let draft = text_input("corrected command", proposal.draft())
             .id(CORRECTION_INPUT_ID.clone())
             .on_input(Message::CommandCorrectionInput)
             .on_submit(Message::CommandCorrectionAccept)
@@ -22590,8 +22595,24 @@ impl Frost {
         ]
         .spacing(6);
 
-        let mut card = column![header, description, draft, actions].spacing(8);
-        if let Some(feedback) = proposal.feedback.as_deref() {
+        let mut card = column![header, description].spacing(8);
+        // The same destructive-risk label the Agent approval card carries, on
+        // the live draft. `is_dangerous` never gates whether a candidate is
+        // *offered* — it only gates the direct-run decision, which is already
+        // false for every unverified proposal — so `rm -rf ~/work` reaches
+        // this card and used to arrive in exactly the chrome `git status` got.
+        if let Some(reason) = proposal.risk() {
+            card = card.push(
+                text(format!("⚠ destructive: {reason}"))
+                    .size(12)
+                    .style(text::danger),
+            );
+        }
+        card = card.push(draft).push(actions);
+        // Safe to render: the engine sanitises and bounds inline feedback on
+        // the way in, which matters because a provider-shaped parse error is
+        // one of the strings that lands here.
+        if let Some(feedback) = proposal.feedback() {
             card = card.push(text(feedback.to_string()).size(11).style(text::danger));
         }
 

