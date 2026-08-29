@@ -21,7 +21,34 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   本地与远程行为一致；`Ctrl+点击` 多选、`Shift+点击` 按可见顺序框选范围，多选后删除/复制/剪切/
   复制路径按批处理（逐项失败不中断、末尾汇总；删除确认框列出数量与前几个路径）。标题栏的
   ⌕ 按钮打开行内名称过滤：大小写无关子串匹配已加载的树（命中项与其祖先保留并强制展开，清空后
-  恢复原展开状态，不产生新的目录扫描）。跨位置粘贴即为上传/下载（不同远端文件系统经本地临时中转；
+  恢复原展开状态，不产生新的目录扫描）。标题区的 **Hidden** 开关统一控制本地与远端点文件；每次
+  切换都以新 generation 刷新当前根，旧可见性策略下的慢响应无法回写新树。刷新尤其针对慢远端采用
+  stale-while-refresh：现有行、已加载子树与展开状态继续可见；成功结果按路径与类型增量对账，失败则
+  保留最后一次成功内容并内联显示错误；初次加载错误和任意目录的刷新错误都提供可聚焦的 **Retry**，
+  并明确区分 Loading 与 Refreshing。Files 面板在鼠标位于其范围内时支持裸 `F5` 刷新，终端区域仍会
+  收到标准 F5 输入。每个目录请求另有同 generation 的 request id 与取消令牌；同路径新请求、根代次或
+  位置变化会主动退役排队与在途 list，排队任务在启动 SSH/Docker 前失败关闭，在途任务复用进程组
+  watchdog 终止并回收。目录扫描由有界 coordinator 调度：最多 2 个并发、64 个排队，且每个远端
+  authority 最多排队 16 个；根刷新与 Retry 优先，同时每 3 个高优先任务后给懒加载一次机会，高优先
+  请求只能替换同 authority 的懒加载，同路径排队请求合并，溢出拒绝和 worker 异常都会回写明确终态；
+  每个 authority 最多占一个执行槽，不可达主机不会同时堵住 Local 与另一远端。
+  coordinator 还显示最老排队时间和最近一次排队/执行耗时。错误按超时、连接、权限、无效响应等类型
+  归类并只显示脱敏、单行、Unicode 安全文案；transport 失败按 authority、权限/不存在按 path 做
+  2–60 秒分类指数冷却，显式 Retry 只旁路一次；无排队/在途引用的过期冷却会在后续调度时清理。
+  每个成功快照记录更新时间，超过 5 分钟会标为 stale；
+  Files 可见时每轮至多低优先重验两个最老的可见/展开陈旧目录，刷新失败继续显示 last-good 的年龄。
+  文件操作完成后只重扫真正受影响的父目录（含折叠目录缓存），不再用根刷新掩盖嵌套目录陈旧；成功
+  rename/move 会按组件前缀恢复选择与 anchor，失败或取消也会重扫可能已在远端生效的父目录。对账按
+  本次目录子树清理已消失路径的选择、悬停、拖放和延迟操作，跨父目录移动不会被先返回的扫描误删。
+  Remote 路径导航先扫描候选目录，成功才原子换根；失败或乱序响应保留原树、选择和展开状态。
+  标题栏提供 Back/Forward/Parent/Home、≤32 项成功历史、可点击面包屑与安全绝对路径栏；路径栏拒绝
+  超长、相对、`.`/`..`、控制与 Bidi 输入。鼠标位于 Files 时可用 `Alt+Left` / `Alt+Right` /
+  `Alt+Up` / `Alt+Home`，目录右键的 **Open Folder** 可把该目录设为当前根。成功离开的根进入按
+  authority + path + Hidden 策略隔离的 8 项缓存，返回时仅在候选扫描成功后复用幸存子树；文件操作
+  精确失效受影响父目录的缓存。Remote Home 复用切换位置时已验证的绝对 UTF-8 home，不重复启动探针。
+  Remote list v4 由客户端下发 `4096 + 1` 硬上限与隐藏策略，远端到限即停，第 4097 项可靠标记
+  “仅显示前 4096 项”。非法 UTF-8/非单组件/重复路径不会生成可操作行，目录符号链接按文件显示且
+  不可展开。跨位置粘贴即为上传/下载（不同远端文件系统经本地临时中转；
   同一主机的保存 profile 与临时 live socket 直接复制/移动），
   文件按流式传输、目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度
   （可随时取消，取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
@@ -613,7 +640,29 @@ rest and are summarized; the delete confirmation lists the count and the
 first few paths). The ⌕ header button opens an inline name filter over the
 loaded tree — case-insensitive substring, matches keep their ancestors
 (force-expanded while filtering), expansion is exactly restored on clear, and
-no new directory scans happen. Paste also
+no new directory scans happen. The adjacent **Hidden** toggle includes or
+excludes dot-prefixed entries on both Local and remote backends; policy changes
+reload under a new tree generation, so a slow response from the prior mode is
+discarded. Same-root refreshes are stale-while-refresh: existing rows, loaded
+descendants, and expansion state remain visible; a successful scan reconciles
+entries by path and type, while a failed scan keeps the last-good snapshot and
+shows the error inline. Reconciliation also retires selection, hover, drop, and
+delayed-action targets whose rows disappeared. Root navigation is
+transactional: Back/Forward, Parent/Home, breadcrumbs, the safe absolute-path
+bar, and Open Folder scan a candidate before committing, so failure or an
+out-of-order result leaves the current tree, selection, and expansion intact.
+Successful history is capped at 32 entries and departed roots use an
+authority/path/Hidden-bound eight-root cache whose affected parent snapshots
+are precisely invalidated after file operations. The two-slot coordinator
+allows one running scan and at most 16 queued scans per remote authority,
+reports queue/run latency, applies classified 2–60 second cooldowns (an explicit
+Retry bypasses once), retires expired unreferenced cooldown buckets, and while
+Files is visible revalidates at most two oldest visible stale directories per
+tick. Remote list v4 receives an
+explicit `4096 + 1` limit and hidden policy, stops emitting at that bound, and
+uses the extra entry to label a partial snapshot. Invalid UTF-8, non-component,
+and duplicate paths never become actionable rows; directory symlinks render as
+non-expandable files. Paste also
 crosses locations: a remote entry pasted locally downloads, a local entry
 pasted to a remote host uploads, and distinct remote filesystems relay through
 a unique local temp path; saved and temporary live routes to one namespace

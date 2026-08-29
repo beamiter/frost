@@ -8,6 +8,8 @@
 //! (`Task::perform`), never on the UI update path. Buffers are bounded, argv
 //! is validated before spawn, and unknown hosts/locations fail closed.
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -163,6 +165,60 @@ pub(crate) fn same_files_transport(left: &RemoteHostConfig, right: &RemoteHostCo
                 == ssh_args_without_control_path(&right.ssh_args))
 }
 
+/// Opaque identity of one Files namespace. The scheduler and cache need to
+/// isolate unrelated destinations, but must never retain or render a username,
+/// hostname, or authentication argument as diagnostic text.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FilesAuthorityKey(u64);
+
+impl std::fmt::Debug for FilesAuthorityKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FilesAuthorityKey(<redacted>)")
+    }
+}
+
+/// Derive the same namespace identity used by [`same_files_transport`]. A
+/// ControlPath overlay is deliberately ignored, so reconnecting through a live
+/// multiplexed socket neither splits scan fairness nor loses cached subtrees.
+pub(crate) fn files_authority_key(
+    location: &FsLocation,
+    hosts: &[RemoteHostConfig],
+) -> FilesAuthorityKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match location {
+        FsLocation::Local => {
+            0_u8.hash(&mut hasher);
+        }
+        FsLocation::Remote(index) => {
+            1_u8.hash(&mut hasher);
+            if let Some(host) = hosts.get(*index) {
+                hash_files_transport(host, &mut hasher);
+            } else {
+                // Invalid snapshots still get a stable, non-local bucket and
+                // fail closed in the backend. Including the slot prevents all
+                // malformed profiles from blocking one another indefinitely.
+                index.hash(&mut hasher);
+            }
+        }
+        FsLocation::Transient(host) => {
+            1_u8.hash(&mut hasher);
+            hash_files_transport(host, &mut hasher);
+        }
+    }
+    FilesAuthorityKey(hasher.finish())
+}
+
+fn hash_files_transport(host: &RemoteHostConfig, hasher: &mut impl Hasher) {
+    host.docker.hash(hasher);
+    host.host.hash(hasher);
+    host.user.hash(hasher);
+    if !host.docker {
+        for argument in ssh_args_without_control_path(&host.ssh_args) {
+            argument.hash(hasher);
+        }
+    }
+}
+
 /// Exact runtime route for file probes. Unlike [`same_files_transport`], this
 /// includes the live SSH argument vector so a new ControlPath can upgrade an
 /// already visible tree before it is treated as fully joined.
@@ -227,7 +283,16 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// Remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
+/// One bounded directory snapshot. `truncated` is true whenever the backend
+/// proved that more entries exist than the UI retains (or its defensive scan
+/// bound was reached), so a partial tree is never presented as complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryListing {
+    pub entries: Vec<Entry>,
+    pub truncated: bool,
+}
+
+/// Remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
 ///
 /// `list` stdout is NUL-separated pairs `"<t>\0<name>\0"`, t in {d,f,l}, names
 /// relative. Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir,
@@ -240,12 +305,16 @@ pub struct Entry {
 /// `untar` into `untar <dir> <name>`, refusing an existing `<dir>/<name>`
 /// with 17 BEFORE extracting (the microscopic check-extract window is
 /// documented at `upload`), and adds `stat <path>` printing one `<t> <size>`
-/// line for pre-checks. Every v1 op and v2's `cat`/`put`/`tar` stay
+/// line for pre-checks. v4 makes `list` take an explicit positive entry limit
+/// plus a 0/1 hidden-entry policy, stops emitting at that limit, and classifies
+/// symlinks before directories so a link to a directory is never expandable.
+/// Every v1 op and v2's `cat`/`put`/`tar` stay
 /// byte-identical. The stdin-consuming ops print one `fsprobe-ready` line on
 /// stdout first: the client must not stream payload before it arrives,
 /// because the shell's own script buffering would otherwise eat payload bytes.
-const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
+const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
+# `list <dir> <limit> <hidden>` emits at most limit entries; hidden is 0 or 1.
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 # put/untar print "fsprobe-ready" on stdout before reading stdin as payload;
 # stream only after the marker, or the shell's script buffering eats the bytes.
@@ -260,17 +329,32 @@ case "$op" in
     pwd
     ;;
   list)
-    d=${2:-}
+    d=${2:-}; limit=${3:-}; hidden=${4:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|0|*[!0-9]*) exit 2 ;; esac
+    case "$hidden" in 0|1) ;; *) exit 2 ;; esac
     cd "$d" 2>/dev/null || exit 3
-    for f in * .[!.]* ..?*; do
-      if [ -d "$f" ]; then t=d
-      elif [ -L "$f" ]; then t=l
+    count=0
+    emit_list_entry() {
+      f=$1
+      if [ -L "$f" ]; then t=l
+      elif [ -d "$f" ]; then t=d
       elif [ -e "$f" ]; then t=f
-      else continue
+      else return
       fi
       printf '%s\0%s\0' "$t" "$f"
+      count=$((count + 1))
+    }
+    for f in *; do
+      [ "$count" -ge "$limit" ] && break
+      emit_list_entry "$f"
     done
+    if [ "$hidden" = 1 ] && [ "$count" -lt "$limit" ]; then
+      for f in .[!.]* ..?*; do
+        [ "$count" -ge "$limit" ] && break
+        emit_list_entry "$f"
+      done
+    fi
     ;;
   mkdir)
     p=${2:-}
@@ -368,7 +452,10 @@ const MAX_LIST_BYTES: usize = 4 * 1024 * 1024;
 /// One directory renders at most this many entries. The byte cap above bounds
 /// the probe read, but the parsed tree is capped too so a huge remote
 /// directory cannot fill the sidebar with an unbounded listing.
-const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+pub const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+/// Ask the remote for exactly one extra entry. Receiving it proves the visible
+/// 4096-entry snapshot is truncated while still bounding far-side output.
+const DIRECTORY_FETCH_ENTRIES: usize = MAX_DIRECTORY_ENTRIES + 1;
 /// Skipped pairs (dotfiles, unknown kinds) still cost a loop iteration, so
 /// scanning also stops once far more pairs than the entry cap were seen.
 const MAX_SCANNED_PAIRS: usize = MAX_DIRECTORY_ENTRIES * 4;
@@ -397,6 +484,29 @@ fn should_publish(last: (Instant, u64), now: Instant, total: u64) -> bool {
         || total.saturating_sub(last.1) >= PROGRESS_MIN_BYTES
 }
 
+/// Cooperative cancellation shared by queued work and the child-process
+/// watchdog. A caller can retire work before spawn or kill its running process
+/// group through the same atomic flag.
+#[derive(Debug, Default)]
+pub struct CancellationToken {
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl CancellationToken {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Shared state for one in-flight transfer: a throttled byte counter the UI
 /// polls, plus the cancellation flag the worker's watchdog polls. One fresh
 /// handle per transfer; cancel racing completion is a no-op because the
@@ -404,7 +514,7 @@ fn should_publish(last: (Instant, u64), now: Instant, total: u64) -> bool {
 #[derive(Debug)]
 pub struct TransferProgress {
     bytes: std::sync::atomic::AtomicU64,
-    cancelled: std::sync::atomic::AtomicBool,
+    cancellation: CancellationToken,
     last_publish: std::sync::Mutex<(Instant, u64)>,
 }
 
@@ -412,7 +522,7 @@ impl TransferProgress {
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             bytes: std::sync::atomic::AtomicU64::new(0),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancellation: CancellationToken::default(),
             // Backdated so the very first report publishes immediately.
             last_publish: std::sync::Mutex::new((
                 Instant::now()
@@ -430,12 +540,11 @@ impl TransferProgress {
 
     /// Ask the worker to stop; the watchdog's group kill does the rest.
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancellation.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+        self.cancellation.is_cancelled()
     }
 
     /// Record `total` bytes so far, throttled: at most ~4 publishes a second
@@ -461,11 +570,11 @@ impl TransferProgress {
     }
 }
 
-/// The sentinel error cancellation surfaces as; the worker maps it (and any
-/// other artifact of the group kill) to a neutral "cancelled" report via the
-/// progress flag, never to an error.
+/// The sentinel error any cancelled worker surfaces. Transfer callers map it
+/// (and other artifacts of the group kill) to a neutral cancelled report;
+/// stale directory callers reject it by request identity.
 fn cancelled_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled")
+    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
 }
 
 /// Human-readable byte counts for the transfer notice: `512 B`, `2.0 KiB`,
@@ -589,22 +698,22 @@ fn kill_tree(child: &mut std::process::Child) {
 }
 
 /// Wait for `child`, killing the whole group and reporting
-/// [`io::ErrorKind::TimedOut`] when it outlives `timeout`. When a transfer
-/// progress handle is attached, a set cancellation flag takes the exact same
-/// path — group kill, then [`io::ErrorKind::Interrupted`] — so cancel and
-/// timeout are indistinguishable to the pipes downstream.
+/// [`io::ErrorKind::TimedOut`] when it outlives `timeout`. When a cancellation
+/// token is attached, a set flag takes the exact same path — group kill, then
+/// [`io::ErrorKind::Interrupted`] — so cancel and timeout are indistinguishable
+/// to the pipes downstream.
 fn wait_status(
     child: &mut std::process::Child,
     timeout: Duration,
     program: &str,
-    cancel: Option<&std::sync::Arc<TransferProgress>>,
+    cancel: Option<&CancellationToken>,
 ) -> io::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
-                if cancel.is_some_and(|progress| progress.is_cancelled()) {
+                if cancel.is_some_and(CancellationToken::is_cancelled) {
                     kill_tree(child);
                     return Err(cancelled_error());
                 }
@@ -658,11 +767,27 @@ fn run_capture(
     timeout: Duration,
     max_out: usize,
 ) -> io::Result<Capture> {
+    run_capture_with_cancel(argv, stdin_bytes, timeout, max_out, None)
+}
+
+fn run_capture_with_cancel(
+    argv: &[String],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: usize,
+    cancel: Option<&CancellationToken>,
+) -> io::Result<Capture> {
     let program = argv
         .first()
         .map(String::as_str)
         .unwrap_or("<empty argv>")
         .to_string();
+    // A task may have sat in the executor after its tree generation was
+    // retired. Fail before spawn so cancelled queued work cannot start a late
+    // ssh/docker process at all.
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(cancelled_error());
+    }
     let mut child = spawn_grouped(argv)?;
     // The probe exits early on a usage error, so a broken stdin pipe is not
     // itself a failure; the exit-status mapping reports the real problem.
@@ -683,7 +808,7 @@ fn run_capture(
     let stdout_reader = std::thread::spawn(move || read_bounded(&mut stdout_pipe, max_out));
     let stderr_reader = std::thread::spawn(move || read_bounded(&mut stderr_pipe, max_out));
 
-    let status = match wait_status(&mut child, timeout, &program, None) {
+    let status = match wait_status(&mut child, timeout, &program, cancel) {
         Ok(status) => status,
         Err(error) => {
             // Join the readers so no thread outlives the pipes.
@@ -712,16 +837,12 @@ fn run_capture(
 fn stderr_excerpt(stderr: &[u8]) -> String {
     const EXCERPT: usize = 256;
     let text = String::from_utf8_lossy(stderr);
-    let text = text.trim();
-    let mut excerpt: String = text.chars().take(EXCERPT).collect();
-    if text.chars().count() > EXCERPT {
-        excerpt.push('…');
-    }
-    excerpt
+    jterm_core::review_input::safe_inline_display(text.trim(), EXCERPT)
 }
 
-/// Map the probe's documented exit codes onto io error kinds; everything
-/// else (ssh's own 255 included) is `Other` with bounded stderr context.
+/// Map the probe's documented exit codes onto io error kinds; ssh's reserved
+/// 255 is connectivity, and every remaining code is `Other` with bounded
+/// stderr context.
 fn probe_status_error(capture: &Capture) -> io::Error {
     let detail = stderr_excerpt(&capture.stderr);
     let with_detail = |message: &str| {
@@ -732,6 +853,12 @@ fn probe_status_error(capture: &Capture) -> io::Error {
         }
     };
     match capture.status.code() {
+        // OpenSSH reserves 255 for client/transport failure. Preserve that as
+        // a retryable connectivity kind instead of collapsing it into Other.
+        Some(255) => io::Error::new(
+            io::ErrorKind::NotConnected,
+            with_detail("remote connection failed"),
+        ),
         Some(17) => io::Error::new(
             io::ErrorKind::AlreadyExists,
             with_detail("target already exists"),
@@ -757,13 +884,25 @@ fn run_probe(
     timeout: Duration,
     max_out: usize,
 ) -> io::Result<Vec<u8>> {
+    run_probe_with_cancel(host, op, args, timeout, max_out, None)
+}
+
+fn run_probe_with_cancel(
+    host: &RemoteHostConfig,
+    op: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_out: usize,
+    cancel: Option<&CancellationToken>,
+) -> io::Result<Vec<u8>> {
     validate_host_for_execution(host)?;
     let argv = if host.docker {
         docker_argv(host, op, args)
     } else {
         ssh_argv(host, &probe_command(op, args))
     };
-    let capture = run_capture(&argv, PROBE_SCRIPT.as_bytes(), timeout, max_out)?;
+    let capture =
+        run_capture_with_cancel(&argv, PROBE_SCRIPT.as_bytes(), timeout, max_out, cancel)?;
     if !capture.status.success() {
         return Err(probe_status_error(&capture));
     }
@@ -836,42 +975,71 @@ fn sort_entries(entries: &mut [Entry]) {
 
 /// Parse a `list` probe buffer: NUL-separated `"<t>\0<name>\0"` pairs. `d` is
 /// a directory, `f`/`l` are files (symlinks are never expanded into dirs).
-/// Non-UTF-8 names are kept lossy; dotfiles are dropped here so remote and
-/// local listings share one hidden-file policy. At most MAX_DIRECTORY_ENTRIES
-/// entries are kept, and scanning stops after MAX_SCANNED_PAIRS pairs, so a
-/// hostile or enormous listing cannot grow the tree (or the parse work)
-/// without bound.
+/// Invalid UTF-8 and non-component names are skipped: turning raw bytes into a
+/// lossy String would make later Rename/Delete target a different path. Exact
+/// path collisions are also kept only once. At most MAX_DIRECTORY_ENTRIES are
+/// retained, while the one extra pair requested from the probe produces an
+/// explicit truncation signal. MAX_SCANNED_PAIRS remains defense-in-depth for
+/// malformed output that did not honor the negotiated limit.
+#[allow(dead_code)] // compatibility wrapper and default-policy test surface
 fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
+    parse_list_listing(bytes, dir, false).entries
+}
+
+#[allow(dead_code)] // compatibility wrapper and hidden-policy test surface
+fn parse_list_with_hidden(bytes: &[u8], dir: &Path, show_hidden: bool) -> Vec<Entry> {
+    parse_list_listing(bytes, dir, show_hidden).entries
+}
+
+fn parse_list_listing(bytes: &[u8], dir: &Path, show_hidden: bool) -> DirectoryListing {
     let mut entries = Vec::new();
+    let mut seen_paths = HashSet::new();
     let mut fields = bytes.split(|byte| *byte == 0);
     let mut scanned = 0usize;
+    let mut truncated = false;
     while let (Some(kind), Some(name)) = (fields.next(), fields.next()) {
         scanned += 1;
-        if scanned > MAX_SCANNED_PAIRS || entries.len() >= MAX_DIRECTORY_ENTRIES {
+        if scanned > MAX_SCANNED_PAIRS {
+            truncated = true;
             break;
         }
-        if name.is_empty() || name == b"." || name == b".." {
-            continue;
-        }
-        // Match the sidebar behavior. Hidden files remain available by typing
-        // paths in the terminal without overwhelming the visual tree.
-        if name[0] == b'.' {
-            continue;
+        // The normal v4 probe emits exactly entries+1 at most. Seeing the
+        // extra pair proves at least one remote entry is not displayed.
+        if scanned >= DIRECTORY_FETCH_ENTRIES {
+            truncated = true;
         }
         let is_dir = match kind {
             b"d" => true,
             b"f" | b"l" => false,
             _ => continue,
         };
-        let name = String::from_utf8_lossy(name).into_owned();
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            continue;
+        }
+        // Match the sidebar behavior. Hidden files remain available by typing
+        // paths in the terminal without overwhelming the visual tree.
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let path = dir.join(name);
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            truncated = true;
+            continue;
+        }
         entries.push(Entry {
-            path: dir.join(&name),
-            name,
+            path,
+            name: name.to_string(),
             is_dir,
         });
     }
     sort_entries(&mut entries);
-    entries
+    DirectoryListing { entries, truncated }
 }
 
 /// Local one-level listing with the same policy (dotfiles hidden, same sort,
@@ -879,25 +1047,63 @@ fn parse_list(bytes: &[u8], dir: &Path) -> Vec<Entry> {
 /// Like parse_list, at most MAX_DIRECTORY_ENTRIES entries are kept and
 /// scanning stops after MAX_SCANNED_PAIRS entries, so a huge local directory
 /// cannot grow the tree without bound.
+#[allow(dead_code)] // compatibility wrapper and default-policy test surface
 fn local_list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|error| io::Error::other(format!("Cannot read {}: {error}", dir.display())))?;
+    local_list_dir_listing(dir, false).map(|listing| listing.entries)
+}
+
+#[allow(dead_code)] // compatibility wrapper for Vec-only callers
+fn local_list_dir_with_hidden(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+    local_list_dir_listing(dir, show_hidden).map(|listing| listing.entries)
+}
+
+fn local_list_dir_listing(dir: &Path, show_hidden: bool) -> io::Result<DirectoryListing> {
+    local_list_dir_listing_with_cancel(dir, show_hidden, None)
+}
+
+fn local_list_dir_listing_with_cancel(
+    dir: &Path,
+    show_hidden: bool,
+    cancel: Option<&CancellationToken>,
+) -> io::Result<DirectoryListing> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(cancelled_error());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("Cannot read {}: {error}", dir.display()),
+        )
+    })?;
     let mut nodes = Vec::new();
+    let mut truncated = false;
     for (scanned, entry) in entries.enumerate() {
-        if scanned >= MAX_SCANNED_PAIRS || nodes.len() >= MAX_DIRECTORY_ENTRIES {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(cancelled_error());
+        }
+        if scanned >= MAX_SCANNED_PAIRS {
+            truncated = true;
             break;
         }
-        let entry = entry
-            .map_err(|error| io::Error::other(format!("Cannot read {}: {error}", dir.display())))?;
+        let entry = entry.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Cannot read {}: {error}", dir.display()),
+            )
+        })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if !show_hidden && name.starts_with('.') {
             continue;
         }
+        if nodes.len() >= MAX_DIRECTORY_ENTRIES {
+            truncated = true;
+            break;
+        }
         let file_type = entry.file_type().map_err(|error| {
-            io::Error::other(format!(
-                "Cannot inspect {}: {error}",
-                entry.path().display()
-            ))
+            io::Error::new(
+                error.kind(),
+                format!("Cannot inspect {}: {error}", entry.path().display()),
+            )
         })?;
         nodes.push(Entry {
             name,
@@ -906,49 +1112,127 @@ fn local_list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
         });
     }
     sort_entries(&mut nodes);
-    Ok(nodes)
+    Ok(DirectoryListing {
+        entries: nodes,
+        truncated,
+    })
 }
 
 /// List exactly one directory level at `dir`, locally or through the probe.
+#[allow(dead_code)] // retained for callers that want the default hidden policy
 pub fn list_dir(
     loc: &FsLocation,
     hosts: &[RemoteHostConfig],
     dir: &Path,
 ) -> io::Result<Vec<Entry>> {
+    list_dir_with_hidden(loc, hosts, dir, false)
+}
+
+pub fn list_dir_with_hidden(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    dir: &Path,
+    show_hidden: bool,
+) -> io::Result<Vec<Entry>> {
+    list_dir_listing_with_hidden(loc, hosts, dir, show_hidden).map(|listing| listing.entries)
+}
+
+/// List one directory level and retain whether the backend stopped at the
+/// negotiated UI limit. Sidebar loads use this form so partial results are
+/// visibly identified; the Vec-returning wrappers remain for compatibility.
+pub fn list_dir_listing_with_hidden(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    dir: &Path,
+    show_hidden: bool,
+) -> io::Result<DirectoryListing> {
+    list_dir_listing_with_hidden_cancellable(loc, hosts, dir, show_hidden, None)
+}
+
+/// Cancellable directory listing used by the lazy file tree. A retired queued
+/// request observes the token before any helper spawn; an in-flight remote
+/// probe is killed and reaped by the same process-group watchdog as transfers.
+pub fn list_dir_listing_with_hidden_cancellable(
+    loc: &FsLocation,
+    hosts: &[RemoteHostConfig],
+    dir: &Path,
+    show_hidden: bool,
+    cancel: Option<&CancellationToken>,
+) -> io::Result<DirectoryListing> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(cancelled_error());
+    }
     match loc {
-        FsLocation::Local => local_list_dir(dir),
+        FsLocation::Local => local_list_dir_listing_with_cancel(dir, show_hidden, cancel),
         FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
-            let stdout = run_probe(
+            let limit = DIRECTORY_FETCH_ENTRIES.to_string();
+            let hidden = if show_hidden { "1" } else { "0" };
+            let stdout = run_probe_with_cancel(
                 host,
                 "list",
-                &[remote_path(dir)?],
+                &[remote_path(dir)?, &limit, hidden],
                 LIST_TIMEOUT,
                 MAX_LIST_BYTES,
+                cancel,
             )
-            .map_err(|error| io::Error::other(format!("Cannot read {}: {error}", dir.display())))?;
-            Ok(parse_list(&stdout, dir))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Cannot read {}: {error}", dir.display()),
+                )
+            })?;
+            Ok(parse_list_listing(&stdout, dir, show_hidden))
         }
     }
 }
 
 /// The directory a freshly switched location opens at: today's behavior for
 /// local (process cwd), the login home for a remote host.
+fn parse_start_dir_output(stdout: &[u8]) -> io::Result<PathBuf> {
+    let text = std::str::from_utf8(stdout).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote host reported a non-UTF-8 home directory",
+        )
+    })?;
+    let home = text.strip_suffix('\n').unwrap_or(text);
+    let home = home.strip_suffix('\r').unwrap_or(home);
+    let unsafe_text = home.is_empty()
+        || home.chars().any(char::is_control)
+        || home.chars().any(|ch| {
+            matches!(
+                ch,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'
+                    | '\u{202b}'
+                    | '\u{202c}'
+                    | '\u{202d}'
+                    | '\u{202e}'
+                    | '\u{2066}'
+                    | '\u{2067}'
+                    | '\u{2068}'
+                    | '\u{2069}'
+            )
+        });
+    if unsafe_text || !Path::new(home).is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote host did not report one safe absolute home directory",
+        ));
+    }
+    Ok(PathBuf::from(home))
+}
+
 pub fn start_dir(loc: &FsLocation, hosts: &[RemoteHostConfig]) -> io::Result<PathBuf> {
     match loc {
         FsLocation::Local => Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
         FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             let stdout = run_probe(host, "home", &[], LIST_TIMEOUT, MAX_OP_BYTES)?;
-            let text = String::from_utf8_lossy(&stdout);
-            let home = text.lines().next().unwrap_or("").trim();
-            if !home.starts_with('/') {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "remote host did not report a home directory",
-                ));
-            }
-            Ok(PathBuf::from(home))
+            parse_start_dir_output(&stdout)
         }
     }
 }
@@ -1282,7 +1566,12 @@ fn stream_argv_to_temp(
         // The watchdog covers a stalled remote and the cancel flag; after a
         // group kill the pipes close and both threads end, so the joins below
         // always terminate.
-        let status = wait_status(&mut child, TRANSFER_TIMEOUT, &program, progress);
+        let status = wait_status(
+            &mut child,
+            TRANSFER_TIMEOUT,
+            &program,
+            progress.map(|progress| &progress.cancellation),
+        );
         let streamed = streamer
             .join()
             .map_err(|_| io::Error::other("stream writer thread panicked"));
@@ -1437,7 +1726,12 @@ fn stream_file_to_argv(
         }
         result
     });
-    let status = wait_status(&mut child, TRANSFER_TIMEOUT, &program, progress);
+    let status = wait_status(
+        &mut child,
+        TRANSFER_TIMEOUT,
+        &program,
+        progress.map(|progress| &progress.cancellation),
+    );
     let written = writer
         .join()
         .map_err(|_| io::Error::other("stream writer thread panicked"));
@@ -1907,7 +2201,10 @@ mod tests {
 
     #[test]
     fn probe_command_is_one_shell_string() {
-        assert_eq!(probe_command("list", &["/tmp"]), "sh -s -- list '/tmp'");
+        assert_eq!(
+            probe_command("list", &["/tmp", "4097", "0"]),
+            "sh -s -- list '/tmp' '4097' '0'"
+        );
         assert_eq!(
             probe_command("mv", &["/a o'ne", "/b two"]),
             "sh -s -- mv '/a o'\\''ne' '/b two'"
@@ -1915,8 +2212,44 @@ mod tests {
     }
 
     #[test]
+    fn remote_home_output_is_strict_absolute_utf8_and_single_line() {
+        assert_eq!(
+            parse_start_dir_output(b"/home/alice\n").expect("ordinary home"),
+            PathBuf::from("/home/alice")
+        );
+        assert_eq!(
+            parse_start_dir_output("/home/雪\n".as_bytes()).expect("unicode home"),
+            PathBuf::from("/home/雪")
+        );
+        for unsafe_output in [
+            b"relative\n".as_slice(),
+            b"/safe\n/forged\n".as_slice(),
+            b"/safe\0tail\n".as_slice(),
+            b"/safe\x1b[31m\n".as_slice(),
+            b"/bad\xff\n".as_slice(),
+        ] {
+            assert!(parse_start_dir_output(unsafe_output).is_err());
+        }
+        assert!(parse_start_dir_output("/safe\u{202e}txt\n".as_bytes()).is_err());
+    }
+
+    #[test]
+    fn stderr_excerpt_is_bounded_and_safe_for_inline_ui() {
+        let excerpt = stderr_excerpt(
+            "first\nsecond\u{1b}[31mred\u{202e}txt雪雪雪"
+                .repeat(100)
+                .as_bytes(),
+        );
+        assert!(!excerpt.contains('\n'));
+        assert!(!excerpt.contains('\u{1b}'));
+        assert!(!excerpt.contains('\u{202e}'));
+        assert!(excerpt.len() <= 256);
+        assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn ssh_argv_places_options_args_dest_and_one_command() {
-        let argv = ssh_argv(&ssh_host(), "sh -s -- list '/tmp'");
+        let argv = ssh_argv(&ssh_host(), "sh -s -- list '/tmp' '4097' '0'");
         assert_eq!(
             argv,
             vec![
@@ -1929,7 +2262,7 @@ mod tests {
                 "22",
                 "--",
                 "yj@dev.example.com",
-                "sh -s -- list '/tmp'",
+                "sh -s -- list '/tmp' '4097' '0'",
             ]
         );
     }
@@ -1944,12 +2277,12 @@ mod tests {
 
     #[test]
     fn docker_argv_is_raw_and_never_allocates_a_tty() {
-        let argv = docker_argv(&docker_host(), "list", &["/var/log"]);
+        let argv = docker_argv(&docker_host(), "list", &["/var/log", "4097", "0"]);
         assert_eq!(
             argv,
             vec![
                 "docker", "exec", "-i", "-u", "root", "myubuntu", "sh", "-s", "--", "list",
-                "/var/log",
+                "/var/log", "4097", "0",
             ]
         );
         assert!(!argv.iter().any(|arg| arg == "-t"));
@@ -2000,11 +2333,12 @@ mod tests {
     fn probe_list_reports_types_and_relative_names() {
         let root = temp_tree();
         let root_str = root.to_str().expect("utf-8 temp path").to_string();
-        let capture = probe("list", &[&root_str]);
+        let capture = probe("list", &[&root_str, "4097", "0"]);
         assert!(capture.status.success());
         let entries = parse_list(&capture.stdout, &root);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        // Dotfiles are filtered by the Rust-side policy, dirs sort first.
+        // The probe applies the requested hidden policy; the parser repeats it
+        // as defense-in-depth. Directories still sort first.
         assert_eq!(names, vec!["nested", "file.txt", "with space.txt"]);
         assert!(entries[0].is_dir);
         assert_eq!(entries[1].path, root.join("file.txt"));
@@ -2013,11 +2347,54 @@ mod tests {
 
     #[test]
     fn probe_list_rejects_relative_and_missing_dirs() {
-        assert_eq!(probe("list", &["relative/path"]).status.code(), Some(2));
         assert_eq!(
-            probe("list", &["/definitely/not/there"]).status.code(),
+            probe("list", &["relative/path", "4097", "0"]).status.code(),
+            Some(2)
+        );
+        assert_eq!(
+            probe("list", &["/definitely/not/there", "4097", "0"])
+                .status
+                .code(),
             Some(3)
         );
+        assert_eq!(probe("list", &["/tmp", "0", "0"]).status.code(), Some(2));
+        assert_eq!(
+            probe("list", &["/tmp", "4097", "maybe"]).status.code(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn probe_list_honors_the_client_limit_and_hidden_policy() {
+        let root = temp_tree();
+        let root_str = root.to_str().expect("utf-8 temp path").to_string();
+        let limited = probe("list", &[&root_str, "2", "0"]);
+        assert!(limited.status.success());
+        assert_eq!(limited.stdout.split(|byte| *byte == 0).count() / 2, 2);
+        let hidden = probe("list", &[&root_str, "16", "1"]);
+        assert!(hidden.status.success());
+        assert!(parse_list_with_hidden(&hidden.stdout, &root, true)
+            .iter()
+            .any(|entry| entry.name == ".hidden"));
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_list_classifies_a_directory_symlink_as_a_non_directory() {
+        let root = temp_tree();
+        let link = root.join("nested-link");
+        std::os::unix::fs::symlink(root.join("nested"), &link).expect("create directory symlink");
+        let root_str = root.to_str().expect("utf-8 temp path").to_string();
+        let capture = probe("list", &[&root_str, "4097", "0"]);
+        assert!(capture.status.success());
+        let entries = parse_list(&capture.stdout, &root);
+        let link = entries
+            .iter()
+            .find(|entry| entry.name == "nested-link")
+            .expect("listed symlink");
+        assert!(!link.is_dir, "a directory symlink must never be expandable");
+        std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
     #[test]
@@ -2069,13 +2446,26 @@ mod tests {
         );
         std::fs::remove_dir_all(root).expect("remove test tree");
 
-        let relative = probe("list", &["nope"]);
+        let relative = probe("list", &["nope", "4097", "0"]);
         assert_eq!(
             probe_status_error(&relative).kind(),
             io::ErrorKind::InvalidInput
         );
-        let absent = probe("list", &["/definitely/not/there"]);
+        let absent = probe("list", &["/definitely/not/there", "4097", "0"]);
         assert_eq!(probe_status_error(&absent).kind(), io::ErrorKind::NotFound);
+
+        let ssh_failure = Capture {
+            status: Command::new("sh")
+                .args(["-c", "exit 255"])
+                .status()
+                .expect("run exit fixture"),
+            stdout: Vec::new(),
+            stderr: b"connection reset".to_vec(),
+        };
+        assert_eq!(
+            probe_status_error(&ssh_failure).kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 
     // ── Probe v2 streaming ops, exercised against the real `sh` ────────
@@ -2474,7 +2864,7 @@ mod tests {
     } // ── List parsing ────────────────────────────────────────────────────
 
     #[test]
-    fn parse_list_handles_odd_names_and_truncation() {
+    fn parse_list_skips_unsafe_names_and_deduplicates_paths() {
         let dir = Path::new("/base");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"d\0dir one\0");
@@ -2482,6 +2872,9 @@ mod tests {
         bytes.extend_from_slice(b"l\0sym link\0");
         bytes.extend_from_slice(b"f\0.hidden\0");
         bytes.extend_from_slice(b"f\0\xff\xfe raw\0");
+        bytes.extend_from_slice("f\0�� raw\0".as_bytes());
+        bytes.extend_from_slice(b"f\0dir one\0");
+        bytes.extend_from_slice(b"f\0nested/name\0");
         bytes.extend_from_slice(b"x\0unknown kind\0");
         // A dangling half-pair (as a capped read leaves) is simply dropped.
         bytes.extend_from_slice(b"d\0");
@@ -2491,6 +2884,19 @@ mod tests {
         assert!(entries[0].is_dir);
         assert!(!entries[1].is_dir && !entries[2].is_dir);
         assert_eq!(entries[3].path, dir.join("�� raw"));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.name == "dir one")
+                .count(),
+            1,
+            "the first type for a duplicate path wins"
+        );
+        assert!(entries.iter().all(|entry| entry.name != "nested/name"));
+
+        let shown = parse_list_with_hidden(&bytes, dir, true);
+        let shown_names: Vec<&str> = shown.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(shown_names.contains(&".hidden"));
     }
 
     #[test]
@@ -2509,9 +2915,10 @@ mod tests {
         for index in 0..MAX_DIRECTORY_ENTRIES + 50 {
             bytes.extend_from_slice(format!("f\0file-{index:06}\0").as_bytes());
         }
-        let entries = parse_list(&bytes, dir);
+        let listing = parse_list_listing(&bytes, dir, false);
         // Parsing stays bounded; the tree never sees more than the cap.
-        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert_eq!(listing.entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert!(listing.truncated);
     }
 
     #[test]
@@ -2525,8 +2932,9 @@ mod tests {
             bytes.extend_from_slice(format!("f\0.hidden-{index:06}\0").as_bytes());
         }
         bytes.extend_from_slice(b"f\0visible\0");
-        let entries = parse_list(&bytes, dir);
-        assert!(entries.is_empty());
+        let listing = parse_list_listing(&bytes, dir, false);
+        assert!(listing.entries.is_empty());
+        assert!(listing.truncated);
     }
 
     #[test]
@@ -2536,9 +2944,10 @@ mod tests {
         for index in 0..MAX_DIRECTORY_ENTRIES + 50 {
             std::fs::write(root.join(format!("file-{index:06}")), b"x").expect("write test file");
         }
-        let entries = local_list_dir(&root).expect("list dir");
+        let listing = local_list_dir_listing(&root, false).expect("list dir");
         // The local listing is bounded by the same cap as the remote one.
-        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert_eq!(listing.entries.len(), MAX_DIRECTORY_ENTRIES);
+        assert!(listing.truncated);
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
@@ -2699,6 +3108,56 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_queued_capture_never_spawns_its_child() {
+        let root = temp_tree();
+        let marker = root.join("spawned");
+        let argv = vec!["touch".to_string(), marker.display().to_string()];
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = run_capture_with_cancel(
+            &argv,
+            b"",
+            Duration::from_secs(5),
+            1024,
+            Some(&cancellation),
+        )
+        .expect_err("a retired queued request must fail before spawn");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!marker.exists(), "the cancelled command must never run");
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn cancellation_kills_an_in_flight_capture_group() {
+        let argv: Vec<String> = ["sh", "-c", "sleep 30"]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect();
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let gate = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            canceller.cancel();
+        });
+        let started = Instant::now();
+
+        let error = run_capture_with_cancel(
+            &argv,
+            b"",
+            Duration::from_secs(30),
+            1024,
+            Some(&cancellation),
+        )
+        .expect_err("an in-flight probe must stop on cancellation");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        gate.join().expect("cancel thread");
+    }
+
+    #[test]
     fn run_capture_kills_overdue_children() {
         let argv: Vec<String> = ["sh", "-c", "sleep 30"]
             .iter()
@@ -2758,6 +3217,21 @@ mod tests {
             ["-p", "22", "-S", "/run/user/1000/jsh/cm-%C"]
         );
         assert!(same_files_transport(&base, &overlaid));
+        assert_eq!(
+            files_authority_key(&FsLocation::Remote(0), std::slice::from_ref(&base)),
+            files_authority_key(&FsLocation::Transient(overlaid.clone()), &[]),
+            "ControlPath overlays share scheduler and cache isolation"
+        );
+        let mut other = base.clone();
+        other.host = "other.example".to_string();
+        assert_ne!(
+            files_authority_key(&FsLocation::Remote(0), std::slice::from_ref(&base)),
+            files_authority_key(&FsLocation::Transient(other), &[])
+        );
+        assert_ne!(
+            files_authority_key(&FsLocation::Local, &[]),
+            files_authority_key(&FsLocation::Remote(0), std::slice::from_ref(&base))
+        );
         assert!(!same_files_execution(&base, &overlaid));
         assert!(same_files_execution(&overlaid, &overlaid));
         assert!(same_files_location(

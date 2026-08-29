@@ -124,6 +124,125 @@ fn block_search_manual_refresh_key(
         && !modifiers.logo()
 }
 
+/// Files owns bare F5 only while the pointer is inside its visible dock. The
+/// terminal therefore keeps its ordinary F5 escape sequence everywhere else.
+fn sidebar_files_manual_refresh_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    files_scope: bool,
+) -> bool {
+    files_scope && block_search_manual_refresh_key(key, modifiers, repeat)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarNavigationKey {
+    Back,
+    Forward,
+    Parent,
+    Home,
+}
+
+/// Remote/local tree navigation owns Alt+Up and Alt+Home only while Files has
+/// the same explicit pointer scope as F5. Everywhere else the PTY receives the
+/// original key unchanged.
+fn sidebar_files_navigation_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    repeat: bool,
+    files_scope: bool,
+) -> Option<SidebarNavigationKey> {
+    if !files_scope
+        || repeat
+        || !modifiers.alt()
+        || modifiers.shift()
+        || modifiers.control()
+        || modifiers.logo()
+    {
+        return None;
+    }
+    match key {
+        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Some(SidebarNavigationKey::Back),
+        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+            Some(SidebarNavigationKey::Forward)
+        }
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(SidebarNavigationKey::Parent),
+        keyboard::Key::Named(keyboard::key::Named::Home) => Some(SidebarNavigationKey::Home),
+        _ => None,
+    }
+}
+
+const SIDEBAR_SNAPSHOT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+fn compact_scan_duration(duration: std::time::Duration) -> String {
+    if duration < std::time::Duration::from_secs(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}s", duration.as_secs())
+    }
+}
+
+fn sidebar_breadcrumbs(
+    path: &std::path::Path,
+    max_items: usize,
+) -> Vec<(String, std::path::PathBuf)> {
+    if max_items == 0 || !path.is_absolute() {
+        return Vec::new();
+    }
+    let mut crumbs = vec![("/".to_string(), std::path::PathBuf::from("/"))];
+    let mut cursor = std::path::PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        cursor.push(name);
+        let label = jterm_core::review_input::safe_inline_display(&name.to_string_lossy(), 48);
+        crumbs.push((
+            if label.is_empty() {
+                "?".to_string()
+            } else {
+                label
+            },
+            cursor.clone(),
+        ));
+    }
+    if crumbs.len() <= max_items {
+        return crumbs;
+    }
+    if max_items == 1 {
+        return crumbs.into_iter().rev().take(1).collect();
+    }
+    if max_items == 2 {
+        return vec![crumbs[0].clone(), crumbs.last().expect("non-empty").clone()];
+    }
+    let tail_len = max_items - 2;
+    let tail_start = crumbs.len() - tail_len;
+    let mut bounded = Vec::with_capacity(max_items);
+    bounded.push(crumbs[0].clone());
+    bounded.push(("…".to_string(), crumbs[tail_start - 1].1.clone()));
+    bounded.extend(crumbs.into_iter().skip(tail_start));
+    bounded
+}
+
+fn sidebar_snapshot_age_copy(age: std::time::Duration) -> (String, bool) {
+    let stale = age >= SIDEBAR_SNAPSHOT_STALE_AFTER;
+    let age_copy = if age < std::time::Duration::from_secs(60) {
+        "just now".to_string()
+    } else if age < std::time::Duration::from_secs(60 * 60) {
+        format!("{}m ago", age.as_secs() / 60)
+    } else {
+        format!("{}h ago", age.as_secs() / (60 * 60))
+    };
+    (
+        if stale {
+            format!("Updated {age_copy} · stale")
+        } else {
+            format!("Updated {age_copy}")
+        },
+        stale,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockSearchToggleKeyRoute {
     NotToggle,
@@ -726,6 +845,8 @@ static SIDEBAR_DIALOG_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-dialog-input"));
 static SIDEBAR_FILTER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-filter-input"));
+static SIDEBAR_PATH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-path-input"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 static CORRECTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -1704,6 +1825,7 @@ enum SidebarPanel {
 /// Delete/Copy/Cut act on the clicked node itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarMenuAction {
+    OpenDirectory,
     NewFile,
     NewFolder,
     Rename,
@@ -2124,19 +2246,33 @@ struct SidebarOpReport {
     /// dangling Copy as well as Cut entries and is settled before the report's
     /// UI-context gate.
     consumed_paths: Vec<std::path::PathBuf>,
+    /// Destination-side directory snapshots whose immediate children may
+    /// have changed, including ambiguous remote failures.
+    affected_parents: Vec<std::path::PathBuf>,
+    /// Backend-confirmed same-location moves. Selection and its anchor follow
+    /// these exact path-prefix rewrites before reconciliation prunes rows.
+    path_remaps: Vec<SidebarPathRemap>,
     op: SidebarOp,
     warning: Option<(String, bool)>,
     cancelled: bool,
     result: Result<(), String>,
 }
 
-type SidebarWorkerOutcome = (
-    remote_fs::FsLocation,
-    Option<(String, bool)>,
-    bool,
-    std::io::Result<()>,
-    Vec<std::path::PathBuf>,
-);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarPathRemap {
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+}
+
+struct SidebarWorkerOutcome {
+    location: remote_fs::FsLocation,
+    warning: Option<(String, bool)>,
+    cancelled: bool,
+    result: std::io::Result<()>,
+    consumed_paths: Vec<std::path::PathBuf>,
+    affected_parents: Vec<std::path::PathBuf>,
+    path_remaps: Vec<SidebarPathRemap>,
+}
 
 fn sidebar_op_report_matches_context(
     report_epoch: u64,
@@ -2996,13 +3132,30 @@ enum Message {
     /// Open a new terminal from the Files header. Local starts at the visible
     /// tree root; Remote opens the selected profile at its default directory.
     SidebarOpenTerminal(u64),
+    SidebarGoBack,
+    SidebarGoForward,
     SidebarGoParent,
+    SidebarGoHome,
+    SidebarNavigatePath(std::path::PathBuf),
+    SidebarPathEdit,
+    SidebarPathInput(String),
+    SidebarPathSubmit,
+    SidebarPathCancel,
     SidebarRefresh,
+    SidebarScanTick,
+    SidebarSnapshotTick,
+    /// Retry the exact failed directory row rendered by this tree generation.
+    SidebarRetry(u64, std::path::PathBuf),
+    SidebarShowHidden(bool),
     SidebarLoaded(sidebar::DirectoryResult),
     /// Switch the file tree between Local and a configured remote host.
     SidebarSetLocation(u64, remote_fs::FsLocation),
     /// Async start-directory resolution for a location switch (generation-guarded).
-    SidebarLocationResolved(u64, Result<std::path::PathBuf, String>),
+    SidebarLocationResolved(
+        u64,
+        u64,
+        Result<std::path::PathBuf, sidebar::DirectoryError>,
+    ),
     /// Staged home probe for an SSH process observed through `/proc`. The
     /// existing tree remains visible until this succeeds and is revalidated.
     SidebarRemoteFollowResolved(u64, Result<std::path::PathBuf, String>),
@@ -4131,6 +4284,9 @@ struct Frost {
     theme_editor: Option<ThemeEditState>,
     /// File-tree sidebar (left panel) and whether it is currently shown.
     sidebar: sidebar::Sidebar,
+    /// Hard-bounded admission and two-slot dispatch for local/remote directory
+    /// scans. This is the sole path from a DirectoryRequest to worker work.
+    sidebar_scans: sidebar::DirectoryScanCoordinator,
     sidebar_open: bool,
     /// Which content the sidebar dock shows (file tree or tab list).
     sidebar_panel: SidebarPanel,
@@ -4161,6 +4317,9 @@ struct Frost {
     sidebar_selection_anchor: Option<std::path::PathBuf>,
     /// Inline tree filter: Some(query) while the filter row is open.
     sidebar_filter: Option<String>,
+    /// Transactional absolute-path editor. Its draft has no filesystem
+    /// authority until validation succeeds on submit.
+    sidebar_path_input: Option<String>,
     /// Paths of the in-flight drop burst (iced delivers one event per path).
     sidebar_drop_burst: Vec<std::path::PathBuf>,
     /// Tree generation whose drop burst owns the armed debounce task.
@@ -4416,6 +4575,7 @@ impl Frost {
             next_tab_id: 1,
             theme_editor: None,
             sidebar: sidebar::Sidebar::new(),
+            sidebar_scans: sidebar::DirectoryScanCoordinator::default(),
             sidebar_open,
             sidebar_panel,
             dock_width: SIDEBAR_W,
@@ -4430,6 +4590,7 @@ impl Frost {
             sidebar_selection: Vec::new(),
             sidebar_selection_anchor: None,
             sidebar_filter: None,
+            sidebar_path_input: None,
             sidebar_drop_burst: Vec::new(),
             sidebar_drop_debounce_generation: None,
             sidebar_drop_hint: false,
@@ -4869,13 +5030,19 @@ impl Frost {
         self.sidebar_filter = None;
     }
 
-    /// Return the Files panel to a known local root and invalidate every load
-    /// issued for the old location. The caller schedules the returned request.
-    fn reset_sidebar_to_local(&mut self, notice: String) -> sidebar::DirectoryRequest {
+    /// Return the Files panel to a known local root after a host-config
+    /// replacement. The sidebar must cache the retained remote root while the
+    /// old host snapshot still defines its numeric location, then install
+    /// `hosts` and fall back in one state transition.
+    fn reset_sidebar_to_local_with_hosts(
+        &mut self,
+        hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+        notice: String,
+    ) -> sidebar::DirectoryRequest {
         self.clear_sidebar_remote_context();
         let request = self
             .sidebar
-            .reset_to_local(self.local_sidebar_fallback_root());
+            .reset_to_local_with_hosts(self.local_sidebar_fallback_root(), hosts);
         self.sidebar_notice = Some((notice, false));
         request
     }
@@ -5019,9 +5186,8 @@ impl Frost {
         // only when it already uses that exact route. Otherwise stage a probe
         // and upgrade future operations without throwing away loaded rows.
         let already_following = same_target && (!live_execution_requested || same_execution);
-        let preserve_loaded_tree = same_target
-            && !already_following
-            && self.sidebar.root.state == sidebar::DirectoryState::Loaded;
+        let preserve_loaded_tree =
+            same_target && !already_following && self.sidebar.has_loaded_snapshot();
         if already_following {
             self.sidebar_open = true;
             self.sidebar_panel = SidebarPanel::Files;
@@ -5162,12 +5328,12 @@ impl Frost {
 
         let label = pending.target_location.label(self.sidebar.hosts_snapshot());
         self.invalidate_sidebar_remote_follow_intent();
-        self.invalidate_sidebar_pending_work();
         if pending.preserve_loaded_tree
             && self
                 .sidebar
                 .rebind_same_namespace_preserving_tree(pending.target_location.clone())
         {
+            self.invalidate_sidebar_pending_work();
             self.sidebar_open = true;
             self.sidebar_panel = SidebarPanel::Files;
             self.sidebar_notice = Some((format!("Following {label}"), true));
@@ -5175,8 +5341,6 @@ impl Frost {
             return Task::none();
         }
 
-        self.sidebar_selection.clear();
-        self.sidebar_selection_anchor = None;
         let generation = self.sidebar.begin_location_change(pending.target_location);
         let Some(request) = self.sidebar.resolve_location(generation, Ok(start)) else {
             return Task::none();
@@ -5185,7 +5349,7 @@ impl Frost {
         self.sidebar_panel = SidebarPanel::Files;
         self.sidebar_notice = Some((format!("Following {label}"), true));
         self.apply_config();
-        sidebar_load_task(request)
+        self.queue_sidebar_load(request)
     }
 
     /// Reconcile the file tree's immutable host snapshot after a config
@@ -5209,14 +5373,14 @@ impl Frost {
         // Config identity really did change, so let the still-live command be
         // reconsidered against the new saved-profile set on the next tick.
         self.sidebar_follow_observed = None;
-        self.sidebar.set_hosts(new_hosts);
-
         let Some(location) = rebound else {
-            return Some(self.reset_sidebar_to_local(
+            return Some(self.reset_sidebar_to_local_with_hosts(
+                new_hosts,
                 "Remote profile changed or is ambiguous; Files returned to Local. Choose a destination again."
                 .to_string(),
             ));
         };
+        self.sidebar.set_hosts(new_hosts);
         let reindexed = location != old_location;
         if !reindexed {
             self.sidebar.location = location.clone();
@@ -5271,6 +5435,139 @@ impl Frost {
         }
     }
 
+    fn navigate_sidebar_to(&mut self, path: std::path::PathBuf) -> Task<Message> {
+        if path == self.sidebar.current_dir {
+            return Task::none();
+        }
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar
+            .begin_navigation(path)
+            .map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    fn navigate_sidebar_back(&mut self) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar
+            .navigate_back()
+            .map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    fn navigate_sidebar_forward(&mut self) -> Task<Message> {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar
+            .navigate_forward()
+            .map_or_else(Task::none, |request| self.queue_sidebar_load(request))
+    }
+
+    fn navigate_sidebar_parent(&mut self) -> Task<Message> {
+        self.sidebar
+            .current_dir
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .map_or_else(Task::none, |parent| self.navigate_sidebar_to(parent))
+    }
+
+    fn navigate_sidebar_home(&mut self) -> Task<Message> {
+        self.sidebar
+            .home_dir()
+            .map(std::path::Path::to_path_buf)
+            .map_or_else(Task::none, |home| self.navigate_sidebar_to(home))
+    }
+
+    fn begin_sidebar_path_edit(&mut self) -> Task<Message> {
+        let Some(path) = self.sidebar.current_dir.to_str().map(ToOwned::to_owned) else {
+            self.sidebar_notice = Some((
+                "This path is not valid UTF-8 and cannot be edited safely".to_string(),
+                false,
+            ));
+            return Task::none();
+        };
+        if sidebar::validate_absolute_navigation_path(&path).is_err() {
+            self.sidebar_notice = Some((
+                "This path contains characters that cannot be edited safely".to_string(),
+                false,
+            ));
+            return Task::none();
+        }
+        self.sidebar_path_input = Some(path);
+        iced::widget::operation::focus(SIDEBAR_PATH_INPUT_ID.clone())
+    }
+
+    fn submit_sidebar_path(&mut self) -> Task<Message> {
+        let Some(input) = self.sidebar_path_input.as_deref() else {
+            return Task::none();
+        };
+        let path = match sidebar::validate_absolute_navigation_path(input) {
+            Ok(path) => path,
+            Err(error) => {
+                self.sidebar_notice = Some((error.to_string(), false));
+                return iced::widget::operation::focus(SIDEBAR_PATH_INPUT_ID.clone());
+            }
+        };
+        self.sidebar_path_input = None;
+        self.navigate_sidebar_to(path)
+    }
+
+    fn queue_sidebar_load(&mut self, request: sidebar::DirectoryRequest) -> Task<Message> {
+        let rejected = self.sidebar_scans.enqueue(request);
+        let mut tasks: Vec<Task<Message>> = rejected
+            .into_iter()
+            .map(|request| {
+                Task::done(Message::SidebarLoaded(sidebar::DirectoryResult::failed(
+                    request,
+                    sidebar::DirectoryError::busy(format!(
+                        "Directory scan queue is full ({} pending); retry after another scan finishes",
+                        sidebar::MAX_DIRECTORY_SCANS_TOTAL
+                    )),
+                )))
+            })
+            .collect();
+        let dispatch = self.dispatch_sidebar_scans();
+        if tasks.is_empty() {
+            dispatch
+        } else {
+            tasks.push(dispatch);
+            Task::batch(tasks)
+        }
+    }
+
+    fn dispatch_sidebar_scans(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for request in self.sidebar_scans.take_ready() {
+            if self.sidebar.mark_request_running(&request) {
+                tasks.push(sidebar_scan_task(request));
+            } else {
+                self.sidebar_scans
+                    .finish(request.generation, request.request_id);
+            }
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
+    }
+
+    /// Refresh only loaded directory snapshots the completed mutation could
+    /// have changed. Collapsed directories retain their cached subtree and are
+    /// reconciled just like expanded ones; paths outside the visible root are
+    /// intentionally ignored.
+    fn refresh_sidebar_directories(&mut self, directories: &[std::path::PathBuf]) -> Task<Message> {
+        self.sidebar.invalidate_cached_directories(directories);
+        let requests: Vec<_> = directories
+            .iter()
+            .filter_map(|path| self.sidebar.refresh_directory(path))
+            .collect();
+        if requests.is_empty() {
+            return Task::none();
+        }
+        let tasks = requests
+            .into_iter()
+            .map(|request| self.queue_sidebar_load(request))
+            .collect::<Vec<_>>();
+        Task::batch(tasks)
+    }
+
     /// Toggle the left dock and refresh its file root when it becomes visible.
     /// Keeping this in one place makes the toolbar, shortcut, and command
     /// palette behave identically.
@@ -5297,7 +5594,7 @@ impl Frost {
             None
         };
         self.apply_config();
-        request.map_or_else(Task::none, sidebar_load_task)
+        request.map_or_else(Task::none, |request| self.queue_sidebar_load(request))
     }
 
     /// Dispatch one file-tree context-menu action against its frozen target.
@@ -5325,6 +5622,13 @@ impl Frost {
                 .unwrap_or_else(|| menu.path.clone())
         };
         match action {
+            SidebarMenuAction::OpenDirectory => {
+                if menu.is_dir {
+                    self.navigate_sidebar_to(menu.path)
+                } else {
+                    Task::none()
+                }
+            }
             SidebarMenuAction::NewFile | SidebarMenuAction::NewFolder => {
                 self.sidebar_dialog = Some(SidebarDialogState {
                     kind: if action == SidebarMenuAction::NewFile {
@@ -5479,7 +5783,10 @@ impl Frost {
                     clipboard.cut.then_some(clipboard.id),
                 )
             }
-            SidebarMenuAction::Refresh => sidebar_load_task(self.sidebar.refresh()),
+            SidebarMenuAction::Refresh => self
+                .sidebar
+                .refresh_directory(&target_dir)
+                .map_or_else(Task::none, |request| self.queue_sidebar_load(request)),
         }
     }
 
@@ -5610,7 +5917,7 @@ impl Frost {
         self.sidebar_selection_anchor = Some(path.clone());
         if is_dir {
             if let Some(request) = self.sidebar.toggle_node(&path) {
-                return sidebar_load_task(request);
+                return self.queue_sidebar_load(request);
             }
             return Task::none();
         }
@@ -12041,7 +12348,7 @@ impl Frost {
                     host.name = name;
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return sidebar_load_task(request);
+                        return self.queue_sidebar_load(request);
                     }
                 }
             }
@@ -12050,7 +12357,7 @@ impl Frost {
                     host.host = value;
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return sidebar_load_task(request);
+                        return self.queue_sidebar_load(request);
                     }
                 }
             }
@@ -12060,7 +12367,7 @@ impl Frost {
                     host.user = Some(user).filter(|u| !u.trim().is_empty());
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return sidebar_load_task(request);
+                        return self.queue_sidebar_load(request);
                     }
                 }
             }
@@ -12069,7 +12376,7 @@ impl Frost {
                     host.docker = docker;
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return sidebar_load_task(request);
+                        return self.queue_sidebar_load(request);
                     }
                 }
             }
@@ -12078,7 +12385,7 @@ impl Frost {
                     host.deploy = deploy;
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return sidebar_load_task(request);
+                        return self.queue_sidebar_load(request);
                     }
                 }
             }
@@ -12111,7 +12418,7 @@ impl Frost {
                     });
                 self.config_dirty = true;
                 if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                    return sidebar_load_task(request);
+                    return self.queue_sidebar_load(request);
                 }
             }
             Message::RemoteHostRemove(index) => {
@@ -12119,7 +12426,7 @@ impl Frost {
                     self.config.remote_hosts.remove(index);
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return sidebar_load_task(request);
+                        return self.queue_sidebar_load(request);
                     }
                 }
             }
@@ -12726,6 +13033,24 @@ impl Frost {
                     }
                     if self.handle_search_key(&key, modifiers, text.as_deref()) {
                         return Task::none();
+                    }
+                    let files_scope = self.dock_open()
+                        && self.sidebar_panel == SidebarPanel::Files
+                        && self.sidebar_hovered;
+                    if let Some(navigation) =
+                        sidebar_files_navigation_key(&key, modifiers, repeat, files_scope)
+                    {
+                        return match navigation {
+                            SidebarNavigationKey::Back => self.navigate_sidebar_back(),
+                            SidebarNavigationKey::Forward => self.navigate_sidebar_forward(),
+                            SidebarNavigationKey::Parent => self.navigate_sidebar_parent(),
+                            SidebarNavigationKey::Home => self.navigate_sidebar_home(),
+                        };
+                    }
+                    if sidebar_files_manual_refresh_key(&key, modifiers, repeat, files_scope) {
+                        self.invalidate_sidebar_remote_follow_intent();
+                        let request = self.sidebar.refresh();
+                        return self.queue_sidebar_load(request);
                     }
                     // Escape dismisses a visible block selection locally. It
                     // must not also reach the PTY: that would both clear the
@@ -13414,10 +13739,11 @@ impl Frost {
                         {
                             let request =
                                 self.sidebar.set_current_dir(std::path::PathBuf::from(cwd));
-                            return sidebar_load_task(request);
+                            return self.queue_sidebar_load(request);
                         }
                     }
-                    return sidebar_load_task(self.sidebar.refresh());
+                    let request = self.sidebar.refresh();
+                    return self.queue_sidebar_load(request);
                 }
             }
             Message::SetTabPosition(pos) => {
@@ -13451,28 +13777,101 @@ impl Frost {
                     self.open_sidebar_terminal();
                 }
             }
+            Message::SidebarGoBack => return self.navigate_sidebar_back(),
+            Message::SidebarGoForward => return self.navigate_sidebar_forward(),
             Message::SidebarGoParent => {
-                if let Some(parent) = self
-                    .sidebar
-                    .current_dir
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                {
-                    self.invalidate_sidebar_remote_follow_intent();
-                    let request = self.sidebar.set_current_dir(parent);
-                    return sidebar_load_task(request);
-                }
+                return self.navigate_sidebar_parent();
             }
+            Message::SidebarGoHome => return self.navigate_sidebar_home(),
+            Message::SidebarNavigatePath(path) => return self.navigate_sidebar_to(path),
+            Message::SidebarPathEdit => return self.begin_sidebar_path_edit(),
+            Message::SidebarPathInput(input) => self.sidebar_path_input = Some(input),
+            Message::SidebarPathSubmit => return self.submit_sidebar_path(),
+            Message::SidebarPathCancel => self.sidebar_path_input = None,
             Message::SidebarRefresh => {
                 self.invalidate_sidebar_remote_follow_intent();
                 let request = self.sidebar.refresh();
-                return sidebar_load_task(request);
+                return self.queue_sidebar_load(request);
+            }
+            Message::SidebarScanTick => return self.dispatch_sidebar_scans(),
+            Message::SidebarSnapshotTick => {
+                let requests = self.sidebar.refresh_stale_visible(
+                    std::time::Instant::now(),
+                    SIDEBAR_SNAPSHOT_STALE_AFTER,
+                    2,
+                );
+                if !requests.is_empty() {
+                    return Task::batch(
+                        requests
+                            .into_iter()
+                            .map(|request| self.queue_sidebar_load(request)),
+                    );
+                }
+            }
+            Message::SidebarRetry(generation, path) => {
+                if !self.sidebar.accepts_generation(generation) {
+                    return Task::none();
+                }
+                self.invalidate_sidebar_remote_follow_intent();
+                if let Some(request) = self.sidebar.retry_node(&path) {
+                    return self.queue_sidebar_load(request);
+                }
+            }
+            Message::SidebarShowHidden(show_hidden) => {
+                self.invalidate_sidebar_remote_follow_intent();
+                self.clear_sidebar_tree_intent();
+                self.sidebar_selection.clear();
+                self.sidebar_selection_anchor = None;
+                if let Some(request) = self.sidebar.set_show_hidden(show_hidden) {
+                    return self.queue_sidebar_load(request);
+                }
             }
             Message::SidebarLoaded(result) => {
-                // Rows the result replaces may be gone; a stale hover must not
-                // become a drop target.
-                self.sidebar_hovered_row = None;
-                self.sidebar.apply_load(result);
+                self.sidebar_scans.finish_result(&result);
+                let reconciled_dir = result.path.clone();
+                let previous_location = self.sidebar.location.clone();
+                let outcome = apply_sidebar_load_result(
+                    &mut self.sidebar,
+                    &mut self.sidebar_hovered_row,
+                    result,
+                );
+                if outcome == SidebarLoadApply::Reconciled {
+                    prune_sidebar_context_after_reconcile(
+                        &self.sidebar,
+                        &reconciled_dir,
+                        &mut self.sidebar_selection,
+                        &mut self.sidebar_selection_anchor,
+                        &mut self.sidebar_hovered_row,
+                        &mut self.sidebar_menu,
+                        &mut self.sidebar_dialog,
+                        &mut self.sidebar_delete_confirm,
+                        &mut self.sidebar_drop_burst,
+                        &mut self.sidebar_drop_debounce_generation,
+                        &mut self.sidebar_drop_hint,
+                    );
+                } else if outcome == SidebarLoadApply::NavigationCommitted {
+                    if self.sidebar.location != previous_location {
+                        self.invalidate_sidebar_pending_work();
+                    } else {
+                        self.clear_sidebar_tree_intent();
+                    }
+                    self.sidebar_selection.clear();
+                    self.sidebar_selection_anchor = None;
+                    self.sidebar_filter = None;
+                    self.sidebar_path_input = None;
+                    self.sidebar_notice = None;
+                } else if outcome == SidebarLoadApply::NavigationFailed {
+                    if let Some(failure) = self.sidebar.navigation_failure() {
+                        self.sidebar_notice = Some((
+                            format!(
+                                "Could not open folder: {}. Current files were kept.",
+                                failure.error
+                            ),
+                            false,
+                        ));
+                    }
+                }
+                return self.dispatch_sidebar_scans();
             }
             Message::SidebarSetLocation(hosts_epoch, location) => {
                 if hosts_epoch != self.sidebar_hosts_epoch {
@@ -13484,40 +13883,37 @@ impl Frost {
                 }
                 if location != self.sidebar.location {
                     self.invalidate_sidebar_remote_follow_intent();
-                    // A new location invalidates the selection's paths.
-                    self.invalidate_sidebar_pending_work();
-                    self.sidebar_selection.clear();
-                    self.sidebar_selection_anchor = None;
                     let generation = self.sidebar.begin_location_change(location.clone());
+                    let hosts_epoch = self.sidebar_hosts_epoch;
                     let hosts = self.sidebar.hosts_snapshot().to_vec();
                     return Task::perform(
                         async move {
                             remote_fs::start_dir(&location, &hosts)
-                                .map_err(|error| error.to_string())
+                                .map_err(sidebar::DirectoryError::from_io)
                         },
-                        move |result| Message::SidebarLocationResolved(generation, result),
+                        move |result| {
+                            Message::SidebarLocationResolved(generation, hosts_epoch, result)
+                        },
                     );
                 }
             }
-            Message::SidebarLocationResolved(generation, start) => {
-                if !self.sidebar.accepts_generation(generation) {
+            Message::SidebarLocationResolved(generation, hosts_epoch, start) => {
+                if hosts_epoch != self.sidebar_hosts_epoch
+                    || !self.sidebar.accepts_generation(generation)
+                {
                     return Task::none();
                 }
-                match start {
-                    Ok(start) => {
-                        if let Some(request) = self.sidebar.resolve_location(generation, Ok(start))
-                        {
-                            return sidebar_load_task(request);
-                        }
-                    }
-                    Err(error) => {
-                        let location = self.sidebar.location.label(self.sidebar.hosts_snapshot());
-                        let error = jterm_core::review_input::safe_inline_display(&error, 192);
-                        let request = self.reset_sidebar_to_local(format!(
-                            "Could not open {location}: {error}. Returned to Local; choose the remote profile to retry."
-                        ));
-                        return sidebar_load_task(request);
-                    }
+                if let Some(request) = self.sidebar.resolve_location(generation, start) {
+                    return self.queue_sidebar_load(request);
+                }
+                if let Some(failure) = self.sidebar.navigation_failure() {
+                    self.sidebar_notice = Some((
+                        format!(
+                            "Could not open location: {}. Current files were kept.",
+                            failure.error
+                        ),
+                        false,
+                    ));
                 }
             }
             Message::SidebarRemoteFollowResolved(token, start) => {
@@ -13634,6 +14030,16 @@ impl Frost {
                 if matches!(report.op, SidebarOp::BatchTransfer { .. }) {
                     self.sidebar_transfer = None;
                 }
+                remap_sidebar_selection(
+                    &mut self.sidebar_selection,
+                    &mut self.sidebar_selection_anchor,
+                    &report.path_remaps,
+                );
+                // Even a failed or cancelled remote mutation may have reached
+                // the server before its transport failed. Re-scan every exact
+                // parent reported by the worker while preserving last-good
+                // children on any subsequent listing failure.
+                let refresh = self.refresh_sidebar_directories(&report.affected_parents);
                 if report.cancelled {
                     // Neutral abort, not an error; the clipboard survives a
                     // cancelled cut so nothing is silently consumed. A batch
@@ -13643,17 +14049,17 @@ impl Frost {
                             .warning
                             .unwrap_or(("Transfer cancelled".to_string(), true)),
                     );
-                    return sidebar_load_task(self.sidebar.refresh());
+                    return refresh;
                 } else {
                     match report.result {
                         Ok(()) => {
                             self.sidebar_notice = report.warning;
-                            // The context gate above proved this is the same
-                            // Local target or the one unique exact profile,
-                            // even if that profile moved to another index.
-                            return sidebar_load_task(self.sidebar.refresh());
+                            return refresh;
                         }
-                        Err(error) => self.sidebar_notice = Some((error, false)),
+                        Err(error) => {
+                            self.sidebar_notice = Some((error, false));
+                            return refresh;
+                        }
                     }
                 }
             }
@@ -14226,7 +14632,7 @@ impl Frost {
                     }
                 }
                 if let Some(request) = sidebar_request {
-                    return sidebar_load_task(request);
+                    return self.queue_sidebar_load(request);
                 }
             }
             Message::ConfigTick => {
@@ -14289,7 +14695,7 @@ impl Frost {
                 let remote_follow_task = self.poll_sidebar_remote_follow();
                 self.expire_toasts();
                 if let Some(request) = sidebar_reload_request {
-                    return Task::batch([sidebar_load_task(request), remote_follow_task]);
+                    return Task::batch([self.queue_sidebar_load(request), remote_follow_task]);
                 }
                 return remote_follow_task;
             }
@@ -15312,6 +15718,9 @@ impl Frost {
             state.path.display().to_string()
         };
         let mut menu = column![text(header).size(12).style(text::secondary)].spacing(2);
+        if multi == 1 && state.is_dir {
+            menu = menu.push(row_btn("Open Folder", SidebarMenuAction::OpenDirectory));
+        }
         if multi > 1 {
             menu = menu.push(disabled_btn("New File"));
             menu = menu.push(disabled_btn("New Folder"));
@@ -15376,7 +15785,8 @@ impl Frost {
         /// Header line + the panel's own vertical padding.
         const PANEL_CHROME_H: f32 = 40.0;
         const EDGE_GAP: f32 = 4.0;
-        let panel_h = PANEL_CHROME_H + 9.0 * ROW_H;
+        let action_rows = 9.0 + if multi == 1 && state.is_dir { 1.0 } else { 0.0 };
+        let panel_h = PANEL_CHROME_H + action_rows * ROW_H;
         let x = (state.at.x)
             .min(self.win_size.width - PANEL_W - EDGE_GAP)
             .max(EDGE_GAP);
@@ -17610,31 +18020,104 @@ impl Frost {
             .and_then(|n| n.to_str())
             .unwrap_or("/")
             .to_string();
-        let mut up = button(text("↑").size(12))
+        let mut back_button = button(text("←").size(12))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self.sidebar.can_navigate_back() {
+            back_button = back_button.on_press(Message::SidebarGoBack);
+        }
+        let back = tooltip(
+            back_button,
+            container(text("Back (Alt+Left while over Files)").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut forward_button = button(text("→").size(12))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self.sidebar.can_navigate_forward() {
+            forward_button = forward_button.on_press(Message::SidebarGoForward);
+        }
+        let forward = tooltip(
+            forward_button,
+            container(text("Forward (Alt+Right while over Files)").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut up_button = button(text("↑").size(12))
             .padding([2, 6])
             .style(self.ghost_btn_style());
         if self.sidebar.current_dir.parent().is_some() {
-            up = up.on_press(Message::SidebarGoParent);
+            up_button = up_button.on_press(Message::SidebarGoParent);
         }
+        let up = tooltip(
+            up_button,
+            container(text("Parent directory (Alt+Up while over Files)").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let mut home_button = button(text("⌂").size(12))
+            .padding([2, 6])
+            .style(self.ghost_btn_style());
+        if self
+            .sidebar
+            .home_dir()
+            .is_some_and(|home| home != self.sidebar.current_dir.as_path())
+        {
+            home_button = home_button.on_press(Message::SidebarGoHome);
+        }
+        let home = tooltip(
+            home_button,
+            container(text("Location home (Alt+Home while over Files)").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
         let filter_active = self.sidebar_filter.is_some();
         let filter_btn = button(text("⌕").size(12))
             .on_press(Message::SidebarFilterToggle)
             .padding([2, 6])
             .style(self.tab_btn_style(filter_active));
-        let header = row![
-            up,
-            text(title)
-                .size(12)
-                .font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::DEFAULT
-                })
-                .width(Length::Fill),
-            filter_btn,
+        let hidden_active = self.sidebar.show_hidden();
+        let hidden_btn = tooltip(
+            button(text("Hidden").size(11))
+                .on_press(Message::SidebarShowHidden(!hidden_active))
+                .padding([2, 6])
+                .style(self.tab_btn_style(hidden_active)),
+            container(text("Show or hide dot-prefixed files").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let refresh_btn = tooltip(
             button(text("↻").size(12))
                 .on_press(Message::SidebarRefresh)
                 .padding([2, 6])
                 .style(self.ghost_btn_style()),
+            container(text("Refresh files (F5 while pointer is over Files)").size(11))
+                .padding(6)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let header = row![
+            back,
+            forward,
+            up,
+            home,
+            button(text(title).size(12).font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::DEFAULT
+            }))
+            .on_press(Message::SidebarPathEdit)
+            .padding([2, 4])
+            .width(Length::Fill)
+            .style(self.ghost_btn_style()),
+            filter_btn,
+            hidden_btn,
+            refresh_btn,
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center);
@@ -17658,6 +18141,103 @@ impl Frost {
                 .width(Length::Fill)
                 .into(),
         ];
+        if let Some(path) = &self.sidebar_path_input {
+            rows.insert(
+                1,
+                container(
+                    row![
+                        text_input("Absolute path…", path)
+                            .id(SIDEBAR_PATH_INPUT_ID.clone())
+                            .on_input(Message::SidebarPathInput)
+                            .on_submit(Message::SidebarPathSubmit)
+                            .size(11),
+                        button(text("Go").size(11))
+                            .on_press(Message::SidebarPathSubmit)
+                            .padding([2, 6])
+                            .style(self.ghost_btn_style()),
+                        button(text("×").size(11))
+                            .on_press(Message::SidebarPathCancel)
+                            .padding([2, 5])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([2, 6])
+                .into(),
+            );
+        } else {
+            let mut crumbs: Vec<Element<'_, Message>> = Vec::new();
+            for (index, (label, path)) in sidebar_breadcrumbs(&self.sidebar.current_dir, 4)
+                .into_iter()
+                .enumerate()
+            {
+                if index > 0 {
+                    crumbs.push(text("›").size(10).style(text::secondary).into());
+                }
+                let mut crumb = button(text(label).size(10))
+                    .padding([1, 4])
+                    .style(self.ghost_btn_style());
+                if path != self.sidebar.current_dir {
+                    crumb = crumb.on_press(Message::SidebarNavigatePath(path));
+                }
+                crumbs.push(crumb.into());
+            }
+            rows.insert(
+                1,
+                container(iced::widget::Row::with_children(crumbs).spacing(2))
+                    .padding([1, 6])
+                    .into(),
+            );
+        }
+        if self.sidebar.navigation_pending_target().is_some()
+            || self.sidebar.location_change_pending()
+        {
+            rows.push(
+                container(
+                    text("Opening folder… current files stay available until it succeeds")
+                        .size(10)
+                        .style(text::secondary),
+                )
+                .padding([1, 8])
+                .into(),
+            );
+        }
+        let queued_scans = self.sidebar_scans.queued_len();
+        let running_scans = self.sidebar_scans.running_len();
+        if queued_scans + running_scans > 0 {
+            let oldest = self
+                .sidebar_scans
+                .oldest_queued_age(std::time::Instant::now())
+                .map(|age| format!(" · oldest {}", compact_scan_duration(age)))
+                .unwrap_or_default();
+            rows.push(
+                container(
+                    text(format!(
+                        "Directory scans: {running_scans} running · {queued_scans} queued{oldest}"
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                )
+                .padding([1, 8])
+                .into(),
+            );
+        }
+        if let Some(timing) = self.sidebar_scans.last_timing() {
+            rows.push(
+                container(
+                    text(format!(
+                        "Last scan: queued {} · ran {}",
+                        compact_scan_duration(timing.queued_for),
+                        compact_scan_duration(timing.ran_for)
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                )
+                .padding([1, 8])
+                .into(),
+            );
+        }
         // The inline filter row: substring match over the loaded tree,
         // local and remote alike; Esc or the toggle closes and clears it.
         if let Some(query) = &self.sidebar_filter {
@@ -17752,16 +18332,79 @@ impl Frost {
         }
         match &self.sidebar.root.state {
             sidebar::DirectoryState::Loading => rows.push(
-                container(text("Loading…").size(11).style(text::secondary))
-                    .padding([4, 8])
-                    .into(),
+                container(
+                    text(
+                        if self.sidebar.request_phase(&self.sidebar.root.path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Queued…"
+                        } else {
+                            "Loading…"
+                        },
+                    )
+                    .size(11)
+                    .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::Refreshing => rows.push(
+                container(
+                    text(
+                        if self.sidebar.request_phase(&self.sidebar.root.path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Refresh queued…"
+                        } else {
+                            "Refreshing…"
+                        },
+                    )
+                    .size(11)
+                    .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
             ),
             sidebar::DirectoryState::Error(error) => rows.push(
                 container(
-                    text(error.clone())
-                        .size(11)
-                        .wrapping(text::Wrapping::Word)
-                        .style(text::danger),
+                    row![
+                        text(error.to_string())
+                            .size(11)
+                            .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .style(text::danger),
+                        button(text("Retry").size(11))
+                            .on_press(Message::SidebarRetry(
+                                self.sidebar.generation(),
+                                self.sidebar.root.path.clone(),
+                            ))
+                            .padding([1, 6])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([4, 8])
+                .into(),
+            ),
+            sidebar::DirectoryState::RefreshError(error) => rows.push(
+                container(
+                    row![
+                        text(format!("Refresh failed: {error}"))
+                            .size(11)
+                            .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .style(text::danger),
+                        button(text("Retry").size(11))
+                            .on_press(Message::SidebarRetry(
+                                self.sidebar.generation(),
+                                self.sidebar.root.path.clone(),
+                            ))
+                            .padding([1, 6])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
                 )
                 .padding([4, 8])
                 .into(),
@@ -17772,6 +18415,33 @@ impl Frost {
                     .into(),
             ),
             _ => {}
+        }
+        if let Some(loaded_at) = self.sidebar.root.last_loaded_at {
+            let age = std::time::Instant::now().saturating_duration_since(loaded_at);
+            let (copy, stale) = sidebar_snapshot_age_copy(age);
+            rows.push(
+                container(text(format!("Snapshot: {copy}")).size(10).style(if stale {
+                    text::warning
+                } else {
+                    text::secondary
+                }))
+                .padding([1, 8])
+                .into(),
+            );
+        }
+        if self.sidebar.root.truncated {
+            rows.push(
+                container(
+                    text(format!(
+                        "Showing first {} entries",
+                        remote_fs::MAX_DIRECTORY_ENTRIES
+                    ))
+                    .size(10)
+                    .style(text::secondary),
+                )
+                .padding([2, 8])
+                .into(),
+            );
         }
         // The filter's match set is computed once per frame and shared by the
         // row walk below; an empty match set under a non-empty query gets its
@@ -17892,10 +18562,7 @@ impl Frost {
             .into()
     }
 
-    /// Recursively flatten a file-tree node (and expanded descendants) into
-    /// rows. With a filter match set, only matches and their (force-expanded)
-    /// ancestors render; expansion flags are never mutated, so clearing the
-    /// filter restores the pre-filter tree exactly.
+    /// Recursively flatten a file-tree node and its expanded descendants into
     /// rows. With a filter match set, only matches and their (force-expanded)
     /// ancestors render; expansion flags are never mutated, so clearing the
     /// filter restores the pre-filter tree exactly.
@@ -17913,8 +18580,8 @@ impl Frost {
             "·"
         } else {
             match &node.state {
-                sidebar::DirectoryState::Loading => "◌",
-                sidebar::DirectoryState::Error(_) => "!",
+                sidebar::DirectoryState::Loading | sidebar::DirectoryState::Refreshing => "◌",
+                sidebar::DirectoryState::Error(_) | sidebar::DirectoryState::RefreshError(_) => "!",
                 sidebar::DirectoryState::Unloaded | sidebar::DirectoryState::Loaded => {
                     if node.expanded || filtering {
                         "▾"
@@ -17924,12 +18591,36 @@ impl Frost {
                 }
             }
         };
-        let label = row![
+        let mut label = row![
             Space::new().width(Length::Fixed(indent)),
             text(icon).size(12).width(Length::Fixed(14.0)),
             text(node.name.clone()).size(12),
         ]
+        .spacing(2)
         .align_y(iced::Alignment::Center);
+        match &node.state {
+            sidebar::DirectoryState::Loading => {
+                let copy = if self.sidebar.request_phase(&node.path)
+                    == Some(sidebar::DirectoryRequestPhase::Queued)
+                {
+                    "Queued…"
+                } else {
+                    "Loading…"
+                };
+                label = label.push(text(copy).size(10).style(text::secondary));
+            }
+            sidebar::DirectoryState::Refreshing => {
+                let copy = if self.sidebar.request_phase(&node.path)
+                    == Some(sidebar::DirectoryRequestPhase::Queued)
+                {
+                    "Refresh queued…"
+                } else {
+                    "Refreshing…"
+                };
+                label = label.push(text(copy).size(10).style(text::secondary));
+            }
+            _ => {}
+        }
         let selected = self.sidebar_selection.contains(&node.path);
         let generation = self.sidebar.generation();
         let row_button = button(label)
@@ -17960,19 +18651,44 @@ impl Frost {
                 .on_exit(Message::SidebarRowHover(generation, None))
                 .into(),
         );
-        if node.is_dir && (node.expanded || filtering) {
-            if let sidebar::DirectoryState::Error(error) = &node.state {
-                out.push(
-                    container(
-                        text(error.clone())
+        if let sidebar::DirectoryState::Error(error)
+        | sidebar::DirectoryState::RefreshError(error) = &node.state
+        {
+            let error = if matches!(&node.state, sidebar::DirectoryState::RefreshError(_)) {
+                let age = node.last_loaded_at.map(|loaded_at| {
+                    sidebar_snapshot_age_copy(
+                        std::time::Instant::now().saturating_duration_since(loaded_at),
+                    )
+                    .0
+                });
+                match age {
+                    Some(age) => format!("Refresh failed: {error} · {age}"),
+                    None => format!("Refresh failed: {error}"),
+                }
+            } else {
+                error.to_string()
+            };
+            out.push(
+                container(
+                    row![
+                        text(error)
                             .size(10)
                             .wrapping(text::Wrapping::Word)
+                            .width(Length::Fill)
                             .style(text::danger),
-                    )
-                    .padding([2, (20.0 + depth as f32 * 12.0) as u16])
-                    .into(),
-                );
-            }
+                        button(text("Retry").size(10))
+                            .on_press(Message::SidebarRetry(generation, node.path.clone()))
+                            .padding([1, 6])
+                            .style(self.ghost_btn_style()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([2, (20.0 + depth as f32 * 12.0) as u16])
+                .into(),
+            );
+        }
+        if node.is_dir && (node.expanded || filtering) {
             for child in &node.children {
                 if let Some(set) = filter {
                     if !set.contains(&child.path) {
@@ -17980,6 +18696,20 @@ impl Frost {
                     }
                 }
                 self.collect_sidebar_nodes(child, depth + 1, filter, out);
+            }
+            if node.truncated {
+                out.push(
+                    container(
+                        text(format!(
+                            "Showing first {} entries",
+                            remote_fs::MAX_DIRECTORY_ENTRIES
+                        ))
+                        .size(10)
+                        .style(text::secondary),
+                    )
+                    .padding([2, (20.0 + depth as f32 * 12.0) as u16])
+                    .into(),
+                );
             }
         }
     }
@@ -19594,6 +20324,12 @@ impl Frost {
             ),
             section("Panels"),
             kb("Ctrl+\\", "Toggle tabs / files sidebar"),
+            kb("F5 over Files", "Refresh the current file-tree root"),
+            kb(
+                "Alt+Left/Right/Up/Home over Files",
+                "Back / Forward / Parent / location home",
+            ),
+            kb("Right-click folder → Open Folder", "Enter that directory"),
             kb("Ctrl+Shift+P", "Command palette"),
             kb("Ctrl+Shift+O", "Settings"),
             kb("F12", "Debug / diagnostics"),
@@ -21396,6 +22132,24 @@ impl Frost {
                     .map(|_| Message::SidebarTransferTick),
             );
         }
+        if self.dock_open()
+            && self.sidebar_panel == SidebarPanel::Files
+            && self.sidebar.root.last_loaded_at.is_some()
+        {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(30))
+                    .map(|_| Message::SidebarSnapshotTick),
+            );
+        }
+        // A cooldown may be the only reason queued work has no running worker
+        // left to wake dispatch. Poll cheaply while such work exists; ordinary
+        // queues still drain immediately on each completion.
+        if self.sidebar_scans.queued_len() > 0 {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(1))
+                    .map(|_| Message::SidebarScanTick),
+            );
+        }
         if self.tab_drag_hover_since.is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(50))
@@ -21522,11 +22276,185 @@ fn slider_row<'a>(
     .into()
 }
 
-fn sidebar_load_task(request: sidebar::DirectoryRequest) -> Task<Message> {
+fn sidebar_scan_task(request: sidebar::DirectoryRequest) -> Task<Message> {
+    let generation = request.generation;
+    let request_id = request.request_id;
+    let path = request.path.clone();
     Task::perform(
-        async move { sidebar::load_directory(request) },
+        async move {
+            match tokio::task::spawn_blocking(move || sidebar::load_directory(request)).await {
+                Ok(result) => result,
+                Err(_) => sidebar::DirectoryResult {
+                    generation,
+                    request_id,
+                    path,
+                    entries: Err(sidebar::DirectoryError::internal()),
+                    truncated: false,
+                },
+            }
+        },
         Message::SidebarLoaded,
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarLoadApply {
+    Rejected,
+    Replaced,
+    Reconciled,
+    RefreshFailed,
+    NavigationCommitted,
+    NavigationFailed,
+}
+
+/// Apply one directory worker result. Rejected generations are completely
+/// inert; a preserving directory refresh keeps a still-live hover, while an ordinary
+/// replacement retires it. The caller prunes the remaining path contexts only
+/// after a successful reconciliation can actually remove rows.
+fn apply_sidebar_load_result(
+    sidebar: &mut sidebar::Sidebar,
+    hovered_row: &mut Option<(std::path::PathBuf, bool)>,
+    result: sidebar::DirectoryResult,
+) -> SidebarLoadApply {
+    let navigation =
+        sidebar.is_pending_navigation_result(result.generation, result.request_id, &result.path);
+    let navigation_succeeded = navigation && result.entries.is_ok();
+    let preserving_refresh =
+        sidebar.accepts_generation(result.generation) && sidebar.node_is_refreshing(&result.path);
+    let refresh_succeeded = preserving_refresh && result.entries.is_ok();
+    let applied = sidebar.apply_load(result);
+    if !applied {
+        return SidebarLoadApply::Rejected;
+    }
+    if navigation {
+        if navigation_succeeded {
+            *hovered_row = None;
+            return SidebarLoadApply::NavigationCommitted;
+        }
+        return SidebarLoadApply::NavigationFailed;
+    }
+    if preserving_refresh {
+        if refresh_succeeded {
+            SidebarLoadApply::Reconciled
+        } else {
+            SidebarLoadApply::RefreshFailed
+        }
+    } else {
+        *hovered_row = None;
+        SidebarLoadApply::Replaced
+    }
+}
+
+/// Remove every path-scoped UI intent invalidated by one accepted root
+/// reconciliation. Contexts opened before the refresh also carry an older
+/// generation and are retired even when their text path happens to survive.
+#[allow(clippy::too_many_arguments)]
+fn prune_sidebar_context_after_reconcile(
+    sidebar: &sidebar::Sidebar,
+    reconciled_dir: &std::path::Path,
+    selection: &mut Vec<std::path::PathBuf>,
+    selection_anchor: &mut Option<std::path::PathBuf>,
+    hovered_row: &mut Option<(std::path::PathBuf, bool)>,
+    menu: &mut Option<SidebarMenuState>,
+    dialog: &mut Option<SidebarDialogState>,
+    delete_confirm: &mut Option<SidebarDeleteConfirmation>,
+    drop_burst: &mut Vec<std::path::PathBuf>,
+    drop_debounce_generation: &mut Option<u64>,
+    drop_hint: &mut bool,
+) {
+    let is_in_reconciled_tree = |path: &std::path::Path| path.starts_with(reconciled_dir);
+    selection.retain(|path| !is_in_reconciled_tree(path) || sidebar.contains_path(path));
+    if selection_anchor
+        .as_ref()
+        .is_some_and(|path| is_in_reconciled_tree(path) && !sidebar.contains_path(path))
+    {
+        *selection_anchor = selection.first().cloned();
+    }
+
+    let hover_removed = hovered_row.as_ref().is_some_and(|(path, is_dir)| {
+        is_in_reconciled_tree(path) && sidebar.node_is_dir(path) != Some(*is_dir)
+    });
+    if hover_removed {
+        *hovered_row = None;
+    }
+    let generation = sidebar.generation();
+    if menu.as_ref().is_some_and(|state| {
+        state.generation != generation
+            || (is_in_reconciled_tree(&state.path)
+                && sidebar.node_is_dir(&state.path) != Some(state.is_dir))
+            || state.targets.iter().any(|(path, is_dir)| {
+                is_in_reconciled_tree(path) && sidebar.node_is_dir(path) != Some(*is_dir)
+            })
+    }) {
+        *menu = None;
+    }
+    if dialog.as_ref().is_some_and(|state| {
+        state.generation != generation
+            || match state.kind {
+                SidebarDialogKind::NewFile | SidebarDialogKind::NewFolder => {
+                    is_in_reconciled_tree(&state.path)
+                        && sidebar.node_is_dir(&state.path) != Some(true)
+                }
+                SidebarDialogKind::Rename => {
+                    is_in_reconciled_tree(&state.path) && !sidebar.contains_path(&state.path)
+                }
+            }
+    }) {
+        *dialog = None;
+    }
+    if delete_confirm.as_ref().is_some_and(|state| {
+        state.generation != generation
+            || state
+                .paths
+                .iter()
+                .any(|path| is_in_reconciled_tree(path) && !sidebar.contains_path(path))
+    }) {
+        *delete_confirm = None;
+    }
+    if hover_removed || *drop_debounce_generation != Some(generation) {
+        drop_burst.clear();
+        *drop_debounce_generation = None;
+        *drop_hint = false;
+    }
+}
+
+/// Rewrite a path through the most specific backend-confirmed move. Component
+/// prefix matching avoids textual collisions such as `/tmp/a` and `/tmp/ab`.
+fn remap_sidebar_path(path: &std::path::Path, remaps: &[SidebarPathRemap]) -> std::path::PathBuf {
+    remaps
+        .iter()
+        .filter_map(|remap| {
+            path.strip_prefix(&remap.from)
+                .ok()
+                .map(|suffix| (remap.from.components().count(), remap.to.join(suffix)))
+        })
+        .max_by_key(|(components, _)| *components)
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Keep selection identity stable across successful rename/move operations.
+/// Duplicates can arise when a batch contains overlapping sources, so retain
+/// the first occurrence just like ordinary insertion-ordered selection.
+fn remap_sidebar_selection(
+    selection: &mut Vec<std::path::PathBuf>,
+    selection_anchor: &mut Option<std::path::PathBuf>,
+    remaps: &[SidebarPathRemap],
+) {
+    if remaps.is_empty() {
+        return;
+    }
+    let mut rewritten = Vec::with_capacity(selection.len());
+    for path in selection.iter() {
+        let path = remap_sidebar_path(path, remaps);
+        if !rewritten.contains(&path) {
+            rewritten.push(path);
+        }
+    }
+    *selection = rewritten;
+    if let Some(anchor) = selection_anchor.as_mut() {
+        *anchor = remap_sidebar_path(anchor, remaps);
+    }
 }
 
 /// The set of paths a filter query shows: rows whose name contains the query
@@ -21719,18 +22647,26 @@ fn sidebar_op_task(
     };
     Task::perform(
         async move {
-            let (report_location, warning, cancelled, result, consumed_paths) =
-                run_sidebar_op(&location, &hosts, &op, progress.as_ref());
+            let outcome = run_sidebar_op(&location, &hosts, &op, progress.as_ref());
             SidebarOpReport {
                 context_epoch,
-                location: report_location,
+                location: outcome.location,
                 location_profile,
                 consumed_clipboard_id,
-                consumed_paths,
+                consumed_paths: outcome.consumed_paths,
+                affected_parents: outcome.affected_parents,
+                path_remaps: outcome.path_remaps,
                 op,
-                warning,
-                cancelled,
-                result: result.map_err(|error| error.to_string()),
+                warning: outcome.warning.map(|(warning, neutral)| {
+                    (
+                        jterm_core::review_input::safe_inline_display(&warning, 512),
+                        neutral,
+                    )
+                }),
+                cancelled: outcome.cancelled,
+                result: outcome.result.map_err(|error| {
+                    jterm_core::review_input::safe_inline_display(&error.to_string(), 256)
+                }),
             }
         },
         |report| Message::SidebarOpFinished(Box::new(report)),
@@ -21748,21 +22684,41 @@ fn run_sidebar_op(
     op: &SidebarOp,
     progress: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
 ) -> SidebarWorkerOutcome {
+    fn push_parent(parents: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+        if let Some(parent) = path.parent().map(std::path::Path::to_path_buf) {
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+    }
+
     match op {
-        SidebarOp::CreateFile(path) => (
-            location.clone(),
-            None,
-            false,
-            remote_fs::create_file(location, hosts, path),
-            Vec::new(),
-        ),
-        SidebarOp::CreateDir(path) => (
-            location.clone(),
-            None,
-            false,
-            remote_fs::create_dir(location, hosts, path),
-            Vec::new(),
-        ),
+        SidebarOp::CreateFile(path) => {
+            let mut affected_parents = Vec::new();
+            push_parent(&mut affected_parents, path);
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: None,
+                cancelled: false,
+                result: remote_fs::create_file(location, hosts, path),
+                consumed_paths: Vec::new(),
+                affected_parents,
+                path_remaps: Vec::new(),
+            }
+        }
+        SidebarOp::CreateDir(path) => {
+            let mut affected_parents = Vec::new();
+            push_parent(&mut affected_parents, path);
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: None,
+                cancelled: false,
+                result: remote_fs::create_dir(location, hosts, path),
+                consumed_paths: Vec::new(),
+                affected_parents,
+                path_remaps: Vec::new(),
+            }
+        }
         SidebarOp::Rename { src, dst } => {
             let result = remote_fs::rename(location, hosts, src, dst);
             let consumed_paths = result
@@ -21770,7 +22726,28 @@ fn run_sidebar_op(
                 .ok()
                 .map(|()| vec![src.clone()])
                 .unwrap_or_default();
-            (location.clone(), None, false, result, consumed_paths)
+            let path_remaps = result
+                .as_ref()
+                .ok()
+                .map(|()| {
+                    vec![SidebarPathRemap {
+                        from: src.clone(),
+                        to: dst.clone(),
+                    }]
+                })
+                .unwrap_or_default();
+            let mut affected_parents = Vec::new();
+            push_parent(&mut affected_parents, src);
+            push_parent(&mut affected_parents, dst);
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: None,
+                cancelled: false,
+                result,
+                consumed_paths,
+                affected_parents,
+                path_remaps,
+            }
         }
         SidebarOp::DeleteBatch(paths) => {
             // Continue past per-item errors; the summary names the first.
@@ -21778,7 +22755,9 @@ fn run_sidebar_op(
             let mut done = 0usize;
             let mut failures: Vec<String> = Vec::new();
             let mut consumed_paths = Vec::new();
+            let mut affected_parents = Vec::new();
             for path in paths {
+                push_parent(&mut affected_parents, path);
                 match remote_fs::delete(location, hosts, path) {
                     Ok(()) => {
                         done += 1;
@@ -21799,13 +22778,15 @@ fn run_sidebar_op(
                     false,
                 )
             };
-            (
-                location.clone(),
-                Some(notice),
-                false,
-                Ok(()),
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: Some(notice),
+                cancelled: false,
+                result: Ok(()),
                 consumed_paths,
-            )
+                affected_parents,
+                path_remaps: Vec::new(),
+            }
         }
         SidebarOp::BatchTransfer {
             src_loc,
@@ -21826,22 +22807,30 @@ fn run_sidebar_op(
             let mut done = 0usize;
             let mut failures: Vec<String> = Vec::new();
             let mut consumed_paths = Vec::new();
+            let mut affected_parents = Vec::new();
+            let mut path_remaps = Vec::new();
             for item in items {
                 if progress.is_some_and(|progress| progress.is_cancelled()) {
-                    return (
-                        location.clone(),
-                        Some((format!("Cancelled after {done} of {total} items"), true)),
-                        true,
-                        Err(std::io::Error::new(
+                    return SidebarWorkerOutcome {
+                        location: location.clone(),
+                        warning: Some((format!("Cancelled after {done} of {total} items"), true)),
+                        cancelled: true,
+                        result: Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
                             "transfer cancelled",
                         )),
                         consumed_paths,
-                    );
+                        affected_parents,
+                        path_remaps,
+                    };
                 }
                 if let Some(error) = &item.error {
                     failures.push(error.clone());
                     continue;
+                }
+                push_parent(&mut affected_parents, &item.dst);
+                if *cut && same_location {
+                    push_parent(&mut affected_parents, &item.src);
                 }
                 let result = if same_location {
                     let execution =
@@ -21878,6 +22867,10 @@ fn run_sidebar_op(
                             }
                         } else if *cut {
                             consumed_paths.push(item.src.clone());
+                            path_remaps.push(SidebarPathRemap {
+                                from: item.src.clone(),
+                                to: item.dst.clone(),
+                            });
                         }
                     }
                     Err(error) => {
@@ -21885,13 +22878,18 @@ fn run_sidebar_op(
                             // The watchdog killed this item's stream; tidy a
                             // partial remote extraction if there is one.
                             cleanup_after_cancel(location, hosts, &item.dst, item.is_dir);
-                            return (
-                                location.clone(),
-                                Some((format!("Cancelled after {done} of {total} items"), true)),
-                                true,
-                                Err(error),
+                            return SidebarWorkerOutcome {
+                                location: location.clone(),
+                                warning: Some((
+                                    format!("Cancelled after {done} of {total} items"),
+                                    true,
+                                )),
+                                cancelled: true,
+                                result: Err(error),
                                 consumed_paths,
-                            );
+                                affected_parents,
+                                path_remaps,
+                            };
                         }
                         failures.push(format!("{}: {error}", item.src.display()));
                     }
@@ -21909,13 +22907,15 @@ fn run_sidebar_op(
                     false,
                 )
             };
-            (
-                location.clone(),
-                Some(notice),
-                false,
-                Ok(()),
+            SidebarWorkerOutcome {
+                location: location.clone(),
+                warning: Some(notice),
+                cancelled: false,
+                result: Ok(()),
                 consumed_paths,
-            )
+                affected_parents,
+                path_remaps,
+            }
         }
     }
 }
@@ -22802,6 +23802,271 @@ mod tests {
         profile.name = name.to_string();
         profile.host = host.to_string();
         profile
+    }
+
+    #[test]
+    fn stale_sidebar_load_does_not_clear_the_live_hover_target() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let stale = sidebar.set_current_dir(std::path::PathBuf::from("/stale"));
+        let current = sidebar.set_current_dir(std::path::PathBuf::from("/current"));
+        let live_hover = (std::path::PathBuf::from("/current/item"), false);
+        let mut hovered = Some(live_hover.clone());
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: stale.generation,
+                    request_id: stale.request_id,
+                    path: stale.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Rejected
+        );
+        assert_eq!(hovered, Some(live_hover));
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: current.generation,
+                    request_id: current.request_id,
+                    path: current.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Replaced
+        );
+        assert_eq!(hovered, None, "an accepted replacement retires hover");
+    }
+
+    #[test]
+    fn transactional_navigation_failure_keeps_hover_and_success_commits_once() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let initial = sidebar.set_current_dir(std::path::PathBuf::from("/current"));
+        assert!(sidebar.apply_load(sidebar::DirectoryResult {
+            generation: initial.generation,
+            request_id: initial.request_id,
+            path: initial.path,
+            entries: Ok(Vec::new()),
+            truncated: false,
+        }));
+        let live_hover = (std::path::PathBuf::from("/current/item"), false);
+        let mut hovered = Some(live_hover.clone());
+
+        let failed = sidebar
+            .begin_navigation(std::path::PathBuf::from("/missing"))
+            .expect("candidate navigation");
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult::failed(
+                    failed,
+                    sidebar::DirectoryError::from_io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "private remote",
+                    )),
+                ),
+            ),
+            SidebarLoadApply::NavigationFailed
+        );
+        assert_eq!(sidebar.current_dir, std::path::Path::new("/current"));
+        assert_eq!(hovered, Some(live_hover));
+
+        let succeeded = sidebar
+            .begin_navigation(std::path::PathBuf::from("/next"))
+            .expect("replacement candidate");
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: succeeded.generation,
+                    request_id: succeeded.request_id,
+                    path: succeeded.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::NavigationCommitted
+        );
+        assert_eq!(sidebar.current_dir, std::path::Path::new("/next"));
+        assert_eq!(hovered, None);
+    }
+
+    #[test]
+    fn retired_same_path_load_does_not_clear_the_live_hover_target() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let old = sidebar.set_current_dir(std::path::PathBuf::from("/current"));
+        let current = sidebar.begin_load_root();
+        assert_eq!(old.generation, current.generation);
+        assert!(old.cancellation.is_cancelled());
+        let live_hover = (std::path::PathBuf::from("/current/item"), false);
+        let mut hovered = Some(live_hover.clone());
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: old.generation,
+                    request_id: old.request_id,
+                    path: old.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Rejected
+        );
+        assert_eq!(hovered, Some(live_hover));
+
+        assert_eq!(
+            apply_sidebar_load_result(
+                &mut sidebar,
+                &mut hovered,
+                sidebar::DirectoryResult {
+                    generation: current.generation,
+                    request_id: current.request_id,
+                    path: current.path,
+                    entries: Ok(Vec::new()),
+                    truncated: false,
+                },
+            ),
+            SidebarLoadApply::Replaced
+        );
+        assert_eq!(hovered, None);
+    }
+
+    #[test]
+    fn root_reconcile_prunes_removed_path_and_delayed_contexts() {
+        let root =
+            std::env::temp_dir().join(format!("frost-sidebar-context-{}", uuid::Uuid::new_v4()));
+        let kept = root.join("kept");
+        let removed = root.join("removed");
+        std::fs::create_dir_all(&kept).expect("create kept directory");
+        std::fs::create_dir_all(&removed).expect("create removed directory");
+        let mut sidebar = sidebar::Sidebar::new();
+        let initial = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(sidebar::load_directory(initial)));
+        let refresh = sidebar.refresh();
+        std::fs::remove_dir_all(&removed).expect("remove stale row");
+
+        let mut selection = vec![kept.clone(), removed.clone()];
+        let mut anchor = Some(removed.clone());
+        let mut hovered = Some((removed.clone(), true));
+        let mut menu = Some(SidebarMenuState {
+            path: removed.clone(),
+            is_dir: true,
+            at: iced::Point::ORIGIN,
+            targets: vec![(removed.clone(), true)],
+            generation: refresh.generation,
+            clipboard_id: None,
+        });
+        let mut dialog = Some(SidebarDialogState {
+            kind: SidebarDialogKind::Rename,
+            path: removed.clone(),
+            input: "renamed".to_string(),
+            error: None,
+            generation: refresh.generation,
+        });
+        let mut delete_confirm = Some(SidebarDeleteConfirmation {
+            paths: vec![removed.clone()],
+            generation: refresh.generation,
+        });
+        let mut drop_burst = vec![std::path::PathBuf::from("/local/source")];
+        let mut drop_generation = Some(refresh.generation);
+        let mut drop_hint = true;
+
+        assert_eq!(
+            apply_sidebar_load_result(&mut sidebar, &mut hovered, sidebar::load_directory(refresh),),
+            SidebarLoadApply::Reconciled
+        );
+        prune_sidebar_context_after_reconcile(
+            &sidebar,
+            &root,
+            &mut selection,
+            &mut anchor,
+            &mut hovered,
+            &mut menu,
+            &mut dialog,
+            &mut delete_confirm,
+            &mut drop_burst,
+            &mut drop_generation,
+            &mut drop_hint,
+        );
+        assert_eq!(selection, vec![kept.clone()]);
+        assert_eq!(anchor, Some(kept));
+        assert_eq!(hovered, None);
+        assert!(menu.is_none() && dialog.is_none() && delete_confirm.is_none());
+        assert!(drop_burst.is_empty());
+        assert_eq!(drop_generation, None);
+        assert!(!drop_hint);
+
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn directory_reconcile_prunes_only_its_own_subtree() {
+        let root =
+            std::env::temp_dir().join(format!("frost-sidebar-scope-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("create source");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let mut sidebar = sidebar::Sidebar::new();
+        let initial = sidebar.set_current_dir(root.clone());
+        assert!(sidebar.apply_load(sidebar::load_directory(initial)));
+
+        // This is the selection path after a cross-parent rename remap, before
+        // the destination parent's refresh has returned.
+        let remapped = destination.join("moved.txt");
+        let mut selection = vec![remapped.clone()];
+        let mut anchor = Some(remapped.clone());
+        let mut hovered = None;
+        let mut menu = None;
+        let mut dialog = None;
+        let mut delete_confirm = None;
+        let mut drop_burst = Vec::new();
+        let mut drop_generation = Some(sidebar.generation());
+        let mut drop_hint = false;
+        prune_sidebar_context_after_reconcile(
+            &sidebar,
+            &source,
+            &mut selection,
+            &mut anchor,
+            &mut hovered,
+            &mut menu,
+            &mut dialog,
+            &mut delete_confirm,
+            &mut drop_burst,
+            &mut drop_generation,
+            &mut drop_hint,
+        );
+        assert_eq!(selection, vec![remapped.clone()]);
+        assert_eq!(anchor, Some(remapped.clone()));
+
+        prune_sidebar_context_after_reconcile(
+            &sidebar,
+            &destination,
+            &mut selection,
+            &mut anchor,
+            &mut hovered,
+            &mut menu,
+            &mut dialog,
+            &mut delete_confirm,
+            &mut drop_burst,
+            &mut drop_generation,
+            &mut drop_hint,
+        );
+        assert!(selection.is_empty());
+        assert!(anchor.is_none());
+        std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
     #[test]
@@ -25820,6 +27085,115 @@ mod tests {
     }
 
     #[test]
+    fn files_f5_refresh_is_scoped_and_never_steals_terminal_input() {
+        let f5 = keyboard::Key::Named(Named::F5);
+        assert!(sidebar_files_manual_refresh_key(
+            &f5,
+            keyboard::Modifiers::NONE,
+            false,
+            true,
+        ));
+        assert!(
+            !sidebar_files_manual_refresh_key(&f5, keyboard::Modifiers::NONE, false, false,),
+            "F5 outside the hovered Files dock must continue to the PTY",
+        );
+        assert!(!sidebar_files_manual_refresh_key(
+            &f5,
+            keyboard::Modifiers::CTRL,
+            false,
+            true,
+        ));
+        assert!(!sidebar_files_manual_refresh_key(
+            &f5,
+            keyboard::Modifiers::NONE,
+            true,
+            true,
+        ));
+        assert!(!sidebar_files_manual_refresh_key(
+            &keyboard::Key::Named(Named::F6),
+            keyboard::Modifiers::NONE,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn files_alt_navigation_is_scoped_and_exact() {
+        let alt = keyboard::Modifiers::ALT;
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::ArrowLeft), alt, false, true,),
+            Some(SidebarNavigationKey::Back)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(
+                &keyboard::Key::Named(Named::ArrowRight),
+                alt,
+                false,
+                true,
+            ),
+            Some(SidebarNavigationKey::Forward)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::ArrowUp), alt, false, true,),
+            Some(SidebarNavigationKey::Parent)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::Home), alt, false, true,),
+            Some(SidebarNavigationKey::Home)
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::ArrowUp), alt, false, false,),
+            None,
+            "outside Files, Alt+Up remains PTY input"
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(
+                &keyboard::Key::Named(Named::Home),
+                alt | keyboard::Modifiers::SHIFT,
+                false,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            sidebar_files_navigation_key(&keyboard::Key::Named(Named::Home), alt, true, true,),
+            None
+        );
+    }
+
+    #[test]
+    fn sidebar_breadcrumbs_are_exact_safe_and_bounded() {
+        let crumbs = sidebar_breadcrumbs(std::path::Path::new("/a/b/c/d/e"), 4);
+        assert_eq!(crumbs.len(), 4);
+        assert_eq!(crumbs[0], ("/".to_string(), std::path::PathBuf::from("/")));
+        assert_eq!(crumbs[1].0, "…");
+        assert_eq!(crumbs[1].1, std::path::PathBuf::from("/a/b/c"));
+        assert_eq!(crumbs[2].1, std::path::PathBuf::from("/a/b/c/d"));
+        assert_eq!(crumbs[3].1, std::path::PathBuf::from("/a/b/c/d/e"));
+        assert!(sidebar_breadcrumbs(std::path::Path::new("relative"), 4).is_empty());
+    }
+
+    #[test]
+    fn sidebar_snapshot_age_copy_marks_the_five_minute_boundary() {
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(59)),
+            ("Updated just now".to_string(), false)
+        );
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(60)),
+            ("Updated 1m ago".to_string(), false)
+        );
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(299)),
+            ("Updated 4m ago".to_string(), false)
+        );
+        assert_eq!(
+            sidebar_snapshot_age_copy(std::time::Duration::from_secs(300)),
+            ("Updated 5m ago · stale".to_string(), true)
+        );
+    }
+
+    #[test]
     fn block_search_toggle_repeat_is_consumed_without_closing_the_picker() {
         let bindings = keybindings::KeyBindings::default_bindings();
         let key = keyboard::Key::Character("f".into());
@@ -26580,12 +27954,11 @@ mod tests {
             cut: true,
             verb: "Moved",
         };
-        let (changed, notice, cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, None);
-        assert!(result.is_ok());
-        assert!(!cancelled);
-        assert_eq!(changed, FsLocation::Local);
-        assert_eq!(consumed, vec![root.join("one.txt")]);
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.location, FsLocation::Local);
+        assert_eq!(outcome.consumed_paths, vec![root.join("one.txt")]);
         assert_eq!(
             std::fs::read(dst_dir.join("one.txt")).expect("read moved"),
             b"1"
@@ -26596,7 +27969,7 @@ mod tests {
             b"2",
             "a failed item keeps its source"
         );
-        let (text, neutral) = notice.expect("summary");
+        let (text, neutral) = outcome.warning.expect("summary");
         assert!(text.starts_with("1 of 2 items failed"), "{text}");
         assert!(!neutral);
 
@@ -26613,12 +27986,14 @@ mod tests {
             cut: true,
             verb: "Moved",
         };
-        let (_changed, notice, cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
-        assert!(result.is_ok(), "batch errors are per-item, not fatal");
-        assert!(!cancelled);
-        assert!(consumed.is_empty());
-        let (text, _) = notice.expect("summary");
+        let outcome = run_sidebar_op(&FsLocation::Remote(9), &[], &op, None);
+        assert!(
+            outcome.result.is_ok(),
+            "batch errors are per-item, not fatal"
+        );
+        assert!(!outcome.cancelled);
+        assert!(outcome.consumed_paths.is_empty());
+        let (text, _) = outcome.warning.expect("summary");
         assert!(text.starts_with("1 of 1 items failed"), "{text}");
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
@@ -26646,13 +28021,16 @@ mod tests {
             cut: false,
             verb: "Pasted",
         };
-        let (_changed, notice, cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
-        assert!(cancelled);
-        assert!(result.is_err());
-        assert!(consumed.is_empty());
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(outcome.cancelled);
+        assert!(outcome.result.is_err());
+        assert!(outcome.consumed_paths.is_empty());
         assert!(!dst_dir.join("one.txt").exists());
-        assert!(notice.expect("cancel summary").0.contains("Cancelled"));
+        assert!(outcome
+            .warning
+            .expect("cancel summary")
+            .0
+            .contains("Cancelled"));
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
@@ -26668,19 +28046,18 @@ mod tests {
             root.join("two.txt"),
         ]);
         std::fs::write(root.join("two.txt"), b"2").expect("write");
-        let (changed, notice, cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, None);
-        assert!(result.is_ok());
-        assert!(!cancelled);
-        assert_eq!(changed, FsLocation::Local);
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.location, FsLocation::Local);
         assert_eq!(
-            consumed,
+            outcome.consumed_paths,
             vec![root.join("one.txt"), root.join("two.txt")],
             "only successfully deleted sources invalidate clipboard entries"
         );
         assert!(!root.join("one.txt").exists());
         assert!(!root.join("two.txt").exists());
-        let (text, neutral) = notice.expect("summary");
+        let (text, neutral) = outcome.warning.expect("summary");
         assert!(text.starts_with("1 of 3 items failed"), "{text}");
         assert!(!neutral);
         std::fs::remove_dir_all(root).expect("remove test tree");
@@ -26699,21 +28076,57 @@ mod tests {
             src: src.clone(),
             dst: dst.clone(),
         };
-        let (_changed, _notice, _cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, None);
-        assert!(result.is_ok());
-        assert_eq!(consumed, vec![src.clone()]);
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.consumed_paths, vec![src.clone()]);
+        assert_eq!(outcome.affected_parents, vec![root.clone()]);
+        assert_eq!(
+            outcome.path_remaps,
+            vec![SidebarPathRemap {
+                from: src.clone(),
+                to: dst.clone(),
+            }]
+        );
 
         let failed = SidebarOp::Rename {
             src: src.clone(),
             dst: root.join("never.txt"),
         };
-        let (_changed, _notice, _cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &failed, None);
-        assert!(result.is_err());
-        assert!(consumed.is_empty());
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &failed, None);
+        assert!(outcome.result.is_err());
+        assert!(outcome.consumed_paths.is_empty());
+        assert_eq!(
+            outcome.affected_parents,
+            vec![root.clone()],
+            "an ambiguous backend failure still invalidates its exact parent"
+        );
+        assert!(outcome.path_remaps.is_empty());
         assert!(dst.exists());
         std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    #[test]
+    fn confirmed_directory_move_remaps_selection_and_anchor_by_path_component() {
+        let remaps = vec![SidebarPathRemap {
+            from: std::path::PathBuf::from("/root/old"),
+            to: std::path::PathBuf::from("/root/new"),
+        }];
+        let mut selection = vec![
+            std::path::PathBuf::from("/root/old"),
+            std::path::PathBuf::from("/root/old/nested/file"),
+            std::path::PathBuf::from("/root/old-suffix"),
+        ];
+        let mut anchor = Some(std::path::PathBuf::from("/root/old/nested"));
+        remap_sidebar_selection(&mut selection, &mut anchor, &remaps);
+        assert_eq!(
+            selection,
+            vec![
+                std::path::PathBuf::from("/root/new"),
+                std::path::PathBuf::from("/root/new/nested/file"),
+                std::path::PathBuf::from("/root/old-suffix"),
+            ]
+        );
+        assert_eq!(anchor, Some(std::path::PathBuf::from("/root/new/nested")));
     }
 
     #[test]
@@ -27007,12 +28420,11 @@ mod tests {
             cut: false,
             verb: "Imported",
         };
-        let (changed, notice, cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, None);
-        assert!(result.is_ok());
-        assert!(!cancelled);
-        assert_eq!(changed, FsLocation::Local);
-        assert!(consumed.is_empty());
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, None);
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.location, FsLocation::Local);
+        assert!(outcome.consumed_paths.is_empty());
         // Two landed, the colliding one is counted in the summary.
         assert!(root.join("target").join("a.txt").exists());
         assert!(root
@@ -27021,7 +28433,7 @@ mod tests {
             .join("sub")
             .join("deep.txt")
             .exists());
-        let (text, neutral) = notice.expect("summary notice");
+        let (text, neutral) = outcome.warning.expect("summary notice");
         assert!(text.starts_with("1 of 3 items failed"), "{text}");
         assert!(!neutral);
 
@@ -27036,13 +28448,16 @@ mod tests {
             cut: false,
             verb: "Imported",
         };
-        let (_changed, notice, cancelled, result, consumed) =
-            run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
-        assert!(cancelled);
-        assert!(result.is_err());
-        assert!(consumed.is_empty());
+        let outcome = run_sidebar_op(&FsLocation::Local, &[], &op, Some(&progress));
+        assert!(outcome.cancelled);
+        assert!(outcome.result.is_err());
+        assert!(outcome.consumed_paths.is_empty());
         assert!(!root2.join("target").join("a.txt").exists());
-        assert!(notice.expect("cancel summary").0.contains("Cancelled"));
+        assert!(outcome
+            .warning
+            .expect("cancel summary")
+            .0
+            .contains("Cancelled"));
         std::fs::remove_dir_all(root2).expect("remove test tree");
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
