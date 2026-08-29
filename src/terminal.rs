@@ -7081,7 +7081,8 @@ impl TerminalState {
         if recovery.len() < limit && !recovery.contains(&b';') {
             recovery.extend_from_slice(&suffix[..suffix.len().min(limit - recovery.len())]);
         }
-        self.kitty_graphics.reject_graphics_payload(&recovery, error);
+        self.kitty_graphics
+            .reject_graphics_payload(&recovery, error);
         let responses = self.kitty_graphics.take_responses();
         if !responses.is_empty() {
             self.output_buffer.extend_from_slice(&responses);
@@ -7224,9 +7225,7 @@ impl TerminalState {
             let bel = input.iter().position(|&byte| byte == 0x07);
             let st = input.windows(2).position(|window| window == b"\x1b\\");
             match (bel, st) {
-                (Some(bel), Some(st)) if bel < st => {
-                    Some((self.pending_osc.len() + bel, bel + 1))
-                }
+                (Some(bel), Some(st)) if bel < st => Some((self.pending_osc.len() + bel, bel + 1)),
                 (Some(_), Some(st)) => Some((self.pending_osc.len() + st, st + 2)),
                 (Some(bel), None) => Some((self.pending_osc.len() + bel, bel + 1)),
                 (None, Some(st)) => Some((self.pending_osc.len() + st, st + 2)),
@@ -7849,8 +7848,7 @@ impl TerminalState {
                         self.utf8_buf[self.utf8_len as usize] = byte;
                         self.utf8_len += 1;
                         if self.utf8_len == self.utf8_expected {
-                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize])
-                            {
+                            match std::str::from_utf8(&self.utf8_buf[..self.utf8_len as usize]) {
                                 Ok(s) => {
                                     if let Some(ch) = s.chars().next() {
                                         self.put_char(ch, true);
@@ -15632,8 +15630,7 @@ mod tests {
 
         // 100 KiB + 1 passes the encoded-length pre-check (its base64 size
         // matches the boundary payload) but exceeds the decoded cap.
-        let payload =
-            base64::engine::general_purpose::STANDARD.encode("x".repeat(100 * 1024 + 1));
+        let payload = base64::engine::general_purpose::STANDARD.encode("x".repeat(100 * 1024 + 1));
         terminal.process_input(format!("\x1b]52;c;{payload}\x07").as_bytes());
         assert_eq!(terminal.take_osc52_clipboard_set(), None);
     }
@@ -15645,15 +15642,17 @@ mod tests {
 
         // Encoded length beyond the pre-check limit: rejected without
         // decoding, leaving no pending clipboard write.
-        let payload =
-            base64::engine::general_purpose::STANDARD.encode("x".repeat(200 * 1024));
+        let payload = base64::engine::general_purpose::STANDARD.encode("x".repeat(200 * 1024));
         terminal.process_input(format!("\x1b]52;c;{payload}\x07").as_bytes());
         assert_eq!(terminal.take_osc52_clipboard_set(), None);
 
         // Ordinary small writes and the query path are unaffected by the cap.
         let small = base64::engine::general_purpose::STANDARD.encode("hello");
         terminal.process_input(format!("\x1b]52;c;{small}\x07").as_bytes());
-        assert_eq!(terminal.take_osc52_clipboard_set().as_deref(), Some("hello"));
+        assert_eq!(
+            terminal.take_osc52_clipboard_set().as_deref(),
+            Some("hello")
+        );
 
         terminal.process_input(b"\x1b]52;c;?\x07");
         assert!(terminal.take_osc52_clipboard_query());
@@ -17237,9 +17236,7 @@ mod tests {
     fn search_line_text(line: super::SearchLine<'_>) -> String {
         match line {
             super::SearchLine::Text(text) => text.to_string(),
-            super::SearchLine::Cells(cells) => {
-                cells.iter().map(|cell| cell.character).collect()
-            }
+            super::SearchLine::Cells(cells) => cells.iter().map(|cell| cell.character).collect(),
         }
     }
 
@@ -17412,10 +17409,7 @@ mod tests {
             terminal.live_prompt_row(),
             Some(prompt_before.saturating_sub(prompt_before.min(scrollback_before)))
         );
-        let retained: String = terminal
-            .search_lines()
-            .map(search_line_text)
-            .collect();
+        let retained: String = terminal.search_lines().map(search_line_text).collect();
         assert!(
             retained.contains("$ draft"),
             "retained buffer: {retained:?}"
@@ -17445,10 +17439,7 @@ mod tests {
 
         assert!(terminal.is_command_running());
         assert_eq!(terminal.running_zone_start(), Some(0));
-        let retained: String = terminal
-            .search_lines()
-            .map(search_line_text)
-            .collect();
+        let retained: String = terminal.search_lines().map(search_line_text).collect();
         assert!(
             retained.contains("sleep 5"),
             "retained buffer: {retained:?}"
@@ -17508,17 +17499,11 @@ mod tests {
     fn clear_completed_blocks_is_a_noop_without_finished_zones() {
         let mut terminal = TerminalState::new(20, 3);
         terminal.process_input(b"plain text");
-        let before: String = terminal
-            .search_lines()
-            .map(search_line_text)
-            .collect();
+        let before: String = terminal.search_lines().map(search_line_text).collect();
 
         assert_eq!(terminal.clear_completed_blocks(), 0);
 
-        let after: String = terminal
-            .search_lines()
-            .map(search_line_text)
-            .collect();
+        let after: String = terminal.search_lines().map(search_line_text).collect();
         assert_eq!(after, before);
     }
 
@@ -17595,19 +17580,13 @@ mod tests {
         // The live lifecycle reached scrollback, so no grid rows are blanked
         // and undo restores the exact pre-clear buffer.
         assert!(start_before < terminal.scrollback_len());
-        let buffer_before: String = terminal
-            .search_lines()
-            .map(search_line_text)
-            .collect();
+        let buffer_before: String = terminal.search_lines().map(search_line_text).collect();
 
         assert_eq!(terminal.clear_completed_blocks(), 1);
         assert_eq!(terminal.undo_clear_completed_blocks(), 1);
 
         assert_eq!(terminal.running_zone_start(), Some(start_before));
-        let buffer_after: String = terminal
-            .search_lines()
-            .map(search_line_text)
-            .collect();
+        let buffer_after: String = terminal.search_lines().map(search_line_text).collect();
         assert_eq!(buffer_after, buffer_before);
 
         terminal.process_input(b"done\r\n\x1b]133;D;0\x07");

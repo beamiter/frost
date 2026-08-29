@@ -14,7 +14,12 @@ pub const PICKER_MAX_ENTRIES: usize = 2_000;
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更早的命令通过输入查询来召回。
 pub const MAX_RESULTS: usize = 15;
-const MAX_HISTORY_CWD_BYTES: usize = 4 * 1024;
+/// The cwd budget the shared writer enforces (`MAX_CWD_BYTES` in
+/// `jterm_core::command_history`, 16 KiB — it is private there, so the number
+/// is mirrored rather than imported). Reading with a stricter bound than the
+/// writer means dropping the cwd off records that are perfectly well-formed
+/// in the family file, so this must not drift below core's value.
+const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
@@ -196,6 +201,27 @@ mod tests {
             sanitized_command(&"x".repeat(crate::review_text::MAX_HISTORY_COMMAND_BYTES + 1)),
             None
         );
+    }
+
+    /// The JSONL index is a family-shared file: anything the core writer
+    /// accepts has to survive frost's read side, or frost silently hides
+    /// records that are present and well-formed on disk (and a record frost
+    /// writes has to be readable by the siblings for the same reason).
+    #[test]
+    fn every_record_the_core_writer_accepts_survives_the_picker() {
+        // The writer's own bounds: command <= MAX_REVIEW_INPUT_BYTES, cwd <=
+        // 16 KiB.
+        assert_eq!(
+            crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+            jterm_core::review_input::MAX_REVIEW_INPUT_BYTES
+        );
+        let command = "e".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES);
+        let cwd = format!("/{}", "d".repeat(16 * 1024 - 1));
+        assert_eq!(sanitized_command(&command), Some(command.as_str()));
+        assert_eq!(sanitized_cwd(&cwd), Some(cwd.as_str()));
+        let state = HistoryPickerState::new(vec![record(&command, Some(&cwd), 0)]);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].cwd.as_deref(), Some(cwd.as_str()));
     }
 
     #[test]

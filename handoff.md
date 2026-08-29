@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (Remote Files transactional navigation and authority isolation)
+Updated: 2026-08-29 (shared AI chat store; the quit-path write that erased the saved chat library)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -10,6 +10,124 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Shared AI chat store, and the quit path that erased the saved library
+  (2026-08-29)**: frost's in-progress AI chats panel had grown a private copy of
+  the multi-chat state machine over `jterm_core::ai::ConversationSnapshot`, and
+  so had anvil, forge and ember. The four copies held no toolkit code and had
+  drifted in both directions, so no one of them was correct on its own;
+  `jterm_core::ai::chat_store` is now their union (1,888 lines, 47 tests) and
+  `src/ai_chat_store.rs` is a 35-line shim carrying the single decision frost
+  owns. That decision is `BusyChatPolicy::Refuse`, pinned at both construction
+  sites rather than inherited as a default: frost's panel has no
+  cancel-then-mutate step — Archive and Delete are single clicks and Stop is a
+  separate button — so a chat with a request in flight refuses both, and
+  `ai_chats` renders the refusal as "Stop this response before …". Archiving the
+  last writable chat at the 50-chat cap is refused before anything mutates, so
+  the library always still has a chat to type into.
+
+  The defect this closed is the worst one the round found anywhere in the family,
+  and it was here. `Frost::quit` called `self.ai_chats.persist(…)` beside
+  `self.agent.persist()` with no guard, and `persist` is a whole-file replace of
+  `~/.config/frost/ai_chats.json`. A session in which the panel was never opened
+  still held the store's construction-time default — one blank "New chat" — so
+  quitting that session overwrote every saved conversation with an empty library.
+  Nothing downstream could catch it: the default snapshot is perfectly valid, and
+  the write is not a read-modify-write, so there was nothing to conflict with.
+  Persistence now fails closed on three independent hazards through
+  `can_persist()`: `PersistState::Unloaded` (this run never read the file, so its
+  store does not descend from what is on disk), `PersistState::Blocked` (this run
+  read it and the read or decode failed — truncated by a crash, past the read
+  bound, wrong permissions, a schema version from a future sibling — which is
+  recoverable evidence, never something to replace with a fresh empty library),
+  and `owns_persistence`, the single-instance lock, because a whole-file write
+  from a second window is a last-writer-wins overwrite of whatever the lock
+  holder has saved since. A non-owning window still restores and uses the library
+  and says so in its notice line rather than silently dropping what is typed into
+  it. `persist_never_overwrites_a_library_this_run_did_not_read` drives all three
+  cases against a real fixture and asserts the bytes on disk are byte-identical
+  afterwards, then proves the owner does republish once it has read the file;
+  `a_failed_restore_blocks_every_later_write` drives draft, new-chat, close and
+  explicit persist after a failed restore of both a truncated and a
+  future-version file.
+
+  The write itself goes through the store's `snapshot_for_persistence`, which
+  compacts live history *before* serialising. The two budgets are deliberately
+  unequal — the live library is bounded in aggregate at 8 MiB across all chats
+  while the persisted schema bounds total turn text at 4 MiB — so `from_chats`
+  still compacts on the way out and reports it, and `compact_to_measured_limit`
+  then measures the encoded JSON against the 8 MiB envelope cap. Without that
+  first pass a long-lived library could reach a size `ConversationSnapshot`
+  refuses outright, after which `Err(SnapshotInvalid)` was the only outcome and
+  nothing could be saved at all. Retry payloads are materialized into a throwaway
+  clone through the core's *detaching* recovery (severing an in-flight request
+  costs nothing on a copy that is discarded, and the message survives as a
+  draft), so persisting never disturbs the live composer; the truncation markers
+  both compaction passes applied are then synced back into the live chats, so a
+  library row admits what the saved copy dropped ("· Some local content omitted")
+  instead of a conversation quietly shrinking. Writes are debounced on the config
+  tick for draft keystrokes but immediate on a finished turn, stop, select,
+  new-chat, archive, delete and close. The panel is also an input-owning overlay
+  now: while it is open its own chord and Escape close it and every other key is
+  swallowed, because keys the panel's focused inputs did not capture — browsing
+  the library, or after clicking a chat row — previously reached the hidden shell
+  behind it.
+
+- **Pane-bound, review-only AI command suggestion (2026-08-29)**: the inline
+  natural-language → command flow (palette entry **Ask AI: Generate Command**, an
+  overlay for the request, `src/ai_command.rs` for the card) drafts through
+  `jterm_core::ai::nl_to_command_with_context_blocking_cancellable` on a worker
+  and inserts only through `review_input::validate` and the guarded
+  prompt-replace path. Generated commands never run automatically; the card says
+  so verbatim. Two defects in that flow were confirmed and fixed.
+
+  The card was not scoped to the pane that asked for it. "Insert for review"
+  resolves its target by `session_id` alone and sends Ctrl+U plus the generated
+  command, so a card drafted in one pane and left open while the user moved to
+  another still rendered, still owned that pane's Escape, and would clear and
+  retype a prompt the user could not see — which is not a review. Rendering,
+  Escape ownership and insert now all go through
+  `ai_suggestion_bound_session()` / `CommandSuggestion::is_bound_to_active_pane`,
+  the same scoping frost's correction card has always had; an off-pane insert is
+  refused with a stated reason rather than performed silently. Closing a pane
+  drops a card bound to it, and `Drop` cancels the drafting worker.
+
+  The request `generation` was per-card and restarted at 1. An iced `Task`
+  returned from `update` cannot be aborted, so a superseded worker always
+  delivers, and the generation is the whole of the reply-routing identity that
+  `AiSuggestionResolved` carries — two successive cards both numbered 1 meant
+  request A's command published onto request B's card, one Enter away from the
+  prompt, while B's own reply was then dropped as "not current". The counter is
+  now window-wide on `Frost` and strictly increasing via
+  `ai_command::next_generation`, which returns `None` on exhaustion (refuse the
+  request) rather than wrapping back onto a live id, and `regenerate` refuses any
+  id it has already seen. `a_superseded_requests_reply_never_publishes_onto_its_successor`
+  pins both halves — the late success and the late cancellation error miss, and
+  the live request's own reply still lands.
+
+- **Family contracts and command-history budget drift (2026-08-29)**: the AI chat
+  panel's command id is `ai_chat:toggle` — singular, matching the
+  `agent:toggle` / `sidebar:toggle` / `debug:toggle` it sits beside — bound by
+  default to `ctrl+shift+alt+a` and displayed as `Ctrl+Shift+Alt+A` in
+  `jterm_core`'s frozen modifier order, the same id and the same chord in all
+  four terminals; a per-app spelling would make one shared keybindings file mean
+  different things in different windows. `ai_chats:toggle` is explicitly rejected
+  by the parser, and a test derives the palette's hint from the default binding
+  through `jterm_core::keybindings::parse(..).display()` so the hint, the table
+  and forge's rendering of the same chord cannot drift into three spellings.
+
+  The command-history JSONL index is a family-shared file written by
+  `jterm_core::command_history`, and frost's read side had drifted from that
+  writer in both constants. `review_text::MAX_HISTORY_COMMAND_BYTES` was a local
+  `256 * 1024` — the right number today, but a re-declaration is exactly how the
+  siblings ended up four times apart, so it now reads
+  `jterm_core::review_input::MAX_REVIEW_INPUT_BYTES` directly. `history_picker`'s
+  `MAX_HISTORY_CWD_BYTES` was a genuine defect: 4 KiB against the writer's
+  16 KiB, so frost silently dropped the cwd off records that are well-formed in
+  the family file. It is now 16 KiB, mirrored with a comment saying why (core's
+  `MAX_CWD_BYTES` is private there), and
+  `every_record_the_core_writer_accepts_survives_the_picker` builds a record at
+  both of the writer's exact bounds and asserts the picker keeps it whole.
 
 - **Remote Files transactional navigation and authority isolation (2026-08-29)**:
   directory root changes now stage a candidate one-level scan and commit only
@@ -529,6 +647,26 @@ The repository still has no formal release tag, so AppStream deliberately has no
 fabricated `<releases>` entry. Add the first release node with the real version and date
 when the first tag is cut; `appstreamcli validate --pedantic --no-net` currently reports
 that omission as its one expected pedantic note.
+
+The AI chats panel, the AI command suggestion, and their shared-store shim
+(`src/ai_chats.rs`, `src/ai_chat_store.rs`, `src/ai_command.rs`, and the
+`src/main.rs` wiring) are still uncommitted work in progress, carried into this
+round rather than produced by it. The dependency half of that is now settled:
+`Cargo.toml` pins `jterm_core` at `1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb`,
+the commit that introduces `jterm_core::ai::chat_store`, with `jagent`
+`f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf` beneath it. The temporary local
+`[patch]` used to develop the two together is gone, `Cargo.lock` carries real
+`source = "git+…"` lines again, and the gate below was rerun with `--locked`
+against the published revisions. What remains uncommitted is frost's own
+panel code. Until then the panel is absent from
+README's shortcut table on purpose: the chord is settled family-wide, but
+nothing here is shipped behavior yet.
+
+The panel also has no "ask about the selected block" entry — the Agent panel
+already owns that surface — so the store's `BlockContext` stays
+schema-compatible but is always `None` for turns begun in the chats panel. The
+suggestion card does attach the selected block's bounded command/output, and
+only under the `ai_share_command_context` consent.
 
 ## Release checks
 

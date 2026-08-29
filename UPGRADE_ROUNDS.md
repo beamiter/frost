@@ -81,5 +81,58 @@ Block Mode convergence continues with rounds 31–33:
     to `0f47569`, adopting AI origin/credential/no-proxy validation without changing the
     four-way completed-block or lifecycle-health contracts.
 
+AI chat-library convergence adds rounds 34–46:
+
+34. **Guarded quit-path write** — `persist()` ran unconditionally on quit, so a
+    session that never opened the AI panel replaced the saved chat library with
+    the store's empty default; `can_persist()` now requires that this run
+    actually read the file it is about to replace.
+35. **Failed restore blocks writing** — an unreadable or undecodable library
+    (truncated, over the read bound, a future sibling's schema version) is left
+    byte-identical for the rest of the run instead of being overwritten by a
+    fresh empty one; the panel stays usable and says why.
+36. **Single-instance write ownership** — only the window holding the instance
+    lock republishes the shared file; a second window restores it, uses it, and
+    states in its notice that chats started there are not saved.
+37. **Shared chat state machine** — frost's private multi-chat store collapses
+    to a 35-line shim over `jterm_core::ai::chat_store`, the union of the four
+    terminals' drifted copies (1,888 lines, 47 tests).
+38. **Explicit busy policy** — `BusyChatPolicy::Refuse` is pinned at every
+    construction site, because frost's panel has no cancel-then-mutate step;
+    archive/delete on a chat with a request in flight refuse with a stated
+    reason rather than inheriting a silent default.
+39. **Compaction before serialisation** — `snapshot_for_persistence` compacts
+    live history first, so a grown library can no longer reach a size the shared
+    schema refuses outright and leave nothing saveable at all.
+40. **Truncation markers sync back** — both compaction passes run on a clone,
+    and what they dropped is carried into the live library so its rows admit it.
+41. **Detaching retry materialisation** — retry payloads merge into the
+    throwaway persistence clone, so saving cannot disturb the live composer.
+42. **Pane-scoped suggestion card** — the AI command card renders, owns Escape,
+    and inserts only for the pane that asked for it; an off-pane insert is
+    refused instead of clearing and retyping an off-screen prompt.
+43. **Window-wide suggestion generations** — the request id is app-level and
+    strictly increasing rather than restarting at 1 per card, so a superseded
+    worker's command can no longer publish onto its successor; exhaustion
+    refuses the request instead of wrapping onto a live id.
+44. **Card teardown follows the pane** — closing a pane drops its card, whose
+    `Drop` cancels the drafting worker.
+45. **Panel keyboard ownership** — while the chats panel is open, keys its
+    focused inputs did not capture are swallowed rather than reaching the shell
+    behind it; its own chord and Escape close it.
+46. **Canonical id, chord, and history budgets** — `ai_chat:toggle` (singular,
+    matching `agent:toggle`) on `ctrl+shift+alt+a`, with the palette hint
+    asserted equal to the core's rendering of the default binding; the shared
+    command-history index's command bound is read from
+    `review_input::MAX_REVIEW_INPUT_BYTES` instead of re-declared, and its cwd
+    bound rises from 4 KiB to the core writer's 16 KiB.
+
 Verification: `bash scripts/test-install-paths.sh`, Frost config tests, and the
 full formatting/check/Clippy/test gates.
+
+Verification for rounds 34–46: `cargo fmt --all -- --check`, `cargo clippy
+--locked --all-targets --all-features -- -D warnings`, and `cargo test`
+(1,017 passing, zero failures). The temporary local `[patch]` those rounds were
+developed under is gone: the gate was rerun with `--locked` against the
+published `jterm_core` `1a04f1e` and `jagent` `f9383ec`. The working tree still
+carries the uncommitted AI panel itself.

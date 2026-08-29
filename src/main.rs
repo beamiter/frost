@@ -9,6 +9,9 @@ use jterm_core::pty_input::{self, PasteModes, PastePolicy, UnbracketedMultiline}
 mod agent;
 mod agent_task;
 mod agent_task_ui;
+mod ai_chat_store;
+mod ai_chats;
+mod ai_command;
 mod ansi;
 mod block_export;
 mod block_mode;
@@ -851,6 +854,14 @@ static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 static CORRECTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-correction-input"));
+static AI_CHATS_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-chats-input"));
+static AI_CHATS_SEARCH_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-chats-search"));
+static AI_ASK_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-ask-input"));
+static AI_SUGGESTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-ai-suggestion-input"));
 
 /// Toast kind drives the accent color of the floating notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2506,7 +2517,9 @@ fn pane_tree_to_snapshot(tree: &PaneTree) -> session_persistence::PaneTreeSnapsh
 fn equalize_pane_tree(node: &mut PaneTree) -> bool {
     match node {
         PaneTree::Leaf(_) => false,
-        PaneTree::Split { children, ratios, .. } => {
+        PaneTree::Split {
+            children, ratios, ..
+        } => {
             let even = 1.0 / children.len().max(1) as f32;
             let mut changed = ratios
                 .iter()
@@ -3010,6 +3023,42 @@ enum Message {
     CommandCorrectionDismiss,
     /// Settings toggle for review-first command correction.
     SetCommandCorrectionEnabled(bool),
+    // Persistent AI chats library (ported from anvil's AI panel) and inline
+    // AI command generation (ported from anvil's `?` palette flow).
+    /// Composer edit of the viewed chat's draft.
+    AiChatsInput(String),
+    AiChatsSubmit,
+    AiChatsStop,
+    AiChatsRetry,
+    /// One streamed fragment for the in-flight chat turn (stale tokens dropped).
+    AiChatsDelta(ai_chat_store::RequestToken, String),
+    /// One finished chat request (stale tokens dropped).
+    AiChatsResult(ai_chat_store::RequestToken, Result<String, String>),
+    AiChatsNewChat,
+    AiChatsSelect(u64),
+    AiChatsSearchInput(String),
+    AiChatsShowLibrary,
+    AiChatsShowChat,
+    /// Rename-editor edit of the viewed chat's title.
+    AiChatsTitleInput(String),
+    AiChatsToggleArchive,
+    /// Two-step delete: the first press arms, the second confirms.
+    AiChatsDelete,
+    AiChatsIncludeRecent(bool),
+    AiChatsClose,
+    /// Edit of the inline AI command-generation request overlay.
+    AiAskInput(String),
+    AiAskSubmit,
+    AiAskClose,
+    /// The suggestion worker resolved (stale generations dropped).
+    AiSuggestionResolved(u64, Result<String, String>),
+    /// Edit of the suggestion card's command draft.
+    AiSuggestionInput(String),
+    /// The card's primary action: insert the validated draft at the prompt
+    /// for review. Never submits.
+    AiSuggestionInsert,
+    AiSuggestionRegenerate,
+    AiSuggestionDismiss,
     // Experimental Tasks dashboard (native Codex runtime + isolated worktrees).
     TaskPanelToggle,
     TaskSelect(agent_task::TaskId),
@@ -4216,6 +4265,19 @@ struct Frost {
     /// Review-first command-correction requests and presented cards, keyed by
     /// stable terminal-session id (per-pane, generation-guarded).
     command_corrections: command_correction::CorrectionRegistry,
+    /// Persistent AI chats library panel (ported from anvil's AI panel).
+    ai_chats: ai_chats::AiChatsUi,
+    /// The inline AI command-generation request overlay's text, while open.
+    ai_ask: Option<String>,
+    /// The pane-bound, review-only AI command suggestion card (never
+    /// auto-runs; insert goes through the guarded prompt path).
+    ai_suggestion: Option<ai_command::CommandSuggestion>,
+    /// Monotonic id for every suggestion request this window launches. The
+    /// worker reply carries it back through `AiSuggestionResolved`, and it is
+    /// the only thing distinguishing a superseded request's late reply from
+    /// the live one — so it must never restart with a new card (anvil's
+    /// `command_suggestion_generation`).
+    ai_suggestion_generation: u64,
     /// Provider-neutral task lifecycle reducer for the experimental Tasks
     /// dashboard (runtime-only metadata; nothing is persisted).
     task_manager: agent_task::TaskManager,
@@ -4541,6 +4603,10 @@ impl Frost {
             block_export_in_flight: false,
             agent: agent::AgentUi::new(),
             command_corrections: command_correction::CorrectionRegistry::default(),
+            ai_chats: ai_chats::AiChatsUi::new(is_first_instance),
+            ai_ask: None,
+            ai_suggestion: None,
+            ai_suggestion_generation: 0,
             task_manager: agent_task::TaskManager::new(),
             agent_runtime: agent_task::AgentRuntimeManager::new(),
             task_panel: agent_task_ui::TaskPanel::new(),
@@ -6426,6 +6492,15 @@ impl Frost {
         // A closed pane's correction request/card goes with it (cancels any
         // in-flight probe or AI call for that pane).
         self.command_corrections.close(closed_id);
+        // A suggestion card bound to the closed pane likewise goes away; its
+        // Drop cancels the drafting worker.
+        if self
+            .ai_suggestion
+            .as_ref()
+            .is_some_and(|session| session.session_id == closed_id)
+        {
+            self.ai_suggestion = None;
+        }
         // The strip's transient state is keyed by tab id; a closed tab is
         // dropped from it in `prune_closed_pane` once we know whether the tab
         // itself went away.
@@ -6562,6 +6637,7 @@ impl Frost {
             return Task::none();
         }
         self.agent.persist();
+        self.ai_chats.persist(self.config.ai_redact_secrets);
         self.save_session_snapshot();
         if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
             log::warn!("jsh execution journal did not flush before exit");
@@ -7858,6 +7934,7 @@ impl Frost {
                     }
                 }
             }
+            C::AiChatToggle => self.toggle_ai_chats(),
             C::FontZoomIn => {
                 self.adjust_font_size(1.0);
                 Task::none()
@@ -8189,6 +8266,29 @@ impl Frost {
             || self.search_replace.is_open
             || self.search.is_open
             || self.correction_card_visible()
+            || self.ai_ask.is_some()
+            // Only the pane the card belongs to; an off-pane card must not
+            // claim the Escape of whatever the user is actually looking at.
+            || self.ai_suggestion_visible()
+            // The chats panel is an input-owning overlay: while it is up its
+            // Escape closes it instead of reaching the shell behind it.
+            || self.ai_chats.is_open
+    }
+
+    /// The suggestion card is bound to the pane that asked for it: it renders,
+    /// owns Escape, and accepts an insert only while that pane is the active
+    /// one. frost's correction card has always been scoped this way
+    /// (`correction_card_visible`), and the insert writes to the bound pane —
+    /// a review-first affordance the user cannot see is not a review.
+    fn ai_suggestion_bound_session(&self) -> Option<&ai_command::CommandSuggestion> {
+        let active_id = self.sessions.get(self.active).map(|sess| sess.id);
+        self.ai_suggestion
+            .as_ref()
+            .filter(|session| session.is_bound_to_active_pane(active_id))
+    }
+
+    fn ai_suggestion_visible(&self) -> bool {
+        self.ai_suggestion_bound_session().is_some()
     }
 
     fn active_pane_has_prompt_marks(&self) -> bool {
@@ -10817,6 +10917,8 @@ impl Frost {
                 }
             }
             PaletteAction::ToggleTasks => Task::done(Message::TaskPanelToggle),
+            PaletteAction::ToggleAiChats => self.toggle_ai_chats(),
+            PaletteAction::AskAiGenerate => self.open_ai_ask(),
             PaletteAction::OpenSettings => {
                 self.config_panel_open = true;
                 Task::none()
@@ -12486,6 +12588,88 @@ impl Frost {
                 self.config.command_correction_enabled = enabled;
                 self.config_dirty = true;
             }
+            // ===== AI chats library + inline AI command generation =====
+            Message::AiChatsInput(draft) => self.ai_chats.set_draft(draft),
+            Message::AiChatsSubmit => {
+                if let Some(request) = self.ai_chats.submit(&self.config) {
+                    return self.ai_chats_request_task(request);
+                }
+            }
+            Message::AiChatsStop => self.ai_chats.stop(self.config.ai_redact_secrets),
+            Message::AiChatsRetry => {
+                if let Some(request) = self.ai_chats.retry(&self.config) {
+                    return self.ai_chats_request_task(request);
+                }
+            }
+            Message::AiChatsDelta(token, text) => {
+                self.ai_chats.push_delta(token, &text);
+            }
+            Message::AiChatsResult(token, result) => {
+                self.ai_chats.complete(token, result);
+                // A finished turn changes durable state immediately (history
+                // or restored draft), not just at the debounce tick.
+                self.ai_chats.persist(self.config.ai_redact_secrets);
+            }
+            Message::AiChatsNewChat => {
+                self.ai_chats.new_chat(self.config.ai_redact_secrets);
+                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
+            }
+            Message::AiChatsSelect(id) => {
+                self.ai_chats.select_chat(id, self.config.ai_redact_secrets);
+                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
+            }
+            Message::AiChatsSearchInput(query) => self.ai_chats.set_search(query),
+            Message::AiChatsShowLibrary => {
+                self.ai_chats.page = ai_chats::ChatsPage::Library;
+                return iced::widget::operation::focus(AI_CHATS_SEARCH_ID.clone());
+            }
+            Message::AiChatsShowChat => {
+                self.ai_chats.page = ai_chats::ChatsPage::Chat;
+                return iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone());
+            }
+            Message::AiChatsTitleInput(title) => self.ai_chats.rename(title),
+            Message::AiChatsToggleArchive => {
+                self.ai_chats.toggle_archive(self.config.ai_redact_secrets);
+            }
+            Message::AiChatsDelete => self.ai_chats.delete(self.config.ai_redact_secrets),
+            Message::AiChatsIncludeRecent(enabled) => self.ai_chats.set_include_recent(enabled),
+            Message::AiChatsClose => {
+                self.ai_chats.close(self.config.ai_redact_secrets);
+            }
+            Message::AiAskInput(text) => {
+                if let Some(query) = self.ai_ask.as_mut() {
+                    if text.len() <= ai_command::MAX_SUGGESTION_REQUEST_BYTES {
+                        *query = text;
+                    }
+                }
+            }
+            Message::AiAskSubmit => return self.submit_ai_ask(),
+            Message::AiAskClose => self.ai_ask = None,
+            Message::AiSuggestionResolved(generation, result) => {
+                let applied = self
+                    .ai_suggestion
+                    .as_mut()
+                    .is_some_and(|session| session.apply_reply(generation, result));
+                if applied {
+                    let focusable = self.ai_suggestion.as_ref().is_some_and(|session| {
+                        session.phase() == ai_command::SuggestionPhase::Review
+                    }) && self.ai_suggestion_focusable();
+                    if focusable {
+                        return iced::widget::operation::focus(AI_SUGGESTION_INPUT_ID.clone());
+                    }
+                }
+            }
+            Message::AiSuggestionInput(draft) => {
+                if let Some(session) = self.ai_suggestion.as_mut() {
+                    if draft.len() <= jterm_core::review_input::MAX_REVIEW_INPUT_BYTES {
+                        session.draft = draft;
+                        session.feedback = None;
+                    }
+                }
+            }
+            Message::AiSuggestionInsert => return self.insert_ai_suggestion(),
+            Message::AiSuggestionRegenerate => return self.regenerate_ai_suggestion(),
+            Message::AiSuggestionDismiss => self.ai_suggestion = None,
             Message::TaskPanelToggle => {
                 self.toggle_task_panel();
             }
@@ -12945,6 +13129,37 @@ impl Frost {
                         self.dismiss_active_correction();
                         return Task::none();
                     }
+                    // The AI suggestion card shares the correction card's
+                    // non-modal Escape discipline (dismiss only), and its
+                    // pane scoping too: a card drafting for a background pane
+                    // must not swallow the Escape of the program on screen.
+                    if self.ai_suggestion_visible()
+                        && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                    {
+                        self.ai_suggestion = None;
+                        return Task::none();
+                    }
+                    // The AI chats panel is an input-owning overlay, like the
+                    // help and debug panels below: while it is up no key
+                    // reaches the terminal behind it. Escape and its own
+                    // toggle chord close it; everything else is swallowed.
+                    // Only keys the panel's focused text inputs did not
+                    // capture reach this far — browsing the library or
+                    // clicking a chat row leaves focus outside every input,
+                    // and before this arm existed that Escape went to the
+                    // foreground program and printable keys were typed into
+                    // the hidden shell.
+                    if self.ai_chats.is_open {
+                        let own_toggle =
+                            resolve_keybinding_command(&self.keybindings, &key, modifiers)
+                                == Some(keybindings::Command::AiChatToggle);
+                        if own_toggle
+                            || matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        {
+                            self.ai_chats.close(self.config.ai_redact_secrets);
+                        }
+                        return Task::none();
+                    }
                     // Apart from the rename editor (whose keys the focused text
                     // input captures before this point), the tab menu is
                     // pointer-driven; keep every other keypress out of the PTY
@@ -12990,6 +13205,15 @@ impl Frost {
                     if self.workflow_overlay.is_some() {
                         if let Some(task) =
                             self.handle_workflow_overlay_key(&key, modifiers, text.as_deref())
+                        {
+                            return task;
+                        }
+                    }
+                    // The inline "Ask AI" request overlay owns the keyboard the
+                    // same way (Enter drafts, Esc dismisses, typing feeds the
+                    // request when the input did not capture it).
+                    if self.ai_ask.is_some() {
+                        if let Some(task) = self.handle_ai_ask_key(&key, modifiers, text.as_deref())
                         {
                             return task;
                         }
@@ -14640,6 +14864,9 @@ impl Frost {
                 // instance cannot erase a newer file without noticing it.
                 let sidebar_reload_request = self.reload_config_if_changed();
                 self.persist_live_config();
+                // Debounced persistence for chat drafts: keystrokes mark the
+                // library dirty, this tick flushes it.
+                self.ai_chats.flush_if_dirty(self.config.ai_redact_secrets);
 
                 let keybindings_changed = keybindings::KeyBindings::config_revision()
                     .map(|revision| self.keybindings_revision.as_ref() != Some(&revision))
@@ -19171,6 +19398,19 @@ impl Frost {
         } else {
             body
         };
+        // The persistent chats panel stacks beside the Agent panel, and the
+        // AI command-suggestion card shares the correction card's layer and
+        // review-first idiom (above the panels, like the correction card).
+        let body: Element<'_, Message> = if self.ai_chats.is_open {
+            stack![body, self.ai_chats_panel()].into()
+        } else {
+            body
+        };
+        let body: Element<'_, Message> = if let Some(card) = self.ai_suggestion_card() {
+            stack![body, card].into()
+        } else {
+            body
+        };
         let body: Element<'_, Message> = if self.help_open {
             stack![body, self.help_panel()].into()
         } else if self.debug_open {
@@ -19235,6 +19475,11 @@ impl Frost {
         };
         let root: Element<'_, Message> = if let Some(s) = &self.workflow_overlay {
             stack![root, self.workflow_overlay_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if self.ai_ask.is_some() {
+            stack![root, self.ai_ask_overlay()].into()
         } else {
             root
         };
@@ -20739,6 +20984,349 @@ impl Frost {
         Task::none()
     }
 
+    // ===== AI chats library + inline AI command generation (ai_chats, ai_command) =====
+
+    /// Show or hide the persistent AI chats panel (palette entry and
+    /// Ctrl+Shift+Alt+A share this path). Disabled AI fails closed with a
+    /// toast and never opens; a broken provider still opens and explains
+    /// itself in the panel (anvil's restored-panel behavior).
+    fn toggle_ai_chats(&mut self) -> Task<Message> {
+        if self.ai_chats.is_open {
+            self.ai_chats.close(self.config.ai_redact_secrets);
+            return Task::none();
+        }
+        if !self.config.ai_enabled {
+            self.push_toast("AI features are disabled in Settings", ToastKind::Info);
+            return Task::none();
+        }
+        self.ai_chats.open(&self.config);
+        iced::widget::operation::focus(AI_CHATS_INPUT_ID.clone())
+    }
+
+    /// Run one chat request off the UI thread, streaming fragments when
+    /// `ai_stream` is on — the Agent panel's transport discipline, with the
+    /// store's `(chat_id, epoch)` token in place of the agent identity.
+    fn ai_chats_request_task(&mut self, request: ai_chats::ChatRequest) -> Task<Message> {
+        let ai_chats::ChatRequest {
+            token,
+            client,
+            system,
+            history,
+            cancellation,
+        } = request;
+        if self.config.ai_stream {
+            let (tx, rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+            std::thread::spawn(move || {
+                let mut on_delta = |fragment: &str| {
+                    let _ = tx.unbounded_send(Message::AiChatsDelta(token, fragment.to_string()));
+                };
+                let result = client
+                    .send_turns_streaming_cancellable(
+                        Some(&system),
+                        &history,
+                        &cancellation,
+                        &mut on_delta,
+                    )
+                    .map_err(|error| error.to_string());
+                let _ = tx.unbounded_send(Message::AiChatsResult(token, result));
+            });
+            return Task::stream(rx);
+        }
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    client
+                        .send_turns_blocking_cancellable(Some(&system), &history, &cancellation)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("AI worker task failed: {error}")),
+                }
+            },
+            move |result| Message::AiChatsResult(token, result),
+        )
+    }
+
+    /// Open the inline "Ask AI" request overlay. The sources reach this flow
+    /// through the palette's `?` prefix and bind no chord, so frost's palette
+    /// entry is the only entry point. Preflight is fail-closed: with no usable
+    /// provider the overlay never opens and a toast explains why.
+    fn open_ai_ask(&mut self) -> Task<Message> {
+        if self.sessions.get(self.active).is_none() {
+            return Task::none();
+        }
+        if let Err(error) = agent::client_from_config(&self.config) {
+            self.push_toast(
+                format!("AI provider is unavailable: {error}"),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.ai_ask = Some(String::new());
+        iced::widget::operation::focus(AI_ASK_INPUT_ID.clone())
+    }
+
+    /// The overlay owns the keyboard while open (the history picker's
+    /// discipline): Enter drafts, Esc closes, typed text feeds the request
+    /// when the input itself did not capture it.
+    fn handle_ai_ask_key(
+        &mut self,
+        key: &keyboard::Key,
+        mods: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        use keyboard::Key;
+        let query = self.ai_ask.as_mut()?;
+        match key {
+            Key::Named(Named::Escape) => {
+                self.ai_ask = None;
+                Some(Task::none())
+            }
+            Key::Named(Named::Enter) => Some(self.submit_ai_ask()),
+            Key::Named(Named::Backspace) => {
+                query.pop();
+                Some(Task::none())
+            }
+            _ => {
+                if !mods.control() && !mods.alt() && !mods.logo() {
+                    if let Some(t) = text {
+                        let printable: String = t.chars().filter(|c| !c.is_control()).collect();
+                        if !printable.is_empty()
+                            && query.len() + printable.len()
+                                <= ai_command::MAX_SUGGESTION_REQUEST_BYTES
+                        {
+                            query.push_str(&printable);
+                        }
+                        return Some(Task::none());
+                    }
+                }
+                // Swallow all other keys while the overlay owns the keyboard.
+                Some(Task::none())
+            }
+        }
+    }
+
+    /// Turn the overlay's natural-language request into the pane-bound,
+    /// review-only suggestion card and launch the drafting worker. The
+    /// selected block's command/output attaches only under the
+    /// `ai_share_command_context` consent.
+    fn submit_ai_ask(&mut self) -> Task<Message> {
+        // Owned: allocating the request id below needs `&mut self`.
+        let Some(query) = self.ai_ask.as_deref().map(str::trim).map(str::to_string) else {
+            return Task::none();
+        };
+        if query.is_empty() {
+            // The sources' empty-`?` entry is a harmless no-op explainer.
+            self.ai_ask = None;
+            return Task::none();
+        }
+        let client = match agent::client_from_config(&self.config) {
+            Ok(client) => client,
+            Err(error) => {
+                self.push_toast(
+                    format!("AI provider is unavailable: {error}"),
+                    ToastKind::Warning,
+                );
+                self.ai_ask = None;
+                return Task::none();
+            }
+        };
+        let Some(sess) = self.sessions.get(self.active) else {
+            self.ai_ask = None;
+            return Task::none();
+        };
+        let session_id = sess.id;
+        let cwd = sess
+            .cwd_cache
+            .clone()
+            .or_else(|| sess.cwd())
+            .filter(|cwd| cwd.len() <= command_correction::MAX_CORRECTION_CWD_BYTES)
+            .unwrap_or_else(|| ".".to_string());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let block_context = if self.config.ai_share_command_context {
+            self.selected_block_context_for_ai(sess)
+        } else {
+            None
+        };
+        let provider = client.display_name();
+        let Some(generation) = self.next_ai_suggestion_generation() else {
+            self.ai_ask = None;
+            return Task::none();
+        };
+        let Some(session) = ai_command::CommandSuggestion::begin(
+            generation,
+            session_id,
+            query,
+            provider,
+            cwd,
+            shell,
+            block_context,
+        ) else {
+            self.ai_ask = None;
+            return Task::none();
+        };
+        self.ai_ask = None;
+        // Replacing any previous card cancels its worker via Drop, like
+        // anvil's `close_command_suggestion`.
+        self.ai_suggestion = Some(session);
+        self.ai_suggestion_worker_task(generation)
+    }
+
+    /// The selected block's bounded context for the suggestion request, or
+    /// None when nothing is selected. Extraction mirrors `block_ask_ai_task`.
+    fn selected_block_context_for_ai(
+        &self,
+        sess: &Session,
+    ) -> Option<jterm_core::ai::BlockContext> {
+        let zone_id = sess.block_selection.active()?;
+        let zone = sess.terminal.zone_by_id(zone_id)?;
+        let (output, output_truncated) = match sess.terminal.zone_output_export_capped(zone_id) {
+            Some(terminal::ZoneOutputExport::Available { text, truncated }) => (text, truncated),
+            Some(terminal::ZoneOutputExport::Empty) => (String::new(), false),
+            Some(terminal::ZoneOutputExport::Unavailable) => (
+                "[output unavailable: retained snapshot and scrollback rows were evicted]"
+                    .to_string(),
+                true,
+            ),
+            None => return None,
+        };
+        let no_reported_status = zone.exit_code.is_none();
+        let (ai_output, ai_output_truncated) = bounded_ai_block_output(&output, no_reported_status);
+        Some(jterm_core::ai::BlockContext {
+            cmd: zone.command.clone().unwrap_or_default(),
+            output: ai_output,
+            cwd: zone.cwd.clone(),
+            // -1 is the family sentinel for "the shell reported no exit
+            // status"; never turn an unknown lifecycle into a false success.
+            exit_code: zone.exit_code.unwrap_or(-1),
+            truncated: zone.command_truncated || output_truncated || ai_output_truncated,
+        })
+    }
+
+    /// Launch the suggestion's drafting worker for the live generation. A
+    /// provider failure is delivered through the normal reply path so the card
+    /// lands in its Retry-offering failed state instead of vanishing.
+    fn ai_suggestion_worker_task(&self, generation: u64) -> Task<Message> {
+        let Some(session) = self.ai_suggestion.as_ref().filter(|session| {
+            session.generation() == generation
+                && session.phase() == ai_command::SuggestionPhase::Drafting
+        }) else {
+            return Task::none();
+        };
+        let client = match agent::client_from_config(&self.config) {
+            Ok(client) => client,
+            Err(error) => {
+                return Task::done(Message::AiSuggestionResolved(generation, Err(error)));
+            }
+        };
+        let request = session.request.clone();
+        let cwd = session.cwd.clone();
+        let shell = session.shell.clone();
+        let block = session.block_context.clone();
+        let token = session.cancellation();
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    jterm_core::ai::nl_to_command_with_context_blocking_cancellable(
+                        &client,
+                        &request,
+                        &cwd,
+                        &shell,
+                        std::env::consts::OS,
+                        block.as_ref(),
+                        &token,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .await;
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("AI command worker failed: {error}")),
+                }
+            },
+            move |result| Message::AiSuggestionResolved(generation, result),
+        )
+    }
+
+    /// Allocate the next request id. Window-wide and strictly increasing, so
+    /// a reply can only ever publish onto the request that asked for it — a
+    /// per-card counter let request A's answer land on card B, which is one
+    /// Enter away from typing an unrelated (possibly destructive) command at
+    /// the prompt. Exhaustion refuses the request instead of wrapping.
+    fn next_ai_suggestion_generation(&mut self) -> Option<u64> {
+        ai_command::next_generation(&mut self.ai_suggestion_generation)
+    }
+
+    /// Re-draft after a failure with the same request and captured context.
+    fn regenerate_ai_suggestion(&mut self) -> Task<Message> {
+        let Some(generation) = self.next_ai_suggestion_generation() else {
+            return Task::none();
+        };
+        let re_armed = self
+            .ai_suggestion
+            .as_mut()
+            .is_some_and(|session| session.regenerate(generation));
+        if !re_armed {
+            return Task::none();
+        }
+        self.ai_suggestion_worker_task(generation)
+    }
+
+    /// Take keyboard focus only for a card bound to the active pane whose
+    /// prompt is clean and idle — the correction card's rule, so a prompt the
+    /// user is already typing into keeps its keystrokes.
+    fn ai_suggestion_focusable(&mut self) -> bool {
+        let Some(session) = self.ai_suggestion.as_ref() else {
+            return false;
+        };
+        self.sessions.get_mut(self.active).is_some_and(|sess| {
+            sess.id == session.session_id && sess.agent_prompt_status().is_ready()
+        })
+    }
+
+    /// The card's primary action: validate the draft with the sources'
+    /// `jterm_core::review_input` gate, re-check prompt ownership at the write
+    /// boundary, and type the command into the prompt through the
+    /// non-submitting insert policy. Generated commands never run
+    /// automatically — the user reviews and presses Enter.
+    fn insert_ai_suggestion(&mut self) -> Task<Message> {
+        // The insert types into the *bound* pane. If the user has moved on to
+        // another pane, refuse rather than clearing and rewriting a prompt
+        // that is off screen (ember refuses the same way).
+        if !self.ai_suggestion_visible() {
+            if let Some(session) = self.ai_suggestion.as_mut() {
+                session.reject_insert("its pane is not on screen — switch back to it first");
+            }
+            return Task::none();
+        }
+        let Some(session) = self.ai_suggestion.as_mut() else {
+            return Task::none();
+        };
+        let session_id = session.session_id;
+        let command = match session.validated_insert_command() {
+            Ok(command) => command.to_string(),
+            Err(error) => {
+                session.reject_insert(error);
+                return Task::none();
+            }
+        };
+        if let Err(reason) = self.session_prompt_replace_ready(session_id) {
+            if let Some(session) = self.ai_suggestion.as_mut() {
+                session.reject_insert(reason);
+            }
+            return Task::none();
+        }
+        if self.write_paste_to_session(session_id, &command, block_reinput_policy(), true) {
+            self.ai_suggestion = None;
+        } else if let Some(session) = self.ai_suggestion.as_mut() {
+            session.reject_insert("the target prompt changed before the command could be queued");
+        }
+        Task::none()
+    }
+
     // ===== Experimental Tasks dashboard (agent_task) =====
 
     /// Show or hide the Tasks dock panel. With the feature flag off the
@@ -22020,6 +22608,459 @@ impl Frost {
         )
     }
 
+    /// The persistent AI chats library panel, ported from anvil's AI panel to
+    /// frost's iced overlay idiom (the Agent panel's layer and chrome). The
+    /// header carries the library, new-chat, and close actions; the chat page
+    /// renders the store's active conversation and composer, the library page
+    /// the searchable chat list (conversation switching/history browsing).
+    fn ai_chats_panel(&self) -> Element<'_, Message> {
+        use ai_chats::ChatsPage;
+
+        let chats = &self.ai_chats;
+        let header = row![
+            text("AI Chats").size(14),
+            text(if chats.provider_label.is_empty() {
+                "not configured".to_string()
+            } else {
+                chats.provider_label.clone()
+            })
+            .size(12)
+            .style(text::secondary),
+            Space::new().width(Length::Fill),
+            button(text("Chats").size(12))
+                .style(button::secondary)
+                .on_press(Message::AiChatsShowLibrary),
+            button(text("+ New").size(12))
+                .style(button::secondary)
+                .on_press(Message::AiChatsNewChat),
+            button(text("✕").size(12))
+                .style(button::secondary)
+                .on_press(Message::AiChatsClose),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let page: Element<'_, Message> = match chats.page {
+            ChatsPage::Chat => self.ai_chats_chat_page(),
+            ChatsPage::Library => self.ai_chats_library_page(),
+        };
+
+        let inner = container(column![header, page].spacing(8))
+            .width(Length::Fixed(560.0))
+            .height(Length::Fixed(520.0))
+            .padding(12)
+            .style(container::dark);
+        container(inner)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(10)
+            .into()
+    }
+
+    /// The viewed chat: title editor, transcript, status, consent-gated
+    /// recent-context toggle, and the composer row. The composer is
+    /// single-line like the Agent panel's; the store keeps the draft so
+    /// switching chats never loses it.
+    fn ai_chats_chat_page(&self) -> Element<'_, Message> {
+        let chats = &self.ai_chats;
+        let store = &chats.store;
+        let busy = store.active_request_token().is_some();
+        let archived = store.active_archived();
+
+        let title = text_input("Chat title", &chats.title_draft)
+            .on_input(Message::AiChatsTitleInput)
+            .size(13);
+
+        let mut transcript = column![].spacing(8);
+        // Every row borrows the store's text rather than cloning it: `view()`
+        // runs on each redraw, and frost redraws continuously while a PTY is
+        // producing output, so cloning here copies the whole visible chat many
+        // times a second — up to the store's live ceiling of 100 turns x 256
+        // KiB per assistant reply. `active_history()` borrows from `&self`,
+        // which is exactly the lifetime the returned Element already carries.
+        for turn in store.active_history() {
+            let (label, body): (&str, Element<'_, Message>) = match turn.role {
+                jterm_core::ai::Role::User => ("You", text(turn.text.as_str()).size(13).into()),
+                jterm_core::ai::Role::Assistant => (
+                    "Assistant",
+                    text(turn.text.as_str())
+                        .size(13)
+                        .wrapping(text::Wrapping::Word)
+                        .into(),
+                ),
+            };
+            transcript = transcript.push(
+                column![
+                    text(label).size(11).style(text::secondary),
+                    container(body)
+                        .padding(6)
+                        .style(container::bordered_box)
+                        .width(Length::Fill),
+                ]
+                .spacing(2),
+            );
+        }
+        // While a reply streams in, its fragments grow in place of the static
+        // waiting line; the completed reply replaces them with a real turn.
+        let partial = store.active_partial();
+        if !partial.is_empty() {
+            transcript = transcript.push(
+                column![
+                    text("Assistant").size(11).style(text::secondary),
+                    container(text(partial).size(13).wrapping(text::Wrapping::Word))
+                        .padding(6)
+                        .style(container::bordered_box)
+                        .width(Length::Fill),
+                ]
+                .spacing(2),
+            );
+        }
+        // After a mid-stream failure the already-shown partial text stays
+        // visible next to the recorded error (the Agent panel's discipline).
+        if let Some(partial) = chats.interrupted_partial() {
+            transcript = transcript.push(
+                column![
+                    text("Assistant (reply interrupted)")
+                        .size(11)
+                        .style(text::secondary),
+                    container(text(partial).size(13).wrapping(text::Wrapping::Word))
+                        .padding(6)
+                        .style(container::bordered_box)
+                        .width(Length::Fill),
+                ]
+                .spacing(2),
+            );
+        }
+        if store.active_history().is_empty() && partial.is_empty() {
+            transcript = transcript.push(
+                text("Ask anything about the shell; every conversation is saved.")
+                    .size(12)
+                    .style(text::secondary),
+            );
+        }
+
+        let status_line: Element<'_, Message> = if chats.status_line().is_empty() {
+            Space::new().into()
+        } else {
+            text(chats.status_line())
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(if chats.status_is_error() {
+                    text::danger
+                } else {
+                    text::secondary
+                })
+                .into()
+        };
+
+        let include_recent = checkbox(chats.include_recent(store.active_id()))
+            .label("Include recent shell context")
+            .text_size(12)
+            .on_toggle(Message::AiChatsIncludeRecent);
+
+        let mut composer = text_input("Ask a question…", store.active_draft())
+            .id(AI_CHATS_INPUT_ID.clone())
+            .size(13);
+        if !busy && !archived {
+            composer = composer
+                .on_input(Message::AiChatsInput)
+                .on_submit(Message::AiChatsSubmit);
+        }
+        let action: Element<'_, Message> = if busy {
+            button(text("Stop").size(12))
+                .style(button::danger)
+                .on_press(Message::AiChatsStop)
+                .into()
+        } else {
+            let mut row = row![].spacing(6);
+            if chats.has_retry() {
+                row = row.push(
+                    button(text("Retry").size(12))
+                        .style(button::secondary)
+                        .on_press(Message::AiChatsRetry),
+                );
+            }
+            let mut send = button(text("Send").size(12)).style(button::primary);
+            if !archived {
+                send = send.on_press(Message::AiChatsSubmit);
+            }
+            row.push(send).into()
+        };
+
+        let archive_label = if archived { "Unarchive" } else { "Archive" };
+        let manage = row![
+            button(text(archive_label).size(12))
+                .style(button::secondary)
+                .on_press(Message::AiChatsToggleArchive),
+            button(
+                text(if chats.delete_armed() {
+                    "Confirm delete"
+                } else {
+                    "Delete"
+                })
+                .size(12)
+            )
+            .style(button::danger)
+            .on_press(Message::AiChatsDelete),
+        ]
+        .spacing(6);
+
+        column![
+            title,
+            scrollable(transcript).height(Length::Fill).anchor_bottom(),
+            status_line,
+            include_recent,
+            row![composer, action].spacing(6),
+            manage,
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    /// The searchable library page: every saved chat, newest first, with the
+    /// sources' status markers (Archived · Thinking… · Error · New reply).
+    fn ai_chats_library_page(&self) -> Element<'_, Message> {
+        let chats = &self.ai_chats;
+        let back_and_search = row![
+            button(text("←").size(13))
+                .style(button::secondary)
+                .on_press(Message::AiChatsShowChat),
+            text_input("Search chats", &chats.search)
+                .id(AI_CHATS_SEARCH_ID.clone())
+                .on_input(Message::AiChatsSearchInput)
+                .size(13),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let summaries = chats.store.summaries_filtered(&chats.search);
+        let mut list = column![].spacing(2);
+        if summaries.is_empty() {
+            list = list.push(
+                text(if chats.search.is_empty() {
+                    "No saved chats yet"
+                } else {
+                    "No chats match"
+                })
+                .size(13)
+                .style(text::secondary),
+            );
+        }
+        // `summaries` is owned, so each row moves its strings instead of
+        // cloning them on every redraw.
+        for summary in summaries {
+            let mut meta = summary.preview;
+            if summary.archived {
+                meta.push_str(" · Archived");
+            }
+            if summary.busy {
+                meta.push_str(" · Thinking…");
+            } else if summary.error {
+                meta.push_str(" · Error");
+            } else if summary.unread {
+                meta.push_str(" · New reply");
+            } else if summary.history_truncated {
+                // The shared store compacts live history and persistence
+                // compacts again to the file budget; the row admits it rather
+                // than letting a conversation quietly shrink.
+                meta.push_str(" · Some local content omitted");
+            }
+            let title_style: fn(&iced::Theme) -> text::Style = if summary.active {
+                text::default
+            } else {
+                text::secondary
+            };
+            let row_body = container(
+                column![
+                    text(summary.title).size(13).style(title_style),
+                    text(meta).size(11).style(text::secondary),
+                ]
+                .spacing(2),
+            )
+            .width(Length::Fill)
+            .padding([4, 8])
+            .style(container::bordered_box);
+            list = list.push(mouse_area(row_body).on_press(Message::AiChatsSelect(summary.id)));
+        }
+
+        column![back_and_search, scrollable(list).height(Length::Fill),]
+            .spacing(8)
+            .into()
+    }
+
+    /// The review-only AI command-suggestion card (ported from anvil's
+    /// `?`-palette flow), using the correction card's idiom: provider badge,
+    /// the request line, an editable command draft, and explicit
+    /// insert/regenerate/dismiss actions. The generated command is only ever
+    /// typed at the prompt for review — never run automatically.
+    fn ai_suggestion_card(&self) -> Option<Element<'_, Message>> {
+        // Scoped to the bound pane, like the correction card above: the card
+        // describes work for one pane's prompt and inserts into it.
+        let session = self.ai_suggestion_bound_session()?;
+
+        let header = row![
+            text("AI command suggestion").size(14),
+            Space::new().width(Length::Fill),
+            text(format!("{} · review only", session.provider))
+                .size(11)
+                .style(text::secondary),
+            button(text("✕").size(12))
+                .style(button::secondary)
+                .on_press(Message::AiSuggestionDismiss),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let request = text(format!(
+            "Request: {}",
+            command_correction::compact_one_line(&session.request, 180)
+        ))
+        .size(12)
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
+
+        let mut card = column![header, request].spacing(8);
+        if let Some(context) = session.block_context.as_ref() {
+            card = card.push(
+                text(format!(
+                    "Selected block context · exit {}{} · {}",
+                    context.exit_code,
+                    if context.truncated {
+                        " · output truncated"
+                    } else {
+                        ""
+                    },
+                    command_correction::compact_one_line(&context.cmd, 72)
+                ))
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+            );
+        }
+        card = card.push(
+            text(session.status())
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        );
+
+        match session.phase() {
+            ai_command::SuggestionPhase::Drafting => {
+                card = card.push(
+                    row![button(text("Stop").size(12))
+                        .style(button::danger)
+                        .on_press(Message::AiSuggestionDismiss)]
+                    .spacing(6),
+                );
+            }
+            ai_command::SuggestionPhase::Review => {
+                card = card.push(
+                    text_input("generated command", &session.draft)
+                        .id(AI_SUGGESTION_INPUT_ID.clone())
+                        .on_input(Message::AiSuggestionInput)
+                        .on_submit(Message::AiSuggestionInsert)
+                        .size(13)
+                        .font(iced::Font::MONOSPACE),
+                );
+                card = card.push(
+                    row![
+                        button(text("Insert for review").size(12))
+                            .style(button::primary)
+                            .on_press(Message::AiSuggestionInsert),
+                        button(text("Regenerate").size(12))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionRegenerate),
+                        button(text("Dismiss").size(12))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionDismiss),
+                    ]
+                    .spacing(6),
+                );
+            }
+            ai_command::SuggestionPhase::Failed => {
+                card = card.push(
+                    row![
+                        button(text("Retry").size(12))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionRegenerate),
+                        button(text("Dismiss").size(12))
+                            .style(button::secondary)
+                            .on_press(Message::AiSuggestionDismiss),
+                    ]
+                    .spacing(6),
+                );
+            }
+        }
+        if let Some(feedback) = session.feedback.as_deref() {
+            card = card.push(
+                text(feedback.to_string())
+                    .size(11)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::danger),
+            );
+        }
+        // The sources' invariant, shown verbatim on the card.
+        card = card.push(
+            text("Enter uses the labelled action · generated commands never run automatically")
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        );
+
+        let inner = container(card)
+            .width(Length::Fixed(560.0))
+            .padding(12)
+            .style(container::dark);
+        Some(
+            container(inner)
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill)
+                .padding(10)
+                .into(),
+        )
+    }
+
+    /// The inline "Ask AI" request overlay (palette entry only, like the
+    /// sources' `?` prefix): one natural-language line in, one review card
+    /// out. Nothing is drafted, inserted, or run until the card's explicit
+    /// action.
+    fn ai_ask_overlay(&self) -> Element<'_, Message> {
+        let query = self.ai_ask.as_deref().unwrap_or("");
+        let input: Element<'_, Message> = text_input(
+            "Describe the command you need… (e.g. find files modified today)",
+            query,
+        )
+        .id(AI_ASK_INPUT_ID.clone())
+        .on_input(Message::AiAskInput)
+        .on_submit(Message::AiAskSubmit)
+        .size(14)
+        .into();
+        let body = column![
+            row![text("?").size(16), input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            text("AI drafts one shell command for your review. It is typed at the prompt only after you approve it and never runs automatically.")
+                .size(11)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .width(Length::Fixed(560.0))
+            .padding(12)
+            .style(container::dark);
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::AiAskClose);
+        let centered = container(panel)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        stack![Element::from(dismiss), Element::from(centered)].into()
+    }
+
     fn subscription(&self) -> Subscription<Message> {
         let mut subs: Vec<Subscription<Message>> = self
             .sessions
@@ -23262,9 +24303,8 @@ fn wait_out_hangup(
         // Recovery probe: a live child may have reopened /dev/tty since the
         // hangup. Data or WouldBlock both mean the slave side lives again.
         let n = loop {
-            let n = unsafe {
-                libc::read(reader_raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n =
+                unsafe { libc::read(reader_raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
@@ -23272,8 +24312,7 @@ fn wait_out_hangup(
         };
         if n > 0 {
             let data = buf[..n as usize].to_vec();
-            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data)))
-                .is_err()
+            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data))).is_err()
             {
                 return HangupOutcome::Shutdown;
             }
@@ -23286,8 +24325,7 @@ fn wait_out_hangup(
             }
             if error.raw_os_error() != Some(libc::EIO) {
                 // A genuine read error keeps the pre-hangup behavior.
-                let _ =
-                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
+                let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
                 return HangupOutcome::Exited;
             }
         }
@@ -23296,16 +24334,14 @@ fn wait_out_hangup(
         // session's Pty to reap, so task terminals keep their true code.
         match Pty::observe_child_exit(child_pid) {
             Ok(Some(code)) => {
-                let _ = iced::futures::executor::block_on(
-                    tx.send(Message::PtyExited(id, fd, code)),
-                );
+                let _ =
+                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, code)));
                 return HangupOutcome::Exited;
             }
             Ok(None) => {}
             Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
                 // Reaped elsewhere (session teardown won the race): gone.
-                let _ =
-                    iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
+                let _ = iced::futures::executor::block_on(tx.send(Message::PtyExited(id, fd, -1)));
                 return HangupOutcome::Exited;
             }
             Err(error) => {
@@ -25620,10 +26656,7 @@ mod tests {
             panic!("expected a split root");
         };
         assert!(ratios.iter().all(|r| (*r - 0.5).abs() <= f32::EPSILON));
-        let PaneTree::Split {
-            ratios: nested, ..
-        } = &children[1]
-        else {
+        let PaneTree::Split { ratios: nested, .. } = &children[1] else {
             panic!("expected the nested split to survive");
         };
         assert!(nested.iter().all(|r| (*r - 0.5).abs() <= f32::EPSILON));
@@ -28501,8 +29534,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut probe = [0u8; 4096];
         loop {
-            let n =
-                unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
+            let n = unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
             if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
                 break;
             }
@@ -28530,8 +29562,7 @@ mod tests {
         // way, then the probe must report the genuine status — never a
         // fabricated exit while the child was still alive.
         loop {
-            let n =
-                unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
+            let n = unsafe { libc::read(fd, probe.as_mut_ptr() as *mut libc::c_void, probe.len()) };
             if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
                 break;
             }

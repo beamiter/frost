@@ -655,8 +655,7 @@ mod tests {
         let lines = vec![SearchLine::Text("alpha beta alpha")];
         let mut cache = None;
 
-        let (matches, error) =
-            SearchEngine::search_lines(lines, "alpha", false, true, &mut cache);
+        let (matches, error) = SearchEngine::search_lines(lines, "alpha", false, true, &mut cache);
 
         assert!(error.is_none());
         assert_eq!(
@@ -683,8 +682,7 @@ mod tests {
         let lines = vec![SearchLine::Text("İB")];
         let mut cache = None;
 
-        let (matches, _) =
-            SearchEngine::search_lines(lines, "i\u{307}b", false, false, &mut cache);
+        let (matches, _) = SearchEngine::search_lines(lines, "i\u{307}b", false, false, &mut cache);
 
         assert_eq!(matches[0].col_start, 0);
         assert_eq!(matches[0].col_end, 2);
@@ -749,8 +747,7 @@ mod tests {
         let lines = vec![SearchLine::Text(line.as_str())];
         let mut cache = None;
 
-        let (matches, warning) =
-            SearchEngine::search_lines(lines, "A", false, true, &mut cache);
+        let (matches, warning) = SearchEngine::search_lines(lines, "A", false, true, &mut cache);
 
         assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
         assert_eq!(warning.as_deref(), Some(MATCH_LIMIT_MESSAGE));

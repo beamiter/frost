@@ -29,6 +29,8 @@ pub enum PaletteAction {
     EqualizePanes,
     ToggleSidebar,
     ToggleAgent,
+    ToggleAiChats,
+    AskAiGenerate,
     ToggleTasks,
     OpenSettings,
     QuickTabSwitch,
@@ -249,6 +251,21 @@ impl PaletteState {
                 description: "Open or close the AI agent panel (per-command approval)",
                 shortcut: "Ctrl+Alt+G",
                 action: PaletteAction::ToggleAgent,
+            },
+            PaletteItem {
+                name: "AI Chats",
+                description: "Open or close the persistent AI chats library",
+                // Rendered in jterm_core's frozen display order
+                // (Ctrl+Shift+Alt+Super), the same string forge shows for the
+                // same panel — one chord must not read as two.
+                shortcut: "Ctrl+Shift+Alt+A",
+                action: PaletteAction::ToggleAiChats,
+            },
+            PaletteItem {
+                name: "Ask AI: Generate Command",
+                description: "Draft a shell command from a natural-language request; inserted for review, never runs automatically",
+                shortcut: "",
+                action: PaletteAction::AskAiGenerate,
             },
             PaletteItem {
                 name: "Toggle Tasks Dashboard",
@@ -642,6 +659,7 @@ mod tests {
             (PaletteAction::ResizePaneDown, "Ctrl+Alt+Shift+Down"),
             (PaletteAction::ToggleSidebar, "Ctrl+\\"),
             (PaletteAction::ToggleAgent, "Ctrl+Alt+G"),
+            (PaletteAction::ToggleAiChats, "Ctrl+Shift+Alt+A"),
             (PaletteAction::QuickTabSwitch, "Ctrl+Shift+L"),
             (PaletteAction::ZoomIn, "Ctrl+="),
             (PaletteAction::PromptJumpPrev, "Ctrl+Shift+Up"),
@@ -659,5 +677,32 @@ mod tests {
         for (action, expected) in cases {
             assert_eq!(shortcut(action), Some(expected), "{action:?}");
         }
+    }
+
+    /// The AI panel's hint is the one place frost prints this chord, and the
+    /// family prints it in `jterm_core`'s frozen display order
+    /// (Ctrl+Shift+Alt+Super). Deriving the expected string from the default
+    /// binding keeps the hint, the table and forge's rendering of the same
+    /// chord from drifting into three spellings of one key.
+    #[test]
+    fn the_ai_chat_hint_is_the_core_rendering_of_its_default_binding() {
+        let defaults = crate::keybindings::KeyBindings::default_bindings();
+        let binding = defaults
+            .bindings
+            .iter()
+            .find(|(_, command)| command.as_str() == "ai_chat:toggle")
+            .map(|(binding, _)| binding.clone())
+            .expect("the AI chat panel has a default binding");
+        let rendered = jterm_core::keybindings::parse(&binding)
+            .expect("the default binding parses")
+            .display();
+        let hint = PaletteState::new()
+            .all
+            .iter()
+            .find(|item| item.action == PaletteAction::ToggleAiChats)
+            .map(|item| item.shortcut)
+            .expect("the palette offers the AI chats panel");
+        assert_eq!(hint, rendered);
+        assert_eq!(rendered, "Ctrl+Shift+Alt+A");
     }
 }

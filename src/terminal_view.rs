@@ -1097,7 +1097,9 @@ fn should_use_cjk_fallback_font(ch: char) -> bool {
 /// heuristic cell width and per-cell glyph emission, so a mismatched
 /// measurement can never shift the grid.
 fn measure_mono_ascii_advance(font: iced::Font, font_size: f32) -> Option<f32> {
-    use cosmic_text::{Attrs, Buffer, Family, Metrics as TextMetrics, Shaping, Stretch, Style, Weight};
+    use cosmic_text::{
+        Attrs, Buffer, Family, Metrics as TextMetrics, Shaping, Stretch, Style, Weight,
+    };
 
     if !(font_size.is_finite() && font_size > 0.0) {
         return None;
@@ -1188,7 +1190,12 @@ fn measure_mono_ascii_advance(font: iced::Font, font_size: f32) -> Option<f32> {
 /// non-ASCII cells keep per-cell emission. Selection and inverse-video enter
 /// through `fg`, so run-flush on `fg` change covers those boundaries;
 /// backgrounds are painted per cell in their own pass and never break a run.
-fn glyph_joins_run(metrics: Metrics, glyph: char, glyph_font: iced::Font, primary: iced::Font) -> bool {
+fn glyph_joins_run(
+    metrics: Metrics,
+    glyph: char,
+    glyph_font: iced::Font,
+    primary: iced::Font,
+) -> bool {
     metrics.mono_advance_exact && glyph.is_ascii() && glyph_font == primary
 }
 

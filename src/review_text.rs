@@ -7,7 +7,15 @@
 use std::fmt;
 
 pub(crate) const MAX_AGENT_COMMAND_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_HISTORY_COMMAND_BYTES: usize = 256 * 1024;
+/// The family-shared command-history JSONL index is written by
+/// `jterm_core::command_history`, and its record budget belongs to that
+/// writer: it accepts a command up to `review_input::MAX_REVIEW_INPUT_BYTES`
+/// and refuses anything longer. Read the number from core rather than
+/// re-declaring it — a local copy is exactly how this constant ended up four
+/// times apart between the siblings, which silently hid frost-written records
+/// from the other apps' history pickers.
+pub(crate) const MAX_HISTORY_COMMAND_BYTES: usize =
+    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 pub(crate) const MAX_PROMPT_INSERT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1109,7 +1109,10 @@ fn is_bidi_display_control(ch: char) -> bool {
 /// 剥掉 Cf 双向控制符后的展示文本。恢复的标签标题与实时 OSC 标题走同一
 /// 处置（剥离而非整体拒绝），同一个标题在保存→重启往返后看起来一致。
 fn strip_bidi_display_controls(value: &str) -> String {
-    value.chars().filter(|&ch| !is_bidi_display_control(ch)).collect()
+    value
+        .chars()
+        .filter(|&ch| !is_bidi_display_control(ch))
+        .collect()
 }
 
 /// Optional title validation mirrors `sanitize`: invalid text becomes `None`
@@ -1957,7 +1960,9 @@ impl InstanceLock {
                 )
                 .is_err()
             {
-                log::warn!("[SessionPersistence] an instance lock descriptor is already registered");
+                log::warn!(
+                    "[SessionPersistence] an instance lock descriptor is already registered"
+                );
                 return None;
             }
         }
@@ -2495,7 +2500,9 @@ mod tests {
             tree: None,
             tabs: vec![
                 tab(Some("bu\u{202e}ild")),
-                tab(Some("\u{2066}\u{2067}\u{2068}\u{2069}\u{061c}\u{200e}\u{200f}")),
+                tab(Some(
+                    "\u{2066}\u{2067}\u{2068}\u{2069}\u{061c}\u{200e}\u{200f}",
+                )),
                 tab(Some("\u{202a}build\u{202c}")),
             ],
             active_tab: Some(0),

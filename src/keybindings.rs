@@ -116,6 +116,15 @@ pub enum Command {
     ConfigToggle,
     SidebarToggle,
     AgentToggle,
+    /// Show or hide the persistent AI chats library panel (anvil's
+    /// `toggle_ai_panel` action and its Ctrl+Shift+Alt+A chord).
+    ///
+    /// The id is the family's `ai_chat:toggle` — singular, like the
+    /// `agent:toggle` / `sidebar:toggle` / `debug:toggle` it sits beside. One
+    /// id and one chord for one panel across anvil, forge, ember and frost:
+    /// a per-app spelling makes a shared keybindings file mean different
+    /// things in different windows.
+    AiChatToggle,
 
     // === 字体缩放 ===
     FontZoomIn,
@@ -204,6 +213,7 @@ impl std::fmt::Display for Command {
             Command::ConfigToggle => write!(f, "config:toggle"),
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
+            Command::AiChatToggle => write!(f, "ai_chat:toggle"),
             Command::FontZoomIn => write!(f, "font:zoom_in"),
             Command::FontZoomOut => write!(f, "font:zoom_out"),
             Command::FontZoomReset => write!(f, "font:zoom_reset"),
@@ -287,6 +297,7 @@ impl std::str::FromStr for Command {
             "config:toggle" => Ok(Command::ConfigToggle),
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
+            "ai_chat:toggle" => Ok(Command::AiChatToggle),
             "font:zoom_in" => Ok(Command::FontZoomIn),
             "font:zoom_out" => Ok(Command::FontZoomOut),
             "font:zoom_reset" => Ok(Command::FontZoomReset),
@@ -515,6 +526,13 @@ impl KeyBindings {
         bindings
             .bindings
             .insert("ctrl+alt+g".to_string(), "agent:toggle".to_string());
+        // The family's AI-panel chord (Ctrl+Shift+Alt+A in display order),
+        // stored in the shared canonical spelling. The ctrl+shift+alt trio is
+        // otherwise used only by pane-resize arrows and copy-block-output, so
+        // the letter is free.
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+a".to_string(), "ai_chat:toggle".to_string());
 
         // 终端操作
         bindings
@@ -754,6 +772,12 @@ mod tests {
         let cmd: Command = "edit:copy_block_output".parse().unwrap();
         assert_eq!(cmd, Command::EditCopyBlockOutput);
         assert_eq!(cmd.to_string(), "edit:copy_block_output");
+
+        // The family id for this panel is singular, matching agent:toggle.
+        let cmd: Command = "ai_chat:toggle".parse().unwrap();
+        assert_eq!(cmd, Command::AiChatToggle);
+        assert_eq!(cmd.to_string(), "ai_chat:toggle");
+        assert!("ai_chats:toggle".parse::<Command>().is_err());
     }
 
     #[test]
@@ -861,6 +885,7 @@ mod tests {
             ("ctrl+shift+k", Command::BlockClear),
             ("ctrl+shift+i", Command::BlockReinputSelectedCommands),
             ("ctrl+alt+g", Command::AgentToggle),
+            ("ctrl+shift+alt+a", Command::AiChatToggle),
             ("ctrl+alt+r", Command::SearchReplaceToggle),
             ("ctrl+shift+x", Command::PaneSwap),
             ("ctrl+d", Command::TerminalSendEof),
