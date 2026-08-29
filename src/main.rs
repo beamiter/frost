@@ -9887,18 +9887,14 @@ impl Frost {
                         return Some(Task::none());
                     }
                     Key::Named(Named::Backspace) => {
-                        state.query.pop();
-                        state.selected = 0;
+                        state.backspace();
                         return Some(Task::none());
                     }
                     _ => {}
                 }
                 if !mods.control() && !mods.alt() {
                     if let Some(t) = text {
-                        let printable: String = t.chars().filter(|c| !c.is_control()).collect();
-                        if !printable.is_empty() {
-                            state.query.push_str(&printable);
-                            state.selected = 0;
+                        if state.push_query_text(t) {
                             return Some(Task::none());
                         }
                     }
@@ -15181,8 +15177,7 @@ impl Frost {
                 if let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
                     self.workflow_overlay.as_mut()
                 {
-                    state.query = q;
-                    state.selected = 0;
+                    state.set_query(q);
                 }
             }
             Message::WorkflowOverlayClose => self.workflow_overlay = None,
@@ -16561,7 +16556,7 @@ impl Frost {
     ) -> Element<'_, Message> {
         let filtered = state.filtered();
 
-        let query: Element<'_, Message> = text_input("Run a workflow…", &state.query)
+        let query: Element<'_, Message> = text_input("Run a workflow…", state.query())
             .id(WORKFLOW_PICKER_INPUT_ID.clone())
             .on_input(Message::WorkflowPickerInput)
             .size(14)
@@ -16580,7 +16575,7 @@ impl Frost {
             list = list.push(text(hint).size(13).style(text::secondary));
         } else {
             for (pos, workflow) in filtered.iter().enumerate() {
-                let selected = pos == state.selected;
+                let selected = pos == state.selected();
                 let mut info = row![text(workflow.name.clone()).size(13)]
                     .spacing(10)
                     .align_y(iced::Alignment::Center);
@@ -16649,7 +16644,7 @@ impl Frost {
         form: &workflow_picker::WorkflowArgsState,
     ) -> Element<'_, Message> {
         let header = row![
-            text(format!("Workflow: {}", form.workflow.name)).size(14),
+            text(format!("Workflow: {}", form.workflow().name)).size(14),
             Space::new().width(Length::Fill),
             button(text("✕").size(12))
                 .style(button::secondary)
@@ -16659,9 +16654,9 @@ impl Frost {
         .align_y(iced::Alignment::Center);
 
         let mut card = column![header].spacing(8);
-        if !form.workflow.description.is_empty() {
+        if !form.workflow().description.is_empty() {
             card = card.push(
-                text(form.workflow.description.clone())
+                text(form.workflow().description.clone())
                     .size(12)
                     .wrapping(text::Wrapping::Word)
                     .style(text::secondary),
@@ -16669,7 +16664,7 @@ impl Frost {
         }
         card = card.push(
             text(crate::review_text::visible_bounded(
-                &form.workflow.command,
+                &form.workflow().command,
                 4 * 1024,
             ))
             .size(12)
@@ -16677,9 +16672,8 @@ impl Frost {
             .wrapping(text::Wrapping::Word),
         );
 
-        for (index, arg) in form.workflow.args.iter().enumerate() {
-            let value = form.values.get(index).cloned().unwrap_or_default();
-            let input = text_input(&arg.name, &value)
+        for (index, arg) in form.workflow().args.iter().enumerate() {
+            let input = text_input(&arg.name, form.value(index))
                 .on_input(move |value| Message::WorkflowArgInput(index, value))
                 .on_submit(Message::WorkflowArgSubmit)
                 .size(13)
@@ -16694,6 +16688,12 @@ impl Frost {
             let mut label = arg.name.clone();
             if !arg.description.is_empty() {
                 label = format!("{label} — {}", arg.description);
+            }
+            // An argument whose file declares no default is not filled by a
+            // blank string (see `workflows`): say so on the row, so the
+            // `missing values:` refusal on Insert is never a surprise.
+            if form.is_missing(index) {
+                label = format!("{label} (required)");
             }
             card =
                 card.push(column![text(label).size(11).style(text::secondary), input,].spacing(2));

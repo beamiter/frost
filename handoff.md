@@ -1,8 +1,9 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared review-first command correction; the consent switch that
-surface never read; the shared AI chat store and the quit-path write that erased the
-saved chat library)
+Updated: 2026-08-29 (the shared TOML/YAML workflow library, and the missing-value
+guard four terminals implemented and none could reach; shared review-first command
+correction; the consent switch that surface never read; the shared AI chat store and
+the quit-path write that erased the saved chat library)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -12,6 +13,124 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **Shared workflow library, and the missing-value guard all four terminals
+  implemented and none could reach (2026-08-29)**: `src/workflows.rs` collapses
+  from 827 lines to 210 (153 insertions against 770 deletions), and
+  `src/workflow_picker.rs` gives up its own fuzzy list and its own value
+  bookkeeping (136/116) while keeping every iced widget. The subsystem is now
+  `jterm_core::workflows` — five files, 3,186 lines with 73 tests at the pinned
+  `790d06ab19b9f3dec7c188728fc468f008df5414` — assembled from the four
+  terminals' separately drifted copies (anvil, forge, ember and frost's own).
+  Fifteen of frost's twenty-three workflow tests went with the engine they
+  covered; nine remain — the eight that are about frost's own wiring, plus one
+  new one pinning the picker's query boundary.
+
+  The reason this one was worth converging is not line count. The four apps
+  read the *same* library out of the *same* directories, so a difference in
+  what one app accepts is a difference in what a user's file **means**
+  depending on which terminal opened it. frost was on the right side of the two
+  worst divergences already — `O_NOFOLLOW` in the bounded reader (ported from
+  forge in the round that introduced this file) and a user-config lookup that
+  returns `Option` rather than a CWD-relative path when `HOME` is unset — and
+  both are now the family's behaviour rather than this repo's.
+
+  **The defect all four shared.** `render()` is supposed to refuse a declared
+  argument that has no default and no value, and frost implemented that guard
+  and unit-tested it. It never fired. The parameter form seeded every declared
+  argument with `""` before the user saw it (old `workflow_picker.rs:139-144`,
+  `arg.default.clone().unwrap_or_default()`),
+  so by the time `render()` looked, every argument *had* a value. `kill -9
+  {pid}` with an untouched Pid field rendered `kill -9 ` and was typed at the
+  prompt for review. The old test
+  `args_form_prefills_defaults_and_renders_edits` asserted `deploy api --env=`
+  renders fine and called that emptiness intentional — it was the fossil record
+  of the defect, not behaviour to preserve, and it is rewritten rather than
+  kept.
+
+  The contract is now stated once — *an empty value is meaningful only if the
+  file says so, and `default = ""` is how a file says so* — and enforced in two
+  places that cannot disagree. `render()` claims the undefaulted, blank-or-
+  absent arguments into its missing set *before* building the binding list, so
+  a caller that pre-seeds cannot seed past it. `ArgsForm` carries `Unset` vs
+  `Supplied` in the type system, so `WorkflowArgsState` no longer holds a
+  `Vec<String>` that cannot represent the difference, and
+  `WorkflowArgsState::is_missing` marks the row `name (required)` in the form
+  *before* Insert is pressed. Insert then refuses with `Workflow could not be
+  rendered: missing values: pid` on the form's own feedback line. Whitespace-only
+  input counts as unfilled. Emptying a *defaulted* field is still a deliberate
+  empty value and still renders as one — frost's tested `deploy  --env=staging`
+  behaviour survives, and is still asserted.
+
+  Root cause of why one app could never have implemented this at all: forge
+  typed `WorkflowArg::default` as `String`, which cannot represent "no
+  default". The shared schema uses `Option<String>`, which is what frost's copy
+  already had.
+
+  **Three more things a frost user can observe.** A template with an
+  unterminated `{{` no longer lets that brace pair claim a later placeholder's
+  close: `awk '{{print $1}' {{log}} | sort -u` used to render `awk '{print $1}'
+  access.log | sort -u`, a different and executable awk program, while the same
+  leading bytes with nothing after them round-tripped unchanged. `{{`/`}}` now
+  nest, so a pair's close is its own. A workflow file declaring a padded
+  argument name — `name = "pid "`, one invisible keystroke inside a quoted
+  string — is rejected at load instead of loading clean, validating clean and
+  matching nothing: placeholder names are trimmed, so `kill -9 {{ pid }}` used
+  to render the literal `kill -9 { pid }`, the missing-value guard returned
+  `Ok` because the argument *had* a value, and whatever the user typed into
+  that row was discarded on the way to the prompt. Both halves of a skip log
+  line are now sanitised: frost wrote `workflows: skipping {path}: {err}` with
+  the path raw and the parser error raw, and `toml::from_str` quotes the
+  offending source line back verbatim — a file whose unterminated string is
+  `command = "echo <ESC>]0;title<BEL>` put that OSC sequence on a warn line for
+  whatever tty was tailing the log.
+
+  **The bundled example that would have hidden the headline fix.**
+  `scripts/workflows/docker-tail-logs.yaml` declared `default: ""` for its
+  required `container` argument. Under the new contract that is an explicit
+  empty value, so the guard would *not* have fired on the example frost ships —
+  Insert would have produced `docker logs -f --tail 100 `. The empty default is
+  removed and `container` is now a required argument. frost's other five
+  bundled files are unchanged, and all six now match anvil's, ember's and
+  forge's byte for byte; the reconciliation that got them there landed in
+  forge, which is where the copies had drifted.
+
+  **What frost still decides, and why each is injected rather than
+  hardcoded.** Four values, because each would silently change behaviour for
+  two of the four apps if the core guessed. The XDG backend: frost has no GTK
+  dependency and answers with `XdgEnvDirs` (the `dirs` crate plus
+  `XDG_DATA_DIRS`), while anvil and forge ask glib, whose fallback chain
+  differs. App identity: `SearchPathSpec::for_app("frost", …)` derives both the
+  `frost/workflows` segment and the `FROST_WORKFLOW_DIR` override from one
+  name, so this app cannot look under its own directory while honouring
+  another's variable. `LOAD_ORDER`: frost lists in directory-precedence order
+  so `~/.config/frost/workflows/` heads the picker, where ember and forge sort
+  the whole library by name — the difference used to be the presence or absence
+  of one `sort_by` line, and `LoadOrder` deliberately has no `Default`, so a
+  shim that stays silent does not compile. The dev-tree root:
+  `env!("CARGO_MANIFEST_DIR")` is expanded against the crate being compiled, so
+  evaluating it inside `jterm_core` would point all four apps at
+  `jterm_core/scripts/workflows` — a directory that does not exist — while
+  every app's bundled-library test kept passing.
+
+  The picker's list state moved too, in the same round rather than the
+  follow-up the migration plan expected: `WorkflowPickerState` is now a wrapper
+  over `jterm_core::workflows::WorkflowPicker` with
+  `PickerPolicy::new(15, false)` — fuzzy, fifteen results, the command template
+  *not* searchable. Both halves were previously implicit: forge alone searched
+  the template, so `lsof` found its kill-port workflow and nothing else in the
+  family found it that way, and forge's list had no cap at all. frost's answers
+  are unchanged; they are now stated as a value rather than as the absence of
+  code. The three `selected = 0` resets that used
+  to live in `main.rs` and the ad-hoc printable-character filter beside them
+  are gone; query text crosses `set_query` / `push_query_text` / `backspace`,
+  which apply the core's one-line and `MAX_PICKER_QUERY_BYTES` bounds to
+  programmatic and accessibility input as well as to typing.
+
+  `serde_yaml_ng` is out of `Cargo.toml`: both halves of the format are now
+  deserialised by one serde derive inside the core, and nothing else in frost
+  used the crate. `fuzzy-matcher` stays — `history_picker` and
+  `command_palette` still use it directly.
 
 - **Shared review-first command correction, and the consent switch this surface
   never read (2026-08-29)**: the four terminals each carried a private copy of
@@ -805,16 +924,51 @@ The AI chats panel, the AI command suggestion, and their shared-store shim
 (`src/ai_chats.rs`, `src/ai_chat_store.rs`, `src/ai_command.rs`, and the
 `src/main.rs` wiring) are still uncommitted work in progress, carried into this
 round rather than produced by it. The dependency half of that is now settled:
-`Cargo.toml` pins `jterm_core` at `badcce222fb5471a6afbfc5d5e898e2bc3faf632`,
-the commit that adds `jterm_core::command_correction` on top of the
-`jterm_core::ai::chat_store` revision the previous round pinned, with `jagent`
-`f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf` beneath it. The temporary local
-`[patch]` used to develop the two together is gone, `Cargo.lock` carries real
-`source = "git+…"` lines again, and the gate below was rerun with `--locked`
-against the published revisions. What remains uncommitted is frost's own
+`Cargo.toml` pins `jterm_core` at `790d06ab19b9f3dec7c188728fc468f008df5414`,
+the commit that adds `jterm_core::workflows` on top of the
+`jterm_core::command_correction` revision the previous round pinned
+(`badcce2`), with `jagent` `f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf` beneath
+it. No local `[patch]` is in effect — `~/.cargo/config.toml` carries only the
+crates.io mirror — `Cargo.lock` carries a real `source = "git+…"` line for the
+new revision, and the gate below was rerun with `--locked` against the
+published core. What remains uncommitted is frost's own
 panel code. Until then the panel is absent from
 README's shortcut table on purpose: the chord is settled family-wide, but
 nothing here is shipped behavior yet.
+
+Four things the workflow migration did not do, none of them papered over.
+
+`WorkflowArgsState::is_missing` restates the core's rule (`default.is_none()`
+and the trimmed value is empty) rather than calling
+`ArgsForm::missing`, which returns argument *names* while the iced view needs a
+per-row predicate at the index it is drawing. Two copies of one rule is exactly
+the shape this round was convening to remove, and the copy here is one
+`is_some_and` — but it can drift from `render`'s. `ArgsForm::is_set(index)` is
+the accessor that exists; it is not the same question, because a field the user
+typed into and then emptied is set and still unusable. A
+`pub fn is_missing(&self, index: usize) -> bool` upstream, answering exactly
+what `missing()` answers per row, would let the shim delete its copy.
+
+`ArgsForm::clear(index)` — the only way back to `Unset`, and therefore the
+"revert this field to its declared default" affordance — is not wired to
+anything. frost's form has no per-row revert control, so a defaulted field the
+user empties stays empty for the life of the dialog and there is no way to ask
+for the default back except closing and reopening the workflow. That is the
+same behaviour as before this round; the capability is new and unused.
+
+The `WorkflowPicker` extraction landed here rather than being deferred, so the
+one thing frost's picker still owns alone is the overlay's *keyboard routing*
+in `main.rs` — Enter/Escape/arrows and the click dispatch. Nothing in that is
+shared-format policy, so it is not obviously a candidate for the core; it is
+recorded because a reader comparing the four apps will find four copies of it.
+
+The pre-existing rustdoc failure in `src/ai_chat_store.rs` is untouched:
+`RUSTDOCFLAGS="-D warnings" cargo doc` still fails on a redundant explicit
+intra-doc link — the label already resolves, so the explicit
+`(jterm_core::ai::BusyChatPolicy)` target is redundant — left by the previous
+round. rustdoc is not in the release checks below and the file is
+not on this round's surface. Both files this round rewrote produce zero rustdoc
+warnings.
 
 Three things the correction migration did not do, none of them papered over.
 
@@ -871,8 +1025,21 @@ bash scripts/test-install-paths.sh
 ```
 
 The three Rust gates were rerun for this round with `--locked` against the published
-`jterm_core` `badcce2`: `cargo fmt --all -- --check` reports no diff, Clippy is silent
-at `-D warnings`, and the suite is 1,006 passing with zero failures. Fifteen of the
-twenty-three tests in `src/command_correction.rs` are gone with the engine they
-covered; the install-path and packaging checks above were not rerun, because this
-round touched no script, desktop file or metadata.
+`jterm_core` `790d06a`: `cargo fmt --all -- --check` reports no diff, Clippy is silent
+at `-D warnings`, and the suite is 992 passing with zero failures. The drop from the
+previous round's 1,006 is this migration exactly: workflows had twenty-three tests
+across `src/workflows.rs` (18) and `src/workflow_picker.rs` (5), and has nine — three
+in `src/workflows.rs` pinning frost's search-path policy, its precedence load order
+and the bundled-library contract, and six in `src/workflow_picker.rs` covering the
+iced wrappers, the query-boundary crossing, and the argument form's new
+supplied-versus-unset behaviour. Each of the fifteen deletions has a named counterpart
+in `jterm_core::workflows` — `render_leaves_unterminated_braces_alone` became
+`an_unterminated_double_brace_survives_verbatim` *plus*
+`an_unterminated_double_brace_survives_a_placeholder_later_in_the_template`,
+which is the case frost's version never asked about, and
+`installed_assets_follow_every_system_data_directory` became
+`search_path_lists_every_tier_in_precedence_order`. The install-path and
+packaging checks above were not rerun: this round touched no script, desktop file or
+metadata. `scripts/workflows/docker-tail-logs.yaml` changed, but it is data the
+`every_bundled_workflow_is_parseable_and_review_only` test loads, not an installed
+artifact those checks inspect.

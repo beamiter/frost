@@ -212,3 +212,89 @@ and an inverted consent mapping each turn the suite red. The probe-thread-name
 assertion does not — it compares the policy's `Debug` output against the same
 constant it renders, so it proves the constant is plumbed through but cannot
 detect a rename; `CorrectionPolicy::probe_thread_name` has no accessor upstream.
+
+The shared TOML/YAML workflow library adds rounds 59–69. Rounds 47–58 used this
+numbered list for the command-correction migration, so it continues here rather
+than restarting:
+
+59. **Shared workflow subsystem** — `src/workflows.rs` collapses from 827 lines
+    to 210 (153 insertions against 770 deletions) and `src/workflow_picker.rs`
+    gives up its own fuzzy list and its own value bookkeeping (136/116), over
+    `jterm_core::workflows` (five files, 3,186 lines, 73 tests). The pinned core
+    revision advances to `790d06ab19b9f3dec7c188728fc468f008df5414`. Four things
+    stay in frost: the search-path policy, the load order, the iced overlay, and
+    the keyboard routing in `main.rs`.
+60. **The missing-value guard, reachable at last** — `render()` refuses a
+    declared argument with no default and no value, and frost implemented and
+    unit-tested that. The form seeded every declared argument with `""` before
+    the user saw it, so it never fired: `kill -9 {pid}` with an untouched Pid
+    field rendered `kill -9 ` and was typed at the prompt. The contract is now
+    stated once — an empty value is meaningful only if the file says so — and
+    `render` claims the undefaulted, blank-or-absent arguments into its missing
+    set *before* building the binding list, so a caller that pre-seeds cannot
+    seed past it.
+61. **Unset and supplied kept apart in the type system** — `WorkflowArgsState`
+    wraps `ArgsForm` instead of a `Vec<String>` that cannot represent the
+    difference. Emptying a *defaulted* field stays a deliberate empty value
+    (`deploy  --env=staging` still renders); emptying an *undefaulted* one is a
+    missing value. Whitespace-only counts as unfilled.
+62. **The refusal is visible before it happens** — outstanding rows carry
+    `(required)` in their label, so Insert's `missing values:` error is never
+    the first the user hears of it.
+63. **Nested brace pairing** — an unterminated `{{` no longer claims a later
+    placeholder's `}}`. `awk '{{print $1}' {{log}} | sort -u` used to render
+    `awk '{print $1}' access.log | sort -u`, a different and executable awk
+    program, while the same leading bytes with nothing after them round-tripped
+    unchanged.
+64. **Declared names held to the placeholder spelling** — placeholder names are
+    trimmed, so a padded declared name (`name = "pid "`) could load clean,
+    validate clean and match nothing while the user's typed value was dropped
+    on the way to the prompt. Both sides of that lookup are now trimmed, and a
+    padded declared name is rejected at load.
+65. **Both halves of a skip log sanitised** — frost logged
+    `workflows: skipping {path}: {err}` with the path raw and the parser error
+    raw, and `toml::from_str` quotes the offending source line back verbatim, so
+    a file whose unterminated string carried an OSC sequence wrote it onto a
+    warn line for whatever tty was tailing the log. Both cross
+    `review_input::safe_inline_display`, bounded.
+66. **One query boundary for the picker** — the three `selected = 0` resets and
+    the ad-hoc printable-character filter in `main.rs` are replaced by
+    `set_query` / `push_query_text` / `backspace`, so programmatic and
+    accessibility input cross the same one-line and `MAX_PICKER_QUERY_BYTES`
+    bounds as typing. frost's policy is stated as `PickerPolicy::new(15, false)`
+    — fuzzy, fifteen results, command template not searchable.
+67. **Every divergence-prone choice injected, none with a `Default`** — the XDG
+    backend (`XdgEnvDirs` here, glib in anvil/forge), the app identity
+    (`SearchPathSpec::for_app` derives both the `frost/workflows` segment and
+    `FROST_WORKFLOW_DIR` from one name), the load order (`LoadOrder::Precedence`
+    here, `ByName` in ember/forge — and `LoadOrder` has no `Default`, so a
+    silent shim does not compile), and the dev-tree root (`env!` expands against
+    the compiling crate, so evaluating it in the core would point all four apps
+    at a directory that does not exist while their bundled-library tests kept
+    passing).
+68. **An empty search-path entry contributes no tier** — a trailing or doubled
+    `:` in `$FROST_WORKFLOW_DIR` is dropped, and a non-absolute `XDG_DATA_DIRS`
+    entry no longer contributes a tier resolved against the process CWD. The
+    `dirs` backend never produced a relative user tier here, so this is
+    hardening for frost and a fix for a sibling.
+69. **The bundled example the guard would have missed, and the documented
+    contract** — `scripts/workflows/docker-tail-logs.yaml` declared
+    `default: ""` for its required `container` argument, which under the new
+    contract is an explicit empty value: Insert would have produced
+    `docker logs -f --tail 100 `. The empty default is removed. README's
+    capability bullet, its shortcut table and a new "Workflow 模板" section state
+    the required-argument rule, how to opt a parameter back into being
+    optional, and the two template tightenings.
+
+Verification for rounds 59–69: `cargo fmt --all -- --check` (no diff),
+`cargo clippy --locked --all-targets --all-features -- -D warnings` (silent),
+and `cargo test --locked --all-targets --all-features --no-fail-fast` (992
+passing, zero failures), all against the published `jterm_core` `790d06a` with
+no local `[patch]`. The drop from 1,006 is this migration exactly: workflows had
+twenty-three tests and has nine — three in `src/workflows.rs` pinning the search
+path, the precedence load order and the bundled-library contract, six in
+`src/workflow_picker.rs`. The rewritten form test is the load-bearing one: it
+previously asserted that `deploy api --env=` renders fine and called that
+emptiness intentional, which was the fossil record of round 60's defect rather
+than behaviour to preserve. The install-path and packaging checks were not
+rerun; this round touched no script, desktop file or metadata.

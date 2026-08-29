@@ -72,7 +72,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 完成块的徽标在行尾空白不足时会逐级缩短（依次舍去完成时刻、生命周期文字、耗时、信号名），
 而不是整条消失，任何缩短形式都保留结果字形，非健康生命周期保留 `~` 标记；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
 - 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
-- 参数化 workflow（`Ctrl+Shift+M`，或命令面板的 **Workflows** 动作）：从 `~/.config/frost/workflows/`、`FROST_WORKFLOW_DIR`、XDG 数据目录与内置示例（`scripts/workflows/`）加载与 anvil/forge 同格式的 TOML/YAML 模板，同名时靠前的目录优先；带参数的模板先弹出逐参数表单（预填默认值），渲染结果只回填到提示符供人工审阅，绝不自动执行；命令经共享 review-only 边界校验，拒绝控制字符与视觉欺骗字符，文件大小/数量均有上限，符号链接与特殊文件直接拒绝
+- 参数化 workflow（`Ctrl+Shift+M`，或命令面板的 **Workflows** 动作）：从 `~/.config/frost/workflows/`、`FROST_WORKFLOW_DIR`、XDG 数据目录与内置示例（`scripts/workflows/`）加载与 anvil/ember/forge **同一份** TOML/YAML 模板库（自 2026-08-29 起四个终端共用 `jterm_core::workflows` 这一份加载/校验/渲染实现，因此同一个文件在哪个终端里打开都是同一个意思），同名时靠前的目录优先；带参数的模板先弹出逐参数表单（声明了 `default` 的参数预填该默认值），渲染结果只回填到提示符供人工审阅，绝不自动执行；**文件里没有声明 `default` 的参数不再被当作空串**——留空（或只填空白）时 Insert 会拒绝并提示 `missing values: <参数名>`，这些行在按下 Insert 之前就带 `(required)` 标记，详见下方“workflow 参数的必填约定”；命令经共享 review-only 边界校验，拒绝控制字符与视觉欺骗字符，文件大小/数量均有上限，符号链接与特殊文件直接拒绝
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
@@ -214,7 +214,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 清空已完成命令块 | `Ctrl+Shift+K`（显示块数并要求确认；不可撤销；保留当前提示符或运行中命令） |
 | 回填所选命令 | `Ctrl+Shift+I`（只回填，不执行） |
 | 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
-| Workflow 选择器 | `Ctrl+Shift+M`（带参数的模板进入逐参数表单；渲染结果只回填到提示符不执行） |
+| Workflow 选择器 | `Ctrl+Shift+M`（带参数的模板进入逐参数表单；未声明 `default` 的参数必填，留空时 Insert 拒绝渲染；渲染结果只回填到提示符不执行） |
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
 | 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
@@ -345,6 +345,66 @@ JSON 使用版本化的 `frost.block-session` v1 envelope，记录 pane session�
 块顺序和截断/淘汰汇总，后续字段演进不再依赖无版本裸数组。
 
 快捷键从 `$XDG_CONFIG_HOME/frost/keybindings.toml`（通常是 `~/.config/frost/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
+
+## Workflow 模板
+
+workflow 是一个 TOML 或 YAML 文件：名字、可选描述与标签、一段带占位符的命令模板，
+以及若干具名参数。四个 jterm 终端（anvil、ember、forge、frost）读的是同一批目录里的
+同一批文件，因此从 2026-08-29 起，加载、校验与渲染由共享的 `jterm_core::workflows`
+统一实现——同一个文件在哪个终端里打开都是同一个意思。
+
+搜索路径按优先级：`~/.config/frost/workflows/` → `$FROST_WORKFLOW_DIR`（可用 `:`
+分隔多个目录，只是**追加**而不替换标准位置）→ `~/.local/share/frost/workflows/` →
+`XDG_DATA_DIRS` 中每个目录下的 `frost/workflows/` → 仓库内置示例
+`scripts/workflows/`。同名 workflow 由靠前的目录胜出，因此你自己的文件可以覆盖内置示例。
+
+### workflow 参数的必填约定
+
+**这是本轮唯一会改变既有文件行为的规则**：一个参数是否可以留空，由文件说了算。
+
+- 参数声明了 `default`（包括 `default = ""`），它就有值。表单预填该默认值；你把这一行
+  清空，那是一次**明确的空值**，仍然照空值渲染，不会回退到默认值。
+- 参数**没有**声明 `default`，它就是必填的。表单里这一行的标签带 `(required)`，
+  在你按 Insert 之前就能看见；留空或只填空白时 Insert 拒绝渲染，并在表单上显示
+  `Workflow could not be rendered: missing values: <参数名>`。
+
+此前四个终端的参数表单都会先用空串把每个声明过的参数填满，于是这条校验虽然写了、
+也有单测，实际上永远触发不了：`kill -9 {pid}` 在 Pid 一栏没动过的情况下会渲染成
+`kill -9 ` 并回填到提示符。现在不会了。
+
+如果你原本依赖某个参数可以留空，请在文件里把这件事说出来：
+
+```yaml
+args:
+  - name: extra_flags
+    description: "额外参数，可留空"
+    default: ""          # 明确声明空值合法
+```
+
+内置示例 `scripts/workflows/docker-tail-logs.yaml` 就因此改过一次：它的 `container`
+参数原先写着 `default: ""`，在新约定下那等于"空值合法"，`docker logs -f --tail 100 `
+仍会被插入提示符。该空默认值已删除，`container` 现在是必填参数。
+
+### 模板占位符
+
+`{name}` 与 `{{name}}` 两种写法都支持，名字两侧的空格会被忽略（`{{ service }}` 与
+`{{service}}` 等价）。没有绑定的 `{{...}}` 是字面花括号转义，输出一对 `{`/`}`；
+没有绑定的单花括号占位符原样保留，好让你看见自己的拼写错误。
+
+两处收紧值得注意：
+
+- `{{` 与 `}}` 现在按嵌套配对，一个未闭合的 `{{` 不会再去认领后面某个占位符的 `}}`。
+  `awk '{{print $1}' {{log}} | sort -u` 过去会渲染成 `awk '{print $1}' access.log | sort -u`
+  ——一段不同的、可执行的 awk 程序；现在未闭合的部分原样保留。
+- 参数名两侧不允许有空格。`name = "pid "` 这种（引号里多一个看不见的按键）以前会
+  正常加载、正常校验，却谁也匹配不上：`kill -9 {{ pid }}` 渲染出字面量
+  `kill -9 { pid }`，缺值校验因为"该参数有值"而通过，你在那一行里输入的东西在通往
+  提示符的路上被丢掉。现在这样的文件在加载时就被拒绝，并写一条日志说明原因。
+
+渲染结果只回填到提示符供人工审阅，**从不自动执行**；命令与你填入的值都要通过共享的
+review-only 边界校验（拒绝控制字符与视觉欺骗字符）。文件大小与数量有上限，符号链接
+与 FIFO 等特殊文件在 `open` 时即被拒绝。某个文件解析失败只会被跳过并记一条日志，
+不会连累其余 workflow；日志里的路径与解析器原文都经过有界的安全内联处理。
 
 ## Shell 集成（OSC 133）
 

@@ -4,170 +4,166 @@
 //!
 //! The picker fuzzy-searches the loaded workflow list; accepting a workflow
 //! without arguments renders and inserts it at the active prompt for review,
-//! while one with arguments opens the per-argument form (defaults prefilled,
-//! exactly like anvil's dialog). Nothing ever executes: the rendered command
-//! goes through the same `PromptRecall` review boundary as history recall.
+//! while one with arguments opens the per-argument form. Nothing ever
+//! executes: the rendered command goes through the same `PromptRecall` review
+//! boundary as history recall.
 //!
-//! Loading is synchronous at open, bounded by `workflows`' file and count
-//! caps — the same seam as `history_picker::HistoryPickerState::load`. This
-//! replaces anvil's single-flight background refresh (`workflow_ops.rs`):
-//! iced has no palette tier to prewarm, so the GTK worker/latch machinery
-//! would buy nothing here.
+//! Loading is synchronous at open, bounded by the file and count caps in
+//! [`jterm_core::workflows`] — the same seam as
+//! `history_picker::HistoryPickerState::load`. This replaces anvil's
+//! single-flight background refresh (`workflow_ops.rs`): iced has no palette
+//! tier to prewarm, so the GTK worker/latch machinery would buy nothing here.
+//!
+//! Iced wiring stays here; both pure state machines do not. The searchable
+//! list is [`jterm_core::workflows::WorkflowPicker`], and the form's value
+//! bookkeeping is [`ArgsForm`], because
+//! keeping "untouched and undefaulted" apart from "deliberately emptied" is
+//! what makes the family-wide missing-value guard reachable at all (see
+//! [`crate::workflows`]).
 
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
-
-use crate::workflows::{self, Workflow};
+use crate::workflows::{self, ArgsForm, Workflow};
+use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
 
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更多的 workflow 通过输入查询来召回（与历史选择器一致）。
 pub(crate) const MAX_RESULTS: usize = 15;
+const PICKER_POLICY: PickerPolicy = PickerPolicy::new(MAX_RESULTS, false);
 
 /// 选择器状态。`entries` 保持 `workflows::load_all` 的目录优先级顺序（与
 /// anvil 一致：更早的目录胜出同名项，目录内按文件名排序）；期间磁盘上的
 /// 变更在下一次打开时生效。
 pub(crate) struct WorkflowPickerState {
-    pub query: String,
-    /// 当前过滤结果中的高亮位置。
-    pub selected: usize,
-    entries: Vec<Workflow>,
-    matcher: SkimMatcherV2,
+    picker: WorkflowPicker,
 }
 
 impl WorkflowPickerState {
     pub(crate) fn new(entries: Vec<Workflow>) -> Self {
         Self {
-            query: String::new(),
-            selected: 0,
-            entries,
-            matcher: SkimMatcherV2::default(),
+            picker: WorkflowPicker::new(entries, PICKER_POLICY),
         }
     }
 
-    /// 从全部搜索路径加载。缺失/损坏的文件被 `workflows` 跳过，这里得到的
-    /// 只是更短的列表而不是错误。
+    /// 从全部搜索路径加载。缺失/损坏的文件被 `jterm_core::workflows` 记录并
+    /// 跳过，这里得到的只是更短的列表而不是错误。
     pub(crate) fn load() -> Self {
         Self::load_from(&workflows::workflow_dirs())
     }
 
-    /// Test seam (and any future caller with an explicit search path).
+    /// Test seam (and any future caller with an explicit search path). 顺序由
+    /// `workflows::load_library_from` 钉死为目录优先级顺序——`filtered()` 的
+    /// 空查询分支直接暴露它。
     pub(crate) fn load_from(dirs: &[std::path::PathBuf]) -> Self {
-        Self::new(workflows::load_all(dirs))
+        Self::new(workflows::load_library_from(dirs))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.picker.is_empty()
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        self.picker.query()
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.picker.selected()
+    }
+
+    /// Iced `text_input` and accessibility/programmatic input both cross the
+    /// core's one-line and byte-budget boundary here.
+    pub(crate) fn set_query(&mut self, query: impl Into<String>) {
+        self.picker.set_query(query);
+    }
+
+    pub(crate) fn push_query_text(&mut self, text: &str) -> bool {
+        self.picker.push_query_text(text)
+    }
+
+    pub(crate) fn backspace(&mut self) -> bool {
+        self.picker.backspace()
     }
 
     /// 当前过滤结果（最多 [`MAX_RESULTS`] 条）。空查询保持加载顺序；否则按
     /// 模糊匹配分数降序，同分保持加载顺序（稳定排序）。名称、描述与标签一起
     /// 参与匹配，对应 anvil 面板对 tags 的检索。
     pub(crate) fn filtered(&self) -> Vec<&Workflow> {
-        if self.query.is_empty() {
-            return self.entries.iter().take(MAX_RESULTS).collect();
-        }
-        let mut scored: Vec<(i64, &Workflow)> = self
-            .entries
-            .iter()
-            .filter_map(|workflow| {
-                let haystack = format!(
-                    "{} {} {}",
-                    workflow.name,
-                    workflow.description,
-                    workflow.tags.join(" ")
-                );
-                self.matcher
-                    .fuzzy_match(&haystack, &self.query)
-                    .map(|score| (score, workflow))
-            })
-            .collect();
-        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        scored
-            .into_iter()
-            .take(MAX_RESULTS)
-            .map(|(_, workflow)| workflow)
-            .collect()
+        self.picker.filtered()
     }
 
     /// 高亮项下移（在过滤结果中循环）。
     pub(crate) fn select_next(&mut self) {
-        let len = self.filtered().len();
-        if len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = (self.selected + 1) % len;
-        }
+        self.picker.select_next();
     }
 
     /// 高亮项上移（在过滤结果中循环）。
     pub(crate) fn select_prev(&mut self) {
-        let len = self.filtered().len();
-        if len == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = if self.selected == 0 {
-                len - 1
-            } else {
-                self.selected - 1
-            };
-        }
+        self.picker.select_prev();
     }
 
     /// 当前高亮的 workflow（按过滤结果中的位置）。
     pub(crate) fn selected_workflow(&self) -> Option<&Workflow> {
-        self.filtered().get(self.selected).copied()
+        self.picker.selected_workflow()
     }
 
     /// 过滤结果中第 `index` 条的 workflow（用于鼠标点击分发）。
     pub(crate) fn workflow_at_filtered(&self, index: usize) -> Option<&Workflow> {
-        self.filtered().get(index).copied()
+        self.picker.workflow_at_filtered(index)
     }
 }
 
 /// 参数填写表单状态，对应 anvil 的 workflow 对话框：每个声明的参数一行输入，
-/// 以声明的默认值预填；用户清空的输入以显式空值覆盖默认值（anvil 的 Open
-/// 消息同样用默认值或空串播种整个 values 表）。
+/// 以声明的默认值预填。值的记账交给 [`ArgsForm`]——它在类型里保留了"未填写
+/// 且文件未声明默认值"与"用户显式清空"的区别，而这正是四份拷贝共有的缺陷所
+/// 在：过去每个 UI（含此处）都用 `""` 预填每一个声明的参数，于是
+/// `workflows::render` 里那条实现过、也单测过的 missing-values 守卫在全家族
+/// 的四个终端里都触发不了，`kill -9 {pid}` 会以 `kill -9 ` 送到提示符。
+///
+/// 现在的契约：空值只有在文件这么说时才成立（`default = ""` 就是这么说）。
+/// 声明了默认值的参数被清空仍然是一次显式的空值；没有声明默认值的参数留空则
+/// 是"未填写"，渲染时报 `missing values:`，[`Self::is_missing`] 让视图在按下
+/// Insert 之前就把这些行标出来。
 pub(crate) struct WorkflowArgsState {
-    pub workflow: Workflow,
-    /// 与 `workflow.args` 对齐的当前值。
-    pub values: Vec<String>,
+    form: ArgsForm,
     /// 最近一次渲染错误，内联显示在表单上（correction 卡片的 feedback 惯例）。
     pub feedback: Option<String>,
 }
 
 impl WorkflowArgsState {
     pub(crate) fn new(workflow: Workflow) -> Self {
-        let values = workflow
-            .args
-            .iter()
-            .map(|arg| arg.default.clone().unwrap_or_default())
-            .collect();
         Self {
-            workflow,
-            values,
+            form: ArgsForm::new(workflow),
             feedback: None,
         }
     }
 
-    pub(crate) fn set_value(&mut self, index: usize, value: String) {
-        if let Some(slot) = self.values.get_mut(index) {
-            *slot = value;
-        }
+    /// 表单正在填写的 workflow（视图取名称、描述与命令模板）。
+    pub(crate) fn workflow(&self) -> &Workflow {
+        self.form.workflow()
     }
 
-    /// Render the template with the current values. All declared arguments are
-    /// supplied (prefilled or edited), so a missing-value error here means the
-    /// template references a placeholder the file never declared — reported
-    /// verbatim, like anvil's dialog error label.
+    /// 第 `index` 行输入框当前应显示的文本。未填写且未声明默认值的行是空串——
+    /// 它显示成什么，就是它的含义。
+    pub(crate) fn value(&self, index: usize) -> &str {
+        self.form.value(index)
+    }
+
+    /// 该行是否仍未提供可用的值：文件没有声明默认值，且用户没有键入非空白
+    /// 内容。与 `workflows::render` 的判定同一条规则。
+    pub(crate) fn is_missing(&self, index: usize) -> bool {
+        self.form
+            .args()
+            .get(index)
+            .is_some_and(|arg| arg.default.is_none())
+            && self.value(index).trim().is_empty()
+    }
+
+    pub(crate) fn set_value(&mut self, index: usize, value: String) {
+        self.form.set(index, value);
+    }
+
+    /// 用当前值渲染模板。未填写的参数不会被当作空串提交，因此这里的
+    /// `missing values:` 是真的缺值，逐字显示在表单的错误标签上。
     pub(crate) fn render(&self) -> Result<String, String> {
-        let values: std::collections::HashMap<String, String> = self
-            .workflow
-            .args
-            .iter()
-            .zip(self.values.iter())
-            .map(|(arg, value)| (arg.name.clone(), value.clone()))
-            .collect();
-        workflows::render(&self.workflow, &values)
+        self.form.render()
     }
 }
 
@@ -215,15 +211,13 @@ mod tests {
 
     #[test]
     fn fuzzy_query_matches_name_description_and_tags() {
-        let state = WorkflowPickerState {
-            query: "deploy".to_string(),
-            ..WorkflowPickerState::new(vec![
-                workflow("Deploy to staging", "", &[]),
-                workflow("Ship it", "run the deploy playbook", &[]),
-                workflow("Tunnel", "ssh forward", &["deploy", "net"]),
-                workflow("Unrelated", "nothing", &[]),
-            ])
-        };
+        let mut state = WorkflowPickerState::new(vec![
+            workflow("Deploy to staging", "", &[]),
+            workflow("Ship it", "run the deploy playbook", &[]),
+            workflow("Tunnel", "ssh forward", &["deploy", "net"]),
+            workflow("Unrelated", "nothing", &[]),
+        ]);
+        state.set_query("deploy");
         let names: Vec<&str> = state.filtered().iter().map(|wf| wf.name.as_str()).collect();
         assert_eq!(
             names.len(),
@@ -238,14 +232,28 @@ mod tests {
         let mut state =
             WorkflowPickerState::new(vec![workflow("one", "", &[]), workflow("two", "", &[])]);
         state.select_prev();
-        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected(), 1);
         assert_eq!(
             state.workflow_at_filtered(1).map(|wf| wf.name.as_str()),
             Some("two")
         );
         state.select_next();
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.selected(), 0);
         assert!(state.workflow_at_filtered(2).is_none());
+    }
+
+    #[test]
+    fn iced_query_input_crosses_the_shared_query_boundary() {
+        let mut state = WorkflowPickerState::new(vec![workflow("alpha", "", &[])]);
+        state.set_query(format!(
+            "{}\nignored",
+            "x".repeat(jterm_core::workflows::MAX_PICKER_QUERY_BYTES + 16)
+        ));
+        assert!(state.query().len() <= jterm_core::workflows::MAX_PICKER_QUERY_BYTES);
+        assert!(!state.query().contains('\n'));
+        assert_eq!(state.selected(), 0);
+        assert_eq!(state.picker.policy(), PICKER_POLICY);
+        assert!(!state.picker.policy().search_command());
     }
 
     #[test]
@@ -272,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn args_form_prefills_defaults_and_renders_edits() {
+    fn args_form_prefills_defaults_and_withholds_the_undeclared_ones() {
         let workflow = Workflow {
             name: "Deploy".to_string(),
             description: String::new(),
@@ -294,22 +302,34 @@ mod tests {
             source_path: None,
         };
         let mut form = WorkflowArgsState::new(workflow);
-        assert_eq!(form.values, ["api", ""]);
-        // A declared argument without a default starts as an explicit empty
-        // value, not a missing one — anvil's dialog seeds the values table the
-        // same way, so "missing values" is unreachable from the form (the
-        // missing-placeholder path is covered by workflows::render's tests).
-        assert_eq!(form.render().unwrap(), "deploy api --env=");
+        assert_eq!(form.value(0), "api");
+        assert_eq!(form.value(1), "");
+
+        // 声明了默认值的行不缺；没有声明默认值又没填的行缺，视图据此标注，
+        // 渲染据此拒绝。这里曾经断言 `deploy api --env=` 渲染成功——那条断言
+        // 是四个终端共有的缺陷留下的化石，不是要保住的行为。
+        assert!(!form.is_missing(0));
+        assert!(form.is_missing(1));
+        let error = form.render().unwrap_err();
+        assert!(error.contains("missing values: env"), "got {error}");
 
         form.set_value(1, "staging".to_string());
+        assert!(!form.is_missing(1));
         assert_eq!(form.render().unwrap(), "deploy api --env=staging");
 
-        // An edited-away value stays an explicit empty string, matching
-        // anvil's dialog (it does not fall back to the declared default).
+        // 清空一个声明了默认值的参数仍然是显式的空值：文件说过空值在这里有
+        // 意义，它就不会回退到默认值，也不算缺值。
         form.set_value(0, String::new());
+        assert!(!form.is_missing(0));
         assert_eq!(form.render().unwrap(), "deploy  --env=staging");
 
-        // Values cross the review-only boundary: a control character fails.
+        // 只输入空白等于没输入：没有声明默认值的参数不接受空白冒充。
+        form.set_value(1, "   ".to_string());
+        assert!(form.is_missing(1));
+        assert!(form.render().unwrap_err().contains("missing values: env"));
+
+        // 值同样要过 review-only 边界：控制字符直接失败。
+        form.set_value(1, "staging".to_string());
         form.set_value(0, "ok\nrm -rf /".to_string());
         assert!(form.render().unwrap_err().contains("unsafe"));
     }

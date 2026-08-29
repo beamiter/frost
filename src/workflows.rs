@@ -1,810 +1,193 @@
-//! Parameterised command templates — Warp-style "workflows".
+//! frost's binding to the shared workflow library.
 //!
-//! Ported from anvil `src/workflows.rs` (with forge `src/workflows.rs` as the
-//! convergent twin). A workflow is a TOML or YAML file: a name, a description,
-//! an optional shell, an optional tag list, a command template with `{arg}` or
-//! `{{arg}}` placeholders, and named arguments with optional defaults and
-//! descriptions.
+//! The subsystem — the five-tier search path, the bounded reader, serde
+//! deserialisation of both TOML and YAML, validation, the `{name}` /
+//! `{{name}}` template engine and the parameter-fill model — lives in
+//! [`jterm_core::workflows`]. That module is the union of the four jterm
+//! terminals' previously duplicated copies (anvil, forge, ember and this one),
+//! ~4,259 lines whose production half contained no toolkit code at all.
 //!
-//! Files are loaded from `~/.config/frost/workflows/`, installed XDG data
-//! directories, and the development `scripts/workflows/` directory. Parse
-//! failures are logged and skipped — one broken file never disables the rest.
+//! The on-disk format is the whole point of this subsystem: the four apps read
+//! the same library out of the same directories, so a difference in what one
+//! app *accepts* was a difference in what a user's file *means* depending on
+//! which terminal opened it. frost's copy contributed two of the union's
+//! guards — `O_NOFOLLOW` in the bounded reader, so a symlink planted in a
+//! scanned directory is refused at `open` rather than followed to a
+//! world-writable target, and the `Option`-returning user-config lookup, so
+//! `HOME` being unset skips the tier instead of scanning `./.config/…`
+//! relative to wherever the process was started (forge did the latter). Both
+//! are now the family's behaviour.
 //!
-//! The render step is intentionally tiny: named substitution plus literal
-//! brace escapes, without a conditionals/loops templating language.
+//! What is left here is the policy frost owns, and only that:
 //!
-//! Once loaded, workflows surface in the workflow picker overlay
-//! (`Ctrl+Shift+M`, or the "Workflows" command-palette action). Rendering
-//! inserts the command at the prompt for review — it never presses Enter.
+//! - **The search path** ([`workflow_dirs`]). [`SearchPathSpec::for_app`]
+//!   derives the directory segment *and* the override variable from one name,
+//!   so frost cannot look under `frost/` while honouring another app's
+//!   variable. The dev-tree tier is passed in rather than computed in the core
+//!   because `env!("CARGO_MANIFEST_DIR")` is resolved at compile time against
+//!   the crate being compiled: evaluating it in `jterm_core` would point all
+//!   four apps at `jterm_core/scripts/workflows`, which does not exist, while
+//!   their bundled-library tests kept passing.
+//! - **The XDG backend** ([`XdgEnvDirs`]). frost has no GTK dependency and
+//!   asks the `dirs` crate plus `XDG_DATA_DIRS`; anvil and forge ask glib,
+//!   whose lookups never fail. Injecting it is what keeps those two apps'
+//!   directories from silently changing.
+//! - **The load order** ([`LOAD_ORDER`]). frost lists in directory-precedence
+//!   order so the user's own files head the picker; ember and forge sort the
+//!   whole library by name. [`LoadOrder`] deliberately has no `Default` — the
+//!   difference used to be the presence or absence of one `sort_by` line, and
+//!   a silent core default is how two apps inherit a behaviour nobody chose.
 //!
-//! Deviations from the sources, all forced by frost's dependency set:
-//! - Safety predicates come from the pinned `jterm_core::review_input` (the
-//!   family-shared module anvil vendors and forge already consumes this way).
-//! - `libc` replaces `nix::libc` for the open flags, and forge's stricter
-//!   `O_NOFOLLOW` is kept: a symlinked workflow file is rejected at open time.
-//! - `dirs` replaces glib for XDG resolution; system data directories come
-//!   from `XDG_DATA_DIRS` with the freedesktop `/usr/local/share:/usr/share`
-//!   fallback instead of `glib::system_data_dirs()`.
-//! - `welcome_notebook_path` is not ported: frost has no notebook surface.
-//! - The extra search-path environment variable is `FROST_WORKFLOW_DIR`.
+//! # What changed for a frost user
+//!
+//! An argument the file declares with **no default** is no longer filled by a
+//! blank string. All four UIs pre-seeded every declared argument with `""`,
+//! which made [`render`]'s `missing values:` guard — implemented and
+//! unit-tested right here — unreachable from every terminal in the family:
+//! `kill -9 {pid}` with an untouched Pid field rendered `kill -9 ` and was
+//! typed at the prompt. An empty value is meaningful only if the file says so,
+//! and `default = ""` is how a file says so. `workflow_picker`'s form shows
+//! the outstanding rows before Insert; the old test asserting the weaker
+//! behaviour was the fossil record of the defect and is gone.
+//!
+//! An unterminated `{{` also survives a template that closes a pair later on:
+//! the close is matched by counting `{{`/`}}` nesting instead of scanning to
+//! the end, so `awk '{{print $1}' {{log}}` no longer lets the first brace pair
+//! claim the second placeholder's close and hand the user a different,
+//! executable awk program. A declared argument name is now held to the same
+//! spelling as the placeholder it must bind (both trimmed), so a quoted
+//! `name = "pid "` is rejected rather than loading clean and silently
+//! discarding whatever the user typed into that row. Every path a workflow
+//! file's own bytes reach a log line through is sanitised, not just the
+//! filename half.
 
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-const MAX_WORKFLOW_FILE_BYTES: u64 = 256 * 1024;
-const MAX_DIRECTORY_ENTRIES: usize = 4_096;
-const MAX_WORKFLOW_FILES_PER_DIRECTORY: usize = 512;
-const MAX_WORKFLOWS: usize = 1_024;
-const MAX_WORKFLOW_DIRECTORIES: usize = 64;
-const MAX_WORKFLOW_NAME_BYTES: usize = 256;
-const MAX_WORKFLOW_DESCRIPTION_BYTES: usize = 4 * 1024;
-const MAX_WORKFLOW_COMMAND_BYTES: usize = 64 * 1024;
-const MAX_WORKFLOW_TAGS: usize = 64;
-const MAX_WORKFLOW_ARGS: usize = 64;
-const MAX_WORKFLOW_FIELD_BYTES: usize = 4 * 1024;
+use jterm_core::workflows::{search_path, LoadOrder, SearchPathSpec, XdgEnvDirs};
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Workflow {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    pub command: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Optional interpreter hint retained for shared workflow libraries.
-    /// Workflows remain review-only and are never auto-executed.
-    #[serde(default)]
-    pub shell: Option<String>,
-    #[serde(default)]
-    pub args: Vec<WorkflowArg>,
-    /// Source file the workflow was loaded from — useful for "edit workflow"
-    /// shortcuts later; populated post-deserialize.
-    #[serde(skip)]
-    pub source_path: Option<PathBuf>,
-}
+pub(crate) use jterm_core::workflows::{render, ArgsForm, Workflow};
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct WorkflowArg {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub default: Option<String>,
-}
-
-/// Load every `*.toml` / `*.yaml` / `*.yml` file under the given directories.
-/// Missing directories are skipped; earlier directories win duplicate names.
-pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
-    let mut out = Vec::new();
-    let mut names = HashSet::new();
-    'directories: for dir in dirs.iter().take(MAX_WORKFLOW_DIRECTORIES) {
-        if !dir.is_dir() {
-            continue;
-        }
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(err) => {
-                log::warn!("workflows: cannot list {}: {err}", dir.display());
-                continue;
-            }
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .take(MAX_DIRECTORY_ENTRIES)
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| {
-                        e.eq_ignore_ascii_case("toml")
-                            || e.eq_ignore_ascii_case("yaml")
-                            || e.eq_ignore_ascii_case("yml")
-                    })
-                    .unwrap_or(false)
-            })
-            .take(MAX_WORKFLOW_FILES_PER_DIRECTORY)
-            .collect();
-        // Deterministic order so two runs with the same files produce the same
-        // picker ordering — easier to keep muscle memory.
-        paths.sort();
-        for path in paths {
-            match load_one(&path) {
-                Ok(wf) => {
-                    // Earlier directories have higher precedence, allowing a
-                    // user workflow to replace an installed example by name.
-                    if names.insert(wf.name.clone()) {
-                        out.push(wf);
-                        if out.len() >= MAX_WORKFLOWS {
-                            break 'directories;
-                        }
-                    }
-                }
-                Err(err) => log::warn!("workflows: skipping {}: {err}", path.display()),
-            }
-        }
-    }
-    out
-}
-
-pub(crate) fn load_one(path: &Path) -> Result<Workflow, String> {
-    let text = read_bounded_workflow(path)?;
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mut wf: Workflow = match extension.as_str() {
-        "toml" => toml::from_str(&text).map_err(|e| format!("parse TOML: {e}"))?,
-        "yaml" | "yml" => serde_yaml_ng::from_str(&text).map_err(|e| format!("parse YAML: {e}"))?,
-        _ => return Err("unsupported workflow extension".to_string()),
-    };
-    validate_workflow(&wf)?;
-    wf.source_path = Some(path.to_path_buf());
-    Ok(wf)
-}
-
-fn read_bounded_workflow(path: &Path) -> Result<String, String> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // forge's stricter open flags are kept: O_NOFOLLOW rejects a symlinked
-        // workflow at open time instead of reading the linked target.
-        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("read: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect: {error}"))?;
-    if !metadata.is_file() {
-        return Err("source is not a regular file".to_string());
-    }
-    if metadata.len() > MAX_WORKFLOW_FILE_BYTES {
-        return Err(format!(
-            "source exceeds the {MAX_WORKFLOW_FILE_BYTES}-byte limit"
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_WORKFLOW_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read: {error}"))?;
-    if bytes.len() as u64 > MAX_WORKFLOW_FILE_BYTES {
-        return Err(format!(
-            "source exceeds the {MAX_WORKFLOW_FILE_BYTES}-byte limit"
-        ));
-    }
-    String::from_utf8(bytes).map_err(|error| format!("source is not UTF-8: {error}"))
-}
-
-fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
-    validate_display_field("name", &workflow.name, MAX_WORKFLOW_NAME_BYTES, false)?;
-    validate_display_field(
-        "description",
-        &workflow.description,
-        MAX_WORKFLOW_DESCRIPTION_BYTES,
-        true,
-    )?;
-    if workflow.command.trim().is_empty() {
-        return Err("workflow has empty command".to_string());
-    }
-    if workflow.command.len() > MAX_WORKFLOW_COMMAND_BYTES {
-        return Err(format!(
-            "workflow command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
-        ));
-    }
-    jterm_core::review_input::validate(&workflow.command)
-        .map_err(|error| format!("command is unsafe for review-only insertion: {error}"))?;
-    if jterm_core::review_input::contains_visual_spoofing(&workflow.command) {
-        return Err("workflow command contains an invisible or bidirectional character".into());
-    }
-    if workflow.tags.len() > MAX_WORKFLOW_TAGS {
-        return Err(format!("workflow has more than {MAX_WORKFLOW_TAGS} tags"));
-    }
-    for tag in &workflow.tags {
-        validate_display_field("tag", tag, MAX_WORKFLOW_FIELD_BYTES, false)?;
-    }
-    if let Some(shell) = &workflow.shell {
-        validate_display_field("shell", shell, MAX_WORKFLOW_FIELD_BYTES, false)?;
-    }
-    if workflow.args.len() > MAX_WORKFLOW_ARGS {
-        return Err(format!(
-            "workflow has more than {MAX_WORKFLOW_ARGS} arguments"
-        ));
-    }
-    let mut names = HashSet::new();
-    for argument in &workflow.args {
-        validate_display_field(
-            "argument name",
-            &argument.name,
-            MAX_WORKFLOW_FIELD_BYTES,
-            false,
-        )?;
-        if !names.insert(argument.name.as_str()) {
-            return Err(format!("duplicate workflow argument '{}'", argument.name));
-        }
-        validate_display_field(
-            "argument description",
-            &argument.description,
-            MAX_WORKFLOW_DESCRIPTION_BYTES,
-            true,
-        )?;
-        if let Some(default) = &argument.default {
-            if default.len() > MAX_WORKFLOW_COMMAND_BYTES {
-                return Err(format!(
-                    "default for '{}' exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes",
-                    argument.name
-                ));
-            }
-            if default.chars().any(|ch| {
-                ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch)
-            }) {
-                return Err(format!(
-                    "default for '{}' is unsafe for command insertion",
-                    argument.name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_display_field(
-    label: &str,
-    value: &str,
-    max_bytes: usize,
-    allow_empty: bool,
-) -> Result<(), String> {
-    if !allow_empty && value.trim().is_empty() {
-        return Err(format!("workflow has empty {label}"));
-    }
-    if value.len() > max_bytes {
-        return Err(format!("workflow {label} exceeds {max_bytes} bytes"));
-    }
-    if value
-        .chars()
-        .any(|ch| ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch))
-    {
-        return Err(format!(
-            "workflow {label} contains a control, invisible, or bidirectional character"
-        ));
-    }
-    Ok(())
-}
-
-/// Standard config dir: `<XDG_CONFIG_HOME>/frost/workflows/`, next to frost's
-/// own `config.toml`. Returns `None` when no home/config directory can be
-/// determined; discovery then simply skips the user-authored tier.
-pub(crate) fn user_workflow_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|base| base.join("frost").join("workflows"))
-}
-
-/// System-wide data directories, the `dirs`-crate equivalent of glib's
-/// `system_data_dirs()`: `XDG_DATA_DIRS` with the freedesktop default.
-fn system_data_dirs() -> Vec<PathBuf> {
-    match std::env::var_os("XDG_DATA_DIRS") {
-        Some(value) if !value.is_empty() => std::env::split_paths(&value).collect(),
-        _ => vec![
-            PathBuf::from("/usr/local/share"),
-            PathBuf::from("/usr/share"),
-        ],
-    }
-}
-
-fn installed_asset_dirs(kind: &str) -> Vec<PathBuf> {
-    asset_dirs_from(system_data_dirs(), kind)
-}
-
-fn asset_dirs_from(data_dirs: impl IntoIterator<Item = PathBuf>, kind: &str) -> Vec<PathBuf> {
-    data_dirs
-        .into_iter()
-        .map(|base| base.join("frost").join(kind))
-        .collect()
-}
-
-/// Workflow search path in precedence order. User-authored config wins,
-/// followed by installed examples, then the source-tree examples used during
-/// development. `FROST_WORKFLOW_DIR` may add one or more platform-separated
-/// directories without replacing the standard locations.
-pub(crate) fn workflow_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(user_dir) = user_workflow_dir() {
-        dirs.push(user_dir);
-    }
-    if let Some(extra) = std::env::var_os("FROST_WORKFLOW_DIR") {
-        dirs.extend(std::env::split_paths(&extra));
-    }
-    if let Some(data_dir) = dirs::data_dir() {
-        dirs.push(data_dir.join("frost").join("workflows"));
-    }
-    dirs.extend(installed_asset_dirs("workflows"));
-    dirs.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("workflows"),
-    );
-    let mut unique = Vec::new();
-    let mut seen = HashSet::new();
-    for dir in dirs.into_iter().take(MAX_WORKFLOW_DIRECTORIES) {
-        if seen.insert(dir.clone()) {
-            unique.push(dir);
-        }
-    }
-    unique
-}
-
-/// Substitute both native `{name}` and shared-library `{{name}}` placeholders.
-/// Unknown single-brace placeholders stay visible. Double braces without a
-/// matching binding emit one literal brace pair, mirroring `format!` escapes.
-/// Iteration advances by Unicode scalar value, never by raw UTF-8 byte.
-///
-/// anvil keeps this `pub(crate)`; here its only consumers are the tests below
-/// (every insertion path goes through the validating [`render`]), so it is
-/// compiled for tests only.
+/// Only the picker's own form test builds a workflow argument by hand — every
+/// production path gets them from a file — so the re-export is compiled for
+/// tests, the way this module's `substitute` used to be.
 #[cfg(test)]
-pub(crate) fn substitute(template: &str, bindings: &[(String, String)]) -> Result<String, String> {
-    render_template(template, bindings, &HashSet::new()).map(|(rendered, _)| rendered)
+pub(crate) use jterm_core::workflows::WorkflowArg;
+
+/// The path segment under every XDG base directory, and — derived from it by
+/// [`SearchPathSpec::for_app`] — the `FROST_WORKFLOW_DIR` override variable.
+const APP: &str = "frost";
+
+/// See the module docs: frost lists in directory-precedence order, so
+/// `~/.config/frost/workflows/` heads the picker and can shadow an installed
+/// example by name. Stated here because the core has no default to inherit.
+const LOAD_ORDER: LoadOrder = LoadOrder::Precedence;
+
+/// The source-tree examples, the lowest-precedence tier. `env!` must be
+/// expanded in this crate — see the module docs.
+fn bundled_library() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("workflows")
 }
 
-fn render_template(
-    template: &str,
-    bindings: &[(String, String)],
-    missing_bindings: &HashSet<String>,
-) -> Result<(String, Vec<String>), String> {
-    if template.len() > MAX_WORKFLOW_COMMAND_BYTES {
-        return Err(format!(
-            "workflow command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
-        ));
-    }
-    let mut out = String::with_capacity(template.len().min(MAX_WORKFLOW_COMMAND_BYTES));
-    let bytes = template.as_bytes();
-    let mut missing = Vec::new();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                if let Some(end) = find_close(bytes, i + 2) {
-                    let name = template[i + 2..end].trim();
-                    if let Some((_, value)) = bindings.iter().find(|(key, _)| key == name) {
-                        push_rendered(&mut out, value)?;
-                        i = end + 2;
-                        continue;
-                    }
-                    if missing_bindings.contains(name) {
-                        if !missing.iter().any(|entry| entry == name) {
-                            missing.push(name.to_owned());
-                        }
-                        i = end + 2;
-                        continue;
-                    }
-                    // No binding means `{{...}}` is a literal-brace escape.
-                    push_rendered(&mut out, "{")?;
-                    i += 2;
-                    continue;
-                }
-                // Preserve an unterminated pair exactly as authored.
-                push_rendered(&mut out, "{")?;
-                i += 1;
-                continue;
-            }
-
-            if let Some(end_relative) = bytes[i + 1..].iter().position(|byte| *byte == b'}') {
-                let end = i + 1 + end_relative;
-                let name = template[i + 1..end].trim();
-                if let Some((_, value)) = bindings.iter().find(|(key, _)| key == name) {
-                    push_rendered(&mut out, value)?;
-                } else if missing_bindings.contains(name) {
-                    if !missing.iter().any(|entry| entry == name) {
-                        missing.push(name.to_owned());
-                    }
-                } else {
-                    push_rendered(&mut out, &template[i..=end])?;
-                }
-                i = end + 1;
-                continue;
-            }
-        } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            push_rendered(&mut out, "}")?;
-            i += 2;
-            continue;
-        }
-
-        let character = template[i..]
-            .chars()
-            .next()
-            .expect("i always points to a UTF-8 boundary");
-        let mut encoded = [0_u8; 4];
-        push_rendered(&mut out, character.encode_utf8(&mut encoded))?;
-        i += character.len_utf8();
-    }
-
-    Ok((out, missing))
+/// frost's half of the search path: the app segment, the override variable it
+/// implies, and where this checkout keeps its examples.
+fn search_path_spec() -> SearchPathSpec {
+    SearchPathSpec::for_app(APP, Some(bundled_library()))
 }
 
-fn push_rendered(output: &mut String, addition: &str) -> Result<(), String> {
-    if output.len().saturating_add(addition.len()) > MAX_WORKFLOW_COMMAND_BYTES {
-        return Err(format!(
-            "rendered command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
-        ));
-    }
-    output.push_str(addition);
-    Ok(())
+/// Workflow search path in precedence order: `~/.config/frost/workflows/`,
+/// `$FROST_WORKFLOW_DIR`, the XDG data directories, then the bundled examples.
+pub(crate) fn workflow_dirs() -> Vec<PathBuf> {
+    search_path(&search_path_spec(), &XdgEnvDirs)
 }
 
-/// Render a workflow using caller values and declared defaults. Missing
-/// declared placeholders are reported, and the final command crosses the same
-/// review-input safety boundary as history/AI/file insertions.
-pub(crate) fn render(
-    workflow: &Workflow,
-    values: &HashMap<String, String>,
-) -> Result<String, String> {
-    validate_workflow(workflow)?;
-    if values.len() > MAX_WORKFLOW_ARGS {
-        return Err(format!(
-            "workflow received more than {MAX_WORKFLOW_ARGS} values"
-        ));
-    }
-    for (name, value) in values {
-        validate_display_field("value name", name, MAX_WORKFLOW_FIELD_BYTES, false)?;
-        if value.len() > MAX_WORKFLOW_COMMAND_BYTES {
-            return Err(format!(
-                "value for '{name}' exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
-            ));
-        }
-        if value
-            .chars()
-            .any(|ch| ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch))
-        {
-            return Err(format!(
-                "value for '{name}' is unsafe for review-only insertion"
-            ));
-        }
-    }
-    let mut bindings: Vec<(String, String)> = values
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    let mut missing_bindings = HashSet::new();
-    for argument in &workflow.args {
-        if values.contains_key(&argument.name) {
-            continue;
-        }
-        if let Some(default) = &argument.default {
-            bindings.push((argument.name.clone(), default.clone()));
-        } else {
-            missing_bindings.insert(argument.name.clone());
-        }
-    }
-
-    let (out, missing) = render_template(&workflow.command, &bindings, &missing_bindings)?;
-    if !missing.is_empty() {
-        return Err(format!("missing values: {}", missing.join(", ")));
-    }
-    jterm_core::review_input::validate(&out)
-        .map_err(|error| format!("command is unsafe for review-only insertion: {error}"))?;
-    Ok(out)
-}
-
-fn find_close(bytes: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'}' && bytes[i + 1] == b'}' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+/// Load a library over an explicit search path — normally [`workflow_dirs`],
+/// and an explicit directory from the picker's test seam.
+///
+/// This is the one site that names [`LOAD_ORDER`], which is why every caller
+/// goes through it rather than through `jterm_core::workflows::load_all`: the
+/// core has no default order to fall back on, and frost should have exactly
+/// one place where its answer can be read or changed.
+pub(crate) fn load_library_from(dirs: &[PathBuf]) -> Vec<Workflow> {
+    jterm_core::workflows::load_all(dirs, LOAD_ORDER)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn wf(name: &str, command: &str, args: &[(&str, Option<&str>)]) -> Workflow {
-        Workflow {
-            name: name.to_string(),
-            description: String::new(),
-            command: command.to_string(),
-            tags: Vec::new(),
-            shell: None,
-            args: args
+    /// Every policy value frost states. The engine's own behaviour is tested
+    /// in `jterm_core::workflows`; what can only be wrong *here* is which
+    /// directories this app reads and in what order, and none of it has a
+    /// default that would let the shim stay silent and still compile.
+    #[test]
+    fn frost_pins_its_search_path_and_its_load_order() {
+        let spec = search_path_spec();
+        assert_eq!(spec.app(), APP);
+        // Derived, not spelled twice: an app cannot look under one name while
+        // honouring another's override.
+        assert_eq!(spec.env_var(), "FROST_WORKFLOW_DIR");
+        assert_eq!(spec.dev_root(), Some(bundled_library().as_path()));
+        assert_eq!(LOAD_ORDER, LoadOrder::Precedence);
+
+        let dirs = workflow_dirs();
+        assert!(dirs.iter().all(|dir| dir.is_absolute()));
+        assert!(dirs.contains(&bundled_library()));
+        // The dev tree is the lowest-precedence tier, and every other tier —
+        // user config, user data, and *each* system data directory — carries
+        // frost's own segment. Conditional because a developer's own
+        // $FROST_WORKFLOW_DIR is kept verbatim and may sit anywhere.
+        if std::env::var_os("FROST_WORKFLOW_DIR").is_none() {
+            assert_eq!(dirs.last(), Some(&bundled_library()));
+            let suffix = PathBuf::from(APP).join("workflows");
+            assert!(dirs
                 .iter()
-                .map(|(n, d)| WorkflowArg {
-                    name: n.to_string(),
-                    description: String::new(),
-                    default: d.map(|s| s.to_string()),
-                })
-                .collect(),
-            source_path: None,
+                .all(|dir| *dir == bundled_library() || dir.ends_with(&suffix)));
+            assert!(dirs.len() >= 3, "config, data and system tiers: {dirs:?}");
         }
     }
 
+    /// [`LOAD_ORDER`] is a choice, not a formality: the same two directories
+    /// come back in a different order under `LoadOrder::ByName` (ember's and
+    /// forge's pick), so this fails if the shim ever stops naming one.
     #[test]
-    fn render_substitutes_single_placeholder() {
-        let w = wf("t", "git rebase -i {{target}}", &[("target", None)]);
-        let mut v = HashMap::new();
-        v.insert("target".to_string(), "origin/main".to_string());
-        assert_eq!(render(&w, &v).unwrap(), "git rebase -i origin/main");
-    }
-
-    #[test]
-    fn render_uses_declared_default_when_value_missing() {
-        let w = wf(
-            "t",
-            "echo {{greeting}} {{name}}",
-            &[("greeting", Some("hi")), ("name", Some("world"))],
-        );
-        let v = HashMap::new();
-        assert_eq!(render(&w, &v).unwrap(), "echo hi world");
-    }
-
-    #[test]
-    fn render_reports_missing_placeholder() {
-        let w = wf("t", "kill -9 {{pid}}", &[("pid", None)]);
-        let v = HashMap::new();
-        let err = render(&w, &v).unwrap_err();
-        assert!(err.contains("pid"), "got {err}");
-    }
-
-    #[test]
-    fn render_leaves_unterminated_braces_alone() {
-        let w = wf("t", "echo {{not_closed", &[]);
-        let v = HashMap::new();
-        // Without a closing `}}` we treat the rest as literal text rather than
-        // erroring — keeps the failure mode predictable.
-        assert_eq!(render(&w, &v).unwrap(), "echo {{not_closed");
-    }
-
-    #[test]
-    fn render_handles_multiple_occurrences_of_same_arg() {
-        let w = wf("t", "cp {{f}} {{f}}.bak", &[("f", None)]);
-        let mut v = HashMap::new();
-        v.insert("f".to_string(), "config.toml".to_string());
-        assert_eq!(render(&w, &v).unwrap(), "cp config.toml config.toml.bak");
-    }
-
-    #[test]
-    fn render_supports_unicode_both_placeholder_styles_and_literal_braces() {
-        let w = wf(
-            "发布",
-            "发布 {服务} 到 {{环境}}，保留 {{a,b}} 🚀",
-            &[("服务", None), ("环境", None)],
-        );
-        let values = HashMap::from([
-            ("服务".to_string(), "接口".to_string()),
-            ("环境".to_string(), "生产".to_string()),
-        ]);
-        assert_eq!(
-            render(&w, &values).unwrap(),
-            "发布 接口 到 生产，保留 {a,b} 🚀"
-        );
-        assert_eq!(
-            substitute(
-                "你好 {name} / {{name}} / {{x,y}}",
-                &[("name".into(), "世界".into())]
-            )
-            .unwrap(),
-            "你好 世界 / 世界 / {x,y}"
-        );
-    }
-
-    #[test]
-    fn render_rejects_control_characters_introduced_by_values() {
-        let w = wf("unsafe", "echo {value}", &[("value", None)]);
-        let values = HashMap::from([("value".to_string(), "ok\nrm -rf /".to_string())]);
-        assert!(render(&w, &values)
-            .unwrap_err()
-            .contains("unsafe for review-only insertion"));
-    }
-
-    #[test]
-    fn load_all_skips_invalid_files_but_returns_good_ones() {
-        let dir = tempdir();
-        std::fs::write(dir.join("a.yaml"), "name: A\ncommand: echo a\n").unwrap();
-        std::fs::write(dir.join("b.yaml"), "this: is not a workflow\n").unwrap();
-        std::fs::write(dir.join("c.yaml"), "name: C\ncommand: echo c\n").unwrap();
-        let loaded = load_all(std::slice::from_ref(&dir));
-        let names: Vec<&str> = loaded.iter().map(|w| w.name.as_str()).collect();
-        assert_eq!(names, vec!["A", "C"], "names actually {:?}", names);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn load_one_rejects_empty_command() {
-        let dir = tempdir();
-        let p = dir.join("bad.yaml");
-        std::fs::write(&p, "name: X\ncommand: \"\"\n").unwrap();
-        let err = load_one(&p).unwrap_err();
-        assert!(err.contains("empty command"), "got {err}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn loads_toml_and_preserves_metadata() {
-        let dir = tempdir();
-        let path = dir.join("deploy.toml");
-        std::fs::write(
-            &path,
-            r#"name = "部署"
-description = "发布服务"
-command = "deploy {service}"
-tags = ["ops", "中文"]
-shell = "fish"
-
-[[args]]
-name = "service"
-description = "服务名"
-default = "api"
-"#,
-        )
-        .unwrap();
-        let workflow = load_one(&path).unwrap();
-        assert_eq!(workflow.name, "部署");
-        assert_eq!(workflow.tags, ["ops", "中文"]);
-        assert_eq!(workflow.shell.as_deref(), Some("fish"));
-        assert_eq!(workflow.args[0].default.as_deref(), Some("api"));
-        assert_eq!(workflow.source_path.as_deref(), Some(path.as_path()));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn earlier_directory_wins_when_names_collide_across_formats() {
+    fn precedence_order_keeps_the_users_directory_first() {
         let user = tempdir();
         let installed = tempdir();
+        std::fs::write(user.join("z.yaml"), "name: Zulu\ncommand: echo user\n").unwrap();
         std::fs::write(
-            user.join("override.toml"),
-            "name = 'Same'\ncommand = 'echo user'\n",
-        )
-        .unwrap();
-        std::fs::write(
-            installed.join("same.yaml"),
-            "name: Same\ncommand: echo installed\n",
-        )
-        .unwrap();
-        std::fs::write(
-            installed.join("other.yml"),
-            "name: Other\ncommand: echo other\n",
+            installed.join("a.yaml"),
+            "name: Alpha\ncommand: echo installed\n",
         )
         .unwrap();
 
-        let loaded = load_all(&[user.clone(), installed.clone()]);
-        assert_eq!(loaded.iter().filter(|wf| wf.name == "Same").count(), 1);
+        let names: Vec<String> = load_library_from(&[user.clone(), installed.clone()])
+            .into_iter()
+            .map(|workflow| workflow.name)
+            .collect();
         assert_eq!(
-            loaded.iter().find(|wf| wf.name == "Same").unwrap().command,
-            "echo user"
+            names,
+            ["Zulu", "Alpha"],
+            "precedence order, not alphabetical"
         );
-        assert!(loaded.iter().any(|wf| wf.name == "Other"));
+
         let _ = std::fs::remove_dir_all(user);
         let _ = std::fs::remove_dir_all(installed);
     }
 
-    #[test]
-    fn load_one_rejects_control_character_commands() {
-        let dir = tempdir();
-        let path = dir.join("unsafe.yaml");
-        std::fs::write(&path, "name: Unsafe\ncommand: \"echo\\tsecret\"\n").unwrap();
-        assert!(load_one(&path)
-            .unwrap_err()
-            .contains("unsafe for review-only insertion"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn workflow_files_and_rendered_commands_are_strictly_bounded() {
-        let dir = tempdir();
-        let path = dir.join("oversized.yaml");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(MAX_WORKFLOW_FILE_BYTES + 1).unwrap();
-        assert!(load_one(&path).unwrap_err().contains("byte limit"));
-
-        let repeated = "{{value}}".repeat(4_000);
-        let workflow = wf("bounded", &repeated, &[("value", None)]);
-        let values = HashMap::from([("value".to_string(), "x".repeat(MAX_WORKFLOW_COMMAND_BYTES))]);
-        assert!(render(&workflow, &values)
-            .unwrap_err()
-            .contains("rendered command exceeds"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workflow_fifo_is_rejected_without_blocking() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let dir = tempdir();
-        let path = dir.join("blocked.yaml");
-        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: path_c is a live NUL-terminated pathname for this call.
-        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
-        let started = std::time::Instant::now();
-        assert!(load_one(&path).unwrap_err().contains("not a regular file"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workflow_symlink_is_rejected_at_open() {
-        // forge's reader guard: O_NOFOLLOW keeps a symlinked workflow from
-        // smuggling in a target outside the search path.
-        let dir = tempdir();
-        let target = dir.join("target.txt");
-        std::fs::write(&target, "name: Linked\ncommand: echo unsafe\n").unwrap();
-        let link = dir.join("linked.yaml");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(load_one(&link).is_err());
-        assert!(load_all(std::slice::from_ref(&dir)).is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn workflow_metadata_rejects_duplicates_and_visual_spoofing() {
-        let mut duplicate = wf("duplicate", "echo ok", &[("x", None), ("x", Some("ok"))]);
-        assert!(validate_workflow(&duplicate)
-            .unwrap_err()
-            .contains("duplicate workflow argument"));
-
-        duplicate.args.truncate(1);
-        duplicate.name = "safe\u{202e}txt".into();
-        assert!(validate_workflow(&duplicate)
-            .unwrap_err()
-            .contains("bidirectional"));
-        duplicate.name = "safe".into();
-        duplicate.command = "echo safe\u{200b}hidden".into();
-        assert!(validate_workflow(&duplicate)
-            .unwrap_err()
-            .contains("bidirectional"));
-        duplicate.command = "echo safe\u{e0020}hidden".into();
-        assert!(validate_workflow(&duplicate)
-            .unwrap_err()
-            .contains("bidirectional"));
-    }
-
-    #[test]
-    fn installed_assets_follow_every_system_data_directory() {
-        assert_eq!(
-            asset_dirs_from(
-                [PathBuf::from("/usr/share"), PathBuf::from("/app/share")],
-                "workflows"
-            ),
-            [
-                PathBuf::from("/usr/share/frost/workflows"),
-                PathBuf::from("/app/share/frost/workflows")
-            ]
-        );
-    }
-
+    /// The bundled-library contract, kept from forge: every example frost
+    /// ships must still parse and stay review-only, so an edit to
+    /// `scripts/workflows/` that the validator rejects breaks the build rather
+    /// than quietly shrinking the picker. The candidate list comes from the
+    /// loader's own predicate — re-deriving `toml|yaml|yml` here is exactly
+    /// the drift that put a second, unbounded directory walk in anvil.
     #[test]
     fn every_bundled_workflow_is_parseable_and_review_only() {
-        // forge's bundled-library contract: the source-tree examples must all
-        // load, and every command must pass the review-only boundary.
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("workflows");
-        let candidate_count = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        matches!(
-                            extension.to_ascii_lowercase().as_str(),
-                            "toml" | "yaml" | "yml"
-                        )
-                    })
-            })
-            .count();
-        let workflows = load_all(std::slice::from_ref(&dir));
-        assert_eq!(workflows.len(), candidate_count);
+        let dir = bundled_library();
+        let candidates = jterm_core::workflows::workflow_files_in(&dir);
+        let workflows = load_library_from(std::slice::from_ref(&dir));
+        assert_eq!(workflows.len(), candidates.len());
         assert!(workflows.len() >= 6);
         assert!(workflows
             .iter()
@@ -812,8 +195,8 @@ default = "api"
     }
 
     fn tempdir() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
+        let mut path = std::env::temp_dir();
+        path.push(format!(
             "frost-workflows-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -821,7 +204,7 @@ default = "api"
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }
