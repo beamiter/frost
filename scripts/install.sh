@@ -481,16 +481,34 @@ for source in "${WORKFLOW_SOURCES[@]}"; do
     require_source_file "${source}"
 done
 
-validate_staging_target "${DESTDIR}${BIN_DIR}"
-validate_staging_target "${DESTDIR}${PREFIX}/share"
-validate_staging_target "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
+STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
+SHARE_DIR="${DESTDIR}${PREFIX}/share"
+WORKFLOW_DIR="${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
+INSTALL_DIRECTORIES=(
+    "${STAGED_BIN_DIR}"
+    "${WORKFLOW_DIR}"
+)
 if ((INSTALL_DESKTOP == 1)); then
     require_source_file "${REPO_ROOT}/data/${APP_ID}.desktop"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.metainfo.xml"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.svg"
     require_source_file "${REPO_ROOT}/data/${APP_ID}-128.png"
     require_source_file "${REPO_ROOT}/data/${APP_ID}-256.png"
+    INSTALL_DIRECTORIES+=(
+        "${SHARE_DIR}/applications"
+        "${SHARE_DIR}/metainfo"
+        "${SHARE_DIR}/icons/hicolor/scalable/apps"
+        "${SHARE_DIR}/icons/hicolor/128x128/apps"
+        "${SHARE_DIR}/icons/hicolor/256x256/apps"
+    )
 fi
+
+# Validate every destination branch before replacing the binary. Checking only
+# PREFIX/share misses a later applications/metainfo/icon ancestor symlink and
+# can otherwise leave a partially upgraded package or write outside DESTDIR.
+for directory in "${INSTALL_DIRECTORIES[@]}"; do
+    validate_staging_target "${directory}"
+done
 
 require_command install
 require_command mktemp
@@ -526,15 +544,12 @@ else
     fi
 fi
 
-STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
 install_binary_atomic "${BINARY}" "${STAGED_BIN_DIR}/frost"
 if [[ -n "${PREBUILT_FD}" ]]; then
     exec {PREBUILT_FD}<&-
 fi
 
-SHARE_DIR="${DESTDIR}${PREFIX}/share"
-WORKFLOW_DIR="${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
 for source in "${WORKFLOW_SOURCES[@]}"; do
     install_file_atomic 0644 "${source}" "${WORKFLOW_DIR}/${source##*/}"
 done

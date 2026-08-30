@@ -403,6 +403,33 @@ assert_absent "binary after workflow preflight failure" "${workflow_link_binary}
 [[ -z "$(find "${workflow_link_victim}" -mindepth 1 -print -quit)" ]] \
     || fail "workflow install escaped through a nested symlink"
 
+# Desktop resources fan out below share. A symlink in the last icon branch
+# must reject the complete plan before the binary or any earlier resource is
+# replaced, rather than being discovered after a partial upgrade.
+late_resource_stage="${TEST_ROOT}/late-resource-stage"
+late_resource_prefix="/opt/frost-late-resource"
+late_resource_victim="${TEST_ROOT}/late-resource-victim"
+late_resource_binary="${late_resource_stage}${late_resource_prefix}/bin/frost"
+late_resource_apps="${late_resource_stage}${late_resource_prefix}/share/icons/hicolor/256x256/apps"
+mkdir -p "${late_resource_binary%/*}" "${late_resource_apps%/*}" \
+    "${late_resource_victim}"
+printf 'old frost before late resource rejection\n' >"${late_resource_binary}"
+ln -s -- "${late_resource_victim}" "${late_resource_apps}"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" \
+    DESTDIR="${late_resource_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${late_resource_prefix}" \
+    >"${TEST_ROOT}/late-resource.log" 2>&1; then
+    fail "installer followed a late desktop-resource ancestor symlink"
+fi
+assert_contains "late resource ancestor diagnostic" \
+    "$(<"${TEST_ROOT}/late-resource.log")" \
+    "staged install path contains a symbolic-link ancestor"
+[[ "$(<"${late_resource_binary}")" == \
+    'old frost before late resource rejection' ]] \
+    || fail "late resource preflight replaced the existing binary"
+[[ -z "$(find "${late_resource_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "late resource preflight wrote outside DESTDIR"
+
 resource_stage="${TEST_ROOT}/resource-stage"
 resource_prefix="/opt/frost-resource"
 resource_victim="${TEST_ROOT}/resource-victim"

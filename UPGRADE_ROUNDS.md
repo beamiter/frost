@@ -386,3 +386,10 @@ Round 70 closes the remaining argument-form affordance gap:
     `XDG_CONFIG_HOME` overrides `HOME/.config`. Its final preservation path is
     shell-quoted, so spaces remain unambiguous and an environment-provided
     newline or terminal control byte cannot forge another uninstall message.
+
+82. **Whole-plan staged install destinations** — before the executable is
+    replaced, the installer now walks the complete binary, workflow,
+    applications, metainfo, and per-size icon directory chains under a
+    non-root `DESTDIR`. A regression puts the symlink only in the final 256px
+    icon branch and proves both the old binary and the outside directory remain
+    byte-for-byte untouched when the entire upgrade is rejected.
