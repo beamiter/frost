@@ -331,3 +331,8 @@ Round 70 closes the remaining argument-form affordance gap:
     `(required)` label, so a future renderer-rule change cannot leave the UI
     claiming the opposite. The existing default/empty/whitespace/reset matrix
     now tests the delegated result.
+
+74. **Strict documentation gate** — CI now builds all frost documentation with
+    warnings denied, matching forge's release boundary. The local verification
+    list and handoff say the same thing, and the former redundant intra-doc-link
+    exception is retired instead of remaining stale institutional knowledge.

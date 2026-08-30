@@ -949,13 +949,9 @@ in `main.rs` — Enter/Escape/arrows and the click dispatch. Nothing in that is
 shared-format policy, so it is not obviously a candidate for the core; it is
 recorded because a reader comparing the four apps will find four copies of it.
 
-The pre-existing rustdoc failure in `src/ai_chat_store.rs` is untouched:
-`RUSTDOCFLAGS="-D warnings" cargo doc` still fails on a redundant explicit
-intra-doc link — the label already resolves, so the explicit
-`(jterm_core::ai::BusyChatPolicy)` target is redundant — left by the previous
-round. rustdoc is not in the release checks below and the file is
-not on this round's surface. Both files this round rewrote produce zero rustdoc
-warnings.
+The former redundant `BusyChatPolicy` intra-doc target in
+`src/ai_chat_store.rs` is gone. Strict rustdoc is now a first-class local and CI
+release gate rather than a recorded exception.
 
 Three things the correction migration did not do, none of them papered over.
 
@@ -1006,6 +1002,7 @@ only under the `ai_share_command_context` consent.
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 bash scripts/test-install-paths.sh
