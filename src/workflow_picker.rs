@@ -158,6 +158,15 @@ impl WorkflowArgsState {
 
     pub(crate) fn set_value(&mut self, index: usize, value: String) {
         self.form.set(index, value);
+        self.feedback = None;
+    }
+
+    /// Return one row to the value declared by the workflow. For an argument
+    /// without a default this restores the genuinely-unset state; assigning an
+    /// empty string cannot express that distinction.
+    pub(crate) fn reset_value(&mut self, index: usize) {
+        self.form.clear(index);
+        self.feedback = None;
     }
 
     /// 用当前值渲染模板。未填写的参数不会被当作空串提交，因此这里的
@@ -316,6 +325,16 @@ mod tests {
         form.set_value(1, "staging".to_string());
         assert!(!form.is_missing(1));
         assert_eq!(form.render().unwrap(), "deploy api --env=staging");
+
+        // Reset is not the same operation as typing an empty string: the first
+        // row returns to its declared default and the second returns to unset.
+        form.set_value(0, "worker".to_string());
+        form.reset_value(0);
+        assert_eq!(form.value(0), "api");
+        form.reset_value(1);
+        assert!(form.is_missing(1));
+        assert!(form.render().unwrap_err().contains("missing values: env"));
+        form.set_value(1, "staging".to_string());
 
         // 清空一个声明了默认值的参数仍然是显式的空值：文件说过空值在这里有
         // 意义，它就不会回退到默认值，也不算缺值。

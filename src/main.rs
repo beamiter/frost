@@ -3354,6 +3354,8 @@ enum Message {
     WorkflowPickerAccept(usize),
     /// Edit of one argument value in the workflow form (args index, new text).
     WorkflowArgInput(usize, String),
+    /// Restore an argument to its declared default, or to genuinely unset.
+    WorkflowArgReset(usize),
     /// Render the workflow form's current values and insert for review.
     WorkflowArgSubmit,
     /// Query text changed in the block search picker.
@@ -15189,6 +15191,13 @@ impl Frost {
                     form.set_value(index, value);
                 }
             }
+            Message::WorkflowArgReset(index) => {
+                if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    form.reset_value(index);
+                }
+            }
             Message::WorkflowArgSubmit => return self.submit_workflow_args(),
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
@@ -16695,8 +16704,16 @@ impl Frost {
             if form.is_missing(index) {
                 label = format!("{label} (required)");
             }
+            let field = row![
+                input,
+                button(text("Reset").size(11))
+                    .style(button::secondary)
+                    .on_press(Message::WorkflowArgReset(index)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
             card =
-                card.push(column![text(label).size(11).style(text::secondary), input,].spacing(2));
+                card.push(column![text(label).size(11).style(text::secondary), field,].spacing(2));
         }
 
         if let Some(feedback) = form.feedback.as_deref() {

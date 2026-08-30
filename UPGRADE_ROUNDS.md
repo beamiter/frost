@@ -298,3 +298,12 @@ previously asserted that `deploy api --env=` renders fine and called that
 emptiness intentional, which was the fossil record of round 60's defect rather
 than behaviour to preserve. The install-path and packaging checks were not
 rerun; this round touched no script, desktop file or metadata.
+
+Round 70 closes the remaining argument-form affordance gap:
+
+70. **Reversible workflow arguments** — every parameter row exposes **Reset**,
+    which calls the shared `ArgsForm::clear` contract: a defaulted argument
+    returns to its declared value, while an undefaulted argument returns to the
+    genuinely-unset state. Editing or resetting also clears stale render
+    feedback, and the form regression proves reset is not equivalent to typing
+    an empty string.
