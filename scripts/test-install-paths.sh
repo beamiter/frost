@@ -769,6 +769,180 @@ assert_regular_file "desktop entry after legacy cleanup warning" \
     \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
     || fail "legacy cleanup warning left a temporary or backup"
 
+# Bind the applications directory before the publish commit. If the legacy-rm
+# helper replaces that directory afterwards, unlink stays in the displaced
+# inode and cannot remove an identically named launcher behind the new symlink.
+install_legacy_bound_tools="${TEST_ROOT}/install-legacy-bound-tools"
+install_legacy_bound_stage="${TEST_ROOT}/install-legacy-bound-stage"
+install_legacy_bound_prefix="/opt/frost-install-legacy-bound"
+install_legacy_bound_app_dir="${install_legacy_bound_stage}${install_legacy_bound_prefix}/share/applications"
+install_legacy_bound_entry="${install_legacy_bound_app_dir}/io.github.beamiter.jterm3.desktop"
+install_legacy_bound_displaced="${TEST_ROOT}/install-legacy-bound-original-applications"
+install_legacy_bound_victim="${TEST_ROOT}/install-legacy-bound-victim"
+install_legacy_bound_arg_log="${TEST_ROOT}/install-legacy-bound-rm-argument"
+mkdir -p "${install_legacy_bound_tools}" "${install_legacy_bound_app_dir}" \
+    "${install_legacy_bound_victim}"
+printf 'legacy launcher removed through bound parent\n' \
+    >"${install_legacy_bound_entry}"
+printf 'outside legacy launcher sentinel\n' \
+    >"${install_legacy_bound_victim}/io.github.beamiter.jterm3.desktop"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'printf "%s\n" "${last}" >"${FROST_TEST_INSTALL_LEGACY_BOUND_ARG_LOG:?}"' \
+    '/usr/bin/mv "${FROST_TEST_INSTALL_LEGACY_BOUND_APP_DIR:?}" "${FROST_TEST_INSTALL_LEGACY_BOUND_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_LEGACY_BOUND_VICTIM:?}" "${FROST_TEST_INSTALL_LEGACY_BOUND_APP_DIR}"' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_legacy_bound_tools}/rm"
+chmod 0755 "${install_legacy_bound_tools}/rm"
+install_legacy_bound_output="$(
+    env HOME="${TEST_HOME}" \
+        PATH="${install_legacy_bound_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_LEGACY_BOUND_ARG_LOG="${install_legacy_bound_arg_log}" \
+        FROST_TEST_INSTALL_LEGACY_BOUND_APP_DIR="${install_legacy_bound_app_dir}" \
+        FROST_TEST_INSTALL_LEGACY_BOUND_DISPLACED="${install_legacy_bound_displaced}" \
+        FROST_TEST_INSTALL_LEGACY_BOUND_VICTIM="${install_legacy_bound_victim}" \
+        DESTDIR="${install_legacy_bound_stage}" "${INSTALLER}" \
+        --binary "${prebuilt_binary}" --prefix "${install_legacy_bound_prefix}" 2>&1
+)"
+[[ -L "${install_legacy_bound_app_dir}" ]] \
+    || fail "install legacy cleanup did not replace its parent"
+assert_absent "legacy launcher in displaced applications directory" \
+    "${install_legacy_bound_displaced}/io.github.beamiter.jterm3.desktop"
+assert_regular_file "new launcher in displaced applications directory" \
+    "${install_legacy_bound_displaced}/${app_id}.desktop"
+[[ "$(<"${install_legacy_bound_victim}/io.github.beamiter.jterm3.desktop")" == \
+    'outside legacy launcher sentinel' ]] \
+    || fail "bound install legacy cleanup touched the replacement referent"
+[[ "$(<"${install_legacy_bound_arg_log}")" == \
+    /proc/self/fd/*/io.github.beamiter.jterm3.desktop ]] \
+    || fail "install legacy cleanup did not receive a directory-fd path"
+assert_contains "bound install legacy parent warning" \
+    "${install_legacy_bound_output}" \
+    "applications directory changed during bound legacy cleanup (non-fatal): ${install_legacy_bound_app_dir}"
+assert_before "bound install legacy diagnostic priority" \
+    "${install_legacy_bound_output}" \
+    "applications directory changed during bound legacy cleanup" \
+    "Installed frost to ${install_legacy_bound_prefix}/bin/frost"
+
+# Cache helpers use the same pre-opened applications fd as desktop validation,
+# plus one bounded icon fd. Replacing either logical directory inside a helper
+# cannot redirect its writes; failures remain optional and precede success.
+install_cache_bound_tools="${TEST_ROOT}/install-cache-bound-tools"
+install_cache_bound_prefix="${TEST_ROOT}/install-cache-bound-prefix"
+install_cache_bound_app_dir="${install_cache_bound_prefix}/share/applications"
+install_cache_bound_icon_dir="${install_cache_bound_prefix}/share/icons/hicolor"
+install_cache_bound_app_displaced="${TEST_ROOT}/install-cache-bound-original-applications"
+install_cache_bound_icon_displaced="${TEST_ROOT}/install-cache-bound-original-hicolor"
+install_cache_bound_app_victim="${TEST_ROOT}/install-cache-bound-app-victim"
+install_cache_bound_icon_victim="${TEST_ROOT}/install-cache-bound-icon-victim"
+install_cache_bound_validate_log="${TEST_ROOT}/install-cache-bound-validate-argument"
+install_cache_bound_update_log="${TEST_ROOT}/install-cache-bound-update-argument"
+install_cache_bound_icon_log="${TEST_ROOT}/install-cache-bound-icon-argument"
+install_cache_bound_prebuilt_leak="${TEST_ROOT}/install-cache-bound-prebuilt-fd-leaked"
+mkdir -p "${install_cache_bound_tools}" "${install_cache_bound_app_victim}" \
+    "${install_cache_bound_icon_victim}"
+printf 'outside install applications sentinel\n' \
+    >"${install_cache_bound_app_victim}/sentinel"
+printf 'outside install icon sentinel\n' \
+    >"${install_cache_bound_icon_victim}/sentinel"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'printf "%s\n" "${1}" >"${FROST_TEST_INSTALL_CACHE_BOUND_VALIDATE_LOG:?}"' \
+    'for candidate in /proc/self/fd/*; do' \
+    '    [ "$(/usr/bin/readlink -- "${candidate}" 2>/dev/null || :)" != "${FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT:?}" ] || : >"${FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT_LEAK:?}"' \
+    'done' \
+    '[ -f "${1}" ]' \
+    >"${install_cache_bound_tools}/desktop-file-validate"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'printf "%s\n" "${1}" >"${FROST_TEST_INSTALL_CACHE_BOUND_UPDATE_LOG:?}"' \
+    '/usr/bin/mv "${FROST_TEST_INSTALL_CACHE_BOUND_APP_DIR:?}" "${FROST_TEST_INSTALL_CACHE_BOUND_APP_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_CACHE_BOUND_APP_VICTIM:?}" "${FROST_TEST_INSTALL_CACHE_BOUND_APP_DIR}"' \
+    ': >"${1}/desktop-cache-bound-marker"' \
+    'exit 94' \
+    >"${install_cache_bound_tools}/update-desktop-database"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'bound=' \
+    'for argument do bound=${argument}; done' \
+    'printf "%s\n" "${bound}" >"${FROST_TEST_INSTALL_CACHE_BOUND_ICON_LOG:?}"' \
+    '/usr/bin/mv "${FROST_TEST_INSTALL_CACHE_BOUND_ICON_DIR:?}" "${FROST_TEST_INSTALL_CACHE_BOUND_ICON_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_CACHE_BOUND_ICON_VICTIM:?}" "${FROST_TEST_INSTALL_CACHE_BOUND_ICON_DIR}"' \
+    ': >"${bound}/icon-cache-bound-marker"' \
+    'exit 95' \
+    >"${install_cache_bound_tools}/gtk-update-icon-cache"
+chmod 0755 "${install_cache_bound_tools}/desktop-file-validate" \
+    "${install_cache_bound_tools}/update-desktop-database" \
+    "${install_cache_bound_tools}/gtk-update-icon-cache"
+install_cache_bound_output="$(
+    env HOME="${TEST_HOME}" PATH="${install_cache_bound_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_VALIDATE_LOG="${install_cache_bound_validate_log}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_UPDATE_LOG="${install_cache_bound_update_log}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_ICON_LOG="${install_cache_bound_icon_log}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT="${prebuilt_binary}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT_LEAK="${install_cache_bound_prebuilt_leak}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_APP_DIR="${install_cache_bound_app_dir}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_APP_DISPLACED="${install_cache_bound_app_displaced}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_APP_VICTIM="${install_cache_bound_app_victim}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_ICON_DIR="${install_cache_bound_icon_dir}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_ICON_DISPLACED="${install_cache_bound_icon_displaced}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_ICON_VICTIM="${install_cache_bound_icon_victim}" \
+        DESTDIR= "${INSTALLER}" --binary "${prebuilt_binary}" \
+        --prefix "${install_cache_bound_prefix}" 2>&1
+)"
+install_cache_bound_validate_arg="$(<"${install_cache_bound_validate_log}")"
+install_cache_bound_update_arg="$(<"${install_cache_bound_update_log}")"
+install_cache_bound_icon_arg="$(<"${install_cache_bound_icon_log}")"
+assert_absent "prebuilt fd before post-install helpers" \
+    "${install_cache_bound_prebuilt_leak}"
+[[ "${install_cache_bound_validate_arg%/*}" == \
+    "${install_cache_bound_update_arg}" ]] \
+    || fail "install desktop helpers did not reuse one applications fd"
+[[ "${install_cache_bound_update_arg}" == /proc/self/fd/* ]] \
+    || fail "install desktop cache helper did not receive a directory-fd path"
+[[ "${install_cache_bound_icon_arg}" == /proc/self/fd/* ]] \
+    || fail "install icon cache helper did not receive a directory-fd path"
+[[ -f "${install_cache_bound_app_displaced}/desktop-cache-bound-marker" ]] \
+    || fail "install desktop cache helper missed its bound directory"
+[[ -f "${install_cache_bound_icon_displaced}/icon-cache-bound-marker" ]] \
+    || fail "install icon cache helper missed its bound directory"
+assert_absent "outside install desktop cache marker" \
+    "${install_cache_bound_app_victim}/desktop-cache-bound-marker"
+assert_absent "outside install icon cache marker" \
+    "${install_cache_bound_icon_victim}/icon-cache-bound-marker"
+[[ "$(<"${install_cache_bound_app_victim}/sentinel")" == \
+    'outside install applications sentinel' ]] \
+    || fail "install desktop cache helper touched the replacement referent"
+[[ "$(<"${install_cache_bound_icon_victim}/sentinel")" == \
+    'outside install icon sentinel' ]] \
+    || fail "install icon cache helper touched the replacement referent"
+assert_contains "install desktop cache failure warning" \
+    "${install_cache_bound_output}" \
+    "update-desktop-database failed (non-fatal)"
+assert_contains "install desktop cache parent warning" \
+    "${install_cache_bound_output}" \
+    "applications directory changed during bound update-desktop-database (non-fatal): ${install_cache_bound_app_dir}"
+assert_contains "install icon cache failure warning" \
+    "${install_cache_bound_output}" \
+    "gtk-update-icon-cache failed (non-fatal)"
+assert_contains "install icon cache parent warning" \
+    "${install_cache_bound_output}" \
+    "icon directory changed during bound gtk-update-icon-cache (non-fatal): ${install_cache_bound_icon_dir}"
+assert_before "install cache diagnostic priority" \
+    "${install_cache_bound_output}" \
+    "gtk-update-icon-cache failed (non-fatal)" \
+    "Installed frost to ${install_cache_bound_prefix}/bin/frost"
+
 interrupt_tools="${TEST_ROOT}/interrupt-tools"
 interrupt_stage="${TEST_ROOT}/interrupt-stage"
 interrupt_prefix="/opt/frost-interrupt"
@@ -1869,17 +2043,22 @@ uninstall_cache_bound_tools="${TEST_ROOT}/uninstall-cache-bound-tools"
 uninstall_cache_bound_prefix="${TEST_ROOT}/uninstall-cache-bound-prefix"
 uninstall_cache_bound_app_dir="${uninstall_cache_bound_prefix}/share/applications"
 uninstall_cache_bound_desktop="${uninstall_cache_bound_app_dir}/${app_id}.desktop"
+uninstall_cache_bound_legacy="${uninstall_cache_bound_app_dir}/io.github.beamiter.jterm3.desktop"
 uninstall_cache_bound_icon_dir="${uninstall_cache_bound_prefix}/share/icons/hicolor"
 uninstall_cache_bound_icon="${uninstall_cache_bound_icon_dir}/scalable/apps/${app_id}.svg"
 uninstall_cache_bound_app_displaced="${TEST_ROOT}/uninstall-cache-bound-original-applications"
 uninstall_cache_bound_icon_displaced="${TEST_ROOT}/uninstall-cache-bound-original-hicolor"
 uninstall_cache_bound_app_victim="${TEST_ROOT}/uninstall-cache-bound-app-victim"
 uninstall_cache_bound_icon_victim="${TEST_ROOT}/uninstall-cache-bound-icon-victim"
+uninstall_cache_bound_rm_log="${TEST_ROOT}/uninstall-cache-bound-rm-directories"
+uninstall_cache_bound_update_log="${TEST_ROOT}/uninstall-cache-bound-update-directory"
 mkdir -p "${uninstall_cache_bound_tools}" "${uninstall_cache_bound_app_dir}" \
     "${uninstall_cache_bound_icon%/*}" "${uninstall_cache_bound_app_victim}" \
     "${uninstall_cache_bound_icon_victim}"
 printf 'desktop removed before bound cache refresh\n' \
     >"${uninstall_cache_bound_desktop}"
+printf 'legacy desktop removed through the shared parent fd\n' \
+    >"${uninstall_cache_bound_legacy}"
 printf 'icon removed before bound cache refresh\n' \
     >"${uninstall_cache_bound_icon}"
 printf 'outside applications sentinel\n' \
@@ -1890,6 +2069,20 @@ printf 'outside icon cache sentinel\n' \
 printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.io.github.beamiter.frost.desktop.uninstall.*|/proc/self/fd/*/.io.github.beamiter.jterm3.desktop.uninstall.*)' \
+    '        printf "%s\n" "${last%/*}" >>"${FROST_TEST_UNINSTALL_CACHE_BOUND_RM_LOG:?}"' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_cache_bound_tools}/rm"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'printf "%s\n" "${1}" >"${FROST_TEST_UNINSTALL_CACHE_BOUND_UPDATE_LOG:?}"' \
     '/usr/bin/mv "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DIR:?}" "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DISPLACED:?}"' \
     '/usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_VICTIM:?}" "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DIR}"' \
     ': >"${1}/desktop-cache-bound-marker"' \
@@ -1906,18 +2099,31 @@ printf '%s\n' \
     ': >"${bound}/icon-cache-bound-marker"' \
     'exit 93' \
     >"${uninstall_cache_bound_tools}/gtk-update-icon-cache"
-chmod 0755 "${uninstall_cache_bound_tools}/update-desktop-database" \
+chmod 0755 "${uninstall_cache_bound_tools}/rm" \
+    "${uninstall_cache_bound_tools}/update-desktop-database" \
     "${uninstall_cache_bound_tools}/gtk-update-icon-cache"
 uninstall_cache_bound_output="$(
     env HOME="${TEST_HOME}" PATH="${uninstall_cache_bound_tools}:${TEST_PATH}" \
         FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DIR="${uninstall_cache_bound_app_dir}" \
         FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DISPLACED="${uninstall_cache_bound_app_displaced}" \
         FROST_TEST_UNINSTALL_CACHE_BOUND_APP_VICTIM="${uninstall_cache_bound_app_victim}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_RM_LOG="${uninstall_cache_bound_rm_log}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_UPDATE_LOG="${uninstall_cache_bound_update_log}" \
         FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DIR="${uninstall_cache_bound_icon_dir}" \
         FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DISPLACED="${uninstall_cache_bound_icon_displaced}" \
         FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_VICTIM="${uninstall_cache_bound_icon_victim}" \
         DESTDIR= "${UNINSTALLER}" --prefix "${uninstall_cache_bound_prefix}" 2>&1
 )"
+uninstall_cache_bound_update_arg="$(<"${uninstall_cache_bound_update_log}")"
+mapfile -t uninstall_cache_bound_rm_dirs \
+    <"${uninstall_cache_bound_rm_log}"
+(( ${#uninstall_cache_bound_rm_dirs[@]} == 2 )) \
+    || fail "shared applications parent did not purge both launcher names"
+for uninstall_cache_bound_rm_dir in "${uninstall_cache_bound_rm_dirs[@]}"; do
+    [[ "${uninstall_cache_bound_rm_dir}" == \
+        "${uninstall_cache_bound_update_arg}" ]] \
+        || fail "uninstall did not reuse one applications fd across removal and cache refresh"
+done
 [[ -f "${uninstall_cache_bound_app_displaced}/desktop-cache-bound-marker" ]] \
     || fail "desktop cache helper did not receive its bound directory"
 [[ -f "${uninstall_cache_bound_icon_displaced}/icon-cache-bound-marker" ]] \

@@ -479,8 +479,8 @@ Round 70 closes the remaining argument-form affordance gap:
     staging restores the exact inode in the bound directory, and purge cannot
     unlink identically named files behind a replacement symlink. Logical parent
     identity is still checked before/after each phase; a failed purge names the
-    bound physical directory on both sides of its recovery command, and target
-    fds close before the optional post-commit phase.
+    bound physical directory on both sides of its recovery command; pooled fds
+    close together after the optional post-commit phase.
 
 94. **Bound post-commit cleanup and cache refresh** — workflow-directory
     cleanup records its target and parent inodes before the commit, while the
@@ -489,3 +489,11 @@ Round 70 closes the remaining argument-form affordance gap:
     replacements made inside either cache helper can touch only the displaced
     bound directory. Helper failures and identity changes remain explicitly
     non-fatal and never suppress the truthful uninstall success summary.
+
+95. **Bound install helpers and capped fd pools** — legacy launcher removal,
+    desktop validation, and desktop/icon cache refresh now reuse pre-publish
+    applications/icon directory fds. Parent swaps inside `rm` or either cache
+    helper cannot reach a replacement symlink referent; helper failures remain
+    non-fatal and precede the truthful install summary. Install and uninstall
+    pools deduplicate by device/inode under fixed 4/16-fd ceilings, close once
+    on every exit path, and preserve per-consumer use-point identity checks.

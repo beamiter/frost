@@ -159,6 +159,9 @@ rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回�
 资源分支，卸载也会先验证完整目标集合，较晚的坏路径不会造成前面文件已改的部分状态。
 所有最终安装目标还会在首次 rollback backup 前整批检查：只接受不存在、普通文件或将被原子
 替换的 symlink；目录、FIFO、socket 与 device 会直接拒绝，FIFO 不会被打开或读取。
+安装成功后的 legacy launcher 删除、desktop 校验及 desktop/icon cache helper 会复用提交前
+绑定的 applications/icon 目录 fd；use point 前身份变化会跳过可选动作，helper 内换 parent
+也只会访问原 inode。helper 失败或竞态只产生非致命警告，不会反转已经完成的安装。
 卸载文件目标采用对称的整批预检：最终 symlink 只删除链接本身；目录、FIFO、socket 与
 device 会在首个 `rm` 前拒绝并保持整套安装不变。workflow cleanup 目标还必须是未被替换的
 真实目录，且只用非递归 `rmdir` 尝试删除空目录；非空用户目录及其自定义文件不会被遍历。
@@ -177,6 +180,9 @@ reservation placeholder、rollback backup 与待 purge 项都会在使用点核�
 提交后的空 workflow 目录清理以及 desktop/icon cache refresh 同样在提交前绑定目录 inode。
 身份在执行前变化会跳过可选操作；若变化发生在 helper 内部，helper 只拿到 `/proc/self/fd`
 路径，随后给出非致命警告。清理/刷新失败不会反转已经完成的卸载，成功摘要仍保持真实。
+安装和卸载的绑定目录都按 `device:inode` 去重，分别设有 4/16 个 fd 的固定上限；同一物理
+applications/workflow parent 的多个消费者仍各自执行 use-point identity 检查，正常完成、早退
+与异常退出最终都由统一清理关闭池中描述符。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机
 prefix 不套用祖先检查，但目标类型与 quarantine 状态机在两种模式下都生效。
 
@@ -216,7 +222,8 @@ dock。有三个细节决定它到底显不显示，安装脚本都已处理：
   `=`。含 `%` 的绝对路径还会落入「引号内 field code 行为未定义」的兼容陷阱，因此这
   两种路径在启用桌面集成时都会被安装器明确拒绝。
 - 安装与卸载后都会刷新 `update-desktop-database` 和 `gtk-update-icon-cache`；陈旧的
-  图标缓存会盖住刚装进去的图标。`DESTDIR` 打包时跳过，交给包管理器处理。
+  图标缓存会盖住刚装进去的图标。helper 只接收预提交绑定的目录 fd 路径；`DESTDIR`
+  打包时跳过，交给包管理器处理。
 - 安装器会尝试删除更名前遗留的 `io.github.beamiter.jterm3.desktop`；这一步发生在新版本
   完整提交之后，只是迁移清理。`DESTDIR` 下会在删除点再次检查目录祖先；路径变化、权限等
   原因导致删除失败时会警告并继续刷新缓存、报告安装成功。

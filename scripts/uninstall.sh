@@ -38,6 +38,9 @@ CACHE_REFRESH_IDENTITIES=()
 CACHE_REFRESH_NEEDED=()
 CACHE_REFRESH_ENABLED=()
 CACHE_REFRESH_BIND_ERRORS=()
+BOUND_DIRECTORY_FDS=()
+BOUND_DIRECTORY_IDENTITIES=()
+MAX_BOUND_DIRECTORY_FDS=16
 UNINSTALL_IN_PROGRESS=0
 UNINSTALL_COMMITTED=0
 
@@ -94,6 +97,52 @@ real_directory_matches_identity() {
         && path_matches_identity "${path}" "${expected}"
 }
 
+# Callers keep their own logical-path identity checks, while this pool owns one
+# descriptor per physical directory inode. Return 2 when its explicit resource
+# ceiling is exhausted so critical and optional callers can choose policy.
+acquire_bound_directory() {
+    local path="$1" result_fd_name="$2" result_identity_name="$3"
+    local candidate_fd directory_identity index existing_fd
+    unset candidate_fd
+    if ! { exec {candidate_fd}<"${path}"; } 2>/dev/null; then
+        return 1
+    fi
+    if ! directory_identity="$(stat -Lc '%d:%i' -- \
+        "/proc/self/fd/${candidate_fd}")"; then
+        exec {candidate_fd}<&-
+        return 1
+    fi
+    for index in "${!BOUND_DIRECTORY_IDENTITIES[@]}"; do
+        if [[ "${BOUND_DIRECTORY_IDENTITIES[index]}" == \
+            "${directory_identity}" ]]; then
+            existing_fd="${BOUND_DIRECTORY_FDS[index]}"
+            exec {candidate_fd}<&-
+            printf -v "${result_fd_name}" '%s' "${existing_fd}"
+            printf -v "${result_identity_name}" '%s' "${directory_identity}"
+            return 0
+        fi
+    done
+    if ((${#BOUND_DIRECTORY_FDS[@]} >= MAX_BOUND_DIRECTORY_FDS)); then
+        exec {candidate_fd}<&-
+        return 2
+    fi
+    BOUND_DIRECTORY_FDS+=("${candidate_fd}")
+    BOUND_DIRECTORY_IDENTITIES+=("${directory_identity}")
+    printf -v "${result_fd_name}" '%s' "${candidate_fd}"
+    printf -v "${result_identity_name}" '%s' "${directory_identity}"
+}
+
+close_bound_directory_fds() {
+    local index fd
+    for index in "${!BOUND_DIRECTORY_FDS[@]}"; do
+        fd="${BOUND_DIRECTORY_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+    done
+    BOUND_DIRECTORY_FDS=()
+    BOUND_DIRECTORY_IDENTITIES=()
+}
+
 bound_entry_path() {
     local index="$1" basename="$2"
     printf '/proc/self/fd/%s/%s' "${REMOVAL_PARENT_FDS[index]}" "${basename}"
@@ -133,16 +182,6 @@ logical_parent_matches_identity() {
         "${REMOVAL_PARENT_IDENTITIES[index]}"
 }
 
-close_uninstall_parent_fds() {
-    local index fd
-    for index in "${!REMOVAL_PARENT_FDS[@]}"; do
-        fd="${REMOVAL_PARENT_FDS[index]:-}"
-        [[ -n "${fd}" ]] || continue
-        exec {fd}<&-
-        REMOVAL_PARENT_FDS[index]=""
-    done
-}
-
 bound_cleanup_path() {
     local index="$1"
     printf '/proc/self/fd/%s/%s' "${CLEANUP_PARENT_FDS[index]}" \
@@ -154,26 +193,6 @@ logical_cleanup_parent_matches_identity() {
     parent="${REMOVAL_DIRS[index]%/*}"
     real_directory_matches_identity "${parent}" \
         "${CLEANUP_PARENT_IDENTITIES[index]}"
-}
-
-close_cleanup_parent_fds() {
-    local index fd
-    for index in "${!CLEANUP_PARENT_FDS[@]}"; do
-        fd="${CLEANUP_PARENT_FDS[index]:-}"
-        [[ -n "${fd}" ]] || continue
-        exec {fd}<&-
-        CLEANUP_PARENT_FDS[index]=""
-    done
-}
-
-close_cache_refresh_fds() {
-    local index fd
-    for index in "${!CACHE_REFRESH_FDS[@]}"; do
-        fd="${CACHE_REFRESH_FDS[index]:-}"
-        [[ -n "${fd}" ]] || continue
-        exec {fd}<&-
-        CACHE_REFRESH_FDS[index]=""
-    done
 }
 
 print_uninstall_recovery() {
@@ -308,15 +327,13 @@ finish_uninstall() {
         rollback_uninstall_plan || status=1
     fi
     cleanup_uninstall_reservations
-    close_uninstall_parent_fds
-    close_cleanup_parent_fds
-    close_cache_refresh_fds
+    close_bound_directory_fds
     exit "${status}"
 }
 
 prepare_uninstall_plan() {
     local index target directory basename quarantine quarantine_path identity
-    local reservation_identity parent_fd parent_identity
+    local reservation_identity parent_fd parent_identity bind_status
     REMOVAL_QUARANTINES=()
     REMOVAL_RESERVATION_IDENTITIES=()
     REMOVAL_PARENT_FDS=()
@@ -336,13 +353,17 @@ prepare_uninstall_plan() {
                 || die "cannot identify uninstall target ${target}"
             directory="${target%/*}"
             basename="${target##*/}"
-            unset parent_fd
-            exec {parent_fd}<"${directory}" \
-                || die "cannot bind uninstall target directory ${directory}"
+            if acquire_bound_directory "${directory}" parent_fd \
+                parent_identity; then
+                :
+            else
+                bind_status=$?
+                if ((bind_status == 2)); then
+                    die "too many distinct uninstall directories (limit ${MAX_BOUND_DIRECTORY_FDS})"
+                fi
+                die "cannot bind uninstall target directory ${directory}"
+            fi
             REMOVAL_PARENT_FDS[index]="${parent_fd}"
-            parent_identity="$(stat -Lc '%d:%i' -- \
-                "/proc/self/fd/${parent_fd}")" \
-                || die "cannot identify uninstall target directory ${directory}"
             REMOVAL_PARENT_IDENTITIES[index]="${parent_identity}"
             validate_removal_file_target "${target}"
             logical_parent_matches_identity "${index}" \
@@ -382,6 +403,7 @@ prepare_uninstall_plan() {
 
 prepare_cleanup_plan() {
     local index target parent target_identity parent_fd parent_identity
+    local bind_status
     CLEANUP_PARENT_FDS=()
     CLEANUP_PARENT_IDENTITIES=()
     CLEANUP_TARGET_BASENAMES=()
@@ -402,19 +424,19 @@ prepare_cleanup_plan() {
                 CLEANUP_BIND_ERRORS[index]="cannot identify cleanup directory ${target}"
                 continue
             fi
-            unset parent_fd
-            if ! { exec {parent_fd}<"${parent}"; } 2>/dev/null; then
-                CLEANUP_BIND_ERRORS[index]="cannot bind cleanup parent directory ${parent}"
+            if acquire_bound_directory "${parent}" parent_fd \
+                parent_identity; then
+                :
+            else
+                bind_status=$?
+                if ((bind_status == 2)); then
+                    CLEANUP_BIND_ERRORS[index]="bound directory fd limit reached while binding cleanup parent ${parent}"
+                else
+                    CLEANUP_BIND_ERRORS[index]="cannot bind cleanup parent directory ${parent}"
+                fi
                 continue
             fi
             CLEANUP_PARENT_FDS[index]="${parent_fd}"
-            if ! parent_identity="$(stat -Lc '%d:%i' -- \
-                "/proc/self/fd/${parent_fd}")"; then
-                CLEANUP_BIND_ERRORS[index]="cannot identify cleanup parent directory ${parent}"
-                exec {parent_fd}<&-
-                CLEANUP_PARENT_FDS[index]=""
-                continue
-            fi
             CLEANUP_PARENT_IDENTITIES[index]="${parent_identity}"
             CLEANUP_TARGET_IDENTITIES[index]="${target_identity}"
             if ! logical_cleanup_parent_matches_identity "${index}" \
@@ -422,7 +444,6 @@ prepare_cleanup_plan() {
                 || ! path_matches_identity "$(bound_cleanup_path "${index}")" \
                     "${target_identity}"; then
                 CLEANUP_BIND_ERRORS[index]="cleanup directory changed while binding ${target}"
-                exec {parent_fd}<&-
                 CLEANUP_PARENT_FDS[index]=""
             fi
         elif [[ -e "${target}" || -L "${target}" ]]; then
@@ -437,7 +458,7 @@ prepare_cleanup_plan() {
 }
 
 prepare_cache_refresh_plan() {
-    local index removal_index path command fd identity
+    local index removal_index path command fd identity bind_status
     CACHE_REFRESH_DIRS=(
         "${SHARE_DIR}/applications"
         "${SHARE_DIR}/icons/hicolor"
@@ -470,22 +491,21 @@ prepare_cache_refresh_plan() {
             CACHE_REFRESH_BIND_ERRORS[index]="cache directory is not a real directory: ${path}"
             continue
         fi
-        unset fd
-        if ! { exec {fd}<"${path}"; } 2>/dev/null; then
-            CACHE_REFRESH_BIND_ERRORS[index]="cannot bind cache directory ${path}"
+        if acquire_bound_directory "${path}" fd identity; then
+            :
+        else
+            bind_status=$?
+            if ((bind_status == 2)); then
+                CACHE_REFRESH_BIND_ERRORS[index]="bound directory fd limit reached while binding cache directory ${path}"
+            else
+                CACHE_REFRESH_BIND_ERRORS[index]="cannot bind cache directory ${path}"
+            fi
             continue
         fi
         CACHE_REFRESH_FDS[index]="${fd}"
-        if ! identity="$(stat -Lc '%d:%i' -- "/proc/self/fd/${fd}")"; then
-            CACHE_REFRESH_BIND_ERRORS[index]="cannot identify cache directory ${path}"
-            exec {fd}<&-
-            CACHE_REFRESH_FDS[index]=""
-            continue
-        fi
         CACHE_REFRESH_IDENTITIES[index]="${identity}"
         if ! real_directory_matches_identity "${path}" "${identity}"; then
             CACHE_REFRESH_BIND_ERRORS[index]="cache directory changed while binding ${path}"
-            exec {fd}<&-
             CACHE_REFRESH_FDS[index]=""
         fi
     done
@@ -945,7 +965,6 @@ else
     # Purge cannot truthfully roll that result back, so failures retain a named
     # quarantine and an exact manual recovery command while the exit stays 0.
     purge_uninstall_quarantines
-    close_uninstall_parent_fds
 fi
 if ((DRY_RUN == 1)); then
     for target in "${REMOVAL_DIRS[@]}"; do
@@ -955,11 +974,10 @@ else
     for index in "${!REMOVAL_DIRS[@]}"; do
         remove_bound_dir_if_empty "${index}"
     done
-    close_cleanup_parent_fds
     # These refreshes are optional and run only for directories bound before
     # the uninstall commit. A failed or stale cache never reverses success.
     refresh_bound_caches
-    close_cache_refresh_fds
+    close_bound_directory_fds
 fi
 
 printf 'Removed frost from %s\n' "${BIN_DIR}"

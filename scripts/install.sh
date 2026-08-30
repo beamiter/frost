@@ -27,6 +27,17 @@ INSTALL_ORIGINAL_PRESENT=()
 PUBLISH_IN_PROGRESS=0
 PUBLISH_LAST_ATTEMPT=-1
 KEEP_INSTALL_BACKUPS=0
+INSTALL_BOUND_DIRECTORY_FDS=()
+INSTALL_BOUND_DIRECTORY_IDENTITIES=()
+MAX_INSTALL_BOUND_DIRECTORY_FDS=4
+POST_INSTALL_APP_DIR=""
+POST_INSTALL_APP_FD=""
+POST_INSTALL_APP_IDENTITY=""
+POST_INSTALL_APP_BIND_ERROR=""
+POST_INSTALL_ICON_DIR=""
+POST_INSTALL_ICON_FD=""
+POST_INSTALL_ICON_IDENTITY=""
+POST_INSTALL_ICON_BIND_ERROR=""
 
 usage() {
     cat <<'USAGE'
@@ -85,6 +96,63 @@ paths_share_inode() {
     [[ "${first_identity}" == "${second_identity}" ]]
 }
 
+path_matches_identity() {
+    local path="$1" expected="$2" actual
+    [[ -e "${path}" || -L "${path}" ]] || return 1
+    actual="$(stat -c '%d:%i' -- "${path}")" || return 1
+    [[ "${actual}" == "${expected}" ]]
+}
+
+real_directory_matches_identity() {
+    local path="$1" expected="$2"
+    [[ -d "${path}" && ! -L "${path}" ]] \
+        && path_matches_identity "${path}" "${expected}"
+}
+
+acquire_install_bound_directory() {
+    local path="$1" result_fd_name="$2" result_identity_name="$3"
+    local candidate_fd directory_identity index existing_fd
+    unset candidate_fd
+    if ! { exec {candidate_fd}<"${path}"; } 2>/dev/null; then
+        return 1
+    fi
+    if ! directory_identity="$(stat -Lc '%d:%i' -- \
+        "/proc/self/fd/${candidate_fd}")"; then
+        exec {candidate_fd}<&-
+        return 1
+    fi
+    for index in "${!INSTALL_BOUND_DIRECTORY_IDENTITIES[@]}"; do
+        if [[ "${INSTALL_BOUND_DIRECTORY_IDENTITIES[index]}" == \
+            "${directory_identity}" ]]; then
+            existing_fd="${INSTALL_BOUND_DIRECTORY_FDS[index]}"
+            exec {candidate_fd}<&-
+            printf -v "${result_fd_name}" '%s' "${existing_fd}"
+            printf -v "${result_identity_name}" '%s' "${directory_identity}"
+            return 0
+        fi
+    done
+    if ((${#INSTALL_BOUND_DIRECTORY_FDS[@]} \
+        >= MAX_INSTALL_BOUND_DIRECTORY_FDS)); then
+        exec {candidate_fd}<&-
+        return 2
+    fi
+    INSTALL_BOUND_DIRECTORY_FDS+=("${candidate_fd}")
+    INSTALL_BOUND_DIRECTORY_IDENTITIES+=("${directory_identity}")
+    printf -v "${result_fd_name}" '%s' "${candidate_fd}"
+    printf -v "${result_identity_name}" '%s' "${directory_identity}"
+}
+
+close_install_bound_directory_fds() {
+    local index fd
+    for index in "${!INSTALL_BOUND_DIRECTORY_FDS[@]}"; do
+        fd="${INSTALL_BOUND_DIRECTORY_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+    done
+    INSTALL_BOUND_DIRECTORY_FDS=()
+    INSTALL_BOUND_DIRECTORY_IDENTITIES=()
+}
+
 rollback_install_plan() {
     local index dest backup rollback_failed=0
     for ((index = PUBLISH_LAST_ATTEMPT; index >= 0; index--)); do
@@ -133,6 +201,11 @@ finish_install() {
         rollback_install_plan || status=1
     fi
     cleanup_install_artifacts
+    if [[ -n "${PREBUILT_FD}" ]]; then
+        exec {PREBUILT_FD}<&-
+        PREBUILT_FD=""
+    fi
+    close_install_bound_directory_fds
     exit "${status}"
 }
 
@@ -523,9 +596,80 @@ stage_desktop_entry() {
     fi
 }
 
+prepare_post_install_plan() {
+    local bind_status
+    POST_INSTALL_APP_DIR="${SHARE_DIR}/applications"
+    POST_INSTALL_APP_FD=""
+    POST_INSTALL_APP_IDENTITY=""
+    POST_INSTALL_APP_BIND_ERROR=""
+    POST_INSTALL_ICON_DIR="${SHARE_DIR}/icons/hicolor"
+    POST_INSTALL_ICON_FD=""
+    POST_INSTALL_ICON_IDENTITY=""
+    POST_INSTALL_ICON_BIND_ERROR=""
+    ((DRY_RUN == 0 && INSTALL_DESKTOP == 1)) || return 0
+
+    if [[ ! -d /proc/self/fd ]]; then
+        POST_INSTALL_APP_BIND_ERROR="/proc/self/fd is unavailable"
+        if ((DESTDIR_ACTIVE == 0)); then
+            POST_INSTALL_ICON_BIND_ERROR="/proc/self/fd is unavailable"
+        fi
+        return 0
+    fi
+    if [[ ! -d "${POST_INSTALL_APP_DIR}" \
+        || -L "${POST_INSTALL_APP_DIR}" ]]; then
+        POST_INSTALL_APP_BIND_ERROR="post-install applications path is not a real directory: ${POST_INSTALL_APP_DIR}"
+    elif acquire_install_bound_directory "${POST_INSTALL_APP_DIR}" \
+        POST_INSTALL_APP_FD POST_INSTALL_APP_IDENTITY; then
+        if ! real_directory_matches_identity "${POST_INSTALL_APP_DIR}" \
+            "${POST_INSTALL_APP_IDENTITY}"; then
+            POST_INSTALL_APP_BIND_ERROR="post-install applications directory changed while binding: ${POST_INSTALL_APP_DIR}"
+            POST_INSTALL_APP_FD=""
+        fi
+    else
+        bind_status=$?
+        if ((bind_status == 2)); then
+            POST_INSTALL_APP_BIND_ERROR="post-install directory fd limit reached (limit ${MAX_INSTALL_BOUND_DIRECTORY_FDS})"
+        else
+            POST_INSTALL_APP_BIND_ERROR="cannot bind post-install applications directory: ${POST_INSTALL_APP_DIR}"
+        fi
+    fi
+
+    ((DESTDIR_ACTIVE == 0)) || return 0
+    if [[ ! -d "${POST_INSTALL_ICON_DIR}" \
+        || -L "${POST_INSTALL_ICON_DIR}" ]]; then
+        POST_INSTALL_ICON_BIND_ERROR="post-install icon path is not a real directory: ${POST_INSTALL_ICON_DIR}"
+    elif acquire_install_bound_directory "${POST_INSTALL_ICON_DIR}" \
+        POST_INSTALL_ICON_FD POST_INSTALL_ICON_IDENTITY; then
+        if ! real_directory_matches_identity "${POST_INSTALL_ICON_DIR}" \
+            "${POST_INSTALL_ICON_IDENTITY}"; then
+            POST_INSTALL_ICON_BIND_ERROR="post-install icon directory changed while binding: ${POST_INSTALL_ICON_DIR}"
+            POST_INSTALL_ICON_FD=""
+        fi
+    else
+        bind_status=$?
+        if ((bind_status == 2)); then
+            POST_INSTALL_ICON_BIND_ERROR="post-install directory fd limit reached (limit ${MAX_INSTALL_BOUND_DIRECTORY_FDS})"
+        else
+            POST_INSTALL_ICON_BIND_ERROR="cannot bind post-install icon directory: ${POST_INSTALL_ICON_DIR}"
+        fi
+    fi
+}
+
+post_install_app_directory_matches() {
+    [[ -n "${POST_INSTALL_APP_FD}" ]] \
+        && real_directory_matches_identity "${POST_INSTALL_APP_DIR}" \
+            "${POST_INSTALL_APP_IDENTITY}"
+}
+
+post_install_icon_directory_matches() {
+    [[ -n "${POST_INSTALL_ICON_FD}" ]] \
+        && real_directory_matches_identity "${POST_INSTALL_ICON_DIR}" \
+            "${POST_INSTALL_ICON_IDENTITY}"
+}
+
 remove_legacy_desktop_entry() {
     local path="${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
-    local validation_error
+    local bound validation_error
     print_command rm -f -- "${path}"
     ((DRY_RUN == 0)) || return 0
 
@@ -540,28 +684,116 @@ remove_legacy_desktop_entry() {
             "${validation_error}" >&2
         return 0
     fi
-    if ! rm -f -- "${path}"; then
+    if [[ -n "${POST_INSTALL_APP_BIND_ERROR}" ]]; then
+        printf 'frost install: warning: skipped legacy launcher cleanup (non-fatal): %s\n' \
+            "${POST_INSTALL_APP_BIND_ERROR}" >&2
+        return 0
+    fi
+    if ! post_install_app_directory_matches; then
+        printf 'frost install: warning: skipped legacy launcher cleanup because applications directory identity changed (non-fatal): %s\n' \
+            "${POST_INSTALL_APP_DIR}" >&2
+        return 0
+    fi
+    bound="/proc/self/fd/${POST_INSTALL_APP_FD}/${path##*/}"
+    if [[ -e "${bound}" || -L "${bound}" ]] \
+        && [[ ! -f "${bound}" && ! -L "${bound}" ]]; then
+        printf 'frost install: warning: skipped legacy launcher cleanup because target is not a regular file or symlink (non-fatal): %s\n' \
+            "${path}" >&2
+        return 0
+    fi
+    if ! rm -f -- "${bound}"; then
         printf 'frost install: warning: could not remove legacy launcher (non-fatal): %s\n' \
             "${path}" >&2
+    fi
+    if ! post_install_app_directory_matches; then
+        printf 'frost install: warning: applications directory changed during bound legacy cleanup (non-fatal): %s\n' \
+            "${POST_INSTALL_APP_DIR}" >&2
     fi
 }
 
 # Freshly installed entries and icons stay invisible until the shell's caches
 # are rebuilt; a stale icon cache can even shadow icons that are already there.
 refresh_desktop_caches() {
+    local logical bound
     if ((DESTDIR_ACTIVE == 1)); then
         printf 'Staged install (DESTDIR set); skipping desktop cache refresh.\n'
         return 0
     fi
+    if ((DRY_RUN == 1)); then
+        if command -v desktop-file-validate >/dev/null 2>&1; then
+            run_optional desktop-file-validate \
+                "${SHARE_DIR}/applications/${APP_ID}.desktop"
+        fi
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            run_optional_public update-desktop-database \
+                "${SHARE_DIR}/applications"
+        fi
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            run_optional_public gtk-update-icon-cache --force \
+                --ignore-theme-index --quiet "${SHARE_DIR}/icons/hicolor"
+        fi
+        return 0
+    fi
     if command -v desktop-file-validate >/dev/null 2>&1; then
-        run_optional desktop-file-validate "${SHARE_DIR}/applications/${APP_ID}.desktop"
+        logical="${SHARE_DIR}/applications/${APP_ID}.desktop"
+        print_command desktop-file-validate "${logical}"
+        if [[ -n "${POST_INSTALL_APP_BIND_ERROR}" ]]; then
+            printf 'frost install: warning: skipped optional desktop-file-validate: %s (non-fatal)\n' \
+                "${POST_INSTALL_APP_BIND_ERROR}" >&2
+        elif ! post_install_app_directory_matches; then
+            printf 'frost install: warning: skipped optional desktop-file-validate because applications directory identity changed (non-fatal): %s\n' \
+                "${POST_INSTALL_APP_DIR}" >&2
+        else
+            bound="/proc/self/fd/${POST_INSTALL_APP_FD}/${APP_ID}.desktop"
+            if [[ ! -f "${bound}" || -L "${bound}" ]]; then
+                printf 'frost install: warning: skipped optional desktop-file-validate because launcher identity/type changed (non-fatal): %s\n' \
+                    "${logical}" >&2
+            elif ! desktop-file-validate "${bound}"; then
+                printf 'frost install: warning: desktop-file-validate failed (non-fatal)\n' >&2
+            fi
+            if ! post_install_app_directory_matches; then
+                printf 'frost install: warning: applications directory changed during bound desktop-file-validate (non-fatal): %s\n' \
+                    "${POST_INSTALL_APP_DIR}" >&2
+            fi
+        fi
     fi
     if command -v update-desktop-database >/dev/null 2>&1; then
-        run_optional_public update-desktop-database "${SHARE_DIR}/applications"
+        print_command update-desktop-database "${POST_INSTALL_APP_DIR}"
+        if [[ -n "${POST_INSTALL_APP_BIND_ERROR}" ]]; then
+            printf 'frost install: warning: skipped optional update-desktop-database: %s (non-fatal)\n' \
+                "${POST_INSTALL_APP_BIND_ERROR}" >&2
+        elif ! post_install_app_directory_matches; then
+            printf 'frost install: warning: skipped optional update-desktop-database because applications directory identity changed (non-fatal): %s\n' \
+                "${POST_INSTALL_APP_DIR}" >&2
+        else
+            bound="/proc/self/fd/${POST_INSTALL_APP_FD}"
+            (umask 022 && update-desktop-database "${bound}") \
+                || printf 'frost install: warning: update-desktop-database failed (non-fatal)\n' >&2
+            if ! post_install_app_directory_matches; then
+                printf 'frost install: warning: applications directory changed during bound update-desktop-database (non-fatal): %s\n' \
+                    "${POST_INSTALL_APP_DIR}" >&2
+            fi
+        fi
     fi
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        run_optional_public gtk-update-icon-cache --force --ignore-theme-index --quiet \
-            "${SHARE_DIR}/icons/hicolor"
+        print_command gtk-update-icon-cache --force --ignore-theme-index --quiet \
+            "${POST_INSTALL_ICON_DIR}"
+        if [[ -n "${POST_INSTALL_ICON_BIND_ERROR}" ]]; then
+            printf 'frost install: warning: skipped optional gtk-update-icon-cache: %s (non-fatal)\n' \
+                "${POST_INSTALL_ICON_BIND_ERROR}" >&2
+        elif ! post_install_icon_directory_matches; then
+            printf 'frost install: warning: skipped optional gtk-update-icon-cache because icon directory identity changed (non-fatal): %s\n' \
+                "${POST_INSTALL_ICON_DIR}" >&2
+        else
+            bound="/proc/self/fd/${POST_INSTALL_ICON_FD}"
+            (umask 022 && gtk-update-icon-cache --force \
+                --ignore-theme-index --quiet "${bound}") \
+                || printf 'frost install: warning: gtk-update-icon-cache failed (non-fatal)\n' >&2
+            if ! post_install_icon_directory_matches; then
+                printf 'frost install: warning: icon directory changed during bound gtk-update-icon-cache (non-fatal): %s\n' \
+                    "${POST_INSTALL_ICON_DIR}" >&2
+            fi
+        fi
     fi
 }
 
@@ -747,7 +979,9 @@ fi
 stage_install_binary "${BINARY}" "${STAGED_BIN_DIR}/frost"
 if [[ -n "${PREBUILT_FD}" ]]; then
     exec {PREBUILT_FD}<&-
+    PREBUILT_FD=""
 fi
+prepare_post_install_plan
 publish_install_plan
 
 if ((INSTALL_DESKTOP == 1)); then
@@ -756,6 +990,7 @@ if ((INSTALL_DESKTOP == 1)); then
     remove_legacy_desktop_entry
     refresh_desktop_caches
 fi
+close_install_bound_directory_fds
 
 printf 'Installed frost to %s\n' "${BIN_DIR}/frost"
 printf 'Installed workflow examples under %s/frost/workflows\n' "${WORKFLOW_SHARE_DIR}"
