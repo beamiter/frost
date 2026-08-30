@@ -489,6 +489,29 @@ stage_desktop_entry() {
     fi
 }
 
+remove_legacy_desktop_entry() {
+    local path="${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
+    local validation_error
+    print_command rm -f -- "${path}"
+    ((DRY_RUN == 0)) || return 0
+
+    # Re-check the staged ancestor at the post-commit use point. The core
+    # generation is already installed, so a changed/unsafe path is a warning,
+    # never a reason to turn the successful upgrade into an error exit.
+    if ((DESTDIR_ACTIVE == 1)) \
+        && ! validation_error="$(
+            validate_staging_target "${path%/*}" 2>&1
+        )"; then
+        printf 'frost install: warning: skipped legacy launcher cleanup (non-fatal): %s\n' \
+            "${validation_error}" >&2
+        return 0
+    fi
+    if ! rm -f -- "${path}"; then
+        printf 'frost install: warning: could not remove legacy launcher (non-fatal): %s\n' \
+            "${path}" >&2
+    fi
+}
+
 # Freshly installed entries and icons stay invisible until the shell's caches
 # are rebuilt; a stale icon cache can even shadow icons that are already there.
 refresh_desktop_caches() {
@@ -694,7 +717,7 @@ publish_install_plan
 if ((INSTALL_DESKTOP == 1)); then
     # Launcher left by installs from before the jterm3 -> frost rename; left in
     # place it shows up as a second "jterm3" entry beside the new one.
-    run rm -f -- "${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
+    remove_legacy_desktop_entry
     refresh_desktop_caches
 fi
 

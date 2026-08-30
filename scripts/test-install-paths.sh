@@ -558,6 +558,46 @@ done
     \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
     || fail "publish rollback left a temporary or backup"
 
+# Removing a pre-rename launcher is migration hygiene, not part of committing
+# the new generation. A cleanup failure must warn without converting an
+# otherwise complete install into a false failure or skipping its summary.
+legacy_cleanup_tools="${TEST_ROOT}/legacy-cleanup-tools"
+legacy_cleanup_stage="${TEST_ROOT}/legacy-cleanup-stage"
+legacy_cleanup_prefix="/opt/frost-legacy-cleanup"
+legacy_cleanup_share="${legacy_cleanup_stage}${legacy_cleanup_prefix}/share"
+legacy_cleanup_entry="${legacy_cleanup_share}/applications/io.github.beamiter.jterm3.desktop"
+mkdir -p "${legacy_cleanup_tools}" "${legacy_cleanup_entry%/*}"
+printf 'legacy launcher retained after warning\n' >"${legacy_cleanup_entry}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'for argument do' \
+    '    case "${argument}" in *io.github.beamiter.jterm3.desktop) exit 75 ;; esac' \
+    'done' \
+    'exec /usr/bin/rm "$@"' \
+    >"${legacy_cleanup_tools}/rm"
+chmod 0755 "${legacy_cleanup_tools}/rm"
+legacy_cleanup_output="$(
+    env HOME="${TEST_HOME}" PATH="${legacy_cleanup_tools}:${TEST_PATH}" \
+        DESTDIR="${legacy_cleanup_stage}" "${INSTALLER}" \
+        --binary "${prebuilt_binary}" --prefix "${legacy_cleanup_prefix}" 2>&1
+)"
+assert_contains "legacy cleanup warning" "${legacy_cleanup_output}" \
+    "warning: could not remove legacy launcher (non-fatal): ${legacy_cleanup_entry}"
+assert_contains "legacy cleanup success summary" "${legacy_cleanup_output}" \
+    "Installed frost to ${legacy_cleanup_prefix}/bin/frost"
+assert_regular_file "binary after legacy cleanup warning" \
+    "${legacy_cleanup_stage}${legacy_cleanup_prefix}/bin/frost"
+[[ "$(<"${legacy_cleanup_entry}")" == \
+    'legacy launcher retained after warning' ]] \
+    || fail "failed legacy cleanup changed its launcher"
+assert_regular_file "desktop entry after legacy cleanup warning" \
+    "${legacy_cleanup_share}/applications/${app_id}.desktop"
+[[ -z "$(find "${legacy_cleanup_stage}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "legacy cleanup warning left a temporary or backup"
+
 interrupt_tools="${TEST_ROOT}/interrupt-tools"
 interrupt_stage="${TEST_ROOT}/interrupt-stage"
 interrupt_prefix="/opt/frost-interrupt"

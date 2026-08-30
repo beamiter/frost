@@ -411,3 +411,10 @@ Round 70 closes the remaining argument-form affordance gap:
     pre-existing resources plus the executable regain their prior bytes and
     modes while an originally absent icon remains absent. If restoration itself
     fails, the recovery backup is retained and named.
+
+85. **Truthful legacy-launcher cleanup** — removal of the pre-rename jterm3
+    desktop entry is explicitly best-effort after the new generation commits.
+    Its staged ancestor is revalidated at the removal point. A deterministic
+    `rm` failure now emits a non-fatal warning, still refreshes caches and prints
+    the success handoff, while the installed binary and new desktop entry remain
+    complete and no transaction artifacts survive.

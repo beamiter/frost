@@ -191,6 +191,9 @@ dock。有三个细节决定它到底显不显示，安装脚本都已处理：
   两种路径在启用桌面集成时都会被安装器明确拒绝。
 - 安装与卸载后都会刷新 `update-desktop-database` 和 `gtk-update-icon-cache`；陈旧的
   图标缓存会盖住刚装进去的图标。`DESTDIR` 打包时跳过，交给包管理器处理。
+- 安装器会尝试删除更名前遗留的 `io.github.beamiter.jterm3.desktop`；这一步发生在新版本
+  完整提交之后，只是迁移清理。`DESTDIR` 下会在删除点再次检查目录祖先；路径变化、权限等
+  原因导致删除失败时会警告并继续刷新缓存、报告安装成功。
 - `StartupWMClass` 为 `io.github.beamiter.frost`，与窗口真实的 `WM_CLASS` 一致。
   iced 把 `window::Settings` 里的 `platform_specific.application_id` 同时用作 X11
   `WM_CLASS` 与 Wayland app_id；不设置时两者都是空字符串，桌面环境无法把窗口关联到
