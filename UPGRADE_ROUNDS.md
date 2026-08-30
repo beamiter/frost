@@ -463,3 +463,11 @@ Round 70 closes the remaining argument-form affordance gap:
     Only an all-renamed plan commits: later purge/rmdir failures are non-fatal,
     keep target names absent, retain a named quarantine when needed, and print
     a copy-safe `mv -fT` recovery command instead of reporting rollback.
+
+92. **Inode-owned quarantine lifecycle** — mktemp reservations, rollback
+    sources, and purge entries are now checked against their recorded inode at
+    every use point. A later reservation replaced by a symlink aborts staging,
+    restores the earlier binary, and leaves the substitute untouched; a
+    post-rename quarantine substitution likewise invokes no `rm`, follows no
+    referent, and is never advertised as the displaced original's recovery
+    copy. Post-action command failures are reconciled by observed inode state.

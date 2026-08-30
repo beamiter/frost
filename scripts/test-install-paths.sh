@@ -1057,6 +1057,7 @@ printf '%s\n' \
     'count=$((count + 1))' \
     'printf "%s\n" "${count}" >"${state}"' \
     '[ "${count}" -ne 3 ] || exit 76' \
+    'if [ "${count}" -eq 4 ]; then /usr/bin/mv "$@"; exit 77; fi' \
     'exec /usr/bin/mv "$@"' \
     >"${uninstall_rollback_tools}/mv"
 chmod 0755 "${uninstall_rollback_tools}/mv"
@@ -1071,6 +1072,9 @@ fi
 assert_contains "uninstall rollback diagnostic" \
     "$(<"${TEST_ROOT}/uninstall-rollback.log")" \
     "cannot quarantine uninstall target ${uninstall_rollback_targets[2]}"
+[[ "$(<"${TEST_ROOT}/uninstall-rollback.log")" != \
+    *"rollback failed for ${uninstall_rollback_targets[1]}"* ]] \
+    || fail "post-restore mv failure was reported as an unrestored target"
 for index in "${!uninstall_rollback_targets[@]}"; do
     [[ "$(<"${uninstall_rollback_targets[index]}")" == \
         "old uninstall rollback target ${index}" ]] \
@@ -1128,6 +1132,198 @@ fi
 [[ -z "$(find "${uninstall_interrupt_stage}" \
     -name '*.uninstall.*' -print -quit)" ]] \
     || fail "uninstall interrupt rollback left a quarantine"
+
+# Reservation names are untrusted again after mktemp returns. After the first
+# target moves, replace the later desktop reservation with a symlink. Its
+# recorded placeholder inode must reject the second rename; rollback restores
+# the binary while cleanup refuses to unlink the substituted entry or referent.
+uninstall_reservation_tools="${TEST_ROOT}/uninstall-reservation-tools"
+uninstall_reservation_stage="${TEST_ROOT}/uninstall-reservation-stage"
+uninstall_reservation_prefix="/opt/frost-uninstall-reservation"
+uninstall_reservation_binary="${uninstall_reservation_stage}${uninstall_reservation_prefix}/bin/frost"
+uninstall_reservation_app_dir="${uninstall_reservation_stage}${uninstall_reservation_prefix}/share/applications"
+uninstall_reservation_desktop="${uninstall_reservation_app_dir}/${app_id}.desktop"
+uninstall_reservation_marker="${TEST_ROOT}/uninstall-reservation-replaced"
+uninstall_reservation_victim="${TEST_ROOT}/uninstall-reservation-victim"
+uninstall_reservation_saved="${TEST_ROOT}/uninstall-reservation-original-placeholder"
+mkdir -p "${uninstall_reservation_tools}" \
+    "${uninstall_reservation_binary%/*}" "${uninstall_reservation_app_dir}" \
+    "${uninstall_reservation_victim}"
+printf 'binary restored after reservation replacement\n' \
+    >"${uninstall_reservation_binary}"
+printf 'desktop preserved after reservation replacement\n' \
+    >"${uninstall_reservation_desktop}"
+uninstall_reservation_binary_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_reservation_binary}")"
+uninstall_reservation_desktop_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_reservation_desktop}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_RESERVATION_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "$@"' \
+    '    : >"${FROST_TEST_UNINSTALL_RESERVATION_MARKER}"' \
+    '    found=' \
+    '    for candidate in "${FROST_TEST_UNINSTALL_RESERVATION_DIR:?}"/.io.github.beamiter.frost.desktop.uninstall.*; do' \
+    '        [ -e "${candidate}" ] || continue' \
+    '        found=${candidate}' \
+    '        break' \
+    '    done' \
+    '    [ -n "${found}" ]' \
+    '    /usr/bin/mv "${found}" "${FROST_TEST_UNINSTALL_RESERVATION_SAVED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_RESERVATION_VICTIM:?}" "${found}"' \
+    '    exit 0' \
+    'fi' \
+    'exec /usr/bin/mv "$@"' \
+    >"${uninstall_reservation_tools}/mv"
+chmod 0755 "${uninstall_reservation_tools}/mv"
+if env HOME="${TEST_HOME}" \
+    PATH="${uninstall_reservation_tools}:${TEST_PATH}" \
+    FROST_TEST_UNINSTALL_RESERVATION_MARKER="${uninstall_reservation_marker}" \
+    FROST_TEST_UNINSTALL_RESERVATION_DIR="${uninstall_reservation_app_dir}" \
+    FROST_TEST_UNINSTALL_RESERVATION_SAVED="${uninstall_reservation_saved}" \
+    FROST_TEST_UNINSTALL_RESERVATION_VICTIM="${uninstall_reservation_victim}" \
+    DESTDIR="${uninstall_reservation_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_reservation_prefix}" \
+    >"${TEST_ROOT}/uninstall-reservation.log" 2>&1; then
+    fail "uninstaller accepted a replaced quarantine reservation"
+fi
+mapfile -t uninstall_reservation_links < <(
+    find "${uninstall_reservation_app_dir}" -maxdepth 1 \
+        -name '.io.github.beamiter.frost.desktop.uninstall.*' -print
+)
+(( ${#uninstall_reservation_links[@]} == 1 )) \
+    || fail "reservation replacement did not leave exactly one refused entry"
+uninstall_reservation_link="${uninstall_reservation_links[0]}"
+assert_contains "changed reservation diagnostic" \
+    "$(<"${TEST_ROOT}/uninstall-reservation.log")" \
+    "uninstall quarantine reservation changed after preflight: ${uninstall_reservation_link}"
+assert_contains "changed reservation cleanup warning" \
+    "$(<"${TEST_ROOT}/uninstall-reservation.log")" \
+    "refusing to remove changed unused quarantine ${uninstall_reservation_link}"
+[[ -L "${uninstall_reservation_link}" ]] \
+    || fail "changed quarantine reservation was unlinked"
+[[ "$(readlink -- "${uninstall_reservation_link}")" == \
+    "${uninstall_reservation_victim}" ]] \
+    || fail "changed quarantine reservation link target changed"
+[[ -z "$(find "${uninstall_reservation_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "changed quarantine reservation referent was touched"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${uninstall_reservation_binary}")" == \
+    "${uninstall_reservation_binary_identity}" ]] \
+    || fail "reservation replacement rollback changed binary inode metadata"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${uninstall_reservation_desktop}")" == \
+    "${uninstall_reservation_desktop_identity}" ]] \
+    || fail "reservation replacement changed desktop inode metadata"
+
+# Purge also owns only the inode that quarantine received from the target.
+# Move that inode aside and substitute a symlink after mv reports success. The
+# committed target stays absent, but purge must neither call rm on the changed
+# name nor advertise the symlink as a recovery copy of the original.
+uninstall_changed_purge_tools="${TEST_ROOT}/uninstall-changed-purge-tools"
+uninstall_changed_purge_stage="${TEST_ROOT}/uninstall-changed-purge-stage"
+uninstall_changed_purge_prefix="/opt/frost-uninstall-changed-purge"
+uninstall_changed_purge_binary="${uninstall_changed_purge_stage}${uninstall_changed_purge_prefix}/bin/frost"
+uninstall_changed_purge_displaced="${TEST_ROOT}/uninstall-changed-purge-original"
+uninstall_changed_purge_victim="${TEST_ROOT}/uninstall-changed-purge-victim"
+uninstall_changed_purge_rm_marker="${TEST_ROOT}/uninstall-changed-purge-rm-called"
+mkdir -p "${uninstall_changed_purge_tools}" \
+    "${uninstall_changed_purge_binary%/*}" "${uninstall_changed_purge_victim}"
+printf 'original inode displaced before purge\n' \
+    >"${uninstall_changed_purge_binary}"
+uninstall_changed_purge_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_changed_purge_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/mv "$@"' \
+    'last=' \
+    'for last do :; done' \
+    '/usr/bin/mv "${last}" "${FROST_TEST_UNINSTALL_CHANGED_PURGE_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CHANGED_PURGE_VICTIM:?}" "${last}"' \
+    >"${uninstall_changed_purge_tools}/mv"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"${FROST_TEST_UNINSTALL_CHANGED_PURGE_RM_MARKER:?}"' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_changed_purge_tools}/rm"
+chmod 0755 "${uninstall_changed_purge_tools}/mv" \
+    "${uninstall_changed_purge_tools}/rm"
+uninstall_changed_purge_output="$(
+    env HOME="${TEST_HOME}" \
+        PATH="${uninstall_changed_purge_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_CHANGED_PURGE_DISPLACED="${uninstall_changed_purge_displaced}" \
+        FROST_TEST_UNINSTALL_CHANGED_PURGE_VICTIM="${uninstall_changed_purge_victim}" \
+        FROST_TEST_UNINSTALL_CHANGED_PURGE_RM_MARKER="${uninstall_changed_purge_rm_marker}" \
+        DESTDIR="${uninstall_changed_purge_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_changed_purge_prefix}" 2>&1
+)"
+assert_absent "binary after changed committed quarantine" \
+    "${uninstall_changed_purge_binary}"
+mapfile -t uninstall_changed_purge_links < <(
+    find "${uninstall_changed_purge_binary%/*}" -maxdepth 1 \
+        -name '.frost.uninstall.*' -print
+)
+(( ${#uninstall_changed_purge_links[@]} == 1 )) \
+    || fail "changed purge quarantine did not remain named"
+uninstall_changed_purge_link="${uninstall_changed_purge_links[0]}"
+[[ -L "${uninstall_changed_purge_link}" ]] \
+    || fail "purge removed a changed quarantine symlink"
+[[ "$(readlink -- "${uninstall_changed_purge_link}")" == \
+    "${uninstall_changed_purge_victim}" ]] \
+    || fail "changed purge quarantine link target changed"
+assert_absent "rm call for changed purge quarantine" \
+    "${uninstall_changed_purge_rm_marker}"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_changed_purge_displaced}")" == \
+    "${uninstall_changed_purge_identity}" ]] \
+    || fail "changed purge lost the displaced original inode"
+[[ -z "$(find "${uninstall_changed_purge_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "changed purge followed the substitute symlink"
+assert_contains "changed purge warning" "${uninstall_changed_purge_output}" \
+    "refusing to purge changed quarantine for ${uninstall_changed_purge_binary}; unexpected entry retained at ${uninstall_changed_purge_link}"
+[[ "${uninstall_changed_purge_output}" != \
+    *"recovery after inspecting destination:"* ]] \
+    || fail "changed quarantine was falsely advertised as the original recovery inode"
+assert_contains "changed purge success summary" "${uninstall_changed_purge_output}" \
+    "Removed frost from ${uninstall_changed_purge_prefix}/bin"
+
+# A wrapper can also return failure after the requested unlink completed. Trust
+# the observed absence: there is no recovery inode to retain or advertise.
+uninstall_post_rm_tools="${TEST_ROOT}/uninstall-post-rm-tools"
+uninstall_post_rm_stage="${TEST_ROOT}/uninstall-post-rm-stage"
+uninstall_post_rm_prefix="/opt/frost-uninstall-post-rm"
+uninstall_post_rm_binary="${uninstall_post_rm_stage}${uninstall_post_rm_prefix}/bin/frost"
+mkdir -p "${uninstall_post_rm_tools}" "${uninstall_post_rm_binary%/*}"
+printf 'purged before rm reports failure\n' >"${uninstall_post_rm_binary}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/rm "$@"' \
+    'exit 79' \
+    >"${uninstall_post_rm_tools}/rm"
+chmod 0755 "${uninstall_post_rm_tools}/rm"
+uninstall_post_rm_output="$(
+    env HOME="${TEST_HOME}" PATH="${uninstall_post_rm_tools}:${TEST_PATH}" \
+        DESTDIR="${uninstall_post_rm_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_post_rm_prefix}" 2>&1
+)"
+assert_absent "binary after post-unlink rm failure" \
+    "${uninstall_post_rm_binary}"
+[[ -z "$(find "${uninstall_post_rm_stage}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "post-unlink rm failure falsely retained a quarantine"
+assert_contains "post-unlink rm warning" "${uninstall_post_rm_output}" \
+    "purge reported failure after removing ${uninstall_post_rm_binary}"
+[[ "${uninstall_post_rm_output}" != \
+    *"recovery after inspecting destination:"* ]] \
+    || fail "post-unlink rm failure printed a nonexistent recovery path"
+assert_contains "post-unlink rm success summary" "${uninstall_post_rm_output}" \
+    "Removed frost from ${uninstall_post_rm_prefix}/bin"
 
 # Once every owned name has moved, uninstall is committed. A purge failure
 # cannot honestly put that generation back; retain the exact inode under its

@@ -166,6 +166,9 @@ device 会在首个 `rm` 前拒绝并保持整套安装不变。workflow cleanup
 不可逆的 purge 阶段。中途 rename 失败或可捕获终止会逆序恢复原 inode；恢复失败会保留并
 报告 quarantine。commit 后的 purge 或空目录清理失败只警告：目标名已删除，所以仍如实报告
 卸载成功，同时给出可复制的 `mv -fT` 恢复命令。`SIGKILL`、掉电及并发替换仍超出该保证。
+reservation placeholder、rollback backup 与待 purge 项都会在使用点核对记录的 inode；若
+使用点看到名称已被换成 symlink 或其他对象，脚本既不会 unlink/restore 它，也不会把替代物
+误报成原文件的恢复副本。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机
 prefix 不套用祖先检查，但目标类型与 quarantine 状态机在两种模式下都生效。
 
