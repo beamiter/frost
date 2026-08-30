@@ -1306,6 +1306,339 @@ assert_contains "copy fallback publish failure diagnostic" \
     \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
     || fail "copy fallback rollback left a temporary or backup"
 
+# A symlink fallback has no descriptor that Bash can open without following
+# its referent. Force the primary hardlink to fail, let cp create the exact
+# link object but return non-zero, and do the same after ln creates a second
+# hardlink pin. A later publish failure must restore link text and ownership
+# metadata without touching the referent or leaking either owned name.
+install_symlink_fallback_tools="${TEST_ROOT}/install-symlink-fallback-tools"
+install_symlink_fallback_stage="${TEST_ROOT}/install-symlink-fallback-stage"
+install_symlink_fallback_prefix="/opt/frost-install-symlink-fallback"
+install_symlink_fallback_workflow_dir="${install_symlink_fallback_stage}${install_symlink_fallback_prefix}/share/frost/workflows"
+install_symlink_fallback_first="${install_symlink_fallback_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_fallback_second="${install_symlink_fallback_workflow_dir}/${WORKFLOW_SOURCES[1]##*/}"
+install_symlink_fallback_victim="${TEST_ROOT}/symlink fallback victim"
+install_symlink_fallback_ln_marker="${TEST_ROOT}/install-symlink-fallback-ln"
+install_symlink_fallback_pin_marker="${TEST_ROOT}/install-symlink-fallback-pin"
+install_symlink_fallback_cp_marker="${TEST_ROOT}/install-symlink-fallback-cp"
+install_symlink_fallback_mv_marker="${TEST_ROOT}/install-symlink-fallback-mv"
+install_symlink_fallback_mv_state="${TEST_ROOT}/install-symlink-fallback-mv-state"
+mkdir -p "${install_symlink_fallback_tools}" \
+    "${install_symlink_fallback_workflow_dir}"
+printf 'symlink fallback victim sentinel\n' \
+    >"${install_symlink_fallback_victim}"
+ln -s -- "${install_symlink_fallback_victim}" \
+    "${install_symlink_fallback_first}"
+install_symlink_fallback_value="$(readlink -- \
+    "${install_symlink_fallback_first}")"
+install_symlink_fallback_metadata="$(stat -c '%u:%g:%a' -- \
+    "${install_symlink_fallback_first}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/*.rollback-pin.*)' \
+    '        /usr/bin/ln "$@"' \
+    '        : >"${FROST_TEST_INSTALL_SYMLINK_FALLBACK_PIN_MARKER:?}"' \
+    '        exit 92' \
+    '        ;;' \
+    '    /proc/self/fd/*/*.rollback.*)' \
+    '        : >"${FROST_TEST_INSTALL_SYMLINK_FALLBACK_LN_MARKER:?}"' \
+    '        exit 90' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/ln "$@"' \
+    >"${install_symlink_fallback_tools}/ln"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/cp "$@"' \
+    ': >"${FROST_TEST_INSTALL_SYMLINK_FALLBACK_CP_MARKER:?}"' \
+    'exit 91' \
+    >"${install_symlink_fallback_tools}/cp"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/*.install.*)' \
+    '        state=${FROST_TEST_INSTALL_SYMLINK_FALLBACK_MV_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            : >"${FROST_TEST_INSTALL_SYMLINK_FALLBACK_MV_MARKER:?}"' \
+    '            exit 93' \
+    '        fi' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_fallback_tools}/mv"
+chmod 0755 "${install_symlink_fallback_tools}/ln" \
+    "${install_symlink_fallback_tools}/cp" \
+    "${install_symlink_fallback_tools}/mv"
+if env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_fallback_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_FALLBACK_LN_MARKER="${install_symlink_fallback_ln_marker}" \
+    FROST_TEST_INSTALL_SYMLINK_FALLBACK_PIN_MARKER="${install_symlink_fallback_pin_marker}" \
+    FROST_TEST_INSTALL_SYMLINK_FALLBACK_CP_MARKER="${install_symlink_fallback_cp_marker}" \
+    FROST_TEST_INSTALL_SYMLINK_FALLBACK_MV_MARKER="${install_symlink_fallback_mv_marker}" \
+    FROST_TEST_INSTALL_SYMLINK_FALLBACK_MV_STATE="${install_symlink_fallback_mv_state}" \
+    DESTDIR="${install_symlink_fallback_stage}" "${INSTALLER}" \
+    --binary "${cross_device_prebuilt}" \
+    --prefix "${install_symlink_fallback_prefix}" --no-desktop \
+    >"${TEST_ROOT}/install-symlink-fallback.log" 2>&1; then
+    fail "installer ignored a publish failure after symlink copy fallback"
+fi
+assert_regular_file "forced symlink hardlink failure marker" \
+    "${install_symlink_fallback_ln_marker}"
+assert_regular_file "completed symlink fallback copy marker" \
+    "${install_symlink_fallback_cp_marker}"
+assert_regular_file "completed symlink fallback pin marker" \
+    "${install_symlink_fallback_pin_marker}"
+assert_regular_file "symlink fallback publish failure marker" \
+    "${install_symlink_fallback_mv_marker}"
+[[ -L "${install_symlink_fallback_first}" ]] \
+    || fail "symlink copy fallback rollback did not restore a symlink"
+[[ "$(readlink -- "${install_symlink_fallback_first}")" == \
+    "${install_symlink_fallback_value}" ]] \
+    || fail "symlink copy fallback rollback changed the link text"
+[[ "$(stat -c '%u:%g:%a' -- "${install_symlink_fallback_first}")" == \
+    "${install_symlink_fallback_metadata}" ]] \
+    || fail "symlink copy fallback rollback changed owner/group/mode"
+[[ "$(<"${install_symlink_fallback_victim}")" == \
+    'symlink fallback victim sentinel' ]] \
+    || fail "symlink copy fallback followed the link referent"
+assert_absent "second target after symlink fallback rollback" \
+    "${install_symlink_fallback_second}"
+assert_contains "symlink fallback publish failure diagnostic" \
+    "$(<"${TEST_ROOT}/install-symlink-fallback.log")" \
+    "cannot atomically replace ${install_symlink_fallback_second}"
+[[ -z "$(find "${install_symlink_fallback_stage}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \
+        -o -name '*.rollback-pin.*' \) -print -quit)" ]] \
+    || fail "symlink copy fallback rollback left an owned artifact"
+
+# The pin placeholder is owned only while its exact reservation inode remains
+# at the bound name. Replace it from inside rm: backup preparation must stop
+# before publish, cleanup may remove the exact main hardlink but must retain the
+# unowned pin substitute without following it.
+install_symlink_pin_aba_tools="${TEST_ROOT}/install-symlink-pin-aba-tools"
+install_symlink_pin_aba_stage="${TEST_ROOT}/install-symlink-pin-aba-stage"
+install_symlink_pin_aba_prefix="/opt/frost-install-symlink-pin-aba"
+install_symlink_pin_aba_first="${install_symlink_pin_aba_stage}${install_symlink_pin_aba_prefix}/share/frost/workflows/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_pin_aba_original_victim="${TEST_ROOT}/install-symlink-pin-aba-original-victim"
+install_symlink_pin_aba_substitute_victim="${TEST_ROOT}/install-symlink-pin-aba-substitute-victim"
+install_symlink_pin_aba_path_log="${TEST_ROOT}/install-symlink-pin-aba-path"
+mkdir -p "${install_symlink_pin_aba_tools}" \
+    "${install_symlink_pin_aba_first%/*}"
+printf 'pin ABA original victim sentinel\n' \
+    >"${install_symlink_pin_aba_original_victim}"
+printf 'pin ABA substitute victim sentinel\n' \
+    >"${install_symlink_pin_aba_substitute_victim}"
+ln -s -- "${install_symlink_pin_aba_original_victim}" \
+    "${install_symlink_pin_aba_first}"
+install_symlink_pin_aba_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_symlink_pin_aba_first}")"
+install_symlink_pin_aba_value="$(readlink -- \
+    "${install_symlink_pin_aba_first}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/*.rollback-pin.*)' \
+    '        /usr/bin/rm "$@"' \
+    '        parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '        physical=${parent}/${last##*/}' \
+    '        printf "%s\n" "${physical}" >"${FROST_TEST_INSTALL_SYMLINK_PIN_ABA_PATH_LOG:?}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_PIN_ABA_VICTIM:?}" "${last}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_symlink_pin_aba_tools}/rm"
+chmod 0755 "${install_symlink_pin_aba_tools}/rm"
+if env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_pin_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_PIN_ABA_PATH_LOG="${install_symlink_pin_aba_path_log}" \
+    FROST_TEST_INSTALL_SYMLINK_PIN_ABA_VICTIM="${install_symlink_pin_aba_substitute_victim}" \
+    DESTDIR="${install_symlink_pin_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_pin_aba_prefix}" --no-desktop \
+    >"${TEST_ROOT}/install-symlink-pin-aba.log" 2>&1; then
+    fail "installer accepted a replaced symlink pin reservation"
+fi
+install_symlink_pin_aba_path="$(<"${install_symlink_pin_aba_path_log}")"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_symlink_pin_aba_first}")" == \
+    "${install_symlink_pin_aba_identity}" ]] \
+    || fail "symlink pin reservation ABA changed the original inode metadata"
+[[ "$(readlink -- "${install_symlink_pin_aba_first}")" == \
+    "${install_symlink_pin_aba_value}" ]] \
+    || fail "symlink pin reservation ABA changed the original link text"
+[[ -L "${install_symlink_pin_aba_path}" ]] \
+    || fail "cleanup deleted the symlink pin reservation substitute"
+[[ "$(readlink -- "${install_symlink_pin_aba_path}")" == \
+    "${install_symlink_pin_aba_substitute_victim}" ]] \
+    || fail "cleanup changed the symlink pin reservation substitute"
+[[ "$(<"${install_symlink_pin_aba_substitute_victim}")" == \
+    'pin ABA substitute victim sentinel' ]] \
+    || fail "cleanup followed the symlink pin reservation substitute"
+assert_contains "symlink pin reservation ABA diagnostic" \
+    "$(<"${TEST_ROOT}/install-symlink-pin-aba.log")" \
+    "symlink rollback pin reservation name changed while removing it beside ${install_symlink_pin_aba_first}"
+assert_contains "symlink pin reservation cleanup warning" \
+    "$(<"${TEST_ROOT}/install-symlink-pin-aba.log")" \
+    "refusing to remove changed rollback pin ${install_symlink_pin_aba_path}"
+install_symlink_pin_aba_backup="$(find \
+    "${install_symlink_pin_aba_first%/*}" -maxdepth 1 \
+    -name ".${install_symlink_pin_aba_first##*/}.rollback.??????" \
+    -print -quit)"
+[[ -n "${install_symlink_pin_aba_backup}" \
+    && -L "${install_symlink_pin_aba_backup}" ]] \
+    || fail "symlink pin reservation ABA lost the exact main recovery link"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_symlink_pin_aba_backup}")" == \
+    "${install_symlink_pin_aba_identity}" ]] \
+    || fail "symlink pin reservation ABA changed the main recovery identity"
+[[ "$(readlink -- "${install_symlink_pin_aba_backup}")" == \
+    "${install_symlink_pin_aba_value}" ]] \
+    || fail "symlink pin reservation ABA changed the main recovery link text"
+assert_contains "symlink pin reservation main-backup warning" \
+    "$(<"${TEST_ROOT}/install-symlink-pin-aba.log")" \
+    "refusing to remove changed rollback backup ${install_symlink_pin_aba_backup}"
+
+# Keep the copied/original symlink inode alive through publish with the second
+# name. After the first staged inode is installed, replace the main backup and
+# return non-zero; a later publish failure must leave that substitute alone and
+# retain the exact pin as an explicitly diagnosed recovery copy.
+install_symlink_publish_aba_tools="${TEST_ROOT}/install-symlink-publish-aba-tools"
+install_symlink_publish_aba_stage="${TEST_ROOT}/install-symlink-publish-aba-stage"
+install_symlink_publish_aba_prefix="/opt/frost-install-symlink-publish-aba"
+install_symlink_publish_aba_workflow_dir="${install_symlink_publish_aba_stage}${install_symlink_publish_aba_prefix}/share/frost/workflows"
+install_symlink_publish_aba_first="${install_symlink_publish_aba_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_publish_aba_second="${install_symlink_publish_aba_workflow_dir}/${WORKFLOW_SOURCES[1]##*/}"
+install_symlink_publish_aba_original_victim="${TEST_ROOT}/install-symlink-publish-aba-original-victim"
+install_symlink_publish_aba_substitute_victim="${TEST_ROOT}/install-symlink-publish-aba-substitute-victim"
+install_symlink_publish_aba_backup_log="${TEST_ROOT}/install-symlink-publish-aba-backup"
+install_symlink_publish_aba_pin_log="${TEST_ROOT}/install-symlink-publish-aba-pin"
+install_symlink_publish_aba_state="${TEST_ROOT}/install-symlink-publish-aba-state"
+install_symlink_publish_aba_second_marker="${TEST_ROOT}/install-symlink-publish-aba-second"
+mkdir -p "${install_symlink_publish_aba_tools}" \
+    "${install_symlink_publish_aba_workflow_dir}"
+printf 'publish ABA original symlink victim\n' \
+    >"${install_symlink_publish_aba_original_victim}"
+printf 'publish ABA substitute symlink victim\n' \
+    >"${install_symlink_publish_aba_substitute_victim}"
+ln -s -- "${install_symlink_publish_aba_original_victim}" \
+    "${install_symlink_publish_aba_first}"
+install_symlink_publish_aba_identity="$(stat -c '%d:%i' -- \
+    "${install_symlink_publish_aba_first}")"
+install_symlink_publish_aba_metadata="$(stat -c '%u:%g:%a' -- \
+    "${install_symlink_publish_aba_first}")"
+install_symlink_publish_aba_value="$(readlink -- \
+    "${install_symlink_publish_aba_first}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/*.install.*)' \
+    '        state=${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        if [ "${count}" -eq 1 ]; then' \
+    '            /usr/bin/mv "$@"' \
+    '            parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '            backup=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_BASENAME:?}.rollback.??????" -print -quit)' \
+    '            pin=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_BASENAME}.rollback-pin.*" -print -quit)' \
+    '            : "${backup:?missing symlink publish backup}"' \
+    '            : "${pin:?missing symlink publish pin}"' \
+    '            printf "%s\n" "${backup}" >"${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_BACKUP_LOG:?}"' \
+    '            printf "%s\n" "${pin}" >"${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_PIN_LOG:?}"' \
+    '            /usr/bin/rm -f -- "${backup}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_VICTIM:?}" "${backup}"' \
+    '            exit 94' \
+    '        fi' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            : >"${FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_SECOND_MARKER:?}"' \
+    '            exit 95' \
+    '        fi' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_publish_aba_tools}/mv"
+chmod 0755 "${install_symlink_publish_aba_tools}/mv"
+if env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_publish_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_STATE="${install_symlink_publish_aba_state}" \
+    FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_BASENAME="${install_symlink_publish_aba_first##*/}" \
+    FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_BACKUP_LOG="${install_symlink_publish_aba_backup_log}" \
+    FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_PIN_LOG="${install_symlink_publish_aba_pin_log}" \
+    FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_VICTIM="${install_symlink_publish_aba_substitute_victim}" \
+    FROST_TEST_INSTALL_SYMLINK_PUBLISH_ABA_SECOND_MARKER="${install_symlink_publish_aba_second_marker}" \
+    DESTDIR="${install_symlink_publish_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_publish_aba_prefix}" --no-desktop \
+    >"${TEST_ROOT}/install-symlink-publish-aba.log" 2>&1; then
+    fail "installer ignored a later failure after symlink backup ABA"
+fi
+install_symlink_publish_aba_backup="$(<"${install_symlink_publish_aba_backup_log}")"
+install_symlink_publish_aba_pin="$(<"${install_symlink_publish_aba_pin_log}")"
+assert_regular_file "later symlink publish failure marker" \
+    "${install_symlink_publish_aba_second_marker}"
+cmp -- "${WORKFLOW_SOURCES[0]}" "${install_symlink_publish_aba_first}" \
+    || fail "symlink publish ABA lost the exact staged destination"
+assert_absent "second target after symlink publish ABA" \
+    "${install_symlink_publish_aba_second}"
+[[ -L "${install_symlink_publish_aba_backup}" ]] \
+    || fail "rollback deleted the symlink backup substitute"
+[[ "$(readlink -- "${install_symlink_publish_aba_backup}")" == \
+    "${install_symlink_publish_aba_substitute_victim}" ]] \
+    || fail "rollback changed the symlink backup substitute"
+[[ -L "${install_symlink_publish_aba_pin}" ]] \
+    || fail "rollback deleted the exact symlink recovery pin"
+[[ "$(stat -c '%d:%i' -- "${install_symlink_publish_aba_pin}")" == \
+    "${install_symlink_publish_aba_identity}" ]] \
+    || fail "symlink recovery pin lost the original inode identity"
+[[ "$(stat -c '%u:%g:%a' -- "${install_symlink_publish_aba_pin}")" == \
+    "${install_symlink_publish_aba_metadata}" ]] \
+    || fail "symlink recovery pin changed the original inode metadata"
+[[ "$(readlink -- "${install_symlink_publish_aba_pin}")" == \
+    "${install_symlink_publish_aba_value}" ]] \
+    || fail "symlink recovery pin changed the original link text"
+[[ "$(<"${install_symlink_publish_aba_substitute_victim}")" == \
+    'publish ABA substitute symlink victim' ]] \
+    || fail "rollback followed the symlink backup substitute"
+assert_contains "later symlink publish failure diagnostic" \
+    "$(<"${TEST_ROOT}/install-symlink-publish-aba.log")" \
+    "cannot atomically replace ${install_symlink_publish_aba_second}"
+assert_contains "changed symlink backup rollback diagnostic" \
+    "$(<"${TEST_ROOT}/install-symlink-publish-aba.log")" \
+    "rollback refused changed backup for ${install_symlink_publish_aba_first}; unexpected entry retained at ${install_symlink_publish_aba_backup}"
+assert_contains "symlink recovery pin diagnostic" \
+    "$(<"${TEST_ROOT}/install-symlink-publish-aba.log")" \
+    "exact symlink recovery pin for ${install_symlink_publish_aba_first} retained at ${install_symlink_publish_aba_pin}"
+[[ -z "$(find "${install_symlink_publish_aba_stage}" \
+    -name '*.install.*' -print -quit)" ]] \
+    || fail "symlink publish ABA left a transaction-owned temporary"
+
 # External wrappers may report failure after completing an operation. Exact
 # post-action state wins: reservation/cleanup rm must observe absence, ln must
 # observe the original inode at the backup name, and publish mv must observe the

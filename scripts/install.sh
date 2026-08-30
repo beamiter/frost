@@ -26,6 +26,9 @@ INSTALL_BACKUPS=()
 INSTALL_BACKUP_BASENAMES=()
 INSTALL_BACKUP_IDENTITIES=()
 INSTALL_BACKUP_FDS=()
+INSTALL_BACKUP_PINS=()
+INSTALL_BACKUP_PIN_BASENAMES=()
+INSTALL_BACKUP_PIN_IDENTITIES=()
 INSTALL_ORIGINAL_PRESENT=()
 INSTALL_ORIGINAL_IDENTITIES=()
 INSTALL_PARENT_FDS=()
@@ -149,6 +152,31 @@ cleanup_install_artifacts() {
                 parent_warning_emitted[index]=1
             fi
         done
+        for index in "${!INSTALL_BACKUP_PINS[@]}"; do
+            path="${INSTALL_BACKUP_PINS[index]:-}"
+            [[ -n "${path}" ]] || continue
+            display="$(bound_install_entry_display "${index}" \
+                "${INSTALL_BACKUP_PIN_BASENAMES[index]}")"
+            if [[ -e "${path}" || -L "${path}" ]]; then
+                expected="${INSTALL_BACKUP_PIN_IDENTITIES[index]:-}"
+                if [[ -z "${expected}" ]] \
+                    || ! path_matches_identity "${path}" "${expected}"; then
+                    printf 'frost install: warning: refusing to remove changed rollback pin %s\n' \
+                        "${display}" >&2
+                else
+                    rm -f -- "${path}" || :
+                    if [[ -e "${path}" || -L "${path}" ]]; then
+                        if path_matches_identity "${path}" "${expected}"; then
+                            printf 'frost install: warning: cannot remove rollback pin %s\n' \
+                                "${display}" >&2
+                        else
+                            printf 'frost install: warning: rollback pin name changed during removal; replacement retained at %s\n' \
+                                "${display}" >&2
+                        fi
+                    fi
+                fi
+            fi
+        done
     fi
     for index in "${!INSTALL_BACKUP_FDS[@]}"; do
         fd="${INSTALL_BACKUP_FDS[index]:-}"
@@ -161,6 +189,9 @@ cleanup_install_artifacts() {
     INSTALL_BACKUP_BASENAMES=()
     INSTALL_BACKUP_IDENTITIES=()
     INSTALL_BACKUP_FDS=()
+    INSTALL_BACKUP_PINS=()
+    INSTALL_BACKUP_PIN_BASENAMES=()
+    INSTALL_BACKUP_PIN_IDENTITIES=()
     INSTALL_ORIGINAL_PRESENT=()
     INSTALL_ORIGINAL_IDENTITIES=()
     INSTALL_PARENT_FDS=()
@@ -284,6 +315,12 @@ bound_install_backup_display() {
     bound_install_entry_display "${index}" "${INSTALL_BACKUP_BASENAMES[index]}"
 }
 
+bound_install_backup_pin_display() {
+    local index="$1"
+    bound_install_entry_display "${index}" \
+        "${INSTALL_BACKUP_PIN_BASENAMES[index]}"
+}
+
 logical_install_parent_matches() {
     local index="$1"
     directory_referent_matches_identity "${INSTALL_DESTS[index]%/*}" \
@@ -292,14 +329,20 @@ logical_install_parent_matches() {
 
 install_backup_copy_matches() {
     local source="$1" expected_source_identity="$2" backup="$3"
-    local source_value backup_value source_mode backup_mode
+    local source_value backup_value source_metadata backup_metadata
+    local source_mode backup_mode
     path_matches_identity "${source}" "${expected_source_identity}" \
         || return 1
     if [[ -L "${source}" ]]; then
         [[ -L "${backup}" ]] || return 1
         source_value="$(readlink -- "${source}")" || return 1
         backup_value="$(readlink -- "${backup}")" || return 1
-        [[ "${backup_value}" == "${source_value}" ]]
+        [[ "${backup_value}" == "${source_value}" ]] || return 1
+        source_metadata="$(stat -c '%u:%g:%a' -- "${source}")" \
+            || return 1
+        backup_metadata="$(stat -c '%u:%g:%a' -- "${backup}")" \
+            || return 1
+        [[ "${backup_metadata}" == "${source_metadata}" ]]
         return
     fi
     [[ -f "${source}" && ! -L "${source}" \
@@ -333,11 +376,17 @@ opened_regular_install_backup_matches() {
 }
 
 install_backup_path_matches_identity() {
-    local index="$1" path="$2" expected="$3" fd
+    local index="$1" path="$2" expected="$3" fd pin
     path_matches_identity "${path}" "${expected}" || return 1
     fd="${INSTALL_BACKUP_FDS[index]:-}"
-    [[ -z "${fd}" ]] \
-        || opened_regular_install_backup_matches "${fd}" "${expected}"
+    if [[ -n "${fd}" ]]; then
+        opened_regular_install_backup_matches "${fd}" "${expected}" \
+            || return 1
+        return 0
+    fi
+    pin="${INSTALL_BACKUP_PINS[index]:-}"
+    [[ -z "${pin}" ]] \
+        || path_matches_identity "${pin}" "${expected}"
 }
 
 retain_regular_install_backup_fd() {
@@ -364,6 +413,85 @@ retain_regular_install_backup_fd() {
     INSTALL_BACKUP_FDS[index]="${candidate_fd}"
 }
 
+retain_symlink_install_backup_pin() {
+    local index="$1" backup="$2" expected="$3" dest="$4"
+    local source="$5" source_identity="$6"
+    local basename pin reservation_identity reservation_fd
+    local reservation_fd_path command_status=0
+    basename="${INSTALL_DEST_BASENAMES[index]}"
+    pin="$(mktemp "$(bound_install_entry_path "${index}" \
+        ".${basename}.rollback-pin.XXXXXX")")" \
+        || die "cannot reserve symlink rollback pin beside ${dest}"
+    INSTALL_BACKUP_PIN_BASENAMES[index]="${pin##*/}"
+    INSTALL_BACKUP_PINS[index]="$(bound_install_entry_path "${index}" \
+        "${INSTALL_BACKUP_PIN_BASENAMES[index]}")"
+    pin="${INSTALL_BACKUP_PINS[index]}"
+    reservation_identity="$(stat -c '%d:%i' -- "${pin}")" \
+        || die "cannot identify symlink rollback pin reservation beside ${dest}"
+    INSTALL_BACKUP_PIN_IDENTITIES[index]="${reservation_identity}"
+    unset reservation_fd
+    exec {reservation_fd}<>"${pin}" \
+        || die "cannot open symlink rollback pin reservation beside ${dest}"
+    reservation_fd_path="/proc/self/fd/${reservation_fd}"
+    if ! opened_staged_install_artifact_matches "${reservation_fd_path}" \
+        "${reservation_identity}" \
+        || ! path_matches_identity "${pin}" "${reservation_identity}"; then
+        INSTALL_BACKUP_PIN_IDENTITIES[index]=""
+        exec {reservation_fd}>&-
+        die "symlink rollback pin reservation changed while opening ${dest}"
+    fi
+    if ! logical_install_parent_matches "${index}"; then
+        exec {reservation_fd}>&-
+        die "install destination directory changed while reserving symlink rollback pin: ${dest%/*}"
+    fi
+    if ! install_backup_copy_matches "${source}" "${source_identity}" \
+        "${backup}"; then
+        exec {reservation_fd}>&-
+        die "symlink rollback backup changed while reserving pin for ${dest}"
+    fi
+    if ! path_matches_identity "${backup}" "${expected}"; then
+        exec {reservation_fd}>&-
+        die "symlink rollback backup identity changed while reserving pin for ${dest}"
+    fi
+    rm -f -- "${pin}" || :
+    if [[ -e "${pin}" || -L "${pin}" ]]; then
+        if path_matches_identity "${pin}" "${reservation_identity}"; then
+            exec {reservation_fd}>&-
+            die "cannot prepare symlink rollback pin beside ${dest}"
+        fi
+        INSTALL_BACKUP_PIN_IDENTITIES[index]=""
+        exec {reservation_fd}>&-
+        die "symlink rollback pin reservation name changed while removing it beside ${dest}"
+    fi
+    exec {reservation_fd}>&-
+    INSTALL_BACKUP_PIN_IDENTITIES[index]=""
+    logical_install_parent_matches "${index}" \
+        || die "install destination directory changed while preparing symlink rollback pin: ${dest%/*}"
+    install_backup_copy_matches "${source}" "${source_identity}" \
+        "${backup}" \
+        || die "symlink rollback backup changed before pinning ${dest}"
+    path_matches_identity "${backup}" "${expected}" \
+        || die "symlink rollback backup identity changed before pinning ${dest}"
+    ln -P -- "${backup}" "${pin}" 2>/dev/null || command_status=$?
+    if path_matches_identity "${backup}" "${expected}" \
+        && path_matches_identity "${pin}" "${expected}" \
+        && install_backup_copy_matches "${source}" "${source_identity}" \
+            "${backup}"; then
+        # Exact post-state is authoritative when an instrumented ln reports
+        # failure after creating the second link to the copied symlink inode.
+        INSTALL_BACKUP_PIN_IDENTITIES[index]="${expected}"
+    elif [[ -e "${pin}" || -L "${pin}" ]]; then
+        INSTALL_BACKUP_PIN_IDENTITIES[index]=""
+        die "symlink rollback pin name was replaced while linking ${dest}"
+    elif ((command_status == 0)); then
+        die "symlink rollback pin disappeared while linking ${dest}"
+    else
+        die "cannot pin symlink rollback backup for ${dest}"
+    fi
+    logical_install_parent_matches "${index}" \
+        || die "install destination directory changed while pinning symlink rollback backup: ${dest%/*}"
+}
+
 bind_install_destination() {
     local index="$1" dest="$2" directory fd identity bind_status
     directory="${dest%/*}"
@@ -385,7 +513,8 @@ bind_install_destination() {
 
 rollback_install_plan() {
     local index dest dest_path dest_display backup backup_display
-    local backup_identity original_identity staged_identity rollback_failed=0
+    local backup_identity original_identity staged_identity pin pin_identity
+    local pin_display rollback_failed=0
     for ((index = PUBLISH_LAST_ATTEMPT; index >= 0; index--)); do
         dest="${INSTALL_DESTS[index]}"
         dest_path="$(bound_install_dest_path "${index}")"
@@ -403,6 +532,17 @@ rollback_install_plan() {
                         "${backup}" "${backup_identity}"; then
                     printf 'frost install: rollback refused changed backup for %s; unexpected entry retained at %s\n' \
                         "${dest_display}" "${backup_display}" >&2
+                    pin="${INSTALL_BACKUP_PINS[index]:-}"
+                    pin_identity="${INSTALL_BACKUP_PIN_IDENTITIES[index]:-}"
+                    if [[ -n "${pin}" && -n "${pin_identity}" \
+                        && ( -e "${pin}" || -L "${pin}" ) ]] \
+                        && path_matches_identity "${pin}" \
+                            "${pin_identity}"; then
+                        pin_display="$(bound_install_backup_pin_display \
+                            "${index}")"
+                        printf 'frost install: exact symlink recovery pin for %s retained at %s\n' \
+                            "${dest_display}" "${pin_display}" >&2
+                    fi
                     rollback_failed=1
                 elif path_matches_identity "${dest_path}" \
                     "${original_identity}"; then
@@ -779,6 +919,10 @@ prepare_install_backups() {
     INSTALL_BACKUPS=()
     INSTALL_BACKUP_BASENAMES=()
     INSTALL_BACKUP_IDENTITIES=()
+    INSTALL_BACKUP_FDS=()
+    INSTALL_BACKUP_PINS=()
+    INSTALL_BACKUP_PIN_BASENAMES=()
+    INSTALL_BACKUP_PIN_IDENTITIES=()
     INSTALL_ORIGINAL_PRESENT=()
     INSTALL_ORIGINAL_IDENTITIES=()
     # Validate the complete final-target set before creating even the first
@@ -806,6 +950,9 @@ prepare_install_backups() {
         INSTALL_BACKUP_BASENAMES[index]=""
         INSTALL_BACKUP_IDENTITIES[index]=""
         INSTALL_BACKUP_FDS[index]=""
+        INSTALL_BACKUP_PINS[index]=""
+        INSTALL_BACKUP_PIN_BASENAMES[index]=""
+        INSTALL_BACKUP_PIN_IDENTITIES[index]=""
         fallback_fd=""
         if [[ -e "${dest_path}" || -L "${dest_path}" ]]; then
             [[ -f "${dest_path}" || -L "${dest_path}" ]] \
@@ -939,7 +1086,7 @@ prepare_install_backups() {
                         die "cannot reconcile fallback rollback backup for ${dest}"
                     fi
                 else
-                    cp -a --no-dereference --no-preserve=ownership -- \
+                    cp -a --no-dereference -- \
                         "${dest_path}" "${INSTALL_BACKUPS[index]}" \
                         || command_status=$?
                     if ! install_backup_copy_matches "${dest_path}" \
@@ -971,6 +1118,13 @@ prepare_install_backups() {
                     "${INSTALL_BACKUPS[index]}" "${backup_identity}" \
                     "${dest}" "${fallback_fd:-}"
                 fallback_fd=""
+            elif [[ -L "${INSTALL_BACKUPS[index]}" ]]; then
+                retain_symlink_install_backup_pin "${index}" \
+                    "${INSTALL_BACKUPS[index]}" "${backup_identity}" \
+                    "${dest}" "${dest_path}" "${original_identity}"
+            else
+                INSTALL_BACKUP_IDENTITIES[index]=""
+                die "rollback backup is not a regular file or symlink for ${dest}"
             fi
             logical_install_parent_matches "${index}" \
                 || die "install destination directory changed while backing up: ${directory}"

@@ -540,3 +540,13 @@ Round 70 closes the remaining argument-form affordance gap:
     A deterministic two-publish regression replaces both names after the first
     completed rename, forces the second rename to fail, and proves rollback
     touches neither substitute while reporting the unrecoverable predecessor.
+
+100. **Pinned symlink fallback snapshots** — a copied symlink backup is accepted
+     only when its link text, uid/gid, and mode match the exact source, then a
+     second same-directory hardlink pins that new inode through publish and
+     rollback. The pin reservation itself stays descriptor-pinned while its
+     placeholder name is removed, closing immediate inode-number reuse. Exact
+     post-state reconciles `cp`/`ln` wrappers that finish then return non-zero;
+     deterministic reservation and post-publish ABA regressions prove cleanup
+     never unlinks substitutes, while failed rollback retains and diagnoses the
+     original symlink inode under its recovery pin.
