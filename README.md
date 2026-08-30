@@ -140,16 +140,20 @@ cargo build --release --locked
 符号链接的普通文件；此路径要求 Linux 已挂载 `/proc/self/fd` 并提供 GNU `stat`，描述符固定不可用时会
 明确报错。这里的 Bash 实现并非原子的 no-follow open；只有在文件成功打开且路径名与描述符
 完成同一 inode 的身份复核后，之后再替换路径名才不会改变经该描述符复制的 inode。目标二进制
-权限统一设为 `0755`。目标同目录中的私有临时文件写完后，由 GNU `mv -T` 原子替换；复制失败
+权限统一设为 `0755`。每个目标同目录中的私有临时 inode 会先被打开，内容与 mode 只通过这个
+描述符写入，再由 GNU `mv -T` 原子替换；因此跨文件系统输入不依赖 inode 复用，复制期间被换掉
+的临时名称会撤销事务所有权，既不会发布也不会在退出清理中删除替代物。复制失败
 或发布阶段前退出会清理整批未提交临时文件并保留旧版本。binary、workflow、desktop、元数据与
 图标会全部 staging 成功后才开始 rename；资源先发布，二进制作为最后一个提交点，因此任何
 复制/转换失败都不会留下半升级。发布前还会为每个既有目标创建不跟随符号链接的同目录回滚
 快照：优先 hardlink 原 inode，因此 owner/group、mode、xattr、hardlink 关系及 dangling symlink
-对象都能原样恢复；文件系统或安全策略拒绝 hardlink 时回退到不跟随链接的 `cp -a`，此时保证
+对象都能原样恢复；文件系统或安全策略拒绝 hardlink 时回退到不跟随链接的 `cp -a`，普通文件
+会复制进已打开且身份已记录的 reservation inode，并在命令后复核源、描述符与逻辑名称，此时保证
 内容、mode 与链接值，但不承诺保留原 owner/group 或 inode。rename 失败或可捕获的终止信号会
 按逆序恢复已尝试目标。真实安装会在 staging 前打开并记录每个物理目标目录，之后的临时文件
 创建、rollback backup、发布 rename、逆序恢复及成功后的 backup 清理都只使用这个目录 fd 下的
-相对名称。即使逻辑 parent 在 `mktemp`、`ln`、`mv` 或 `rm` 内被换成指向另一目录的 symlink，
+相对名称。即使逻辑 parent 在 `mktemp`、`cat`/`cp`、`chmod`、`ln`、`mv` 或 `rm` 内被换成
+指向另一目录的 symlink，
 操作也只落在原目录 inode；紧随其后的身份检查会中止并绑定回滚，既不会删除新 referent 中的
 同名文件，也不会在已提交的旧 parent 留下 backup。reservation 名称只有在确认消失后才会
 复用，hardlink backup 必须与原目标 inode 完全一致；命令即使返回非零，只要观察到的
@@ -157,7 +161,7 @@ cargo build --release --locked
 不会被后续 cleanup 再次删除。各 rename 自身原子，但整批
 rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回滚本身的 I/O 故障仍可能留下混合
 版本；恢复失败时 backup 会保留并打印路径，不会被清理。除上述条件外还需要 GNU coreutils 的
-`cp`/`ln`/`mktemp`/`mv`/`readlink`。它可与
+`cat`/`chmod`/`cmp`/`cp`/`ln`/`mktemp`/`mv`/`readlink`。它可与
 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR` 组合使用。
 零字节预编译产物会在旧目标改变前被拒绝。desktop、AppStream、SVG 与 PNG 源文件都在
 构建/写入前预检，公共资源也以明确权限写入目标同目录临时文件后原子 rename。非根

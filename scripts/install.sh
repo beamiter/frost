@@ -167,6 +167,24 @@ path_matches_identity() {
     [[ "${actual}" == "${expected}" ]]
 }
 
+staged_install_artifact_matches() {
+    local path="$1" expected="$2" link_count
+    [[ -f "${path}" && ! -L "${path}" ]] \
+        && path_matches_identity "${path}" "${expected}" \
+        || return 1
+    link_count="$(stat -c '%h' -- "${path}")" || return 1
+    [[ "${link_count}" == 1 ]]
+}
+
+opened_staged_install_artifact_matches() {
+    local fd_path="$1" expected="$2" actual link_count
+    [[ -f "${fd_path}" ]] || return 1
+    actual="$(stat -Lc '%d:%i' -- "${fd_path}")" || return 1
+    [[ "${actual}" == "${expected}" ]] || return 1
+    link_count="$(stat -Lc '%h' -- "${fd_path}")" || return 1
+    [[ "${link_count}" == 1 ]]
+}
+
 real_directory_matches_identity() {
     local path="$1" expected="$2"
     [[ -d "${path}" && ! -L "${path}" ]] \
@@ -260,6 +278,41 @@ logical_install_parent_matches() {
     local index="$1"
     directory_referent_matches_identity "${INSTALL_DESTS[index]%/*}" \
         "${INSTALL_PARENT_IDENTITIES[index]}"
+}
+
+install_backup_copy_matches() {
+    local source="$1" expected_source_identity="$2" backup="$3"
+    local source_value backup_value source_mode backup_mode
+    path_matches_identity "${source}" "${expected_source_identity}" \
+        || return 1
+    if [[ -L "${source}" ]]; then
+        [[ -L "${backup}" ]] || return 1
+        source_value="$(readlink -- "${source}")" || return 1
+        backup_value="$(readlink -- "${backup}")" || return 1
+        [[ "${backup_value}" == "${source_value}" ]]
+        return
+    fi
+    [[ -f "${source}" && ! -L "${source}" \
+        && -f "${backup}" && ! -L "${backup}" ]] || return 1
+    cmp -s -- "${source}" "${backup}" || return 1
+    source_mode="$(stat -c '%a' -- "${source}")" || return 1
+    backup_mode="$(stat -c '%a' -- "${backup}")" || return 1
+    [[ "${backup_mode}" == "${source_mode}" ]]
+}
+
+opened_regular_backup_copy_matches() {
+    local source="$1" expected_source_identity="$2"
+    local backup_fd_path="$3" expected_backup_identity="$4"
+    local source_mode backup_mode
+    path_matches_identity "${source}" "${expected_source_identity}" \
+        || return 1
+    [[ -f "${source}" && ! -L "${source}" ]] || return 1
+    opened_staged_install_artifact_matches "${backup_fd_path}" \
+        "${expected_backup_identity}" || return 1
+    cmp -s -- "${source}" "${backup_fd_path}" || return 1
+    source_mode="$(stat -c '%a' -- "${source}")" || return 1
+    backup_mode="$(stat -Lc '%a' -- "${backup_fd_path}")" || return 1
+    [[ "${backup_mode}" == "${source_mode}" ]]
 }
 
 bind_install_destination() {
@@ -501,6 +554,92 @@ validate_staging_target() {
     done
 }
 
+populate_staged_install_artifact() {
+    local index="$1" source="$2" mode="$3" dest="$4"
+    local temp="${INSTALL_TEMPS[index]}" staged_identity staged_fd fd_path
+    local actual_mode command_status
+    staged_identity="${INSTALL_STAGED_IDENTITIES[index]}"
+
+    # GNU install deliberately unlinks an existing destination before copying,
+    # so it cannot preserve the inode mktemp gave this transaction. Keep that
+    # inode open and address the descriptor itself while copying and chmodding;
+    # an ABA replacement of the logical temporary name can then neither receive
+    # bytes nor be mistaken for this transaction's artifact.
+    unset staged_fd
+    exec {staged_fd}<>"${temp}" \
+        || die "cannot open install temporary for ${dest}"
+    fd_path="/proc/self/fd/${staged_fd}"
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${temp}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "install temporary changed while opening ${dest}"
+    fi
+
+    printf 'frost install reservation %s\n' \
+        "${INSTALL_TEMP_BASENAMES[index]}" >"${fd_path}" \
+        || die "cannot initialize install temporary for ${dest}"
+    if cmp -s -- "${source}" "${fd_path}"; then
+        printf '\n' >>"${fd_path}" \
+            || die "cannot distinguish install temporary for ${dest}"
+    fi
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${temp}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "install temporary changed while initializing ${dest}"
+    fi
+
+    command_status=0
+    cat -- "${source}" >"${fd_path}" || command_status=$?
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${temp}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "install temporary changed while copying ${dest}"
+    fi
+    if ! cmp -s -- "${source}" "${fd_path}"; then
+        exec {staged_fd}>&-
+        if ((command_status != 0)); then
+            die "cannot copy staged content for ${dest}"
+        fi
+        die "cannot reconcile staged content for ${dest}"
+    fi
+    # Exact descriptor and pathname state is authoritative when an
+    # instrumented byte-copy command reports failure after completing output.
+
+    command_status=0
+    chmod "${mode}" "${fd_path}" || command_status=$?
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${temp}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "install temporary changed while setting mode for ${dest}"
+    fi
+    actual_mode="$(stat -Lc '%a' -- "${fd_path}")" \
+        || die "cannot identify staged mode for ${dest}"
+    if [[ "${actual_mode}" != "${mode#0}" ]]; then
+        exec {staged_fd}>&-
+        if ((command_status != 0)); then
+            die "cannot set staged mode for ${dest}"
+        fi
+        die "cannot reconcile staged mode for ${dest}"
+    fi
+    if ! cmp -s -- "${source}" "${fd_path}"; then
+        exec {staged_fd}>&-
+        die "staged content changed while setting mode for ${dest}"
+    fi
+    exec {staged_fd}>&-
+}
+
 stage_install_file() {
     local mode="$1" source="$2" dest="$3" directory basename temp
     local index staged_identity
@@ -530,13 +669,15 @@ stage_install_file() {
     staged_identity="$(stat -c '%d:%i' -- "${INSTALL_TEMPS[index]}")" \
         || die "cannot identify install temporary for ${dest}"
     INSTALL_STAGED_IDENTITIES[index]="${staged_identity}"
+    if ! staged_install_artifact_matches "${INSTALL_TEMPS[index]}" \
+        "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        die "install temporary is not a private regular file for ${dest}"
+    fi
     logical_install_parent_matches "${index}" \
         || die "install destination directory changed while staging: ${directory}"
-    if ! install -m "${mode}" "${source}" "${INSTALL_TEMPS[index]}"; then
-        die "cannot stage ${dest}"
-    fi
-    path_matches_identity "${INSTALL_TEMPS[index]}" "${staged_identity}" \
-        || die "install temporary changed while staging ${dest}"
+    populate_staged_install_artifact "${index}" "${source}" "${mode}" \
+        "${dest}"
     logical_install_parent_matches "${index}" \
         || die "install destination directory changed while staging: ${directory}"
 }
@@ -569,13 +710,14 @@ stage_install_binary() {
     staged_identity="$(stat -c '%d:%i' -- "${INSTALL_TEMPS[index]}")" \
         || die "cannot identify temporary binary for ${dest}"
     INSTALL_STAGED_IDENTITIES[index]="${staged_identity}"
+    if ! staged_install_artifact_matches "${INSTALL_TEMPS[index]}" \
+        "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        die "temporary binary is not a private regular file for ${dest}"
+    fi
     logical_install_parent_matches "${index}" \
         || die "binary destination directory changed while staging: ${directory}"
-    if ! install -m 0755 "${source}" "${INSTALL_TEMPS[index]}"; then
-        die "cannot stage binary for ${dest}"
-    fi
-    path_matches_identity "${INSTALL_TEMPS[index]}" "${staged_identity}" \
-        || die "temporary binary changed while staging ${dest}"
+    populate_staged_install_artifact "${index}" "${source}" 0755 "${dest}"
     logical_install_parent_matches "${index}" \
         || die "binary destination directory changed while staging: ${directory}"
 }
@@ -583,6 +725,8 @@ stage_install_binary() {
 prepare_install_backups() {
     local index dest dest_path directory basename backup reservation_identity
     local original_identity backup_identity staged_identity command_status
+    local fallback fallback_identity fallback_is_symlink
+    local fallback_fd fallback_fd_path
     INSTALL_BACKUPS=()
     INSTALL_BACKUP_BASENAMES=()
     INSTALL_BACKUP_IDENTITIES=()
@@ -597,7 +741,8 @@ prepare_install_backups() {
         staged_identity="${INSTALL_STAGED_IDENTITIES[index]}"
         logical_install_parent_matches "${index}" \
             || die "install destination directory changed before backup: ${dest%/*}"
-        path_matches_identity "$(bound_install_temp_path "${index}")" \
+        staged_install_artifact_matches \
+            "$(bound_install_temp_path "${index}")" \
             "${staged_identity}" \
             || die "install temporary changed before backup: ${dest}"
         if [[ -e "${dest_path}" || -L "${dest_path}" ]]; then
@@ -664,9 +809,107 @@ prepare_install_backups() {
                 die "rollback backup name was replaced while linking ${dest}"
             elif ((command_status == 0)); then
                 die "rollback backup disappeared while linking ${dest}"
-            elif ! cp -a --no-dereference --no-preserve=ownership -- \
-                "${dest_path}" "${INSTALL_BACKUPS[index]}"; then
-                die "cannot back up existing install target ${dest}"
+            else
+                # Hardlink creation can be forbidden by filesystem or policy.
+                # Reserve a fresh regular inode instead of asking cp to create
+                # an unknown name, so ordinary-file copies have a known exact
+                # destination identity before the external command runs.
+                fallback="$(mktemp "$(bound_install_entry_path "${index}" \
+                    ".${basename}.rollback.XXXXXX")")" \
+                    || die "cannot reserve fallback rollback backup beside ${dest}"
+                INSTALL_BACKUP_BASENAMES[index]="${fallback##*/}"
+                INSTALL_BACKUPS[index]="$(bound_install_backup_path "${index}")"
+                fallback_identity="$(stat -c '%d:%i' -- \
+                    "${INSTALL_BACKUPS[index]}")" \
+                    || die "cannot identify fallback rollback reservation beside ${dest}"
+                INSTALL_BACKUP_IDENTITIES[index]="${fallback_identity}"
+                [[ -f "${INSTALL_BACKUPS[index]}" \
+                    && ! -L "${INSTALL_BACKUPS[index]}" ]] \
+                    || die "fallback rollback reservation is not a regular file beside ${dest}"
+                fallback_is_symlink=0
+                [[ -L "${dest_path}" ]] && fallback_is_symlink=1
+                if ((fallback_is_symlink == 0)); then
+                    unset fallback_fd
+                    exec {fallback_fd}<>"${INSTALL_BACKUPS[index]}" \
+                        || die "cannot open fallback rollback reservation beside ${dest}"
+                    fallback_fd_path="/proc/self/fd/${fallback_fd}"
+                    if ! opened_staged_install_artifact_matches \
+                        "${fallback_fd_path}" "${fallback_identity}" \
+                        || ! path_matches_identity \
+                            "${INSTALL_BACKUPS[index]}" \
+                            "${fallback_identity}"; then
+                        INSTALL_BACKUP_IDENTITIES[index]=""
+                        exec {fallback_fd}>&-
+                        die "fallback rollback reservation changed while opening ${dest}"
+                    fi
+                    printf 'frost rollback reservation %s\n' \
+                        "${fallback##*/}" >"${fallback_fd_path}" \
+                        || die "cannot initialize fallback rollback reservation beside ${dest}"
+                    if cmp -s -- "${dest_path}" \
+                        "${fallback_fd_path}"; then
+                        printf '\n' >>"${fallback_fd_path}" \
+                            || die "cannot distinguish fallback rollback reservation beside ${dest}"
+                    fi
+                    if ! opened_staged_install_artifact_matches \
+                        "${fallback_fd_path}" "${fallback_identity}" \
+                        || ! path_matches_identity \
+                            "${INSTALL_BACKUPS[index]}" \
+                            "${fallback_identity}"; then
+                        INSTALL_BACKUP_IDENTITIES[index]=""
+                        exec {fallback_fd}>&-
+                        die "fallback rollback reservation changed while initializing ${dest}"
+                    fi
+                fi
+                logical_install_parent_matches "${index}" \
+                    || die "install destination directory changed while reserving fallback backup: ${directory}"
+                path_matches_identity "${dest_path}" "${original_identity}" \
+                    || die "install target changed while reserving fallback backup: ${dest}"
+                command_status=0
+                if ((fallback_is_symlink == 0)); then
+                    cp -a --no-dereference --no-preserve=ownership -- \
+                        "${dest_path}" "${fallback_fd_path}" \
+                        || command_status=$?
+                    if ! opened_staged_install_artifact_matches \
+                        "${fallback_fd_path}" "${fallback_identity}" \
+                        || ! path_matches_identity \
+                            "${INSTALL_BACKUPS[index]}" \
+                            "${fallback_identity}"; then
+                        INSTALL_BACKUP_IDENTITIES[index]=""
+                        exec {fallback_fd}>&-
+                        die "fallback rollback backup name was replaced while copying ${dest}"
+                    fi
+                    if ! opened_regular_backup_copy_matches "${dest_path}" \
+                        "${original_identity}" "${fallback_fd_path}" \
+                        "${fallback_identity}"; then
+                        exec {fallback_fd}>&-
+                        if ((command_status != 0)); then
+                            die "cannot copy fallback rollback backup for ${dest}"
+                        fi
+                        die "cannot reconcile fallback rollback backup for ${dest}"
+                    fi
+                    exec {fallback_fd}>&-
+                else
+                    cp -a --no-dereference --no-preserve=ownership -- \
+                        "${dest_path}" "${INSTALL_BACKUPS[index]}" \
+                        || command_status=$?
+                    if ! install_backup_copy_matches "${dest_path}" \
+                        "${original_identity}" \
+                        "${INSTALL_BACKUPS[index]}"; then
+                        if [[ -e "${INSTALL_BACKUPS[index]}" \
+                            || -L "${INSTALL_BACKUPS[index]}" ]] \
+                            && ! path_matches_identity \
+                                "${INSTALL_BACKUPS[index]}" \
+                                "${fallback_identity}"; then
+                            INSTALL_BACKUP_IDENTITIES[index]=""
+                        fi
+                        if ((command_status != 0)); then
+                            die "cannot copy fallback rollback backup for ${dest}"
+                        fi
+                        die "cannot reconcile fallback rollback backup for ${dest}"
+                    fi
+                fi
+                # Exact copy semantics are authoritative even when a wrapper
+                # reports a failure after completing the operation.
             fi
             backup_identity="$(stat -c '%d:%i' -- \
                 "${INSTALL_BACKUPS[index]}")" \
@@ -703,7 +946,7 @@ publish_install_plan() {
         staged_identity="${INSTALL_STAGED_IDENTITIES[index]}"
         logical_install_parent_matches "${index}" \
             || die "install destination directory changed before publish: ${dest%/*}"
-        path_matches_identity "${temp}" "${staged_identity}" \
+        staged_install_artifact_matches "${temp}" "${staged_identity}" \
             || die "install temporary changed before publish: ${temp_display}"
         if (( ${INSTALL_ORIGINAL_PRESENT[index]:-0} == 1 )); then
             path_matches_identity "${dest_path}" \
@@ -844,7 +1087,8 @@ validate_desktop_exec_path() {
 
 stage_desktop_entry() {
     local source="$1" dest="$2" exec_path exec_value try_exec_value
-    local desktop_dir temp index staged_identity
+    local desktop_dir temp index staged_identity staged_fd fd_path
+    local actual_mode command_status
     exec_path="$(desktop_exec_path)"
     validate_desktop_exec_path "${exec_path}"
     exec_value="$(desktop_exec_value "${exec_path}")"
@@ -874,9 +1118,27 @@ stage_desktop_entry() {
     staged_identity="$(stat -c '%d:%i' -- "${INSTALL_TEMPS[index]}")" \
         || die "cannot identify temporary desktop entry for ${dest}"
     INSTALL_STAGED_IDENTITIES[index]="${staged_identity}"
+    if ! staged_install_artifact_matches "${INSTALL_TEMPS[index]}" \
+        "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        die "temporary desktop entry is not a private regular file for ${dest}"
+    fi
     logical_install_parent_matches "${index}" \
         || die "desktop-entry directory changed while staging: ${desktop_dir}"
-    if ! FROST_DESKTOP_EXEC_VALUE="${exec_value}" \
+    unset staged_fd
+    exec {staged_fd}<>"${INSTALL_TEMPS[index]}" \
+        || die "cannot open temporary desktop entry for ${dest}"
+    fd_path="/proc/self/fd/${staged_fd}"
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${INSTALL_TEMPS[index]}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "temporary desktop entry changed while opening ${dest}"
+    fi
+    command_status=0
+    FROST_DESKTOP_EXEC_VALUE="${exec_value}" \
         FROST_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
         awk '
         BEGIN { exec_count = 0; try_exec_count = 0 }
@@ -900,12 +1162,39 @@ stage_desktop_entry() {
         END {
             if (exec_count < 1 || try_exec_count != 1) exit 44
         }
-    ' "${source}" >"${INSTALL_TEMPS[index]}" \
-        || ! chmod 0644 "${INSTALL_TEMPS[index]}"; then
+    ' "${source}" >"${fd_path}" || command_status=$?
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${INSTALL_TEMPS[index]}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "temporary desktop entry changed while staging ${dest}"
+    fi
+    if ((command_status != 0)); then
+        exec {staged_fd}>&-
         die "cannot stage desktop entry for ${dest}"
     fi
-    path_matches_identity "${INSTALL_TEMPS[index]}" "${staged_identity}" \
-        || die "temporary desktop entry changed while staging ${dest}"
+    command_status=0
+    chmod 0644 "${fd_path}" || command_status=$?
+    if ! opened_staged_install_artifact_matches "${fd_path}" \
+        "${staged_identity}" \
+        || ! staged_install_artifact_matches "${INSTALL_TEMPS[index]}" \
+            "${staged_identity}"; then
+        INSTALL_STAGED_IDENTITIES[index]=""
+        exec {staged_fd}>&-
+        die "temporary desktop entry changed while setting mode for ${dest}"
+    fi
+    actual_mode="$(stat -Lc '%a' -- "${fd_path}")" \
+        || die "cannot identify temporary desktop-entry mode for ${dest}"
+    if [[ "${actual_mode}" != 644 ]]; then
+        exec {staged_fd}>&-
+        if ((command_status != 0)); then
+            die "cannot set desktop-entry mode for ${dest}"
+        fi
+        die "cannot reconcile desktop-entry mode for ${dest}"
+    fi
+    exec {staged_fd}>&-
     logical_install_parent_matches "${index}" \
         || die "desktop-entry directory changed while staging: ${desktop_dir}"
 }
@@ -1243,9 +1532,11 @@ require_command cp
 require_command ln
 require_command stat
 require_command readlink
+require_command cmp
+require_command cat
+require_command chmod
 if ((INSTALL_DESKTOP == 1)); then
     require_command awk
-    require_command chmod
     validate_desktop_exec_path "$(desktop_exec_path)"
 fi
 

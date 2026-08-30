@@ -534,9 +534,9 @@ printf '%s\n' \
     'for argument do' \
     '    case "${argument}" in *io.github.beamiter.frost-256.png) exit 73 ;; esac' \
     'done' \
-    'exec /usr/bin/install "$@"' \
-    >"${stage_failure_tools}/install"
-chmod 0755 "${stage_failure_tools}/install"
+    'exec /usr/bin/cat "$@"' \
+    >"${stage_failure_tools}/cat"
+chmod 0755 "${stage_failure_tools}/cat"
 if env HOME="${TEST_HOME}" PATH="${stage_failure_tools}:${TEST_PATH}" \
     DESTDIR="${stage_failure_root}" "${INSTALLER}" \
     --binary "${prebuilt_binary}" --prefix "${stage_failure_prefix}" \
@@ -545,7 +545,7 @@ if env HOME="${TEST_HOME}" PATH="${stage_failure_tools}:${TEST_PATH}" \
 fi
 assert_contains "late staging failure diagnostic" \
     "$(<"${TEST_ROOT}/stage-failure.log")" \
-    "cannot stage ${stage_failure_root}${stage_failure_prefix}/share/icons/hicolor/256x256/apps/${app_id}.png"
+    "cannot copy staged content for ${stage_failure_root}${stage_failure_prefix}/share/icons/hicolor/256x256/apps/${app_id}.png"
 [[ "$(<"${stage_failure_binary}")" == 'old staged frost' ]] \
     || fail "late staging failure replaced the existing binary"
 [[ "$(<"${stage_failure_workflow}")" == 'old staged workflow' ]] \
@@ -1030,6 +1030,282 @@ assert_contains "rollback backup ABA diagnostic" \
     'old binary before backup ABA' ]] \
     || fail "rollback backup ABA changed the original binary"
 
+# Staged bytes are written through an already-open temporary inode. Replace its
+# logical name from inside cat before copying: the installer must revoke
+# ownership, leave the substitute untouched, and never publish it.
+install_stage_aba_tools="${TEST_ROOT}/install-stage-aba-tools"
+install_stage_aba_stage="${TEST_ROOT}/install-stage-aba-stage"
+install_stage_aba_prefix="/opt/frost-install-stage-aba"
+install_stage_aba_binary="${install_stage_aba_stage}${install_stage_aba_prefix}/bin/frost"
+install_stage_aba_victim="${TEST_ROOT}/install-stage-aba-victim"
+install_stage_aba_path_log="${TEST_ROOT}/install-stage-aba-path"
+mkdir -p "${install_stage_aba_tools}" "${install_stage_aba_binary%/*}"
+printf 'old binary before staged temporary ABA\n' \
+    >"${install_stage_aba_binary}"
+printf 'staged temporary ABA victim sentinel\n' \
+    >"${install_stage_aba_victim}"
+install_stage_aba_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_stage_aba_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'temporary=' \
+    'for candidate in /proc/self/fd/*; do' \
+    '    target=$(/usr/bin/readlink -- "${candidate}" 2>/dev/null || :)' \
+    '    case "${target}" in *.install.*) temporary=${target}; break ;; esac' \
+    'done' \
+    ': "${temporary:?missing inherited staged temporary fd}"' \
+    'printf "%s\n" "${temporary}" >"${FROST_TEST_INSTALL_STAGE_ABA_PATH_LOG:?}"' \
+    '/usr/bin/rm -f -- "${temporary}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_STAGE_ABA_VICTIM:?}" "${temporary}"' \
+    '/usr/bin/cat "$@"' \
+    'exit 0' \
+    >"${install_stage_aba_tools}/cat"
+chmod 0755 "${install_stage_aba_tools}/cat"
+if env HOME="${TEST_HOME}" PATH="${install_stage_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_STAGE_ABA_PATH_LOG="${install_stage_aba_path_log}" \
+    FROST_TEST_INSTALL_STAGE_ABA_VICTIM="${install_stage_aba_victim}" \
+    DESTDIR="${install_stage_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_stage_aba_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-stage-aba.log" 2>&1; then
+    fail "installer accepted a replaced staged temporary name"
+fi
+install_stage_aba_path="$(<"${install_stage_aba_path_log}")"
+assert_contains "staged temporary ABA diagnostic" \
+    "$(<"${TEST_ROOT}/install-stage-aba.log")" \
+    "install temporary changed while copying"
+assert_contains "staged temporary ABA cleanup warning" \
+    "$(<"${TEST_ROOT}/install-stage-aba.log")" \
+    "refusing to remove changed temporary ${install_stage_aba_path}"
+[[ -L "${install_stage_aba_path}" ]] \
+    || fail "installer deleted the staged temporary substitute"
+[[ "$(readlink -- "${install_stage_aba_path}")" == \
+    "${install_stage_aba_victim}" ]] \
+    || fail "installer changed the staged temporary substitute"
+[[ "$(<"${install_stage_aba_victim}")" == \
+    'staged temporary ABA victim sentinel' ]] \
+    || fail "installer followed the staged temporary substitute"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${install_stage_aba_binary}")" == \
+    "${install_stage_aba_identity}" ]] \
+    || fail "staged temporary ABA changed the old binary inode"
+[[ "$(<"${install_stage_aba_binary}")" == \
+    'old binary before staged temporary ABA' ]] \
+    || fail "staged temporary ABA changed the old binary"
+
+# A regular copy fallback also owns an already-open reservation inode. Force
+# hardlink failure, copy into that descriptor, then replace the bound name from
+# inside cp. The installer must retain the substitute and leave the source
+# target byte-for-byte and inode-for-inode unchanged.
+install_fallback_aba_tools="${TEST_ROOT}/install-fallback-aba-tools"
+install_fallback_aba_stage="${TEST_ROOT}/install-fallback-aba-stage"
+install_fallback_aba_prefix="/opt/frost-install-fallback-aba"
+install_fallback_aba_binary="${install_fallback_aba_stage}${install_fallback_aba_prefix}/bin/frost"
+install_fallback_aba_victim="${TEST_ROOT}/install-fallback-aba-victim"
+install_fallback_aba_path_log="${TEST_ROOT}/install-fallback-aba-path"
+mkdir -p "${install_fallback_aba_tools}" \
+    "${install_fallback_aba_binary%/*}"
+printf 'old binary before fallback ABA\n' \
+    >"${install_fallback_aba_binary}"
+printf 'fallback ABA victim sentinel\n' \
+    >"${install_fallback_aba_victim}"
+install_fallback_aba_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_fallback_aba_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'exit 88' \
+    >"${install_fallback_aba_tools}/ln"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/cp "$@"' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'backup=$(/usr/bin/readlink -- "${last}")' \
+    'printf "%s\n" "${backup}" >"${FROST_TEST_INSTALL_FALLBACK_ABA_PATH_LOG:?}"' \
+    '/usr/bin/rm -f -- "${backup}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_FALLBACK_ABA_VICTIM:?}" "${backup}"' \
+    'exit 0' \
+    >"${install_fallback_aba_tools}/cp"
+chmod 0755 "${install_fallback_aba_tools}/ln" \
+    "${install_fallback_aba_tools}/cp"
+if env HOME="${TEST_HOME}" PATH="${install_fallback_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_FALLBACK_ABA_PATH_LOG="${install_fallback_aba_path_log}" \
+    FROST_TEST_INSTALL_FALLBACK_ABA_VICTIM="${install_fallback_aba_victim}" \
+    DESTDIR="${install_fallback_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_fallback_aba_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-fallback-aba.log" 2>&1; then
+    fail "installer accepted a replaced fallback backup name"
+fi
+install_fallback_aba_path="$(<"${install_fallback_aba_path_log}")"
+assert_contains "fallback backup ABA diagnostic" \
+    "$(<"${TEST_ROOT}/install-fallback-aba.log")" \
+    "fallback rollback backup name was replaced while copying ${install_fallback_aba_binary}"
+assert_contains "fallback backup ABA cleanup warning" \
+    "$(<"${TEST_ROOT}/install-fallback-aba.log")" \
+    "refusing to remove changed rollback backup ${install_fallback_aba_path}"
+[[ -L "${install_fallback_aba_path}" ]] \
+    || fail "installer deleted the fallback backup substitute"
+[[ "$(readlink -- "${install_fallback_aba_path}")" == \
+    "${install_fallback_aba_victim}" ]] \
+    || fail "installer changed the fallback backup substitute"
+[[ "$(<"${install_fallback_aba_victim}")" == \
+    'fallback ABA victim sentinel' ]] \
+    || fail "installer followed the fallback backup substitute"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_fallback_aba_binary}")" == \
+    "${install_fallback_aba_identity}" ]] \
+    || fail "fallback backup ABA changed the original binary inode"
+[[ "$(<"${install_fallback_aba_binary}")" == \
+    'old binary before fallback ABA' ]] \
+    || fail "fallback backup ABA changed the original binary"
+
+# Select a readable prebuilt fixture on another device from the DESTDIR. A
+# post-action cat failure must reconcile the descriptor-pinned bytes and mode,
+# proving staging never relies on a same-filesystem rename or inode reuse.
+cross_device_prebuilt=
+install_cross_device_stage="${TEST_ROOT}/install-cross-device-stage"
+install_cross_device_prefix="/opt/frost-install-cross-device"
+mkdir -p "${install_cross_device_stage}"
+install_cross_device_dev="$(stat -c '%d' -- "${install_cross_device_stage}")"
+for candidate in "${SCRIPT_DIR}/../Cargo.toml" /etc/hostname /bin/true; do
+    if [[ -f "${candidate}" && -r "${candidate}" && -s "${candidate}" \
+        && "$(stat -c '%d' -- "${candidate}")" != \
+            "${install_cross_device_dev}" ]]; then
+        cross_device_prebuilt="${candidate}"
+        break
+    fi
+done
+[[ -n "${cross_device_prebuilt}" ]] \
+    || fail "no cross-device prebuilt fixture is available"
+install_cross_device_tools="${TEST_ROOT}/install-cross-device-tools"
+install_cross_device_cat_marker="${TEST_ROOT}/install-cross-device-cat"
+install_cross_device_binary="${install_cross_device_stage}${install_cross_device_prefix}/bin/frost"
+mkdir -p "${install_cross_device_tools}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/cat "$@"' \
+    ': >"${FROST_TEST_INSTALL_CROSS_DEVICE_CAT_MARKER:?}"' \
+    'exit 89' \
+    >"${install_cross_device_tools}/cat"
+chmod 0755 "${install_cross_device_tools}/cat"
+install_cross_device_output="$(
+    env HOME="${TEST_HOME}" PATH="${install_cross_device_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_CROSS_DEVICE_CAT_MARKER="${install_cross_device_cat_marker}" \
+        DESTDIR="${install_cross_device_stage}" "${INSTALLER}" \
+        --binary "${cross_device_prebuilt}" \
+        --prefix "${install_cross_device_prefix}" --no-desktop 2>&1
+)"
+assert_regular_file "cross-device post-action cat marker" \
+    "${install_cross_device_cat_marker}"
+cmp -- "${cross_device_prebuilt}" "${install_cross_device_binary}" \
+    || fail "cross-device descriptor copy changed the installed bytes"
+assert_mode "cross-device descriptor copy" \
+    "${install_cross_device_binary}" 755
+assert_contains "cross-device install success summary" \
+    "${install_cross_device_output}" \
+    "Installed frost to ${install_cross_device_prefix}/bin/frost"
+[[ -z "$(find "${install_cross_device_stage}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "cross-device descriptor copy left a temporary or backup"
+
+# Exercise the complete regular fallback path: every hardlink fails, cp copies
+# the first existing workflow and then returns non-zero, and the next publish
+# rename fails. Rollback must restore the copied bytes/mode while removing all
+# transaction-owned artifacts.
+install_fallback_restore_tools="${TEST_ROOT}/install-fallback-restore-tools"
+install_fallback_restore_stage="${TEST_ROOT}/install-fallback-restore-stage"
+install_fallback_restore_prefix="/opt/frost-install-fallback-restore"
+install_fallback_restore_workflow_dir="${install_fallback_restore_stage}${install_fallback_restore_prefix}/share/frost/workflows"
+install_fallback_restore_first="${install_fallback_restore_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_fallback_restore_second="${install_fallback_restore_workflow_dir}/${WORKFLOW_SOURCES[1]##*/}"
+install_fallback_restore_ln_marker="${TEST_ROOT}/install-fallback-restore-ln"
+install_fallback_restore_cp_marker="${TEST_ROOT}/install-fallback-restore-cp"
+install_fallback_restore_mv_marker="${TEST_ROOT}/install-fallback-restore-mv"
+install_fallback_restore_mv_state="${TEST_ROOT}/install-fallback-restore-mv-state"
+mkdir -p "${install_fallback_restore_tools}" \
+    "${install_fallback_restore_workflow_dir}"
+printf 'old workflow before copy fallback rollback\n' \
+    >"${install_fallback_restore_first}"
+chmod 0613 "${install_fallback_restore_first}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"${FROST_TEST_INSTALL_FALLBACK_RESTORE_LN_MARKER:?}"' \
+    'exit 90' \
+    >"${install_fallback_restore_tools}/ln"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/cp "$@"' \
+    ': >"${FROST_TEST_INSTALL_FALLBACK_RESTORE_CP_MARKER:?}"' \
+    'exit 91' \
+    >"${install_fallback_restore_tools}/cp"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/*.install.*)' \
+    '        state=${FROST_TEST_INSTALL_FALLBACK_RESTORE_MV_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            : >"${FROST_TEST_INSTALL_FALLBACK_RESTORE_MV_MARKER:?}"' \
+    '            exit 92' \
+    '        fi' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_fallback_restore_tools}/mv"
+chmod 0755 "${install_fallback_restore_tools}/ln" \
+    "${install_fallback_restore_tools}/cp" \
+    "${install_fallback_restore_tools}/mv"
+if env HOME="${TEST_HOME}" \
+    PATH="${install_fallback_restore_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_FALLBACK_RESTORE_LN_MARKER="${install_fallback_restore_ln_marker}" \
+    FROST_TEST_INSTALL_FALLBACK_RESTORE_CP_MARKER="${install_fallback_restore_cp_marker}" \
+    FROST_TEST_INSTALL_FALLBACK_RESTORE_MV_MARKER="${install_fallback_restore_mv_marker}" \
+    FROST_TEST_INSTALL_FALLBACK_RESTORE_MV_STATE="${install_fallback_restore_mv_state}" \
+    DESTDIR="${install_fallback_restore_stage}" "${INSTALLER}" \
+    --binary "${cross_device_prebuilt}" \
+    --prefix "${install_fallback_restore_prefix}" --no-desktop \
+    >"${TEST_ROOT}/install-fallback-restore.log" 2>&1; then
+    fail "installer ignored a publish failure after copy fallback"
+fi
+assert_regular_file "forced hardlink failure marker" \
+    "${install_fallback_restore_ln_marker}"
+assert_regular_file "completed fallback copy marker" \
+    "${install_fallback_restore_cp_marker}"
+assert_regular_file "forced publish failure marker" \
+    "${install_fallback_restore_mv_marker}"
+[[ "$(<"${install_fallback_restore_first}")" == \
+    'old workflow before copy fallback rollback' ]] \
+    || fail "copy fallback rollback changed the old workflow bytes"
+assert_mode "copy fallback rollback" "${install_fallback_restore_first}" 613
+assert_absent "failed second workflow publish" \
+    "${install_fallback_restore_second}"
+assert_absent "binary after pre-commit fallback rollback" \
+    "${install_fallback_restore_stage}${install_fallback_restore_prefix}/bin/frost"
+assert_contains "copy fallback publish failure diagnostic" \
+    "$(<"${TEST_ROOT}/install-fallback-restore.log")" \
+    "cannot atomically replace ${install_fallback_restore_second}"
+[[ -z "$(find "${install_fallback_restore_stage}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "copy fallback rollback left a temporary or backup"
+
 # External wrappers may report failure after completing an operation. Exact
 # post-action state wins: reservation/cleanup rm must observe absence, ln must
 # observe the original inode at the backup name, and publish mv must observe the
@@ -1473,12 +1749,10 @@ printf 'old interrupt frost\n' >"${interrupt_binary}"
 printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
-    'last=""' \
-    'for argument do last="${argument}"; done' \
-    '/usr/bin/install "$@"' \
-    'case "${last}" in *.install.*) kill -TERM "${PPID}" ;; esac' \
-    >"${interrupt_tools}/install"
-chmod 0755 "${interrupt_tools}/install"
+    '/usr/bin/cat "$@"' \
+    'kill -TERM "${PPID}"' \
+    >"${interrupt_tools}/cat"
+chmod 0755 "${interrupt_tools}/cat"
 if {
     env HOME="${TEST_HOME}" PATH="${interrupt_tools}:${TEST_PATH}" \
         DESTDIR="${interrupt_stage}" "${INSTALLER}" --binary "${prebuilt_binary}" \

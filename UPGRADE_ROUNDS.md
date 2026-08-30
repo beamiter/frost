@@ -518,3 +518,14 @@ Round 70 closes the remaining argument-form affordance gap:
     creation, or final publish rename reconcile from exact post-action state;
     deterministic regressions prove the generation commits with no false
     rollback while every transaction-owned temporary and backup disappears.
+
+98. **Descriptor-pinned staged and fallback copies** — every regular staging
+    temporary stays open while byte copy and mode application address its fd,
+    so cross-device sources cannot trigger destination inode replacement.
+    Regular hardlink fallbacks likewise copy into an opened, exact reservation
+    inode and revalidate source, descriptor, and bound name before ownership is
+    accepted. Non-zero copy helpers reconcile only from complete content/mode
+    plus exact identity; a name swapped after copy has ownership revoked and is
+    retained untouched by cleanup or rollback. Deterministic regressions cover
+    cross-device staging, forced hardlink fallback followed by reverse restore,
+    and both staged-temporary and fallback-reservation ABA replacement.
