@@ -495,5 +495,16 @@ Round 70 closes the remaining argument-form affordance gap:
     applications/icon directory fds. Parent swaps inside `rm` or either cache
     helper cannot reach a replacement symlink referent; helper failures remain
     non-fatal and precede the truthful install summary. Install and uninstall
-    pools deduplicate by device/inode under fixed 4/16-fd ceilings, close once
-    on every exit path, and preserve per-consumer use-point identity checks.
+    pools deduplicate by device/inode under fixed ceilings, close once on every
+    exit path, and preserve per-consumer use-point identity checks.
+
+96. **Directory-fd-bound install publication** — every staged destination now
+    records a pooled read-only parent fd plus exact temporary/original/backup
+    identities. Temporary creation, hardlink/copy snapshots, publish rename,
+    reverse rollback, and successful backup cleanup operate through Linux
+    `/proc/self/fd` names and recheck the logical parent at each use point.
+    Deterministic swaps from inside `mktemp`, `ln`, `mv`, and cleanup `rm` prove
+    that work remains in the displaced inode: failed publication never removes
+    an identically named replacement target, and successful cleanup leaves no
+    rollback artifact in the old parent. Both directory pools now have a
+    16-physical-inode ceiling and retain one close-on-exit owner per fd.

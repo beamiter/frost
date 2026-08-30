@@ -659,6 +659,258 @@ fi
     \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
     || fail "publish rollback left a temporary or backup"
 
+# The core install transaction binds each physical destination directory before
+# it creates a staging name. Replacing the logical workflow directory from
+# inside mktemp must create and clean the temporary only in the displaced inode;
+# the replacement symlink and its referent remain untouched.
+install_stage_parent_tools="${TEST_ROOT}/install-stage-parent-tools"
+install_stage_parent_stage="${TEST_ROOT}/install-stage-parent-stage"
+install_stage_parent_prefix="/opt/frost-install-stage-parent"
+install_stage_parent_dir="${install_stage_parent_stage}${install_stage_parent_prefix}/share/frost/workflows"
+install_stage_parent_displaced="${TEST_ROOT}/install-stage-parent-original-workflows"
+install_stage_parent_victim="${TEST_ROOT}/install-stage-parent-victim"
+install_stage_parent_marker="${TEST_ROOT}/install-stage-parent-replaced"
+install_stage_parent_name="${WORKFLOW_SOURCES[0]##*/}"
+install_stage_parent_target="${install_stage_parent_dir}/${install_stage_parent_name}"
+install_stage_parent_binary="${install_stage_parent_stage}${install_stage_parent_prefix}/bin/frost"
+mkdir -p "${install_stage_parent_tools}" "${install_stage_parent_dir}" \
+    "${install_stage_parent_victim}"
+printf 'original workflow before staging parent swap\n' \
+    >"${install_stage_parent_target}"
+printf 'outside workflow staging sentinel\n' \
+    >"${install_stage_parent_victim}/${install_stage_parent_name}"
+install_stage_parent_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_stage_parent_target}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_INSTALL_STAGE_PARENT_MARKER:?}" ]; then' \
+    '    : >"${FROST_TEST_INSTALL_STAGE_PARENT_MARKER}"' \
+    '    /usr/bin/mv "${FROST_TEST_INSTALL_STAGE_PARENT_DIR:?}" "${FROST_TEST_INSTALL_STAGE_PARENT_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_INSTALL_STAGE_PARENT_VICTIM:?}" "${FROST_TEST_INSTALL_STAGE_PARENT_DIR}"' \
+    'fi' \
+    'exec /usr/bin/mktemp "$@"' \
+    >"${install_stage_parent_tools}/mktemp"
+chmod 0755 "${install_stage_parent_tools}/mktemp"
+if env HOME="${TEST_HOME}" PATH="${install_stage_parent_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_STAGE_PARENT_MARKER="${install_stage_parent_marker}" \
+    FROST_TEST_INSTALL_STAGE_PARENT_DIR="${install_stage_parent_dir}" \
+    FROST_TEST_INSTALL_STAGE_PARENT_DISPLACED="${install_stage_parent_displaced}" \
+    FROST_TEST_INSTALL_STAGE_PARENT_VICTIM="${install_stage_parent_victim}" \
+    DESTDIR="${install_stage_parent_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_stage_parent_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-stage-parent.log" 2>&1; then
+    fail "installer accepted a parent replacement during staging mktemp"
+fi
+assert_contains "install staging parent diagnostic" \
+    "$(<"${TEST_ROOT}/install-stage-parent.log")" \
+    "install destination directory changed while staging: ${install_stage_parent_dir}"
+[[ -L "${install_stage_parent_dir}" ]] \
+    || fail "install staging mktemp did not replace its logical parent"
+[[ "$(<"${install_stage_parent_victim}/${install_stage_parent_name}")" == \
+    'outside workflow staging sentinel' ]] \
+    || fail "install staging mktemp touched the replacement parent referent"
+[[ "$(<"${install_stage_parent_displaced}/${install_stage_parent_name}")" == \
+    'original workflow before staging parent swap' ]] \
+    || fail "install staging failure changed the original workflow"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_stage_parent_displaced}/${install_stage_parent_name}")" == \
+    "${install_stage_parent_identity}" ]] \
+    || fail "install staging failure changed original workflow inode metadata"
+[[ -z "$(find "${install_stage_parent_displaced}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "bound staging cleanup left an artifact in the displaced parent"
+assert_absent "binary after staging parent swap" "${install_stage_parent_binary}"
+
+# Backup reservations and snapshots use the same bound directory. Swap the
+# logical parent from inside ln: the backup is made beside the original inode,
+# then the use-point identity check aborts and bound cleanup removes it without
+# touching an identically named file behind the new symlink.
+install_backup_parent_tools="${TEST_ROOT}/install-backup-parent-tools"
+install_backup_parent_stage="${TEST_ROOT}/install-backup-parent-stage"
+install_backup_parent_prefix="/opt/frost-install-backup-parent"
+install_backup_parent_dir="${install_backup_parent_stage}${install_backup_parent_prefix}/share/frost/workflows"
+install_backup_parent_displaced="${TEST_ROOT}/install-backup-parent-original-workflows"
+install_backup_parent_victim="${TEST_ROOT}/install-backup-parent-victim"
+install_backup_parent_name="${WORKFLOW_SOURCES[0]##*/}"
+install_backup_parent_target="${install_backup_parent_dir}/${install_backup_parent_name}"
+install_backup_parent_binary="${install_backup_parent_stage}${install_backup_parent_prefix}/bin/frost"
+mkdir -p "${install_backup_parent_tools}" "${install_backup_parent_dir}" \
+    "${install_backup_parent_victim}"
+printf 'original workflow before backup parent swap\n' \
+    >"${install_backup_parent_target}"
+printf 'outside workflow backup sentinel\n' \
+    >"${install_backup_parent_victim}/${install_backup_parent_name}"
+install_backup_parent_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_backup_parent_target}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/mv "${FROST_TEST_INSTALL_BACKUP_PARENT_DIR:?}" "${FROST_TEST_INSTALL_BACKUP_PARENT_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_BACKUP_PARENT_VICTIM:?}" "${FROST_TEST_INSTALL_BACKUP_PARENT_DIR}"' \
+    'exec /usr/bin/ln "$@"' \
+    >"${install_backup_parent_tools}/ln"
+chmod 0755 "${install_backup_parent_tools}/ln"
+if env HOME="${TEST_HOME}" PATH="${install_backup_parent_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_BACKUP_PARENT_DIR="${install_backup_parent_dir}" \
+    FROST_TEST_INSTALL_BACKUP_PARENT_DISPLACED="${install_backup_parent_displaced}" \
+    FROST_TEST_INSTALL_BACKUP_PARENT_VICTIM="${install_backup_parent_victim}" \
+    DESTDIR="${install_backup_parent_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_backup_parent_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-backup-parent.log" 2>&1; then
+    fail "installer accepted a parent replacement during backup ln"
+fi
+assert_contains "install backup parent diagnostic" \
+    "$(<"${TEST_ROOT}/install-backup-parent.log")" \
+    "install destination directory changed while backing up: ${install_backup_parent_dir}"
+[[ -L "${install_backup_parent_dir}" ]] \
+    || fail "install backup ln did not replace its logical parent"
+[[ "$(<"${install_backup_parent_victim}/${install_backup_parent_name}")" == \
+    'outside workflow backup sentinel' ]] \
+    || fail "install backup ln touched the replacement parent referent"
+[[ "$(<"${install_backup_parent_displaced}/${install_backup_parent_name}")" == \
+    'original workflow before backup parent swap' ]] \
+    || fail "install backup failure changed the original workflow"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_backup_parent_displaced}/${install_backup_parent_name}")" == \
+    "${install_backup_parent_identity}" ]] \
+    || fail "install backup failure changed original workflow inode metadata"
+[[ -z "$(find "${install_backup_parent_displaced}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "bound backup failure left a temporary or rollback backup"
+assert_absent "binary after backup parent swap" "${install_backup_parent_binary}"
+
+# Swap the binary directory inside its final publish rename. The bound rename
+# lands in the displaced directory, the post-rename identity check fails, and
+# rollback removes that newly introduced inode there—not the same name exposed
+# by the replacement symlink.
+install_publish_parent_tools="${TEST_ROOT}/install-publish-parent-tools"
+install_publish_parent_stage="${TEST_ROOT}/install-publish-parent-stage"
+install_publish_parent_prefix="/opt/frost-install-publish-parent"
+install_publish_parent_dir="${install_publish_parent_stage}${install_publish_parent_prefix}/bin"
+install_publish_parent_displaced="${TEST_ROOT}/install-publish-parent-original-bin"
+install_publish_parent_victim="${TEST_ROOT}/install-publish-parent-victim"
+mkdir -p "${install_publish_parent_tools}" \
+    "${install_publish_parent_victim}"
+printf 'outside binary publish sentinel\n' \
+    >"${install_publish_parent_victim}/frost"
+printf 'outside rollback-name sentinel\n' \
+    >"${install_publish_parent_victim}/.frost.rollback.outside"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/frost)' \
+    '        /usr/bin/mv "${FROST_TEST_INSTALL_PUBLISH_PARENT_DIR:?}" "${FROST_TEST_INSTALL_PUBLISH_PARENT_DISPLACED:?}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_PUBLISH_PARENT_VICTIM:?}" "${FROST_TEST_INSTALL_PUBLISH_PARENT_DIR}"' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_publish_parent_tools}/mv"
+chmod 0755 "${install_publish_parent_tools}/mv"
+if env HOME="${TEST_HOME}" PATH="${install_publish_parent_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_PUBLISH_PARENT_DIR="${install_publish_parent_dir}" \
+    FROST_TEST_INSTALL_PUBLISH_PARENT_DISPLACED="${install_publish_parent_displaced}" \
+    FROST_TEST_INSTALL_PUBLISH_PARENT_VICTIM="${install_publish_parent_victim}" \
+    DESTDIR="${install_publish_parent_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_publish_parent_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-publish-parent.log" 2>&1; then
+    fail "installer accepted a parent replacement during publish mv"
+fi
+assert_contains "install publish parent diagnostic" \
+    "$(<"${TEST_ROOT}/install-publish-parent.log")" \
+    "install destination directory changed during publish: ${install_publish_parent_dir}"
+[[ -L "${install_publish_parent_dir}" ]] \
+    || fail "install publish mv did not replace its logical parent"
+[[ "$(<"${install_publish_parent_victim}/frost")" == \
+    'outside binary publish sentinel' ]] \
+    || fail "bound install rollback removed the replacement binary"
+[[ "$(<"${install_publish_parent_victim}/.frost.rollback.outside")" == \
+    'outside rollback-name sentinel' ]] \
+    || fail "bound install rollback touched an outside rollback name"
+assert_absent "rolled-back binary in displaced parent" \
+    "${install_publish_parent_displaced}/frost"
+[[ -z "$(find "${install_publish_parent_displaced}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "bound publish rollback left an artifact in the displaced parent"
+
+# A successful generation commit owns its rollback backup until cleanup. Swap
+# the logical bin directory from the cleanup rm itself: removal stays bound to
+# the old inode, installation still succeeds, and neither the retained binary
+# nor the replacement referent is polluted by a stale backup.
+install_cleanup_parent_tools="${TEST_ROOT}/install-cleanup-parent-tools"
+install_cleanup_parent_stage="${TEST_ROOT}/install-cleanup-parent-stage"
+install_cleanup_parent_prefix="/opt/frost-install-cleanup-parent"
+install_cleanup_parent_dir="${install_cleanup_parent_stage}${install_cleanup_parent_prefix}/bin"
+install_cleanup_parent_displaced="${TEST_ROOT}/install-cleanup-parent-original-bin"
+install_cleanup_parent_victim="${TEST_ROOT}/install-cleanup-parent-victim"
+install_cleanup_parent_binary="${install_cleanup_parent_dir}/frost"
+install_cleanup_parent_state="${TEST_ROOT}/install-cleanup-parent-rm-count"
+mkdir -p "${install_cleanup_parent_tools}" "${install_cleanup_parent_dir}" \
+    "${install_cleanup_parent_victim}"
+printf 'old binary before bound backup cleanup\n' \
+    >"${install_cleanup_parent_binary}"
+printf 'outside binary cleanup sentinel\n' \
+    >"${install_cleanup_parent_victim}/frost"
+printf 'outside cleanup-name sentinel\n' \
+    >"${install_cleanup_parent_victim}/.frost.rollback.outside"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.frost.rollback.*)' \
+    '        state=${FROST_TEST_INSTALL_CLEANUP_PARENT_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            /usr/bin/mv "${FROST_TEST_INSTALL_CLEANUP_PARENT_DIR:?}" "${FROST_TEST_INSTALL_CLEANUP_PARENT_DISPLACED:?}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_CLEANUP_PARENT_VICTIM:?}" "${FROST_TEST_INSTALL_CLEANUP_PARENT_DIR}"' \
+    '        fi' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_cleanup_parent_tools}/rm"
+chmod 0755 "${install_cleanup_parent_tools}/rm"
+install_cleanup_parent_output="$(
+    env HOME="${TEST_HOME}" PATH="${install_cleanup_parent_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_CLEANUP_PARENT_STATE="${install_cleanup_parent_state}" \
+        FROST_TEST_INSTALL_CLEANUP_PARENT_DIR="${install_cleanup_parent_dir}" \
+        FROST_TEST_INSTALL_CLEANUP_PARENT_DISPLACED="${install_cleanup_parent_displaced}" \
+        FROST_TEST_INSTALL_CLEANUP_PARENT_VICTIM="${install_cleanup_parent_victim}" \
+        DESTDIR="${install_cleanup_parent_stage}" "${INSTALLER}" \
+        --binary "${prebuilt_binary}" --prefix "${install_cleanup_parent_prefix}" \
+        --no-desktop 2>&1
+)"
+[[ -L "${install_cleanup_parent_dir}" ]] \
+    || fail "install backup cleanup did not replace its logical parent"
+cmp -- "${prebuilt_binary}" "${install_cleanup_parent_displaced}/frost" \
+    || fail "successful bound cleanup did not retain the installed binary"
+[[ "$(<"${install_cleanup_parent_victim}/frost")" == \
+    'outside binary cleanup sentinel' ]] \
+    || fail "successful bound cleanup touched the replacement binary"
+[[ "$(<"${install_cleanup_parent_victim}/.frost.rollback.outside")" == \
+    'outside cleanup-name sentinel' ]] \
+    || fail "successful bound cleanup touched an outside backup name"
+[[ -z "$(find "${install_cleanup_parent_displaced}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "successful install left a backup in the displaced parent"
+assert_contains "install backup cleanup parent warning" \
+    "${install_cleanup_parent_output}" \
+    "destination directory changed during bound artifact cleanup (non-fatal): ${install_cleanup_parent_dir}"
+assert_contains "install backup cleanup success summary" \
+    "${install_cleanup_parent_output}" \
+    "Installed frost to ${install_cleanup_parent_prefix}/bin/frost"
+
 # Final targets may be regular files, symlinks (atomically replaced), or
 # absent. Reject special files and directories across the complete set before
 # the first rollback hardlink; in particular, never open or read a FIFO.

@@ -23,13 +23,21 @@ DRY_RUN=0
 INSTALL_TEMPS=()
 INSTALL_DESTS=()
 INSTALL_BACKUPS=()
+INSTALL_BACKUP_BASENAMES=()
+INSTALL_BACKUP_IDENTITIES=()
 INSTALL_ORIGINAL_PRESENT=()
+INSTALL_ORIGINAL_IDENTITIES=()
+INSTALL_PARENT_FDS=()
+INSTALL_PARENT_IDENTITIES=()
+INSTALL_DEST_BASENAMES=()
+INSTALL_TEMP_BASENAMES=()
+INSTALL_STAGED_IDENTITIES=()
 PUBLISH_IN_PROGRESS=0
 PUBLISH_LAST_ATTEMPT=-1
 KEEP_INSTALL_BACKUPS=0
 INSTALL_BOUND_DIRECTORY_FDS=()
 INSTALL_BOUND_DIRECTORY_IDENTITIES=()
-MAX_INSTALL_BOUND_DIRECTORY_FDS=4
+MAX_INSTALL_BOUND_DIRECTORY_FDS=16
 POST_INSTALL_APP_DIR=""
 POST_INSTALL_APP_FD=""
 POST_INSTALL_APP_IDENTITY=""
@@ -64,36 +72,74 @@ die() {
 }
 
 cleanup_install_artifacts() {
-    local temp path
-    for temp in "${INSTALL_TEMPS[@]}"; do
-        if ((DRY_RUN == 0)) && [[ -n "${temp}" ]]; then
-            rm -f -- "${temp}" \
-                || printf 'frost install: warning: cannot remove temporary %s\n' \
-                    "${temp}" >&2
+    local index temp path expected display
+    local -a parent_warning_emitted=()
+    for index in "${!INSTALL_TEMPS[@]}"; do
+        temp="${INSTALL_TEMPS[index]:-}"
+        if ((DRY_RUN == 0)) && [[ -n "${temp}" ]] \
+            && [[ -e "${temp}" || -L "${temp}" ]]; then
+            expected="${INSTALL_STAGED_IDENTITIES[index]:-}"
+            display="${temp}"
+            if [[ -n "${INSTALL_PARENT_FDS[index]:-}" \
+                && -n "${INSTALL_TEMP_BASENAMES[index]:-}" ]]; then
+                display="$(bound_install_entry_display "${index}" \
+                    "${INSTALL_TEMP_BASENAMES[index]}")"
+            fi
+            if [[ -z "${expected}" ]] \
+                || ! path_matches_identity "${temp}" "${expected}"; then
+                printf 'frost install: warning: refusing to remove changed temporary %s\n' \
+                    "${display}" >&2
+            elif ! rm -f -- "${temp}"; then
+                printf 'frost install: warning: cannot remove temporary %s\n' \
+                    "${display}" >&2
+            fi
+        fi
+        if [[ -n "${INSTALL_PARENT_FDS[index]:-}" ]] \
+            && (( ${parent_warning_emitted[index]:-0} == 0 )) \
+            && ! logical_install_parent_matches "${index}"; then
+            printf 'frost install: warning: destination directory changed during bound artifact cleanup (non-fatal): %s\n' \
+                "${INSTALL_DESTS[index]%/*}" >&2
+            parent_warning_emitted[index]=1
         fi
     done
     if ((KEEP_INSTALL_BACKUPS == 0)); then
-        for path in "${INSTALL_BACKUPS[@]}"; do
+        for index in "${!INSTALL_BACKUPS[@]}"; do
+            path="${INSTALL_BACKUPS[index]:-}"
             if ((DRY_RUN == 0)) && [[ -n "${path}" ]]; then
-                rm -f -- "${path}" \
-                    || printf 'frost install: warning: cannot remove rollback backup %s\n' \
-                        "${path}" >&2
+                display="$(bound_install_backup_display "${index}")"
+                if [[ -e "${path}" || -L "${path}" ]]; then
+                    expected="${INSTALL_BACKUP_IDENTITIES[index]:-}"
+                    if [[ -z "${expected}" ]] \
+                        || ! path_matches_identity "${path}" "${expected}"; then
+                        printf 'frost install: warning: refusing to remove changed rollback backup %s\n' \
+                            "${display}" >&2
+                    elif ! rm -f -- "${path}"; then
+                        printf 'frost install: warning: cannot remove rollback backup %s\n' \
+                            "${display}" >&2
+                    fi
+                fi
+            fi
+            if [[ -n "${INSTALL_PARENT_FDS[index]:-}" ]] \
+                && (( ${parent_warning_emitted[index]:-0} == 0 )) \
+                && ! logical_install_parent_matches "${index}"; then
+                printf 'frost install: warning: destination directory changed during bound artifact cleanup (non-fatal): %s\n' \
+                    "${INSTALL_DESTS[index]%/*}" >&2
+                parent_warning_emitted[index]=1
             fi
         done
     fi
     INSTALL_TEMPS=()
     INSTALL_DESTS=()
     INSTALL_BACKUPS=()
+    INSTALL_BACKUP_BASENAMES=()
+    INSTALL_BACKUP_IDENTITIES=()
     INSTALL_ORIGINAL_PRESENT=()
-}
-
-paths_share_inode() {
-    local first="$1" second="$2" first_identity second_identity
-    [[ ( -e "${first}" || -L "${first}" ) \
-        && ( -e "${second}" || -L "${second}" ) ]] || return 1
-    first_identity="$(stat -c '%d:%i' -- "${first}")" || return 1
-    second_identity="$(stat -c '%d:%i' -- "${second}")" || return 1
-    [[ "${first_identity}" == "${second_identity}" ]]
+    INSTALL_ORIGINAL_IDENTITIES=()
+    INSTALL_PARENT_FDS=()
+    INSTALL_PARENT_IDENTITIES=()
+    INSTALL_DEST_BASENAMES=()
+    INSTALL_TEMP_BASENAMES=()
+    INSTALL_STAGED_IDENTITIES=()
 }
 
 path_matches_identity() {
@@ -107,6 +153,13 @@ real_directory_matches_identity() {
     local path="$1" expected="$2"
     [[ -d "${path}" && ! -L "${path}" ]] \
         && path_matches_identity "${path}" "${expected}"
+}
+
+directory_referent_matches_identity() {
+    local path="$1" expected="$2" actual
+    [[ -d "${path}" ]] || return 1
+    actual="$(stat -Lc '%d:%i' -- "${path}")" || return 1
+    [[ "${actual}" == "${expected}" ]]
 }
 
 acquire_install_bound_directory() {
@@ -153,36 +206,137 @@ close_install_bound_directory_fds() {
     INSTALL_BOUND_DIRECTORY_IDENTITIES=()
 }
 
+bound_install_entry_path() {
+    local index="$1" basename="$2"
+    printf '/proc/self/fd/%s/%s' "${INSTALL_PARENT_FDS[index]}" "${basename}"
+}
+
+bound_install_dest_path() {
+    local index="$1"
+    bound_install_entry_path "${index}" "${INSTALL_DEST_BASENAMES[index]}"
+}
+
+bound_install_temp_path() {
+    local index="$1"
+    bound_install_entry_path "${index}" "${INSTALL_TEMP_BASENAMES[index]}"
+}
+
+bound_install_backup_path() {
+    local index="$1"
+    bound_install_entry_path "${index}" "${INSTALL_BACKUP_BASENAMES[index]}"
+}
+
+bound_install_entry_display() {
+    local index="$1" basename="$2" parent
+    parent="$(readlink -- "/proc/$$/fd/${INSTALL_PARENT_FDS[index]}" \
+        2>/dev/null)" || parent="${INSTALL_DESTS[index]%/*}"
+    printf '%s/%s' "${parent}" "${basename}"
+}
+
+bound_install_backup_display() {
+    local index="$1"
+    bound_install_entry_display "${index}" "${INSTALL_BACKUP_BASENAMES[index]}"
+}
+
+logical_install_parent_matches() {
+    local index="$1"
+    directory_referent_matches_identity "${INSTALL_DESTS[index]%/*}" \
+        "${INSTALL_PARENT_IDENTITIES[index]}"
+}
+
+bind_install_destination() {
+    local index="$1" dest="$2" directory fd identity bind_status
+    directory="${dest%/*}"
+    if acquire_install_bound_directory "${directory}" fd identity; then
+        :
+    else
+        bind_status=$?
+        if ((bind_status == 2)); then
+            die "too many distinct install directories (limit ${MAX_INSTALL_BOUND_DIRECTORY_FDS})"
+        fi
+        die "cannot bind install destination directory ${directory}"
+    fi
+    INSTALL_PARENT_FDS[index]="${fd}"
+    INSTALL_PARENT_IDENTITIES[index]="${identity}"
+    INSTALL_DEST_BASENAMES[index]="${dest##*/}"
+    directory_referent_matches_identity "${directory}" "${identity}" \
+        || die "install destination directory changed while binding: ${directory}"
+}
+
 rollback_install_plan() {
-    local index dest backup rollback_failed=0
+    local index dest dest_path dest_display backup backup_display
+    local backup_identity original_identity staged_identity rollback_failed=0
     for ((index = PUBLISH_LAST_ATTEMPT; index >= 0; index--)); do
         dest="${INSTALL_DESTS[index]}"
+        dest_path="$(bound_install_dest_path "${index}")"
+        dest_display="$(bound_install_entry_display "${index}" \
+            "${INSTALL_DEST_BASENAMES[index]}")"
+        staged_identity="${INSTALL_STAGED_IDENTITIES[index]:-}"
         if (( ${INSTALL_ORIGINAL_PRESENT[index]:-0} == 1 )); then
             backup="${INSTALL_BACKUPS[index]:-}"
+            backup_identity="${INSTALL_BACKUP_IDENTITIES[index]:-}"
+            original_identity="${INSTALL_ORIGINAL_IDENTITIES[index]:-}"
+            backup_display="$(bound_install_backup_display "${index}")"
             if [[ -n "${backup}" && ( -e "${backup}" || -L "${backup}" ) ]]; then
-                if paths_share_inode "${backup}" "${dest}"; then
+                if [[ -z "${backup_identity}" ]] \
+                    || ! path_matches_identity "${backup}" \
+                        "${backup_identity}"; then
+                    printf 'frost install: rollback refused changed backup for %s; unexpected entry retained at %s\n' \
+                        "${dest_display}" "${backup_display}" >&2
+                    rollback_failed=1
+                elif path_matches_identity "${dest_path}" \
+                    "${original_identity}"; then
                     if rm -f -- "${backup}"; then
                         INSTALL_BACKUPS[index]=""
                     else
                         printf 'frost install: rollback restored %s but could not remove backup link %s\n' \
-                            "${dest}" "${backup}" >&2
+                            "${dest_display}" "${backup_display}" >&2
                         rollback_failed=1
                     fi
-                elif mv -fT -- "${backup}" "${dest}"; then
-                    INSTALL_BACKUPS[index]=""
+                elif [[ ! -e "${dest_path}" && ! -L "${dest_path}" ]] \
+                    || path_matches_identity "${dest_path}" \
+                        "${staged_identity}"; then
+                    if mv -fT -- "${backup}" "${dest_path}"; then
+                        INSTALL_BACKUPS[index]=""
+                    elif path_matches_identity "${dest_path}" \
+                        "${backup_identity}" \
+                        && [[ ! -e "${backup}" && ! -L "${backup}" ]]; then
+                        # Reconcile a wrapper that reports failure after the
+                        # bound restore rename already completed.
+                        INSTALL_BACKUPS[index]=""
+                    else
+                        printf 'frost install: rollback failed for %s; backup retained at %s\n' \
+                            "${dest_display}" "${backup_display}" >&2
+                        rollback_failed=1
+                    fi
                 else
-                    printf 'frost install: rollback failed for %s; backup retained at %s\n' \
-                        "${dest}" "${backup}" >&2
+                    printf 'frost install: rollback refused to overwrite changed target %s; backup retained at %s\n' \
+                        "${dest_display}" "${backup_display}" >&2
                     rollback_failed=1
                 fi
             else
                 printf 'frost install: rollback backup missing for %s\n' \
-                    "${dest}" >&2
+                    "${dest_display}" >&2
                 rollback_failed=1
             fi
-        elif ! rm -f -- "${dest}"; then
-            printf 'frost install: rollback could not remove new target %s\n' \
-                "${dest}" >&2
+        elif [[ ! -e "${dest_path}" && ! -L "${dest_path}" ]]; then
+            :
+        elif [[ -n "${staged_identity}" ]] \
+            && path_matches_identity "${dest_path}" "${staged_identity}"; then
+            if rm -f -- "${dest_path}"; then
+                :
+            elif [[ ! -e "${dest_path}" && ! -L "${dest_path}" ]]; then
+                # As above, observed post-action state wins over a wrapper's
+                # non-zero status.
+                :
+            else
+                printf 'frost install: rollback could not remove new target %s\n' \
+                    "${dest_display}" >&2
+                rollback_failed=1
+            fi
+        else
+            printf 'frost install: rollback refused to remove changed new target %s\n' \
+                "${dest_display}" >&2
             rollback_failed=1
         fi
     done
@@ -331,95 +485,166 @@ validate_staging_target() {
 
 stage_install_file() {
     local mode="$1" source="$2" dest="$3" directory basename temp
+    local index staged_identity
     printf '  install -m %q %q %q\n' \
         "${mode}" "${source}" "${dest}.<temporary>"
+    index="${#INSTALL_DESTS[@]}"
+    INSTALL_DESTS[index]="${dest}"
+    INSTALL_PARENT_FDS[index]=""
+    INSTALL_PARENT_IDENTITIES[index]=""
+    INSTALL_DEST_BASENAMES[index]="${dest##*/}"
+    INSTALL_TEMP_BASENAMES[index]=""
+    INSTALL_STAGED_IDENTITIES[index]=""
     if ((DRY_RUN == 1)); then
-        INSTALL_TEMPS+=("${dest}.<temporary>")
-        INSTALL_DESTS+=("${dest}")
+        INSTALL_TEMPS[index]="${dest}.<temporary>"
         return 0
     fi
     directory="${dest%/*}"
     basename="${dest##*/}"
     install -d -m 0755 "${directory}" \
         || die "cannot create destination directory for ${dest}"
-    temp="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
+    bind_install_destination "${index}" "${dest}"
+    temp="$(mktemp "$(bound_install_entry_path "${index}" \
+        ".${basename}.install.XXXXXX")")" \
         || die "cannot create temporary file beside ${dest}"
-    INSTALL_TEMPS+=("${temp}")
-    INSTALL_DESTS+=("${dest}")
-    if ! install -m "${mode}" "${source}" "${temp}"; then
+    INSTALL_TEMP_BASENAMES[index]="${temp##*/}"
+    INSTALL_TEMPS[index]="$(bound_install_temp_path "${index}")"
+    staged_identity="$(stat -c '%d:%i' -- "${INSTALL_TEMPS[index]}")" \
+        || die "cannot identify install temporary for ${dest}"
+    INSTALL_STAGED_IDENTITIES[index]="${staged_identity}"
+    logical_install_parent_matches "${index}" \
+        || die "install destination directory changed while staging: ${directory}"
+    if ! install -m "${mode}" "${source}" "${INSTALL_TEMPS[index]}"; then
         die "cannot stage ${dest}"
     fi
+    path_matches_identity "${INSTALL_TEMPS[index]}" "${staged_identity}" \
+        || die "install temporary changed while staging ${dest}"
+    logical_install_parent_matches "${index}" \
+        || die "install destination directory changed while staging: ${directory}"
 }
 
 # Keep the binary temporary on its destination filesystem. It is queued after
 # every resource so publish_install_plan makes the executable the last commit.
 stage_install_binary() {
-    local source="$1" dest="$2" directory temp
+    local source="$1" dest="$2" directory temp index staged_identity
     printf '  install -m 0755 %q %q\n' "${source}" "${dest}.<temporary>"
+    index="${#INSTALL_DESTS[@]}"
+    INSTALL_DESTS[index]="${dest}"
+    INSTALL_PARENT_FDS[index]=""
+    INSTALL_PARENT_IDENTITIES[index]=""
+    INSTALL_DEST_BASENAMES[index]="${dest##*/}"
+    INSTALL_TEMP_BASENAMES[index]=""
+    INSTALL_STAGED_IDENTITIES[index]=""
     if ((DRY_RUN == 1)); then
-        INSTALL_TEMPS+=("${dest}.<temporary>")
-        INSTALL_DESTS+=("${dest}")
+        INSTALL_TEMPS[index]="${dest}.<temporary>"
         return 0
     fi
     directory="${dest%/*}"
     install -d -m 0755 "${directory}" \
         || die "cannot create binary directory for ${dest}"
-    temp="$(mktemp "${dest}.install.XXXXXX")" \
+    bind_install_destination "${index}" "${dest}"
+    temp="$(mktemp "$(bound_install_entry_path "${index}" \
+        ".${dest##*/}.install.XXXXXX")")" \
         || die "cannot create temporary binary beside ${dest}"
-    INSTALL_TEMPS+=("${temp}")
-    INSTALL_DESTS+=("${dest}")
-    if ! install -m 0755 "${source}" "${temp}"; then
+    INSTALL_TEMP_BASENAMES[index]="${temp##*/}"
+    INSTALL_TEMPS[index]="$(bound_install_temp_path "${index}")"
+    staged_identity="$(stat -c '%d:%i' -- "${INSTALL_TEMPS[index]}")" \
+        || die "cannot identify temporary binary for ${dest}"
+    INSTALL_STAGED_IDENTITIES[index]="${staged_identity}"
+    logical_install_parent_matches "${index}" \
+        || die "binary destination directory changed while staging: ${directory}"
+    if ! install -m 0755 "${source}" "${INSTALL_TEMPS[index]}"; then
         die "cannot stage binary for ${dest}"
     fi
+    path_matches_identity "${INSTALL_TEMPS[index]}" "${staged_identity}" \
+        || die "temporary binary changed while staging ${dest}"
+    logical_install_parent_matches "${index}" \
+        || die "binary destination directory changed while staging: ${directory}"
 }
 
 prepare_install_backups() {
-    local index dest directory basename backup
+    local index dest dest_path directory basename backup reservation_identity
+    local original_identity backup_identity staged_identity
     INSTALL_BACKUPS=()
+    INSTALL_BACKUP_BASENAMES=()
+    INSTALL_BACKUP_IDENTITIES=()
     INSTALL_ORIGINAL_PRESENT=()
+    INSTALL_ORIGINAL_IDENTITIES=()
     # Validate the complete final-target set before creating even the first
     # rollback link. A late FIFO/socket/device/directory must not leave earlier
     # targets with transient backup names, and no special file is ever opened.
     for index in "${!INSTALL_DESTS[@]}"; do
         dest="${INSTALL_DESTS[index]}"
-        if [[ -e "${dest}" || -L "${dest}" ]]; then
-            [[ -f "${dest}" || -L "${dest}" ]] \
+        dest_path="$(bound_install_dest_path "${index}")"
+        staged_identity="${INSTALL_STAGED_IDENTITIES[index]}"
+        logical_install_parent_matches "${index}" \
+            || die "install destination directory changed before backup: ${dest%/*}"
+        path_matches_identity "$(bound_install_temp_path "${index}")" \
+            "${staged_identity}" \
+            || die "install temporary changed before backup: ${dest}"
+        if [[ -e "${dest_path}" || -L "${dest_path}" ]]; then
+            [[ -f "${dest_path}" || -L "${dest_path}" ]] \
                 || die "install destination is not a regular file or symlink: ${dest}"
         fi
     done
     for index in "${!INSTALL_DESTS[@]}"; do
         dest="${INSTALL_DESTS[index]}"
-        if [[ -e "${dest}" || -L "${dest}" ]]; then
-            # Best-effort use-point recheck; the installer makes no claim that
-            # this closes concurrent pathname replacement after preflight.
-            [[ -f "${dest}" || -L "${dest}" ]] \
+        dest_path="$(bound_install_dest_path "${index}")"
+        INSTALL_BACKUPS[index]=""
+        INSTALL_BACKUP_BASENAMES[index]=""
+        INSTALL_BACKUP_IDENTITIES[index]=""
+        if [[ -e "${dest_path}" || -L "${dest_path}" ]]; then
+            [[ -f "${dest_path}" || -L "${dest_path}" ]] \
                 || die "install destination is not a regular file or symlink: ${dest}"
             directory="${dest%/*}"
             basename="${dest##*/}"
-            backup="$(mktemp "${directory}/.${basename}.rollback.XXXXXX")" \
-                || die "cannot reserve rollback backup beside ${dest}"
-            INSTALL_BACKUPS[index]="${backup}"
+            original_identity="$(stat -c '%d:%i' -- "${dest_path}")" \
+                || die "cannot identify existing install target ${dest}"
             INSTALL_ORIGINAL_PRESENT[index]=1
-            rm -f -- "${backup}" \
+            INSTALL_ORIGINAL_IDENTITIES[index]="${original_identity}"
+            backup="$(mktemp "$(bound_install_entry_path "${index}" \
+                ".${basename}.rollback.XXXXXX")")" \
+                || die "cannot reserve rollback backup beside ${dest}"
+            INSTALL_BACKUP_BASENAMES[index]="${backup##*/}"
+            INSTALL_BACKUPS[index]="$(bound_install_backup_path "${index}")"
+            reservation_identity="$(stat -c '%d:%i' -- \
+                "${INSTALL_BACKUPS[index]}")" \
+                || die "cannot identify rollback reservation beside ${dest}"
+            INSTALL_BACKUP_IDENTITIES[index]="${reservation_identity}"
+            logical_install_parent_matches "${index}" \
+                || die "install destination directory changed while reserving backup: ${directory}"
+            path_matches_identity "${dest_path}" "${original_identity}" \
+                || die "install target changed while reserving backup: ${dest}"
+            rm -f -- "${INSTALL_BACKUPS[index]}" \
                 || die "cannot prepare rollback backup beside ${dest}"
+            INSTALL_BACKUP_IDENTITIES[index]=""
             # A same-directory hard link retains the exact inode: owner/group,
             # mode, xattrs, and even a dangling symlink's link object. Some
             # filesystems or protected-hardlink policies reject it; the copy
             # fallback still preserves content/mode and never follows links.
-            if ! ln -P -- "${dest}" "${backup}" 2>/dev/null \
+            if ! ln -P -- "${dest_path}" "${INSTALL_BACKUPS[index]}" \
+                2>/dev/null \
                 && ! cp -a --no-dereference --no-preserve=ownership -- \
-                    "${dest}" "${backup}"; then
+                    "${dest_path}" "${INSTALL_BACKUPS[index]}"; then
                 die "cannot back up existing install target ${dest}"
             fi
+            backup_identity="$(stat -c '%d:%i' -- \
+                "${INSTALL_BACKUPS[index]}")" \
+                || die "cannot identify rollback backup for ${dest}"
+            INSTALL_BACKUP_IDENTITIES[index]="${backup_identity}"
+            logical_install_parent_matches "${index}" \
+                || die "install destination directory changed while backing up: ${directory}"
+            path_matches_identity "${dest_path}" "${original_identity}" \
+                || die "install target changed while backing up: ${dest}"
         else
-            INSTALL_BACKUPS[index]=""
             INSTALL_ORIGINAL_PRESENT[index]=0
+            INSTALL_ORIGINAL_IDENTITIES[index]=""
         fi
     done
 }
 
 publish_install_plan() {
-    local index temp dest
+    local index temp temp_display dest dest_path staged_identity
     if ((DRY_RUN == 0)); then
         prepare_install_backups
         PUBLISH_IN_PROGRESS=1
@@ -427,11 +652,38 @@ publish_install_plan() {
     for index in "${!INSTALL_TEMPS[@]}"; do
         temp="${INSTALL_TEMPS[index]}"
         dest="${INSTALL_DESTS[index]}"
-        print_command mv -fT -- "${temp}" "${dest}"
+        if ((DRY_RUN == 1)); then
+            print_command mv -fT -- "${temp}" "${dest}"
+            continue
+        fi
+        temp="$(bound_install_temp_path "${index}")"
+        temp_display="$(bound_install_entry_display "${index}" \
+            "${INSTALL_TEMP_BASENAMES[index]}")"
+        dest_path="$(bound_install_dest_path "${index}")"
+        staged_identity="${INSTALL_STAGED_IDENTITIES[index]}"
+        logical_install_parent_matches "${index}" \
+            || die "install destination directory changed before publish: ${dest%/*}"
+        path_matches_identity "${temp}" "${staged_identity}" \
+            || die "install temporary changed before publish: ${temp_display}"
+        if (( ${INSTALL_ORIGINAL_PRESENT[index]:-0} == 1 )); then
+            path_matches_identity "${dest_path}" \
+                "${INSTALL_ORIGINAL_IDENTITIES[index]}" \
+                || die "install target changed after backup: ${dest}"
+        else
+            [[ ! -e "${dest_path}" && ! -L "${dest_path}" ]] \
+                || die "install target appeared after backup: ${dest}"
+        fi
+        print_command mv -fT -- "${temp_display}" "${dest}"
         PUBLISH_LAST_ATTEMPT="${index}"
-        if ((DRY_RUN == 0)) && ! mv -fT -- "${temp}" "${dest}"; then
+        if ! mv -fT -- "${temp}" "${dest_path}"; then
             die "cannot atomically replace ${dest}"
         fi
+        path_matches_identity "${dest_path}" "${staged_identity}" \
+            || die "cannot reconcile published install target ${dest}"
+        [[ ! -e "${temp}" && ! -L "${temp}" ]] \
+            || die "install temporary remained after publish: ${temp_display}"
+        logical_install_parent_matches "${index}" \
+            || die "install destination directory changed during publish: ${dest%/*}"
         INSTALL_TEMPS[index]=""
     done
     PUBLISH_IN_PROGRESS=0
@@ -547,25 +799,39 @@ validate_desktop_exec_path() {
 }
 
 stage_desktop_entry() {
-    local source="$1" dest="$2" exec_path exec_value try_exec_value desktop_dir temp
+    local source="$1" dest="$2" exec_path exec_value try_exec_value
+    local desktop_dir temp index staged_identity
     exec_path="$(desktop_exec_path)"
     validate_desktop_exec_path "${exec_path}"
     exec_value="$(desktop_exec_value "${exec_path}")"
     try_exec_value="$(desktop_try_exec_value "${exec_path}")"
     printf '  install -Dm0644 (Exec=%s) %q %q\n' \
         "${exec_path}" "${source}" "${dest}.<temporary>"
+    index="${#INSTALL_DESTS[@]}"
+    INSTALL_DESTS[index]="${dest}"
+    INSTALL_PARENT_FDS[index]=""
+    INSTALL_PARENT_IDENTITIES[index]=""
+    INSTALL_DEST_BASENAMES[index]="${dest##*/}"
+    INSTALL_TEMP_BASENAMES[index]=""
+    INSTALL_STAGED_IDENTITIES[index]=""
     if ((DRY_RUN == 1)); then
-        INSTALL_TEMPS+=("${dest}.<temporary>")
-        INSTALL_DESTS+=("${dest}")
+        INSTALL_TEMPS[index]="${dest}.<temporary>"
         return 0
     fi
     desktop_dir="${dest%/*}"
     install -d -m 0755 "${desktop_dir}" \
         || die "cannot create desktop-entry directory for ${dest}"
-    temp="$(mktemp "${desktop_dir}/.${APP_ID}.desktop.install.XXXXXX")" \
+    bind_install_destination "${index}" "${dest}"
+    temp="$(mktemp "$(bound_install_entry_path "${index}" \
+        ".${APP_ID}.desktop.install.XXXXXX")")" \
         || die "cannot create temporary desktop entry beside ${dest}"
-    INSTALL_TEMPS+=("${temp}")
-    INSTALL_DESTS+=("${dest}")
+    INSTALL_TEMP_BASENAMES[index]="${temp##*/}"
+    INSTALL_TEMPS[index]="$(bound_install_temp_path "${index}")"
+    staged_identity="$(stat -c '%d:%i' -- "${INSTALL_TEMPS[index]}")" \
+        || die "cannot identify temporary desktop entry for ${dest}"
+    INSTALL_STAGED_IDENTITIES[index]="${staged_identity}"
+    logical_install_parent_matches "${index}" \
+        || die "desktop-entry directory changed while staging: ${desktop_dir}"
     if ! FROST_DESKTOP_EXEC_VALUE="${exec_value}" \
         FROST_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
         awk '
@@ -590,10 +856,14 @@ stage_desktop_entry() {
         END {
             if (exec_count < 1 || try_exec_count != 1) exit 44
         }
-    ' "${source}" >"${temp}" \
-        || ! chmod 0644 "${temp}"; then
+    ' "${source}" >"${INSTALL_TEMPS[index]}" \
+        || ! chmod 0644 "${INSTALL_TEMPS[index]}"; then
         die "cannot stage desktop entry for ${dest}"
     fi
+    path_matches_identity "${INSTALL_TEMPS[index]}" "${staged_identity}" \
+        || die "temporary desktop entry changed while staging ${dest}"
+    logical_install_parent_matches "${index}" \
+        || die "desktop-entry directory changed while staging: ${desktop_dir}"
 }
 
 prepare_post_install_plan() {
@@ -928,6 +1198,7 @@ require_command rm
 require_command cp
 require_command ln
 require_command stat
+require_command readlink
 if ((INSTALL_DESKTOP == 1)); then
     require_command awk
     require_command chmod

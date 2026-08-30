@@ -147,10 +147,14 @@ cargo build --release --locked
 快照：优先 hardlink 原 inode，因此 owner/group、mode、xattr、hardlink 关系及 dangling symlink
 对象都能原样恢复；文件系统或安全策略拒绝 hardlink 时回退到不跟随链接的 `cp -a`，此时保证
 内容、mode 与链接值，但不承诺保留原 owner/group 或 inode。rename 失败或可捕获的终止信号会
-按逆序恢复已尝试目标。各 rename 自身原子，但整批
+按逆序恢复已尝试目标。真实安装会在 staging 前打开并记录每个物理目标目录，之后的临时文件
+创建、rollback backup、发布 rename、逆序恢复及成功后的 backup 清理都只使用这个目录 fd 下的
+相对名称。即使逻辑 parent 在 `mktemp`、`ln`、`mv` 或 `rm` 内被换成指向另一目录的 symlink，
+操作也只落在原目录 inode；紧随其后的身份检查会中止并绑定回滚，既不会删除新 referent 中的
+同名文件，也不会在已提交的旧 parent 留下 backup。各 rename 自身原子，但整批
 rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回滚本身的 I/O 故障仍可能留下混合
 版本；恢复失败时 backup 会保留并打印路径，不会被清理。除上述条件外还需要 GNU coreutils 的
-`cp`/`ln`/`mktemp`/`mv`。它可与
+`cp`/`ln`/`mktemp`/`mv`/`readlink`。它可与
 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR` 组合使用。
 零字节预编译产物会在旧目标改变前被拒绝。desktop、AppStream、SVG 与 PNG 源文件都在
 构建/写入前预检，公共资源也以明确权限写入目标同目录临时文件后原子 rename。非根
@@ -176,11 +180,11 @@ reservation placeholder、rollback backup 与待 purge 项都会在使用点核�
 `/proc/self/fd` 完成 reservation、rename、rollback 与 purge；即使逻辑 parent 在外部命令
 执行期间被换成 symlink，文件操作仍只落在原目录 inode，随后检查会失败/警告而不沿新 referent。
 若 purge 同时失败，恢复提示中的源和目标也会解析到这个已绑定目录，而不使用被替换的逻辑 parent。
-因此真实卸载需要可用的 procfs；dry-run 不需要，也不会打开目录。
+因此真实安装和卸载需要可用的 procfs；dry-run 不需要，也不会打开目录。
 提交后的空 workflow 目录清理以及 desktop/icon cache refresh 同样在提交前绑定目录 inode。
 身份在执行前变化会跳过可选操作；若变化发生在 helper 内部，helper 只拿到 `/proc/self/fd`
 路径，随后给出非致命警告。清理/刷新失败不会反转已经完成的卸载，成功摘要仍保持真实。
-安装和卸载的绑定目录都按 `device:inode` 去重，分别设有 4/16 个 fd 的固定上限；同一物理
+安装和卸载的绑定目录都按 `device:inode` 去重，各设有 16 个 fd 的固定上限；同一物理
 applications/workflow parent 的多个消费者仍各自执行 use-point identity 检查，正常完成、早退
 与异常退出最终都由统一清理关闭池中描述符。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机
