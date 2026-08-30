@@ -532,6 +532,33 @@ assert_contains "uninstall ancestor diagnostic" \
 [[ "$(<"${uninstall_link_victim}/frost-uninstall-link/bin/frost")" == \
     'outside frost' ]] || fail "uninstaller removed a file outside DESTDIR"
 
+# A late unsafe target must reject the whole plan before an earlier safe binary
+# is removed. The old per-target validation discovered this share symlink only
+# after deleting PREFIX/bin/frost.
+late_link_stage="${TEST_ROOT}/late-uninstall-link-stage"
+late_link_victim="${TEST_ROOT}/late-uninstall-link-victim"
+late_link_prefix="/opt/frost-late-uninstall-link"
+late_link_binary="${late_link_stage}${late_link_prefix}/bin/frost"
+mkdir -p "${late_link_binary%/*}" "${late_link_victim}"
+printf 'installed frost before rejected uninstall\n' >"${late_link_binary}"
+ln -s -- "${late_link_victim}" \
+    "${late_link_stage}${late_link_prefix}/share"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" \
+    DESTDIR="${late_link_stage}" "${UNINSTALLER}" \
+    --prefix "${late_link_prefix}" >"${TEST_ROOT}/late-uninstall-link.log" 2>&1; then
+    fail "uninstaller accepted a late symbolic-link ancestor below DESTDIR"
+fi
+assert_contains "late uninstall ancestor diagnostic" \
+    "$(<"${TEST_ROOT}/late-uninstall-link.log")" \
+    "staged uninstall path contains a symbolic-link ancestor"
+assert_regular_file "binary preserved after whole-plan rejection" \
+    "${late_link_binary}"
+[[ "$(<"${late_link_binary}")" == \
+    'installed frost before rejected uninstall' ]] \
+    || fail "late uninstall preflight changed the existing binary"
+[[ -z "$(find "${late_link_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "late uninstall preflight removed outside DESTDIR"
+
 # Normalize `link/.` and repeated-separator DESTDIR spellings before walking
 # the complete existing root chain. Neither install nor uninstall may reach
 # the directory behind such a root symlink.

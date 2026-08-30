@@ -197,28 +197,49 @@ if ((DESTDIR_ACTIVE == 1)); then
 fi
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
-remove_file "${DESTDIR}${BIN_DIR}/frost"
-remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
-remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
-remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
-remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
-remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
-for workflow in \
-    docker-tail-logs.yaml \
-    find-large-files.yaml \
-    git-feature.yaml \
-    git-rebase-interactive.yaml \
-    kill-port.yaml \
-    ssh-tunnel.yaml; do
-    remove_file "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows/${workflow}"
+OWNED_WORKFLOWS=(
+    docker-tail-logs.yaml
+    find-large-files.yaml
+    git-feature.yaml
+    git-rebase-interactive.yaml
+    kill-port.yaml
+    ssh-tunnel.yaml
+)
+REMOVAL_FILES=(
+    "${DESTDIR}${BIN_DIR}/frost"
+    "${SHARE_DIR}/applications/${APP_ID}.desktop"
+    "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
+    "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
+    "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
+    "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+)
+for workflow in "${OWNED_WORKFLOWS[@]}"; do
+    REMOVAL_FILES+=(
+        "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows/${workflow}"
+    )
 done
-remove_dir_if_empty "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
 # Desktop integration from before the jterm3 -> frost rename.
-remove_file "${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
-remove_file "${SHARE_DIR}/metainfo/io.github.beamiter.jterm3.metainfo.xml"
-remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/io.github.beamiter.jterm3.svg"
-remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/io.github.beamiter.jterm3.png"
-remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/io.github.beamiter.jterm3.png"
+REMOVAL_FILES+=(
+    "${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
+    "${SHARE_DIR}/metainfo/io.github.beamiter.jterm3.metainfo.xml"
+    "${SHARE_DIR}/icons/hicolor/scalable/apps/io.github.beamiter.jterm3.svg"
+    "${SHARE_DIR}/icons/hicolor/128x128/apps/io.github.beamiter.jterm3.png"
+    "${SHARE_DIR}/icons/hicolor/256x256/apps/io.github.beamiter.jterm3.png"
+)
+REMOVAL_DIRS=("${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows")
+
+# Validate the complete caller-owned staging plan before the first removal.
+# Per-target checks remain in remove_file/remove_dir_if_empty as a best-effort
+# guard against a path being replaced between this preflight and its use.
+for target in "${REMOVAL_FILES[@]}" "${REMOVAL_DIRS[@]}"; do
+    validate_staging_removal_target "${target}"
+done
+for target in "${REMOVAL_FILES[@]}"; do
+    remove_file "${target}"
+done
+for target in "${REMOVAL_DIRS[@]}"; do
+    remove_dir_if_empty "${target}"
+done
 
 # Without this the launcher keeps offering a dead entry and a cached icon.
 if ((DESTDIR_ACTIVE == 0 && DRY_RUN == 0)); then

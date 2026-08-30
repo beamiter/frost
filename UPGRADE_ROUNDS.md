@@ -373,3 +373,10 @@ Round 70 closes the remaining argument-form affordance gap:
     owned examples and leaves a non-empty user directory alone, and the real
     DESTDIR round trip compares every installed byte and proves
     install/uninstall symmetry.
+
+80. **Whole-plan staged uninstall preflight** — every binary, current/legacy
+    desktop asset, owned workflow, and cleanup directory is validated before
+    the first removal under a non-root `DESTDIR`; per-target checks remain at
+    use time. A regression places the unsafe symlink only under the later
+    `share` branch and proves the earlier safe binary survives unchanged, so an
+    escape refusal can no longer leave a partially uninstalled package tree.
