@@ -160,7 +160,8 @@ rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回�
 所有最终安装目标还会在首次 rollback backup 前整批检查：只接受不存在、普通文件或将被原子
 替换的 symlink；目录、FIFO、socket 与 device 会直接拒绝，FIFO 不会被打开或读取。
 卸载文件目标采用对称的整批预检：最终 symlink 只删除链接本身；目录、FIFO、socket 与
-device 会在首个 `rm` 前拒绝并保持整套安装不变。
+device 会在首个 `rm` 前拒绝并保持整套安装不变。workflow cleanup 目标还必须是未被替换的
+真实目录，且只用非递归 `rmdir` 尝试删除空目录；非空用户目录及其自定义文件不会被遍历。
 该检查只描述预检时的状态，不承诺抵御之后的并发
 路径替换；正常主机 prefix 不套用这条策略。
 

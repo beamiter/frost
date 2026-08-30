@@ -947,6 +947,67 @@ for special_kind in "${special_target_kinds[@]}"; do
     esac || fail "${special_kind} uninstall target changed during rejection"
 done
 
+# The one cleanup path is intentionally narrower than file targets: only a
+# real directory may reach non-recursive rmdir. Reject every replacement type
+# during whole-plan preflight, before the earlier binary can be unlinked.
+cleanup_target_kinds=(regular fifo symlink)
+for special_kind in "${special_target_kinds[@]}"; do
+    case "${special_kind}" in
+        socket|device) cleanup_target_kinds+=("${special_kind}") ;;
+    esac
+done
+for cleanup_kind in "${cleanup_target_kinds[@]}"; do
+    cleanup_stage="${TEST_ROOT}/uninstall-cleanup-${cleanup_kind}-stage"
+    cleanup_prefix="/opt/frost-uninstall-cleanup-${cleanup_kind}"
+    cleanup_binary="${cleanup_stage}${cleanup_prefix}/bin/frost"
+    cleanup_target="${cleanup_stage}${cleanup_prefix}/share/frost/workflows"
+    cleanup_marker="${TEST_ROOT}/uninstall-cleanup-${cleanup_kind}-rm-called"
+    cleanup_victim="${TEST_ROOT}/uninstall-cleanup-${cleanup_kind}-victim"
+    mkdir -p "${cleanup_binary%/*}" "${cleanup_target%/*}"
+    printf 'installed frost before cleanup target rejection\n' \
+        >"${cleanup_binary}"
+    case "${cleanup_kind}" in
+        regular) printf 'not a cleanup directory\n' >"${cleanup_target}" ;;
+        fifo) mkfifo "${cleanup_target}" ;;
+        symlink)
+            mkdir -p "${cleanup_victim}"
+            ln -s -- "${cleanup_victim}" "${cleanup_target}"
+            ;;
+        socket)
+            python3 -c \
+                'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
+                "${cleanup_target}"
+            ;;
+        device) mknod "${cleanup_target}" c 1 3 ;;
+    esac
+    if env HOME="${TEST_HOME}" \
+        PATH="${uninstall_special_tools}:${TEST_PATH}" \
+        FROST_TEST_RM_MARKER="${cleanup_marker}" DESTDIR="${cleanup_stage}" \
+        "${UNINSTALLER}" --prefix "${cleanup_prefix}" \
+        >"${TEST_ROOT}/uninstall-cleanup-${cleanup_kind}.log" 2>&1; then
+        fail "uninstaller accepted a ${cleanup_kind} cleanup target"
+    fi
+    assert_contains "${cleanup_kind} cleanup target diagnostic" \
+        "$(<"${TEST_ROOT}/uninstall-cleanup-${cleanup_kind}.log")" \
+        "uninstall cleanup target is not a directory: ${cleanup_target}"
+    assert_absent "rm call before ${cleanup_kind} cleanup rejection" \
+        "${cleanup_marker}"
+    [[ "$(<"${cleanup_binary}")" == \
+        'installed frost before cleanup target rejection' ]] \
+        || fail "${cleanup_kind} cleanup preflight changed the binary"
+    case "${cleanup_kind}" in
+        regular) [[ -f "${cleanup_target}" && ! -L "${cleanup_target}" ]] ;;
+        fifo) [[ -p "${cleanup_target}" ]] ;;
+        symlink) [[ -L "${cleanup_target}" ]] ;;
+        socket) [[ -S "${cleanup_target}" ]] ;;
+        device) [[ -c "${cleanup_target}" ]] ;;
+    esac || fail "${cleanup_kind} cleanup target changed during rejection"
+    if [[ "${cleanup_kind}" == symlink ]]; then
+        [[ -z "$(find "${cleanup_victim}" -mindepth 1 -print -quit)" ]] \
+            || fail "cleanup symlink rejection touched its referent"
+    fi
+done
+
 # A final symlink is an entry the installer owns: unlink it without following
 # its target, including when the target lives outside the staged prefix.
 uninstall_symlink_stage="${TEST_ROOT}/uninstall-final-symlink-stage"

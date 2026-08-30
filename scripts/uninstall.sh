@@ -60,7 +60,7 @@ remove_file() {
 
 remove_dir_if_empty() {
     local path="$1"
-    validate_staging_removal_target "${path}"
+    validate_removal_dir_target "${path}"
     if [[ -d "${path}" ]]; then
         run rmdir --ignore-fail-on-non-empty -- "${path}"
     fi
@@ -139,6 +139,15 @@ validate_removal_file_target() {
     if [[ -e "${path}" || -L "${path}" ]]; then
         [[ -f "${path}" || -L "${path}" ]] \
             || die "uninstall target is not a regular file or symlink: ${path}"
+    fi
+}
+
+validate_removal_dir_target() {
+    local path="$1"
+    validate_staging_removal_target "${path}"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -d "${path}" && ! -L "${path}" ]] \
+            || die "uninstall cleanup target is not a directory: ${path}"
     fi
 }
 
@@ -238,15 +247,16 @@ REMOVAL_FILES+=(
 )
 REMOVAL_DIRS=("${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows")
 
-# Validate the complete caller-owned plan before the first removal. Exact final
+# Validate the complete caller-owned plan before the first removal. Cleanup
+# paths must remain real directories and are checked first; exact final file
 # symlinks are deliberately allowed and unlinked without following them, while
 # directories and special files at file destinations fail closed. Per-target
 # checks remain as a best-effort guard against replacement after preflight.
+for target in "${REMOVAL_DIRS[@]}"; do
+    validate_removal_dir_target "${target}"
+done
 for target in "${REMOVAL_FILES[@]}"; do
     validate_removal_file_target "${target}"
-done
-for target in "${REMOVAL_DIRS[@]}"; do
-    validate_staging_removal_target "${target}"
 done
 for target in "${REMOVAL_FILES[@]}"; do
     remove_file "${target}"

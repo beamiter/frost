@@ -447,3 +447,10 @@ Round 70 closes the remaining argument-form affordance gap:
     late directories, FIFOs, and host-creatable sockets/devices fail closed.
     Instrumented `rm` coverage proves both special-target and late ancestor
     rejection leave the earlier executable and the entire staged tree intact.
+
+90. **Typed non-recursive cleanup** — the owned workflow cleanup path is now
+    preflighted as either absent or a real directory before any file removal.
+    Regular files, final symlinks, FIFOs, and host-creatable sockets/devices are
+    rejected without invoking `rm`; the earlier binary and replacement object
+    remain unchanged. Valid cleanup still uses only non-recursive `rmdir`, so a
+    non-empty user workflow directory and its custom files are never traversed.
