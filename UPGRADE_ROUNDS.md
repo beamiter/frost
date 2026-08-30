@@ -426,3 +426,10 @@ Round 70 closes the remaining argument-form affordance gap:
     dangling desktop symlink by link value, and checks a user xattr when the
     host supplies attr tools. Filesystems that reject hardlinks use a documented
     no-follow copy fallback with deliberately narrower ownership guarantees.
+
+87. **Copy-safe PATH handoff** — the installer emits a direct, `%q`-escaped
+    `export PATH=...:"$PATH"` line instead of nesting an arbitrary directory in
+    single quotes inside an `echo` command. Empty, relative, and trailing-empty
+    PATH cases stay exact; apostrophes and dollars cannot break the suggestion,
+    while newline-bearing prebuilt or shadowing executable paths are reversibly
+    quoted and cannot forge diagnostic lines.

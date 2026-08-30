@@ -692,7 +692,8 @@ fi
 
 if [[ -n "${PREBUILT_BINARY}" ]]; then
     BINARY="${PREBUILT_BINARY}"
-    printf 'Using prebuilt frost binary: %s\n' "${BINARY}"
+    printf 'Using prebuilt frost binary: '
+    printf '%q\n' "${BINARY}"
     if ((DRY_RUN == 0)); then
         pin_prebuilt_binary "${PREBUILT_BINARY}"
     fi
@@ -756,19 +757,26 @@ if ((DESTDIR_ACTIVE == 1)); then
 fi
 if ((DESTDIR_ACTIVE == 0)); then
     if ! bin_dir_on_path; then
-        printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
-            "${BIN_DIR}"
-        printf 'but shells will not find frost until you add it, for example:\n'
-        printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
+        printf '\nNote: '
+        printf '%q' "${BIN_DIR}"
+        printf ' is not in PATH; the launcher entry uses the absolute path,\n'
+        printf 'but shells will not find frost. Add this line to ~/.profile:\n'
+        printf '  export PATH='
+        printf '%q' "${BIN_DIR}"
+        # Keep PATH expansion in the generated profile line, not this process.
+        # shellcheck disable=SC2016
+        printf ':"$PATH"\n'
     fi
     SHADOWING_BIN="$(command -v frost 2>/dev/null || true)"
     if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/frost" ]]; then
         # The backticks are literal command-name markup in user-facing prose.
         # shellcheck disable=SC2016
-        printf '\nNote: typing `frost` still runs %s, an older copy earlier in PATH.\n' \
-            "${SHADOWING_BIN}"
-        printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
-        printf 'The launcher entry is unaffected: it runs %s directly.\n' \
-            "${BIN_DIR}/frost"
+        printf '\nNote: typing `frost` still runs '
+        printf '%q' "${SHADOWING_BIN}"
+        printf ', an older copy earlier in PATH.\nRemove it, or put '
+        printf '%q' "${BIN_DIR}"
+        printf ' ahead of it in PATH.\nThe launcher entry is unaffected: it runs '
+        printf '%q' "${BIN_DIR}/frost"
+        printf ' directly.\n'
     fi
 fi

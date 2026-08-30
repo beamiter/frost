@@ -176,6 +176,9 @@ rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回�
 `DESTDIR` 的运行时路径。
 这些运行时绝对路径可包含空格、Unicode 和 `.` 段；空值、控制字符和词法 `..` 段会被拒绝。
 只有 `DESTDIR` 的拼写会按上文做词法规范化。
+若 binary 目录不在 `PATH`，安装结束会输出一行可直接加入 `~/.profile` 的
+`export PATH=...:"$PATH"`；目录使用 Bash 可逆 quoting，空格、单引号、`$` 等字符不会
+截断或注入命令。`command -v frost` 检出的旧副本路径也以同样方式显示。
 
 旧版源码安装脚本曾错误地把无参数安装写到 `~/.cargo/bin/frost`。新脚本不会
 自动删除那个可能由用户显式管理的文件；若升级后 `command -v frost` 仍指向旧

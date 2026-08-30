@@ -244,6 +244,63 @@ mkdir -p "${prebuilt_dir}"
 printf '#!/bin/sh\nprintf "frost release fixture\\n"\n' >"${prebuilt_binary}"
 chmod 0600 "${prebuilt_binary}"
 
+# PATH handoff is executable shell syntax, so quote it as one layer rather
+# than nesting an arbitrary directory inside an `echo '...'` command. Exercise
+# an apostrophe, dollar, relative PATH entry, and trailing empty PATH segment.
+path_hint_bin="${TEST_ROOT}/shell hint '\$"
+path_hint_output="$(
+    env HOME="${TEST_HOME}" PATH="relative/bin:${TEST_PATH}:" DESTDIR= \
+        "${INSTALLER}" --dry-run --binary "${prebuilt_binary}" \
+        --bin-dir "${path_hint_bin}" --no-desktop
+)"
+printf -v expected_path_hint '%q' "${path_hint_bin}"
+assert_contains "shell-safe PATH handoff" "${path_hint_output}" \
+    "  export PATH=${expected_path_hint}:\"\$PATH\""
+[[ "${path_hint_output}" != *"echo 'export PATH="* ]] \
+    || fail "PATH handoff retained a breakable nested shell quote"
+
+# Invoke Bash directly with an empty PATH. BASH_ENV supplies only the dirname
+# helper needed before dry-run dependency checks; the handoff must remain
+# nounset-safe and must not mistake an empty segment for the absolute bin dir.
+empty_path_env="${TEST_ROOT}/empty-path-bash-env"
+printf '%s\n' 'dirname() { /usr/bin/dirname "$@"; }' >"${empty_path_env}"
+empty_path_output="$(
+    env HOME="${TEST_HOME}" PATH= BASH_ENV="${empty_path_env}" DESTDIR= \
+        /bin/bash "${INSTALLER}" --dry-run --binary "${prebuilt_binary}" \
+        --bin-dir "${path_hint_bin}" --no-desktop
+)"
+assert_contains "empty PATH handoff" "${empty_path_output}" \
+    "  export PATH=${expected_path_hint}:\"\$PATH\""
+
+# Environment-derived executable diagnostics are inert even when PATH itself
+# contains a newline-bearing directory.
+shadow_dir="${TEST_ROOT}/shadow"$'\n''forged-shadow'
+shadow_binary="${shadow_dir}/frost"
+mkdir -p "${shadow_dir}"
+printf '#!/bin/sh\nexit 0\n' >"${shadow_binary}"
+chmod 0755 "${shadow_binary}"
+shadow_output="$(
+    env HOME="${TEST_HOME}" PATH="${shadow_dir}:${TEST_PATH}:" DESTDIR= \
+        "${INSTALLER}" --dry-run --binary "${prebuilt_binary}" \
+        --bin-dir "${path_hint_bin}" --no-desktop
+)"
+printf -v expected_shadow_display '%q' "${shadow_binary}"
+assert_contains "quoted shadowing executable" "${shadow_output}" \
+    "typing \`frost\` still runs ${expected_shadow_display}, an older copy"
+[[ "${shadow_output}" != *$'\nforged-shadow/frost, an older copy'* ]] \
+    || fail "shadowing executable injected an install diagnostic line"
+
+hostile_prebuilt="${TEST_ROOT}/prebuilt"$'\n''forged-prebuilt-message'
+hostile_prebuilt_output="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        "${INSTALLER}" --dry-run --binary "${hostile_prebuilt}" --no-desktop
+)"
+printf -v expected_prebuilt_display '%q' "${hostile_prebuilt}"
+assert_contains "quoted prebuilt diagnostic" "${hostile_prebuilt_output}" \
+    "Using prebuilt frost binary: ${expected_prebuilt_display}"
+[[ "${hostile_prebuilt_output}" != *$'\nforged-prebuilt-message'* ]] \
+    || fail "prebuilt path injected an install diagnostic line"
+
 roundtrip_install="$(
     env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
         "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${roundtrip_prefix}" \
