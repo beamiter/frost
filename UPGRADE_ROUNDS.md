@@ -440,3 +440,10 @@ Round 70 closes the remaining argument-form affordance gap:
     a regular file nor symlink; an instrumented `ln` proves no earlier backup
     was attempted, the special object is unchanged, FIFO handling never blocks,
     and every staged temporary is removed.
+
+89. **Symmetric uninstall target ownership** — the complete removal file set is
+    now restricted to absent entries, regular files, and final symlinks before
+    the first `rm`. A final symlink is unlinked without touching its referent;
+    late directories, FIFOs, and host-creatable sockets/devices fail closed.
+    Instrumented `rm` coverage proves both special-target and late ancestor
+    rejection leave the earlier executable and the entire staged tree intact.

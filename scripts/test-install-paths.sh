@@ -890,6 +890,79 @@ assert_contains "Unicode path accepted" \
     "$(install_dry_run "${stage_root}" --prefix "${portable_path}")" \
     "Installed frost to ${portable_path}/bin/frost"
 
+# Uninstall owns regular files and final symlink entries, not whatever special
+# object may have replaced one of those paths. Put the unexpected object after
+# a valid binary in the removal plan and prove preflight calls no rm at all.
+uninstall_special_tools="${TEST_ROOT}/uninstall-special-tools"
+mkdir -p "${uninstall_special_tools}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"${FROST_TEST_RM_MARKER:?}"' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_special_tools}/rm"
+chmod 0755 "${uninstall_special_tools}/rm"
+for special_kind in "${special_target_kinds[@]}"; do
+    uninstall_special_stage="${TEST_ROOT}/uninstall-special-${special_kind}-stage"
+    uninstall_special_prefix="/opt/frost-uninstall-special-${special_kind}"
+    uninstall_special_binary="${uninstall_special_stage}${uninstall_special_prefix}/bin/frost"
+    uninstall_special_target="${uninstall_special_stage}${uninstall_special_prefix}/share/applications/${app_id}.desktop"
+    uninstall_special_marker="${TEST_ROOT}/uninstall-special-${special_kind}-rm-called"
+    mkdir -p "${uninstall_special_binary%/*}" \
+        "${uninstall_special_target%/*}"
+    printf 'installed frost before special target rejection\n' \
+        >"${uninstall_special_binary}"
+    case "${special_kind}" in
+        directory) mkdir "${uninstall_special_target}" ;;
+        fifo) mkfifo "${uninstall_special_target}" ;;
+        socket)
+            python3 -c \
+                'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
+                "${uninstall_special_target}"
+            ;;
+        device) mknod "${uninstall_special_target}" c 1 3 ;;
+    esac
+    if env HOME="${TEST_HOME}" \
+        PATH="${uninstall_special_tools}:${TEST_PATH}" \
+        FROST_TEST_RM_MARKER="${uninstall_special_marker}" \
+        DESTDIR="${uninstall_special_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_special_prefix}" \
+        >"${TEST_ROOT}/uninstall-special-${special_kind}.log" 2>&1; then
+        fail "uninstaller accepted a ${special_kind} file target"
+    fi
+    assert_contains "${special_kind} uninstall target diagnostic" \
+        "$(<"${TEST_ROOT}/uninstall-special-${special_kind}.log")" \
+        "uninstall target is not a regular file or symlink: ${uninstall_special_target}"
+    assert_absent "rm call before ${special_kind} uninstall rejection" \
+        "${uninstall_special_marker}"
+    [[ "$(<"${uninstall_special_binary}")" == \
+        'installed frost before special target rejection' ]] \
+        || fail "${special_kind} preflight changed the installed binary"
+    case "${special_kind}" in
+        directory) [[ -d "${uninstall_special_target}" ]] ;;
+        fifo) [[ -p "${uninstall_special_target}" ]] ;;
+        socket) [[ -S "${uninstall_special_target}" ]] ;;
+        device) [[ -c "${uninstall_special_target}" ]] ;;
+    esac || fail "${special_kind} uninstall target changed during rejection"
+done
+
+# A final symlink is an entry the installer owns: unlink it without following
+# its target, including when the target lives outside the staged prefix.
+uninstall_symlink_stage="${TEST_ROOT}/uninstall-final-symlink-stage"
+uninstall_symlink_prefix="/opt/frost-uninstall-final-symlink"
+uninstall_symlink_path="${uninstall_symlink_stage}${uninstall_symlink_prefix}/bin/frost"
+uninstall_symlink_victim="${TEST_ROOT}/uninstall-final-symlink-victim"
+mkdir -p "${uninstall_symlink_path%/*}"
+printf 'outside final symlink target\n' >"${uninstall_symlink_victim}"
+ln -s -- "${uninstall_symlink_victim}" "${uninstall_symlink_path}"
+env HOME="${TEST_HOME}" PATH="${TEST_PATH}" \
+    DESTDIR="${uninstall_symlink_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_symlink_prefix}" >/dev/null
+assert_absent "final uninstall symlink" "${uninstall_symlink_path}"
+[[ "$(<"${uninstall_symlink_victim}")" == 'outside final symlink target' ]] \
+    || fail "uninstaller followed a final symlink"
+
 uninstall_link_stage="${TEST_ROOT}/uninstall-link-stage"
 uninstall_link_victim="${TEST_ROOT}/uninstall-link-victim"
 uninstall_link_prefix="/opt/frost-uninstall-link"
@@ -916,11 +989,14 @@ late_link_stage="${TEST_ROOT}/late-uninstall-link-stage"
 late_link_victim="${TEST_ROOT}/late-uninstall-link-victim"
 late_link_prefix="/opt/frost-late-uninstall-link"
 late_link_binary="${late_link_stage}${late_link_prefix}/bin/frost"
+late_link_rm_marker="${TEST_ROOT}/late-uninstall-link-rm-called"
 mkdir -p "${late_link_binary%/*}" "${late_link_victim}"
 printf 'installed frost before rejected uninstall\n' >"${late_link_binary}"
 ln -s -- "${late_link_victim}" \
     "${late_link_stage}${late_link_prefix}/share"
-if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" \
+if env HOME="${TEST_HOME}" \
+    PATH="${uninstall_special_tools}:${TEST_PATH}" \
+    FROST_TEST_RM_MARKER="${late_link_rm_marker}" \
     DESTDIR="${late_link_stage}" "${UNINSTALLER}" \
     --prefix "${late_link_prefix}" >"${TEST_ROOT}/late-uninstall-link.log" 2>&1; then
     fail "uninstaller accepted a late symbolic-link ancestor below DESTDIR"
@@ -930,6 +1006,7 @@ assert_contains "late uninstall ancestor diagnostic" \
     "staged uninstall path contains a symbolic-link ancestor"
 assert_regular_file "binary preserved after whole-plan rejection" \
     "${late_link_binary}"
+assert_absent "rm call before late ancestor rejection" "${late_link_rm_marker}"
 [[ "$(<"${late_link_binary}")" == \
     'installed frost before rejected uninstall' ]] \
     || fail "late uninstall preflight changed the existing binary"

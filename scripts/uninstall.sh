@@ -52,7 +52,7 @@ run() {
 
 remove_file() {
     local path="$1"
-    validate_staging_removal_target "${path}"
+    validate_removal_file_target "${path}"
     if [[ -e "${path}" || -L "${path}" ]]; then
         run rm -f -- "${path}"
     fi
@@ -131,6 +131,15 @@ validate_staging_removal_target() {
             || die "staged uninstall path contains a symbolic-link ancestor: ${current}"
         [[ -e "${current}" ]] || break
     done
+}
+
+validate_removal_file_target() {
+    local path="$1"
+    validate_staging_removal_target "${path}"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -f "${path}" || -L "${path}" ]] \
+            || die "uninstall target is not a regular file or symlink: ${path}"
+    fi
 }
 
 while (($# > 0)); do
@@ -229,10 +238,14 @@ REMOVAL_FILES+=(
 )
 REMOVAL_DIRS=("${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows")
 
-# Validate the complete caller-owned staging plan before the first removal.
-# Per-target checks remain in remove_file/remove_dir_if_empty as a best-effort
-# guard against a path being replaced between this preflight and its use.
-for target in "${REMOVAL_FILES[@]}" "${REMOVAL_DIRS[@]}"; do
+# Validate the complete caller-owned plan before the first removal. Exact final
+# symlinks are deliberately allowed and unlinked without following them, while
+# directories and special files at file destinations fail closed. Per-target
+# checks remain as a best-effort guard against replacement after preflight.
+for target in "${REMOVAL_FILES[@]}"; do
+    validate_removal_file_target "${target}"
+done
+for target in "${REMOVAL_DIRS[@]}"; do
     validate_staging_removal_target "${target}"
 done
 for target in "${REMOVAL_FILES[@]}"; do
