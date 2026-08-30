@@ -16681,6 +16681,7 @@ impl Frost {
             .wrapping(text::Wrapping::Word),
         );
 
+        let missing = form.missing();
         for (index, arg) in form.workflow().args.iter().enumerate() {
             let input = text_input(&arg.name, form.value(index))
                 .on_input(move |value| Message::WorkflowArgInput(index, value))
@@ -16701,7 +16702,7 @@ impl Frost {
             // An argument whose file declares no default is not filled by a
             // blank string (see `workflows`): say so on the row, so the
             // `missing values:` refusal on Insert is never a surprise.
-            if form.is_missing(index) {
+            if missing.contains(&arg.name.as_str()) {
                 label = format!("{label} (required)");
             }
             let field = row![

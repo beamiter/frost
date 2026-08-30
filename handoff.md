@@ -55,8 +55,8 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
   a caller that pre-seeds cannot seed past it. `ArgsForm` carries `Unset` vs
   `Supplied` in the type system, so `WorkflowArgsState` no longer holds a
   `Vec<String>` that cannot represent the difference, and
-  `WorkflowArgsState::is_missing` marks the row `name (required)` in the form
-  *before* Insert is pressed. Insert then refuses with `Workflow could not be
+  the shared `ArgsForm::missing` result marks the row `name (required)` in the
+  form *before* Insert is pressed. Insert then refuses with `Workflow could not be
   rendered: missing values: pid` on the form's own feedback line. Whitespace-only
   input counts as unfilled. Emptying a *defaulted* field is still a deliberate
   empty value and still renders as one — frost's tested `deploy  --env=staging`
@@ -936,25 +936,12 @@ panel code. Until then the panel is absent from
 README's shortcut table on purpose: the chord is settled family-wide, but
 nothing here is shipped behavior yet.
 
-Four things the workflow migration did not do, none of them papered over.
+Two things the workflow migration deliberately leaves app-owned.
 
-`WorkflowArgsState::is_missing` restates the core's rule (`default.is_none()`
-and the trimmed value is empty) rather than calling
-`ArgsForm::missing`, which returns argument *names* while the iced view needs a
-per-row predicate at the index it is drawing. Two copies of one rule is exactly
-the shape this round was convening to remove, and the copy here is one
-`is_some_and` — but it can drift from `render`'s. `ArgsForm::is_set(index)` is
-the accessor that exists; it is not the same question, because a field the user
-typed into and then emptied is set and still unusable. A
-`pub fn is_missing(&self, index: usize) -> bool` upstream, answering exactly
-what `missing()` answers per row, would let the shim delete its copy.
-
-`ArgsForm::clear(index)` — the only way back to `Unset`, and therefore the
-"revert this field to its declared default" affordance — is not wired to
-anything. frost's form has no per-row revert control, so a defaulted field the
-user empties stays empty for the life of the dialog and there is no way to ask
-for the default back except closing and reopening the workflow. That is the
-same behaviour as before this round; the capability is new and unused.
+The two format-policy gaps formerly recorded here are now closed: the iced view
+snapshots `ArgsForm::missing()` directly rather than restating its predicate,
+and each row's **Reset** action calls `ArgsForm::clear(index)` to return to the
+declared default or to genuinely unset.
 
 The `WorkflowPicker` extraction landed here rather than being deferred, so the
 one thing frost's picker still owns alone is the overlay's *keyboard routing*

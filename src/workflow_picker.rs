@@ -119,7 +119,7 @@ impl WorkflowPickerState {
 ///
 /// 现在的契约：空值只有在文件这么说时才成立（`default = ""` 就是这么说）。
 /// 声明了默认值的参数被清空仍然是一次显式的空值；没有声明默认值的参数留空则
-/// 是"未填写"，渲染时报 `missing values:`，[`Self::is_missing`] 让视图在按下
+/// 是"未填写"，渲染时报 `missing values:`，[`Self::missing`] 让视图在按下
 /// Insert 之前就把这些行标出来。
 pub(crate) struct WorkflowArgsState {
     form: ArgsForm,
@@ -146,14 +146,11 @@ impl WorkflowArgsState {
         self.form.value(index)
     }
 
-    /// 该行是否仍未提供可用的值：文件没有声明默认值，且用户没有键入非空白
-    /// 内容。与 `workflows::render` 的判定同一条规则。
-    pub(crate) fn is_missing(&self, index: usize) -> bool {
-        self.form
-            .args()
-            .get(index)
-            .is_some_and(|arg| arg.default.is_none())
-            && self.value(index).trim().is_empty()
+    /// Still-outstanding argument names, computed by the shared form. The view
+    /// snapshots this once before drawing its at-most-64 rows, so its required
+    /// labels cannot drift from the renderer's rule.
+    pub(crate) fn missing(&self) -> Vec<&str> {
+        self.form.missing()
     }
 
     pub(crate) fn set_value(&mut self, index: usize, value: String) {
@@ -317,13 +314,13 @@ mod tests {
         // 声明了默认值的行不缺；没有声明默认值又没填的行缺，视图据此标注，
         // 渲染据此拒绝。这里曾经断言 `deploy api --env=` 渲染成功——那条断言
         // 是四个终端共有的缺陷留下的化石，不是要保住的行为。
-        assert!(!form.is_missing(0));
-        assert!(form.is_missing(1));
+        assert!(!form.missing().contains(&"service"));
+        assert!(form.missing().contains(&"env"));
         let error = form.render().unwrap_err();
         assert!(error.contains("missing values: env"), "got {error}");
 
         form.set_value(1, "staging".to_string());
-        assert!(!form.is_missing(1));
+        assert!(!form.missing().contains(&"env"));
         assert_eq!(form.render().unwrap(), "deploy api --env=staging");
 
         // Reset is not the same operation as typing an empty string: the first
@@ -332,19 +329,19 @@ mod tests {
         form.reset_value(0);
         assert_eq!(form.value(0), "api");
         form.reset_value(1);
-        assert!(form.is_missing(1));
+        assert!(form.missing().contains(&"env"));
         assert!(form.render().unwrap_err().contains("missing values: env"));
         form.set_value(1, "staging".to_string());
 
         // 清空一个声明了默认值的参数仍然是显式的空值：文件说过空值在这里有
         // 意义，它就不会回退到默认值，也不算缺值。
         form.set_value(0, String::new());
-        assert!(!form.is_missing(0));
+        assert!(!form.missing().contains(&"service"));
         assert_eq!(form.render().unwrap(), "deploy  --env=staging");
 
         // 只输入空白等于没输入：没有声明默认值的参数不接受空白冒充。
         form.set_value(1, "   ".to_string());
-        assert!(form.is_missing(1));
+        assert!(form.missing().contains(&"env"));
         assert!(form.render().unwrap_err().contains("missing values: env"));
 
         // 值同样要过 review-only 边界：控制字符直接失败。

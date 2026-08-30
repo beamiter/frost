@@ -324,3 +324,10 @@ Round 70 closes the remaining argument-form affordance gap:
     requirement. Two unavoidable *unmaintained* (not vulnerability or
     unsoundness) notices are exact-ID exceptions; every other advisory remains
     fail-closed.
+
+73. **One missing-argument truth** — the iced form no longer restates
+    `default.is_none() && value.trim().is_empty()`. It snapshots the shared
+    `ArgsForm::missing()` result once per render and uses those names for every
+    `(required)` label, so a future renderer-rule change cannot leave the UI
+    claiming the opposite. The existing default/empty/whitespace/reset matrix
+    now tests the delegated result.
