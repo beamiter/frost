@@ -404,7 +404,7 @@ Round 70 closes the remaining argument-form affordance gap:
     transaction during that short rename phase.
 
 84. **Reversible publish phase** — before the first rename, every existing
-    destination is copied without following symlinks into a private sibling
+    destination is snapshotted without following symlinks into a private sibling
     rollback backup. A failed rename or catchable termination restores every
     attempted destination in reverse order and removes new destinations that
     had no predecessor; a deterministic final-binary rename failure proves all
@@ -418,3 +418,11 @@ Round 70 closes the remaining argument-form affordance gap:
     `rm` failure now emits a non-fatal warning, still refreshes caches and prints
     the success handoff, while the installed binary and new desktop entry remain
     complete and no transaction artifacts survive.
+
+86. **Inode-faithful rollback snapshots** — a same-directory `ln -P` now keeps
+    the exact old inode alive through publication, preserving ownership, mode,
+    xattrs, hardlink identity, and dangling symlinks. The final-rename rollback
+    regression checks device/inode/uid/gid for every predecessor, restores a
+    dangling desktop symlink by link value, and checks a user xattr when the
+    host supplies attr tools. Filesystems that reject hardlinks use a documented
+    no-follow copy fallback with deliberately narrower ownership guarantees.

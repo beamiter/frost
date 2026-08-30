@@ -523,6 +523,26 @@ for index in "${!rollback_targets[@]}"; do
 done
 rollback_absent_target="${rollback_targets[4]}"
 rm -f -- "${rollback_absent_target}"
+rollback_symlink_target="${rollback_targets[0]}"
+rollback_symlink_value='../../missing-old-desktop'
+rm -f -- "${rollback_symlink_target}"
+ln -s -- "${rollback_symlink_value}" "${rollback_symlink_target}"
+rollback_xattr_target="${rollback_targets[1]}"
+rollback_xattr_checked=0
+if command -v setfattr >/dev/null 2>&1 \
+    && command -v getfattr >/dev/null 2>&1; then
+    setfattr -n user.frost.rollback -v 'old-xattr' "${rollback_xattr_target}"
+    rollback_xattr_checked=1
+fi
+rollback_identities=()
+for index in "${!rollback_targets[@]}"; do
+    if [[ "${rollback_targets[index]}" == "${rollback_absent_target}" ]]; then
+        rollback_identities+=("")
+    else
+        rollback_identities+=("$(stat -c '%d:%i:%u:%g' -- \
+            "${rollback_targets[index]}")")
+    fi
+done
 # shellcheck disable=SC2016
 printf '%s\n' \
     '#!/bin/sh' \
@@ -550,10 +570,26 @@ for index in "${!rollback_targets[@]}"; do
             "${rollback_targets[index]}"
         continue
     fi
+    [[ "$(stat -c '%d:%i:%u:%g' -- "${rollback_targets[index]}")" == \
+        "${rollback_identities[index]}" ]] \
+        || fail "publish rollback changed inode ownership for ${rollback_targets[index]}"
+    if [[ "${rollback_targets[index]}" == "${rollback_symlink_target}" ]]; then
+        [[ -L "${rollback_symlink_target}" ]] \
+            || fail "publish rollback did not restore a dangling symlink"
+        [[ "$(readlink -- "${rollback_symlink_target}")" == \
+            "${rollback_symlink_value}" ]] \
+            || fail "publish rollback changed a dangling symlink target"
+        continue
+    fi
     [[ "$(<"${rollback_targets[index]}")" == "old rollback target ${index}" ]] \
         || fail "publish rollback changed target ${rollback_targets[index]}"
     assert_mode "publish rollback target" "${rollback_targets[index]}" 600
 done
+if ((rollback_xattr_checked == 1)); then
+    [[ "$(getfattr --only-values -n user.frost.rollback -- \
+        "${rollback_xattr_target}" 2>/dev/null)" == 'old-xattr' ]] \
+        || fail "publish rollback changed a target xattr"
+fi
 [[ -z "$(find "${rollback_stage}" \
     \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
     || fail "publish rollback left a temporary or backup"

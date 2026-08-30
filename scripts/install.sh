@@ -76,6 +76,15 @@ cleanup_install_artifacts() {
     INSTALL_ORIGINAL_PRESENT=()
 }
 
+paths_share_inode() {
+    local first="$1" second="$2" first_identity second_identity
+    [[ ( -e "${first}" || -L "${first}" ) \
+        && ( -e "${second}" || -L "${second}" ) ]] || return 1
+    first_identity="$(stat -c '%d:%i' -- "${first}")" || return 1
+    second_identity="$(stat -c '%d:%i' -- "${second}")" || return 1
+    [[ "${first_identity}" == "${second_identity}" ]]
+}
+
 rollback_install_plan() {
     local index dest backup rollback_failed=0
     for ((index = PUBLISH_LAST_ATTEMPT; index >= 0; index--)); do
@@ -83,7 +92,15 @@ rollback_install_plan() {
         if (( ${INSTALL_ORIGINAL_PRESENT[index]:-0} == 1 )); then
             backup="${INSTALL_BACKUPS[index]:-}"
             if [[ -n "${backup}" && ( -e "${backup}" || -L "${backup}" ) ]]; then
-                if mv -fT -- "${backup}" "${dest}"; then
+                if paths_share_inode "${backup}" "${dest}"; then
+                    if rm -f -- "${backup}"; then
+                        INSTALL_BACKUPS[index]=""
+                    else
+                        printf 'frost install: rollback restored %s but could not remove backup link %s\n' \
+                            "${dest}" "${backup}" >&2
+                        rollback_failed=1
+                    fi
+                elif mv -fT -- "${backup}" "${dest}"; then
                     INSTALL_BACKUPS[index]=""
                 else
                     printf 'frost install: rollback failed for %s; backup retained at %s\n' \
@@ -300,8 +317,13 @@ prepare_install_backups() {
             INSTALL_ORIGINAL_PRESENT[index]=1
             rm -f -- "${backup}" \
                 || die "cannot prepare rollback backup beside ${dest}"
-            if ! cp -a --no-dereference --no-preserve=ownership -- \
-                "${dest}" "${backup}"; then
+            # A same-directory hard link retains the exact inode: owner/group,
+            # mode, xattrs, and even a dangling symlink's link object. Some
+            # filesystems or protected-hardlink policies reject it; the copy
+            # fallback still preserves content/mode and never follows links.
+            if ! ln -P -- "${dest}" "${backup}" 2>/dev/null \
+                && ! cp -a --no-dereference --no-preserve=ownership -- \
+                    "${dest}" "${backup}"; then
                 die "cannot back up existing install target ${dest}"
             fi
         else
@@ -660,6 +682,8 @@ require_command mktemp
 require_command mv
 require_command rm
 require_command cp
+require_command ln
+require_command stat
 if ((INSTALL_DESKTOP == 1)); then
     require_command awk
     require_command chmod
@@ -670,7 +694,6 @@ if [[ -n "${PREBUILT_BINARY}" ]]; then
     BINARY="${PREBUILT_BINARY}"
     printf 'Using prebuilt frost binary: %s\n' "${BINARY}"
     if ((DRY_RUN == 0)); then
-        require_command stat
         pin_prebuilt_binary "${PREBUILT_BINARY}"
     fi
 else

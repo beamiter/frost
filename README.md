@@ -144,10 +144,13 @@ cargo build --release --locked
 或发布阶段前退出会清理整批未提交临时文件并保留旧版本。binary、workflow、desktop、元数据与
 图标会全部 staging 成功后才开始 rename；资源先发布，二进制作为最后一个提交点，因此任何
 复制/转换失败都不会留下半升级。发布前还会为每个既有目标创建不跟随符号链接的同目录回滚
-副本；rename 失败或可捕获的终止信号会按逆序恢复已尝试目标。各 rename 自身原子，但整批
+快照：优先 hardlink 原 inode，因此 owner/group、mode、xattr、hardlink 关系及 dangling symlink
+对象都能原样恢复；文件系统或安全策略拒绝 hardlink 时回退到不跟随链接的 `cp -a`，此时保证
+内容、mode 与链接值，但不承诺保留原 owner/group 或 inode。rename 失败或可捕获的终止信号会
+按逆序恢复已尝试目标。各 rename 自身原子，但整批
 rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回滚本身的 I/O 故障仍可能留下混合
 版本；恢复失败时 backup 会保留并打印路径，不会被清理。除上述条件外还需要 GNU coreutils 的
-`cp`/`mktemp`/`mv`。它可与
+`cp`/`ln`/`mktemp`/`mv`。它可与
 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR` 组合使用。
 零字节预编译产物会在旧目标改变前被拒绝。desktop、AppStream、SVG 与 PNG 源文件都在
 构建/写入前预检，公共资源也以明确权限写入目标同目录临时文件后原子 rename。非根
