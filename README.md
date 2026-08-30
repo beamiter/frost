@@ -169,6 +169,11 @@ device 会在首个 `rm` 前拒绝并保持整套安装不变。workflow cleanup
 reservation placeholder、rollback backup 与待 purge 项都会在使用点核对记录的 inode；若
 使用点看到名称已被换成 symlink 或其他对象，脚本既不会 unlink/restore 它，也不会把替代物
 误报成原文件的恢复副本。
+为绑定 parent 本身，真实卸载还会保持每个目标目录的只读 fd，并通过 Linux
+`/proc/self/fd` 完成 reservation、rename、rollback 与 purge；即使逻辑 parent 在外部命令
+执行期间被换成 symlink，文件操作仍只落在原目录 inode，随后检查会失败/警告而不沿新 referent。
+若 purge 同时失败，恢复提示中的源和目标也会解析到这个已绑定目录，而不使用被替换的逻辑 parent。
+因此真实卸载需要可用的 procfs；dry-run 不需要，也不会打开目录。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机
 prefix 不套用祖先检查，但目标类型与 quarantine 状态机在两种模式下都生效。
 

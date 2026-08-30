@@ -1133,6 +1133,135 @@ fi
     -name '*.uninstall.*' -print -quit)" ]] \
     || fail "uninstall interrupt rollback left a quarantine"
 
+# Keep reservation creation anchored to the directory inode opened before
+# mktemp. The wrapper swaps the logical bin directory for an outside symlink;
+# the empty reservation must be created and cleaned only in the displaced
+# original directory, while both real files remain untouched.
+uninstall_reserve_parent_tools="${TEST_ROOT}/uninstall-reserve-parent-tools"
+uninstall_reserve_parent_stage="${TEST_ROOT}/uninstall-reserve-parent-stage"
+uninstall_reserve_parent_prefix="/opt/frost-uninstall-reserve-parent"
+uninstall_reserve_parent_dir="${uninstall_reserve_parent_stage}${uninstall_reserve_parent_prefix}/bin"
+uninstall_reserve_parent_binary="${uninstall_reserve_parent_dir}/frost"
+uninstall_reserve_parent_displaced="${TEST_ROOT}/uninstall-reserve-parent-original-bin"
+uninstall_reserve_parent_victim="${TEST_ROOT}/uninstall-reserve-parent-victim"
+uninstall_reserve_parent_marker="${TEST_ROOT}/uninstall-reserve-parent-replaced"
+mkdir -p "${uninstall_reserve_parent_tools}" "${uninstall_reserve_parent_dir}" \
+    "${uninstall_reserve_parent_victim}"
+printf 'original binary before reservation parent replacement\n' \
+    >"${uninstall_reserve_parent_binary}"
+printf 'outside binary must remain untouched\n' \
+    >"${uninstall_reserve_parent_victim}/frost"
+uninstall_reserve_parent_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_reserve_parent_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_RESERVE_PARENT_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "${FROST_TEST_UNINSTALL_RESERVE_PARENT_DIR:?}" "${FROST_TEST_UNINSTALL_RESERVE_PARENT_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_RESERVE_PARENT_VICTIM:?}" "${FROST_TEST_UNINSTALL_RESERVE_PARENT_DIR}"' \
+    '    : >"${FROST_TEST_UNINSTALL_RESERVE_PARENT_MARKER}"' \
+    'fi' \
+    'exec /usr/bin/mktemp "$@"' \
+    >"${uninstall_reserve_parent_tools}/mktemp"
+chmod 0755 "${uninstall_reserve_parent_tools}/mktemp"
+if env HOME="${TEST_HOME}" \
+    PATH="${uninstall_reserve_parent_tools}:${TEST_PATH}" \
+    FROST_TEST_UNINSTALL_RESERVE_PARENT_MARKER="${uninstall_reserve_parent_marker}" \
+    FROST_TEST_UNINSTALL_RESERVE_PARENT_DIR="${uninstall_reserve_parent_dir}" \
+    FROST_TEST_UNINSTALL_RESERVE_PARENT_DISPLACED="${uninstall_reserve_parent_displaced}" \
+    FROST_TEST_UNINSTALL_RESERVE_PARENT_VICTIM="${uninstall_reserve_parent_victim}" \
+    DESTDIR="${uninstall_reserve_parent_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_reserve_parent_prefix}" \
+    >"${TEST_ROOT}/uninstall-reserve-parent.log" 2>&1; then
+    fail "uninstaller accepted a parent replacement during reservation"
+fi
+assert_contains "reservation parent diagnostic" \
+    "$(<"${TEST_ROOT}/uninstall-reserve-parent.log")" \
+    "uninstall target directory changed while reserving quarantine: ${uninstall_reserve_parent_dir}"
+[[ -L "${uninstall_reserve_parent_dir}" ]] \
+    || fail "reservation parent replacement did not occur"
+[[ "$(<"${uninstall_reserve_parent_victim}/frost")" == \
+    'outside binary must remain untouched' ]] \
+    || fail "reservation followed the replacement parent symlink"
+[[ "$(<"${uninstall_reserve_parent_displaced}/frost")" == \
+    'original binary before reservation parent replacement' ]] \
+    || fail "reservation changed the original binary"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_reserve_parent_displaced}/frost")" == \
+    "${uninstall_reserve_parent_identity}" ]] \
+    || fail "reservation parent replacement changed original inode metadata"
+[[ -z "$(find "${uninstall_reserve_parent_displaced}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "reservation parent replacement left a bound placeholder"
+[[ -z "$(find "${uninstall_reserve_parent_victim}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "reservation parent replacement created an outside placeholder"
+
+# Bind the actual quarantine rename to that same directory fd. A wrapper swaps
+# the logical parent immediately before delegating mv; post-use validation
+# fails and rollback restores the exact original inside the displaced bound
+# directory without touching the new symlink referent.
+uninstall_stage_parent_tools="${TEST_ROOT}/uninstall-stage-parent-tools"
+uninstall_stage_parent_stage="${TEST_ROOT}/uninstall-stage-parent-stage"
+uninstall_stage_parent_prefix="/opt/frost-uninstall-stage-parent"
+uninstall_stage_parent_dir="${uninstall_stage_parent_stage}${uninstall_stage_parent_prefix}/bin"
+uninstall_stage_parent_binary="${uninstall_stage_parent_dir}/frost"
+uninstall_stage_parent_displaced="${TEST_ROOT}/uninstall-stage-parent-original-bin"
+uninstall_stage_parent_victim="${TEST_ROOT}/uninstall-stage-parent-victim"
+uninstall_stage_parent_marker="${TEST_ROOT}/uninstall-stage-parent-replaced"
+mkdir -p "${uninstall_stage_parent_tools}" "${uninstall_stage_parent_dir}" \
+    "${uninstall_stage_parent_victim}"
+printf 'original binary restored in bound parent\n' \
+    >"${uninstall_stage_parent_binary}"
+printf 'outside stage binary remains untouched\n' \
+    >"${uninstall_stage_parent_victim}/frost"
+uninstall_stage_parent_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_stage_parent_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_STAGE_PARENT_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "${FROST_TEST_UNINSTALL_STAGE_PARENT_DIR:?}" "${FROST_TEST_UNINSTALL_STAGE_PARENT_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_STAGE_PARENT_VICTIM:?}" "${FROST_TEST_UNINSTALL_STAGE_PARENT_DIR}"' \
+    '    : >"${FROST_TEST_UNINSTALL_STAGE_PARENT_MARKER}"' \
+    'fi' \
+    'exec /usr/bin/mv "$@"' \
+    >"${uninstall_stage_parent_tools}/mv"
+chmod 0755 "${uninstall_stage_parent_tools}/mv"
+if env HOME="${TEST_HOME}" PATH="${uninstall_stage_parent_tools}:${TEST_PATH}" \
+    FROST_TEST_UNINSTALL_STAGE_PARENT_MARKER="${uninstall_stage_parent_marker}" \
+    FROST_TEST_UNINSTALL_STAGE_PARENT_DIR="${uninstall_stage_parent_dir}" \
+    FROST_TEST_UNINSTALL_STAGE_PARENT_DISPLACED="${uninstall_stage_parent_displaced}" \
+    FROST_TEST_UNINSTALL_STAGE_PARENT_VICTIM="${uninstall_stage_parent_victim}" \
+    DESTDIR="${uninstall_stage_parent_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_stage_parent_prefix}" \
+    >"${TEST_ROOT}/uninstall-stage-parent.log" 2>&1; then
+    fail "uninstaller accepted a parent replacement during quarantine rename"
+fi
+assert_contains "stage parent diagnostic" \
+    "$(<"${TEST_ROOT}/uninstall-stage-parent.log")" \
+    "staged uninstall path contains a symbolic-link ancestor: ${uninstall_stage_parent_dir}"
+[[ -L "${uninstall_stage_parent_dir}" ]] \
+    || fail "stage parent replacement did not occur"
+[[ "$(<"${uninstall_stage_parent_victim}/frost")" == \
+    'outside stage binary remains untouched' ]] \
+    || fail "quarantine rename followed the replacement parent symlink"
+[[ "$(<"${uninstall_stage_parent_displaced}/frost")" == \
+    'original binary restored in bound parent' ]] \
+    || fail "bound rollback did not restore the original binary"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_stage_parent_displaced}/frost")" == \
+    "${uninstall_stage_parent_identity}" ]] \
+    || fail "bound rollback changed original binary inode metadata"
+[[ -z "$(find "${uninstall_stage_parent_displaced}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "bound parent rollback left a quarantine"
+[[ -z "$(find "${uninstall_stage_parent_victim}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "stage parent replacement wrote an outside quarantine"
+
 # Reservation names are untrusted again after mktemp returns. After the first
 # target moves, replace the later desktop reservation with a symlink. Its
 # recorded placeholder inode must reject the second rename; rollback restores
@@ -1227,6 +1356,7 @@ uninstall_changed_purge_binary="${uninstall_changed_purge_stage}${uninstall_chan
 uninstall_changed_purge_displaced="${TEST_ROOT}/uninstall-changed-purge-original"
 uninstall_changed_purge_victim="${TEST_ROOT}/uninstall-changed-purge-victim"
 uninstall_changed_purge_rm_marker="${TEST_ROOT}/uninstall-changed-purge-rm-called"
+uninstall_changed_purge_replace_marker="${TEST_ROOT}/uninstall-changed-purge-replaced"
 mkdir -p "${uninstall_changed_purge_tools}" \
     "${uninstall_changed_purge_binary%/*}" "${uninstall_changed_purge_victim}"
 printf 'original inode displaced before purge\n' \
@@ -1237,12 +1367,20 @@ uninstall_changed_purge_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
 printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
-    '/usr/bin/mv "$@"' \
-    'last=' \
-    'for last do :; done' \
-    '/usr/bin/mv "${last}" "${FROST_TEST_UNINSTALL_CHANGED_PURGE_DISPLACED:?}"' \
-    '/usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CHANGED_PURGE_VICTIM:?}" "${last}"' \
-    >"${uninstall_changed_purge_tools}/mv"
+    'if [ ! -e "${FROST_TEST_UNINSTALL_CHANGED_PURGE_REPLACE_MARKER:?}" ]; then' \
+    '    : >"${FROST_TEST_UNINSTALL_CHANGED_PURGE_REPLACE_MARKER}"' \
+    '    found=' \
+    '    for candidate in "${FROST_TEST_UNINSTALL_CHANGED_PURGE_DIR:?}"/.frost.uninstall.*; do' \
+    '        [ -e "${candidate}" ] || continue' \
+    '        found=${candidate}' \
+    '        break' \
+    '    done' \
+    '    [ -n "${found}" ]' \
+    '    /usr/bin/mv "${found}" "${FROST_TEST_UNINSTALL_CHANGED_PURGE_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CHANGED_PURGE_VICTIM:?}" "${found}"' \
+    'fi' \
+    'exec /usr/bin/readlink "$@"' \
+    >"${uninstall_changed_purge_tools}/readlink"
 # shellcheck disable=SC2016
 printf '%s\n' \
     '#!/bin/sh' \
@@ -1250,14 +1388,16 @@ printf '%s\n' \
     ': >"${FROST_TEST_UNINSTALL_CHANGED_PURGE_RM_MARKER:?}"' \
     'exec /usr/bin/rm "$@"' \
     >"${uninstall_changed_purge_tools}/rm"
-chmod 0755 "${uninstall_changed_purge_tools}/mv" \
+chmod 0755 "${uninstall_changed_purge_tools}/readlink" \
     "${uninstall_changed_purge_tools}/rm"
 uninstall_changed_purge_output="$(
     env HOME="${TEST_HOME}" \
         PATH="${uninstall_changed_purge_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_CHANGED_PURGE_DIR="${uninstall_changed_purge_binary%/*}" \
         FROST_TEST_UNINSTALL_CHANGED_PURGE_DISPLACED="${uninstall_changed_purge_displaced}" \
         FROST_TEST_UNINSTALL_CHANGED_PURGE_VICTIM="${uninstall_changed_purge_victim}" \
         FROST_TEST_UNINSTALL_CHANGED_PURGE_RM_MARKER="${uninstall_changed_purge_rm_marker}" \
+        FROST_TEST_UNINSTALL_CHANGED_PURGE_REPLACE_MARKER="${uninstall_changed_purge_replace_marker}" \
         DESTDIR="${uninstall_changed_purge_stage}" "${UNINSTALLER}" \
         --prefix "${uninstall_changed_purge_prefix}" 2>&1
 )"
@@ -1290,6 +1430,134 @@ assert_contains "changed purge warning" "${uninstall_changed_purge_output}" \
     || fail "changed quarantine was falsely advertised as the original recovery inode"
 assert_contains "changed purge success summary" "${uninstall_changed_purge_output}" \
     "Removed frost from ${uninstall_changed_purge_prefix}/bin"
+
+# Finally, replace the parent from inside rm itself. The pre-opened fd keeps
+# unlink bound to the original directory even after its logical path becomes a
+# symlink. Identically named files in the new referent must survive unchanged.
+uninstall_purge_parent_tools="${TEST_ROOT}/uninstall-purge-parent-tools"
+uninstall_purge_parent_stage="${TEST_ROOT}/uninstall-purge-parent-stage"
+uninstall_purge_parent_prefix="/opt/frost-uninstall-purge-parent"
+uninstall_purge_parent_dir="${uninstall_purge_parent_stage}${uninstall_purge_parent_prefix}/bin"
+uninstall_purge_parent_binary="${uninstall_purge_parent_dir}/frost"
+uninstall_purge_parent_displaced="${TEST_ROOT}/uninstall-purge-parent-original-bin"
+uninstall_purge_parent_victim="${TEST_ROOT}/uninstall-purge-parent-victim"
+uninstall_purge_parent_marker="${TEST_ROOT}/uninstall-purge-parent-replaced"
+mkdir -p "${uninstall_purge_parent_tools}" "${uninstall_purge_parent_dir}" \
+    "${uninstall_purge_parent_victim}"
+printf 'original binary committed before bound purge\n' \
+    >"${uninstall_purge_parent_binary}"
+printf 'outside purge binary sentinel\n' \
+    >"${uninstall_purge_parent_victim}/frost"
+printf 'outside quarantine-like sentinel\n' \
+    >"${uninstall_purge_parent_victim}/.frost.uninstall.outside"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_PURGE_PARENT_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "${FROST_TEST_UNINSTALL_PURGE_PARENT_DIR:?}" "${FROST_TEST_UNINSTALL_PURGE_PARENT_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_PURGE_PARENT_VICTIM:?}" "${FROST_TEST_UNINSTALL_PURGE_PARENT_DIR}"' \
+    '    : >"${FROST_TEST_UNINSTALL_PURGE_PARENT_MARKER}"' \
+    'fi' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_purge_parent_tools}/rm"
+chmod 0755 "${uninstall_purge_parent_tools}/rm"
+uninstall_purge_parent_output="$(
+    env HOME="${TEST_HOME}" PATH="${uninstall_purge_parent_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_PURGE_PARENT_MARKER="${uninstall_purge_parent_marker}" \
+        FROST_TEST_UNINSTALL_PURGE_PARENT_DIR="${uninstall_purge_parent_dir}" \
+        FROST_TEST_UNINSTALL_PURGE_PARENT_DISPLACED="${uninstall_purge_parent_displaced}" \
+        FROST_TEST_UNINSTALL_PURGE_PARENT_VICTIM="${uninstall_purge_parent_victim}" \
+        DESTDIR="${uninstall_purge_parent_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_purge_parent_prefix}" 2>&1
+)"
+[[ -L "${uninstall_purge_parent_dir}" ]] \
+    || fail "purge parent replacement did not occur"
+[[ "$(<"${uninstall_purge_parent_victim}/frost")" == \
+    'outside purge binary sentinel' ]] \
+    || fail "bound purge removed the outside binary sentinel"
+[[ "$(<"${uninstall_purge_parent_victim}/.frost.uninstall.outside")" == \
+    'outside quarantine-like sentinel' ]] \
+    || fail "bound purge removed an outside quarantine-like sentinel"
+[[ -z "$(find "${uninstall_purge_parent_displaced}" \
+    -mindepth 1 -print -quit)" ]] \
+    || fail "bound purge left the committed target or quarantine behind"
+assert_contains "purge parent change warning" "${uninstall_purge_parent_output}" \
+    "target directory changed after bound purge of ${uninstall_purge_parent_binary}"
+assert_contains "purge parent success summary" "${uninstall_purge_parent_output}" \
+    "Removed frost from ${uninstall_purge_parent_prefix}/bin"
+
+# If that same parent replacement is followed by a purge failure, the exact
+# original inode must remain recoverable in the displaced bound directory.
+# The copy-safe recovery command must name that directory on both sides rather
+# than offer the now-symlinked logical destination.
+uninstall_purge_fail_parent_tools="${TEST_ROOT}/uninstall-purge-fail-parent-tools"
+uninstall_purge_fail_parent_stage="${TEST_ROOT}/uninstall-purge-fail-parent-stage"
+uninstall_purge_fail_parent_prefix="/opt/frost-uninstall-purge-fail-parent"
+uninstall_purge_fail_parent_dir="${uninstall_purge_fail_parent_stage}${uninstall_purge_fail_parent_prefix}/bin"
+uninstall_purge_fail_parent_binary="${uninstall_purge_fail_parent_dir}/frost"
+uninstall_purge_fail_parent_displaced="${TEST_ROOT}/uninstall-purge-fail-parent-original-bin"
+uninstall_purge_fail_parent_victim="${TEST_ROOT}/uninstall-purge-fail-parent-victim"
+uninstall_purge_fail_parent_marker="${TEST_ROOT}/uninstall-purge-fail-parent-replaced"
+mkdir -p "${uninstall_purge_fail_parent_tools}" \
+    "${uninstall_purge_fail_parent_dir}" "${uninstall_purge_fail_parent_victim}"
+printf 'original binary retained after failed bound purge\n' \
+    >"${uninstall_purge_fail_parent_binary}"
+printf 'outside failed-purge sentinel\n' \
+    >"${uninstall_purge_fail_parent_victim}/frost"
+uninstall_purge_fail_parent_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_purge_fail_parent_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "${FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_DIR:?}" "${FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_VICTIM:?}" "${FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_DIR}"' \
+    '    : >"${FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_MARKER}"' \
+    'fi' \
+    'exit 80' \
+    >"${uninstall_purge_fail_parent_tools}/rm"
+chmod 0755 "${uninstall_purge_fail_parent_tools}/rm"
+uninstall_purge_fail_parent_output="$(
+    env HOME="${TEST_HOME}" \
+        PATH="${uninstall_purge_fail_parent_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_MARKER="${uninstall_purge_fail_parent_marker}" \
+        FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_DIR="${uninstall_purge_fail_parent_dir}" \
+        FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_DISPLACED="${uninstall_purge_fail_parent_displaced}" \
+        FROST_TEST_UNINSTALL_PURGE_FAIL_PARENT_VICTIM="${uninstall_purge_fail_parent_victim}" \
+        DESTDIR="${uninstall_purge_fail_parent_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_purge_fail_parent_prefix}" 2>&1
+)"
+[[ -L "${uninstall_purge_fail_parent_dir}" ]] \
+    || fail "failed-purge parent replacement did not occur"
+[[ "$(<"${uninstall_purge_fail_parent_victim}/frost")" == \
+    'outside failed-purge sentinel' ]] \
+    || fail "failed bound purge touched the replacement parent referent"
+mapfile -t uninstall_purge_fail_parent_quarantines < <(
+    find "${uninstall_purge_fail_parent_displaced}" -maxdepth 1 \
+        -name '.frost.uninstall.*' -print
+)
+(( ${#uninstall_purge_fail_parent_quarantines[@]} == 1 )) \
+    || fail "failed bound purge did not retain exactly one quarantine"
+uninstall_purge_fail_parent_quarantine="${uninstall_purge_fail_parent_quarantines[0]}"
+[[ "$(<"${uninstall_purge_fail_parent_quarantine}")" == \
+    'original binary retained after failed bound purge' ]] \
+    || fail "failed bound purge changed retained quarantine content"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_purge_fail_parent_quarantine}")" == \
+    "${uninstall_purge_fail_parent_identity}" ]] \
+    || fail "failed bound purge changed retained quarantine inode metadata"
+uninstall_purge_fail_parent_recovery_target="${uninstall_purge_fail_parent_displaced}/frost"
+assert_contains "failed bound purge recovery command" \
+    "${uninstall_purge_fail_parent_output}" \
+    "recovery after inspecting destination: mv -fT -- ${uninstall_purge_fail_parent_quarantine} ${uninstall_purge_fail_parent_recovery_target}"
+[[ "${uninstall_purge_fail_parent_output}" != \
+    *"recovery after inspecting destination: mv -fT -- ${uninstall_purge_fail_parent_quarantine} ${uninstall_purge_fail_parent_binary}"* ]] \
+    || fail "failed bound purge advertised the replacement symlink destination"
+assert_contains "failed bound purge success summary" \
+    "${uninstall_purge_fail_parent_output}" \
+    "Removed frost from ${uninstall_purge_fail_parent_prefix}/bin"
 
 # A wrapper can also return failure after the requested unlink completed. Trust
 # the observed absence: there is no recovery inode to retain or advertise.

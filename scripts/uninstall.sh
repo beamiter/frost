@@ -17,6 +17,10 @@ BIN_DIR=""
 DRY_RUN=0
 REMOVAL_QUARANTINES=()
 REMOVAL_RESERVATION_IDENTITIES=()
+REMOVAL_PARENT_FDS=()
+REMOVAL_PARENT_IDENTITIES=()
+REMOVAL_TARGET_BASENAMES=()
+REMOVAL_QUARANTINE_BASENAMES=()
 REMOVAL_ORIGINAL_PRESENT=()
 REMOVAL_ORIGINAL_IDENTITIES=()
 REMOVAL_STAGED=()
@@ -70,6 +74,56 @@ path_matches_identity() {
     [[ "${actual}" == "${expected}" ]]
 }
 
+bound_entry_path() {
+    local index="$1" basename="$2"
+    printf '/proc/self/fd/%s/%s' "${REMOVAL_PARENT_FDS[index]}" "${basename}"
+}
+
+bound_target_path() {
+    local index="$1"
+    bound_entry_path "${index}" "${REMOVAL_TARGET_BASENAMES[index]}"
+}
+
+bound_quarantine_path() {
+    local index="$1"
+    bound_entry_path "${index}" "${REMOVAL_QUARANTINE_BASENAMES[index]}"
+}
+
+bound_entry_display() {
+    local index="$1" basename="$2" parent
+    parent="$(readlink -- "/proc/$$/fd/${REMOVAL_PARENT_FDS[index]}" 2>/dev/null)" \
+        || parent="${REMOVAL_FILES[index]%/*}"
+    printf '%s/%s' "${parent}" "${basename}"
+}
+
+bound_target_display() {
+    local index="$1"
+    bound_entry_display "${index}" "${REMOVAL_TARGET_BASENAMES[index]}"
+}
+
+bound_quarantine_display() {
+    local index="$1"
+    bound_entry_display "${index}" "${REMOVAL_QUARANTINE_BASENAMES[index]}"
+}
+
+logical_parent_matches_identity() {
+    local index="$1" parent
+    parent="${REMOVAL_FILES[index]%/*}"
+    [[ -d "${parent}" && ! -L "${parent}" ]] \
+        && path_matches_identity "${parent}" \
+            "${REMOVAL_PARENT_IDENTITIES[index]}"
+}
+
+close_uninstall_parent_fds() {
+    local index fd
+    for index in "${!REMOVAL_PARENT_FDS[@]}"; do
+        fd="${REMOVAL_PARENT_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+        REMOVAL_PARENT_FDS[index]=""
+    done
+}
+
 print_uninstall_recovery() {
     local quarantine="$1" target="$2"
     printf 'frost uninstall: recovery after inspecting destination: mv -fT -- %q %q\n' \
@@ -77,44 +131,48 @@ print_uninstall_recovery() {
 }
 
 cleanup_uninstall_reservations() {
-    local index quarantine reservation_identity
+    local index quarantine quarantine_path quarantine_display reservation_identity
     for index in "${!REMOVAL_QUARANTINES[@]}"; do
         quarantine="${REMOVAL_QUARANTINES[index]:-}"
         [[ -n "${quarantine}" ]] || continue
+        quarantine_path="$(bound_quarantine_path "${index}")"
+        quarantine_display="$(bound_quarantine_display "${index}")"
         # A staged entry still contains the removed original. Never discard it
         # after a failed rollback; only empty, unused reservations are cleanup.
         if (( ${REMOVAL_STAGED[index]:-0} == 0 )) \
-            && [[ -e "${quarantine}" || -L "${quarantine}" ]]; then
+            && [[ -e "${quarantine_path}" || -L "${quarantine_path}" ]]; then
             reservation_identity="${REMOVAL_RESERVATION_IDENTITIES[index]:-}"
             if [[ -z "${reservation_identity}" ]] \
-                || ! path_matches_identity "${quarantine}" \
+                || ! path_matches_identity "${quarantine_path}" \
                     "${reservation_identity}"; then
                 printf 'frost uninstall: warning: refusing to remove changed unused quarantine %s\n' \
-                    "${quarantine}" >&2
-            elif rm -f -- "${quarantine}"; then
+                    "${quarantine_display}" >&2
+            elif rm -f -- "${quarantine_path}"; then
                 REMOVAL_QUARANTINES[index]=""
             else
                 printf 'frost uninstall: warning: cannot remove unused quarantine %s\n' \
-                    "${quarantine}" >&2
+                    "${quarantine_display}" >&2
             fi
         fi
     done
 }
 
 reconcile_uninstall_attempt() {
-    local index="$1" target quarantine identity
+    local index="$1" target quarantine target_path quarantine_path identity
     target="${REMOVAL_FILES[index]}"
     quarantine="${REMOVAL_QUARANTINES[index]:-}"
+    target_path="$(bound_target_path "${index}")"
+    quarantine_path="$(bound_quarantine_path "${index}")"
     identity="${REMOVAL_ORIGINAL_IDENTITIES[index]:-}"
     # State 2 means a signal may have interrupted the tiny interval between mv
     # and its bookkeeping. Identity determines which name still owns the exact
     # preflight inode without ever treating the empty reservation as a backup.
-    if path_matches_identity "${target}" "${identity}"; then
+    if path_matches_identity "${target_path}" "${identity}"; then
         REMOVAL_STAGED[index]=0
         return 0
     fi
     if [[ -n "${quarantine}" ]] \
-        && path_matches_identity "${quarantine}" "${identity}"; then
+        && path_matches_identity "${quarantine_path}" "${identity}"; then
         REMOVAL_STAGED[index]=1
         return 0
     fi
@@ -125,7 +183,8 @@ reconcile_uninstall_attempt() {
 }
 
 rollback_uninstall_plan() {
-    local index target quarantine identity validation_error state rollback_failed=0
+    local index target quarantine target_path quarantine_path target_display
+    local quarantine_display identity state rollback_failed=0
     for ((index = ${#REMOVAL_FILES[@]} - 1; index >= 0; index--)); do
         state="${REMOVAL_STAGED[index]:-0}"
         if ((state == 2)); then
@@ -137,54 +196,52 @@ rollback_uninstall_plan() {
         (( ${REMOVAL_STAGED[index]:-0} == 1 )) || continue
         target="${REMOVAL_FILES[index]}"
         quarantine="${REMOVAL_QUARANTINES[index]:-}"
+        target_path="$(bound_target_path "${index}")"
+        quarantine_path="$(bound_quarantine_path "${index}")"
+        target_display="$(bound_target_display "${index}")"
+        quarantine_display="$(bound_quarantine_display "${index}")"
         identity="${REMOVAL_ORIGINAL_IDENTITIES[index]:-}"
         if [[ -z "${quarantine}" \
-            || ( ! -e "${quarantine}" && ! -L "${quarantine}" ) ]]; then
+            || ( ! -e "${quarantine_path}" && ! -L "${quarantine_path}" ) ]]; then
             printf 'frost uninstall: rollback quarantine missing for %s\n' \
                 "${target}" >&2
             rollback_failed=1
             continue
         fi
-        if ! path_matches_identity "${quarantine}" "${identity}"; then
+        if ! path_matches_identity "${quarantine_path}" "${identity}"; then
             printf 'frost uninstall: rollback refused changed quarantine for %s; unexpected entry retained at %s\n' \
-                "${target}" "${quarantine}" >&2
+                "${target}" "${quarantine_display}" >&2
             rollback_failed=1
             continue
         fi
-        if [[ -e "${target}" || -L "${target}" ]]; then
+        if [[ -e "${target_path}" || -L "${target_path}" ]]; then
             printf 'frost uninstall: rollback refused to overwrite reappeared target %s; quarantine retained at %s\n' \
-                "${target}" "${quarantine}" >&2
-            print_uninstall_recovery "${quarantine}" "${target}"
+                "${target_display}" "${quarantine_display}" >&2
+            print_uninstall_recovery "${quarantine_display}" "${target_display}"
             rollback_failed=1
             continue
         fi
-        if ! validation_error="$(
-            validate_staging_removal_target "${target}" 2>&1
-        )"; then
-            printf 'frost uninstall: rollback cannot safely restore %s: %s; quarantine retained at %s\n' \
-                "${target}" "${validation_error}" "${quarantine}" >&2
-            print_uninstall_recovery "${quarantine}" "${target}"
-            rollback_failed=1
-            continue
-        fi
-        if mv -fT -- "${quarantine}" "${target}"; then
+        if mv -fT -- "${quarantine_path}" "${target_path}"; then
             REMOVAL_QUARANTINES[index]=""
             REMOVAL_STAGED[index]=0
-        elif path_matches_identity "${target}" "${identity}"; then
+        elif path_matches_identity "${target_path}" "${identity}"; then
             # Treat a wrapper's post-rename failure by observed state, not its
             # exit status. Never claim a quarantine is retained when restore
             # already put the exact original inode back at its target.
             REMOVAL_STAGED[index]=0
-            if [[ ! -e "${quarantine}" && ! -L "${quarantine}" ]]; then
+            if [[ ! -e "${quarantine_path}" && ! -L "${quarantine_path}" ]]; then
                 REMOVAL_QUARANTINES[index]=""
             else
+                quarantine_display="$(bound_quarantine_display "${index}")"
                 printf 'frost uninstall: warning: rollback restored %s but a changed quarantine entry remains at %s\n' \
-                    "${target}" "${quarantine}" >&2
+                    "${target_display}" "${quarantine_display}" >&2
             fi
         else
+            target_display="$(bound_target_display "${index}")"
+            quarantine_display="$(bound_quarantine_display "${index}")"
             printf 'frost uninstall: rollback failed for %s; quarantine retained at %s\n' \
-                "${target}" "${quarantine}" >&2
-            print_uninstall_recovery "${quarantine}" "${target}"
+                "${target_display}" "${quarantine_display}" >&2
+            print_uninstall_recovery "${quarantine_display}" "${target_display}"
             rollback_failed=1
         fi
     done
@@ -199,36 +256,70 @@ finish_uninstall() {
         rollback_uninstall_plan || status=1
     fi
     cleanup_uninstall_reservations
+    close_uninstall_parent_fds
     exit "${status}"
 }
 
 prepare_uninstall_plan() {
-    local index target directory basename quarantine identity reservation_identity
+    local index target directory basename quarantine quarantine_path identity
+    local reservation_identity parent_fd parent_identity
     REMOVAL_QUARANTINES=()
     REMOVAL_RESERVATION_IDENTITIES=()
+    REMOVAL_PARENT_FDS=()
+    REMOVAL_PARENT_IDENTITIES=()
+    REMOVAL_TARGET_BASENAMES=()
+    REMOVAL_QUARANTINE_BASENAMES=()
     REMOVAL_ORIGINAL_PRESENT=()
     REMOVAL_ORIGINAL_IDENTITIES=()
     REMOVAL_STAGED=()
     for index in "${!REMOVAL_FILES[@]}"; do
         target="${REMOVAL_FILES[index]}"
         REMOVAL_STAGED[index]=0
+        REMOVAL_TARGET_BASENAMES[index]="${target##*/}"
         if [[ -e "${target}" || -L "${target}" ]]; then
             validate_removal_file_target "${target}"
             identity="$(stat -c '%d:%i' -- "${target}")" \
                 || die "cannot identify uninstall target ${target}"
             directory="${target%/*}"
             basename="${target##*/}"
-            quarantine="$(mktemp "${directory}/.${basename}.uninstall.XXXXXX")" \
+            unset parent_fd
+            exec {parent_fd}<"${directory}" \
+                || die "cannot bind uninstall target directory ${directory}"
+            REMOVAL_PARENT_FDS[index]="${parent_fd}"
+            parent_identity="$(stat -Lc '%d:%i' -- \
+                "/proc/self/fd/${parent_fd}")" \
+                || die "cannot identify uninstall target directory ${directory}"
+            REMOVAL_PARENT_IDENTITIES[index]="${parent_identity}"
+            validate_removal_file_target "${target}"
+            logical_parent_matches_identity "${index}" \
+                || die "uninstall target directory changed after preflight: ${directory}"
+            path_matches_identity "$(bound_target_path "${index}")" \
+                "${identity}" \
+                || die "uninstall target changed while binding directory: ${target}"
+            quarantine_path="$(mktemp \
+                "/proc/self/fd/${parent_fd}/.${basename}.uninstall.XXXXXX")" \
                 || die "cannot reserve uninstall quarantine beside ${target}"
+            REMOVAL_QUARANTINE_BASENAMES[index]="${quarantine_path##*/}"
+            quarantine="${directory}/${REMOVAL_QUARANTINE_BASENAMES[index]}"
             REMOVAL_QUARANTINES[index]="${quarantine}"
-            reservation_identity="$(stat -c '%d:%i' -- "${quarantine}")" \
+            reservation_identity="$(stat -c '%d:%i' -- \
+                "$(bound_quarantine_path "${index}")")" \
                 || die "cannot identify uninstall quarantine ${quarantine}"
             REMOVAL_RESERVATION_IDENTITIES[index]="${reservation_identity}"
+            logical_parent_matches_identity "${index}" \
+                || die "uninstall target directory changed while reserving quarantine: ${directory}"
+            validate_removal_file_target "${target}"
+            path_matches_identity "$(bound_target_path "${index}")" \
+                "${identity}" \
+                || die "uninstall target changed while reserving quarantine: ${target}"
             REMOVAL_ORIGINAL_PRESENT[index]=1
             REMOVAL_ORIGINAL_IDENTITIES[index]="${identity}"
         else
             REMOVAL_QUARANTINES[index]=""
             REMOVAL_RESERVATION_IDENTITIES[index]=""
+            REMOVAL_PARENT_FDS[index]=""
+            REMOVAL_PARENT_IDENTITIES[index]=""
+            REMOVAL_QUARANTINE_BASENAMES[index]=""
             REMOVAL_ORIGINAL_PRESENT[index]=0
             REMOVAL_ORIGINAL_IDENTITIES[index]=""
         fi
@@ -236,7 +327,7 @@ prepare_uninstall_plan() {
 }
 
 stage_uninstall_plan() {
-    local index target quarantine identity
+    local index target quarantine target_path quarantine_path identity
     for target in "${REMOVAL_DIRS[@]}"; do
         validate_removal_dir_target "${target}"
     done
@@ -250,10 +341,14 @@ stage_uninstall_plan() {
             continue
         fi
         identity="${REMOVAL_ORIGINAL_IDENTITIES[index]}"
-        path_matches_identity "${target}" "${identity}" \
+        logical_parent_matches_identity "${index}" \
+            || die "uninstall target directory changed after preflight: ${target%/*}"
+        target_path="$(bound_target_path "${index}")"
+        quarantine_path="$(bound_quarantine_path "${index}")"
+        path_matches_identity "${target_path}" "${identity}" \
             || die "uninstall target changed after preflight: ${target}"
         quarantine="${REMOVAL_QUARANTINES[index]}"
-        path_matches_identity "${quarantine}" \
+        path_matches_identity "${quarantine_path}" \
             "${REMOVAL_RESERVATION_IDENTITIES[index]}" \
             || die "uninstall quarantine reservation changed after preflight: ${quarantine}"
         print_command mv -fT -- "${target}" "${quarantine}"
@@ -261,52 +356,86 @@ stage_uninstall_plan() {
         # 2 by inode if a catchable signal lands after rename but before the
         # success assignment below.
         REMOVAL_STAGED[index]=2
-        if ! mv -fT -- "${target}" "${quarantine}"; then
+        if ! mv -fT -- "${target_path}" "${quarantine_path}"; then
             die "cannot quarantine uninstall target ${target}"
         fi
-        REMOVAL_STAGED[index]=1
+        if path_matches_identity "${quarantine_path}" "${identity}" \
+            && ! path_matches_identity "${target_path}" "${identity}"; then
+            REMOVAL_STAGED[index]=1
+        elif path_matches_identity "${target_path}" "${identity}"; then
+            REMOVAL_STAGED[index]=0
+            die "quarantine rename did not remove uninstall target ${target}"
+        else
+            die "cannot reconcile quarantine rename for ${target}"
+        fi
+        validate_removal_file_target "${target}"
+        logical_parent_matches_identity "${index}" \
+            || die "uninstall target directory changed during quarantine: ${target%/*}"
     done
     UNINSTALL_COMMITTED=1
     UNINSTALL_IN_PROGRESS=0
 }
 
 purge_uninstall_quarantines() {
-    local index target quarantine identity
+    local index target target_display quarantine quarantine_path quarantine_display
+    local identity
+    local validation_error
     for index in "${!REMOVAL_QUARANTINES[@]}"; do
         (( ${REMOVAL_STAGED[index]:-0} == 1 )) || continue
         target="${REMOVAL_FILES[index]}"
         quarantine="${REMOVAL_QUARANTINES[index]:-}"
+        quarantine_path="$(bound_quarantine_path "${index}")"
+        quarantine_display="$(bound_quarantine_display "${index}")"
         identity="${REMOVAL_ORIGINAL_IDENTITIES[index]:-}"
         if [[ -z "${quarantine}" \
-            || ( ! -e "${quarantine}" && ! -L "${quarantine}" ) ]]; then
+            || ( ! -e "${quarantine_path}" && ! -L "${quarantine_path}" ) ]]; then
             REMOVAL_QUARANTINES[index]=""
             REMOVAL_STAGED[index]=0
             continue
         fi
-        if ! path_matches_identity "${quarantine}" "${identity}"; then
+        if ! validation_error="$(
+            validate_staging_removal_target "${target}" 2>&1
+        )" || ! logical_parent_matches_identity "${index}"; then
+            target_display="$(bound_target_display "${index}")"
+            printf 'frost uninstall: warning: refusing to purge through changed target directory for %s; quarantine retained at %s%s\n' \
+                "${target}" "${quarantine_display}" \
+                "${validation_error:+ (${validation_error})}" >&2
+            print_uninstall_recovery "${quarantine_display}" "${target_display}"
+            continue
+        fi
+        if ! path_matches_identity "${quarantine_path}" "${identity}"; then
             printf 'frost uninstall: warning: refusing to purge changed quarantine for %s; unexpected entry retained at %s\n' \
-                "${target}" "${quarantine}" >&2
+                "${target}" "${quarantine_display}" >&2
             continue
         fi
         print_command rm -f -- "${quarantine}"
-        if rm -f -- "${quarantine}"; then
+        if rm -f -- "${quarantine_path}"; then
             REMOVAL_QUARANTINES[index]=""
             REMOVAL_STAGED[index]=0
-        elif [[ ! -e "${quarantine}" && ! -L "${quarantine}" ]]; then
-            # The requested unlink completed even though a wrapper reported
-            # failure. The committed target remains absent and no recovery
-            # inode exists, so do not print a false retained-path instruction.
-            REMOVAL_QUARANTINES[index]=""
-            REMOVAL_STAGED[index]=0
-            printf 'frost uninstall: warning: purge reported failure after removing %s\n' \
-                "${target}" >&2
-        elif ! path_matches_identity "${quarantine}" "${identity}"; then
-            printf 'frost uninstall: warning: purge failed and quarantine identity changed for %s; unexpected entry retained at %s\n' \
-                "${target}" "${quarantine}" >&2
+            if ! logical_parent_matches_identity "${index}"; then
+                printf 'frost uninstall: warning: target directory changed after bound purge of %s\n' \
+                    "${target}" >&2
+            fi
         else
-            printf 'frost uninstall: warning: cannot purge removed target %s; quarantine retained at %s\n' \
-                "${target}" "${quarantine}" >&2
-            print_uninstall_recovery "${quarantine}" "${target}"
+            # The parent itself may have moved while rm ran. Re-resolve the
+            # bound fd before naming either side of a recovery command.
+            quarantine_display="$(bound_quarantine_display "${index}")"
+            target_display="$(bound_target_display "${index}")"
+            if [[ ! -e "${quarantine_path}" && ! -L "${quarantine_path}" ]]; then
+                # The requested unlink completed even though a wrapper reported
+                # failure. No recovery inode exists; do not print a false path.
+                REMOVAL_QUARANTINES[index]=""
+                REMOVAL_STAGED[index]=0
+                printf 'frost uninstall: warning: purge reported failure after removing %s\n' \
+                    "${target}" >&2
+            elif ! path_matches_identity "${quarantine_path}" "${identity}"; then
+                printf 'frost uninstall: warning: purge failed and quarantine identity changed for %s; unexpected entry retained at %s\n' \
+                    "${target}" "${quarantine_display}" >&2
+            else
+                printf 'frost uninstall: warning: cannot purge removed target %s; quarantine retained at %s\n' \
+                    "${target}" "${quarantine_display}" >&2
+                print_uninstall_recovery "${quarantine_display}" "${target_display}"
+            fi
         fi
     done
 }
@@ -555,12 +684,16 @@ else
     require_command rm
     require_command rmdir
     require_command stat
+    require_command readlink
+    [[ -d /proc/self/fd ]] \
+        || die "transactional uninstall requires /proc/self/fd"
     prepare_uninstall_plan
     stage_uninstall_plan
     # Every owned name is now absent: this is the uninstall commit point.
     # Purge cannot truthfully roll that result back, so failures retain a named
     # quarantine and an exact manual recovery command while the exit stays 0.
     purge_uninstall_quarantines
+    close_uninstall_parent_fds
 fi
 for target in "${REMOVAL_DIRS[@]}"; do
     remove_dir_if_empty "${target}"

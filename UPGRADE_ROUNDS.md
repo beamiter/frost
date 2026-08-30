@@ -471,3 +471,13 @@ Round 70 closes the remaining argument-form affordance gap:
     post-rename quarantine substitution likewise invokes no `rm`, follows no
     referent, and is never advertised as the displaced original's recovery
     copy. Post-action command failures are reconciled by observed inode state.
+
+93. **Directory-fd-bound uninstall operations** — every present target keeps a
+    read-only parent fd, and reservation, quarantine rename, rollback, and purge
+    execute through Linux `/proc/self/fd` names. Deterministic parent swaps from
+    inside `mktemp`, `mv`, and `rm` prove placeholders never escape, interrupted
+    staging restores the exact inode in the bound directory, and purge cannot
+    unlink identically named files behind a replacement symlink. Logical parent
+    identity is still checked before/after each phase; a failed purge names the
+    bound physical directory on both sides of its recovery command, and fds
+    close before caches.
