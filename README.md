@@ -191,7 +191,11 @@ reservation placeholder、rollback backup 与待 purge 项都会在使用点核�
 提交后的空 workflow 目录清理以及 desktop/icon cache refresh 同样在提交前绑定目录 inode。
 身份在执行前变化会跳过可选操作；若变化发生在 helper 内部，helper 只拿到 `/proc/self/fd`
 路径，随后给出非致命警告。清理/刷新失败不会反转已经完成的卸载，成功摘要仍保持真实。
-安装和卸载的绑定目录都按 `device:inode` 去重，各设有 16 个 fd 的固定上限；同一物理
+安装和卸载的绑定目录都按 `device:inode` 去重，各设有 16 个 fd 的固定上限；安装期间每个普通
+rollback backup 还会保留一个只读 fd（同样最多 16 个），直到 rollback/cleanup 完成才关闭，
+所以 backup 名被删除后立刻复用同一 inode number 也不能伪装成原快照。publish 已把 staged inode
+移到目标时，旧 source 名若被不同 inode 回填会立即撤销名称所有权，命令非零仍按精确目标状态
+收敛，后续 rollback/cleanup 不会触碰该替代物。同一物理
 applications/workflow parent 的多个消费者仍各自执行 use-point identity 检查，正常完成、早退
 与异常退出最终都由统一清理关闭池中描述符。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机

@@ -529,3 +529,14 @@ Round 70 closes the remaining argument-form affordance gap:
     retained untouched by cleanup or rollback. Deterministic regressions cover
     cross-device staging, forced hardlink fallback followed by reverse restore,
     and both staged-temporary and fallback-reservation ABA replacement.
+
+99. **Pinned backup lifetime and post-publish name reconciliation** — every
+    regular rollback snapshot now keeps a read-only fd until rollback/cleanup,
+    preventing immediate inode-number reuse from making a replacement name look
+    owned. Publish completion is defined by the staged inode reaching the exact
+    destination and leaving its recorded source name; a different inode inserted
+    at that source is retained as unowned even when `mv` returns non-zero.
+    Backup identity is rechecked at the same boundary and revoked on mismatch.
+    A deterministic two-publish regression replaces both names after the first
+    completed rename, forces the second rename to fail, and proves rollback
+    touches neither substitute while reporting the unrecoverable predecessor.

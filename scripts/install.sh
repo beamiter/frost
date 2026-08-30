@@ -25,6 +25,7 @@ INSTALL_DESTS=()
 INSTALL_BACKUPS=()
 INSTALL_BACKUP_BASENAMES=()
 INSTALL_BACKUP_IDENTITIES=()
+INSTALL_BACKUP_FDS=()
 INSTALL_ORIGINAL_PRESENT=()
 INSTALL_ORIGINAL_IDENTITIES=()
 INSTALL_PARENT_FDS=()
@@ -38,6 +39,7 @@ KEEP_INSTALL_BACKUPS=0
 INSTALL_BOUND_DIRECTORY_FDS=()
 INSTALL_BOUND_DIRECTORY_IDENTITIES=()
 MAX_INSTALL_BOUND_DIRECTORY_FDS=16
+MAX_INSTALL_BACKUP_FDS=16
 POST_INSTALL_APP_DIR=""
 POST_INSTALL_APP_FD=""
 POST_INSTALL_APP_IDENTITY=""
@@ -72,7 +74,7 @@ die() {
 }
 
 cleanup_install_artifacts() {
-    local index temp path expected display
+    local index temp path expected display fd
     local -a parent_warning_emitted=()
     for index in "${!INSTALL_TEMPS[@]}"; do
         temp="${INSTALL_TEMPS[index]:-}"
@@ -120,13 +122,15 @@ cleanup_install_artifacts() {
                 if [[ -e "${path}" || -L "${path}" ]]; then
                     expected="${INSTALL_BACKUP_IDENTITIES[index]:-}"
                     if [[ -z "${expected}" ]] \
-                        || ! path_matches_identity "${path}" "${expected}"; then
+                        || ! install_backup_path_matches_identity "${index}" \
+                            "${path}" "${expected}"; then
                         printf 'frost install: warning: refusing to remove changed rollback backup %s\n' \
                             "${display}" >&2
                     else
                         rm -f -- "${path}" || :
                         if [[ -e "${path}" || -L "${path}" ]]; then
-                            if path_matches_identity "${path}" "${expected}"; then
+                            if install_backup_path_matches_identity "${index}" \
+                                "${path}" "${expected}"; then
                                 printf 'frost install: warning: cannot remove rollback backup %s\n' \
                                     "${display}" >&2
                             else
@@ -146,11 +150,17 @@ cleanup_install_artifacts() {
             fi
         done
     fi
+    for index in "${!INSTALL_BACKUP_FDS[@]}"; do
+        fd="${INSTALL_BACKUP_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+    done
     INSTALL_TEMPS=()
     INSTALL_DESTS=()
     INSTALL_BACKUPS=()
     INSTALL_BACKUP_BASENAMES=()
     INSTALL_BACKUP_IDENTITIES=()
+    INSTALL_BACKUP_FDS=()
     INSTALL_ORIGINAL_PRESENT=()
     INSTALL_ORIGINAL_IDENTITIES=()
     INSTALL_PARENT_FDS=()
@@ -315,6 +325,45 @@ opened_regular_backup_copy_matches() {
     [[ "${backup_mode}" == "${source_mode}" ]]
 }
 
+opened_regular_install_backup_matches() {
+    local fd="$1" expected="$2" actual
+    [[ -n "${fd}" && -f "/proc/self/fd/${fd}" ]] || return 1
+    actual="$(stat -Lc '%d:%i' -- "/proc/self/fd/${fd}")" || return 1
+    [[ "${actual}" == "${expected}" ]]
+}
+
+install_backup_path_matches_identity() {
+    local index="$1" path="$2" expected="$3" fd
+    path_matches_identity "${path}" "${expected}" || return 1
+    fd="${INSTALL_BACKUP_FDS[index]:-}"
+    [[ -z "${fd}" ]] \
+        || opened_regular_install_backup_matches "${fd}" "${expected}"
+}
+
+retain_regular_install_backup_fd() {
+    local index="$1" backup="$2" expected="$3" dest="$4"
+    local candidate_fd="${5:-}" fd count=0
+    for fd in "${INSTALL_BACKUP_FDS[@]}"; do
+        [[ -n "${fd}" ]] && count=$((count + 1))
+    done
+    ((count < MAX_INSTALL_BACKUP_FDS)) \
+        || die "too many regular rollback backups (limit ${MAX_INSTALL_BACKUP_FDS})"
+    if [[ -z "${candidate_fd}" ]]; then
+        unset candidate_fd
+        exec {candidate_fd}<"${backup}" \
+            || die "cannot pin regular rollback backup for ${dest}"
+    fi
+    if [[ -L "${backup}" || ! -f "${backup}" ]] \
+        || ! path_matches_identity "${backup}" "${expected}" \
+        || ! opened_regular_install_backup_matches "${candidate_fd}" \
+            "${expected}"; then
+        exec {candidate_fd}<&-
+        INSTALL_BACKUP_IDENTITIES[index]=""
+        die "regular rollback backup changed while pinning ${dest}"
+    fi
+    INSTALL_BACKUP_FDS[index]="${candidate_fd}"
+}
+
 bind_install_destination() {
     local index="$1" dest="$2" directory fd identity bind_status
     directory="${dest%/*}"
@@ -350,8 +399,8 @@ rollback_install_plan() {
             backup_display="$(bound_install_backup_display "${index}")"
             if [[ -n "${backup}" && ( -e "${backup}" || -L "${backup}" ) ]]; then
                 if [[ -z "${backup_identity}" ]] \
-                    || ! path_matches_identity "${backup}" \
-                        "${backup_identity}"; then
+                    || ! install_backup_path_matches_identity "${index}" \
+                        "${backup}" "${backup_identity}"; then
                     printf 'frost install: rollback refused changed backup for %s; unexpected entry retained at %s\n' \
                         "${dest_display}" "${backup_display}" >&2
                     rollback_failed=1
@@ -369,8 +418,8 @@ rollback_install_plan() {
                         "${staged_identity}"; then
                     if mv -fT -- "${backup}" "${dest_path}"; then
                         INSTALL_BACKUPS[index]=""
-                    elif path_matches_identity "${dest_path}" \
-                        "${backup_identity}" \
+                    elif install_backup_path_matches_identity "${index}" \
+                        "${dest_path}" "${backup_identity}" \
                         && [[ ! -e "${backup}" && ! -L "${backup}" ]]; then
                         # Reconcile a wrapper that reports failure after the
                         # bound restore rename already completed.
@@ -756,6 +805,8 @@ prepare_install_backups() {
         INSTALL_BACKUPS[index]=""
         INSTALL_BACKUP_BASENAMES[index]=""
         INSTALL_BACKUP_IDENTITIES[index]=""
+        INSTALL_BACKUP_FDS[index]=""
+        fallback_fd=""
         if [[ -e "${dest_path}" || -L "${dest_path}" ]]; then
             [[ -f "${dest_path}" || -L "${dest_path}" ]] \
                 || die "install destination is not a regular file or symlink: ${dest}"
@@ -887,7 +938,6 @@ prepare_install_backups() {
                         fi
                         die "cannot reconcile fallback rollback backup for ${dest}"
                     fi
-                    exec {fallback_fd}>&-
                 else
                     cp -a --no-dereference --no-preserve=ownership -- \
                         "${dest_path}" "${INSTALL_BACKUPS[index]}" \
@@ -915,6 +965,13 @@ prepare_install_backups() {
                 "${INSTALL_BACKUPS[index]}")" \
                 || die "cannot identify rollback backup for ${dest}"
             INSTALL_BACKUP_IDENTITIES[index]="${backup_identity}"
+            if [[ -f "${INSTALL_BACKUPS[index]}" \
+                && ! -L "${INSTALL_BACKUPS[index]}" ]]; then
+                retain_regular_install_backup_fd "${index}" \
+                    "${INSTALL_BACKUPS[index]}" "${backup_identity}" \
+                    "${dest}" "${fallback_fd:-}"
+                fallback_fd=""
+            fi
             logical_install_parent_matches "${index}" \
                 || die "install destination directory changed while backing up: ${directory}"
             path_matches_identity "${dest_path}" "${original_identity}" \
@@ -928,6 +985,7 @@ prepare_install_backups() {
 
 publish_install_plan() {
     local index temp temp_display dest dest_path staged_identity command_status
+    local backup backup_identity source_released
     if ((DRY_RUN == 0)); then
         prepare_install_backups
         PUBLISH_IN_PROGRESS=1
@@ -960,17 +1018,46 @@ publish_install_plan() {
         PUBLISH_LAST_ATTEMPT="${index}"
         command_status=0
         mv -fT -- "${temp}" "${dest_path}" || command_status=$?
+        source_released=0
+        if [[ ! -e "${temp}" && ! -L "${temp}" ]]; then
+            source_released=1
+        elif ! path_matches_identity "${temp}" "${staged_identity}"; then
+            # The expected source inode left this name, so a completed rename
+            # remains complete even if an unrelated entry was inserted before
+            # the external command returned. Revoke ownership of that name;
+            # neither EXIT cleanup nor rollback may touch the replacement.
+            printf 'frost install: warning: install temporary name changed after publish; replacement retained at %s\n' \
+                "${temp_display}" >&2
+            INSTALL_TEMPS[index]=""
+            source_released=1
+        fi
         if ! path_matches_identity "${dest_path}" "${staged_identity}" \
-            || [[ -e "${temp}" || -L "${temp}" ]]; then
+            || ((source_released == 0)); then
             if ((command_status != 0)); then
                 die "cannot atomically replace ${dest}"
             fi
             die "cannot reconcile published install target ${dest}"
         fi
         # A non-zero wrapper status after the exact staged inode reached the
-        # destination and its old name vanished is a completed publication.
+        # destination and left its recorded source name is a completed
+        # publication. A different inode at that source name is not ours.
         logical_install_parent_matches "${index}" \
             || die "install destination directory changed during publish: ${dest%/*}"
+        if (( ${INSTALL_ORIGINAL_PRESENT[index]:-0} == 1 )); then
+            backup="${INSTALL_BACKUPS[index]:-}"
+            backup_identity="${INSTALL_BACKUP_IDENTITIES[index]:-}"
+            if [[ -z "${backup}" \
+                || ( ! -e "${backup}" && ! -L "${backup}" ) ]] \
+                || [[ -z "${backup_identity}" ]] \
+                || ! install_backup_path_matches_identity "${index}" \
+                    "${backup}" "${backup_identity}"; then
+                # Publication no longer needs this snapshot to be considered
+                # complete. Mark a missing/replaced backup unowned so a later
+                # rollback can report degradation without moving or unlinking
+                # an entry that this transaction did not create.
+                INSTALL_BACKUP_IDENTITIES[index]=""
+            fi
+        fi
         INSTALL_TEMPS[index]=""
     done
     PUBLISH_IN_PROGRESS=0

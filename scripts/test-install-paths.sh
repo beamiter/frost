@@ -1390,6 +1390,115 @@ assert_contains "post-action install success summary" \
 [[ "${install_post_action_output}" != *'cannot atomically replace'* ]] \
     || fail "completed publish was reported as an atomic replacement failure"
 
+# Once the staged inode reaches its destination, a different inode inserted at
+# the old source name is not evidence that mv failed. Reconcile the completed
+# non-zero publish, revoke both source-name and replaced-backup ownership, then
+# prove a later rollback leaves both substitutes untouched.
+install_publish_aba_tools="${TEST_ROOT}/install-publish-aba-tools"
+install_publish_aba_stage="${TEST_ROOT}/install-publish-aba-stage"
+install_publish_aba_prefix="/opt/frost-install-publish-aba"
+install_publish_aba_workflow_dir="${install_publish_aba_stage}${install_publish_aba_prefix}/share/frost/workflows"
+install_publish_aba_first="${install_publish_aba_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_publish_aba_second="${install_publish_aba_workflow_dir}/${WORKFLOW_SOURCES[1]##*/}"
+install_publish_aba_source_victim="${TEST_ROOT}/install-publish-aba-source-victim"
+install_publish_aba_backup_victim="${TEST_ROOT}/install-publish-aba-backup-victim"
+install_publish_aba_source_log="${TEST_ROOT}/install-publish-aba-source-path"
+install_publish_aba_backup_log="${TEST_ROOT}/install-publish-aba-backup-path"
+install_publish_aba_second_marker="${TEST_ROOT}/install-publish-aba-second-mv"
+install_publish_aba_state="${TEST_ROOT}/install-publish-aba-state"
+mkdir -p "${install_publish_aba_tools}" \
+    "${install_publish_aba_workflow_dir}"
+printf 'old workflow before publish source ABA\n' \
+    >"${install_publish_aba_first}"
+printf 'publish source ABA victim sentinel\n' \
+    >"${install_publish_aba_source_victim}"
+printf 'publish backup ABA victim sentinel\n' \
+    >"${install_publish_aba_backup_victim}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/*.install.*)' \
+    '        state=${FROST_TEST_INSTALL_PUBLISH_ABA_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        if [ "${count}" -eq 1 ]; then' \
+    '            /usr/bin/mv "$@"' \
+    '            parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '            source_path=${parent}/${previous##*/}' \
+    '            backup_path=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${FROST_TEST_INSTALL_PUBLISH_ABA_FIRST_BASENAME:?}.rollback.*" -print -quit)' \
+    '            : "${backup_path:?missing publish rollback backup}"' \
+    '            printf "%s\n" "${source_path}" >"${FROST_TEST_INSTALL_PUBLISH_ABA_SOURCE_LOG:?}"' \
+    '            printf "%s\n" "${backup_path}" >"${FROST_TEST_INSTALL_PUBLISH_ABA_BACKUP_LOG:?}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_PUBLISH_ABA_SOURCE_VICTIM:?}" "${previous}"' \
+    '            /usr/bin/rm -f -- "${backup_path}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_PUBLISH_ABA_BACKUP_VICTIM:?}" "${backup_path}"' \
+    '            exit 93' \
+    '        fi' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            : >"${FROST_TEST_INSTALL_PUBLISH_ABA_SECOND_MARKER:?}"' \
+    '            exit 94' \
+    '        fi' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_publish_aba_tools}/mv"
+chmod 0755 "${install_publish_aba_tools}/mv"
+if env HOME="${TEST_HOME}" PATH="${install_publish_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_STATE="${install_publish_aba_state}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_FIRST_BASENAME="${install_publish_aba_first##*/}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_SOURCE_LOG="${install_publish_aba_source_log}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_BACKUP_LOG="${install_publish_aba_backup_log}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_SOURCE_VICTIM="${install_publish_aba_source_victim}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_BACKUP_VICTIM="${install_publish_aba_backup_victim}" \
+    FROST_TEST_INSTALL_PUBLISH_ABA_SECOND_MARKER="${install_publish_aba_second_marker}" \
+    DESTDIR="${install_publish_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_publish_aba_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-publish-aba.log" 2>&1; then
+    fail "installer ignored a later failure after completed publish ABA"
+fi
+install_publish_aba_source_path="$(<"${install_publish_aba_source_log}")"
+install_publish_aba_backup_path="$(<"${install_publish_aba_backup_log}")"
+assert_regular_file "later publish failure marker" \
+    "${install_publish_aba_second_marker}"
+[[ "$(<"${install_publish_aba_state}")" == 2 ]] \
+    || fail "completed publish ABA did not reach the later publish"
+cmp -- "${WORKFLOW_SOURCES[0]}" "${install_publish_aba_first}" \
+    || fail "completed publish ABA lost the exact staged destination"
+assert_absent "second target after publish ABA failure" \
+    "${install_publish_aba_second}"
+[[ -L "${install_publish_aba_source_path}" ]] \
+    || fail "rollback deleted the published-source substitute"
+[[ "$(readlink -- "${install_publish_aba_source_path}")" == \
+    "${install_publish_aba_source_victim}" ]] \
+    || fail "rollback changed the published-source substitute"
+[[ -L "${install_publish_aba_backup_path}" ]] \
+    || fail "rollback deleted the published-backup substitute"
+[[ "$(readlink -- "${install_publish_aba_backup_path}")" == \
+    "${install_publish_aba_backup_victim}" ]] \
+    || fail "rollback changed the published-backup substitute"
+[[ "$(<"${install_publish_aba_source_victim}")" == \
+    'publish source ABA victim sentinel' ]] \
+    || fail "rollback followed the published-source substitute"
+[[ "$(<"${install_publish_aba_backup_victim}")" == \
+    'publish backup ABA victim sentinel' ]] \
+    || fail "rollback followed the published-backup substitute"
+assert_contains "completed publish source ABA warning" \
+    "$(<"${TEST_ROOT}/install-publish-aba.log")" \
+    "install temporary name changed after publish; replacement retained at ${install_publish_aba_source_path}"
+assert_contains "later publish failure diagnostic" \
+    "$(<"${TEST_ROOT}/install-publish-aba.log")" \
+    "cannot atomically replace ${install_publish_aba_second}"
+assert_contains "changed backup rollback diagnostic" \
+    "$(<"${TEST_ROOT}/install-publish-aba.log")" \
+    "rollback refused changed backup for ${install_publish_aba_first}; unexpected entry retained at ${install_publish_aba_backup_path}"
+
 # Cleanup performs one unlink attempt only. If the owned backup disappears but
 # that same name is repopulated before rm returns, the new inode is retained and
 # reported; cleanup never retries against the now-unowned name.
@@ -1639,8 +1748,12 @@ install_cache_bound_validate_log="${TEST_ROOT}/install-cache-bound-validate-argu
 install_cache_bound_update_log="${TEST_ROOT}/install-cache-bound-update-argument"
 install_cache_bound_icon_log="${TEST_ROOT}/install-cache-bound-icon-argument"
 install_cache_bound_prebuilt_leak="${TEST_ROOT}/install-cache-bound-prebuilt-fd-leaked"
+install_cache_bound_backup_leak="${TEST_ROOT}/install-cache-bound-backup-fd-leaked"
 mkdir -p "${install_cache_bound_tools}" "${install_cache_bound_app_victim}" \
-    "${install_cache_bound_icon_victim}"
+    "${install_cache_bound_icon_victim}" \
+    "${install_cache_bound_prefix}/bin"
+printf 'old binary whose backup fd must close before helpers\n' \
+    >"${install_cache_bound_prefix}/bin/frost"
 printf 'outside install applications sentinel\n' \
     >"${install_cache_bound_app_victim}/sentinel"
 printf 'outside install icon sentinel\n' \
@@ -1651,7 +1764,9 @@ printf '%s\n' \
     'set -eu' \
     'printf "%s\n" "${1}" >"${FROST_TEST_INSTALL_CACHE_BOUND_VALIDATE_LOG:?}"' \
     'for candidate in /proc/self/fd/*; do' \
-    '    [ "$(/usr/bin/readlink -- "${candidate}" 2>/dev/null || :)" != "${FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT:?}" ] || : >"${FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT_LEAK:?}"' \
+    '    target=$(/usr/bin/readlink -- "${candidate}" 2>/dev/null || :)' \
+    '    [ "${target}" != "${FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT:?}" ] || : >"${FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT_LEAK:?}"' \
+    '    case "${target}" in *.rollback.*) : >"${FROST_TEST_INSTALL_CACHE_BOUND_BACKUP_LEAK:?}" ;; esac' \
     'done' \
     '[ -f "${1}" ]' \
     >"${install_cache_bound_tools}/desktop-file-validate"
@@ -1687,6 +1802,7 @@ install_cache_bound_output="$(
         FROST_TEST_INSTALL_CACHE_BOUND_ICON_LOG="${install_cache_bound_icon_log}" \
         FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT="${prebuilt_binary}" \
         FROST_TEST_INSTALL_CACHE_BOUND_PREBUILT_LEAK="${install_cache_bound_prebuilt_leak}" \
+        FROST_TEST_INSTALL_CACHE_BOUND_BACKUP_LEAK="${install_cache_bound_backup_leak}" \
         FROST_TEST_INSTALL_CACHE_BOUND_APP_DIR="${install_cache_bound_app_dir}" \
         FROST_TEST_INSTALL_CACHE_BOUND_APP_DISPLACED="${install_cache_bound_app_displaced}" \
         FROST_TEST_INSTALL_CACHE_BOUND_APP_VICTIM="${install_cache_bound_app_victim}" \
@@ -1701,6 +1817,8 @@ install_cache_bound_update_arg="$(<"${install_cache_bound_update_log}")"
 install_cache_bound_icon_arg="$(<"${install_cache_bound_icon_log}")"
 assert_absent "prebuilt fd before post-install helpers" \
     "${install_cache_bound_prebuilt_leak}"
+assert_absent "rollback backup fd before post-install helpers" \
+    "${install_cache_bound_backup_leak}"
 [[ "${install_cache_bound_validate_arg%/*}" == \
     "${install_cache_bound_update_arg}" ]] \
     || fail "install desktop helpers did not reuse one applications fd"
