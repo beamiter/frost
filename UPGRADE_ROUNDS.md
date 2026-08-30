@@ -508,3 +508,13 @@ Round 70 closes the remaining argument-form affordance gap:
     an identically named replacement target, and successful cleanup leaves no
     rollback artifact in the old parent. Both directory pools now have a
     16-physical-inode ceiling and retain one close-on-exit owner per fd.
+
+97. **Exact install-artifact transitions** — rollback reservations are reused
+    only after their bound name is observably absent, and a hardlink snapshot
+    is accepted only when it has the original target's exact device/inode.
+    Substitutes injected after reservation `rm`, backup `ln`, or cleanup `rm`
+    are retained as unowned names and never retried or removed. Conversely,
+    non-zero wrappers after completed reservation/cleanup unlinks, hardlink
+    creation, or final publish rename reconcile from exact post-action state;
+    deterministic regressions prove the generation commits with no false
+    rollback while every transaction-owned temporary and backup disappears.

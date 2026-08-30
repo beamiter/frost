@@ -89,9 +89,19 @@ cleanup_install_artifacts() {
                 || ! path_matches_identity "${temp}" "${expected}"; then
                 printf 'frost install: warning: refusing to remove changed temporary %s\n' \
                     "${display}" >&2
-            elif ! rm -f -- "${temp}"; then
-                printf 'frost install: warning: cannot remove temporary %s\n' \
-                    "${display}" >&2
+            else
+                # The exact post-action name state is authoritative: a
+                # non-zero wrapper may have completed the unlink already.
+                rm -f -- "${temp}" || :
+                if [[ -e "${temp}" || -L "${temp}" ]]; then
+                    if path_matches_identity "${temp}" "${expected}"; then
+                        printf 'frost install: warning: cannot remove temporary %s\n' \
+                            "${display}" >&2
+                    else
+                        printf 'frost install: warning: temporary name changed during removal; replacement retained at %s\n' \
+                            "${display}" >&2
+                    fi
+                fi
             fi
         fi
         if [[ -n "${INSTALL_PARENT_FDS[index]:-}" ]] \
@@ -113,9 +123,17 @@ cleanup_install_artifacts() {
                         || ! path_matches_identity "${path}" "${expected}"; then
                         printf 'frost install: warning: refusing to remove changed rollback backup %s\n' \
                             "${display}" >&2
-                    elif ! rm -f -- "${path}"; then
-                        printf 'frost install: warning: cannot remove rollback backup %s\n' \
-                            "${display}" >&2
+                    else
+                        rm -f -- "${path}" || :
+                        if [[ -e "${path}" || -L "${path}" ]]; then
+                            if path_matches_identity "${path}" "${expected}"; then
+                                printf 'frost install: warning: cannot remove rollback backup %s\n' \
+                                    "${display}" >&2
+                            else
+                                printf 'frost install: warning: rollback backup name changed during removal; replacement retained at %s\n' \
+                                    "${display}" >&2
+                            fi
+                        fi
                     fi
                 fi
             fi
@@ -564,7 +582,7 @@ stage_install_binary() {
 
 prepare_install_backups() {
     local index dest dest_path directory basename backup reservation_identity
-    local original_identity backup_identity staged_identity
+    local original_identity backup_identity staged_identity command_status
     INSTALL_BACKUPS=()
     INSTALL_BACKUP_BASENAMES=()
     INSTALL_BACKUP_IDENTITIES=()
@@ -615,17 +633,39 @@ prepare_install_backups() {
                 || die "install destination directory changed while reserving backup: ${directory}"
             path_matches_identity "${dest_path}" "${original_identity}" \
                 || die "install target changed while reserving backup: ${dest}"
-            rm -f -- "${INSTALL_BACKUPS[index]}" \
-                || die "cannot prepare rollback backup beside ${dest}"
+            rm -f -- "${INSTALL_BACKUPS[index]}" || :
+            if [[ -e "${INSTALL_BACKUPS[index]}" \
+                || -L "${INSTALL_BACKUPS[index]}" ]]; then
+                if path_matches_identity "${INSTALL_BACKUPS[index]}" \
+                    "${reservation_identity}"; then
+                    die "cannot prepare rollback backup beside ${dest}"
+                fi
+                # Once the name contains another inode, ownership is
+                # ambiguous. Do not let exit cleanup unlink it a second time.
+                INSTALL_BACKUP_IDENTITIES[index]=""
+                die "rollback reservation name changed while removing it beside ${dest}"
+            fi
             INSTALL_BACKUP_IDENTITIES[index]=""
             # A same-directory hard link retains the exact inode: owner/group,
             # mode, xattrs, and even a dangling symlink's link object. Some
             # filesystems or protected-hardlink policies reject it; the copy
             # fallback still preserves content/mode and never follows links.
-            if ! ln -P -- "${dest_path}" "${INSTALL_BACKUPS[index]}" \
-                2>/dev/null \
-                && ! cp -a --no-dereference --no-preserve=ownership -- \
-                    "${dest_path}" "${INSTALL_BACKUPS[index]}"; then
+            command_status=0
+            ln -P -- "${dest_path}" "${INSTALL_BACKUPS[index]}" \
+                2>/dev/null || command_status=$?
+            if path_matches_identity "${INSTALL_BACKUPS[index]}" \
+                "${original_identity}"; then
+                # Reconcile a hard link that was created successfully even if
+                # an instrumented command returned a non-zero status.
+                :
+            elif [[ -e "${INSTALL_BACKUPS[index]}" \
+                || -L "${INSTALL_BACKUPS[index]}" ]]; then
+                INSTALL_BACKUP_IDENTITIES[index]=""
+                die "rollback backup name was replaced while linking ${dest}"
+            elif ((command_status == 0)); then
+                die "rollback backup disappeared while linking ${dest}"
+            elif ! cp -a --no-dereference --no-preserve=ownership -- \
+                "${dest_path}" "${INSTALL_BACKUPS[index]}"; then
                 die "cannot back up existing install target ${dest}"
             fi
             backup_identity="$(stat -c '%d:%i' -- \
@@ -644,7 +684,7 @@ prepare_install_backups() {
 }
 
 publish_install_plan() {
-    local index temp temp_display dest dest_path staged_identity
+    local index temp temp_display dest dest_path staged_identity command_status
     if ((DRY_RUN == 0)); then
         prepare_install_backups
         PUBLISH_IN_PROGRESS=1
@@ -675,13 +715,17 @@ publish_install_plan() {
         fi
         print_command mv -fT -- "${temp_display}" "${dest}"
         PUBLISH_LAST_ATTEMPT="${index}"
-        if ! mv -fT -- "${temp}" "${dest_path}"; then
-            die "cannot atomically replace ${dest}"
+        command_status=0
+        mv -fT -- "${temp}" "${dest_path}" || command_status=$?
+        if ! path_matches_identity "${dest_path}" "${staged_identity}" \
+            || [[ -e "${temp}" || -L "${temp}" ]]; then
+            if ((command_status != 0)); then
+                die "cannot atomically replace ${dest}"
+            fi
+            die "cannot reconcile published install target ${dest}"
         fi
-        path_matches_identity "${dest_path}" "${staged_identity}" \
-            || die "cannot reconcile published install target ${dest}"
-        [[ ! -e "${temp}" && ! -L "${temp}" ]] \
-            || die "install temporary remained after publish: ${temp_display}"
+        # A non-zero wrapper status after the exact staged inode reached the
+        # destination and its old name vanished is a completed publication.
         logical_install_parent_matches "${index}" \
             || die "install destination directory changed during publish: ${dest%/*}"
         INSTALL_TEMPS[index]=""

@@ -911,6 +911,274 @@ assert_contains "install backup cleanup success summary" \
     "${install_cleanup_parent_output}" \
     "Installed frost to ${install_cleanup_parent_prefix}/bin/frost"
 
+# Once the rollback reservation has been unlinked, its name must be absent
+# before it can be reused. Inject a symlink after rm returns successfully: the
+# installer must abort, mark that name unowned, and leave the substitute for an
+# operator rather than overwrite it with ln/cp or delete it from the exit trap.
+install_reservation_aba_tools="${TEST_ROOT}/install-reservation-aba-tools"
+install_reservation_aba_stage="${TEST_ROOT}/install-reservation-aba-stage"
+install_reservation_aba_prefix="/opt/frost-install-reservation-aba"
+install_reservation_aba_binary="${install_reservation_aba_stage}${install_reservation_aba_prefix}/bin/frost"
+install_reservation_aba_victim="${TEST_ROOT}/install-reservation-aba-victim"
+install_reservation_aba_path_log="${TEST_ROOT}/install-reservation-aba-path"
+mkdir -p "${install_reservation_aba_tools}" \
+    "${install_reservation_aba_binary%/*}"
+printf 'old binary before reservation ABA\n' \
+    >"${install_reservation_aba_binary}"
+printf 'reservation ABA victim sentinel\n' \
+    >"${install_reservation_aba_victim}"
+install_reservation_aba_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_reservation_aba_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.frost.rollback.*)' \
+    '        /usr/bin/rm "$@"' \
+    '        parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '        printf "%s/%s\n" "${parent}" "${last##*/}" >"${FROST_TEST_INSTALL_RESERVATION_ABA_PATH_LOG:?}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_RESERVATION_ABA_VICTIM:?}" "${last}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_reservation_aba_tools}/rm"
+chmod 0755 "${install_reservation_aba_tools}/rm"
+if env HOME="${TEST_HOME}" PATH="${install_reservation_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_RESERVATION_ABA_PATH_LOG="${install_reservation_aba_path_log}" \
+    FROST_TEST_INSTALL_RESERVATION_ABA_VICTIM="${install_reservation_aba_victim}" \
+    DESTDIR="${install_reservation_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_reservation_aba_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-reservation-aba.log" 2>&1; then
+    fail "installer reused a replaced rollback reservation name"
+fi
+install_reservation_aba_path="$(<"${install_reservation_aba_path_log}")"
+assert_contains "rollback reservation ABA diagnostic" \
+    "$(<"${TEST_ROOT}/install-reservation-aba.log")" \
+    "rollback reservation name changed while removing it beside ${install_reservation_aba_binary}"
+[[ -L "${install_reservation_aba_path}" ]] \
+    || fail "installer deleted the rollback reservation substitute"
+[[ "$(readlink -- "${install_reservation_aba_path}")" == \
+    "${install_reservation_aba_victim}" ]] \
+    || fail "installer changed the rollback reservation substitute"
+[[ "$(<"${install_reservation_aba_victim}")" == \
+    'reservation ABA victim sentinel' ]] \
+    || fail "installer followed the rollback reservation substitute"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_reservation_aba_binary}")" == \
+    "${install_reservation_aba_identity}" ]] \
+    || fail "rollback reservation ABA changed the original binary inode"
+[[ "$(<"${install_reservation_aba_binary}")" == \
+    'old binary before reservation ABA' ]] \
+    || fail "rollback reservation ABA changed the original binary"
+
+# A successful hardlink has a known identity: it must be the original target's
+# inode. Replace that link before ln returns zero and prove the unexpected name
+# is neither accepted as a backup nor removed by cleanup.
+install_backup_aba_tools="${TEST_ROOT}/install-backup-aba-tools"
+install_backup_aba_stage="${TEST_ROOT}/install-backup-aba-stage"
+install_backup_aba_prefix="/opt/frost-install-backup-aba"
+install_backup_aba_binary="${install_backup_aba_stage}${install_backup_aba_prefix}/bin/frost"
+install_backup_aba_victim="${TEST_ROOT}/install-backup-aba-victim"
+install_backup_aba_path_log="${TEST_ROOT}/install-backup-aba-path"
+mkdir -p "${install_backup_aba_tools}" "${install_backup_aba_binary%/*}"
+printf 'old binary before backup ABA\n' >"${install_backup_aba_binary}"
+printf 'backup ABA victim sentinel\n' >"${install_backup_aba_victim}"
+install_backup_aba_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_backup_aba_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/ln "$@"' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    'printf "%s/%s\n" "${parent}" "${last##*/}" >"${FROST_TEST_INSTALL_BACKUP_ABA_PATH_LOG:?}"' \
+    '/usr/bin/rm -f -- "${last}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_INSTALL_BACKUP_ABA_VICTIM:?}" "${last}"' \
+    'exit 0' \
+    >"${install_backup_aba_tools}/ln"
+chmod 0755 "${install_backup_aba_tools}/ln"
+if env HOME="${TEST_HOME}" PATH="${install_backup_aba_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_BACKUP_ABA_PATH_LOG="${install_backup_aba_path_log}" \
+    FROST_TEST_INSTALL_BACKUP_ABA_VICTIM="${install_backup_aba_victim}" \
+    DESTDIR="${install_backup_aba_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_backup_aba_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-backup-aba.log" 2>&1; then
+    fail "installer accepted a replaced rollback backup name"
+fi
+install_backup_aba_path="$(<"${install_backup_aba_path_log}")"
+assert_contains "rollback backup ABA diagnostic" \
+    "$(<"${TEST_ROOT}/install-backup-aba.log")" \
+    "rollback backup name was replaced while linking ${install_backup_aba_binary}"
+[[ -L "${install_backup_aba_path}" ]] \
+    || fail "installer deleted the rollback backup substitute"
+[[ "$(readlink -- "${install_backup_aba_path}")" == \
+    "${install_backup_aba_victim}" ]] \
+    || fail "installer changed the rollback backup substitute"
+[[ "$(<"${install_backup_aba_victim}")" == \
+    'backup ABA victim sentinel' ]] \
+    || fail "installer followed the rollback backup substitute"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${install_backup_aba_binary}")" == \
+    "${install_backup_aba_identity}" ]] \
+    || fail "rollback backup ABA changed the original binary inode"
+[[ "$(<"${install_backup_aba_binary}")" == \
+    'old binary before backup ABA' ]] \
+    || fail "rollback backup ABA changed the original binary"
+
+# External wrappers may report failure after completing an operation. Exact
+# post-action state wins: reservation/cleanup rm must observe absence, ln must
+# observe the original inode at the backup name, and publish mv must observe the
+# staged inode at the destination with its temporary name gone.
+install_post_action_tools="${TEST_ROOT}/install-post-action-tools"
+install_post_action_stage="${TEST_ROOT}/install-post-action-stage"
+install_post_action_prefix="/opt/frost-install-post-action"
+install_post_action_binary="${install_post_action_stage}${install_post_action_prefix}/bin/frost"
+install_post_action_rm_state="${TEST_ROOT}/install-post-action-rm-count"
+install_post_action_ln_marker="${TEST_ROOT}/install-post-action-ln-called"
+install_post_action_mv_marker="${TEST_ROOT}/install-post-action-mv-called"
+mkdir -p "${install_post_action_tools}" "${install_post_action_binary%/*}"
+printf 'old binary before post-action reconciliation\n' \
+    >"${install_post_action_binary}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.frost.rollback.*)' \
+    '        state=${FROST_TEST_INSTALL_POST_ACTION_RM_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        /usr/bin/rm "$@"' \
+    '        exit 91' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_post_action_tools}/rm"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/ln "$@"' \
+    ': >"${FROST_TEST_INSTALL_POST_ACTION_LN_MARKER:?}"' \
+    'exit 92' \
+    >"${install_post_action_tools}/ln"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/frost)' \
+    '        /usr/bin/mv "$@"' \
+    '        : >"${FROST_TEST_INSTALL_POST_ACTION_MV_MARKER:?}"' \
+    '        exit 93' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_post_action_tools}/mv"
+chmod 0755 "${install_post_action_tools}/rm" \
+    "${install_post_action_tools}/ln" "${install_post_action_tools}/mv"
+install_post_action_output="$(
+    env HOME="${TEST_HOME}" PATH="${install_post_action_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_POST_ACTION_RM_STATE="${install_post_action_rm_state}" \
+        FROST_TEST_INSTALL_POST_ACTION_LN_MARKER="${install_post_action_ln_marker}" \
+        FROST_TEST_INSTALL_POST_ACTION_MV_MARKER="${install_post_action_mv_marker}" \
+        DESTDIR="${install_post_action_stage}" "${INSTALLER}" \
+        --binary "${prebuilt_binary}" --prefix "${install_post_action_prefix}" \
+        --no-desktop 2>&1
+)"
+cmp -- "${prebuilt_binary}" "${install_post_action_binary}" \
+    || fail "post-action reconciliation did not commit the new binary"
+[[ "$(<"${install_post_action_rm_state}")" == 2 ]] \
+    || fail "post-action reconciliation did not exercise both backup unlinks"
+assert_regular_file "post-action hardlink marker" \
+    "${install_post_action_ln_marker}"
+assert_regular_file "post-action publish marker" \
+    "${install_post_action_mv_marker}"
+[[ -z "$(find "${install_post_action_stage}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "post-action reconciliation left a temporary or backup"
+assert_contains "post-action install success summary" \
+    "${install_post_action_output}" \
+    "Installed frost to ${install_post_action_prefix}/bin/frost"
+[[ "${install_post_action_output}" != *'cannot atomically replace'* ]] \
+    || fail "completed publish was reported as an atomic replacement failure"
+
+# Cleanup performs one unlink attempt only. If the owned backup disappears but
+# that same name is repopulated before rm returns, the new inode is retained and
+# reported; cleanup never retries against the now-unowned name.
+install_cleanup_aba_tools="${TEST_ROOT}/install-cleanup-aba-tools"
+install_cleanup_aba_stage="${TEST_ROOT}/install-cleanup-aba-stage"
+install_cleanup_aba_prefix="/opt/frost-install-cleanup-aba"
+install_cleanup_aba_binary="${install_cleanup_aba_stage}${install_cleanup_aba_prefix}/bin/frost"
+install_cleanup_aba_victim="${TEST_ROOT}/install-cleanup-aba-victim"
+install_cleanup_aba_path_log="${TEST_ROOT}/install-cleanup-aba-path"
+install_cleanup_aba_state="${TEST_ROOT}/install-cleanup-aba-rm-count"
+mkdir -p "${install_cleanup_aba_tools}" "${install_cleanup_aba_binary%/*}"
+printf 'old binary before cleanup ABA\n' >"${install_cleanup_aba_binary}"
+printf 'cleanup ABA victim sentinel\n' >"${install_cleanup_aba_victim}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.frost.rollback.*)' \
+    '        state=${FROST_TEST_INSTALL_CLEANUP_ABA_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        /usr/bin/rm "$@"' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '            printf "%s/%s\n" "${parent}" "${last##*/}" >"${FROST_TEST_INSTALL_CLEANUP_ABA_PATH_LOG:?}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_CLEANUP_ABA_VICTIM:?}" "${last}"' \
+    '        fi' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_cleanup_aba_tools}/rm"
+chmod 0755 "${install_cleanup_aba_tools}/rm"
+install_cleanup_aba_output="$(
+    env HOME="${TEST_HOME}" PATH="${install_cleanup_aba_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_CLEANUP_ABA_STATE="${install_cleanup_aba_state}" \
+        FROST_TEST_INSTALL_CLEANUP_ABA_PATH_LOG="${install_cleanup_aba_path_log}" \
+        FROST_TEST_INSTALL_CLEANUP_ABA_VICTIM="${install_cleanup_aba_victim}" \
+        DESTDIR="${install_cleanup_aba_stage}" "${INSTALLER}" \
+        --binary "${prebuilt_binary}" --prefix "${install_cleanup_aba_prefix}" \
+        --no-desktop 2>&1
+)"
+install_cleanup_aba_path="$(<"${install_cleanup_aba_path_log}")"
+cmp -- "${prebuilt_binary}" "${install_cleanup_aba_binary}" \
+    || fail "cleanup ABA did not retain the committed binary"
+[[ -L "${install_cleanup_aba_path}" ]] \
+    || fail "cleanup retried and deleted the replacement backup name"
+[[ "$(readlink -- "${install_cleanup_aba_path}")" == \
+    "${install_cleanup_aba_victim}" ]] \
+    || fail "cleanup changed the replacement backup name"
+[[ "$(<"${install_cleanup_aba_victim}")" == \
+    'cleanup ABA victim sentinel' ]] \
+    || fail "cleanup followed the replacement backup name"
+assert_contains "cleanup ABA replacement warning" \
+    "${install_cleanup_aba_output}" \
+    "rollback backup name changed during removal; replacement retained at ${install_cleanup_aba_path}"
+assert_contains "cleanup ABA success summary" \
+    "${install_cleanup_aba_output}" \
+    "Installed frost to ${install_cleanup_aba_prefix}/bin/frost"
+
 # Final targets may be regular files, symlinks (atomically replaced), or
 # absent. Reject special files and directories across the complete set before
 # the first rollback hardlink; in particular, never open or read a FIFO.

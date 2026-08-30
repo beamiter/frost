@@ -151,7 +151,10 @@ cargo build --release --locked
 创建、rollback backup、发布 rename、逆序恢复及成功后的 backup 清理都只使用这个目录 fd 下的
 相对名称。即使逻辑 parent 在 `mktemp`、`ln`、`mv` 或 `rm` 内被换成指向另一目录的 symlink，
 操作也只落在原目录 inode；紧随其后的身份检查会中止并绑定回滚，既不会删除新 referent 中的
-同名文件，也不会在已提交的旧 parent 留下 backup。各 rename 自身原子，但整批
+同名文件，也不会在已提交的旧 parent 留下 backup。reservation 名称只有在确认消失后才会
+复用，hardlink backup 必须与原目标 inode 完全一致；命令即使返回非零，只要观察到的
+`(device,inode,name)` 已精确完成预期转换就会收敛为成功。相反，同名替代物会保留并给出诊断，
+不会被后续 cleanup 再次删除。各 rename 自身原子，但整批
 rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回滚本身的 I/O 故障仍可能留下混合
 版本；恢复失败时 backup 会保留并打印路径，不会被清理。除上述条件外还需要 GNU coreutils 的
 `cp`/`ln`/`mktemp`/`mv`/`readlink`。它可与
