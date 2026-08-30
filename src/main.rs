@@ -17535,7 +17535,7 @@ impl Frost {
 
     /// Absolute row span `[start, end)` of the live card — the running
     /// command's rows, or the idle prompt's input area. Factored out of
-    /// [`Self::block_paint_rows`] so card painting and the badge anchor can
+    /// [`Self::build_block_paint_rows`] so card painting and the badge anchor can
     /// never disagree about where the live card is.
     fn active_zone_span(terminal: &terminal::TerminalState) -> Option<(usize, usize)> {
         let total = terminal.scrollback_len() + terminal.grid.rows();

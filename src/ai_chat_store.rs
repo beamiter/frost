@@ -9,7 +9,7 @@
 //! drifted apart in exactly the ways an unshared state machine does.
 //!
 //! What is left here is the one decision frost owns: which
-//! [`BusyChatPolicy`](jterm_core::ai::BusyChatPolicy) its library is built
+//! [`BusyChatPolicy`] its library is built
 //! with. frost's panel has no cancel-then-mutate step — Archive and Delete are
 //! single clicks and Stop is a separate button the user must press first — so
 //! a chat with a request in flight refuses both, and `ai_chats` turns the
