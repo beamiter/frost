@@ -14,6 +14,7 @@ if [[ -n "${DESTDIR}" ]]; then
     DESTDIR_ACTIVE=1
 fi
 PREFIX="${HOME_DIR}/.local"
+PREFIX_EXPLICIT=0
 BIN_DIR=""
 PREBUILT_BINARY=""
 PREBUILT_FD=""
@@ -35,6 +36,7 @@ Options:
 
 Environment:
   DESTDIR                Optional staging root for packaging
+  XDG_DATA_HOME          Workflow data base when --prefix is not specified
   CARGO_TARGET_DIR       Cargo target directory when building (default: <repo>/target)
 USAGE
 }
@@ -390,11 +392,13 @@ while (($# > 0)); do
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
+            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
+            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -443,6 +447,11 @@ done
 
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 validate_absolute_path "--prefix" "${PREFIX}"
+WORKFLOW_SHARE_DIR="${PREFIX}/share"
+if ((PREFIX_EXPLICIT == 0)) && [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    validate_absolute_path "XDG_DATA_HOME" "${XDG_DATA_HOME}"
+    WORKFLOW_SHARE_DIR="$(normalize_absolute_path "${XDG_DATA_HOME}")"
+fi
 if [[ -z "${BIN_DIR}" ]]; then
     BIN_DIR="${PREFIX}/bin"
 fi
@@ -456,8 +465,25 @@ if ((DESTDIR_ACTIVE == 1)); then
     fi
 fi
 
+# Install every format the shared loader accepts. Nullglob makes an empty
+# source directory an explicit preflight failure instead of copying a literal
+# wildcard; the per-file check also rejects symlinks and special files.
+shopt -s nullglob
+WORKFLOW_SOURCES=(
+    "${REPO_ROOT}/scripts/workflows/"*.toml
+    "${REPO_ROOT}/scripts/workflows/"*.yaml
+    "${REPO_ROOT}/scripts/workflows/"*.yml
+)
+shopt -u nullglob
+((${#WORKFLOW_SOURCES[@]} > 0)) \
+    || die "no bundled workflow sources found under ${REPO_ROOT}/scripts/workflows"
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    require_source_file "${source}"
+done
+
 validate_staging_target "${DESTDIR}${BIN_DIR}"
 validate_staging_target "${DESTDIR}${PREFIX}/share"
+validate_staging_target "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
 if ((INSTALL_DESKTOP == 1)); then
     require_source_file "${REPO_ROOT}/data/${APP_ID}.desktop"
     require_source_file "${REPO_ROOT}/data/${APP_ID}.metainfo.xml"
@@ -508,6 +534,10 @@ if [[ -n "${PREBUILT_FD}" ]]; then
 fi
 
 SHARE_DIR="${DESTDIR}${PREFIX}/share"
+WORKFLOW_DIR="${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    install_file_atomic 0644 "${source}" "${WORKFLOW_DIR}/${source##*/}"
+done
 if ((INSTALL_DESKTOP == 1)); then
     install_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
         "${SHARE_DIR}/applications/${APP_ID}.desktop"
@@ -526,6 +556,7 @@ if ((INSTALL_DESKTOP == 1)); then
 fi
 
 printf 'Installed frost to %s\n' "${BIN_DIR}/frost"
+printf 'Installed workflow examples under %s/frost/workflows\n' "${WORKFLOW_SHARE_DIR}"
 if ((INSTALL_DESKTOP == 1)); then
     printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
     printf 'Launcher entry: %s (Exec=%s)\n' \

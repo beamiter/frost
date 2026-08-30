@@ -123,13 +123,21 @@ cargo build --release --locked
 ./scripts/install.sh              # 构建并安装二进制 + 启动器条目
 ./scripts/install.sh --binary /path/to/frost  # 安装已构建的二进制，跳过 Cargo
 ./scripts/install.sh --dry-run    # 只打印将要执行的命令，不改动文件
-./scripts/install.sh --no-desktop # 只装二进制
+./scripts/install.sh --no-desktop # 安装二进制 + workflow，省略桌面集成
 ./scripts/uninstall.sh            # 一并移除；配置与历史保留
 ```
 
+安装脚本会把六个 workflow 示例一并复制到运行时数据目录。默认前缀会遵循
+`XDG_DATA_HOME`，未设置时对应
+`~/.local/share/frost/workflows/`；标准 `/usr`、`/usr/local` 前缀则由
+`XDG_DATA_DIRS` 覆盖，因此移动预构建二进制或删除源码 checkout 后仍有同一套示例。显式指定
+`PREFIX` 时安装到 `PREFIX/share/frost/workflows/`；自定义的非 XDG 前缀需把
+`PREFIX/share` 加入 `XDG_DATA_DIRS`。`--no-desktop` 只省略启动器、AppStream 与图标，
+不省略这些运行时资源。
+
 `--binary` 适合发布压缩包、CI 产物和发行版打包：安装器不会调用 Rust 工具链，仍会用同一套
-受测路径安装二进制、desktop 文件、AppStream 元数据和图标。输入必须是可读且非符号链接的
-普通文件；此路径要求 Linux 已挂载 `/proc/self/fd` 并提供 GNU `stat`，描述符固定不可用时会
+受测路径安装二进制、workflow、desktop 文件、AppStream 元数据和图标。输入必须是可读且非
+符号链接的普通文件；此路径要求 Linux 已挂载 `/proc/self/fd` 并提供 GNU `stat`，描述符固定不可用时会
 明确报错。这里的 Bash 实现并非原子的 no-follow open；只有在文件成功打开且路径名与描述符
 完成同一 inode 的身份复核后，之后再替换路径名才不会改变经该描述符复制的 inode。目标二进制
 权限统一设为 `0755`。目标同目录中的私有临时文件写完后，由 GNU `mv -T` 原子替换；复制失败
@@ -357,8 +365,9 @@ workflow 是一个 TOML 或 YAML 文件：名字、可选描述与标签、一�
 
 搜索路径按优先级：`~/.config/frost/workflows/` → `$FROST_WORKFLOW_DIR`（可用 `:`
 分隔多个目录，只是**追加**而不替换标准位置）→ `~/.local/share/frost/workflows/` →
-`XDG_DATA_DIRS` 中每个目录下的 `frost/workflows/` → 仓库内置示例
-`scripts/workflows/`。同名 workflow 由靠前的目录胜出，因此你自己的文件可以覆盖内置示例。
+`XDG_DATA_DIRS` 中每个目录下的 `frost/workflows/` → 开发 checkout 的
+`scripts/workflows/`。安装脚本把内置示例放进前面的 XDG data 层；源码树只是开发期兜底，
+不再是已安装二进制获得示例的条件。同名 workflow 由靠前的目录胜出，因此你自己的文件可以覆盖内置示例。
 
 ### workflow 参数的必填约定
 

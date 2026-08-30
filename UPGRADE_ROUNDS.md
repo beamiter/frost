@@ -365,3 +365,11 @@ Round 70 closes the remaining argument-form affordance gap:
     sole deliberate crates.io patch and its removal condition, while README's
     feature list and shortcut table now expose the shipped AI Chats chord and
     distinguish the review-only command-generation palette action.
+
+79. **Installed workflow library** — source and prebuilt installs now copy all
+    six accepted workflow fixtures into the selected data tree: the default
+    follows `XDG_DATA_HOME`, while an explicit prefix owns its `share` tree.
+    `--no-desktop` keeps these runtime resources, uninstall removes only the
+    owned examples and leaves a non-empty user directory alone, and the real
+    DESTDIR round trip compares every installed byte and proves
+    install/uninstall symmetry.

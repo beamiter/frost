@@ -1,8 +1,9 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (a fail-closed local/CI security entry point and the
-RUSTSEC-2026-0253 dependency repair; the shared TOML/YAML workflow library and
-review-first command correction; the shared AI chat store and its persistence
+Updated: 2026-08-30 (an installed workflow library; a fail-closed local/CI
+security entry point and the RUSTSEC-2026-0253 dependency repair; the shared
+TOML/YAML workflow library and review-first command correction; the shared AI
+chat store and its persistence
 boundary)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
@@ -1009,3 +1010,10 @@ the old lockfile is a negative control that fails specifically on
 RUSTSEC-2026-0253. The vendored Rust sources, README, and three license files are
 byte-identical to crates.io cryoglyph 0.1.0, while its manifest differs only in
 the documented `lru 0.18.2` requirement.
+
+The install-path gate also proves the runtime workflow library rather than only
+the binary and desktop metadata: every accepted example is installed byte-for-
+byte and mode 0644 into the selected data tree, survives `--no-desktop`, and is
+removed symmetrically without deleting an adjacent user workflow. A nested
+symlink below the staging `share` directory fails before the existing binary is
+replaced, and default-prefix installs honour an explicit `XDG_DATA_HOME`.

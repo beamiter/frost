@@ -11,6 +11,7 @@ if [[ -n "${DESTDIR}" ]]; then
     DESTDIR_ACTIVE=1
 fi
 PREFIX="${HOME_DIR}/.local"
+PREFIX_EXPLICIT=0
 BIN_DIR=""
 DRY_RUN=0
 
@@ -26,6 +27,7 @@ Options:
 
 Environment:
   DESTDIR                Optional staging root for packaging
+  XDG_DATA_HOME          Workflow data base when --prefix is not specified
 USAGE
 }
 
@@ -52,6 +54,14 @@ remove_file() {
     validate_staging_removal_target "${path}"
     if [[ -e "${path}" || -L "${path}" ]]; then
         run rm -f -- "${path}"
+    fi
+}
+
+remove_dir_if_empty() {
+    local path="$1"
+    validate_staging_removal_target "${path}"
+    if [[ -d "${path}" ]]; then
+        run rmdir --ignore-fail-on-non-empty -- "${path}"
     fi
 }
 
@@ -128,11 +138,13 @@ while (($# > 0)); do
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
+            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
             [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
+            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -166,6 +178,11 @@ done
 
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 validate_absolute_path "--prefix" "${PREFIX}"
+WORKFLOW_SHARE_DIR="${PREFIX}/share"
+if ((PREFIX_EXPLICIT == 0)) && [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    validate_absolute_path "XDG_DATA_HOME" "${XDG_DATA_HOME}"
+    WORKFLOW_SHARE_DIR="$(normalize_absolute_path "${XDG_DATA_HOME}")"
+fi
 if [[ -z "${BIN_DIR}" ]]; then
     BIN_DIR="${PREFIX}/bin"
 fi
@@ -186,6 +203,16 @@ remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
 remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
 remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
 remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+for workflow in \
+    docker-tail-logs.yaml \
+    find-large-files.yaml \
+    git-feature.yaml \
+    git-rebase-interactive.yaml \
+    kill-port.yaml \
+    ssh-tunnel.yaml; do
+    remove_file "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows/${workflow}"
+done
+remove_dir_if_empty "${DESTDIR}${WORKFLOW_SHARE_DIR}/frost/workflows"
 # Desktop integration from before the jterm3 -> frost rename.
 remove_file "${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
 remove_file "${SHARE_DIR}/metainfo/io.github.beamiter.jterm3.metainfo.xml"

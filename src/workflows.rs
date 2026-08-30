@@ -134,6 +134,9 @@ mod tests {
         let dirs = workflow_dirs();
         assert!(dirs.iter().all(|dir| dir.is_absolute()));
         assert!(dirs.contains(&bundled_library()));
+        if let Some(data_dir) = dirs::data_dir() {
+            assert!(dirs.contains(&data_dir.join(APP).join("workflows")));
+        }
         // The dev tree is the lowest-precedence tier, and every other tier —
         // user config, user data, and *each* system data directory — carries
         // frost's own segment. Conditional because a developer's own

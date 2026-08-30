@@ -11,6 +11,19 @@ UNINSTALLER="${SCRIPT_DIR}/uninstall.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/frost-install-paths.XXXXXX")"
 TEST_HOME="${TEST_ROOT}/home"
 TEST_PATH="/usr/bin:/bin"
+unset XDG_DATA_HOME
+
+shopt -s nullglob
+WORKFLOW_SOURCES=(
+    "${SCRIPT_DIR}/workflows/"*.toml
+    "${SCRIPT_DIR}/workflows/"*.yaml
+    "${SCRIPT_DIR}/workflows/"*.yml
+)
+shopt -u nullglob
+if ((${#WORKFLOW_SOURCES[@]} != 6)); then
+    printf 'FAIL: expected six bundled workflow fixtures\n' >&2
+    exit 1
+fi
 
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT
 mkdir -p "${TEST_HOME}"
@@ -90,6 +103,44 @@ default_install="$(install_dry_run "")"
 assert_install_uninstall_pair \
     "default" "${TEST_HOME}/.local/bin/frost"
 assert_same "default reinstall plan" "$(install_dry_run "")" "${default_install}"
+
+# With the default prefix, workflow assets follow the exact XDG user-data tier
+# the runtime reads. An explicit packaging prefix deliberately remains
+# prefix-relative; non-standard prefixes are exposed through XDG_DATA_DIRS.
+custom_xdg_data="${TEST_ROOT}/custom-xdg-data"
+custom_xdg_install="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_DATA_HOME="${custom_xdg_data}" CARGO_TARGET_DIR= \
+        "${INSTALLER}" --dry-run
+)"
+assert_contains "custom XDG workflow install" "${custom_xdg_install}" \
+    "Installed workflow examples under ${custom_xdg_data}/frost/workflows"
+explicit_xdg_install="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_DATA_HOME="${custom_xdg_data}" CARGO_TARGET_DIR= \
+        "${INSTALLER}" --dry-run --prefix "${TEST_ROOT}/xdg-explicit-prefix"
+)"
+assert_contains "explicit prefix owns workflow install" "${explicit_xdg_install}" \
+    "Installed workflow examples under ${TEST_ROOT}/xdg-explicit-prefix/share/frost/workflows"
+mkdir -p "${custom_xdg_data}/frost/workflows"
+touch "${custom_xdg_data}/frost/workflows/git-feature.yaml"
+custom_xdg_uninstall="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_DATA_HOME="${custom_xdg_data}" \
+        "${UNINSTALLER}" --dry-run
+)"
+assert_contains "custom XDG workflow uninstall" "${custom_xdg_uninstall}" \
+    "${custom_xdg_data}/frost/workflows/git-feature.yaml"
+for command in "${INSTALLER}" "${UNINSTALLER}"; do
+    if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_DATA_HOME=relative/data "${command}" --dry-run \
+        >"${TEST_ROOT}/relative-xdg.log" 2>&1; then
+        fail "${command} accepted a relative XDG_DATA_HOME"
+    fi
+    assert_contains "relative XDG diagnostic" \
+        "$(<"${TEST_ROOT}/relative-xdg.log")" \
+        "XDG_DATA_HOME must be an absolute path"
+done
 
 custom_prefix="${TEST_ROOT}/prefix"
 assert_install_uninstall_pair \
@@ -174,6 +225,11 @@ installed_metainfo="${roundtrip_stage}${roundtrip_share}/metainfo/${app_id}.meta
 installed_svg="${roundtrip_stage}${roundtrip_share}/icons/hicolor/scalable/apps/${app_id}.svg"
 installed_png_128="${roundtrip_stage}${roundtrip_share}/icons/hicolor/128x128/apps/${app_id}.png"
 installed_png_256="${roundtrip_stage}${roundtrip_share}/icons/hicolor/256x256/apps/${app_id}.png"
+installed_workflow_dir="${roundtrip_stage}${roundtrip_share}/frost/workflows"
+installed_workflows=()
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    installed_workflows+=("${installed_workflow_dir}/${source##*/}")
+done
 
 for installed_file in \
     "${installed_binary}" \
@@ -181,7 +237,8 @@ for installed_file in \
     "${installed_metainfo}" \
     "${installed_svg}" \
     "${installed_png_128}" \
-    "${installed_png_256}"; do
+    "${installed_png_256}" \
+    "${installed_workflows[@]}"; do
     assert_regular_file "staged install output" "${installed_file}"
 done
 cmp -- "${prebuilt_binary}" "${installed_binary}" \
@@ -192,8 +249,13 @@ for public_file in \
     "${installed_metainfo}" \
     "${installed_svg}" \
     "${installed_png_128}" \
-    "${installed_png_256}"; do
+    "${installed_png_256}" \
+    "${installed_workflows[@]}"; do
     assert_mode "staged public resource" "${public_file}" 644
+done
+for index in "${!WORKFLOW_SOURCES[@]}"; do
+    cmp -- "${WORKFLOW_SOURCES[index]}" "${installed_workflows[index]}" \
+        || fail "installed workflow differs from ${WORKFLOW_SOURCES[index]}"
 done
 
 expected_exec='Exec="/opt/frost release \\\\dir \\$/bin/frost"'
@@ -217,9 +279,11 @@ for removed_file in \
     "${installed_metainfo}" \
     "${installed_svg}" \
     "${installed_png_128}" \
-    "${installed_png_256}"; do
+    "${installed_png_256}" \
+    "${installed_workflows[@]}"; do
     assert_absent "staged uninstall target" "${removed_file}"
 done
+assert_absent "empty installed workflow directory" "${installed_workflow_dir}"
 assert_regular_file "prebuilt source after uninstall" "${prebuilt_binary}"
 
 symlink_victim="${TEST_ROOT}/must-not-change"
@@ -230,6 +294,9 @@ env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
     "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${roundtrip_prefix}" \
     --no-desktop >/dev/null
 assert_regular_file "atomically replaced destination" "${installed_binary}"
+for installed_workflow in "${installed_workflows[@]}"; do
+    assert_regular_file "workflow retained by --no-desktop install" "${installed_workflow}"
+done
 [[ ! -L "${installed_binary}" ]] \
     || fail "binary install followed or retained the destination symlink"
 [[ "$(<"${symlink_victim}")" == victim ]] \
@@ -242,8 +309,14 @@ desktop_temps=("${roundtrip_stage}${roundtrip_share}/applications/.${app_id}.des
 shopt -u nullglob
 (( ${#binary_temps[@]} == 0 )) || fail "binary install left temporary files"
 (( ${#desktop_temps[@]} == 0 )) || fail "desktop install left temporary files"
+custom_workflow="${installed_workflow_dir}/custom-user-workflow.yaml"
+printf 'name: Custom\ncommand: echo custom\n' >"${custom_workflow}"
 env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${roundtrip_stage}" \
     "${UNINSTALLER}" --prefix "${roundtrip_prefix}" >/dev/null
+assert_regular_file "custom workflow preserved by uninstall" "${custom_workflow}"
+for installed_workflow in "${installed_workflows[@]}"; do
+    assert_absent "owned workflow removed beside custom file" "${installed_workflow}"
+done
 
 empty_prebuilt="${prebuilt_dir}/empty-frost"
 : >"${empty_prebuilt}"
@@ -271,6 +344,29 @@ assert_contains "staging ancestor diagnostic" "$(<"${TEST_ROOT}/ancestor.log")" 
     "symbolic-link ancestor"
 [[ -z "$(find "${ancestor_victim}" -mindepth 1 -print -quit)" ]] \
     || fail "staging ancestor validation wrote outside DESTDIR"
+
+# The workflow library adds a runtime-resource subtree below share. Preflight
+# its complete directory chain before replacing the binary, so a package tree
+# cannot redirect those copies through a pre-existing nested symlink.
+workflow_link_stage="${TEST_ROOT}/workflow-link-stage"
+workflow_link_prefix="/opt/frost-workflow-link"
+workflow_link_victim="${TEST_ROOT}/workflow-link-victim"
+workflow_link_binary="${workflow_link_stage}${workflow_link_prefix}/bin/frost"
+mkdir -p "${workflow_link_stage}${workflow_link_prefix}/share" \
+    "${workflow_link_victim}"
+ln -s -- "${workflow_link_victim}" \
+    "${workflow_link_stage}${workflow_link_prefix}/share/frost"
+if env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${workflow_link_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" --prefix "${workflow_link_prefix}" \
+    --no-desktop >"${TEST_ROOT}/workflow-link.log" 2>&1; then
+    fail "installer followed a nested workflow-directory symlink"
+fi
+assert_contains "workflow ancestor diagnostic" \
+    "$(<"${TEST_ROOT}/workflow-link.log")" \
+    "staged install path contains a symbolic-link ancestor"
+assert_absent "binary after workflow preflight failure" "${workflow_link_binary}"
+[[ -z "$(find "${workflow_link_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "workflow install escaped through a nested symlink"
 
 resource_stage="${TEST_ROOT}/resource-stage"
 resource_prefix="/opt/frost-resource"
