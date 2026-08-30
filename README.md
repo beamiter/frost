@@ -162,8 +162,12 @@ rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回�
 卸载文件目标采用对称的整批预检：最终 symlink 只删除链接本身；目录、FIFO、socket 与
 device 会在首个 `rm` 前拒绝并保持整套安装不变。workflow cleanup 目标还必须是未被替换的
 真实目录，且只用非递归 `rmdir` 尝试删除空目录；非空用户目录及其自定义文件不会被遍历。
-该检查只描述预检时的状态，不承诺抵御之后的并发
-路径替换；正常主机 prefix 不套用这条策略。
+真实卸载会先把每个既有目标原子 rename 到同目录私有 quarantine；全部 rename 完成才进入
+不可逆的 purge 阶段。中途 rename 失败或可捕获终止会逆序恢复原 inode；恢复失败会保留并
+报告 quarantine。commit 后的 purge 或空目录清理失败只警告：目标名已删除，所以仍如实报告
+卸载成功，同时给出可复制的 `mv -fT` 恢复命令。`SIGKILL`、掉电及并发替换仍超出该保证。
+其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机
+prefix 不套用祖先检查，但目标类型与 quarantine 状态机在两种模式下都生效。
 
 默认装到 `~/.local`（可用 `--prefix` / `--bin-dir` 覆盖，打包场景用 `DESTDIR`）：
 

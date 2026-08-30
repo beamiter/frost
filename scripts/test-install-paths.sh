@@ -1024,6 +1024,188 @@ assert_absent "final uninstall symlink" "${uninstall_symlink_path}"
 [[ "$(<"${uninstall_symlink_victim}")" == 'outside final symlink target' ]] \
     || fail "uninstaller followed a final symlink"
 
+# File removal is a reversible rename phase. Fail the third quarantine rename
+# before it executes and require both earlier targets to return in reverse
+# order with their exact inode identity, while unused reservations disappear.
+uninstall_rollback_tools="${TEST_ROOT}/uninstall-rollback-tools"
+uninstall_rollback_stage="${TEST_ROOT}/uninstall-rollback-stage"
+uninstall_rollback_prefix="/opt/frost-uninstall-rollback"
+uninstall_rollback_state="${TEST_ROOT}/uninstall-rollback-mv-state"
+uninstall_rollback_share="${uninstall_rollback_stage}${uninstall_rollback_prefix}/share"
+uninstall_rollback_targets=(
+    "${uninstall_rollback_stage}${uninstall_rollback_prefix}/bin/frost"
+    "${uninstall_rollback_share}/applications/${app_id}.desktop"
+    "${uninstall_rollback_share}/metainfo/${app_id}.metainfo.xml"
+)
+mkdir -p "${uninstall_rollback_tools}"
+uninstall_rollback_identities=()
+for index in "${!uninstall_rollback_targets[@]}"; do
+    mkdir -p "${uninstall_rollback_targets[index]%/*}"
+    printf 'old uninstall rollback target %s\n' "${index}" \
+        >"${uninstall_rollback_targets[index]}"
+    chmod 0600 "${uninstall_rollback_targets[index]}"
+    uninstall_rollback_identities+=("$(stat -c '%d:%i:%u:%g:%a' -- \
+        "${uninstall_rollback_targets[index]}")")
+done
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'state=${FROST_TEST_UNINSTALL_MV_STATE:?}' \
+    'count=0' \
+    '[ ! -f "${state}" ] || read -r count <"${state}"' \
+    'count=$((count + 1))' \
+    'printf "%s\n" "${count}" >"${state}"' \
+    '[ "${count}" -ne 3 ] || exit 76' \
+    'exec /usr/bin/mv "$@"' \
+    >"${uninstall_rollback_tools}/mv"
+chmod 0755 "${uninstall_rollback_tools}/mv"
+if env HOME="${TEST_HOME}" \
+    PATH="${uninstall_rollback_tools}:${TEST_PATH}" \
+    FROST_TEST_UNINSTALL_MV_STATE="${uninstall_rollback_state}" \
+    DESTDIR="${uninstall_rollback_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_rollback_prefix}" \
+    >"${TEST_ROOT}/uninstall-rollback.log" 2>&1; then
+    fail "uninstaller accepted a quarantine rename failure"
+fi
+assert_contains "uninstall rollback diagnostic" \
+    "$(<"${TEST_ROOT}/uninstall-rollback.log")" \
+    "cannot quarantine uninstall target ${uninstall_rollback_targets[2]}"
+for index in "${!uninstall_rollback_targets[@]}"; do
+    [[ "$(<"${uninstall_rollback_targets[index]}")" == \
+        "old uninstall rollback target ${index}" ]] \
+        || fail "uninstall rollback changed target ${uninstall_rollback_targets[index]}"
+    [[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+        "${uninstall_rollback_targets[index]}")" == \
+        "${uninstall_rollback_identities[index]}" ]] \
+        || fail "uninstall rollback changed inode metadata for ${uninstall_rollback_targets[index]}"
+done
+[[ -z "$(find "${uninstall_rollback_stage}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "uninstall rollback left a quarantine reservation"
+
+# A catchable signal can land after rename(2) succeeds but before Bash records
+# that success. The in-flight state is reconciled by inode, then restored.
+uninstall_interrupt_tools="${TEST_ROOT}/uninstall-interrupt-tools"
+uninstall_interrupt_stage="${TEST_ROOT}/uninstall-interrupt-stage"
+uninstall_interrupt_prefix="/opt/frost-uninstall-interrupt"
+uninstall_interrupt_binary="${uninstall_interrupt_stage}${uninstall_interrupt_prefix}/bin/frost"
+uninstall_interrupt_marker="${TEST_ROOT}/uninstall-interrupt-moved"
+mkdir -p "${uninstall_interrupt_tools}" "${uninstall_interrupt_binary%/*}"
+printf 'binary restored after uninstall interrupt\n' \
+    >"${uninstall_interrupt_binary}"
+uninstall_interrupt_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_interrupt_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_INTERRUPT_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "$@"' \
+    '    : >"${FROST_TEST_UNINSTALL_INTERRUPT_MARKER}"' \
+    '    kill -TERM "${PPID}"' \
+    '    exit 0' \
+    'fi' \
+    'exec /usr/bin/mv "$@"' \
+    >"${uninstall_interrupt_tools}/mv"
+chmod 0755 "${uninstall_interrupt_tools}/mv"
+if env HOME="${TEST_HOME}" \
+    PATH="${uninstall_interrupt_tools}:${TEST_PATH}" \
+    FROST_TEST_UNINSTALL_INTERRUPT_MARKER="${uninstall_interrupt_marker}" \
+    DESTDIR="${uninstall_interrupt_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_interrupt_prefix}" \
+    >"${TEST_ROOT}/uninstall-interrupt.log" 2>&1; then
+    fail "uninstaller ignored a catchable interrupt during quarantine"
+fi
+[[ -e "${uninstall_interrupt_marker}" ]] \
+    || fail "uninstall interrupt did not occur after rename"
+[[ "$(<"${uninstall_interrupt_binary}")" == \
+    'binary restored after uninstall interrupt' ]] \
+    || fail "uninstall interrupt rollback changed the binary"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${uninstall_interrupt_binary}")" == \
+    "${uninstall_interrupt_identity}" ]] \
+    || fail "uninstall interrupt rollback changed binary inode metadata"
+[[ -z "$(find "${uninstall_interrupt_stage}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "uninstall interrupt rollback left a quarantine"
+
+# Once every owned name has moved, uninstall is committed. A purge failure
+# cannot honestly put that generation back; retain the exact inode under its
+# named quarantine, report a copy-safe recovery command, and still report the
+# target as uninstalled.
+uninstall_purge_tools="${TEST_ROOT}/uninstall-purge-tools"
+uninstall_purge_stage="${TEST_ROOT}/uninstall-purge-stage"
+uninstall_purge_prefix="/opt/frost-uninstall-purge"
+uninstall_purge_binary="${uninstall_purge_stage}${uninstall_purge_prefix}/bin/frost"
+mkdir -p "${uninstall_purge_tools}" "${uninstall_purge_binary%/*}"
+printf 'committed uninstall quarantine\n' >"${uninstall_purge_binary}"
+uninstall_purge_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_purge_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'for argument do' \
+    '    case "${argument}" in *.uninstall.*) exit 77 ;; esac' \
+    'done' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_purge_tools}/rm"
+chmod 0755 "${uninstall_purge_tools}/rm"
+uninstall_purge_output="$(
+    env HOME="${TEST_HOME}" PATH="${uninstall_purge_tools}:${TEST_PATH}" \
+        DESTDIR="${uninstall_purge_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_purge_prefix}" 2>&1
+)"
+assert_absent "binary after committed uninstall" "${uninstall_purge_binary}"
+mapfile -t uninstall_purge_quarantines < <(
+    find "${uninstall_purge_binary%/*}" -maxdepth 1 \
+        -name '.frost.uninstall.*' -print
+)
+(( ${#uninstall_purge_quarantines[@]} == 1 )) \
+    || fail "purge failure did not retain exactly one quarantine"
+uninstall_purge_quarantine="${uninstall_purge_quarantines[0]}"
+[[ "$(<"${uninstall_purge_quarantine}")" == \
+    'committed uninstall quarantine' ]] \
+    || fail "purge failure changed retained quarantine content"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${uninstall_purge_quarantine}")" == \
+    "${uninstall_purge_identity}" ]] \
+    || fail "purge failure changed retained quarantine inode metadata"
+assert_contains "purge failure warning" "${uninstall_purge_output}" \
+    "quarantine retained at ${uninstall_purge_quarantine}"
+assert_contains "purge recovery command" "${uninstall_purge_output}" \
+    "recovery after inspecting destination: mv -fT -- ${uninstall_purge_quarantine} ${uninstall_purge_binary}"
+assert_contains "purge failure success summary" "${uninstall_purge_output}" \
+    "Removed frost from ${uninstall_purge_prefix}/bin"
+
+# Empty-directory cleanup is also post-commit and non-recursive. Its failure
+# may leave the harmless directory, but must not reverse the committed file
+# removal or turn the truthful uninstall summary into an error exit.
+uninstall_rmdir_tools="${TEST_ROOT}/uninstall-rmdir-tools"
+uninstall_rmdir_stage="${TEST_ROOT}/uninstall-rmdir-stage"
+uninstall_rmdir_prefix="/opt/frost-uninstall-rmdir"
+uninstall_rmdir_binary="${uninstall_rmdir_stage}${uninstall_rmdir_prefix}/bin/frost"
+uninstall_rmdir_target="${uninstall_rmdir_stage}${uninstall_rmdir_prefix}/share/frost/workflows"
+mkdir -p "${uninstall_rmdir_tools}" "${uninstall_rmdir_binary%/*}" \
+    "${uninstall_rmdir_target}"
+printf 'binary before non-fatal rmdir failure\n' >"${uninstall_rmdir_binary}"
+printf '%s\n' '#!/bin/sh' 'exit 78' >"${uninstall_rmdir_tools}/rmdir"
+chmod 0755 "${uninstall_rmdir_tools}/rmdir"
+uninstall_rmdir_output="$(
+    env HOME="${TEST_HOME}" PATH="${uninstall_rmdir_tools}:${TEST_PATH}" \
+        DESTDIR="${uninstall_rmdir_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_rmdir_prefix}" 2>&1
+)"
+assert_absent "binary after non-fatal rmdir failure" "${uninstall_rmdir_binary}"
+[[ -d "${uninstall_rmdir_target}" ]] \
+    || fail "failed rmdir unexpectedly removed its cleanup directory"
+assert_contains "non-fatal rmdir warning" "${uninstall_rmdir_output}" \
+    "could not remove empty cleanup directory ${uninstall_rmdir_target} (non-fatal)"
+assert_contains "rmdir failure success summary" "${uninstall_rmdir_output}" \
+    "Removed frost from ${uninstall_rmdir_prefix}/bin"
+[[ -z "$(find "${uninstall_rmdir_stage}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "non-fatal rmdir failure left a quarantine"
+
 uninstall_link_stage="${TEST_ROOT}/uninstall-link-stage"
 uninstall_link_victim="${TEST_ROOT}/uninstall-link-victim"
 uninstall_link_prefix="/opt/frost-uninstall-link"
@@ -1073,6 +1255,62 @@ assert_absent "rm call before late ancestor rejection" "${late_link_rm_marker}"
     || fail "late uninstall preflight changed the existing binary"
 [[ -z "$(find "${late_link_victim}" -mindepth 1 -print -quit)" ]] \
     || fail "late uninstall preflight removed outside DESTDIR"
+
+# A point-in-time preflight can become stale. Replace the later share ancestor
+# only after the binary has moved to quarantine; the use-point check must abort
+# and the transaction must restore that exact binary rather than leave a
+# partial uninstall or follow the new link.
+uninstall_race_tools="${TEST_ROOT}/uninstall-race-tools"
+uninstall_race_stage="${TEST_ROOT}/uninstall-race-stage"
+uninstall_race_prefix="/opt/frost-uninstall-race"
+uninstall_race_binary="${uninstall_race_stage}${uninstall_race_prefix}/bin/frost"
+uninstall_race_share="${uninstall_race_stage}${uninstall_race_prefix}/share"
+uninstall_race_victim="${TEST_ROOT}/uninstall-race-victim"
+uninstall_race_marker="${TEST_ROOT}/uninstall-race-moved"
+mkdir -p "${uninstall_race_tools}" "${uninstall_race_binary%/*}" \
+    "${uninstall_race_share}" "${uninstall_race_victim}"
+printf 'binary restored after ancestor replacement\n' >"${uninstall_race_binary}"
+uninstall_race_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${uninstall_race_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_RACE_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "$@"' \
+    '    : >"${FROST_TEST_UNINSTALL_RACE_MARKER}"' \
+    '    /usr/bin/rmdir "${FROST_TEST_UNINSTALL_RACE_ANCESTOR:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_RACE_VICTIM:?}" "${FROST_TEST_UNINSTALL_RACE_ANCESTOR}"' \
+    '    exit 0' \
+    'fi' \
+    'exec /usr/bin/mv "$@"' \
+    >"${uninstall_race_tools}/mv"
+chmod 0755 "${uninstall_race_tools}/mv"
+if env HOME="${TEST_HOME}" PATH="${uninstall_race_tools}:${TEST_PATH}" \
+    FROST_TEST_UNINSTALL_RACE_MARKER="${uninstall_race_marker}" \
+    FROST_TEST_UNINSTALL_RACE_ANCESTOR="${uninstall_race_share}" \
+    FROST_TEST_UNINSTALL_RACE_VICTIM="${uninstall_race_victim}" \
+    DESTDIR="${uninstall_race_stage}" "${UNINSTALLER}" \
+    --prefix "${uninstall_race_prefix}" \
+    >"${TEST_ROOT}/uninstall-race.log" 2>&1; then
+    fail "uninstaller accepted an ancestor replacement during quarantine"
+fi
+assert_contains "uninstall use-point ancestor diagnostic" \
+    "$(<"${TEST_ROOT}/uninstall-race.log")" \
+    "staged uninstall path contains a symbolic-link ancestor: ${uninstall_race_share}"
+[[ "$(<"${uninstall_race_binary}")" == \
+    'binary restored after ancestor replacement' ]] \
+    || fail "ancestor replacement rollback changed the binary"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- "${uninstall_race_binary}")" == \
+    "${uninstall_race_identity}" ]] \
+    || fail "ancestor replacement rollback changed binary inode metadata"
+[[ -L "${uninstall_race_share}" ]] \
+    || fail "test ancestor replacement did not occur"
+[[ -z "$(find "${uninstall_race_victim}" -mindepth 1 -print -quit)" ]] \
+    || fail "uninstaller followed a replaced ancestor"
+[[ -z "$(find "${uninstall_race_stage}" \
+    -name '*.uninstall.*' -print -quit)" ]] \
+    || fail "ancestor replacement rollback left a quarantine"
 
 # Normalize `link/.` and repeated-separator DESTDIR spellings before walking
 # the complete existing root chain. Neither install nor uninstall may reach

@@ -454,3 +454,12 @@ Round 70 closes the remaining argument-form affordance gap:
     rejected without invoking `rm`; the earlier binary and replacement object
     remain unchanged. Valid cleanup still uses only non-recursive `rmdir`, so a
     non-empty user workflow directory and its custom files are never traversed.
+
+91. **Transactional uninstall quarantine** — after whole-plan preflight, every
+    existing owned file is atomically renamed to a private sibling quarantine.
+    A deterministic third-rename failure and a post-first-rename ancestor swap
+    both restore earlier entries in reverse order with exact inode metadata; a
+    post-rename `TERM` also proves in-flight bookkeeping is reconciled by inode.
+    Only an all-renamed plan commits: later purge/rmdir failures are non-fatal,
+    keep target names absent, retain a named quarantine when needed, and print
+    a copy-safe `mv -fT` recovery command instead of reporting rollback.
