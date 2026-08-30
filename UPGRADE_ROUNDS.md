@@ -307,3 +307,9 @@ Round 70 closes the remaining argument-form affordance gap:
     genuinely-unset state. Editing or resetting also clears stale render
     feedback, and the form regression proves reset is not equivalent to typing
     an empty string.
+
+71. **Current-toolchain clean placement boundary** — the completed-graphics
+    filter now states its real predicate directly: with no live lifecycle every
+    placement is stashed, otherwise only rows before the live start are. This
+    removes the Rust 1.96 `nonminimal_bool` failure without changing the
+    finished/live graphics contract covered by the clear/undo regression.

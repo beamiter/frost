@@ -5321,7 +5321,7 @@ impl TerminalState {
             .kitty_graphics
             .get_placements()
             .iter()
-            .filter(|placement| !live_start.is_some_and(|start| placement.buffer_row >= start))
+            .filter(|placement| live_start.is_none_or(|start| placement.buffer_row < start))
             .cloned()
             .collect();
         let mut stashed_image_ids: Vec<u32> = stashed_placements
