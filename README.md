@@ -435,7 +435,9 @@ Block mode、提示符跳转、命令历史、长命令通知和失败块的 Age
 
 ## 配置
 
-主配置位于 `$XDG_CONFIG_HOME/frost/config.toml`。设置面板中的修改会自动保存，外部编辑也会热重载。示例：
+主配置位于 `$XDG_CONFIG_HOME/frost/config.toml`；未设置或设置为相对路径时，与运行时
+`dirs::config_dir` 一样回退到 `~/.config/frost/config.toml`。设置面板中的修改会自动保存，
+外部编辑也会热重载。示例：
 
 ```toml
 font_family = "JetBrains Mono Nerd Font"

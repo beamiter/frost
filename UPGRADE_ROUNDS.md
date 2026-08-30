@@ -380,3 +380,9 @@ Round 70 closes the remaining argument-form affordance gap:
     use time. A regression places the unsafe symlink only under the later
     `share` branch and proves the earlier safe binary survives unchanged, so an
     escape refusal can no longer leave a partially uninstalled package tree.
+
+81. **Truthful and inert configuration handoff** — the uninstaller now mirrors
+    the application's `dirs::config_dir` rule: only an absolute
+    `XDG_CONFIG_HOME` overrides `HOME/.config`. Its final preservation path is
+    shell-quoted, so spaces remain unambiguous and an environment-provided
+    newline or terminal control byte cannot forge another uninstall message.

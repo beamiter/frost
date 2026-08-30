@@ -28,6 +28,7 @@ Options:
 Environment:
   DESTDIR                Optional staging root for packaging
   XDG_DATA_HOME          Workflow data base when --prefix is not specified
+  XDG_CONFIG_HOME        Absolute configuration base (relative values ignored)
 USAGE
 }
 
@@ -255,6 +256,16 @@ if ((DESTDIR_ACTIVE == 0 && DRY_RUN == 0)); then
     fi
 fi
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/frost"
 printf 'Removed frost from %s\n' "${BIN_DIR}"
-printf 'Preserved configuration and history under %s\n' "${CONFIG_DIR}"
+
+# `dirs::config_dir`, used by frost itself, accepts XDG_CONFIG_HOME only when
+# it is absolute and otherwise falls back to HOME/.config. Keep the handoff
+# message on that exact contract. The value is environment-controlled and may
+# contain terminal control bytes, so render it with Bash's reversible quoting.
+CONFIG_BASE="${HOME_DIR}/.config"
+if [[ -n "${XDG_CONFIG_HOME:-}" && "${XDG_CONFIG_HOME}" == /* ]]; then
+    CONFIG_BASE="${XDG_CONFIG_HOME}"
+fi
+CONFIG_DIR="${CONFIG_BASE}/frost"
+printf 'Preserved configuration and history under '
+printf '%q\n' "${CONFIG_DIR}"

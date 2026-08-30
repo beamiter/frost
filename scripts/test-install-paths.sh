@@ -11,7 +11,7 @@ UNINSTALLER="${SCRIPT_DIR}/uninstall.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/frost-install-paths.XXXXXX")"
 TEST_HOME="${TEST_ROOT}/home"
 TEST_PATH="/usr/bin:/bin"
-unset XDG_DATA_HOME
+unset XDG_CONFIG_HOME XDG_DATA_HOME
 
 shopt -s nullglob
 WORKFLOW_SOURCES=(
@@ -141,6 +141,41 @@ for command in "${INSTALLER}" "${UNINSTALLER}"; do
         "$(<"${TEST_ROOT}/relative-xdg.log")" \
         "XDG_DATA_HOME must be an absolute path"
 done
+
+# The preservation handoff must match `dirs::config_dir`: only an absolute
+# XDG_CONFIG_HOME wins. Quote the environment-derived value so a newline or
+# terminal escape cannot forge another diagnostic line after uninstall.
+custom_xdg_config="${TEST_ROOT}/custom config"
+custom_config_uninstall="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_CONFIG_HOME="${custom_xdg_config}" \
+        "${UNINSTALLER}" --dry-run
+)"
+printf -v expected_config_display '%q' "${custom_xdg_config}/frost"
+assert_contains "absolute XDG config handoff" "${custom_config_uninstall}" \
+    "Preserved configuration and history under ${expected_config_display}"
+
+relative_config_uninstall="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_CONFIG_HOME=relative/config "${UNINSTALLER}" --dry-run
+)"
+printf -v expected_config_display '%q' "${TEST_HOME}/.config/frost"
+assert_contains "relative XDG config fallback" "${relative_config_uninstall}" \
+    "Preserved configuration and history under ${expected_config_display}"
+[[ "${relative_config_uninstall}" != *relative/config* ]] \
+    || fail "uninstaller reported a relative XDG_CONFIG_HOME ignored by frost"
+
+hostile_xdg_config="${TEST_ROOT}/config"$'\n''forged uninstall message'
+hostile_config_uninstall="$(
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR= \
+        XDG_CONFIG_HOME="${hostile_xdg_config}" \
+        "${UNINSTALLER}" --dry-run
+)"
+printf -v expected_config_display '%q' "${hostile_xdg_config}/frost"
+assert_contains "quoted XDG config handoff" "${hostile_config_uninstall}" \
+    "Preserved configuration and history under ${expected_config_display}"
+[[ "${hostile_config_uninstall}" != *$'\nforged uninstall message'* ]] \
+    || fail "XDG_CONFIG_HOME injected an uninstall diagnostic line"
 
 custom_prefix="${TEST_ROOT}/prefix"
 assert_install_uninstall_pair \
