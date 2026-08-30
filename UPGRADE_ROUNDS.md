@@ -433,3 +433,10 @@ Round 70 closes the remaining argument-form affordance gap:
     PATH cases stay exact; apostrophes and dollars cannot break the suggestion,
     while newline-bearing prebuilt or shadowing executable paths are reversibly
     quoted and cannot forge diagnostic lines.
+
+88. **Side-effect-free special-target preflight** — final destinations are
+    checked as a complete set before the first rollback link is created. A late
+    directory, FIFO, or host-creatable Unix socket/device is rejected as neither
+    a regular file nor symlink; an instrumented `ln` proves no earlier backup
+    was attempted, the special object is unchanged, FIFO handling never blocks,
+    and every staged temporary is removed.

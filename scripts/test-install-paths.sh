@@ -651,6 +651,76 @@ fi
     \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
     || fail "publish rollback left a temporary or backup"
 
+# Final targets may be regular files, symlinks (atomically replaced), or
+# absent. Reject special files and directories across the complete set before
+# the first rollback hardlink; in particular, never open or read a FIFO.
+special_backup_tools="${TEST_ROOT}/special-backup-tools"
+mkdir -p "${special_backup_tools}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"${FROST_TEST_LN_MARKER:?}"' \
+    'exec /usr/bin/ln "$@"' \
+    >"${special_backup_tools}/ln"
+chmod 0755 "${special_backup_tools}/ln"
+special_target_kinds=(directory fifo)
+socket_probe="${TEST_ROOT}/socket-probe"
+if command -v python3 >/dev/null 2>&1 \
+    && python3 -c \
+        'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
+        "${socket_probe}" 2>/dev/null; then
+    rm -f -- "${socket_probe}"
+    special_target_kinds+=(socket)
+fi
+device_probe="${TEST_ROOT}/device-probe"
+if mknod "${device_probe}" c 1 3 2>/dev/null; then
+    rm -f -- "${device_probe}"
+    special_target_kinds+=(device)
+fi
+for special_kind in "${special_target_kinds[@]}"; do
+    special_stage="${TEST_ROOT}/special-${special_kind}-stage"
+    special_prefix="/opt/frost-special-${special_kind}"
+    special_binary="${special_stage}${special_prefix}/bin/frost"
+    special_marker="${TEST_ROOT}/special-${special_kind}-ln-called"
+    env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${special_stage}" \
+        "${INSTALLER}" --binary "${prebuilt_binary}" \
+        --prefix "${special_prefix}" --no-desktop >/dev/null
+    rm -f -- "${special_binary}"
+    case "${special_kind}" in
+        directory) mkdir "${special_binary}" ;;
+        fifo) mkfifo "${special_binary}" ;;
+        socket)
+            python3 -c \
+                'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
+                "${special_binary}"
+            ;;
+        device) mknod "${special_binary}" c 1 3 ;;
+    esac
+    if env HOME="${TEST_HOME}" \
+        PATH="${special_backup_tools}:${TEST_PATH}" \
+        FROST_TEST_LN_MARKER="${special_marker}" DESTDIR="${special_stage}" \
+        "${INSTALLER}" --binary "${prebuilt_binary}" \
+        --prefix "${special_prefix}" --no-desktop \
+        >"${TEST_ROOT}/special-${special_kind}.log" 2>&1; then
+        fail "installer accepted a ${special_kind} final target"
+    fi
+    assert_contains "${special_kind} target diagnostic" \
+        "$(<"${TEST_ROOT}/special-${special_kind}.log")" \
+        "install destination is not a regular file or symlink: ${special_binary}"
+    assert_absent "backup attempt before ${special_kind} rejection" \
+        "${special_marker}"
+    case "${special_kind}" in
+        directory) [[ -d "${special_binary}" ]] ;;
+        fifo) [[ -p "${special_binary}" ]] ;;
+        socket) [[ -S "${special_binary}" ]] ;;
+        device) [[ -c "${special_binary}" ]] ;;
+    esac || fail "${special_kind} target changed during rejection"
+    [[ -z "$(find "${special_stage}" \
+        \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+        || fail "${special_kind} rejection left a temporary or backup"
+done
+
 # Removing a pre-rename launcher is migration hygiene, not part of committing
 # the new generation. A cleanup failure must warn without converting an
 # otherwise complete install into a false failure or skipping its summary.

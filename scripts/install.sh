@@ -304,9 +304,21 @@ prepare_install_backups() {
     local index dest directory basename backup
     INSTALL_BACKUPS=()
     INSTALL_ORIGINAL_PRESENT=()
+    # Validate the complete final-target set before creating even the first
+    # rollback link. A late FIFO/socket/device/directory must not leave earlier
+    # targets with transient backup names, and no special file is ever opened.
     for index in "${!INSTALL_DESTS[@]}"; do
         dest="${INSTALL_DESTS[index]}"
         if [[ -e "${dest}" || -L "${dest}" ]]; then
+            [[ -f "${dest}" || -L "${dest}" ]] \
+                || die "install destination is not a regular file or symlink: ${dest}"
+        fi
+    done
+    for index in "${!INSTALL_DESTS[@]}"; do
+        dest="${INSTALL_DESTS[index]}"
+        if [[ -e "${dest}" || -L "${dest}" ]]; then
+            # Best-effort use-point recheck; the installer makes no claim that
+            # this closes concurrent pathname replacement after preflight.
             [[ -f "${dest}" || -L "${dest}" ]] \
                 || die "install destination is not a regular file or symlink: ${dest}"
             directory="${dest%/*}"
