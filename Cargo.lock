@@ -1261,7 +1261,6 @@ dependencies = [
  "jterm_core",
  "libc",
  "log",
- "lru 0.18.2",
  "once_cell",
  "parking_lot",
  "regex",
@@ -1271,7 +1270,6 @@ dependencies = [
  "tokio",
  "toml",
  "unicode-normalization",
- "unicode-width",
  "uuid",
 ]
 

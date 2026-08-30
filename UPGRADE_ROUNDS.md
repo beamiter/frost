@@ -336,3 +336,9 @@ Round 70 closes the remaining argument-form affordance gap:
     warnings denied, matching forge's release boundary. The local verification
     list and handoff say the same thing, and the former redundant intra-doc-link
     exception is retired instead of remaining stale institutional knowledge.
+
+75. **Smaller direct dependency contract** — `unicode-width` and `lru` leave
+    frost's manifest because no frost source or feature uses either crate
+    directly. Both remain transitively locked where `jterm_core`/wgpu need them,
+    but frost no longer claims their APIs as app-owned build inputs or requires
+    future maintainers to review two misleading direct edges.
