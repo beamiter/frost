@@ -358,3 +358,10 @@ Round 70 closes the remaining argument-form affordance gap:
     policy now denies every new warning outside the two exact unmaintained
     exceptions, while a Rust-source-identical cryoglyph patch selects fixed
     `lru 0.18.2` until upstream publishes that dependency repair.
+
+78. **Truthful release handoff and discoverable AI entry** — the remaining
+    release boundary no longer calls the committed AI panel an uncommitted
+    worktree or reports obsolete core and jagent revisions. It records the
+    sole deliberate crates.io patch and its removal condition, while README's
+    feature list and shortcut table now expose the shipped AI Chats chord and
+    distinguish the review-only command-generation palette action.

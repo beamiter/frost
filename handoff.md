@@ -920,21 +920,15 @@ fabricated `<releases>` entry. Add the first release node with the real version 
 when the first tag is cut; `appstreamcli validate --pedantic --no-net` currently reports
 that omission as its one expected pedantic note.
 
-The AI chats panel, the AI command suggestion, and their shared-store shim
-(`src/ai_chats.rs`, `src/ai_chat_store.rs`, `src/ai_command.rs`, and the
-`src/main.rs` wiring) are still uncommitted work in progress, carried into this
-round rather than produced by it. The dependency half of that is now settled:
-`Cargo.toml` pins `jterm_core` at `790d06ab19b9f3dec7c188728fc468f008df5414`,
-the commit that adds `jterm_core::workflows` on top of the
-`jterm_core::command_correction` revision the previous round pinned
-(`badcce2`), with `jagent` `f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf` beneath
-it. No local `[patch]` is in effect — `~/.cargo/config.toml` carries only the
-crates.io mirror — `Cargo.lock` carries a real `source = "git+…"` line for the
-new revision, and the gate below was rerun with `--locked` against the
-published core. What remains uncommitted is frost's own
-panel code. Until then the panel is absent from
-README's shortcut table on purpose: the chord is settled family-wide, but
-nothing here is shipped behavior yet.
+The former AI-panel worktree boundary is closed. The chats panel, command
+suggestion, shared-store shim and `src/main.rs` wiring have all been tracked
+since `7691bd0`; README now exposes the shipped `Ctrl+Shift+Alt+A` entry rather
+than treating it as future behaviour. The current shared baseline exact-pins
+`jterm_core` at `f60c507df59129b281822dd97d2df3a709a02ce4` and its transitive
+`jagent` at `ab7552d2bf287e330f67f7b75ab766b73aa6268e` in the manifest, lockfile
+and dependency policy. The only local `[patch.crates-io]` override is the
+documented, Rust-source-identical cryoglyph 0.1.0 copy that selects
+RustSec-fixed `lru 0.18.2`; remove it when upstream publishes the same repair.
 
 Two things the workflow migration deliberately leaves app-owned.
 

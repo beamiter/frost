@@ -73,6 +73,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 而不是整条消失，任何缩短形式都保留结果字形，非健康生命周期保留 `~` 标记；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
 - 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
 - 参数化 workflow（`Ctrl+Shift+M`，或命令面板的 **Workflows** 动作）：从 `~/.config/frost/workflows/`、`FROST_WORKFLOW_DIR`、XDG 数据目录与内置示例（`scripts/workflows/`）加载与 anvil/ember/forge **同一份** TOML/YAML 模板库（自 2026-08-29 起四个终端共用 `jterm_core::workflows` 这一份加载/校验/渲染实现，因此同一个文件在哪个终端里打开都是同一个意思），同名时靠前的目录优先；带参数的模板先弹出逐参数表单（声明了 `default` 的参数预填该默认值，每行的 **Reset** 可恢复该默认值），渲染结果只回填到提示符供人工审阅，绝不自动执行；**文件里没有声明 `default` 的参数不再被当作空串**——留空（或只填空白）时 Insert 会拒绝并提示 `missing values: <参数名>`，这些行在按下 Insert 之前就带 `(required)` 标记，详见下方“workflow 参数的必填约定”；命令经共享 review-only 边界校验，拒绝控制字符与视觉欺骗字符，文件大小/数量均有上限，符号链接与特殊文件直接拒绝
+- 持久化 AI Chats（`Ctrl+Shift+Alt+A`，或命令面板的 **AI Chats** 动作）跨重启保存会话；命令面板的 **Ask AI: Generate Command** 可把自然语言请求生成可编辑的命令草稿，经过提示符与输入安全门后只回填供人工审阅，绝不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
 - 分屏 pane 标题栏显示所在目录的 git 分支与脏状态（后台探测并缓存，从不逐帧运行 git）
 - 有界 PTY 输入/输出队列、稳定会话身份校验和繁忙进程关闭保护
@@ -215,6 +216,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 回填所选命令 | `Ctrl+Shift+I`（只回填，不执行） |
 | 历史命令选择器 | `Ctrl+Shift+H`（Enter 回填到提示符不执行；`Ctrl+R` 留给 shell 自身） |
 | Workflow 选择器 | `Ctrl+Shift+M`（带参数的模板进入逐参数表单；未声明 `default` 的参数必填，留空时 Insert 拒绝渲染；渲染结果只回填到提示符不执行） |
+| AI Chats | `Ctrl+Shift+Alt+A`（跨重启保存会话；也可从命令面板打开） |
 | 命令面板 | `Ctrl+Shift+P` |
 | 快速切换标签 | `Ctrl+Shift+L` |
 | 标签 1–8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
