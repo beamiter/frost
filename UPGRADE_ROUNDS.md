@@ -479,5 +479,13 @@ Round 70 closes the remaining argument-form affordance gap:
     staging restores the exact inode in the bound directory, and purge cannot
     unlink identically named files behind a replacement symlink. Logical parent
     identity is still checked before/after each phase; a failed purge names the
-    bound physical directory on both sides of its recovery command, and fds
-    close before caches.
+    bound physical directory on both sides of its recovery command, and target
+    fds close before the optional post-commit phase.
+
+94. **Bound post-commit cleanup and cache refresh** — workflow-directory
+    cleanup records its target and parent inodes before the commit, while the
+    optional desktop and icon refreshers receive only pre-opened directory-fd
+    paths. Purge-time parent replacement skips cleanup/cache helpers entirely;
+    replacements made inside either cache helper can touch only the displaced
+    bound directory. Helper failures and identity changes remain explicitly
+    non-fatal and never suppress the truthful uninstall success summary.

@@ -50,6 +50,14 @@ assert_contains() {
     fi
 }
 
+assert_before() {
+    local label="$1" output="$2" first="$3" second="$4"
+    case "${output}" in
+        *"${first}"*"${second}"*) ;;
+        *) fail "${label} did not report ${first@Q} before ${second@Q}" ;;
+    esac
+}
+
 assert_same() {
     local label="$1" actual="$2" expected="$3"
     if [[ "${actual}" != "${expected}" ]]; then
@@ -1669,6 +1677,279 @@ assert_contains "rmdir failure success summary" "${uninstall_rmdir_output}" \
 [[ -z "$(find "${uninstall_rmdir_stage}" \
     -name '*.uninstall.*' -print -quit)" ]] \
     || fail "non-fatal rmdir failure left a quarantine"
+
+# Cleanup is planned before the uninstall commit. Replace its parent from the
+# purge wrapper: the committed workflow stays removed, but the post-commit
+# rmdir must be skipped rather than traverse the new parent symlink.
+uninstall_cleanup_parent_tools="${TEST_ROOT}/uninstall-cleanup-parent-tools"
+uninstall_cleanup_parent_stage="${TEST_ROOT}/uninstall-cleanup-parent-stage"
+uninstall_cleanup_parent_prefix="/opt/frost-uninstall-cleanup-parent"
+uninstall_cleanup_parent_dir="${uninstall_cleanup_parent_stage}${uninstall_cleanup_parent_prefix}/share/frost"
+uninstall_cleanup_parent_workflows="${uninstall_cleanup_parent_dir}/workflows"
+uninstall_cleanup_parent_file="${uninstall_cleanup_parent_workflows}/git-feature.yaml"
+uninstall_cleanup_parent_displaced="${TEST_ROOT}/uninstall-cleanup-parent-original-frost"
+uninstall_cleanup_parent_victim="${TEST_ROOT}/uninstall-cleanup-parent-victim"
+uninstall_cleanup_parent_rm_marker="${TEST_ROOT}/uninstall-cleanup-parent-replaced"
+uninstall_cleanup_parent_rmdir_marker="${TEST_ROOT}/uninstall-cleanup-parent-rmdir-called"
+mkdir -p "${uninstall_cleanup_parent_tools}" \
+    "${uninstall_cleanup_parent_workflows}" \
+    "${uninstall_cleanup_parent_victim}/workflows"
+printf 'workflow removed before skipped cleanup\n' \
+    >"${uninstall_cleanup_parent_file}"
+printf 'outside cleanup sentinel\n' \
+    >"${uninstall_cleanup_parent_victim}/workflows/sentinel"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_CLEANUP_PARENT_RM_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "${FROST_TEST_UNINSTALL_CLEANUP_PARENT_DIR:?}" "${FROST_TEST_UNINSTALL_CLEANUP_PARENT_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CLEANUP_PARENT_VICTIM:?}" "${FROST_TEST_UNINSTALL_CLEANUP_PARENT_DIR}"' \
+    '    : >"${FROST_TEST_UNINSTALL_CLEANUP_PARENT_RM_MARKER}"' \
+    'fi' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_cleanup_parent_tools}/rm"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"${FROST_TEST_UNINSTALL_CLEANUP_PARENT_RMDIR_MARKER:?}"' \
+    'exec /usr/bin/rmdir "$@"' \
+    >"${uninstall_cleanup_parent_tools}/rmdir"
+chmod 0755 "${uninstall_cleanup_parent_tools}/rm" \
+    "${uninstall_cleanup_parent_tools}/rmdir"
+uninstall_cleanup_parent_output="$(
+    env HOME="${TEST_HOME}" \
+        PATH="${uninstall_cleanup_parent_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_CLEANUP_PARENT_RM_MARKER="${uninstall_cleanup_parent_rm_marker}" \
+        FROST_TEST_UNINSTALL_CLEANUP_PARENT_RMDIR_MARKER="${uninstall_cleanup_parent_rmdir_marker}" \
+        FROST_TEST_UNINSTALL_CLEANUP_PARENT_DIR="${uninstall_cleanup_parent_dir}" \
+        FROST_TEST_UNINSTALL_CLEANUP_PARENT_DISPLACED="${uninstall_cleanup_parent_displaced}" \
+        FROST_TEST_UNINSTALL_CLEANUP_PARENT_VICTIM="${uninstall_cleanup_parent_victim}" \
+        DESTDIR="${uninstall_cleanup_parent_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_cleanup_parent_prefix}" 2>&1
+)"
+[[ -L "${uninstall_cleanup_parent_dir}" ]] \
+    || fail "cleanup parent replacement did not occur"
+assert_absent "workflow in displaced cleanup parent" \
+    "${uninstall_cleanup_parent_displaced}/workflows/git-feature.yaml"
+[[ -d "${uninstall_cleanup_parent_displaced}/workflows" ]] \
+    || fail "identity-changed cleanup removed the bound workflow directory"
+[[ "$(<"${uninstall_cleanup_parent_victim}/workflows/sentinel")" == \
+    'outside cleanup sentinel' ]] \
+    || fail "post-commit cleanup touched the replacement parent referent"
+assert_absent "rmdir call after cleanup parent replacement" \
+    "${uninstall_cleanup_parent_rmdir_marker}"
+assert_contains "changed cleanup parent warning" \
+    "${uninstall_cleanup_parent_output}" \
+    "skipped post-commit directory cleanup because identity changed after preflight: ${uninstall_cleanup_parent_workflows} (non-fatal)"
+assert_contains "changed cleanup parent success summary" \
+    "${uninstall_cleanup_parent_output}" \
+    "Removed frost from ${uninstall_cleanup_parent_prefix}/bin"
+
+# A replacement from inside rmdir lands after the identity decision. The
+# actual cleanup name is still relative to the pre-opened parent fd, so the
+# original empty directory may be removed but the new referent cannot be.
+uninstall_cleanup_bound_tools="${TEST_ROOT}/uninstall-cleanup-bound-tools"
+uninstall_cleanup_bound_stage="${TEST_ROOT}/uninstall-cleanup-bound-stage"
+uninstall_cleanup_bound_prefix="/opt/frost-uninstall-cleanup-bound"
+uninstall_cleanup_bound_binary="${uninstall_cleanup_bound_stage}${uninstall_cleanup_bound_prefix}/bin/frost"
+uninstall_cleanup_bound_parent="${uninstall_cleanup_bound_stage}${uninstall_cleanup_bound_prefix}/share/frost"
+uninstall_cleanup_bound_workflows="${uninstall_cleanup_bound_parent}/workflows"
+uninstall_cleanup_bound_displaced="${TEST_ROOT}/uninstall-cleanup-bound-original-frost"
+uninstall_cleanup_bound_victim="${TEST_ROOT}/uninstall-cleanup-bound-victim"
+mkdir -p "${uninstall_cleanup_bound_tools}" \
+    "${uninstall_cleanup_bound_binary%/*}" \
+    "${uninstall_cleanup_bound_workflows}" \
+    "${uninstall_cleanup_bound_victim}/workflows"
+printf 'binary removed before bound directory cleanup\n' \
+    >"${uninstall_cleanup_bound_binary}"
+printf 'outside bound cleanup sentinel\n' \
+    >"${uninstall_cleanup_bound_victim}/workflows/sentinel"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/mv "${FROST_TEST_UNINSTALL_CLEANUP_BOUND_PARENT:?}" "${FROST_TEST_UNINSTALL_CLEANUP_BOUND_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CLEANUP_BOUND_VICTIM:?}" "${FROST_TEST_UNINSTALL_CLEANUP_BOUND_PARENT}"' \
+    'exec /usr/bin/rmdir "$@"' \
+    >"${uninstall_cleanup_bound_tools}/rmdir"
+chmod 0755 "${uninstall_cleanup_bound_tools}/rmdir"
+uninstall_cleanup_bound_output="$(
+    env HOME="${TEST_HOME}" \
+        PATH="${uninstall_cleanup_bound_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_CLEANUP_BOUND_PARENT="${uninstall_cleanup_bound_parent}" \
+        FROST_TEST_UNINSTALL_CLEANUP_BOUND_DISPLACED="${uninstall_cleanup_bound_displaced}" \
+        FROST_TEST_UNINSTALL_CLEANUP_BOUND_VICTIM="${uninstall_cleanup_bound_victim}" \
+        DESTDIR="${uninstall_cleanup_bound_stage}" "${UNINSTALLER}" \
+        --prefix "${uninstall_cleanup_bound_prefix}" 2>&1
+)"
+[[ -L "${uninstall_cleanup_bound_parent}" ]] \
+    || fail "bound cleanup parent replacement did not occur"
+assert_absent "empty workflow directory after bound cleanup" \
+    "${uninstall_cleanup_bound_displaced}/workflows"
+[[ "$(<"${uninstall_cleanup_bound_victim}/workflows/sentinel")" == \
+    'outside bound cleanup sentinel' ]] \
+    || fail "bound rmdir touched the replacement parent referent"
+assert_contains "bound cleanup parent warning" \
+    "${uninstall_cleanup_bound_output}" \
+    "cleanup parent changed during bound rmdir: ${uninstall_cleanup_bound_parent} (non-fatal)"
+assert_before "bound cleanup diagnostic priority" \
+    "${uninstall_cleanup_bound_output}" \
+    "cleanup parent changed during bound rmdir" \
+    "Removed frost from ${uninstall_cleanup_bound_prefix}/bin"
+
+# Cache refresh is likewise planned and bound before removal. A purge-time
+# replacement makes the logical applications directory stale, so the optional
+# refresh must be skipped without invoking the helper or changing success.
+uninstall_cache_skip_tools="${TEST_ROOT}/uninstall-cache-skip-tools"
+uninstall_cache_skip_prefix="${TEST_ROOT}/uninstall-cache-skip-prefix"
+uninstall_cache_skip_app_dir="${uninstall_cache_skip_prefix}/share/applications"
+uninstall_cache_skip_desktop="${uninstall_cache_skip_app_dir}/${app_id}.desktop"
+uninstall_cache_skip_displaced="${TEST_ROOT}/uninstall-cache-skip-original-applications"
+uninstall_cache_skip_victim="${TEST_ROOT}/uninstall-cache-skip-victim"
+uninstall_cache_skip_rm_marker="${TEST_ROOT}/uninstall-cache-skip-replaced"
+uninstall_cache_skip_refresh_marker="${TEST_ROOT}/uninstall-cache-skip-refresh-called"
+mkdir -p "${uninstall_cache_skip_tools}" "${uninstall_cache_skip_app_dir}" \
+    "${uninstall_cache_skip_victim}"
+printf 'desktop removed before skipped refresh\n' \
+    >"${uninstall_cache_skip_desktop}"
+printf 'outside desktop cache sentinel\n' \
+    >"${uninstall_cache_skip_victim}/${app_id}.desktop"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'if [ ! -e "${FROST_TEST_UNINSTALL_CACHE_SKIP_RM_MARKER:?}" ]; then' \
+    '    /usr/bin/mv "${FROST_TEST_UNINSTALL_CACHE_SKIP_APP_DIR:?}" "${FROST_TEST_UNINSTALL_CACHE_SKIP_DISPLACED:?}"' \
+    '    /usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CACHE_SKIP_VICTIM:?}" "${FROST_TEST_UNINSTALL_CACHE_SKIP_APP_DIR}"' \
+    '    : >"${FROST_TEST_UNINSTALL_CACHE_SKIP_RM_MARKER}"' \
+    'fi' \
+    'exec /usr/bin/rm "$@"' \
+    >"${uninstall_cache_skip_tools}/rm"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"${FROST_TEST_UNINSTALL_CACHE_SKIP_REFRESH_MARKER:?}"' \
+    'exit 91' \
+    >"${uninstall_cache_skip_tools}/update-desktop-database"
+chmod 0755 "${uninstall_cache_skip_tools}/rm" \
+    "${uninstall_cache_skip_tools}/update-desktop-database"
+uninstall_cache_skip_output="$(
+    env HOME="${TEST_HOME}" PATH="${uninstall_cache_skip_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_CACHE_SKIP_RM_MARKER="${uninstall_cache_skip_rm_marker}" \
+        FROST_TEST_UNINSTALL_CACHE_SKIP_REFRESH_MARKER="${uninstall_cache_skip_refresh_marker}" \
+        FROST_TEST_UNINSTALL_CACHE_SKIP_APP_DIR="${uninstall_cache_skip_app_dir}" \
+        FROST_TEST_UNINSTALL_CACHE_SKIP_DISPLACED="${uninstall_cache_skip_displaced}" \
+        FROST_TEST_UNINSTALL_CACHE_SKIP_VICTIM="${uninstall_cache_skip_victim}" \
+        DESTDIR= "${UNINSTALLER}" --prefix "${uninstall_cache_skip_prefix}" 2>&1
+)"
+[[ -L "${uninstall_cache_skip_app_dir}" ]] \
+    || fail "cache parent replacement did not occur"
+assert_absent "refresh call after cache directory replacement" \
+    "${uninstall_cache_skip_refresh_marker}"
+[[ "$(<"${uninstall_cache_skip_victim}/${app_id}.desktop")" == \
+    'outside desktop cache sentinel' ]] \
+    || fail "skipped cache refresh touched the replacement directory"
+[[ -z "$(find "${uninstall_cache_skip_displaced}" -mindepth 1 -print -quit)" ]] \
+    || fail "cache replacement purge left an unexpected entry"
+assert_contains "changed cache directory warning" \
+    "${uninstall_cache_skip_output}" \
+    "skipped optional desktop database refresh because directory identity changed: ${uninstall_cache_skip_app_dir} (non-fatal)"
+assert_contains "changed cache directory success summary" \
+    "${uninstall_cache_skip_output}" \
+    "Removed frost from ${uninstall_cache_skip_prefix}/bin"
+
+# If a cache helper replaces its directory after the use-point check, its fd
+# argument remains anchored to the preflight inode. Exercise both refreshers,
+# force helper failures, and prove diagnostics remain non-fatal and precede a
+# truthful uninstall success summary.
+uninstall_cache_bound_tools="${TEST_ROOT}/uninstall-cache-bound-tools"
+uninstall_cache_bound_prefix="${TEST_ROOT}/uninstall-cache-bound-prefix"
+uninstall_cache_bound_app_dir="${uninstall_cache_bound_prefix}/share/applications"
+uninstall_cache_bound_desktop="${uninstall_cache_bound_app_dir}/${app_id}.desktop"
+uninstall_cache_bound_icon_dir="${uninstall_cache_bound_prefix}/share/icons/hicolor"
+uninstall_cache_bound_icon="${uninstall_cache_bound_icon_dir}/scalable/apps/${app_id}.svg"
+uninstall_cache_bound_app_displaced="${TEST_ROOT}/uninstall-cache-bound-original-applications"
+uninstall_cache_bound_icon_displaced="${TEST_ROOT}/uninstall-cache-bound-original-hicolor"
+uninstall_cache_bound_app_victim="${TEST_ROOT}/uninstall-cache-bound-app-victim"
+uninstall_cache_bound_icon_victim="${TEST_ROOT}/uninstall-cache-bound-icon-victim"
+mkdir -p "${uninstall_cache_bound_tools}" "${uninstall_cache_bound_app_dir}" \
+    "${uninstall_cache_bound_icon%/*}" "${uninstall_cache_bound_app_victim}" \
+    "${uninstall_cache_bound_icon_victim}"
+printf 'desktop removed before bound cache refresh\n' \
+    >"${uninstall_cache_bound_desktop}"
+printf 'icon removed before bound cache refresh\n' \
+    >"${uninstall_cache_bound_icon}"
+printf 'outside applications sentinel\n' \
+    >"${uninstall_cache_bound_app_victim}/sentinel"
+printf 'outside icon cache sentinel\n' \
+    >"${uninstall_cache_bound_icon_victim}/sentinel"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '/usr/bin/mv "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DIR:?}" "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_VICTIM:?}" "${FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DIR}"' \
+    ': >"${1}/desktop-cache-bound-marker"' \
+    'exit 92' \
+    >"${uninstall_cache_bound_tools}/update-desktop-database"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'bound=' \
+    'for argument do bound=${argument}; done' \
+    '/usr/bin/mv "${FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DIR:?}" "${FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DISPLACED:?}"' \
+    '/usr/bin/ln -s -- "${FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_VICTIM:?}" "${FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DIR}"' \
+    ': >"${bound}/icon-cache-bound-marker"' \
+    'exit 93' \
+    >"${uninstall_cache_bound_tools}/gtk-update-icon-cache"
+chmod 0755 "${uninstall_cache_bound_tools}/update-desktop-database" \
+    "${uninstall_cache_bound_tools}/gtk-update-icon-cache"
+uninstall_cache_bound_output="$(
+    env HOME="${TEST_HOME}" PATH="${uninstall_cache_bound_tools}:${TEST_PATH}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DIR="${uninstall_cache_bound_app_dir}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_APP_DISPLACED="${uninstall_cache_bound_app_displaced}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_APP_VICTIM="${uninstall_cache_bound_app_victim}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DIR="${uninstall_cache_bound_icon_dir}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_DISPLACED="${uninstall_cache_bound_icon_displaced}" \
+        FROST_TEST_UNINSTALL_CACHE_BOUND_ICON_VICTIM="${uninstall_cache_bound_icon_victim}" \
+        DESTDIR= "${UNINSTALLER}" --prefix "${uninstall_cache_bound_prefix}" 2>&1
+)"
+[[ -f "${uninstall_cache_bound_app_displaced}/desktop-cache-bound-marker" ]] \
+    || fail "desktop cache helper did not receive its bound directory"
+[[ -f "${uninstall_cache_bound_icon_displaced}/icon-cache-bound-marker" ]] \
+    || fail "icon cache helper did not receive its bound directory"
+assert_absent "outside desktop cache marker" \
+    "${uninstall_cache_bound_app_victim}/desktop-cache-bound-marker"
+assert_absent "outside icon cache marker" \
+    "${uninstall_cache_bound_icon_victim}/icon-cache-bound-marker"
+[[ "$(<"${uninstall_cache_bound_app_victim}/sentinel")" == \
+    'outside applications sentinel' ]] \
+    || fail "desktop cache helper changed the replacement directory"
+[[ "$(<"${uninstall_cache_bound_icon_victim}/sentinel")" == \
+    'outside icon cache sentinel' ]] \
+    || fail "icon cache helper changed the replacement directory"
+assert_contains "desktop cache failure warning" \
+    "${uninstall_cache_bound_output}" \
+    "optional desktop database refresh failed for ${uninstall_cache_bound_app_dir} (non-fatal)"
+assert_contains "desktop cache parent change warning" \
+    "${uninstall_cache_bound_output}" \
+    "directory changed during bound desktop database refresh: ${uninstall_cache_bound_app_dir} (non-fatal)"
+assert_contains "icon cache failure warning" \
+    "${uninstall_cache_bound_output}" \
+    "optional icon cache refresh failed for ${uninstall_cache_bound_icon_dir} (non-fatal)"
+assert_contains "icon cache parent change warning" \
+    "${uninstall_cache_bound_output}" \
+    "directory changed during bound icon cache refresh: ${uninstall_cache_bound_icon_dir} (non-fatal)"
+assert_contains "bound cache failure success summary" \
+    "${uninstall_cache_bound_output}" \
+    "Removed frost from ${uninstall_cache_bound_prefix}/bin"
+assert_before "cache diagnostic priority" "${uninstall_cache_bound_output}" \
+    "optional icon cache refresh failed" \
+    "Removed frost from ${uninstall_cache_bound_prefix}/bin"
 
 uninstall_link_stage="${TEST_ROOT}/uninstall-link-stage"
 uninstall_link_victim="${TEST_ROOT}/uninstall-link-victim"

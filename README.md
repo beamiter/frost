@@ -174,6 +174,9 @@ reservation placeholder、rollback backup 与待 purge 项都会在使用点核�
 执行期间被换成 symlink，文件操作仍只落在原目录 inode，随后检查会失败/警告而不沿新 referent。
 若 purge 同时失败，恢复提示中的源和目标也会解析到这个已绑定目录，而不使用被替换的逻辑 parent。
 因此真实卸载需要可用的 procfs；dry-run 不需要，也不会打开目录。
+提交后的空 workflow 目录清理以及 desktop/icon cache refresh 同样在提交前绑定目录 inode。
+身份在执行前变化会跳过可选操作；若变化发生在 helper 内部，helper 只拿到 `/proc/self/fd`
+路径，随后给出非致命警告。清理/刷新失败不会反转已经完成的卸载，成功摘要仍保持真实。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机
 prefix 不套用祖先检查，但目标类型与 quarantine 状态机在两种模式下都生效。
 

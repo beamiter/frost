@@ -24,6 +24,20 @@ REMOVAL_QUARANTINE_BASENAMES=()
 REMOVAL_ORIGINAL_PRESENT=()
 REMOVAL_ORIGINAL_IDENTITIES=()
 REMOVAL_STAGED=()
+CLEANUP_PARENT_FDS=()
+CLEANUP_PARENT_IDENTITIES=()
+CLEANUP_TARGET_BASENAMES=()
+CLEANUP_TARGET_IDENTITIES=()
+CLEANUP_ORIGINAL_PRESENT=()
+CLEANUP_BIND_ERRORS=()
+CACHE_REFRESH_DIRS=()
+CACHE_REFRESH_LABELS=()
+CACHE_REFRESH_COMMANDS=()
+CACHE_REFRESH_FDS=()
+CACHE_REFRESH_IDENTITIES=()
+CACHE_REFRESH_NEEDED=()
+CACHE_REFRESH_ENABLED=()
+CACHE_REFRESH_BIND_ERRORS=()
 UNINSTALL_IN_PROGRESS=0
 UNINSTALL_COMMITTED=0
 
@@ -74,6 +88,12 @@ path_matches_identity() {
     [[ "${actual}" == "${expected}" ]]
 }
 
+real_directory_matches_identity() {
+    local path="$1" expected="$2"
+    [[ -d "${path}" && ! -L "${path}" ]] \
+        && path_matches_identity "${path}" "${expected}"
+}
+
 bound_entry_path() {
     local index="$1" basename="$2"
     printf '/proc/self/fd/%s/%s' "${REMOVAL_PARENT_FDS[index]}" "${basename}"
@@ -109,9 +129,8 @@ bound_quarantine_display() {
 logical_parent_matches_identity() {
     local index="$1" parent
     parent="${REMOVAL_FILES[index]%/*}"
-    [[ -d "${parent}" && ! -L "${parent}" ]] \
-        && path_matches_identity "${parent}" \
-            "${REMOVAL_PARENT_IDENTITIES[index]}"
+    real_directory_matches_identity "${parent}" \
+        "${REMOVAL_PARENT_IDENTITIES[index]}"
 }
 
 close_uninstall_parent_fds() {
@@ -121,6 +140,39 @@ close_uninstall_parent_fds() {
         [[ -n "${fd}" ]] || continue
         exec {fd}<&-
         REMOVAL_PARENT_FDS[index]=""
+    done
+}
+
+bound_cleanup_path() {
+    local index="$1"
+    printf '/proc/self/fd/%s/%s' "${CLEANUP_PARENT_FDS[index]}" \
+        "${CLEANUP_TARGET_BASENAMES[index]}"
+}
+
+logical_cleanup_parent_matches_identity() {
+    local index="$1" parent
+    parent="${REMOVAL_DIRS[index]%/*}"
+    real_directory_matches_identity "${parent}" \
+        "${CLEANUP_PARENT_IDENTITIES[index]}"
+}
+
+close_cleanup_parent_fds() {
+    local index fd
+    for index in "${!CLEANUP_PARENT_FDS[@]}"; do
+        fd="${CLEANUP_PARENT_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+        CLEANUP_PARENT_FDS[index]=""
+    done
+}
+
+close_cache_refresh_fds() {
+    local index fd
+    for index in "${!CACHE_REFRESH_FDS[@]}"; do
+        fd="${CACHE_REFRESH_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+        CACHE_REFRESH_FDS[index]=""
     done
 }
 
@@ -257,6 +309,8 @@ finish_uninstall() {
     fi
     cleanup_uninstall_reservations
     close_uninstall_parent_fds
+    close_cleanup_parent_fds
+    close_cache_refresh_fds
     exit "${status}"
 }
 
@@ -322,6 +376,202 @@ prepare_uninstall_plan() {
             REMOVAL_QUARANTINE_BASENAMES[index]=""
             REMOVAL_ORIGINAL_PRESENT[index]=0
             REMOVAL_ORIGINAL_IDENTITIES[index]=""
+        fi
+    done
+}
+
+prepare_cleanup_plan() {
+    local index target parent target_identity parent_fd parent_identity
+    CLEANUP_PARENT_FDS=()
+    CLEANUP_PARENT_IDENTITIES=()
+    CLEANUP_TARGET_BASENAMES=()
+    CLEANUP_TARGET_IDENTITIES=()
+    CLEANUP_ORIGINAL_PRESENT=()
+    CLEANUP_BIND_ERRORS=()
+    for index in "${!REMOVAL_DIRS[@]}"; do
+        target="${REMOVAL_DIRS[index]}"
+        parent="${target%/*}"
+        CLEANUP_TARGET_BASENAMES[index]="${target##*/}"
+        CLEANUP_PARENT_FDS[index]=""
+        CLEANUP_PARENT_IDENTITIES[index]=""
+        CLEANUP_TARGET_IDENTITIES[index]=""
+        CLEANUP_BIND_ERRORS[index]=""
+        if [[ -d "${target}" && ! -L "${target}" ]]; then
+            CLEANUP_ORIGINAL_PRESENT[index]=1
+            if ! target_identity="$(stat -c '%d:%i' -- "${target}")"; then
+                CLEANUP_BIND_ERRORS[index]="cannot identify cleanup directory ${target}"
+                continue
+            fi
+            unset parent_fd
+            if ! { exec {parent_fd}<"${parent}"; } 2>/dev/null; then
+                CLEANUP_BIND_ERRORS[index]="cannot bind cleanup parent directory ${parent}"
+                continue
+            fi
+            CLEANUP_PARENT_FDS[index]="${parent_fd}"
+            if ! parent_identity="$(stat -Lc '%d:%i' -- \
+                "/proc/self/fd/${parent_fd}")"; then
+                CLEANUP_BIND_ERRORS[index]="cannot identify cleanup parent directory ${parent}"
+                exec {parent_fd}<&-
+                CLEANUP_PARENT_FDS[index]=""
+                continue
+            fi
+            CLEANUP_PARENT_IDENTITIES[index]="${parent_identity}"
+            CLEANUP_TARGET_IDENTITIES[index]="${target_identity}"
+            if ! logical_cleanup_parent_matches_identity "${index}" \
+                || ! path_matches_identity "${target}" "${target_identity}" \
+                || ! path_matches_identity "$(bound_cleanup_path "${index}")" \
+                    "${target_identity}"; then
+                CLEANUP_BIND_ERRORS[index]="cleanup directory changed while binding ${target}"
+                exec {parent_fd}<&-
+                CLEANUP_PARENT_FDS[index]=""
+            fi
+        elif [[ -e "${target}" || -L "${target}" ]]; then
+            # The complete preflight accepted a directory, so a different
+            # object here is a race. Cleanup is optional; retain it untouched.
+            CLEANUP_ORIGINAL_PRESENT[index]=1
+            CLEANUP_BIND_ERRORS[index]="cleanup directory changed before binding ${target}"
+        else
+            CLEANUP_ORIGINAL_PRESENT[index]=0
+        fi
+    done
+}
+
+prepare_cache_refresh_plan() {
+    local index removal_index path command fd identity
+    CACHE_REFRESH_DIRS=(
+        "${SHARE_DIR}/applications"
+        "${SHARE_DIR}/icons/hicolor"
+    )
+    CACHE_REFRESH_LABELS=("desktop database" "icon cache")
+    CACHE_REFRESH_COMMANDS=(update-desktop-database gtk-update-icon-cache)
+    CACHE_REFRESH_FDS=("" "")
+    CACHE_REFRESH_IDENTITIES=("" "")
+    CACHE_REFRESH_NEEDED=(0 0)
+    CACHE_REFRESH_ENABLED=(0 0)
+    CACHE_REFRESH_BIND_ERRORS=("" "")
+
+    ((DESTDIR_ACTIVE == 0)) || return 0
+    for removal_index in "${!REMOVAL_FILES[@]}"; do
+        (( ${REMOVAL_ORIGINAL_PRESENT[removal_index]:-0} == 1 )) \
+            || continue
+        case "${REMOVAL_FILES[removal_index]}" in
+            "${CACHE_REFRESH_DIRS[0]}/"*) CACHE_REFRESH_NEEDED[0]=1 ;;
+            "${CACHE_REFRESH_DIRS[1]}/"*) CACHE_REFRESH_NEEDED[1]=1 ;;
+        esac
+    done
+
+    for index in "${!CACHE_REFRESH_DIRS[@]}"; do
+        ((CACHE_REFRESH_NEEDED[index] == 1)) || continue
+        command="${CACHE_REFRESH_COMMANDS[index]}"
+        command -v "${command}" >/dev/null 2>&1 || continue
+        CACHE_REFRESH_ENABLED[index]=1
+        path="${CACHE_REFRESH_DIRS[index]}"
+        if [[ ! -d "${path}" || -L "${path}" ]]; then
+            CACHE_REFRESH_BIND_ERRORS[index]="cache directory is not a real directory: ${path}"
+            continue
+        fi
+        unset fd
+        if ! { exec {fd}<"${path}"; } 2>/dev/null; then
+            CACHE_REFRESH_BIND_ERRORS[index]="cannot bind cache directory ${path}"
+            continue
+        fi
+        CACHE_REFRESH_FDS[index]="${fd}"
+        if ! identity="$(stat -Lc '%d:%i' -- "/proc/self/fd/${fd}")"; then
+            CACHE_REFRESH_BIND_ERRORS[index]="cannot identify cache directory ${path}"
+            exec {fd}<&-
+            CACHE_REFRESH_FDS[index]=""
+            continue
+        fi
+        CACHE_REFRESH_IDENTITIES[index]="${identity}"
+        if ! real_directory_matches_identity "${path}" "${identity}"; then
+            CACHE_REFRESH_BIND_ERRORS[index]="cache directory changed while binding ${path}"
+            exec {fd}<&-
+            CACHE_REFRESH_FDS[index]=""
+        fi
+    done
+}
+
+remove_bound_dir_if_empty() {
+    local index="$1" target parent bound identity bind_error
+    target="${REMOVAL_DIRS[index]}"
+    parent="${target%/*}"
+    if (( ${CLEANUP_ORIGINAL_PRESENT[index]:-0} == 0 )); then
+        if [[ -e "${target}" || -L "${target}" ]]; then
+            printf 'frost uninstall: warning: skipped post-commit directory cleanup because target appeared after preflight: %s (non-fatal)\n' \
+                "${target}" >&2
+        fi
+        return 0
+    fi
+    bind_error="${CLEANUP_BIND_ERRORS[index]:-}"
+    if [[ -n "${bind_error}" ]]; then
+        printf 'frost uninstall: warning: skipped post-commit directory cleanup: %s (non-fatal)\n' \
+            "${bind_error}" >&2
+        return 0
+    fi
+    bound="$(bound_cleanup_path "${index}")"
+    identity="${CLEANUP_TARGET_IDENTITIES[index]}"
+    if ! logical_cleanup_parent_matches_identity "${index}" \
+        || ! path_matches_identity "${target}" "${identity}" \
+        || ! path_matches_identity "${bound}" "${identity}"; then
+        printf 'frost uninstall: warning: skipped post-commit directory cleanup because identity changed after preflight: %s (non-fatal)\n' \
+            "${target}" >&2
+        return 0
+    fi
+    print_command rmdir --ignore-fail-on-non-empty -- "${target}"
+    if ! rmdir --ignore-fail-on-non-empty -- "${bound}"; then
+        printf 'frost uninstall: warning: could not remove empty cleanup directory %s (non-fatal)\n' \
+            "${target}" >&2
+    elif [[ -e "${bound}" || -L "${bound}" ]] \
+        && ! path_matches_identity "${bound}" "${identity}"; then
+        printf 'frost uninstall: warning: cleanup entry changed during bound rmdir: %s (non-fatal)\n' \
+            "${target}" >&2
+    fi
+    if ! real_directory_matches_identity "${parent}" \
+        "${CLEANUP_PARENT_IDENTITIES[index]}"; then
+        printf 'frost uninstall: warning: cleanup parent changed during bound rmdir: %s (non-fatal)\n' \
+            "${parent}" >&2
+    fi
+}
+
+refresh_bound_caches() {
+    local index path label command fd bound bind_error refresh_failed
+    for index in "${!CACHE_REFRESH_DIRS[@]}"; do
+        (( ${CACHE_REFRESH_NEEDED[index]:-0} == 1 )) || continue
+        (( ${CACHE_REFRESH_ENABLED[index]:-0} == 1 )) || continue
+        path="${CACHE_REFRESH_DIRS[index]}"
+        label="${CACHE_REFRESH_LABELS[index]}"
+        command="${CACHE_REFRESH_COMMANDS[index]}"
+        bind_error="${CACHE_REFRESH_BIND_ERRORS[index]:-}"
+        if [[ -n "${bind_error}" ]]; then
+            printf 'frost uninstall: warning: skipped optional %s refresh: %s (non-fatal)\n' \
+                "${label}" "${bind_error}" >&2
+            continue
+        fi
+        fd="${CACHE_REFRESH_FDS[index]}"
+        if ! real_directory_matches_identity "${path}" \
+            "${CACHE_REFRESH_IDENTITIES[index]}"; then
+            printf 'frost uninstall: warning: skipped optional %s refresh because directory identity changed: %s (non-fatal)\n' \
+                "${label}" "${path}" >&2
+            continue
+        fi
+        bound="/proc/self/fd/${fd}"
+        refresh_failed=0
+        if ((index == 0)); then
+            (umask 022 && "${command}" "${bound}") >/dev/null 2>&1 \
+                || refresh_failed=1
+        else
+            (umask 022 && "${command}" --force --ignore-theme-index \
+                --quiet "${bound}") >/dev/null 2>&1 \
+                || refresh_failed=1
+        fi
+        if ((refresh_failed == 1)); then
+            printf 'frost uninstall: warning: optional %s refresh failed for %s (non-fatal)\n' \
+                "${label}" "${path}" >&2
+        fi
+        if ! real_directory_matches_identity "${path}" \
+            "${CACHE_REFRESH_IDENTITIES[index]}"; then
+            printf 'frost uninstall: warning: directory changed during bound %s refresh: %s (non-fatal)\n' \
+                "${label}" "${path}" >&2
         fi
     done
 }
@@ -688,6 +938,8 @@ else
     [[ -d /proc/self/fd ]] \
         || die "transactional uninstall requires /proc/self/fd"
     prepare_uninstall_plan
+    prepare_cleanup_plan
+    prepare_cache_refresh_plan
     stage_uninstall_plan
     # Every owned name is now absent: this is the uninstall commit point.
     # Purge cannot truthfully roll that result back, so failures retain a named
@@ -695,22 +947,19 @@ else
     purge_uninstall_quarantines
     close_uninstall_parent_fds
 fi
-for target in "${REMOVAL_DIRS[@]}"; do
-    remove_dir_if_empty "${target}"
-done
-
-# Without this the launcher keeps offering a dead entry and a cached icon.
-if ((DESTDIR_ACTIVE == 0 && DRY_RUN == 0)); then
-    if command -v update-desktop-database >/dev/null 2>&1 \
-        && [[ -d "${SHARE_DIR}/applications" ]]; then
-        (umask 022 && update-desktop-database "${SHARE_DIR}/applications") \
-            >/dev/null 2>&1 || true
-    fi
-    if command -v gtk-update-icon-cache >/dev/null 2>&1 \
-        && [[ -d "${SHARE_DIR}/icons/hicolor" ]]; then
-        (umask 022 && gtk-update-icon-cache --force --ignore-theme-index --quiet \
-            "${SHARE_DIR}/icons/hicolor") >/dev/null 2>&1 || true
-    fi
+if ((DRY_RUN == 1)); then
+    for target in "${REMOVAL_DIRS[@]}"; do
+        remove_dir_if_empty "${target}"
+    done
+else
+    for index in "${!REMOVAL_DIRS[@]}"; do
+        remove_bound_dir_if_empty "${index}"
+    done
+    close_cleanup_parent_fds
+    # These refreshes are optional and run only for directories bound before
+    # the uninstall commit. A failed or stale cache never reverses success.
+    refresh_bound_caches
+    close_cache_refresh_fds
 fi
 
 printf 'Removed frost from %s\n' "${BIN_DIR}"
