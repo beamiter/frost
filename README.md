@@ -150,8 +150,11 @@ cargo build --release --locked
 对象都能原样恢复；文件系统或安全策略拒绝 hardlink 时回退到不跟随链接的 `cp -a`。普通文件
 会复制进已打开且身份已记录的 reservation inode，并在命令后复核源、描述符与逻辑名称，此时保证
 内容与 mode，但不承诺保留原 owner/group 或 inode。symlink fallback 则要求复制后的 link text、
-uid/gid 与 mode 全部等于原链接，再为复制出的 symlink inode 创建第二个同目录 hardlink pin；任一
-语义不一致或无法 pin 都会在首次 publish 前失败。rename 失败或可捕获的终止信号会
+uid/gid 与 mode 全部等于原链接，再为复制出的 symlink inode 创建第二个同目录 hardlink pin；
+同时会在目标 parent 下创建随机、`0700`、由独立目录 fd 固定的私有目录，并在其中保留第三个
+hardlink anchor。原始 link text（包括尾随换行）与元数据会随事务保存在内存中，防止三个
+名称均被移除后复用相同 inode number 的外来 symlink 冒充快照；任一语义不一致、私有目录身份/
+权限变化或无法建立 pin/anchor 都会在首次 publish 前失败。rename 失败或可捕获的终止信号会
 按逆序恢复已尝试目标。真实安装会在 staging 前打开并记录每个物理目标目录，之后的临时文件
 创建、rollback backup、发布 rename、逆序恢复及成功后的 backup 清理都只使用这个目录 fd 下的
 相对名称。即使逻辑 parent 在 `mktemp`、`cat`/`cp`、`chmod`、`ln`、`mv` 或 `rm` 内被换成
@@ -197,10 +200,15 @@ reservation placeholder、rollback backup 与待 purge 项都会在使用点核�
 rollback backup 还会保留一个只读 fd（同样最多 16 个），直到 rollback/cleanup 完成才关闭，
 所以 backup 名被删除后立刻复用同一 inode number 也不能伪装成原快照。publish 已把 staged inode
 移到目标时，旧 source 名若被不同 inode 回填会立即撤销名称所有权，命令非零仍按精确目标状态
-收敛，后续 rollback/cleanup 不会触碰该替代物。symlink backup 不能用 no-follow fd 固定，因此
-主 backup 与第二个 pin 必须始终指向同一记录 inode；pin reservation 在移除名称时仍由打开的
-placeholder fd 防止 inode-number ABA。任一名称被替换都会 fail closed，并保留精确恢复副本及
-替代物；成功、失败和命令完成后返回非零的 cleanup 都只删除本事务仍拥有的名称。同一物理
+收敛，后续 rollback/cleanup 不会触碰该替代物。symlink backup 不能由 Bash 以 no-follow fd
+直接固定，因此主 backup、第二个公开 pin 与随机 `0700` 私有目录中的 anchor 必须同时匹配记录
+inode、link-text digest 及 uid/gid/mode；pin reservation 在移除名称时仍由打开的 placeholder fd
+防止 inode-number ABA。成功 cleanup 按 main、pin、anchor 顺序处理，每次 unlink 都重新检查逻辑
+parent、私有目录 fd/身份/权限及尚存 peer；前一步成功不授权下一步。目录或名称出现任何歧义时会
+fail closed，保留精确恢复副本和所有替代物，并只用绑定物理路径生成单行 `%q` 恢复命令，不读取
+或显示 link text/referent。私有目录缩小了意外并发窗口，但不宣称抵御能以同一 uid 主动枚举并
+修改事务私有目录的恶意进程。成功、失败和命令完成后返回非零的 cleanup 都只删除仍可验证属于
+本事务的名称。同一物理
 applications/workflow parent 的多个消费者仍各自执行 use-point identity 检查，正常完成、早退
 与异常退出最终都由统一清理关闭池中描述符。
 其中 `DESTDIR` 祖先检查只描述预检时的状态，不承诺抵御之后的并发路径替换；正常主机

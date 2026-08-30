@@ -29,6 +29,16 @@ INSTALL_BACKUP_FDS=()
 INSTALL_BACKUP_PINS=()
 INSTALL_BACKUP_PIN_BASENAMES=()
 INSTALL_BACKUP_PIN_IDENTITIES=()
+INSTALL_BACKUP_ANCHORS=()
+INSTALL_BACKUP_ANCHOR_BASENAMES=()
+INSTALL_BACKUP_ANCHOR_IDENTITIES=()
+INSTALL_BACKUP_ANCHOR_DIRS=()
+INSTALL_BACKUP_ANCHOR_DIR_BASENAMES=()
+INSTALL_BACKUP_ANCHOR_DIR_FDS=()
+INSTALL_BACKUP_ANCHOR_DIR_IDENTITIES=()
+INSTALL_BACKUP_ANCHOR_DIR_METADATA=()
+INSTALL_BACKUP_SYMLINK_VALUES=()
+INSTALL_BACKUP_SYMLINK_METADATA=()
 INSTALL_ORIGINAL_PRESENT=()
 INSTALL_ORIGINAL_IDENTITIES=()
 INSTALL_PARENT_FDS=()
@@ -43,6 +53,7 @@ INSTALL_BOUND_DIRECTORY_FDS=()
 INSTALL_BOUND_DIRECTORY_IDENTITIES=()
 MAX_INSTALL_BOUND_DIRECTORY_FDS=16
 MAX_INSTALL_BACKUP_FDS=16
+MAX_INSTALL_BACKUP_ANCHOR_DIR_FDS=16
 POST_INSTALL_APP_DIR=""
 POST_INSTALL_APP_FD=""
 POST_INSTALL_APP_IDENTITY=""
@@ -118,28 +129,52 @@ cleanup_install_artifacts() {
         fi
     done
     if ((KEEP_INSTALL_BACKUPS == 0)); then
+        # Symlink snapshots retain a third link inside a private, descriptor-
+        # bound directory. It remains live while the public backup and pin are
+        # removed, so neither public-name replacement can recycle the owned
+        # inode number. Every unlink is nevertheless a fresh use point.
+        for index in "${!INSTALL_BACKUP_ANCHORS[@]}"; do
+            [[ -n "${INSTALL_BACKUP_ANCHOR_DIRS[index]:-}" ]] || continue
+            cleanup_symlink_install_snapshot "${index}"
+        done
+        for index in "${!INSTALL_BACKUP_PINS[@]}"; do
+            [[ -n "${INSTALL_BACKUP_PINS[index]:-}" \
+                && -z "${INSTALL_BACKUP_ANCHOR_DIRS[index]:-}" ]] \
+                || continue
+            warn_retained_symlink_install_snapshot "${index}" \
+                'private anchor was not established'
+        done
         for index in "${!INSTALL_BACKUPS[@]}"; do
+            [[ -z "${INSTALL_BACKUP_ANCHOR_DIRS[index]:-}" \
+                && -z "${INSTALL_BACKUP_PINS[index]:-}" ]] || continue
             path="${INSTALL_BACKUPS[index]:-}"
             if ((DRY_RUN == 0)) && [[ -n "${path}" ]]; then
                 display="$(bound_install_backup_display "${index}")"
                 if [[ -e "${path}" || -L "${path}" ]]; then
                     expected="${INSTALL_BACKUP_IDENTITIES[index]:-}"
-                    if [[ -z "${expected}" ]] \
+                    if ! logical_install_parent_matches "${index}"; then
+                        printf 'frost install: warning: skipped rollback backup cleanup because destination directory identity changed (non-fatal): %q\n' \
+                            "${INSTALL_DESTS[index]%/*}" >&2
+                        parent_warning_emitted[index]=1
+                        continue
+                    elif [[ -z "${expected}" ]] \
                         || ! install_backup_path_matches_identity "${index}" \
                             "${path}" "${expected}"; then
-                        printf 'frost install: warning: refusing to remove changed rollback backup %s\n' \
+                        printf 'frost install: warning: refusing to remove changed rollback backup %q\n' \
                             "${display}" >&2
                     else
                         rm -f -- "${path}" || :
                         if [[ -e "${path}" || -L "${path}" ]]; then
                             if install_backup_path_matches_identity "${index}" \
                                 "${path}" "${expected}"; then
-                                printf 'frost install: warning: cannot remove rollback backup %s\n' \
+                                printf 'frost install: warning: cannot remove rollback backup %q\n' \
                                     "${display}" >&2
                             else
-                                printf 'frost install: warning: rollback backup name changed during removal; replacement retained at %s\n' \
+                                printf 'frost install: warning: rollback backup name changed during removal; replacement retained at %q\n' \
                                     "${display}" >&2
                             fi
+                        else
+                            INSTALL_BACKUPS[index]=""
                         fi
                     fi
                 fi
@@ -152,34 +187,14 @@ cleanup_install_artifacts() {
                 parent_warning_emitted[index]=1
             fi
         done
-        for index in "${!INSTALL_BACKUP_PINS[@]}"; do
-            path="${INSTALL_BACKUP_PINS[index]:-}"
-            [[ -n "${path}" ]] || continue
-            display="$(bound_install_entry_display "${index}" \
-                "${INSTALL_BACKUP_PIN_BASENAMES[index]}")"
-            if [[ -e "${path}" || -L "${path}" ]]; then
-                expected="${INSTALL_BACKUP_PIN_IDENTITIES[index]:-}"
-                if [[ -z "${expected}" ]] \
-                    || ! path_matches_identity "${path}" "${expected}"; then
-                    printf 'frost install: warning: refusing to remove changed rollback pin %s\n' \
-                        "${display}" >&2
-                else
-                    rm -f -- "${path}" || :
-                    if [[ -e "${path}" || -L "${path}" ]]; then
-                        if path_matches_identity "${path}" "${expected}"; then
-                            printf 'frost install: warning: cannot remove rollback pin %s\n' \
-                                "${display}" >&2
-                        else
-                            printf 'frost install: warning: rollback pin name changed during removal; replacement retained at %s\n' \
-                                "${display}" >&2
-                        fi
-                    fi
-                fi
-            fi
-        done
     fi
     for index in "${!INSTALL_BACKUP_FDS[@]}"; do
         fd="${INSTALL_BACKUP_FDS[index]:-}"
+        [[ -n "${fd}" ]] || continue
+        exec {fd}<&-
+    done
+    for index in "${!INSTALL_BACKUP_ANCHOR_DIR_FDS[@]}"; do
+        fd="${INSTALL_BACKUP_ANCHOR_DIR_FDS[index]:-}"
         [[ -n "${fd}" ]] || continue
         exec {fd}<&-
     done
@@ -192,6 +207,16 @@ cleanup_install_artifacts() {
     INSTALL_BACKUP_PINS=()
     INSTALL_BACKUP_PIN_BASENAMES=()
     INSTALL_BACKUP_PIN_IDENTITIES=()
+    INSTALL_BACKUP_ANCHORS=()
+    INSTALL_BACKUP_ANCHOR_BASENAMES=()
+    INSTALL_BACKUP_ANCHOR_IDENTITIES=()
+    INSTALL_BACKUP_ANCHOR_DIRS=()
+    INSTALL_BACKUP_ANCHOR_DIR_BASENAMES=()
+    INSTALL_BACKUP_ANCHOR_DIR_FDS=()
+    INSTALL_BACKUP_ANCHOR_DIR_IDENTITIES=()
+    INSTALL_BACKUP_ANCHOR_DIR_METADATA=()
+    INSTALL_BACKUP_SYMLINK_VALUES=()
+    INSTALL_BACKUP_SYMLINK_METADATA=()
     INSTALL_ORIGINAL_PRESENT=()
     INSTALL_ORIGINAL_IDENTITIES=()
     INSTALL_PARENT_FDS=()
@@ -321,6 +346,307 @@ bound_install_backup_pin_display() {
         "${INSTALL_BACKUP_PIN_BASENAMES[index]}"
 }
 
+bound_install_backup_anchor_dir_path() {
+    local index="$1"
+    bound_install_entry_path "${index}" \
+        "${INSTALL_BACKUP_ANCHOR_DIR_BASENAMES[index]}"
+}
+
+bound_install_backup_anchor_display() {
+    local index="$1" directory
+    directory="$(readlink -- \
+        "/proc/$$/fd/${INSTALL_BACKUP_ANCHOR_DIR_FDS[index]}" \
+        2>/dev/null)" || return 1
+    printf '%s/%s' "${directory}" \
+        "${INSTALL_BACKUP_ANCHOR_BASENAMES[index]}"
+}
+
+read_symlink_text_exact() {
+    local path="$1" value
+    value="$({ readlink -n -- "${path}" || exit; printf .; })" || return 1
+    printf '%s' "${value%.}"
+}
+
+symlink_install_snapshot_path_matches() {
+    local index="$1" path="$2" expected="$3" value metadata
+    [[ -L "${path}" ]] \
+        && path_matches_identity "${path}" "${expected}" || return 1
+    value="$(read_symlink_text_exact "${path}")" || return 1
+    metadata="$(stat -c '%u:%g:%a' -- "${path}")" || return 1
+    [[ -v 'INSTALL_BACKUP_SYMLINK_VALUES[index]' \
+        && "${value}" == "${INSTALL_BACKUP_SYMLINK_VALUES[index]}" \
+        && "${metadata}" == "${INSTALL_BACKUP_SYMLINK_METADATA[index]:-}" ]]
+}
+
+private_install_anchor_directory_matches() {
+    local index="$1" directory fd expected metadata
+    local fd_identity fd_metadata
+    directory="${INSTALL_BACKUP_ANCHOR_DIRS[index]:-}"
+    fd="${INSTALL_BACKUP_ANCHOR_DIR_FDS[index]:-}"
+    expected="${INSTALL_BACKUP_ANCHOR_DIR_IDENTITIES[index]:-}"
+    metadata="${INSTALL_BACKUP_ANCHOR_DIR_METADATA[index]:-}"
+    [[ -n "${directory}" && -n "${fd}" && -n "${expected}" \
+        && -n "${metadata}" && -d "${directory}" \
+        && ! -L "${directory}" ]] || return 1
+    path_matches_identity "${directory}" "${expected}" || return 1
+    fd_identity="$(stat -Lc '%d:%i' -- "/proc/self/fd/${fd}")" \
+        || return 1
+    fd_metadata="$(stat -Lc '%u:%g:%a' -- "/proc/self/fd/${fd}")" \
+        || return 1
+    [[ "${fd_identity}" == "${expected}" \
+        && "${fd_metadata}" == "${metadata}" \
+        && "$(stat -c '%u:%g:%a' -- "${directory}")" == "${metadata}" ]]
+}
+
+symlink_install_snapshot_names_match() {
+    local index="$1" expected backup pin anchor
+    expected="${INSTALL_BACKUP_ANCHOR_IDENTITIES[index]:-}"
+    backup="${INSTALL_BACKUPS[index]:-}"
+    pin="${INSTALL_BACKUP_PINS[index]:-}"
+    anchor="${INSTALL_BACKUP_ANCHORS[index]:-}"
+    [[ -n "${expected}" && -n "${anchor}" ]] \
+        && symlink_install_snapshot_path_matches "${index}" "${anchor}" \
+            "${expected}" \
+        || return 1
+    if [[ -n "${backup}" ]]; then
+        symlink_install_snapshot_path_matches "${index}" "${backup}" \
+            "${expected}" \
+            || return 1
+    fi
+    if [[ -n "${pin}" ]]; then
+        symlink_install_snapshot_path_matches "${index}" "${pin}" \
+            "${expected}" \
+            || return 1
+    fi
+    private_install_anchor_directory_matches "${index}"
+}
+
+print_exact_symlink_install_recovery_command() {
+    local index="$1" expected source_basename source_display dest_display
+    local backup pin anchor
+    expected="${INSTALL_BACKUP_ANCHOR_IDENTITIES[index]:-}"
+    [[ -n "${expected}" ]] \
+        || expected="${INSTALL_BACKUP_PIN_IDENTITIES[index]:-}"
+    [[ -n "${expected}" ]] \
+        || expected="${INSTALL_BACKUP_IDENTITIES[index]:-}"
+    [[ -n "${expected}" ]] || return 1
+    backup="${INSTALL_BACKUPS[index]:-}"
+    pin="${INSTALL_BACKUP_PINS[index]:-}"
+    anchor="${INSTALL_BACKUP_ANCHORS[index]:-}"
+    if [[ -n "${backup}" ]] \
+        && symlink_install_snapshot_path_matches "${index}" "${backup}" \
+            "${expected}"; then
+        source_basename="${INSTALL_BACKUP_BASENAMES[index]}"
+        source_display="$(bound_install_entry_display "${index}" \
+            "${source_basename}")"
+    elif [[ -n "${pin}" ]] \
+        && symlink_install_snapshot_path_matches "${index}" "${pin}" \
+            "${expected}"; then
+        source_basename="${INSTALL_BACKUP_PIN_BASENAMES[index]}"
+        source_display="$(bound_install_entry_display "${index}" \
+            "${source_basename}")"
+    elif [[ -n "${anchor}" ]] \
+        && symlink_install_snapshot_path_matches "${index}" "${anchor}" \
+            "${expected}"; then
+        source_display="$(bound_install_backup_anchor_display "${index}")" \
+            || return 1
+    else
+        return 1
+    fi
+    dest_display="$(bound_install_entry_display "${index}" \
+        "${INSTALL_DEST_BASENAMES[index]}")"
+    {
+        printf 'frost install: recovery command (symlink contents not displayed): '
+        printf '%q ' mv -fT -- "${source_display}" "${dest_display}"
+        printf '\n'
+    } >&2
+}
+
+warn_retained_symlink_install_snapshot() {
+    local index="$1" reason="$2" expected path display label
+    local exact_recovery=0
+    expected="${INSTALL_BACKUP_ANCHOR_IDENTITIES[index]:-}"
+    [[ -n "${expected}" ]] \
+        || expected="${INSTALL_BACKUP_PIN_IDENTITIES[index]:-}"
+    [[ -n "${expected}" ]] \
+        || expected="${INSTALL_BACKUP_IDENTITIES[index]:-}"
+    printf 'frost install: warning: retaining symlink rollback snapshot (%s): %q\n' \
+        "${reason}" "${INSTALL_DESTS[index]}" >&2
+    for label in backup pin anchor; do
+        case "${label}" in
+            backup)
+                path="${INSTALL_BACKUPS[index]:-}"
+                [[ -n "${path}" ]] || continue
+                display="$(bound_install_backup_display "${index}")"
+                ;;
+            pin)
+                path="${INSTALL_BACKUP_PINS[index]:-}"
+                [[ -n "${path}" ]] || continue
+                display="$(bound_install_backup_pin_display "${index}")"
+                ;;
+            anchor)
+                path="${INSTALL_BACKUP_ANCHORS[index]:-}"
+                [[ -n "${path}" ]] || continue
+                display="$(bound_install_backup_anchor_display "${index}" \
+                    2>/dev/null)" || display='<bound-private-anchor>'
+                ;;
+        esac
+        if [[ -n "${expected}" ]] \
+            && symlink_install_snapshot_path_matches "${index}" "${path}" \
+                "${expected}"; then
+            printf 'frost install: warning: exact rollback %s retained at %q\n' \
+                "${label}" "${display}" >&2
+            exact_recovery=1
+        elif [[ -e "${path}" || -L "${path}" ]]; then
+            printf 'frost install: warning: changed rollback %s retained at %q\n' \
+                "${label}" "${display}" >&2
+        else
+            printf 'frost install: warning: rollback %s missing at %q\n' \
+                "${label}" "${display}" >&2
+        fi
+    done
+    if ((exact_recovery == 1)); then
+        print_exact_symlink_install_recovery_command "${index}" || :
+    else
+        display="$(bound_install_entry_display "${index}" \
+            "${INSTALL_DEST_BASENAMES[index]}")"
+        printf 'frost install: warning: no exact symlink recovery name remains for %q\n' \
+            "${display}" >&2
+    fi
+}
+
+cleanup_symlink_install_snapshot() {
+    local index="$1" expected path display directory
+    expected="${INSTALL_BACKUP_ANCHOR_IDENTITIES[index]:-}"
+    if ! logical_install_parent_matches "${index}" \
+        || ! symlink_install_snapshot_names_match "${index}"; then
+        warn_retained_symlink_install_snapshot "${index}" \
+            'preflight identity changed'
+        return
+    fi
+
+    # The public backup is the first independent use point. The pin and the
+    # private anchor must both still identify the owned inode immediately
+    # before it is removed.
+    path="${INSTALL_BACKUPS[index]:-}"
+    if [[ -n "${path}" ]]; then
+        display="$(bound_install_backup_display "${index}")"
+        if ! logical_install_parent_matches "${index}" \
+            || ! symlink_install_snapshot_names_match "${index}"; then
+            warn_retained_symlink_install_snapshot "${index}" \
+                'backup use-point identity changed'
+            return
+        fi
+        rm -f -- "${path}" || :
+        if [[ -e "${path}" || -L "${path}" ]]; then
+            if symlink_install_snapshot_path_matches "${index}" "${path}" \
+                "${expected}"; then
+                printf 'frost install: warning: cannot remove rollback backup %q\n' \
+                    "${display}" >&2
+            else
+                printf 'frost install: warning: rollback backup name changed during removal; replacement retained at %q\n' \
+                    "${display}" >&2
+            fi
+            warn_retained_symlink_install_snapshot "${index}" \
+                'backup removal did not reach the exact post-state'
+            return
+        fi
+        INSTALL_BACKUPS[index]=""
+        if ! logical_install_parent_matches "${index}" \
+            || ! private_install_anchor_directory_matches "${index}"; then
+            warn_retained_symlink_install_snapshot "${index}" \
+                'directory identity changed after backup removal'
+            return
+        fi
+    fi
+
+    # Removing the first link does not authorize removing the second. Recheck
+    # the public parent, the pin name, and the private anchor at this use point.
+    path="${INSTALL_BACKUP_PINS[index]:-}"
+    if [[ -n "${path}" ]]; then
+        display="$(bound_install_backup_pin_display "${index}")"
+        if ! logical_install_parent_matches "${index}" \
+            || ! private_install_anchor_directory_matches "${index}" \
+            || ! symlink_install_snapshot_path_matches "${index}" "${path}" \
+                "${expected}" \
+            || ! symlink_install_snapshot_path_matches "${index}" \
+                "${INSTALL_BACKUP_ANCHORS[index]}" "${expected}"; then
+            warn_retained_symlink_install_snapshot "${index}" \
+                'pin use-point identity changed'
+            return
+        fi
+        rm -f -- "${path}" || :
+        if [[ -e "${path}" || -L "${path}" ]]; then
+            if symlink_install_snapshot_path_matches "${index}" "${path}" \
+                "${expected}"; then
+                printf 'frost install: warning: cannot remove rollback pin %q\n' \
+                    "${display}" >&2
+            else
+                printf 'frost install: warning: rollback pin name changed during removal; replacement retained at %q\n' \
+                    "${display}" >&2
+            fi
+            warn_retained_symlink_install_snapshot "${index}" \
+                'pin removal did not reach the exact post-state'
+            return
+        fi
+        INSTALL_BACKUP_PINS[index]=""
+        if ! logical_install_parent_matches "${index}" \
+            || ! private_install_anchor_directory_matches "${index}"; then
+            warn_retained_symlink_install_snapshot "${index}" \
+                'directory identity changed after pin removal'
+            return
+        fi
+    fi
+
+    # The last link is reachable only inside the random 0700 directory held by
+    # its own descriptor. If that directory or name changed, leave it intact.
+    path="${INSTALL_BACKUP_ANCHORS[index]:-}"
+    display="$(bound_install_backup_anchor_display "${index}" 2>/dev/null)" \
+        || display='<bound-private-anchor>'
+    if ! logical_install_parent_matches "${index}" \
+        || ! private_install_anchor_directory_matches "${index}" \
+        || ! symlink_install_snapshot_path_matches "${index}" "${path}" \
+            "${expected}"; then
+        warn_retained_symlink_install_snapshot "${index}" \
+            'private anchor use-point identity changed'
+        return
+    fi
+    rm -f -- "${path}" || :
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        if symlink_install_snapshot_path_matches "${index}" "${path}" \
+            "${expected}"; then
+            printf 'frost install: warning: cannot remove private rollback anchor %q\n' \
+                "${display}" >&2
+        else
+            printf 'frost install: warning: private rollback anchor name changed during removal; replacement retained at %q\n' \
+                "${display}" >&2
+        fi
+        return
+    fi
+    INSTALL_BACKUP_ANCHORS[index]=""
+    INSTALL_BACKUP_ANCHOR_IDENTITIES[index]=""
+
+    directory="${INSTALL_BACKUP_ANCHOR_DIRS[index]}"
+    if ! logical_install_parent_matches "${index}" \
+        || ! private_install_anchor_directory_matches "${index}"; then
+        printf 'frost install: warning: empty private rollback directory retained after its identity changed: %q\n' \
+            "${directory}" >&2
+        return
+    fi
+    rmdir -- "${directory}" 2>/dev/null || :
+    if [[ -e "${directory}" || -L "${directory}" ]]; then
+        if private_install_anchor_directory_matches "${index}"; then
+            printf 'frost install: warning: cannot remove empty private rollback directory %q\n' \
+                "${directory}" >&2
+        else
+            printf 'frost install: warning: private rollback directory name changed during removal; replacement retained at %q\n' \
+                "${directory}" >&2
+        fi
+    else
+        INSTALL_BACKUP_ANCHOR_DIRS[index]=""
+    fi
+}
+
 logical_install_parent_matches() {
     local index="$1"
     directory_referent_matches_identity "${INSTALL_DESTS[index]%/*}" \
@@ -376,8 +702,13 @@ opened_regular_install_backup_matches() {
 }
 
 install_backup_path_matches_identity() {
-    local index="$1" path="$2" expected="$3" fd pin
-    path_matches_identity "${path}" "${expected}" || return 1
+    local index="$1" path="$2" expected="$3" fd pin anchor
+    if [[ -v 'INSTALL_BACKUP_SYMLINK_VALUES[index]' ]]; then
+        symlink_install_snapshot_path_matches "${index}" "${path}" \
+            "${expected}" || return 1
+    else
+        path_matches_identity "${path}" "${expected}" || return 1
+    fi
     fd="${INSTALL_BACKUP_FDS[index]:-}"
     if [[ -n "${fd}" ]]; then
         opened_regular_install_backup_matches "${fd}" "${expected}" \
@@ -385,8 +716,16 @@ install_backup_path_matches_identity() {
         return 0
     fi
     pin="${INSTALL_BACKUP_PINS[index]:-}"
-    [[ -z "${pin}" ]] \
-        || path_matches_identity "${pin}" "${expected}"
+    anchor="${INSTALL_BACKUP_ANCHORS[index]:-}"
+    if [[ -n "${pin}" ]]; then
+        symlink_install_snapshot_path_matches "${index}" "${pin}" \
+            "${expected}" || return 1
+    fi
+    if [[ -n "${anchor}" ]]; then
+        private_install_anchor_directory_matches "${index}" \
+            && symlink_install_snapshot_path_matches "${index}" "${anchor}" \
+                "${expected}" || return 1
+    fi
 }
 
 retain_regular_install_backup_fd() {
@@ -413,11 +752,87 @@ retain_regular_install_backup_fd() {
     INSTALL_BACKUP_FDS[index]="${candidate_fd}"
 }
 
+retain_symlink_install_backup_anchor() {
+    local index="$1" backup="$2" expected="$3" dest="$4"
+    local source="$5" source_identity="$6"
+    local basename directory directory_identity directory_metadata
+    local anchor anchor_fd command_status=0 fd count=0
+    for fd in "${INSTALL_BACKUP_ANCHOR_DIR_FDS[@]}"; do
+        [[ -n "${fd}" ]] && count=$((count + 1))
+    done
+    ((count < MAX_INSTALL_BACKUP_ANCHOR_DIR_FDS)) \
+        || die "too many symlink rollback anchors (limit ${MAX_INSTALL_BACKUP_ANCHOR_DIR_FDS})"
+
+    basename="${INSTALL_DEST_BASENAMES[index]}"
+    directory="$(mktemp -d "$(bound_install_entry_path "${index}" \
+        ".${basename}.rollback-anchor.XXXXXX")")" \
+        || die "cannot reserve private symlink rollback directory beside ${dest}"
+    INSTALL_BACKUP_ANCHOR_DIR_BASENAMES[index]="${directory##*/}"
+    INSTALL_BACKUP_ANCHOR_DIRS[index]="$(bound_install_backup_anchor_dir_path \
+        "${index}")"
+    directory="${INSTALL_BACKUP_ANCHOR_DIRS[index]}"
+    directory_identity="$(stat -c '%d:%i' -- "${directory}")" \
+        || die "cannot identify private symlink rollback directory beside ${dest}"
+    directory_metadata="$(stat -c '%u:%g:%a' -- "${directory}")" \
+        || die "cannot inspect private symlink rollback directory beside ${dest}"
+    [[ "${directory_metadata##*:}" == 700 ]] \
+        || die "private symlink rollback directory has unsafe permissions beside ${dest}"
+    INSTALL_BACKUP_ANCHOR_DIR_IDENTITIES[index]="${directory_identity}"
+    INSTALL_BACKUP_ANCHOR_DIR_METADATA[index]="${directory_metadata}"
+    unset anchor_fd
+    exec {anchor_fd}<"${directory}" \
+        || die "cannot bind private symlink rollback directory beside ${dest}"
+    INSTALL_BACKUP_ANCHOR_DIR_FDS[index]="${anchor_fd}"
+    private_install_anchor_directory_matches "${index}" \
+        || die "private symlink rollback directory changed while binding ${dest}"
+    logical_install_parent_matches "${index}" \
+        || die "install destination directory changed while reserving private symlink rollback anchor: ${dest%/*}"
+    install_backup_copy_matches "${source}" "${source_identity}" \
+        "${backup}" \
+        || die "symlink rollback backup changed while reserving private anchor for ${dest}"
+    path_matches_identity "${backup}" "${expected}" \
+        || die "symlink rollback backup identity changed while reserving private anchor for ${dest}"
+    path_matches_identity "${INSTALL_BACKUP_PINS[index]}" "${expected}" \
+        || die "symlink rollback pin identity changed while reserving private anchor for ${dest}"
+
+    INSTALL_BACKUP_ANCHOR_BASENAMES[index]="snapshot"
+    INSTALL_BACKUP_ANCHORS[index]="/proc/self/fd/${anchor_fd}/snapshot"
+    anchor="${INSTALL_BACKUP_ANCHORS[index]}"
+    INSTALL_BACKUP_ANCHOR_IDENTITIES[index]=""
+    ln -P -- "${backup}" "${anchor}" 2>/dev/null || command_status=$?
+    if private_install_anchor_directory_matches "${index}" \
+        && path_matches_identity "${backup}" "${expected}" \
+        && path_matches_identity "${INSTALL_BACKUP_PINS[index]}" \
+            "${expected}" \
+        && [[ -L "${anchor}" ]] \
+        && path_matches_identity "${anchor}" "${expected}" \
+        && install_backup_copy_matches "${source}" "${source_identity}" \
+            "${backup}"; then
+        # The exact three-link state wins over a wrapper reporting failure
+        # after it created the private anchor.
+        INSTALL_BACKUP_ANCHOR_IDENTITIES[index]="${expected}"
+    elif [[ -e "${anchor}" || -L "${anchor}" ]]; then
+        die "private symlink rollback anchor was replaced while linking ${dest}"
+    elif ((command_status == 0)); then
+        die "private symlink rollback anchor disappeared while linking ${dest}"
+    else
+        die "cannot create private symlink rollback anchor for ${dest}"
+    fi
+    logical_install_parent_matches "${index}" \
+        || die "install destination directory changed while pinning private symlink rollback anchor: ${dest%/*}"
+}
+
 retain_symlink_install_backup_pin() {
     local index="$1" backup="$2" expected="$3" dest="$4"
     local source="$5" source_identity="$6"
     local basename pin reservation_identity reservation_fd
-    local reservation_fd_path command_status=0
+    local reservation_fd_path value metadata command_status=0
+    value="$(read_symlink_text_exact "${backup}")" \
+        || die "cannot record symlink rollback backup text for ${dest}"
+    metadata="$(stat -c '%u:%g:%a' -- "${backup}")" \
+        || die "cannot inspect symlink rollback backup for ${dest}"
+    INSTALL_BACKUP_SYMLINK_VALUES[index]="${value}"
+    INSTALL_BACKUP_SYMLINK_METADATA[index]="${metadata}"
     basename="${INSTALL_DEST_BASENAMES[index]}"
     pin="$(mktemp "$(bound_install_entry_path "${index}" \
         ".${basename}.rollback-pin.XXXXXX")")" \
@@ -490,6 +905,8 @@ retain_symlink_install_backup_pin() {
     fi
     logical_install_parent_matches "${index}" \
         || die "install destination directory changed while pinning symlink rollback backup: ${dest%/*}"
+    retain_symlink_install_backup_anchor "${index}" "${backup}" \
+        "${expected}" "${dest}" "${source}" "${source_identity}"
 }
 
 bind_install_destination() {
@@ -540,8 +957,10 @@ rollback_install_plan() {
                             "${pin_identity}"; then
                         pin_display="$(bound_install_backup_pin_display \
                             "${index}")"
-                        printf 'frost install: exact symlink recovery pin for %s retained at %s\n' \
+                        printf 'frost install: exact symlink recovery pin for %q retained at %q\n' \
                             "${dest_display}" "${pin_display}" >&2
+                        print_exact_symlink_install_recovery_command \
+                            "${index}" || :
                     fi
                     rollback_failed=1
                 elif path_matches_identity "${dest_path}" \
@@ -923,6 +1342,16 @@ prepare_install_backups() {
     INSTALL_BACKUP_PINS=()
     INSTALL_BACKUP_PIN_BASENAMES=()
     INSTALL_BACKUP_PIN_IDENTITIES=()
+    INSTALL_BACKUP_ANCHORS=()
+    INSTALL_BACKUP_ANCHOR_BASENAMES=()
+    INSTALL_BACKUP_ANCHOR_IDENTITIES=()
+    INSTALL_BACKUP_ANCHOR_DIRS=()
+    INSTALL_BACKUP_ANCHOR_DIR_BASENAMES=()
+    INSTALL_BACKUP_ANCHOR_DIR_FDS=()
+    INSTALL_BACKUP_ANCHOR_DIR_IDENTITIES=()
+    INSTALL_BACKUP_ANCHOR_DIR_METADATA=()
+    INSTALL_BACKUP_SYMLINK_VALUES=()
+    INSTALL_BACKUP_SYMLINK_METADATA=()
     INSTALL_ORIGINAL_PRESENT=()
     INSTALL_ORIGINAL_IDENTITIES=()
     # Validate the complete final-target set before creating even the first
@@ -953,6 +1382,16 @@ prepare_install_backups() {
         INSTALL_BACKUP_PINS[index]=""
         INSTALL_BACKUP_PIN_BASENAMES[index]=""
         INSTALL_BACKUP_PIN_IDENTITIES[index]=""
+        INSTALL_BACKUP_ANCHORS[index]=""
+        INSTALL_BACKUP_ANCHOR_BASENAMES[index]=""
+        INSTALL_BACKUP_ANCHOR_IDENTITIES[index]=""
+        INSTALL_BACKUP_ANCHOR_DIRS[index]=""
+        INSTALL_BACKUP_ANCHOR_DIR_BASENAMES[index]=""
+        INSTALL_BACKUP_ANCHOR_DIR_FDS[index]=""
+        INSTALL_BACKUP_ANCHOR_DIR_IDENTITIES[index]=""
+        INSTALL_BACKUP_ANCHOR_DIR_METADATA[index]=""
+        unset 'INSTALL_BACKUP_SYMLINK_VALUES[index]'
+        INSTALL_BACKUP_SYMLINK_METADATA[index]=""
         fallback_fd=""
         if [[ -e "${dest_path}" || -L "${dest_path}" ]]; then
             [[ -f "${dest_path}" || -L "${dest_path}" ]] \

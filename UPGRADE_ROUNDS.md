@@ -550,3 +550,16 @@ Round 70 closes the remaining argument-form affordance gap:
      deterministic reservation and post-publish ABA regressions prove cleanup
      never unlinks substitutes, while failed rollback retains and diagnoses the
      original symlink inode under its recovery pin.
+
+101. **Private-anchor symlink cleanup state machine** — each symlink snapshot
+     now keeps a third hardlink inside a random `0700`, descriptor-bound private
+     directory, plus the exact in-memory link text and uid/gid/mode (including
+     preservation of trailing newlines). Cleanup treats main, pin, and anchor
+     unlinks as independent use points, revalidating the logical parent,
+     private directory, remaining
+     peers, inode, and semantic fingerprint before advancing. Parent/private-dir
+     renames, post-unlink substitutions, public-name hardlink merges, and even a
+     forced three-name deletion with numeric inode reuse all fail closed without
+     touching replacements. Any exact survivor yields one copy-safe `%q`
+     recovery command based only on bound physical names; diagnostics never
+     expose link text or its referent.

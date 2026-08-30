@@ -89,6 +89,22 @@ assert_absent() {
         || fail "${label} was not removed: ${path}"
 }
 
+extract_symlink_recovery_command() {
+    local label="$1" log="$2" line command="" count=0
+    local prefix='frost install: recovery command (symlink contents not displayed): '
+    while IFS= read -r line; do
+        case "${line}" in
+            "${prefix}"*)
+                count=$((count + 1))
+                command="${line#"${prefix}"}"
+                ;;
+        esac
+    done <"${log}"
+    ((count == 1)) \
+        || fail "${label} emitted ${count} recovery commands instead of one"
+    printf '%s' "${command}"
+}
+
 assert_install_uninstall_pair() {
     local label="$1" expected_binary="$2"
     shift 2
@@ -725,8 +741,9 @@ assert_absent "binary after staging parent swap" "${install_stage_parent_binary}
 
 # Backup reservations and snapshots use the same bound directory. Swap the
 # logical parent from inside ln: the backup is made beside the original inode,
-# then the use-point identity check aborts and bound cleanup removes it without
-# touching an identically named file behind the new symlink.
+# then the use-point identity check aborts. Cleanup now fails closed on that
+# directory identity change and retains the exact backup without touching an
+# identically named file behind the new symlink.
 install_backup_parent_tools="${TEST_ROOT}/install-backup-parent-tools"
 install_backup_parent_stage="${TEST_ROOT}/install-backup-parent-stage"
 install_backup_parent_prefix="/opt/frost-install-backup-parent"
@@ -777,9 +794,22 @@ assert_contains "install backup parent diagnostic" \
     "${install_backup_parent_displaced}/${install_backup_parent_name}")" == \
     "${install_backup_parent_identity}" ]] \
     || fail "install backup failure changed original workflow inode metadata"
+install_backup_parent_recovery="$(find \
+    "${install_backup_parent_displaced}" -maxdepth 1 \
+    -name ".${install_backup_parent_name}.rollback.??????" -print -quit)"
+[[ -n "${install_backup_parent_recovery}" \
+    && -f "${install_backup_parent_recovery}" ]] \
+    || fail "bound backup failure lost the exact rollback backup"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_backup_parent_recovery}")" == \
+    "${install_backup_parent_identity}" ]] \
+    || fail "bound backup failure changed the retained rollback identity"
 [[ -z "$(find "${install_backup_parent_displaced}" \
-    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
-    || fail "bound backup failure left a temporary or rollback backup"
+    -name '*.install.*' -print -quit)" ]] \
+    || fail "bound backup failure left a temporary"
+assert_contains "install backup parent cleanup diagnostic" \
+    "$(<"${TEST_ROOT}/install-backup-parent.log")" \
+    "skipped rollback backup cleanup because destination directory identity changed (non-fatal): ${install_backup_parent_dir}"
 assert_absent "binary after backup parent swap" "${install_backup_parent_binary}"
 
 # Swap the binary directory inside its final publish rename. The bound rename
@@ -1424,13 +1454,14 @@ assert_contains "symlink fallback publish failure diagnostic" \
     "cannot atomically replace ${install_symlink_fallback_second}"
 [[ -z "$(find "${install_symlink_fallback_stage}" \
     \( -name '*.install.*' -o -name '*.rollback.*' \
-        -o -name '*.rollback-pin.*' \) -print -quit)" ]] \
+        -o -name '*.rollback-pin.*' -o -name '*.rollback-anchor.*' \) \
+        -print -quit)" ]] \
     || fail "symlink copy fallback rollback left an owned artifact"
 
 # The pin placeholder is owned only while its exact reservation inode remains
 # at the bound name. Replace it from inside rm: backup preparation must stop
-# before publish, cleanup may remove the exact main hardlink but must retain the
-# unowned pin substitute without following it.
+# before publish. Without a private anchor, cleanup must retain both the exact
+# main hardlink and the unowned pin substitute without following either one.
 install_symlink_pin_aba_tools="${TEST_ROOT}/install-symlink-pin-aba-tools"
 install_symlink_pin_aba_stage="${TEST_ROOT}/install-symlink-pin-aba-stage"
 install_symlink_pin_aba_prefix="/opt/frost-install-symlink-pin-aba"
@@ -1500,7 +1531,7 @@ assert_contains "symlink pin reservation ABA diagnostic" \
     "symlink rollback pin reservation name changed while removing it beside ${install_symlink_pin_aba_first}"
 assert_contains "symlink pin reservation cleanup warning" \
     "$(<"${TEST_ROOT}/install-symlink-pin-aba.log")" \
-    "refusing to remove changed rollback pin ${install_symlink_pin_aba_path}"
+    "changed rollback pin retained at ${install_symlink_pin_aba_path}"
 install_symlink_pin_aba_backup="$(find \
     "${install_symlink_pin_aba_first%/*}" -maxdepth 1 \
     -name ".${install_symlink_pin_aba_first##*/}.rollback.??????" \
@@ -1517,7 +1548,7 @@ install_symlink_pin_aba_backup="$(find \
     || fail "symlink pin reservation ABA changed the main recovery link text"
 assert_contains "symlink pin reservation main-backup warning" \
     "$(<"${TEST_ROOT}/install-symlink-pin-aba.log")" \
-    "refusing to remove changed rollback backup ${install_symlink_pin_aba_backup}"
+    "exact rollback backup retained at ${install_symlink_pin_aba_backup}"
 
 # Keep the copied/original symlink inode alive through publish with the second
 # name. After the first staged inode is installed, replace the main backup and
@@ -1638,6 +1669,706 @@ assert_contains "symlink recovery pin diagnostic" \
 [[ -z "$(find "${install_symlink_publish_aba_stage}" \
     -name '*.install.*' -print -quit)" ]] \
     || fail "symlink publish ABA left a transaction-owned temporary"
+
+# A successful publish may be followed by a main-backup substitution before
+# cleanup. Rename its already-bound parent to a path containing newline and ESC
+# bytes: pair preflight must retain the foreign name and exact pin, never
+# disclose link text, and emit one single-line %q command that restores only
+# inside that bound physical directory rather than the replacement symlink.
+install_symlink_cleanup_main_tools="${TEST_ROOT}/install-symlink-cleanup-main-tools"
+install_symlink_cleanup_main_stage="${TEST_ROOT}/install-symlink-cleanup-main-stage"
+install_symlink_cleanup_main_prefix="/opt/frost-cleanup-main"
+install_symlink_cleanup_main_workflow_dir="${install_symlink_cleanup_main_stage}${install_symlink_cleanup_main_prefix}/share/frost/workflows"
+install_symlink_cleanup_main_first="${install_symlink_cleanup_main_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_main_displaced="${TEST_ROOT}"$'/cleanup-main\nnext-\033-dir'
+install_symlink_cleanup_main_outside="${TEST_ROOT}/cleanup-main-outside"
+install_symlink_cleanup_main_secret="${TEST_ROOT}/cleanup-main-private-referent"
+install_symlink_cleanup_main_backup_log="${TEST_ROOT}/install-symlink-cleanup-main-backup"
+install_symlink_cleanup_main_pin_log="${TEST_ROOT}/install-symlink-cleanup-main-pin"
+mkdir -p "${install_symlink_cleanup_main_tools}" \
+    "${install_symlink_cleanup_main_workflow_dir}" \
+    "${install_symlink_cleanup_main_outside}"
+printf 'cleanup main private sentinel\n' \
+    >"${install_symlink_cleanup_main_secret}"
+printf 'cleanup main outside target sentinel\n' \
+    >"${install_symlink_cleanup_main_outside}/${WORKFLOW_SOURCES[0]##*/}"
+ln -s -- "${install_symlink_cleanup_main_secret}" \
+    "${install_symlink_cleanup_main_first}"
+install_symlink_cleanup_main_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_symlink_cleanup_main_first}")"
+install_symlink_cleanup_main_value="$(readlink -- \
+    "${install_symlink_cleanup_main_first}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/.frost.install.*)' \
+    '        /usr/bin/mv "$@"' \
+    '        parent=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_PARENT:?}' \
+    '        basename=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_BASENAME:?}' \
+    '        backup=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback.??????" -print -quit)' \
+    '        pin=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback-pin.*" -print -quit)' \
+    '        : "${backup:?missing cleanup main backup}"' \
+    '        : "${pin:?missing cleanup main pin}"' \
+    '        printf "%s\n" "${backup}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_BACKUP_LOG:?}"' \
+    '        printf "%s\n" "${pin}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_PIN_LOG:?}"' \
+    '        /usr/bin/rm -f -- "${backup}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_SECRET:?}" "${backup}"' \
+    '        /usr/bin/mv -- "${parent}" "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_DISPLACED:?}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_OUTSIDE:?}" "${parent}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_cleanup_main_tools}/mv"
+chmod 0755 "${install_symlink_cleanup_main_tools}/mv"
+install_symlink_cleanup_main_log="${TEST_ROOT}/install-symlink-cleanup-main.log"
+install_symlink_cleanup_main_output="$({
+    env HOME="${TEST_HOME}" \
+        PATH="${install_symlink_cleanup_main_tools}:${TEST_PATH}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_PARENT="${install_symlink_cleanup_main_workflow_dir}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_BASENAME="${install_symlink_cleanup_main_first##*/}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_BACKUP_LOG="${install_symlink_cleanup_main_backup_log}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_PIN_LOG="${install_symlink_cleanup_main_pin_log}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_SECRET="${install_symlink_cleanup_main_secret}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_DISPLACED="${install_symlink_cleanup_main_displaced}" \
+        FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_OUTSIDE="${install_symlink_cleanup_main_outside}" \
+        DESTDIR="${install_symlink_cleanup_main_stage}" "${INSTALLER}" \
+        --binary "${prebuilt_binary}" \
+        --prefix "${install_symlink_cleanup_main_prefix}" --no-desktop
+} 2>&1 | tee "${install_symlink_cleanup_main_log}")"
+install_symlink_cleanup_main_backup="${install_symlink_cleanup_main_displaced}/$(basename -- "$(<"${install_symlink_cleanup_main_backup_log}")")"
+install_symlink_cleanup_main_pin="${install_symlink_cleanup_main_displaced}/$(basename -- "$(<"${install_symlink_cleanup_main_pin_log}")")"
+install_symlink_cleanup_main_restored="${install_symlink_cleanup_main_displaced}/${WORKFLOW_SOURCES[0]##*/}"
+[[ -L "${install_symlink_cleanup_main_backup}" ]] \
+    || fail "cleanup deleted the main-backup substitute"
+[[ "$(readlink -- "${install_symlink_cleanup_main_backup}")" == \
+    "${install_symlink_cleanup_main_secret}" ]] \
+    || fail "cleanup changed the main-backup substitute"
+[[ -L "${install_symlink_cleanup_main_pin}" ]] \
+    || fail "cleanup deleted the exact recovery pin after main replacement"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_symlink_cleanup_main_pin}")" == \
+    "${install_symlink_cleanup_main_identity}" ]] \
+    || fail "cleanup changed the exact pin identity after main replacement"
+[[ "$(readlink -- "${install_symlink_cleanup_main_pin}")" == \
+    "${install_symlink_cleanup_main_value}" ]] \
+    || fail "cleanup changed the exact pin text after main replacement"
+[[ "${install_symlink_cleanup_main_output}" != \
+    *"${install_symlink_cleanup_main_secret}"* ]] \
+    || fail "cleanup diagnostics disclosed symlink contents"
+install_symlink_cleanup_main_command="$(extract_symlink_recovery_command \
+    "main-backup replacement" "${install_symlink_cleanup_main_log}")"
+[[ "${install_symlink_cleanup_main_command}" != *$'\n'* \
+    && "${install_symlink_cleanup_main_command}" != *$'\033'* ]] \
+    || fail "recovery command contains a literal control character"
+[[ "${install_symlink_cleanup_main_command}" == *'\n'* \
+    && "${install_symlink_cleanup_main_command}" == *'\E'* ]] \
+    || fail "recovery command did not %q-encode newline and ESC path bytes"
+bash -n -c "${install_symlink_cleanup_main_command}" \
+    || fail "main-backup recovery command is not valid shell"
+(cd -- "${TEST_ROOT}" \
+    && PATH="${TEST_PATH}" bash -c \
+        "${install_symlink_cleanup_main_command}")
+[[ -L "${install_symlink_cleanup_main_restored}" ]] \
+    || fail "main-backup recovery command did not restore the symlink"
+[[ "$(readlink -- "${install_symlink_cleanup_main_restored}")" == \
+    "${install_symlink_cleanup_main_value}" ]] \
+    || fail "main-backup recovery command changed the link text"
+[[ "$(<"${install_symlink_cleanup_main_outside}/${WORKFLOW_SOURCES[0]##*/}")" == \
+    'cleanup main outside target sentinel' ]] \
+    || fail "main-backup recovery command followed the replacement parent"
+assert_absent "consumed main-replacement recovery pin" \
+    "${install_symlink_cleanup_main_pin}"
+[[ -L "${install_symlink_cleanup_main_backup}" ]] \
+    || fail "recovery command touched the main-backup substitute"
+
+# The symmetric pin substitution must retain the exact main backup and the
+# foreign pin. The command should select only that exact main inode and leave
+# the substitute untouched when copied and executed.
+install_symlink_cleanup_pin_tools="${TEST_ROOT}/install-symlink-cleanup-pin-tools"
+install_symlink_cleanup_pin_stage="${TEST_ROOT}/install-symlink-cleanup-pin-stage"
+install_symlink_cleanup_pin_prefix="/opt/frost-install-symlink-cleanup-pin"
+install_symlink_cleanup_pin_workflow_dir="${install_symlink_cleanup_pin_stage}${install_symlink_cleanup_pin_prefix}/share/frost/workflows"
+install_symlink_cleanup_pin_first="${install_symlink_cleanup_pin_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_pin_secret="${TEST_ROOT}/cleanup-pin-private-referent"
+install_symlink_cleanup_pin_backup_log="${TEST_ROOT}/install-symlink-cleanup-pin-backup"
+install_symlink_cleanup_pin_path_log="${TEST_ROOT}/install-symlink-cleanup-pin-path"
+mkdir -p "${install_symlink_cleanup_pin_tools}" \
+    "${install_symlink_cleanup_pin_workflow_dir}"
+printf 'cleanup pin private sentinel\n' \
+    >"${install_symlink_cleanup_pin_secret}"
+ln -s -- "${install_symlink_cleanup_pin_secret}" \
+    "${install_symlink_cleanup_pin_first}"
+install_symlink_cleanup_pin_value="$(readlink -- \
+    "${install_symlink_cleanup_pin_first}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/.frost.install.*)' \
+    '        /usr/bin/mv "$@"' \
+    '        parent=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_PARENT:?}' \
+    '        basename=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_BASENAME:?}' \
+    '        backup=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback.??????" -print -quit)' \
+    '        pin=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback-pin.*" -print -quit)' \
+    '        : "${backup:?missing cleanup pin backup}"' \
+    '        : "${pin:?missing cleanup pin}"' \
+    '        printf "%s\n" "${backup}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_BACKUP_LOG:?}"' \
+    '        printf "%s\n" "${pin}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_PATH_LOG:?}"' \
+    '        /usr/bin/rm -f -- "${pin}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_SECRET:?}" "${pin}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_cleanup_pin_tools}/mv"
+chmod 0755 "${install_symlink_cleanup_pin_tools}/mv"
+install_symlink_cleanup_pin_log="${TEST_ROOT}/install-symlink-cleanup-pin.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_pin_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_PARENT="${install_symlink_cleanup_pin_workflow_dir}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_BASENAME="${install_symlink_cleanup_pin_first##*/}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_BACKUP_LOG="${install_symlink_cleanup_pin_backup_log}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_PATH_LOG="${install_symlink_cleanup_pin_path_log}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_SECRET="${install_symlink_cleanup_pin_secret}" \
+    DESTDIR="${install_symlink_cleanup_pin_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_pin_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_pin_log}" 2>&1
+install_symlink_cleanup_pin_backup="$(<"${install_symlink_cleanup_pin_backup_log}")"
+install_symlink_cleanup_pin_path="$(<"${install_symlink_cleanup_pin_path_log}")"
+[[ -L "${install_symlink_cleanup_pin_backup}" ]] \
+    || fail "cleanup deleted the exact main backup after pin replacement"
+[[ -L "${install_symlink_cleanup_pin_path}" \
+    && "$(readlink -- "${install_symlink_cleanup_pin_path}")" == \
+        "${install_symlink_cleanup_pin_secret}" ]] \
+    || fail "cleanup changed or deleted the pin substitute"
+if grep -Fq -- "${install_symlink_cleanup_pin_secret}" \
+    "${install_symlink_cleanup_pin_log}"; then
+    fail "pin-replacement diagnostics disclosed symlink contents"
+fi
+install_symlink_cleanup_pin_command="$(extract_symlink_recovery_command \
+    "pin replacement" "${install_symlink_cleanup_pin_log}")"
+bash -n -c "${install_symlink_cleanup_pin_command}" \
+    || fail "pin-replacement recovery command is not valid shell"
+PATH="${TEST_PATH}" bash -c "${install_symlink_cleanup_pin_command}"
+[[ -L "${install_symlink_cleanup_pin_first}" \
+    && "$(readlink -- "${install_symlink_cleanup_pin_first}")" == \
+        "${install_symlink_cleanup_pin_value}" ]] \
+    || fail "pin-replacement recovery command did not restore the symlink"
+assert_absent "consumed exact main recovery backup" \
+    "${install_symlink_cleanup_pin_backup}"
+[[ -L "${install_symlink_cleanup_pin_path}" ]] \
+    || fail "pin-replacement recovery touched the substitute"
+
+# Main and pin are two names for the same owned inode. Exchanging the names and
+# then recreating the pin as another hardlink to that exact inode produces the
+# same recorded (directory,name,device,inode) state, so cleanup may remove both.
+install_symlink_cleanup_exact_tools="${TEST_ROOT}/install-symlink-cleanup-exact-tools"
+install_symlink_cleanup_exact_stage="${TEST_ROOT}/install-symlink-cleanup-exact-stage"
+install_symlink_cleanup_exact_prefix="/opt/frost-install-symlink-cleanup-exact"
+install_symlink_cleanup_exact_workflow_dir="${install_symlink_cleanup_exact_stage}${install_symlink_cleanup_exact_prefix}/share/frost/workflows"
+install_symlink_cleanup_exact_first="${install_symlink_cleanup_exact_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_exact_secret="${TEST_ROOT}/cleanup-exact-private-referent"$'\n\n'
+install_symlink_cleanup_exact_marker="${TEST_ROOT}/install-symlink-cleanup-exact-marker"
+mkdir -p "${install_symlink_cleanup_exact_tools}" \
+    "${install_symlink_cleanup_exact_workflow_dir}"
+printf 'cleanup exact private sentinel\n' \
+    >"${install_symlink_cleanup_exact_secret}"
+ln -s -- "${install_symlink_cleanup_exact_secret}" \
+    "${install_symlink_cleanup_exact_first}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/.frost.install.*)' \
+    '        /usr/bin/mv "$@"' \
+    '        parent=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_EXACT_PARENT:?}' \
+    '        basename=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_EXACT_BASENAME:?}' \
+    '        backup=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback.??????" -print -quit)' \
+    '        pin=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback-pin.*" -print -quit)' \
+    '        swap=${parent}/.${basename}.rollback-swap' \
+    '        : "${backup:?missing exact cleanup backup}"' \
+    '        : "${pin:?missing exact cleanup pin}"' \
+    '        /usr/bin/mv -- "${backup}" "${swap}"' \
+    '        /usr/bin/mv -- "${pin}" "${backup}"' \
+    '        /usr/bin/mv -- "${swap}" "${pin}"' \
+    '        /usr/bin/rm -f -- "${pin}"' \
+    '        /usr/bin/ln -P -- "${backup}" "${pin}"' \
+    '        : >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_EXACT_MARKER:?}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_cleanup_exact_tools}/mv"
+chmod 0755 "${install_symlink_cleanup_exact_tools}/mv"
+install_symlink_cleanup_exact_log="${TEST_ROOT}/install-symlink-cleanup-exact.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_exact_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_EXACT_PARENT="${install_symlink_cleanup_exact_workflow_dir}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_EXACT_BASENAME="${install_symlink_cleanup_exact_first##*/}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_EXACT_MARKER="${install_symlink_cleanup_exact_marker}" \
+    DESTDIR="${install_symlink_cleanup_exact_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_exact_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_exact_log}" 2>&1
+assert_regular_file "exact symlink cleanup exchange marker" \
+    "${install_symlink_cleanup_exact_marker}"
+[[ -z "$(find "${install_symlink_cleanup_exact_stage}" \
+    \( -name '*.rollback.*' -o -name '*.rollback-pin.*' \
+        -o -name '*.rollback-anchor.*' -o -name '*.rollback-swap' \) \
+        -print -quit)" ]] \
+    || fail "exact name exchange/hardlink merge left a rollback artifact"
+if grep -Fq 'recovery command (symlink contents not displayed)' \
+    "${install_symlink_cleanup_exact_log}"; then
+    fail "exact name exchange incorrectly retained a recovery artifact"
+fi
+[[ "$(<"${install_symlink_cleanup_exact_secret}")" == \
+    'cleanup exact private sentinel' ]] \
+    || fail "exact name exchange followed the old symlink referent"
+
+# In contrast, merging both public names as hardlinks to one foreign symlink
+# does not make either name transaction-owned. The private anchor keeps the old
+# inode live, so both substitutes survive and recovery selects only that anchor.
+install_symlink_cleanup_foreign_tools="${TEST_ROOT}/install-symlink-cleanup-foreign-tools"
+install_symlink_cleanup_foreign_stage="${TEST_ROOT}/install-symlink-cleanup-foreign-stage"
+install_symlink_cleanup_foreign_prefix="/opt/frost-install-symlink-cleanup-foreign"
+install_symlink_cleanup_foreign_workflow_dir="${install_symlink_cleanup_foreign_stage}${install_symlink_cleanup_foreign_prefix}/share/frost/workflows"
+install_symlink_cleanup_foreign_first="${install_symlink_cleanup_foreign_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_foreign_secret="${TEST_ROOT}/cleanup-foreign-private-referent"
+install_symlink_cleanup_foreign_backup_log="${TEST_ROOT}/install-symlink-cleanup-foreign-backup"
+install_symlink_cleanup_foreign_pin_log="${TEST_ROOT}/install-symlink-cleanup-foreign-pin"
+mkdir -p "${install_symlink_cleanup_foreign_tools}" \
+    "${install_symlink_cleanup_foreign_workflow_dir}"
+printf 'cleanup foreign private sentinel\n' \
+    >"${install_symlink_cleanup_foreign_secret}"
+ln -s -- "${TEST_ROOT}/cleanup-foreign-original-referent" \
+    "${install_symlink_cleanup_foreign_first}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/.frost.install.*)' \
+    '        /usr/bin/mv "$@"' \
+    '        parent=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_PARENT:?}' \
+    '        basename=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_BASENAME:?}' \
+    '        backup=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback.??????" -print -quit)' \
+    '        pin=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback-pin.*" -print -quit)' \
+    '        foreign=${parent}/.${basename}.foreign-link' \
+    '        : "${backup:?missing foreign cleanup backup}"' \
+    '        : "${pin:?missing foreign cleanup pin}"' \
+    '        printf "%s\n" "${backup}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_BACKUP_LOG:?}"' \
+    '        printf "%s\n" "${pin}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_PIN_LOG:?}"' \
+    '        /usr/bin/rm -f -- "${backup}" "${pin}"' \
+    '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_SECRET:?}" "${foreign}"' \
+    '        /usr/bin/ln -P -- "${foreign}" "${backup}"' \
+    '        /usr/bin/ln -P -- "${foreign}" "${pin}"' \
+    '        /usr/bin/rm -f -- "${foreign}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_cleanup_foreign_tools}/mv"
+chmod 0755 "${install_symlink_cleanup_foreign_tools}/mv"
+install_symlink_cleanup_foreign_log="${TEST_ROOT}/install-symlink-cleanup-foreign.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_foreign_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_PARENT="${install_symlink_cleanup_foreign_workflow_dir}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_BASENAME="${install_symlink_cleanup_foreign_first##*/}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_SECRET="${install_symlink_cleanup_foreign_secret}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_BACKUP_LOG="${install_symlink_cleanup_foreign_backup_log}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_FOREIGN_PIN_LOG="${install_symlink_cleanup_foreign_pin_log}" \
+    DESTDIR="${install_symlink_cleanup_foreign_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_foreign_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_foreign_log}" 2>&1
+install_symlink_cleanup_foreign_backup="$(<"${install_symlink_cleanup_foreign_backup_log}")"
+install_symlink_cleanup_foreign_pin="$(<"${install_symlink_cleanup_foreign_pin_log}")"
+install_symlink_cleanup_foreign_anchor="$(find \
+    "${install_symlink_cleanup_foreign_workflow_dir}" -mindepth 2 -maxdepth 2 \
+    -path "*/.${install_symlink_cleanup_foreign_first##*/}.rollback-anchor.??????/snapshot" \
+    -print -quit)"
+[[ -L "${install_symlink_cleanup_foreign_backup}" \
+    && -L "${install_symlink_cleanup_foreign_pin}" ]] \
+    || fail "cleanup removed a foreign hardlink-merged substitute"
+[[ "$(stat -c '%d:%i' -- "${install_symlink_cleanup_foreign_backup}")" == \
+    "$(stat -c '%d:%i' -- "${install_symlink_cleanup_foreign_pin}")" ]] \
+    || fail "foreign hardlink-merged names no longer share one inode"
+[[ "$(readlink -- "${install_symlink_cleanup_foreign_backup}")" == \
+    "${install_symlink_cleanup_foreign_secret}" \
+    && "$(readlink -- "${install_symlink_cleanup_foreign_pin}")" == \
+        "${install_symlink_cleanup_foreign_secret}" ]] \
+    || fail "cleanup changed a foreign hardlink-merged substitute"
+if grep -Fq -- "${install_symlink_cleanup_foreign_secret}" \
+    "${install_symlink_cleanup_foreign_log}"; then
+    fail "foreign-pair diagnostics disclosed symlink contents"
+fi
+[[ -L "${install_symlink_cleanup_foreign_anchor}" \
+    && "$(readlink -- "${install_symlink_cleanup_foreign_anchor}")" == \
+        "${TEST_ROOT}/cleanup-foreign-original-referent" ]] \
+    || fail "foreign hardlink merge lost the private exact recovery anchor"
+install_symlink_cleanup_foreign_command="$(extract_symlink_recovery_command \
+    "foreign public-name merge" "${install_symlink_cleanup_foreign_log}")"
+bash -n -c "${install_symlink_cleanup_foreign_command}" \
+    || fail "foreign-merge recovery command is not valid shell"
+PATH="${TEST_PATH}" bash -c "${install_symlink_cleanup_foreign_command}"
+[[ -L "${install_symlink_cleanup_foreign_first}" \
+    && "$(readlink -- "${install_symlink_cleanup_foreign_first}")" == \
+        "${TEST_ROOT}/cleanup-foreign-original-referent" ]] \
+    || fail "private anchor recovery did not restore the original symlink"
+[[ -L "${install_symlink_cleanup_foreign_backup}" \
+    && -L "${install_symlink_cleanup_foreign_pin}" ]] \
+    || fail "private anchor recovery touched a foreign public substitute"
+
+# Even the private name can be removed by another process running as the same
+# uid. Force all three links away, churn the private name until the filesystem
+# reuses the recorded inode number, and recreate a foreign three-link set. The
+# stored no-follow text/metadata fingerprint must reject that numeric ABA and
+# retain every substitute without advertising an exact recovery command.
+install_symlink_cleanup_reuse_tools="${TEST_ROOT}/install-symlink-cleanup-reuse-tools"
+install_symlink_cleanup_reuse_stage="${TEST_ROOT}/install-symlink-cleanup-reuse-stage"
+install_symlink_cleanup_reuse_prefix="/opt/frost-install-symlink-cleanup-reuse"
+install_symlink_cleanup_reuse_workflow_dir="${install_symlink_cleanup_reuse_stage}${install_symlink_cleanup_reuse_prefix}/share/frost/workflows"
+install_symlink_cleanup_reuse_first="${install_symlink_cleanup_reuse_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_reuse_secret="${TEST_ROOT}/cleanup-reuse-private-referent"
+install_symlink_cleanup_reuse_marker="${TEST_ROOT}/install-symlink-cleanup-reuse-marker"
+install_symlink_cleanup_reuse_backup_log="${TEST_ROOT}/install-symlink-cleanup-reuse-backup"
+install_symlink_cleanup_reuse_pin_log="${TEST_ROOT}/install-symlink-cleanup-reuse-pin"
+install_symlink_cleanup_reuse_anchor_log="${TEST_ROOT}/install-symlink-cleanup-reuse-anchor"
+mkdir -p "${install_symlink_cleanup_reuse_tools}" \
+    "${install_symlink_cleanup_reuse_workflow_dir}"
+printf 'numeric ABA private sentinel\n' \
+    >"${install_symlink_cleanup_reuse_secret}"
+ln -s -- "${TEST_ROOT}/cleanup-reuse-original-referent" \
+    "${install_symlink_cleanup_reuse_first}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'previous=' \
+    'last=' \
+    'for argument do previous=${last}; last=${argument}; done' \
+    'case "${previous}" in' \
+    '    /proc/self/fd/*/.frost.install.*)' \
+    '        /usr/bin/mv "$@"' \
+    '        parent=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_PARENT:?}' \
+    '        basename=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_BASENAME:?}' \
+    '        backup=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback.??????" -print -quit)' \
+    '        pin=$(/usr/bin/find "${parent}" -maxdepth 1 -name ".${basename}.rollback-pin.*" -print -quit)' \
+    '        anchor=$(/usr/bin/find "${parent}" -mindepth 2 -maxdepth 2 -path "*/.${basename}.rollback-anchor.??????/snapshot" -print -quit)' \
+    '        : "${backup:?missing reuse backup}"' \
+    '        : "${pin:?missing reuse pin}"' \
+    '        : "${anchor:?missing reuse anchor}"' \
+    '        expected=$(/usr/bin/stat -c "%d:%i" -- "${anchor}")' \
+    '        printf "%s\n" "${backup}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_BACKUP_LOG:?}"' \
+    '        printf "%s\n" "${pin}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_PIN_LOG:?}"' \
+    '        printf "%s\n" "${anchor}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_ANCHOR_LOG:?}"' \
+    '        /usr/bin/rm -f -- "${backup}" "${pin}" "${anchor}"' \
+    '        actual=' \
+    '        attempt=0' \
+    '        while [ "${attempt}" -lt 20000 ]; do' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_SECRET:?}" "${anchor}"' \
+    '            actual=$(/usr/bin/stat -c "%d:%i" -- "${anchor}")' \
+    '            [ "${actual}" != "${expected}" ] || break' \
+    '            /usr/bin/rm -f -- "${anchor}"' \
+    '            attempt=$((attempt + 1))' \
+    '        done' \
+    '        [ "${actual}" = "${expected}" ] || exit 97' \
+    '        /usr/bin/ln -P -- "${anchor}" "${backup}"' \
+    '        /usr/bin/ln -P -- "${anchor}" "${pin}"' \
+    '        printf "%s %s\n" "${expected}" "${actual}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_MARKER:?}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/mv "$@"' \
+    >"${install_symlink_cleanup_reuse_tools}/mv"
+chmod 0755 "${install_symlink_cleanup_reuse_tools}/mv"
+install_symlink_cleanup_reuse_log="${TEST_ROOT}/install-symlink-cleanup-reuse.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_reuse_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_PARENT="${install_symlink_cleanup_reuse_workflow_dir}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_BASENAME="${install_symlink_cleanup_reuse_first##*/}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_SECRET="${install_symlink_cleanup_reuse_secret}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_MARKER="${install_symlink_cleanup_reuse_marker}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_BACKUP_LOG="${install_symlink_cleanup_reuse_backup_log}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_PIN_LOG="${install_symlink_cleanup_reuse_pin_log}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_REUSE_ANCHOR_LOG="${install_symlink_cleanup_reuse_anchor_log}" \
+    DESTDIR="${install_symlink_cleanup_reuse_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_reuse_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_reuse_log}" 2>&1
+read -r install_symlink_cleanup_reuse_expected \
+    install_symlink_cleanup_reuse_actual \
+    <"${install_symlink_cleanup_reuse_marker}"
+[[ "${install_symlink_cleanup_reuse_expected}" == \
+    "${install_symlink_cleanup_reuse_actual}" ]] \
+    || fail "numeric ABA fixture did not reuse the old symlink inode"
+for install_symlink_cleanup_reuse_path_log in \
+    "${install_symlink_cleanup_reuse_backup_log}" \
+    "${install_symlink_cleanup_reuse_pin_log}" \
+    "${install_symlink_cleanup_reuse_anchor_log}"; do
+    install_symlink_cleanup_reuse_path="$(<"${install_symlink_cleanup_reuse_path_log}")"
+    [[ -L "${install_symlink_cleanup_reuse_path}" \
+        && "$(readlink -- "${install_symlink_cleanup_reuse_path}")" == \
+            "${install_symlink_cleanup_reuse_secret}" ]] \
+        || fail "numeric ABA cleanup removed or changed a foreign substitute"
+done
+if grep -Fq -- "${install_symlink_cleanup_reuse_secret}" \
+    "${install_symlink_cleanup_reuse_log}"; then
+    fail "numeric ABA diagnostics disclosed symlink contents"
+fi
+if grep -Fq 'recovery command (symlink contents not displayed)' \
+    "${install_symlink_cleanup_reuse_log}"; then
+    fail "numeric ABA cleanup advertised a foreign recovery name"
+fi
+assert_contains "numeric ABA fail-closed diagnostic" \
+    "$(<"${install_symlink_cleanup_reuse_log}")" \
+    "retaining symlink rollback snapshot (preflight identity changed)"
+
+# Treat cleanup rm as a use point in its own right. After the main link is
+# removed, rename the bound workflow parent and replace the logical path. The
+# installer must stop before pin/anchor removal and recover only in the old
+# physical directory.
+install_symlink_cleanup_main_rm_tools="${TEST_ROOT}/install-symlink-cleanup-main-rm-tools"
+install_symlink_cleanup_main_rm_stage="${TEST_ROOT}/install-symlink-cleanup-main-rm-stage"
+install_symlink_cleanup_main_rm_prefix="/opt/frost-install-symlink-cleanup-main-rm"
+install_symlink_cleanup_main_rm_parent="${install_symlink_cleanup_main_rm_stage}${install_symlink_cleanup_main_rm_prefix}/share/frost/workflows"
+install_symlink_cleanup_main_rm_first="${install_symlink_cleanup_main_rm_parent}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_main_rm_displaced="${TEST_ROOT}/install-symlink-cleanup-main-rm-displaced"
+install_symlink_cleanup_main_rm_outside="${TEST_ROOT}/install-symlink-cleanup-main-rm-outside"
+install_symlink_cleanup_main_rm_secret="${TEST_ROOT}/install-symlink-cleanup-main-rm-secret"
+install_symlink_cleanup_main_rm_state="${TEST_ROOT}/install-symlink-cleanup-main-rm-state"
+mkdir -p "${install_symlink_cleanup_main_rm_tools}" \
+    "${install_symlink_cleanup_main_rm_parent}" \
+    "${install_symlink_cleanup_main_rm_outside}"
+printf 'main rm private sentinel\n' >"${install_symlink_cleanup_main_rm_secret}"
+printf 'main rm outside sentinel\n' \
+    >"${install_symlink_cleanup_main_rm_outside}/${WORKFLOW_SOURCES[0]##*/}"
+ln -s -- "${install_symlink_cleanup_main_rm_secret}" \
+    "${install_symlink_cleanup_main_rm_first}"
+install_symlink_cleanup_main_rm_value="$(readlink -- \
+    "${install_symlink_cleanup_main_rm_first}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.docker-tail-logs.yaml.rollback.??????)' \
+    '        state=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        /usr/bin/rm "$@"' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            /usr/bin/mv -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_PARENT:?}" "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_DISPLACED:?}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_OUTSIDE:?}" "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_PARENT}"' \
+    '        fi' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_symlink_cleanup_main_rm_tools}/rm"
+chmod 0755 "${install_symlink_cleanup_main_rm_tools}/rm"
+install_symlink_cleanup_main_rm_log="${TEST_ROOT}/install-symlink-cleanup-main-rm.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_main_rm_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_STATE="${install_symlink_cleanup_main_rm_state}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_PARENT="${install_symlink_cleanup_main_rm_parent}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_DISPLACED="${install_symlink_cleanup_main_rm_displaced}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_MAIN_RM_OUTSIDE="${install_symlink_cleanup_main_rm_outside}" \
+    DESTDIR="${install_symlink_cleanup_main_rm_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_main_rm_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_main_rm_log}" 2>&1
+[[ "$(<"${install_symlink_cleanup_main_rm_state}")" == 2 ]] \
+    || fail "main rollback name was not removed at both reservation and cleanup"
+[[ -L "${install_symlink_cleanup_main_rm_parent}" ]] \
+    || fail "main cleanup use point did not replace the logical parent"
+install_symlink_cleanup_main_rm_pin="$(find \
+    "${install_symlink_cleanup_main_rm_displaced}" -maxdepth 1 \
+    -name '.docker-tail-logs.yaml.rollback-pin.*' -print -quit)"
+install_symlink_cleanup_main_rm_anchor="$(find \
+    "${install_symlink_cleanup_main_rm_displaced}" -mindepth 2 -maxdepth 2 \
+    -path '*/.docker-tail-logs.yaml.rollback-anchor.??????/snapshot' \
+    -print -quit)"
+[[ -L "${install_symlink_cleanup_main_rm_pin}" \
+    && -L "${install_symlink_cleanup_main_rm_anchor}" ]] \
+    || fail "parent rename after main cleanup lost pin/anchor recovery links"
+[[ "$(stat -c '%d:%i' -- "${install_symlink_cleanup_main_rm_pin}")" == \
+    "$(stat -c '%d:%i' -- "${install_symlink_cleanup_main_rm_anchor}")" ]] \
+    || fail "retained pin/anchor no longer share the exact inode"
+install_symlink_cleanup_main_rm_command="$(extract_symlink_recovery_command \
+    "main cleanup use point" "${install_symlink_cleanup_main_rm_log}")"
+bash -n -c "${install_symlink_cleanup_main_rm_command}" \
+    || fail "main cleanup use-point recovery command is not valid shell"
+PATH="${TEST_PATH}" bash -c "${install_symlink_cleanup_main_rm_command}"
+[[ -L "${install_symlink_cleanup_main_rm_displaced}/${WORKFLOW_SOURCES[0]##*/}" \
+    && "$(readlink -- \
+        "${install_symlink_cleanup_main_rm_displaced}/${WORKFLOW_SOURCES[0]##*/}")" == \
+        "${install_symlink_cleanup_main_rm_value}" ]] \
+    || fail "main cleanup use-point recovery restored the wrong symlink"
+[[ "$(<"${install_symlink_cleanup_main_rm_outside}/${WORKFLOW_SOURCES[0]##*/}")" == \
+    'main rm outside sentinel' ]] \
+    || fail "main cleanup use point crossed into the replacement parent"
+
+# The pin unlink is a separate use point after main is already gone. Recreate a
+# foreign pin only after rm completed: cleanup must not touch it or proceed to
+# the exact private anchor, which remains the sole recovery source.
+install_symlink_cleanup_pin_rm_tools="${TEST_ROOT}/install-symlink-cleanup-pin-rm-tools"
+install_symlink_cleanup_pin_rm_stage="${TEST_ROOT}/install-symlink-cleanup-pin-rm-stage"
+install_symlink_cleanup_pin_rm_prefix="/opt/frost-install-symlink-cleanup-pin-rm"
+install_symlink_cleanup_pin_rm_parent="${install_symlink_cleanup_pin_rm_stage}${install_symlink_cleanup_pin_rm_prefix}/share/frost/workflows"
+install_symlink_cleanup_pin_rm_first="${install_symlink_cleanup_pin_rm_parent}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_pin_rm_original="${TEST_ROOT}/install-symlink-cleanup-pin-rm-original"
+install_symlink_cleanup_pin_rm_foreign="${TEST_ROOT}/install-symlink-cleanup-pin-rm-foreign"
+install_symlink_cleanup_pin_rm_state="${TEST_ROOT}/install-symlink-cleanup-pin-rm-state"
+install_symlink_cleanup_pin_rm_path_log="${TEST_ROOT}/install-symlink-cleanup-pin-rm-path"
+mkdir -p "${install_symlink_cleanup_pin_rm_tools}" \
+    "${install_symlink_cleanup_pin_rm_parent}"
+printf 'pin rm original sentinel\n' >"${install_symlink_cleanup_pin_rm_original}"
+printf 'pin rm foreign sentinel\n' >"${install_symlink_cleanup_pin_rm_foreign}"
+ln -s -- "${install_symlink_cleanup_pin_rm_original}" \
+    "${install_symlink_cleanup_pin_rm_first}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/*.rollback-pin.*)' \
+    '        state=${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_RM_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        /usr/bin/rm "$@"' \
+    '        if [ "${count}" -eq 2 ]; then' \
+    '            parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '            printf "%s/%s\n" "${parent}" "${last##*/}" >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_RM_PATH_LOG:?}"' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_RM_FOREIGN:?}" "${last}"' \
+    '        fi' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_symlink_cleanup_pin_rm_tools}/rm"
+chmod 0755 "${install_symlink_cleanup_pin_rm_tools}/rm"
+install_symlink_cleanup_pin_rm_log="${TEST_ROOT}/install-symlink-cleanup-pin-rm.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_pin_rm_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_RM_STATE="${install_symlink_cleanup_pin_rm_state}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_RM_PATH_LOG="${install_symlink_cleanup_pin_rm_path_log}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_PIN_RM_FOREIGN="${install_symlink_cleanup_pin_rm_foreign}" \
+    DESTDIR="${install_symlink_cleanup_pin_rm_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_pin_rm_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_pin_rm_log}" 2>&1
+install_symlink_cleanup_pin_rm_path="$(<"${install_symlink_cleanup_pin_rm_path_log}")"
+install_symlink_cleanup_pin_rm_anchor="$(find \
+    "${install_symlink_cleanup_pin_rm_parent}" -mindepth 2 -maxdepth 2 \
+    -path '*/.docker-tail-logs.yaml.rollback-anchor.??????/snapshot' \
+    -print -quit)"
+[[ -L "${install_symlink_cleanup_pin_rm_path}" \
+    && "$(readlink -- "${install_symlink_cleanup_pin_rm_path}")" == \
+        "${install_symlink_cleanup_pin_rm_foreign}" ]] \
+    || fail "pin cleanup use point removed or changed its substitute"
+[[ -L "${install_symlink_cleanup_pin_rm_anchor}" \
+    && "$(readlink -- "${install_symlink_cleanup_pin_rm_anchor}")" == \
+        "${install_symlink_cleanup_pin_rm_original}" ]] \
+    || fail "pin cleanup use point did not retain the private anchor"
+install_symlink_cleanup_pin_rm_command="$(extract_symlink_recovery_command \
+    "pin cleanup use point" "${install_symlink_cleanup_pin_rm_log}")"
+bash -n -c "${install_symlink_cleanup_pin_rm_command}" \
+    || fail "pin cleanup use-point recovery command is not valid shell"
+PATH="${TEST_PATH}" bash -c "${install_symlink_cleanup_pin_rm_command}"
+[[ -L "${install_symlink_cleanup_pin_rm_first}" \
+    && "$(readlink -- "${install_symlink_cleanup_pin_rm_first}")" == \
+        "${install_symlink_cleanup_pin_rm_original}" ]] \
+    || fail "pin cleanup use-point recovery restored the wrong symlink"
+[[ -L "${install_symlink_cleanup_pin_rm_path}" ]] \
+    || fail "pin cleanup recovery touched the foreign pin"
+
+# Finally, rename the random 0700 directory immediately after the exact anchor
+# unlink. No public recovery link remains, but the installer must not follow or
+# remove a new logical directory name; the displaced empty directory is kept
+# as an explicit fail-closed residue.
+install_symlink_cleanup_anchor_rm_tools="${TEST_ROOT}/install-symlink-cleanup-anchor-rm-tools"
+install_symlink_cleanup_anchor_rm_stage="${TEST_ROOT}/install-symlink-cleanup-anchor-rm-stage"
+install_symlink_cleanup_anchor_rm_prefix="/opt/frost-install-symlink-cleanup-anchor-rm"
+install_symlink_cleanup_anchor_rm_parent="${install_symlink_cleanup_anchor_rm_stage}${install_symlink_cleanup_anchor_rm_prefix}/share/frost/workflows"
+install_symlink_cleanup_anchor_rm_first="${install_symlink_cleanup_anchor_rm_parent}/${WORKFLOW_SOURCES[0]##*/}"
+install_symlink_cleanup_anchor_rm_original="${TEST_ROOT}/install-symlink-cleanup-anchor-rm-original"
+install_symlink_cleanup_anchor_rm_displaced="${TEST_ROOT}/install-symlink-cleanup-anchor-rm-displaced"
+install_symlink_cleanup_anchor_rm_marker="${TEST_ROOT}/install-symlink-cleanup-anchor-rm-marker"
+mkdir -p "${install_symlink_cleanup_anchor_rm_tools}" \
+    "${install_symlink_cleanup_anchor_rm_parent}"
+printf 'anchor rm original sentinel\n' \
+    >"${install_symlink_cleanup_anchor_rm_original}"
+ln -s -- "${install_symlink_cleanup_anchor_rm_original}" \
+    "${install_symlink_cleanup_anchor_rm_first}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/snapshot)' \
+    '        /usr/bin/rm "$@"' \
+    '        physical=$(/usr/bin/readlink -- "${last%/*}")' \
+    '        /usr/bin/mv -- "${physical}" "${FROST_TEST_INSTALL_SYMLINK_CLEANUP_ANCHOR_RM_DISPLACED:?}"' \
+    '        : >"${FROST_TEST_INSTALL_SYMLINK_CLEANUP_ANCHOR_RM_MARKER:?}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_symlink_cleanup_anchor_rm_tools}/rm"
+chmod 0755 "${install_symlink_cleanup_anchor_rm_tools}/rm"
+install_symlink_cleanup_anchor_rm_log="${TEST_ROOT}/install-symlink-cleanup-anchor-rm.log"
+env HOME="${TEST_HOME}" \
+    PATH="${install_symlink_cleanup_anchor_rm_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_ANCHOR_RM_DISPLACED="${install_symlink_cleanup_anchor_rm_displaced}" \
+    FROST_TEST_INSTALL_SYMLINK_CLEANUP_ANCHOR_RM_MARKER="${install_symlink_cleanup_anchor_rm_marker}" \
+    DESTDIR="${install_symlink_cleanup_anchor_rm_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" \
+    --prefix "${install_symlink_cleanup_anchor_rm_prefix}" --no-desktop \
+    >"${install_symlink_cleanup_anchor_rm_log}" 2>&1
+assert_regular_file "private anchor cleanup rename marker" \
+    "${install_symlink_cleanup_anchor_rm_marker}"
+[[ -d "${install_symlink_cleanup_anchor_rm_displaced}" \
+    && -z "$(find "${install_symlink_cleanup_anchor_rm_displaced}" \
+        -mindepth 1 -print -quit)" ]] \
+    || fail "anchor cleanup did not retain the displaced empty private directory"
+assert_mode "displaced private anchor directory" \
+    "${install_symlink_cleanup_anchor_rm_displaced}" 700
+assert_contains "private anchor directory rename warning" \
+    "$(<"${install_symlink_cleanup_anchor_rm_log}")" \
+    'empty private rollback directory retained after its identity changed'
+if grep -Fq 'recovery command (symlink contents not displayed)' \
+    "${install_symlink_cleanup_anchor_rm_log}"; then
+    fail "completed anchor unlink advertised a nonexistent recovery name"
+fi
 
 # External wrappers may report failure after completing an operation. Exact
 # post-action state wins: reservation/cleanup rm must observe absence, ln must
