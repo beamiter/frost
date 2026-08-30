@@ -342,3 +342,8 @@ Round 70 closes the remaining argument-form affordance gap:
     directly. Both remain transitively locked where `jterm_core`/wgpu need them,
     but frost no longer claims their APIs as app-owned build inputs or requires
     future maintainers to review two misleading direct edges.
+
+76. **Fixed and exhaustive CI baseline** — every validation job now names
+    Ubuntu 24.04 instead of following the moving `ubuntu-latest` alias. The
+    test job and documented local command also use `--no-fail-fast`, so one
+    failing target cannot hide independent failures in the rest of the matrix.

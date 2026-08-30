@@ -641,7 +641,7 @@ cargo fmt --all -- --check
 cargo deny --locked check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
-cargo test --all-targets --all-features --locked
+cargo test --all-targets --all-features --locked --no-fail-fast
 cargo build --release --all-features --locked
 bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
