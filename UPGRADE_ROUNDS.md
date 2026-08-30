@@ -402,3 +402,12 @@ Round 70 closes the remaining argument-form affordance gap:
     then atomically published one by one and the executable is the final commit
     marker. The contract explicitly stops short of claiming a cross-filesystem
     transaction during that short rename phase.
+
+84. **Reversible publish phase** — before the first rename, every existing
+    destination is copied without following symlinks into a private sibling
+    rollback backup. A failed rename or catchable termination restores every
+    attempted destination in reverse order and removes new destinations that
+    had no predecessor; a deterministic final-binary rename failure proves all
+    pre-existing resources plus the executable regain their prior bytes and
+    modes while an originally absent icon remains absent. If restoration itself
+    fails, the recovery backup is retained and named.

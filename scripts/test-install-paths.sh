@@ -492,6 +492,72 @@ assert_contains "late staging failure diagnostic" \
 [[ -z "$(find "${stage_failure_root}" -type f -name '*.install.*' -print -quit)" ]] \
     || fail "late staging failure left an install temporary"
 
+# Fail the executable's final rename after every resource has published. The
+# exit trap must restore the full old generation in reverse order, including
+# content/mode, and remove both staging files and rollback backups.
+rollback_tools="${TEST_ROOT}/rollback-tools"
+rollback_stage="${TEST_ROOT}/rollback-stage"
+rollback_prefix="/opt/frost-rollback"
+rollback_state="${TEST_ROOT}/rollback-mv-count"
+mkdir -p "${rollback_tools}"
+env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${rollback_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" \
+    --prefix "${rollback_prefix}" >/dev/null
+rollback_share="${rollback_stage}${rollback_prefix}/share"
+rollback_targets=(
+    "${rollback_share}/applications/${app_id}.desktop"
+    "${rollback_share}/metainfo/${app_id}.metainfo.xml"
+    "${rollback_share}/icons/hicolor/scalable/apps/${app_id}.svg"
+    "${rollback_share}/icons/hicolor/128x128/apps/${app_id}.png"
+    "${rollback_share}/icons/hicolor/256x256/apps/${app_id}.png"
+)
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    rollback_targets+=(
+        "${rollback_share}/frost/workflows/${source##*/}"
+    )
+done
+rollback_targets+=("${rollback_stage}${rollback_prefix}/bin/frost")
+for index in "${!rollback_targets[@]}"; do
+    printf 'old rollback target %s\n' "${index}" >"${rollback_targets[index]}"
+    chmod 0600 "${rollback_targets[index]}"
+done
+rollback_absent_target="${rollback_targets[4]}"
+rm -f -- "${rollback_absent_target}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'state=${FROST_TEST_MV_STATE:?}' \
+    'count=0' \
+    '[ ! -f "${state}" ] || read -r count <"${state}"' \
+    'count=$((count + 1))' \
+    'printf "%s\n" "${count}" >"${state}"' \
+    '[ "${count}" -ne 12 ] || exit 74' \
+    'exec /usr/bin/mv "$@"' \
+    >"${rollback_tools}/mv"
+chmod 0755 "${rollback_tools}/mv"
+if env HOME="${TEST_HOME}" PATH="${rollback_tools}:${TEST_PATH}" \
+    FROST_TEST_MV_STATE="${rollback_state}" DESTDIR="${rollback_stage}" \
+    "${INSTALLER}" --binary "${prebuilt_binary}" \
+    --prefix "${rollback_prefix}" >"${TEST_ROOT}/rollback.log" 2>&1; then
+    fail "installer accepted a final executable rename failure"
+fi
+assert_contains "publish rollback diagnostic" "$(<"${TEST_ROOT}/rollback.log")" \
+    "cannot atomically replace ${rollback_stage}${rollback_prefix}/bin/frost"
+for index in "${!rollback_targets[@]}"; do
+    if [[ "${rollback_targets[index]}" == "${rollback_absent_target}" ]]; then
+        assert_absent "new target removed by publish rollback" \
+            "${rollback_targets[index]}"
+        continue
+    fi
+    [[ "$(<"${rollback_targets[index]}")" == "old rollback target ${index}" ]] \
+        || fail "publish rollback changed target ${rollback_targets[index]}"
+    assert_mode "publish rollback target" "${rollback_targets[index]}" 600
+done
+[[ -z "$(find "${rollback_stage}" \
+    \( -name '*.install.*' -o -name '*.rollback.*' \) -print -quit)" ]] \
+    || fail "publish rollback left a temporary or backup"
+
 interrupt_tools="${TEST_ROOT}/interrupt-tools"
 interrupt_stage="${TEST_ROOT}/interrupt-stage"
 interrupt_prefix="/opt/frost-interrupt"

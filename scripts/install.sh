@@ -22,6 +22,11 @@ INSTALL_DESKTOP=1
 DRY_RUN=0
 INSTALL_TEMPS=()
 INSTALL_DESTS=()
+INSTALL_BACKUPS=()
+INSTALL_ORIGINAL_PRESENT=()
+PUBLISH_IN_PROGRESS=0
+PUBLISH_LAST_ATTEMPT=-1
+KEEP_INSTALL_BACKUPS=0
 
 usage() {
     cat <<'USAGE'
@@ -47,18 +52,74 @@ die() {
     exit 1
 }
 
-cleanup_install_temps() {
-    local temp
+cleanup_install_artifacts() {
+    local temp path
     for temp in "${INSTALL_TEMPS[@]}"; do
         if ((DRY_RUN == 0)) && [[ -n "${temp}" ]]; then
-            rm -f -- "${temp}" || true
+            rm -f -- "${temp}" \
+                || printf 'frost install: warning: cannot remove temporary %s\n' \
+                    "${temp}" >&2
         fi
     done
+    if ((KEEP_INSTALL_BACKUPS == 0)); then
+        for path in "${INSTALL_BACKUPS[@]}"; do
+            if ((DRY_RUN == 0)) && [[ -n "${path}" ]]; then
+                rm -f -- "${path}" \
+                    || printf 'frost install: warning: cannot remove rollback backup %s\n' \
+                        "${path}" >&2
+            fi
+        done
+    fi
     INSTALL_TEMPS=()
     INSTALL_DESTS=()
+    INSTALL_BACKUPS=()
+    INSTALL_ORIGINAL_PRESENT=()
 }
 
-trap cleanup_install_temps EXIT
+rollback_install_plan() {
+    local index dest backup rollback_failed=0
+    for ((index = PUBLISH_LAST_ATTEMPT; index >= 0; index--)); do
+        dest="${INSTALL_DESTS[index]}"
+        if (( ${INSTALL_ORIGINAL_PRESENT[index]:-0} == 1 )); then
+            backup="${INSTALL_BACKUPS[index]:-}"
+            if [[ -n "${backup}" && ( -e "${backup}" || -L "${backup}" ) ]]; then
+                if mv -fT -- "${backup}" "${dest}"; then
+                    INSTALL_BACKUPS[index]=""
+                else
+                    printf 'frost install: rollback failed for %s; backup retained at %s\n' \
+                        "${dest}" "${backup}" >&2
+                    rollback_failed=1
+                fi
+            else
+                printf 'frost install: rollback backup missing for %s\n' \
+                    "${dest}" >&2
+                rollback_failed=1
+            fi
+        elif ! rm -f -- "${dest}"; then
+            printf 'frost install: rollback could not remove new target %s\n' \
+                "${dest}" >&2
+            rollback_failed=1
+        fi
+    done
+    PUBLISH_IN_PROGRESS=0
+    PUBLISH_LAST_ATTEMPT=-1
+    if ((rollback_failed == 1)); then
+        KEEP_INSTALL_BACKUPS=1
+        return 1
+    fi
+}
+
+finish_install() {
+    local status=$?
+    trap - EXIT
+    if ((PUBLISH_IN_PROGRESS == 1)); then
+        rollback_install_plan || status=1
+    fi
+    cleanup_install_artifacts
+    exit "${status}"
+}
+
+trap finish_install EXIT
 
 print_command() {
     printf '  '
@@ -222,19 +283,53 @@ stage_install_binary() {
     fi
 }
 
+prepare_install_backups() {
+    local index dest directory basename backup
+    INSTALL_BACKUPS=()
+    INSTALL_ORIGINAL_PRESENT=()
+    for index in "${!INSTALL_DESTS[@]}"; do
+        dest="${INSTALL_DESTS[index]}"
+        if [[ -e "${dest}" || -L "${dest}" ]]; then
+            [[ -f "${dest}" || -L "${dest}" ]] \
+                || die "install destination is not a regular file or symlink: ${dest}"
+            directory="${dest%/*}"
+            basename="${dest##*/}"
+            backup="$(mktemp "${directory}/.${basename}.rollback.XXXXXX")" \
+                || die "cannot reserve rollback backup beside ${dest}"
+            INSTALL_BACKUPS[index]="${backup}"
+            INSTALL_ORIGINAL_PRESENT[index]=1
+            rm -f -- "${backup}" \
+                || die "cannot prepare rollback backup beside ${dest}"
+            if ! cp -a --no-dereference --no-preserve=ownership -- \
+                "${dest}" "${backup}"; then
+                die "cannot back up existing install target ${dest}"
+            fi
+        else
+            INSTALL_BACKUPS[index]=""
+            INSTALL_ORIGINAL_PRESENT[index]=0
+        fi
+    done
+}
+
 publish_install_plan() {
     local index temp dest
+    if ((DRY_RUN == 0)); then
+        prepare_install_backups
+        PUBLISH_IN_PROGRESS=1
+    fi
     for index in "${!INSTALL_TEMPS[@]}"; do
         temp="${INSTALL_TEMPS[index]}"
         dest="${INSTALL_DESTS[index]}"
         print_command mv -fT -- "${temp}" "${dest}"
+        PUBLISH_LAST_ATTEMPT="${index}"
         if ((DRY_RUN == 0)) && ! mv -fT -- "${temp}" "${dest}"; then
             die "cannot atomically replace ${dest}"
         fi
         INSTALL_TEMPS[index]=""
     done
-    INSTALL_TEMPS=()
-    INSTALL_DESTS=()
+    PUBLISH_IN_PROGRESS=0
+    PUBLISH_LAST_ATTEMPT=-1
+    cleanup_install_artifacts
 }
 
 # Bash cannot make the initial no-symlink check and open atomic. Once the open
@@ -541,6 +636,7 @@ require_command install
 require_command mktemp
 require_command mv
 require_command rm
+require_command cp
 if ((INSTALL_DESKTOP == 1)); then
     require_command awk
     require_command chmod

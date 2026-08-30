@@ -143,9 +143,11 @@ cargo build --release --locked
 权限统一设为 `0755`。目标同目录中的私有临时文件写完后，由 GNU `mv -T` 原子替换；复制失败
 或发布阶段前退出会清理整批未提交临时文件并保留旧版本。binary、workflow、desktop、元数据与
 图标会全部 staging 成功后才开始 rename；资源先发布，二进制作为最后一个提交点，因此任何
-复制/转换失败都不会留下半升级。各 rename 自身原子，但整批 rename 不是跨文件系统事务；发布
-阶段的并发目标替换、强制终止或 I/O 错误仍可能留下混合资源版本。除上述条件外还需要 GNU
-coreutils 的 `mktemp`/`mv`。它可与
+复制/转换失败都不会留下半升级。发布前还会为每个既有目标创建不跟随符号链接的同目录回滚
+副本；rename 失败或可捕获的终止信号会按逆序恢复已尝试目标。各 rename 自身原子，但整批
+rename 不是文件系统事务：`SIGKILL`、掉电、并发目标替换或回滚本身的 I/O 故障仍可能留下混合
+版本；恢复失败时 backup 会保留并打印路径，不会被清理。除上述条件外还需要 GNU coreutils 的
+`cp`/`mktemp`/`mv`。它可与
 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR` 组合使用。
 零字节预编译产物会在旧目标改变前被拒绝。desktop、AppStream、SVG 与 PNG 源文件都在
 构建/写入前预检，公共资源也以明确权限写入目标同目录临时文件后原子 rename。非根
