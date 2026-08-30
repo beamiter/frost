@@ -1,0 +1,13 @@
+# Keep these exact exceptions aligned with deny.toml. Both are unmaintained
+# notices in the current iced/image graph, not vulnerabilities or unsoundness.
+[advisories]
+ignore = [
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2026-0192",
+]
+
+# cargo-audit otherwise reports informational advisories but exits successfully.
+# New unmaintained, unsound, notice, or yanked findings must fail the gate.
+[output]
+deny = ["warnings"]
+quiet = false

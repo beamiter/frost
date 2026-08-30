@@ -347,3 +347,14 @@ Round 70 closes the remaining argument-form affordance gap:
     Ubuntu 24.04 instead of following the moving `ubuntu-latest` alias. The
     test job and documented local command also use `--no-fail-fast`, so one
     failing target cannot hide independent failures in the rest of the matrix.
+
+77. **One fail-closed security entry point** — local `--all` and CI's
+    `--policy`, `--audit`, and `--shell` modes now share a single script. It
+    first proves the lockfile is usable, keeps cargo-deny and RustSec on that
+    exact graph, exposes duplicate crates, and discovers every shell script so
+    a new maintenance entry point cannot silently escape Bash and ShellCheck.
+    The unified gate exposed cargo-audit's success exit for warnings and the
+    newly reported unsound `lru 0.16.4` below iced/cryoglyph. A project audit
+    policy now denies every new warning outside the two exact unmaintained
+    exceptions, while a Rust-source-identical cryoglyph patch selects fixed
+    `lru 0.18.2` until upstream publishes that dependency repair.

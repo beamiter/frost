@@ -1,9 +1,9 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (the shared TOML/YAML workflow library, and the missing-value
-guard four terminals implemented and none could reach; shared review-first command
-correction; the consent switch that surface never read; the shared AI chat store and
-the quit-path write that erased the saved chat library)
+Updated: 2026-08-30 (a fail-closed local/CI security entry point and the
+RUSTSEC-2026-0253 dependency repair; the shared TOML/YAML workflow library and
+review-first command correction; the shared AI chat store and its persistence
+boundary)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
 native bounded OSC 8 interaction, hardened app-owned helper processes, and a tested
@@ -1003,27 +1003,15 @@ cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
-bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
-shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+scripts/security-check.sh
 bash scripts/test-install-paths.sh
 ```
 
-The three Rust gates were rerun for this round with `--locked` against the published
-`jterm_core` `790d06a`: `cargo fmt --all -- --check` reports no diff, Clippy is silent
-at `-D warnings`, and the suite is 992 passing with zero failures. The drop from the
-previous round's 1,006 is this migration exactly: workflows had twenty-three tests
-across `src/workflows.rs` (18) and `src/workflow_picker.rs` (5), and has nine — three
-in `src/workflows.rs` pinning frost's search-path policy, its precedence load order
-and the bundled-library contract, and six in `src/workflow_picker.rs` covering the
-iced wrappers, the query-boundary crossing, and the argument form's new
-supplied-versus-unset behaviour. Each of the fifteen deletions has a named counterpart
-in `jterm_core::workflows` — `render_leaves_unterminated_braces_alone` became
-`an_unterminated_double_brace_survives_verbatim` *plus*
-`an_unterminated_double_brace_survives_a_placeholder_later_in_the_template`,
-which is the case frost's version never asked about, and
-`installed_assets_follow_every_system_data_directory` became
-`search_path_lists_every_tier_in_precedence_order`. The install-path and
-packaging checks above were not rerun: this round touched no script, desktop file or
-metadata. `scripts/workflows/docker-tail-logs.yaml` changed, but it is data the
-`every_bundled_workflow_is_parseable_and_review_only` test loads, not an installed
-artifact those checks inspect.
+The complete gate was rerun against published `jterm_core` `f60c507`. Formatting,
+zero-warning Clippy and rustdoc, the 992-test matrix, and the release build pass
+with the patched cryoglyph. The unified security entry point passes cargo-deny,
+warnings-denied cargo-audit, duplicate reporting, Bash parsing, and ShellCheck;
+the old lockfile is a negative control that fails specifically on
+RUSTSEC-2026-0253. The vendored Rust sources, README, and three license files are
+byte-identical to crates.io cryoglyph 0.1.0, while its manifest differs only in
+the documented `lru 0.18.2` requirement.

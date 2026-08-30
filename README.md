@@ -638,20 +638,23 @@ frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不
 
 ```bash
 cargo fmt --all -- --check
-cargo deny --locked check
+scripts/security-check.sh
 cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 cargo test --all-targets --all-features --locked --no-fail-fast
 cargo build --release --all-features --locked
-bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
-shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
 bash scripts/test-install-paths.sh
 desktop-file-validate data/io.github.beamiter.frost.desktop
 appstreamcli validate --pedantic --no-net data/io.github.beamiter.frost.metainfo.xml
 ```
 
-CI 对依赖来源/许可证、格式、零警告 Clippy/rustdoc、全量测试和 release 构建分别设有独立质量门槛；安装测试还会用
+`security-check.sh` 要求 `cargo-deny`、`cargo-audit` 与 ShellCheck；也可用
+`--policy`、`--audit` 或 `--shell` 单独运行对应子门。CI 对依赖来源/许可证、
+RustSec、格式、零警告 Clippy/rustdoc、全量测试和 release 构建分别设有独立质量门槛；安装测试还会用
 预编译 fixture 做一次真实 `DESTDIR` 安装/卸载往返，核对权限、桌面启动路径和全部资源文件。
+项目级 cargo-audit 策略把新的 warning 也视为失败；`vendor/cryoglyph` 是
+crates.io 0.1.0 的源码，仅把受 RUSTSEC-2026-0253 影响的 `lru 0.16`
+约束提升到已修复的 0.18.2，待上游发布等价修复后即可删除。
 
 调试构建可设置 `FROST_DEBUG=1` 输出有界的协议字节预览。
 

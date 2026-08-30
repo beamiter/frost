@@ -40,7 +40,7 @@ jobs:
           --locked --force
 
       - name: Enforce dependency policy
-        run: cargo deny --locked check
+        run: scripts/security-check.sh --policy
 
   fmt:
     name: Rustfmt
@@ -80,8 +80,7 @@ jobs:
 
       - name: Check installer contracts
         run: |
-          bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
-          shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh
+          scripts/security-check.sh --shell
           bash scripts/test-install-paths.sh
 
       - name: Validate desktop integration metadata

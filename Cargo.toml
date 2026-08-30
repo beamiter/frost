@@ -51,3 +51,8 @@ lto = "thin"
 strip = "symbols"
 codegen-units = 1
 opt-level = 3
+
+# cryoglyph 0.1.0 requires the unsound lru 0.16 line. This Rust-source-identical
+# local copy changes only that dependency to the RustSec-fixed 0.18.2 release.
+[patch.crates-io]
+cryoglyph = { path = "vendor/cryoglyph" }
