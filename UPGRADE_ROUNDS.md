@@ -17,7 +17,8 @@ are numbered 11–30.
    renamed over the target without following a destination symlink.
 7. **Pre-commit cleanup** — EXIT cleanup tracks the sole live temporary and
    preserves the old executable only until rename commits the binary; later
-   resource failures do not imply rollback.
+   resource failures do not imply rollback. Superseded by round 83's complete
+   staging plan and executable-last publication.
 8. **Atomic desktop replacement** — an unpredictable same-directory temporary
    removes the predictable `.new` staging race.
 9. **Remote-host semantic gate** — one application gate combines spoofing and
@@ -393,3 +394,11 @@ Round 70 closes the remaining argument-form affordance gap:
     non-root `DESTDIR`. A regression puts the symlink only in the final 256px
     icon branch and proves both the old binary and the outside directory remain
     byte-for-byte untouched when the entire upgrade is rejected.
+
+83. **Stage-complete publication** — every workflow, transformed desktop entry,
+    metadata file, icon, and executable is copied into a sibling temporary
+    before the first destination rename. Any copy/transform failure cleans the
+    entire queue and leaves the installed generation unchanged; resources are
+    then atomically published one by one and the executable is the final commit
+    marker. The contract explicitly stops short of claiming a cross-filesystem
+    transaction during that short rename phase.

@@ -20,7 +20,8 @@ PREBUILT_BINARY=""
 PREBUILT_FD=""
 INSTALL_DESKTOP=1
 DRY_RUN=0
-INSTALL_TEMP=""
+INSTALL_TEMPS=()
+INSTALL_DESTS=()
 
 usage() {
     cat <<'USAGE'
@@ -46,14 +47,18 @@ die() {
     exit 1
 }
 
-cleanup_install_temp() {
-    if [[ -n "${INSTALL_TEMP:-}" ]]; then
-        rm -f -- "${INSTALL_TEMP}"
-        INSTALL_TEMP=""
-    fi
+cleanup_install_temps() {
+    local temp
+    for temp in "${INSTALL_TEMPS[@]}"; do
+        if ((DRY_RUN == 0)) && [[ -n "${temp}" ]]; then
+            rm -f -- "${temp}" || true
+        fi
+    done
+    INSTALL_TEMPS=()
+    INSTALL_DESTS=()
 }
 
-trap cleanup_install_temp EXIT
+trap cleanup_install_temps EXIT
 
 print_command() {
     printf '  '
@@ -173,46 +178,63 @@ validate_staging_target() {
     done
 }
 
-install_file_atomic() {
-    local mode="$1" source="$2" dest="$3" directory basename
-    printf '  install -m %q %q %q && mv -fT -- %q %q\n' \
-        "${mode}" "${source}" "${dest}.<temporary>" "${dest}.<temporary>" "${dest}"
-    ((DRY_RUN == 0)) || return 0
+stage_install_file() {
+    local mode="$1" source="$2" dest="$3" directory basename temp
+    printf '  install -m %q %q %q\n' \
+        "${mode}" "${source}" "${dest}.<temporary>"
+    if ((DRY_RUN == 1)); then
+        INSTALL_TEMPS+=("${dest}.<temporary>")
+        INSTALL_DESTS+=("${dest}")
+        return 0
+    fi
     directory="${dest%/*}"
     basename="${dest##*/}"
-    install -d -m 0755 "${directory}"
-    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
+    install -d -m 0755 "${directory}" \
+        || die "cannot create destination directory for ${dest}"
+    temp="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
         || die "cannot create temporary file beside ${dest}"
-    if ! install -m "${mode}" "${source}" "${INSTALL_TEMP}"; then
-        cleanup_install_temp
+    INSTALL_TEMPS+=("${temp}")
+    INSTALL_DESTS+=("${dest}")
+    if ! install -m "${mode}" "${source}" "${temp}"; then
         die "cannot stage ${dest}"
     fi
-    if ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
-        cleanup_install_temp
-        die "cannot atomically replace ${dest}"
-    fi
-    INSTALL_TEMP=""
 }
 
-# Keep the temporary on the destination filesystem so the final rename is
-# atomic. Copy/rename failures remove the temp and preserve the old binary.
-install_binary_atomic() {
-    local source="$1" dest="$2"
-    printf '  install -m 0755 %q %q && mv -fT -- %q %q\n' \
-        "${source}" "${dest}.<temporary>" "${dest}.<temporary>" "${dest}"
-    ((DRY_RUN == 0)) || return 0
-
-    INSTALL_TEMP="$(mktemp "${dest}.install.XXXXXX")" \
+# Keep the binary temporary on its destination filesystem. It is queued after
+# every resource so publish_install_plan makes the executable the last commit.
+stage_install_binary() {
+    local source="$1" dest="$2" directory temp
+    printf '  install -m 0755 %q %q\n' "${source}" "${dest}.<temporary>"
+    if ((DRY_RUN == 1)); then
+        INSTALL_TEMPS+=("${dest}.<temporary>")
+        INSTALL_DESTS+=("${dest}")
+        return 0
+    fi
+    directory="${dest%/*}"
+    install -d -m 0755 "${directory}" \
+        || die "cannot create binary directory for ${dest}"
+    temp="$(mktemp "${dest}.install.XXXXXX")" \
         || die "cannot create temporary binary beside ${dest}"
-    if ! install -m 0755 "${source}" "${INSTALL_TEMP}"; then
-        cleanup_install_temp
+    INSTALL_TEMPS+=("${temp}")
+    INSTALL_DESTS+=("${dest}")
+    if ! install -m 0755 "${source}" "${temp}"; then
         die "cannot stage binary for ${dest}"
     fi
-    if ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
-        cleanup_install_temp
-        die "cannot atomically replace ${dest}"
-    fi
-    INSTALL_TEMP=""
+}
+
+publish_install_plan() {
+    local index temp dest
+    for index in "${!INSTALL_TEMPS[@]}"; do
+        temp="${INSTALL_TEMPS[index]}"
+        dest="${INSTALL_DESTS[index]}"
+        print_command mv -fT -- "${temp}" "${dest}"
+        if ((DRY_RUN == 0)) && ! mv -fT -- "${temp}" "${dest}"; then
+            die "cannot atomically replace ${dest}"
+        fi
+        INSTALL_TEMPS[index]=""
+    done
+    INSTALL_TEMPS=()
+    INSTALL_DESTS=()
 }
 
 # Bash cannot make the initial no-symlink check and open atomic. Once the open
@@ -322,18 +344,26 @@ validate_desktop_exec_path() {
     fi
 }
 
-install_desktop_entry() {
-    local source="$1" dest="$2" exec_path exec_value try_exec_value desktop_dir
+stage_desktop_entry() {
+    local source="$1" dest="$2" exec_path exec_value try_exec_value desktop_dir temp
     exec_path="$(desktop_exec_path)"
     validate_desktop_exec_path "${exec_path}"
     exec_value="$(desktop_exec_value "${exec_path}")"
     try_exec_value="$(desktop_try_exec_value "${exec_path}")"
-    printf '  install -Dm0644 (Exec=%s) %q %q\n' "${exec_path}" "${source}" "${dest}"
-    ((DRY_RUN == 0)) || return 0
+    printf '  install -Dm0644 (Exec=%s) %q %q\n' \
+        "${exec_path}" "${source}" "${dest}.<temporary>"
+    if ((DRY_RUN == 1)); then
+        INSTALL_TEMPS+=("${dest}.<temporary>")
+        INSTALL_DESTS+=("${dest}")
+        return 0
+    fi
     desktop_dir="${dest%/*}"
-    install -d -m 0755 "${desktop_dir}"
-    INSTALL_TEMP="$(mktemp "${desktop_dir}/.${APP_ID}.desktop.install.XXXXXX")" \
+    install -d -m 0755 "${desktop_dir}" \
+        || die "cannot create desktop-entry directory for ${dest}"
+    temp="$(mktemp "${desktop_dir}/.${APP_ID}.desktop.install.XXXXXX")" \
         || die "cannot create temporary desktop entry beside ${dest}"
+    INSTALL_TEMPS+=("${temp}")
+    INSTALL_DESTS+=("${dest}")
     if ! FROST_DESKTOP_EXEC_VALUE="${exec_value}" \
         FROST_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
         awk '
@@ -358,13 +388,10 @@ install_desktop_entry() {
         END {
             if (exec_count < 1 || try_exec_count != 1) exit 44
         }
-    ' "${source}" >"${INSTALL_TEMP}" \
-        || ! chmod 0644 "${INSTALL_TEMP}" \
-        || ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
-        cleanup_install_temp
-        die "cannot atomically install desktop entry at ${dest}"
+    ' "${source}" >"${temp}" \
+        || ! chmod 0644 "${temp}"; then
+        die "cannot stage desktop entry for ${dest}"
     fi
-    INSTALL_TEMP=""
 }
 
 # Freshly installed entries and icons stay invisible until the shell's caches
@@ -544,29 +571,34 @@ else
     fi
 fi
 
-run install -d -m 0755 "${STAGED_BIN_DIR}"
-install_binary_atomic "${BINARY}" "${STAGED_BIN_DIR}/frost"
+# Stage the complete plan without changing any existing destination. Resource
+# temps are published first and the executable is the final rename, so a copy
+# or desktop transformation failure leaves the installed generation intact.
+for source in "${WORKFLOW_SOURCES[@]}"; do
+    stage_install_file 0644 "${source}" "${WORKFLOW_DIR}/${source##*/}"
+done
+if ((INSTALL_DESKTOP == 1)); then
+    stage_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
+        "${SHARE_DIR}/applications/${APP_ID}.desktop"
+    stage_install_file 0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
+        "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
+    stage_install_file 0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
+        "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
+    for size in 128 256; do
+        stage_install_file 0644 "${REPO_ROOT}/data/${APP_ID}-${size}.png" \
+            "${SHARE_DIR}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
+    done
+fi
+stage_install_binary "${BINARY}" "${STAGED_BIN_DIR}/frost"
 if [[ -n "${PREBUILT_FD}" ]]; then
     exec {PREBUILT_FD}<&-
 fi
+publish_install_plan
 
-for source in "${WORKFLOW_SOURCES[@]}"; do
-    install_file_atomic 0644 "${source}" "${WORKFLOW_DIR}/${source##*/}"
-done
 if ((INSTALL_DESKTOP == 1)); then
-    install_desktop_entry "${REPO_ROOT}/data/${APP_ID}.desktop" \
-        "${SHARE_DIR}/applications/${APP_ID}.desktop"
     # Launcher left by installs from before the jterm3 -> frost rename; left in
     # place it shows up as a second "jterm3" entry beside the new one.
     run rm -f -- "${SHARE_DIR}/applications/io.github.beamiter.jterm3.desktop"
-    install_file_atomic 0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
-        "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
-    install_file_atomic 0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
-        "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
-    for size in 128 256; do
-        install_file_atomic 0644 "${REPO_ROOT}/data/${APP_ID}-${size}.png" \
-            "${SHARE_DIR}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
-    done
     refresh_desktop_caches
 fi
 

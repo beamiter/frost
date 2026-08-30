@@ -141,8 +141,11 @@ cargo build --release --locked
 明确报错。这里的 Bash 实现并非原子的 no-follow open；只有在文件成功打开且路径名与描述符
 完成同一 inode 的身份复核后，之后再替换路径名才不会改变经该描述符复制的 inode。目标二进制
 权限统一设为 `0755`。目标同目录中的私有临时文件写完后，由 GNU `mv -T` 原子替换；复制失败
-或 rename 前退出会清理未提交临时文件并保留旧二进制。rename 是二进制提交点；之后资源安装
-失败不会回滚已提交的二进制。除上述条件外还需要 GNU coreutils 的 `mktemp`/`mv`。它可与
+或发布阶段前退出会清理整批未提交临时文件并保留旧版本。binary、workflow、desktop、元数据与
+图标会全部 staging 成功后才开始 rename；资源先发布，二进制作为最后一个提交点，因此任何
+复制/转换失败都不会留下半升级。各 rename 自身原子，但整批 rename 不是跨文件系统事务；发布
+阶段的并发目标替换、强制终止或 I/O 错误仍可能留下混合资源版本。除上述条件外还需要 GNU
+coreutils 的 `mktemp`/`mv`。它可与
 `--prefix`、`--bin-dir`、`--no-desktop` 和 `DESTDIR` 组合使用。
 零字节预编译产物会在旧目标改变前被拒绝。desktop、AppStream、SVG 与 PNG 源文件都在
 构建/写入前预检，公共资源也以明确权限写入目标同目录临时文件后原子 rename。非根

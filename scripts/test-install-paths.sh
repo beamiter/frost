@@ -446,6 +446,52 @@ assert_regular_file "atomically replaced metainfo" "${resource_metainfo}"
 env HOME="${TEST_HOME}" PATH="${TEST_PATH}" DESTDIR="${resource_stage}" \
     "${UNINSTALLER}" --prefix "${resource_prefix}" >/dev/null
 
+# A failure while staging the last public resource must discard every queued
+# temporary before any existing binary, workflow, or desktop asset changes.
+stage_failure_tools="${TEST_ROOT}/stage-failure-tools"
+stage_failure_root="${TEST_ROOT}/stage-failure-root"
+stage_failure_prefix="/opt/frost-stage-failure"
+stage_failure_binary="${stage_failure_root}${stage_failure_prefix}/bin/frost"
+stage_failure_workflow="${stage_failure_root}${stage_failure_prefix}/share/frost/workflows/git-feature.yaml"
+stage_failure_desktop="${stage_failure_root}${stage_failure_prefix}/share/applications/${app_id}.desktop"
+stage_failure_icon="${stage_failure_root}${stage_failure_prefix}/share/icons/hicolor/128x128/apps/${app_id}.png"
+mkdir -p "${stage_failure_tools}" "${stage_failure_binary%/*}" \
+    "${stage_failure_workflow%/*}" "${stage_failure_desktop%/*}" \
+    "${stage_failure_icon%/*}"
+printf 'old staged frost\n' >"${stage_failure_binary}"
+printf 'old staged workflow\n' >"${stage_failure_workflow}"
+printf 'old staged desktop\n' >"${stage_failure_desktop}"
+printf 'old staged icon\n' >"${stage_failure_icon}"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'for argument do' \
+    '    case "${argument}" in *io.github.beamiter.frost-256.png) exit 73 ;; esac' \
+    'done' \
+    'exec /usr/bin/install "$@"' \
+    >"${stage_failure_tools}/install"
+chmod 0755 "${stage_failure_tools}/install"
+if env HOME="${TEST_HOME}" PATH="${stage_failure_tools}:${TEST_PATH}" \
+    DESTDIR="${stage_failure_root}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${stage_failure_prefix}" \
+    >"${TEST_ROOT}/stage-failure.log" 2>&1; then
+    fail "installer accepted a failure while staging the final icon"
+fi
+assert_contains "late staging failure diagnostic" \
+    "$(<"${TEST_ROOT}/stage-failure.log")" \
+    "cannot stage ${stage_failure_root}${stage_failure_prefix}/share/icons/hicolor/256x256/apps/${app_id}.png"
+[[ "$(<"${stage_failure_binary}")" == 'old staged frost' ]] \
+    || fail "late staging failure replaced the existing binary"
+[[ "$(<"${stage_failure_workflow}")" == 'old staged workflow' ]] \
+    || fail "late staging failure replaced an existing workflow"
+[[ "$(<"${stage_failure_desktop}")" == 'old staged desktop' ]] \
+    || fail "late staging failure replaced the existing desktop entry"
+[[ "$(<"${stage_failure_icon}")" == 'old staged icon' ]] \
+    || fail "late staging failure replaced an earlier icon"
+[[ -z "$(find "${stage_failure_root}" -type f -name '*.install.*' -print -quit)" ]] \
+    || fail "late staging failure left an install temporary"
+
 interrupt_tools="${TEST_ROOT}/interrupt-tools"
 interrupt_stage="${TEST_ROOT}/interrupt-stage"
 interrupt_prefix="/opt/frost-interrupt"
