@@ -638,6 +638,7 @@ frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不
 
 ```bash
 cargo fmt --all -- --check
+cargo deny --locked check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --all-features --locked
@@ -648,7 +649,7 @@ desktop-file-validate data/io.github.beamiter.frost.desktop
 appstreamcli validate --pedantic --no-net data/io.github.beamiter.frost.metainfo.xml
 ```
 
-CI 对格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛；安装测试还会用
+CI 对依赖来源/许可证、格式、零警告 Clippy、全量测试和 release 构建分别设有独立质量门槛；安装测试还会用
 预编译 fixture 做一次真实 `DESTDIR` 安装/卸载往返，核对权限、桌面启动路径和全部资源文件。
 
 调试构建可设置 `FROST_DEBUG=1` 输出有界的协议字节预览。

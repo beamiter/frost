@@ -313,3 +313,14 @@ Round 70 closes the remaining argument-form affordance gap:
     placement is stashed, otherwise only rows before the live start are. This
     removes the Rust 1.96 `nonminimal_bool` failure without changing the
     finished/live graphics contract covered by the clear/undo regression.
+
+72. **Fail-closed dependency policy** — CI now runs a pinned `cargo-deny`
+    against the committed lockfile. Wildcard requirements, unapproved
+    licenses, unknown registries and unknown git sources fail the build; the
+    two family git dependencies are admitted only at their exact reviewed
+    revisions. Duplicate versions stay visible as warnings while the iced/wgpu
+    graph still requires them. The core git dependency now also states its
+    crate version, so a revision pin no longer counts as a wildcard API
+    requirement. Two unavoidable *unmaintained* (not vulnerability or
+    unsoundness) notices are exact-ID exceptions; every other advisory remains
+    fail-closed.
