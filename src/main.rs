@@ -5250,15 +5250,15 @@ impl Frost {
             remote_fs::remote_host(&target_location, self.sidebar.hosts_snapshot())
                 .is_ok_and(|target| remote_fs::same_files_execution(current, target))
         });
-        // If the new command offers a live socket, reveal an existing tree
+        // If the new command offers a live socket, keep an existing tree
         // only when it already uses that exact route. Otherwise stage a probe
         // and upgrade future operations without throwing away loaded rows.
+        // The sidebar is never forced open: the tree follows in the
+        // background and is visible the next time the user opens it.
         let already_following = same_target && (!live_execution_requested || same_execution);
         let preserve_loaded_tree =
             same_target && !already_following && self.sidebar.has_loaded_snapshot();
         if already_following {
-            self.sidebar_open = true;
-            self.sidebar_panel = SidebarPanel::Files;
             self.sidebar_notice = Some((
                 format!(
                     "Following {}",
@@ -5402,8 +5402,6 @@ impl Frost {
                 .rebind_same_namespace_preserving_tree(pending.target_location.clone())
         {
             self.invalidate_sidebar_pending_work();
-            self.sidebar_open = true;
-            self.sidebar_panel = SidebarPanel::Files;
             self.sidebar_notice = Some((format!("Following {label}"), true));
             self.apply_config();
             return Task::none();
@@ -5413,8 +5411,6 @@ impl Frost {
         let Some(request) = self.sidebar.resolve_location(generation, Ok(start)) else {
             return Task::none();
         };
-        self.sidebar_open = true;
-        self.sidebar_panel = SidebarPanel::Files;
         self.sidebar_notice = Some((format!("Following {label}"), true));
         self.apply_config();
         self.queue_sidebar_load(request)
