@@ -576,6 +576,49 @@ impl KeyBindings {
         bindings
     }
 
+    /// The chords currently bound to one command id, in display form.
+    ///
+    /// This is the reverse of [`Self::get_command`] and exists because the
+    /// command palette and the Keyboard Shortcuts panel used to print
+    /// hardcoded chords: they showed frost's shipped defaults regardless of
+    /// what the user had actually bound, so the two surfaces whose entire job
+    /// is to teach the keyboard were the two that could be wrong. A user who
+    /// rebound `edit:copy`, or unbound it, was told the opposite.
+    ///
+    /// Sorted by the stored canonical spelling so the rendering is stable
+    /// across runs (the table is a `HashMap`), and capped: a command with more
+    /// aliases than this has a legible label instead of a row that grows
+    /// without bound.
+    pub fn chords_for(&self, command_id: &str) -> Vec<String> {
+        const MAX_SHOWN_CHORDS: usize = 3;
+        let mut bound: Vec<&String> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound_id)| bound_id.as_str() == command_id)
+            .map(|(chord, _)| chord)
+            .collect();
+        bound.sort_unstable();
+        bound
+            .into_iter()
+            .filter_map(|chord| {
+                jterm_core::keybindings::parse(chord)
+                    .ok()
+                    .map(|chord| chord.display())
+            })
+            .take(MAX_SHOWN_CHORDS)
+            .collect()
+    }
+
+    /// One display label for a command id, or `None` when nothing is bound.
+    ///
+    /// An unbound command deliberately has no label rather than falling back
+    /// to the shipped default: the default is exactly the wrong answer for a
+    /// user who removed the binding.
+    pub fn shortcut_label(&self, command_id: &str) -> Option<String> {
+        let chords = self.chords_for(command_id);
+        (!chords.is_empty()).then(|| chords.join(" / "))
+    }
+
     /// 获取快捷键对应的命令
     pub fn get_command(&self, key_str: &str) -> Option<Command> {
         let normalized = KeyBinding::canonical(key_str)?;
@@ -1099,6 +1142,72 @@ mod tests {
         let unreadable = KeyBindings::load_path_with_diagnostics(&root.0);
         assert!(!unreadable.usable);
         assert!(unreadable.revision.is_none());
+    }
+
+    /// The reverse lookup the palette and the help panel now render from.
+    #[test]
+    fn shortcut_labels_come_from_the_table_and_never_from_a_default() {
+        let mut bindings = KeyBindings::default_bindings();
+        assert_eq!(
+            bindings.shortcut_label("edit:copy").as_deref(),
+            Some("Ctrl+Shift+C")
+        );
+
+        // Rebound: the label follows the table, in core's frozen modifier
+        // order rather than whatever order the user typed.
+        bindings
+            .bindings
+            .retain(|_, command| command.as_str() != "edit:copy");
+        bindings
+            .bindings
+            .insert("ctrl+shift+alt+y".to_string(), "edit:copy".to_string());
+        assert_eq!(
+            bindings.shortcut_label("edit:copy").as_deref(),
+            Some("Ctrl+Shift+Alt+Y")
+        );
+
+        // Unbound: no label at all. Falling back to the shipped default would
+        // tell the user the one thing that is certainly wrong.
+        bindings
+            .bindings
+            .retain(|_, command| command.as_str() != "edit:copy");
+        assert_eq!(bindings.shortcut_label("edit:copy"), None);
+        assert!(bindings.chords_for("edit:copy").is_empty());
+
+        // Aliases render in a stable order — the table is a HashMap, so
+        // without the sort the row would shuffle between runs.
+        for chord in ["ctrl+alt+y", "ctrl+shift+y", "ctrl+y"] {
+            bindings
+                .bindings
+                .insert(chord.to_string(), "edit:copy".to_string());
+        }
+        let first = bindings.chords_for("edit:copy");
+        assert_eq!(first, ["Ctrl+Alt+Y", "Ctrl+Shift+Y", "Ctrl+Y"]);
+        for _ in 0..8 {
+            assert_eq!(
+                KeyBindings {
+                    bindings: bindings.bindings.clone()
+                }
+                .chords_for("edit:copy"),
+                first
+            );
+        }
+
+        // …and are capped, so one command bound many times cannot grow a row
+        // without bound.
+        for index in 0..12 {
+            bindings
+                .bindings
+                .insert(format!("ctrl+f{}", index + 1), "edit:copy".to_string());
+        }
+        assert_eq!(bindings.chords_for("edit:copy").len(), 3);
+
+        // An unparseable stored chord is skipped rather than rendered raw.
+        let mut broken = KeyBindings::new();
+        broken
+            .bindings
+            .insert("not a chord".to_string(), "edit:copy".to_string());
+        assert_eq!(broken.shortcut_label("edit:copy"), None);
     }
 
     #[test]

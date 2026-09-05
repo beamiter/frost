@@ -1,9 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (an installed workflow library; a fail-closed local/CI
-security entry point and the RUSTSEC-2026-0253 dependency repair; the shared
-TOML/YAML workflow library and review-first command correction; the shared AI
-chat store and its persistence
+Updated: 2026-09-05 (the jsh execution-journal lifecycle token and the
+`--session` identity that makes it reachable at all; an untrusted-archive
+staging boundary and OSC 52/OSC 9/OSC 133 hardening; the amortised command-zone
+rebase; the keybinding-driven palette and help panel; an installed workflow
+library; a fail-closed local/CI security entry point and the RUSTSEC-2026-0253
+dependency repair; the shared TOML/YAML workflow library and review-first
+command correction; the shared AI chat store and its persistence
 boundary)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now carries
@@ -14,6 +17,176 @@ lifecycle identities and cell boundaries are checked, finalized rows own a real 
 stale UI targets fail closed, and automatic helper resolution no longer trusts `PATH`.
 
 ## Completed since the previous handoff
+
+- **The execution journal's Start identity, and the `--session` flag without
+  which none of it was reachable (2026-09-05)**: `jterm_core` moves to
+  `9f94f77b694ef5e0b20b9fd4bd776b98220360c4` (transitively `jagent`
+  `bdc8023faa535ee00bb972cdb0adc11ba280fdc5`), where
+  `execution_journal::CompletedExecution` no longer takes an `id: String`. It
+  takes an `ExecutionLifecycle` — a token with private fields whose only
+  constructor, `from_command_meta`, refuses unless `id`, `session_id`, `seq`
+  and `started_at_ms` all arrived on **one** OSC 133 `C` packet. The core's
+  writer then re-checks all four against the authoritative on-disk Start under
+  the journal's exclusive lock, so a stale or forged token fails closed there
+  too.
+
+  frost owns its OSC 133 decoder, and its per-mark field loop recognised none
+  of the three Start-only slots. It does now, gated on `mark == 'C'`
+  (`src/terminal.rs`): jsh emits them on `C` and its `D` carries only the id, a
+  duration and the cwd it *ended* in, so a completion that supplied them would
+  be naming a Start generation this terminal never observed. The four slots are
+  captured together as one `StartLifecycle` or not at all — a partial envelope
+  has no journal meaning, and retaining the pieces would invite the matching
+  `D`, or a forged one, to supply the rest. `D` may only be **compared**
+  against the captured id; the existing mismatch refusal already guaranteed
+  that by the time the token is taken. `main.rs` turns the token into a
+  `parser::CommandMeta` and hands it to `from_command_meta`, so core re-derives
+  the capability rather than trusting frost's copy.
+
+  **The second blocker, which made all of the above a no-op.** frost never
+  launched jsh with `--session`. `src/pty.rs` had implemented the flag for both
+  the direct-exec and bash-wrapped shapes, and `agent_task_ui` already
+  generated an id satisfying `is_valid_jsh_session_id`, but the only production
+  PTY spawn passed `None`. So jsh omitted `session_id=` from every `C`,
+  `from_command_meta` could never be satisfied, and the journal submit was a
+  permanent silent no-op — while jsh also never restored its per-session
+  snapshot in frost and wrote `"session_id": null` on its own `start` events
+  (3,867 of 4,637 starts on the real journal). The id originated in
+  `Session::spawn_argv_env` is `agent_task_ui::terminal_session_id`, the same
+  string the task reducer already binds terminals with, so one PTY session has
+  one identity everywhere; the shell-basename half of the gate stays in
+  `pty.rs`, where the configured shell is finally resolved.
+
+  The submit loop also cloned each finished block's whole captured output
+  *before* `submit` could discover the journal was disabled, and its comment
+  stated the gate backwards — the journal is on unless `JSH_EXECUTION_JOURNAL`
+  turns it off. `output_capture_enabled()` is now asked once, ahead of the
+  loop. In the same round `CompletionFacts::output` became `&'a str`, so the
+  correction trigger's per-command copy of up to `MAX_CAPTURED_OUTPUT_BYTES` on
+  the UI thread is gone; the local `enabled` short-circuit stays because the
+  session lookup and the command/cwd copies are still pure waste with the
+  feature off.
+
+- **Four decoder defects the lifecycle work sat on top of (2026-09-05)**: all
+  in `TerminalState::handle_osc_133`, and all now matching core's parser
+  because a shared protocol read two ways is two protocols.
+
+  *`D`'s cwd is where the command ENDED.* It overwrote `C`'s, so every block
+  that changed directory was labelled with its destination — `cd /tmp` run from
+  `/home/u/proj` recorded `/tmp` as "the working directory the command ran
+  in", and that value reaches the block menu, the Markdown export and the agent
+  prompt. `D` may now only fill an empty cwd. ember and forge both already
+  guarded this; forge's `merge_command_end` documents exactly why.
+
+  *Repeated keys were last-wins.* A second `cmd_truncated=0` retracted a
+  truncation disclosure, a second `cwd_url` chose which of two contradictory
+  directories a block claimed, and a second `id` was simply adopted. A repeat
+  is ambiguity, not an update, so every slot fails closed exactly as core's
+  does.
+
+  *Two exit slots committed to the first.* `D;1;exit=0` rendered a failed block
+  green, and a malformed `exit=` deferred to the next field instead of
+  occupying the slot it had claimed, so `D;exit=x;1` produced an authoritative
+  status the producer never spelled. Both follow
+  `parse_osc133_exit_status` now: an ambiguous outcome is Unknown.
+
+  *Aliases and text rules drifted.* `command_url` and `cmdline` were
+  unrecognised and a bare `command=` was taken without percent-decoding, so
+  identical bytes decoded differently depending on the spelling a shell chose.
+  Metadata was filtered for control characters only and then rendered raw, so a
+  cwd, command or id spelled with a zero-width joiner, a bidi override or an
+  interlinear annotation control drew as one thing and named another; those
+  three now go through the newly-public
+  `review_input::is_terminal_visual_spoofing_character`, and cwds additionally
+  through `execution_journal::is_valid_jsh_cwd`.
+
+- **Untrusted archives, notification text, and the last exit (2026-09-05)**:
+  three places where frost trusted something it had no reason to.
+
+  A remote **directory download** extracted the far side's tar into the
+  destination's *parent* with nothing about its members checked, so an archive
+  naming `../../.ssh/authorized_keys`, an absolute path, or a second top-level
+  tree beside the requested one wrote wherever it named. `src/remote_fs.rs` now
+  refuses an archive whose declared shape is wrong (streamed, bounded, never
+  retained), extracts into an owner-only `create_new` directory this process
+  owns, re-checks that the extraction produced exactly the one expected
+  top-level component, and publishes only that with one `RENAME_NOREPLACE`
+  operation. The two checks answer different threats and neither replaces the
+  other: the listing refuses a wrong shape, the private staging means even a
+  tar ignoring its own `..`/absolute-path rules can only damage a tree that is
+  about to be deleted.
+
+  **OSC 9/777 notification** title and body reached `notify-send` with controls
+  and bidi overrides intact — the only PTY-authored text frost hands to another
+  process, drawn by a server that applies none of the terminal's own display
+  rules. They now go through the same rule core's `bounded_notification_field`
+  uses, on the terminal-strict spoofing class, replacing rather than dropping
+  so a rewritten field reads as rewritten.
+
+  **Quitting by closing the last session** returned the exit task after writing
+  only the session snapshot: the Agent transcript, the AI-chat store, the jsh
+  execution journal and the shared command-history index were all abandoned
+  mid-flight, so whether a session's last commands survived depended on which
+  gesture the user quit with. Both gestures now return through
+  `exit_flushing_durable_state`, and the exit task has exactly one construction
+  site — which is what the regression pins, because nothing is observable once
+  both paths have left the process. Unifying them also reordered the step the
+  two gestures did not share: the last session's PTY was signalled before the
+  flush, and `save_session_snapshot` reads each pane's directory from the live
+  child's `/proc/<pid>/cwd` whenever the shell reports no OSC 7. `terminate`
+  returns as soon as the signals are away, so the snapshot was reading a
+  zombie's cwd link and a plain bash session was persisted with no directory at
+  all. The flush runs first now and the signal second, pinned by a second
+  structural regression.
+
+  Two remaining bounds: the **OSC 7 cwd** was stored uncapped while the OSC 133
+  cwd beside it was bounded, even though OSC 7 is the wider liability (retained
+  for the pane's life, cloned into every cwd-less command zone, written into
+  the session snapshot, inherited by every split); both now use the same 4 KiB
+  ceiling, on the decoded path. And **OSC 52 clipboard writes** had no config
+  gate at all — frost was the one app of the four that let PTY output, from an
+  ssh peer included, choose what the user's next paste produced.
+  `allow_remote_clipboard_write` defaults off beside the existing read gate,
+  matching anvil/forge's identically named option and ember's
+  `osc52_clipboard_write`.
+
+- **Three parity and hot-path items (2026-09-05)**.
+
+  The **command-zone rebase** ran once per scrolled line past the scrollback
+  cap — 256 zones rewritten for every line of streaming output, on the PTY
+  ingest path, forever. The shift is uniform, so it accumulates and applies
+  once per ingest batch; `process_input` became a wrapper so the settle happens
+  whichever early return the parser takes, and the two paths inside a batch
+  that touch zone geometry (`handle_osc_133`, `push_command_zone_*`) settle
+  first. The regression proves the batched anchors are identical to the
+  per-row ones.
+
+  The **command palette and the Keyboard Shortcuts panel** printed hardcoded
+  default chords, so the two surfaces whose entire job is to teach the keyboard
+  were the two most likely to be wrong for a user who had configured one — and
+  still showed a chord for a command they had unbound. `KeyBindings::chords_for`
+  / `shortcut_label` are the reverse of `get_command`; the palette carries a
+  command id rather than a chord string, the help panel's configurable rows
+  read the same way and say `(unbound)` when nothing is bound, and the
+  genuinely non-configurable app chrome (`chrome_shortcut`'s palette, help, tab
+  switcher, history and workflow chords) keeps its literal hint. Reading the
+  live table immediately exposed two palette hints spelled
+  `Ctrl+Alt+Shift+…`, which is an order core's frozen renderer never produces.
+
+  The family's **`ad_hoc_block_context`** adapter — carried by anvil, ember and
+  forge, and documented in all three as frost's own `AskAi` adapter — had been
+  dropped here and re-implemented inline three times, with an unknown-status
+  note none of the other apps used and a second local bounding helper. It is
+  re-adopted into `src/agent_task/context.rs` with its six regressions, and the
+  three surfaces now build a lenient `SemanticCommandContext` and convert once.
+
+  Two upstream additions from the same round closed recorded gaps here:
+  `CorrectionPolicy::probe_thread_name()` replaces the `format!("{policy:?}")`
+  workaround (which could not catch a rename, because the substring it looked
+  for was the constant it had just passed in), and
+  `CorrectionCandidate::for_tests` makes frost's *verified* candidate branch —
+  the only one whose primary action submits rather than inserts — reachable
+  hermetically for the first time.
 
 - **Shared workflow library, and the missing-value guard all four terminals
   implemented and none could reach (2026-08-29)**: `src/workflows.rs` collapses
@@ -925,11 +1098,19 @@ The former AI-panel worktree boundary is closed. The chats panel, command
 suggestion, shared-store shim and `src/main.rs` wiring have all been tracked
 since `7691bd0`; README now exposes the shipped `Ctrl+Shift+Alt+A` entry rather
 than treating it as future behaviour. The current shared baseline exact-pins
-`jterm_core` at `f60c507df59129b281822dd97d2df3a709a02ce4` and its transitive
-`jagent` at `ab7552d2bf287e330f67f7b75ab766b73aa6268e` in the manifest, lockfile
-and dependency policy. The only local `[patch.crates-io]` override is the
-documented, Rust-source-identical cryoglyph 0.1.0 copy that selects
-RustSec-fixed `lru 0.18.2`; remove it when upstream publishes the same repair.
+`jterm_core` at `9f94f77b694ef5e0b20b9fd4bd776b98220360c4` and its transitive
+`jagent` at `bdc8023faa535ee00bb972cdb0adc11ba280fdc5` in the manifest, lockfile
+and dependency policy. jagent's classifier grew from 32 to 54 warning classes in
+that move (signals, mount/swap/losetup/cryptsetup, set-id `chmod`,
+`shred`/`truncate`, mode-aware `parted`/`sfdisk`/`fdisk`,
+`systemctl`/`service`/`shutdown`, whole-pipeline network provenance, bounded
+`xargs`/`env -S` lexing), and it reaches frost's approval cards and the
+correction card's risk line without a code change here: frost carries no
+duplicate danger or read-only classification list, and has delegated to
+`jterm_core::agent::is_dangerous` since the Agent panel was written. The only
+local `[patch.crates-io]` override is the documented, Rust-source-identical
+cryoglyph 0.1.0 copy that selects RustSec-fixed `lru 0.18.2`; remove it when
+upstream publishes the same repair.
 
 Two things the workflow migration deliberately leaves app-owned.
 
@@ -948,42 +1129,28 @@ The former redundant `BusyChatPolicy` intra-doc target in
 `src/ai_chat_store.rs` is gone. Strict rustdoc is now a first-class local and CI
 release gate rather than a recorded exception.
 
-Three things the correction migration did not do, none of them papered over.
+All three of the correction migration's recorded gaps are closed upstream and
+adopted here.
 
-frost's shim cannot hermetically build a `CorrectionCandidate` carrying verified
-(`AptIndex` / `ExecutablePath`) evidence, so its card-wiring test exercises only
-the insert-only branch. `CorrectionCandidate::new` is private and every public
-path to one — `parse_ai_reply`, `deterministic_candidate`,
-`resolve_correction_blocking` — yields `AiUnverified` or `TargetOutput` unless a
-real APT or PATH probe runs and matches, which is not hermetic on a build host.
-That narrowness is deliberate and is exactly what makes it impossible for a shim
-to render prose the gate never saw, so the fix is not to widen it: a
-`#[cfg(feature = "test-fixtures")]` or `#[doc(hidden)]` constructor would let
-each shim prove its own "Run verified command" branch. The invariant itself is
-covered upstream by the core's
-`the_primary_actions_label_and_its_action_never_disagree`.
+`CorrectionCandidate::for_tests` — `#[doc(hidden)]`, fixture-only, and running
+the real `validate_candidate` gate — makes frost's *verified* candidate branch
+reachable hermetically. That branch is the only one whose primary action
+submits rather than inserts, and
+`a_verified_candidate_runs_directly_until_the_draft_is_edited` now pins the
+pairing the card depends on: the label comes from `run_allowed()`,
+the write policy from `accept().run_directly`, whitespace is not an edit, any
+real edit downgrades both together, and a fixture naming an unsafe command is
+rejected exactly as a model reply would be.
 
-The policy test reads the probe thread name off `format!("{policy:?}")` rather
-than an accessor, because `CorrectionPolicy::probe_thread_name` is private with
-no getter while `evidence()` and `context_sharing()` both have one. Two costs,
-both measured rather than assumed: the assertion is coupled to a `derive`, and
-because it compares the Debug output against `PROBE_THREAD_NAME` itself, it
-proves only that that constant is what `correction_policy` passes — renaming the
-constant renames both sides and the test stays green, so a thread name that no
-longer says "frost" would not be caught. A one-line
-`pub fn probe_thread_name(&self) -> &'static str` upstream, asserted against a
-literal here, would fix both.
+`CorrectionPolicy::probe_thread_name()` replaces the `format!("{policy:?}")`
+workaround, and the assertion is against a literal. The old form could not have
+caught a rename: the substring it looked for was the same constant it had just
+passed in.
 
-`CompletionFacts::output` takes the finished block's output by value, so an
-enabled correction feature clones up to `MAX_CAPTURED_OUTPUT_BYTES` per finished
-command. The core is explicit that a shim must pass the output whole and must
-not pre-sample, and the field is `String`, so the only mitigation available here
-was to short-circuit on frost's own `enabled` gate before building the facts
-(`src/main.rs`, `maybe_start_command_correction`) — which means the default
-configuration pays nothing, while an agent-issued or boundary-inferred
-completion with the feature on still copies the whole block. `output: &str` with
-`should_start` sampling from the borrow would remove the copy without weakening
-the trigger; that is a core change and outside this repo.
+`CompletionFacts::output` is `&'a str`, so the finished block is borrowed rather
+than copied on the UI thread. frost's own `enabled` short-circuit stays, because
+the session lookup and the command/cwd copies below it are still pure waste with
+the feature off — but the block-sized copy that motivated it is gone.
 
 The panel also has no "ask about the selected block" entry — the Agent panel
 already owns that surface — so the store's `BlockContext` stays
@@ -1002,14 +1169,26 @@ scripts/security-check.sh
 bash scripts/test-install-paths.sh
 ```
 
-The complete gate was rerun against published `jterm_core` `f60c507`. Formatting,
-zero-warning Clippy and rustdoc, the 992-test matrix, and the release build pass
-with the patched cryoglyph. The unified security entry point passes cargo-deny,
-warnings-denied cargo-audit, duplicate reporting, Bash parsing, and ShellCheck;
-the old lockfile is a negative control that fails specifically on
-RUSTSEC-2026-0253. The vendored Rust sources, README, and three license files are
-byte-identical to crates.io cryoglyph 0.1.0, while its manifest differs only in
-the documented `lru 0.18.2` requirement.
+The complete gate was rerun against published `jterm_core` `9f94f77`.
+Formatting, zero-warning Clippy and rustdoc, and the now 1,021-test matrix pass
+with the patched cryoglyph. The unified security entry point passes cargo-deny
+(`--policy`) and warnings-denied cargo-audit (`--audit`) against the repinned
+lockfile, and every `scripts/*.sh` parses under `bash -n`; the old lockfile is a
+negative control that fails specifically on RUSTSEC-2026-0253.
+
+Two gate steps could not be executed on the machine this round was prepared on,
+and both failures are environmental rather than regressions. `--shell` needs
+`shellcheck`, which is not installed there (`bash -n` over the same file list
+passes). `bash scripts/test-install-paths.sh` fails at round 101's
+`cleanup diagnostics disclosed symlink contents` assertion — byte-identically on
+a pristine checkout at the previous `f60c507` pin, with `scripts/` untouched by
+this round, so it is a property of that host's `/tmp` and coreutils rather than
+of the change. Both must be rerun where the toolchain is complete before the
+gate can be called green.
+
+The vendored Rust sources, README, and three license files are byte-identical to
+crates.io cryoglyph 0.1.0, while its manifest differs only in the documented
+`lru 0.18.2` requirement.
 
 The install-path gate also proves the runtime workflow library rather than only
 the binary and desktop metadata: every accepted example is installed byte-for-

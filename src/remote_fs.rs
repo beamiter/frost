@@ -472,6 +472,18 @@ pub const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 /// of it either way.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Members inspected in one downloaded archive before the listing is refused.
+/// A directory transfer of a tree this large is not a sidebar operation, and
+/// the cap keeps the pre-extraction scan bounded against a hostile producer.
+const MAX_ARCHIVE_MEMBERS: usize = 200_000;
+/// One member path may not exceed this. Linux `PATH_MAX` is 4096, so a longer
+/// name could not be created on the destination anyway.
+const MAX_ARCHIVE_MEMBER_BYTES: usize = 4 * 1024;
+/// Total bytes of listing text read while scanning one archive. Nothing is
+/// retained — each member is validated and dropped — but the scan itself stops
+/// rather than following an endless listing.
+const MAX_ARCHIVE_LISTING_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Progress publishes at most about four times a second…
 const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// …and at least every 256 KiB transferred, whichever comes first.
@@ -1831,6 +1843,273 @@ fn stage_local_tar(
     Ok(temp)
 }
 
+/// Whether one listed archive member is inside `expected_top` and nowhere
+/// else.
+///
+/// The archive comes from the far side of an ssh or docker connection and is
+/// entirely attacker-shaped if that side is compromised. A member spelled
+/// `/etc/cron.d/x`, `../../.ssh/authorized_keys`, or a second top-level tree
+/// beside the requested one is not part of the directory the user asked to
+/// download, so the whole archive is refused rather than partially extracted.
+/// The exact top-level component is required — not merely a prefix — because
+/// `proj-evil/x` starts with `proj` without being inside it.
+fn archive_member_is_contained(member: &str, expected_top: &str) -> bool {
+    // A leading `./` is how some producers spell the archive root; strip
+    // exactly one, then require the first component to be the expected one.
+    let member = member.strip_prefix("./").unwrap_or(member);
+    let member = member.trim_end_matches('/');
+    if member.is_empty()
+        || member.len() > MAX_ARCHIVE_MEMBER_BYTES
+        || member.starts_with('/')
+        || member.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let mut components = member.split('/');
+    if components.next() != Some(expected_top) {
+        return false;
+    }
+    // `.` is harmless but `..` climbs, and an empty component means `//`,
+    // which no producer needs and which changes how a consumer resolves the
+    // path. Neither is worth accepting from an untrusted archive.
+    components.all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+/// Refuse a downloaded archive unless every member sits under the single
+/// top-level component the transfer asked for.
+///
+/// This runs BEFORE extraction, and extraction then runs into a private
+/// staging directory, because the two answer different threats: this refuses
+/// an archive whose shape is wrong, while the staging directory means even a
+/// tar that ignores its own `..`/absolute-path safety rules can only damage a
+/// tree this process created and is about to delete.
+///
+/// The listing is streamed and never retained — a member is validated and
+/// dropped — so a huge archive costs one pass, not memory. A file name
+/// containing a newline is indistinguishable from two members here, and both
+/// halves then have to pass containment; that fails closed, which is the
+/// intended answer for a name no ordinary transfer produces.
+fn verify_archive_members(archive: &Path, expected_top: &str) -> io::Result<()> {
+    use std::io::BufRead;
+
+    let archive_arg = archive.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive path is not valid UTF-8",
+        )
+    })?;
+    let argv: Vec<String> = ["tar", "tf", archive_arg]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    let mut child = spawn_grouped(&argv)?;
+    // The listing never reads stdin, and a tar left with an open stdin pipe
+    // would keep the descriptor alive for nothing.
+    drop(child.stdin.take());
+    let (Some(stdout), Some(mut stderr_pipe)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_tree(&mut child);
+        return Err(io::Error::other("child stdio pipes were not created"));
+    };
+    // Drained on its own thread: a tar filling stderr must not deadlock
+    // against a reader that only consumes stdout.
+    let stderr_reader = std::thread::spawn(move || read_bounded(&mut stderr_pipe, MAX_OP_BYTES));
+
+    let mut reader = io::BufReader::new(stdout.take(MAX_ARCHIVE_LISTING_BYTES));
+    let mut member = String::new();
+    let mut members = 0usize;
+    let mut verdict = Ok(());
+    loop {
+        member.clear();
+        // Invalid UTF-8 in a member name is itself a refusal: the name would
+        // have to be displayed and joined onto a local path.
+        let read = match reader.read_line(&mut member) {
+            Ok(read) => read,
+            Err(error) => {
+                verdict = Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unreadable archive listing: {error}"),
+                ));
+                break;
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        members += 1;
+        if members > MAX_ARCHIVE_MEMBERS {
+            verdict = Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("archive holds more than {MAX_ARCHIVE_MEMBERS} entries"),
+            ));
+            break;
+        }
+        let listed = member.trim_end_matches('\n');
+        if !archive_member_is_contained(listed, expected_top) {
+            verdict = Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "archive member escapes {expected_top}: {}",
+                    jterm_core::review_input::safe_inline_display(listed, 128)
+                ),
+            ));
+            break;
+        }
+    }
+    // Stop reading before the wait: a refused listing must not wait for a tar
+    // that is still producing members.
+    drop(reader);
+    if verdict.is_err() {
+        kill_tree(&mut child);
+        let _ = stderr_reader.join();
+        return verdict;
+    }
+    let status = match wait_status(&mut child, TRANSFER_TIMEOUT, "tar", None) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
+    };
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("stream reader thread panicked"))?
+        .map(|(bytes, _)| bytes)
+        .unwrap_or_default();
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "local tar could not list the downloaded archive: {}",
+            stderr_excerpt(&stderr)
+        )));
+    }
+    if members == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "downloaded archive is empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Create a fresh owner-only staging directory next to the destination.
+///
+/// Owner-only and `create_new` together are what make the extraction private:
+/// nothing else on the machine can read a half-extracted tree, and the name
+/// cannot be pre-created by another process to steer the extraction somewhere
+/// else. It sits beside the destination so the final publish is a rename on
+/// the same filesystem rather than a second copy.
+fn create_private_staging_dir(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let staging = unique_staging_path(dir, &format!("{name}.unpack"));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&staging)?;
+    Ok(staging)
+}
+
+/// Publish a staged tree at `to` with one namespace operation that refuses an
+/// existing name.
+///
+/// `std::fs::rename` would silently replace an empty directory that appeared
+/// after the up-front existence check, so the transfer that promised never to
+/// touch an existing destination could still consume one. `RENAME_NOREPLACE`
+/// makes that a failure instead of a race the user cannot see.
+fn publish_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let as_c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path contains NUL: {}", path.display()),
+            )
+        })
+    };
+    let from_c = as_c(from)?;
+    let to_c = as_c(to)?;
+    // SAFETY: both C strings outlive the syscall, which retains no pointers
+    // and returns only once the single namespace operation has committed or
+    // failed.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    ) {
+        return Err(error);
+    }
+    // A filesystem without RENAME_NOREPLACE (some older network mounts) falls
+    // back to the plain rename behind one more existence check. That is
+    // exactly the window this transfer already had, not a new one, and it is
+    // still narrower than extracting into the destination's parent.
+    ensure_absent(to)?;
+    std::fs::rename(from, to)
+}
+
+/// Validate one downloaded directory archive, extract it privately, and
+/// publish the single tree it was allowed to contain at `dst`.
+///
+/// The archive was produced on the far side of an ssh or docker connection, so
+/// its shape is only as trustworthy as that side. It used to be extracted
+/// straight into the destination's PARENT — the user's own directory — with
+/// nothing about the members checked, so an archive carrying
+/// `../../.ssh/authorized_keys`, an absolute path, or a second top-level tree
+/// beside the requested one wrote wherever it named.
+///
+/// The two checks answer different threats and neither replaces the other.
+/// The listing refuses an archive whose declared shape is wrong. The private
+/// staging directory means that even a tar that ignores its own
+/// `..`/absolute-path rules can only damage a tree this process just created
+/// and is about to delete, and that only the one verified top-level component
+/// is ever published.
+fn unpack_downloaded_archive(
+    archive: &Path,
+    dst_parent: &Path,
+    name: &str,
+    dst: &Path,
+) -> io::Result<()> {
+    verify_archive_members(archive, name)?;
+    let staging = create_private_staging_dir(dst_parent, name)?;
+    let published = extract_tar(archive, &staging).and_then(|()| {
+        let extracted = staging.join(name);
+        // The listing said every member is under `name`; this says the
+        // extraction actually produced it and produced nothing beside it,
+        // which is the check a listing alone cannot make.
+        let mut entries = std::fs::read_dir(&staging)?;
+        let (Some(_), None) = (entries.next(), entries.next()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive did not extract to a single directory",
+            ));
+        };
+        if !std::fs::symlink_metadata(&extracted)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive did not extract the requested directory",
+            ));
+        }
+        publish_no_replace(&extracted, dst)
+    });
+    // The staging directory is ours either way: empty after a successful
+    // publish, a partial tree after a failure.
+    let _ = std::fs::remove_dir_all(&staging);
+    published
+}
+
 /// Extract a staged tar into `dst_parent` with the system tar.
 fn extract_tar(archive: &Path, dst_parent: &Path) -> io::Result<()> {
     let archive = archive.to_str().ok_or_else(|| {
@@ -1965,16 +2244,19 @@ pub fn download(
                 stderr: outcome.stderr,
             }));
         }
-        // The archive names the source's top directory; extracting into the
-        // destination's parent recreates it at `dst`.
-        if let Err(error) = extract_tar(&temp, dst_parent) {
-            let _ = std::fs::remove_file(&temp);
-            // Nothing was at `dst` before; drop the partial extraction.
-            let _ = std::fs::remove_dir_all(dst);
-            return Err(error);
-        }
+        // The archive was produced on the far side of the connection, so its
+        // shape is only as trustworthy as that side. It used to be extracted
+        // straight into the destination's PARENT — the user's own directory —
+        // with nothing checked, so an archive carrying `../../.ssh/config` or
+        // a second top-level tree wrote wherever it named. Refuse a wrongly
+        // shaped archive first, then extract into a staging directory this
+        // process created and owns, so even a tar that ignores its own
+        // `..`/absolute-path rules can only damage a tree that is about to be
+        // deleted, and only the verified single top-level component is ever
+        // published at `dst`.
+        let result = unpack_downloaded_archive(&temp, dst_parent, &name, dst);
         let _ = std::fs::remove_file(&temp);
-        Ok(())
+        result
     } else {
         // `stat` up front: a friendly NotFound (or "is a directory") before
         // one byte streams, and an expected size to verify the stream against
@@ -2689,6 +2971,172 @@ mod tests {
             std::fs::read(unpack.join("nested").join("blob.bin")).expect("read blob"),
             binary_payload()
         );
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    /// The containment rule, on its own. Everything a remote archive can name
+    /// that is not inside the one directory the user asked to download.
+    #[test]
+    fn archive_members_must_sit_under_the_requested_top_level() {
+        for accepted in [
+            "nested",
+            "nested/",
+            "nested/a.txt",
+            "./nested/a.txt",
+            "nested/deep/b.txt",
+        ] {
+            assert!(
+                archive_member_is_contained(accepted, "nested"),
+                "{accepted:?} is inside the requested directory"
+            );
+        }
+        for refused in [
+            "",
+            "/",
+            // A sibling tree that merely shares a prefix is not inside it.
+            "nested-evil/a.txt",
+            "other/b.txt",
+            // Climbing out, absolutely or relatively.
+            "/etc/cron.d/payload",
+            "../../.ssh/authorized_keys",
+            "nested/../../escape",
+            // No producer needs an interior `.` or `//`, and both change how
+            // a consumer resolves the path, so neither is accepted from an
+            // untrusted archive.
+            "nested/./b.txt",
+            "nested//escape",
+            // A control character in a name that will be shown and joined
+            // onto a local path.
+            "nested/a\u{1b}[2Kb",
+        ] {
+            assert!(
+                !archive_member_is_contained(refused, "nested"),
+                "{refused:?} must never be treated as part of the download"
+            );
+        }
+        let oversized = format!("nested/{}", "x".repeat(MAX_ARCHIVE_MEMBER_BYTES));
+        assert!(!archive_member_is_contained(&oversized, "nested"));
+    }
+
+    /// The whole download-side unpack, driven with real archives produced by
+    /// the same system tar the transfer uses: a well-shaped archive publishes
+    /// at the destination, and every wrongly shaped one is refused with
+    /// nothing written outside the staging directory it cleans up.
+    #[test]
+    fn downloaded_archives_publish_only_the_single_requested_tree() {
+        let root = temp_tree();
+        let tar = |args: &[&str]| {
+            let argv: Vec<String> = std::iter::once("tar")
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect();
+            let capture = run_capture(&argv, b"", Duration::from_secs(30), MAX_OP_BYTES);
+            assert!(
+                capture.is_ok_and(|capture| capture.status.success()),
+                "tar {args:?} must build the fixture"
+            );
+        };
+        let root_str = root.to_str().expect("utf-8 temp path").to_string();
+        let landing = root.join("landing");
+        std::fs::create_dir(&landing).expect("create landing dir");
+
+        // The good shape: exactly the requested top-level component.
+        let good = root.join("good.tar");
+        tar(&[
+            "cf",
+            good.to_str().expect("utf-8"),
+            "-C",
+            &root_str,
+            "nested",
+        ]);
+        let dst = landing.join("nested");
+        unpack_downloaded_archive(&good, &landing, "nested", &dst).expect("publish the tree");
+        assert_eq!(
+            std::fs::read(dst.join("inner.txt")).expect("read published file"),
+            b"y"
+        );
+
+        // A second top-level tree beside the requested one is not part of the
+        // download and cannot ride along with it.
+        let two_tops = root.join("two.tar");
+        tar(&[
+            "cf",
+            two_tops.to_str().expect("utf-8"),
+            "-C",
+            &root_str,
+            "nested",
+            "file.txt",
+        ]);
+        let smuggled = landing.join("smuggled");
+        let error = unpack_downloaded_archive(&two_tops, &landing, "nested", &smuggled)
+            .expect_err("a second top-level component is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!smuggled.exists());
+        assert!(!landing.join("file.txt").exists());
+
+        // An absolute member names a path outside the transfer entirely.
+        let absolute = root.join("absolute.tar");
+        tar(&[
+            "cPf",
+            absolute.to_str().expect("utf-8"),
+            "-C",
+            &root_str,
+            "nested",
+            root.join("file.txt").to_str().expect("utf-8"),
+        ]);
+        let error = unpack_downloaded_archive(&absolute, &landing, "nested", &smuggled)
+            .expect_err("an absolute member is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!smuggled.exists());
+
+        // A climbing member is refused before a single byte is extracted.
+        let climbing = root.join("climbing.tar");
+        tar(&[
+            "cPf",
+            climbing.to_str().expect("utf-8"),
+            "-C",
+            root.join("nested").to_str().expect("utf-8"),
+            ".",
+            "../file.txt",
+        ]);
+        let error = unpack_downloaded_archive(&climbing, &landing, "nested", &smuggled)
+            .expect_err("a climbing member is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!smuggled.exists());
+
+        // Nothing above left a staging directory behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&landing)
+            .expect("read landing")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains("unpack"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+
+        std::fs::remove_dir_all(root).expect("remove test tree");
+    }
+
+    /// Publishing is one namespace operation that refuses an existing name, so
+    /// a destination that appeared after the up-front check cannot be consumed
+    /// by the transfer that promised not to touch it.
+    #[test]
+    fn publishing_never_replaces_a_destination_that_appeared_late() {
+        let root = temp_tree();
+        let staged = root.join("staged");
+        std::fs::create_dir(&staged).expect("create staged tree");
+        std::fs::write(staged.join("payload"), b"p").expect("write payload");
+
+        let occupied = root.join("occupied");
+        std::fs::create_dir(&occupied).expect("create the late destination");
+        let error = publish_no_replace(&staged, &occupied).expect_err("an existing name is fatal");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(staged.join("payload").exists(), "the stage is untouched");
+
+        let fresh = root.join("fresh");
+        publish_no_replace(&staged, &fresh).expect("a free name publishes");
+        assert!(fresh.join("payload").exists());
+        assert!(!staged.exists());
+
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 

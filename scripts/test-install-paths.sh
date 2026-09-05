@@ -2643,6 +2643,27 @@ printf '%s\n' \
 chmod 0755 "${special_backup_tools}/ln"
 special_target_kinds=(directory fifo)
 socket_probe="${TEST_ROOT}/socket-probe"
+# `bind(2)` truncates AF_UNIX addresses at 108 bytes of `sun_path`, and the
+# staged target paths these cases need a socket at run well past that: the
+# uninstaller's desktop-entry target reaches 149 bytes even with the shortest
+# possible TMPDIR. Binding there fails unconditionally, on every machine.
+#
+# The probe above did not catch that, because it binds a short name directly
+# under TEST_ROOT and so always succeeded — enabling a kind whose two real
+# bind sites could not work. Bind the short name and rename the inode into
+# place instead: the length limit applies to the address passed to `bind`, not
+# to the socket file it leaves behind, so this keeps the coverage rather than
+# skipping the kind. Both names are under TEST_ROOT, so the rename never
+# crosses a filesystem.
+socket_at() {
+    local target="$1"
+    local staged="${TEST_ROOT}/.socket-stage.$$"
+    rm -f -- "${staged}"
+    python3 -c \
+        'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
+        "${staged}"
+    mv -- "${staged}" "${target}"
+}
 if command -v python3 >/dev/null 2>&1 \
     && python3 -c \
         'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
@@ -2667,11 +2688,7 @@ for special_kind in "${special_target_kinds[@]}"; do
     case "${special_kind}" in
         directory) mkdir "${special_binary}" ;;
         fifo) mkfifo "${special_binary}" ;;
-        socket)
-            python3 -c \
-                'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
-                "${special_binary}"
-            ;;
+        socket) socket_at "${special_binary}" ;;
         device) mknod "${special_binary}" c 1 3 ;;
     esac
     if env HOME="${TEST_HOME}" \
@@ -3074,11 +3091,7 @@ for special_kind in "${special_target_kinds[@]}"; do
     case "${special_kind}" in
         directory) mkdir "${uninstall_special_target}" ;;
         fifo) mkfifo "${uninstall_special_target}" ;;
-        socket)
-            python3 -c \
-                'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
-                "${uninstall_special_target}"
-            ;;
+        socket) socket_at "${uninstall_special_target}" ;;
         device) mknod "${uninstall_special_target}" c 1 3 ;;
     esac
     if env HOME="${TEST_HOME}" \
@@ -3131,11 +3144,7 @@ for cleanup_kind in "${cleanup_target_kinds[@]}"; do
             mkdir -p "${cleanup_victim}"
             ln -s -- "${cleanup_victim}" "${cleanup_target}"
             ;;
-        socket)
-            python3 -c \
-                'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' \
-                "${cleanup_target}"
-            ;;
+        socket) socket_at "${cleanup_target}" ;;
         device) mknod "${cleanup_target}" c 1 3 ;;
     esac
     if env HOME="${TEST_HOME}" \

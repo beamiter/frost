@@ -275,6 +275,19 @@ pub struct Config {
     #[serde(default)]
     pub allow_clipboard_read: bool,
 
+    /// Permit applications running in the PTY to overwrite the host clipboard
+    /// via an OSC 52 SET (`\e]52;c;<base64>\e\\`).
+    ///
+    /// Off by default, matching anvil and forge's `allow_remote_clipboard_write`
+    /// and ember's `osc52_clipboard_write`. frost was the one app of the four
+    /// that let PTY output replace the clipboard unconditionally: any program
+    /// in the terminal, including one on the far side of an ssh connection,
+    /// could silently swap what the user's next paste would produce — into a
+    /// shell, into a password field, anywhere. Reads were already gated; a
+    /// write crosses the same trust boundary in the other direction.
+    #[serde(default)]
+    pub allow_remote_clipboard_write: bool,
+
     /// Post a desktop notification when a command tracked via OSC 133 runs
     /// longer than `notify_long_block_threshold_ms` and finishes while the
     /// user is not watching that pane (window unfocused or pane inactive).
@@ -629,6 +642,7 @@ impl Default for Config {
             ui_scale: None,
             shell: None,
             allow_clipboard_read: false,
+            allow_remote_clipboard_write: false,
             notify_long_blocks: default_notify_long_blocks(),
             notify_long_block_threshold_ms: default_notify_long_block_threshold_ms(),
             show_repo_strip: default_show_repo_strip(),
@@ -1588,6 +1602,31 @@ mod tests {
         assert!(!config.experimental_task_sidebar);
         assert!(!config.ai_share_command_context);
         assert!(config.ai_redact_secrets);
+    }
+
+    /// Both directions of the OSC 52 clipboard boundary are refused by
+    /// default. frost was the one app of the four that let PTY output — a
+    /// program on the far side of an ssh connection included — replace the
+    /// host clipboard with no gate at all, so the next paste produced whatever
+    /// that program chose.
+    #[test]
+    fn both_osc52_clipboard_directions_default_closed() {
+        let config = Config::from_toml("").expect("empty config parses");
+        assert!(!config.allow_clipboard_read);
+        assert!(!config.allow_remote_clipboard_write);
+
+        let config = Config::from_toml(
+            "allow_clipboard_read = true\n\
+             allow_remote_clipboard_write = true\n",
+        )
+        .expect("overrides parse");
+        assert!(config.allow_clipboard_read);
+        assert!(config.allow_remote_clipboard_write);
+
+        // The two are independent: opening reads must not open writes.
+        let config = Config::from_toml("allow_clipboard_read = true\n").expect("override parses");
+        assert!(config.allow_clipboard_read);
+        assert!(!config.allow_remote_clipboard_write);
     }
 
     #[test]

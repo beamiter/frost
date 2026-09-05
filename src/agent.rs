@@ -1456,6 +1456,7 @@ mod tests {
             exit_code: Some(exit),
             output: output.to_string(),
             id: None,
+            lifecycle: None,
             agent_generation,
             output_available: true,
             truncated: false,

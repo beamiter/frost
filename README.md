@@ -535,6 +535,11 @@ jsh_update_check = "daily"
 # 安全默认值。开启后，SSH 中的程序也能读取宿主剪贴板。
 allow_clipboard_read = false
 
+# 安全默认值。开启后，终端里（含 SSH 对端）的程序可用 OSC 52 改写宿主剪贴板，
+# 下一次粘贴就可能粘出别人准备好的内容；与 anvil/forge 的
+# allow_remote_clipboard_write、ember 的 osc52_clipboard_write 同义。
+allow_remote_clipboard_write = false
+
 # 长命令完成桌面通知（OSC 133 计时；正被注视的 pane 不提醒）
 notify_long_blocks = true
 notify_long_block_threshold_ms = 10000
@@ -709,7 +714,7 @@ frost 优先使用配套 shell [`jsh`](https://github.com/beamiter/jsh)，找不
 
 ## 安全说明
 
-终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。剪贴板写入仍按主流终端兼容行为允许。Kitty 图像、OSC 8 链接和通知均有资源、协议或频率限制。
+终端控制序列来自本地或远程程序，不能天然视为可信输入。frost 默认拒绝 OSC 52/5522 读取宿主剪贴板；如果显式开启 `allow_clipboard_read`，通过 SSH 运行的程序也可能获得剪贴板内容。OSC 52 写入同样默认拒绝：改写剪贴板与读取跨越同一条信任边界，只是方向相反——决定用户下一次粘贴出什么内容的，会变成终端里跑的程序；需要时用 `allow_remote_clipboard_write` 显式打开。Kitty 图像、OSC 8 链接和通知均有资源、协议或频率限制。
 
 失败命令的纠正卡片是唯一会“因为命令失败而自动拉起子进程”的界面，因此它的探测只从固定绝对候选
 路径解析 helper，并要求路径每一段都属系统所有且不可被组/其他人写入；用户 `PATH` 上的同名程序

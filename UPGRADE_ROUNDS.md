@@ -563,3 +563,168 @@ Round 70 closes the remaining argument-form affordance gap:
      touching replacements. Any exact survivor yields one copy-safe `%q`
      recovery command based only on bound physical names; diagnostics never
      expose link text or its referent.
+
+102. **Start identity captured at `C` and never minted at `D`** — the OSC 133
+     field loop now recognises `session_id`, `seq` and `started_at_ms`, gated
+     on the `C` mark, and stashes them with the execution id as one
+     all-or-nothing `StartLifecycle`. jsh puts all four on `C` and none of the
+     last three on `D`, so a completion that supplied them would be naming a
+     Start generation this terminal never observed; `D` may only be compared
+     against the captured id. The finished record carries that token to
+     `main.rs`, where it becomes a `jterm_core::parser::CommandMeta` and then
+     an `ExecutionLifecycle` — the journal's only durable-output capability,
+     which core's writer re-checks against the authoritative on-disk Start
+     under the journal lock. A boundary-inferred completion and a synthesized
+     agent termination both carry `None`: neither corresponds to a journal
+     Finish.
+
+103. **Every interactive shell has a session identity** — `Session::spawn_*`
+     passed `None` for `--session`, so every jsh under frost ran anonymously
+     even though `pty.rs` had implemented the flag for both argv shapes.
+     Without it jsh omits `session_id=` from `C`, the Start envelope is
+     permanently incomplete, `ExecutionLifecycle::from_command_meta` always
+     returns `None`, and the journal submit is a silent no-op — while jsh's own
+     `start` events record a null session and its per-session snapshot never
+     restores. The id is `agent_task_ui::terminal_session_id`, the same string
+     the task reducer already binds terminals with, filtered through
+     `is_valid_jsh_session_id`; the "is the shell actually jsh?" half of the
+     gate stays in `pty.rs`, where the configured shell is finally resolved,
+     and an explicit one-shot `command_argv` gets no session at all.
+
+104. **The journal gate is asked before the copy, not after** — the submit loop
+     cloned each finished block's whole captured output and only then let
+     `submit` discover the journal was disabled, and its comment stated the
+     gate backwards (the journal is on unless `JSH_EXECUTION_JOURNAL` turns it
+     off). `output_capture_enabled()` is now checked once, ahead of the loop.
+     `CompletionFacts::output` became `&'a str` upstream in the same round, so
+     the correction trigger's per-command copy of up to
+     `MAX_CAPTURED_OUTPUT_BYTES` is gone as well.
+
+105. **A finished block names the directory the command RAN in** — `D`'s
+     `cwd_url` is jsh's cwd *after* the command, so every block that changed
+     directory was labelled with its destination: `cd /tmp` from
+     `/home/u/proj` recorded `/tmp` as the working directory it ran in, and
+     that value reaches the block menu, the Markdown export and the agent
+     prompt. `D` may now only fill an empty cwd, never replace `C`'s. ember and
+     forge both already guarded this.
+
+106. **Untrusted archives are validated, staged privately, then published** —
+     a remote directory download extracted the far side's tar straight into the
+     destination's *parent* with nothing about its members checked, so an
+     archive naming `../../.ssh/authorized_keys`, an absolute path, or a second
+     top-level tree beside the requested one wrote wherever it named. Every
+     member is now required to sit under the one expected top-level component
+     (streamed and bounded, never retained), extraction happens in an
+     owner-only `create_new` directory this process owns, the extracted shape
+     is re-checked, and only that single verified tree is published with one
+     `RENAME_NOREPLACE` namespace operation. The staging directory is removed
+     on both paths.
+
+107. **Notification text is sanitised before it leaves the terminal** — OSC
+     9/777 titles and bodies reached `notify-send` with control characters and
+     bidi overrides intact, so `printf '\e]777;notify;<RLO>Security
+     Update;<RLO>approve\a'` put attacker-reordered text into a desktop toast
+     wearing the desktop's chrome. Offending scalars become U+FFFD rather than
+     disappearing, on the terminal-strict spoofing class, matching core's own
+     `bounded_notification_field`; a field that trims to nothing falls back to
+     the application identity.
+
+108. **One exit, and it is the one that flushes** — closing the last session
+     returned the exit task after writing only the session snapshot, so the
+     Agent transcript, the AI-chat store, the jsh execution journal and the
+     shared command-history index were abandoned mid-flight. Whether a
+     session's last commands survived depended on which quit gesture the user
+     used. Both gestures now return through `exit_flushing_durable_state`, each
+     flush keeps its own short deadline so a stalled state filesystem cannot
+     turn quitting into a hang, and a structural regression pins the exit task
+     to that one construction site.
+
+109. **Repeated OSC 133 slots and contradictory exit slots fail closed** —
+     repeated keys were last-wins, so PTY output could retract a truncation
+     disclosure with a second `cmd_truncated=0`, choose between two
+     contradictory directories, or name an execution twice. A `D` carrying two
+     outcome slots committed to the first, rendering `D;1;exit=0` as a
+     successful block, and a malformed `exit=` deferred to the next field
+     instead of occupying the slot it claimed. Both now follow core's parser
+     exactly: a repeated slot is ambiguity, and ambiguity is Unknown.
+
+110. **The OSC 133 alias set, decoding and text rules match core** —
+     `command_url` and `cmdline` were unrecognised and a bare `command=` was
+     taken without percent-decoding, so identical bytes decoded differently
+     depending on which spelling a shell chose. Metadata was filtered for
+     control characters only and then rendered raw in the block menu and the
+     export, so a cwd or id spelled with a zero-width joiner, a bidi override
+     or an interlinear annotation control drew as one path and named another;
+     ids, commands and cwds now go through the now-public
+     `review_input::is_terminal_visual_spoofing_character`, and cwds
+     additionally through `execution_journal::is_valid_jsh_cwd`.
+
+111. **The OSC 7 working directory is bounded** — the OSC 133 `cwd` param was
+     capped while OSC 7 was not, even though OSC 7 is the wider liability: it
+     is retained for the life of the pane, cloned into every command zone with
+     no cwd of its own, written into the session snapshot, and inherited by
+     every split. Both now use the same 4 KiB ceiling, which is also Linux's
+     own pathname limit, and the cap is on the decoded path so percent-encoding
+     buys no extra room.
+
+112. **OSC 52 writes are gated in both directions** — frost was the one app of
+     the four that let PTY output replace the host clipboard with no gate,
+     while already gating reads. A program in the terminal — including one on
+     the far side of an ssh connection — could silently choose what the user's
+     next paste produced, into a shell or a password field.
+     `allow_remote_clipboard_write` defaults off, matching anvil and forge's
+     identically named option and ember's `osc52_clipboard_write`, and is
+     independent of the read gate.
+
+113. **The command-zone rebase is amortised** — past the scrollback cap every
+     scrolled line trims a row, and rebasing the retained zones for it was a
+     per-line walk of the whole 256-entry deque on the PTY ingest path. The
+     shift is uniform, so it accumulates and is applied once per ingest batch;
+     every path that can observe a zone's anchors settles it first, so no
+     reader ever sees a stale row. A regression proves the batched result is
+     byte-identical to the per-row one and that one batch rebases once however
+     many rows it trimmed.
+
+114. **The keyboard surfaces read the keyboard table** — the command palette
+     and the Keyboard Shortcuts panel printed hardcoded default chords, so the
+     two surfaces whose entire job is to teach the keyboard were the two most
+     likely to be lying to a user who had configured one, and still showed a
+     chord for a command they had unbound. `KeyBindings::chords_for` /
+     `shortcut_label` render from the live table in core's frozen modifier
+     order (which exposed two palette hints spelled `Ctrl+Alt+Shift+…`), an
+     unbound command shows nothing rather than its former default, and the
+     genuinely non-configurable app chrome keeps its literal hint.
+
+115. **One ad-hoc block-context adapter, not three** — the three surfaces that
+     attach a block to the AI as untrusted evidence each hand-rolled a
+     `BlockContext`, with an unknown-status note none of the other three apps
+     used and a second local bounding helper. `ad_hoc_block_context` — the
+     family-shared adapter carried by anvil, ember and forge, and documented
+     there as frost's own `AskAi` adapter — is re-adopted with its six
+     regressions, so the sentinel, the explanatory note, the unavailable-output
+     placeholder and the head/tail bound are the family's in every surface.
+
+116. **The last-session quit flushes while its child can still answer** —
+     unifying the two quit gestures (item 108) reordered the one they did not
+     share: the last session's PTY was signalled *before*
+     `exit_flushing_durable_state` ran, and `save_session_snapshot` is the third
+     flush inside it. `terminate` returns as soon as SIGHUP/SIGTERM are away and
+     its reaper waits before reaping, so the snapshot read the `/proc/<pid>/cwd`
+     link of a zombie. For a shell that reports OSC 7 — jsh does — nothing was
+     lost, but a plain bash session has no other source for its directory, so
+     the last thing frost persisted before quitting was `cwd: None` and the next
+     launch opened somewhere else. The flush now runs first and the signal
+     second.
+
+117. **The lifecycle-bound journal submit is pinned, not merely present** —
+     rounds 102–104 and 112 landed with no test between them and the code:
+     neutering the submit loop, inverting the capture gate, dropping a slot from
+     the `CommandMeta` the submit path builds, or restoring the unconditional
+     OSC 52 clipboard write all compiled and left the whole matrix green, which
+     is the "compiles, passes, never journals" shape the round existed to
+     remove. The conversion is now a named `journal_lifecycle`, driven end to
+     end from a real OSC 133 A/B/C/D sequence and from the boundary-inferred
+     completion that must yield nothing; the submit site, its two gates, and the
+     `--session` identity handed to the one PTY spawn are pinned structurally,
+     in the style of `the_process_has_exactly_one_exit_and_it_flushes_first`,
+     because none of them is observable after the fact.

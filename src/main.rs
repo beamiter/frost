@@ -653,29 +653,56 @@ fn validated_summary_target(
 }
 
 fn agent_context_exit_label(exit_code: i32) -> String {
-    if exit_code == -1 {
+    if exit_code == agent_task::context::UNKNOWN_EXIT_STATUS_SENTINEL {
         "no reported exit status".to_string()
     } else {
         format!("exit {exit_code}")
     }
 }
 
-const NO_REPORTED_EXIT_STATUS_NOTE: &str =
-    "[terminal] the shell reported no exit status for this command";
-
-fn bounded_ai_block_output(output: &str, no_reported_status: bool) -> (String, bool) {
-    let prepared = if no_reported_status {
-        if output.is_empty() {
-            NO_REPORTED_EXIT_STATUS_NOTE.to_string()
-        } else {
-            format!("{NO_REPORTED_EXIT_STATUS_NOTE}\n{output}")
-        }
-    } else {
-        output.to_string()
-    };
-    let bounded = jterm_core::ai::truncate_for_context(&prepared, 80);
-    let truncated = bounded != prepared;
-    (bounded, truncated)
+/// The lenient semantic snapshot of one finished block, for the three surfaces
+/// that attach a block as untrusted evidence rather than as a task's subject.
+///
+/// Deliberately lenient where [`agent_task::SemanticCommandContext::to_block_context`]
+/// is strict: a background block with no command, no cwd and no reported
+/// status is still attachable evidence. What it must never do is launder that
+/// missing evidence, which is why the conversion is
+/// [`agent_task::context::ad_hoc_block_context`] — the family's shared
+/// adapter — and not a fourth hand-rolled `BlockContext` literal.
+fn ad_hoc_block_semantic_context(
+    sess: &Session,
+    zone_id: u64,
+    configured_shell: Option<&str>,
+) -> Option<agent_task::SemanticCommandContext> {
+    let zone = sess.terminal.zone_by_id(zone_id)?;
+    let (output_text, output_truncated, output_available) =
+        match sess.terminal.zone_output_export_capped(zone_id)? {
+            terminal::ZoneOutputExport::Available { text, truncated } => (text, truncated, true),
+            terminal::ZoneOutputExport::Empty => (String::new(), false, true),
+            // Not empty output: the rows and the snapshot are both gone. The
+            // adapter substitutes the family's placeholder and marks the
+            // context truncated rather than presenting silence as a result.
+            terminal::ZoneOutputExport::Unavailable => (String::new(), false, false),
+        };
+    Some(agent_task::SemanticCommandContext {
+        source_session_id: agent_task_ui::terminal_session_id(sess.id),
+        source_execution_id: format!("zone-{zone_id}"),
+        source_sequence: zone_id,
+        source_shell: pty::resolved_shell_identity(configured_shell, zone.cwd.as_deref()),
+        command: zone.command.clone(),
+        command_exact: zone.command_exact,
+        command_truncated: zone.command_truncated,
+        cwd: zone.cwd.clone(),
+        cwd_after: None,
+        exit_code: zone.exit_code,
+        duration_ms: zone.duration_ms,
+        output_total_bytes: output_text.len(),
+        output_text,
+        output_available,
+        output_truncated,
+        started_at: None,
+        finished_at: None,
+    })
 }
 
 fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
@@ -3293,6 +3320,7 @@ enum Message {
     SetScrollbarAlways(bool),
     SetDisableAltScreen(bool),
     SetAllowClipboardRead(bool),
+    SetAllowRemoteClipboardWrite(bool),
     SetNotifyLongBlocks(bool),
     SetBlockMode(bool),
     SetBlockCompact(bool),
@@ -3601,6 +3629,57 @@ fn session_label(base: String, transcript_read_only: bool) -> String {
     }
 }
 
+/// The `--session` identity a newly spawned interactive shell is launched with.
+///
+/// jsh only announces `session_id=` on its OSC 133 `C` packets, and only
+/// restores its per-session snapshot, when it was launched with `--session`.
+/// frost passed `None` here, so every jsh under it ran anonymously: the `C`
+/// envelope was permanently incomplete, `ExecutionLifecycle::from_command_meta`
+/// could never be satisfied, the journal submit was a silent no-op, and jsh's
+/// own `start` events recorded a null session.
+///
+/// The string is the one the task reducer already keys terminal bindings on,
+/// so one PTY session has one identity everywhere. It satisfies
+/// `is_valid_jsh_session_id` by construction; the filter is the fail-closed
+/// check on that rather than a formality, because a session id jsh refuses
+/// would take the shell down at launch instead of degrading to anonymous.
+///
+/// The "is the shell actually jsh?" half of the gate lives in
+/// `pty::new_with_cwd_env`, which is where the configured shell is finally
+/// resolved to a path; both argv shapes there append `--session` only for a
+/// jsh basename. An explicit `command_argv` is a one-shot helper — the jsh
+/// installer, a remote wrapper, an agent CLI — not the configured shell, so it
+/// gets no session identity at all.
+fn jsh_session_id(id: usize, command_argv: Option<&[String]>) -> Option<String> {
+    command_argv
+        .is_none()
+        .then(|| agent_task_ui::terminal_session_id(id))
+        .filter(|session| jterm_core::execution_journal::is_valid_jsh_session_id(session))
+}
+
+/// Mint the durable journal capability for one finished command from the Start
+/// identity OSC 133 `C` announced, and from nothing else.
+///
+/// `CompletedCommand::id` sits right beside the lifecycle and is not a
+/// substitute: that slot can be filled by a `D` alone, naming an execution this
+/// terminal never saw start. Core re-checks all four slots against the
+/// authoritative on-disk Start under the journal lock, so a guess assembled
+/// here would fail closed there anyway — after the whole block output had
+/// already been copied on the UI thread.
+fn journal_lifecycle(
+    start: &terminal::StartLifecycle,
+) -> Option<jterm_core::execution_journal::ExecutionLifecycle> {
+    jterm_core::execution_journal::ExecutionLifecycle::from_command_meta(
+        &jterm_core::parser::CommandMeta {
+            id: Some(start.id.clone()),
+            session_id: Some(start.session_id.clone()),
+            seq: Some(start.seq),
+            started_at_ms: Some(start.started_at_ms),
+            ..Default::default()
+        },
+    )
+}
+
 impl Session {
     fn spawn(
         config: &Config,
@@ -3636,11 +3715,12 @@ impl Session {
         command_argv: Option<&[String]>,
         extra_env: &[(&str, &str)],
     ) -> anyhow::Result<Session> {
+        let session_id = jsh_session_id(id, command_argv);
         let pty = Pty::new_with_cwd_env(
             cols,
             rows,
             cwd,
-            None,
+            session_id.as_deref(),
             config.shell.as_deref(),
             command_argv,
             extra_env,
@@ -6472,11 +6552,19 @@ impl Frost {
         // hit against the wrong session. Close it; see
         // `close_block_search_on_session_change`.
         self.close_block_search_on_session_change();
-        // Closing the last session quits the app.
+        // Closing the last session quits the app, and quitting has to be the
+        // same thing however it is reached.
         if self.sessions.len() == 1 {
-            self.save_session_snapshot();
+            // Flush first, signal second. `save_session_snapshot` records each
+            // pane's working directory, and for a shell without OSC 7
+            // integration that value can only come from the live child's
+            // /proc/<pid>/cwd link. `terminate` returns as soon as the signals
+            // are away, leaving a zombie whose cwd link is already gone, so
+            // signalling first would persist the last session with no
+            // directory at all and reopen it somewhere else next launch.
+            let exit = self.exit_flushing_durable_state();
             let _ = self.sessions[0].pty.terminate();
-            return iced::exit();
+            return exit;
         }
         let mut sess = self.sessions.remove(index);
         let closed_id = sess.id;
@@ -6634,15 +6722,33 @@ impl Frost {
             );
             return Task::none();
         }
+        self.exit_flushing_durable_state()
+    }
+
+    /// The one way out of the process.
+    ///
+    /// frost has two quit gestures — the window-close request and closing the
+    /// last session — and only the first one used to be durable. The second
+    /// wrote the session snapshot and left immediately, so the Agent
+    /// transcript, the AI-chat store, the jsh execution journal and the shared
+    /// command-history index were all abandoned mid-flight: whether a whole
+    /// session's work survived depended on which gesture the user happened to
+    /// close with. Both writers hand work to bounded background threads, so
+    /// "abandoned" means the last commands of the session simply never
+    /// appeared, with nothing logged.
+    ///
+    /// Each flush has its own short deadline rather than one shared budget,
+    /// because a stalled state filesystem must not turn quitting into a hang;
+    /// a missed deadline is logged and the exit continues.
+    fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+        const EXIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         self.agent.persist();
         self.ai_chats.persist(self.config.ai_redact_secrets);
         self.save_session_snapshot();
-        if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
+        if !jterm_core::execution_journal::flush(EXIT_FLUSH_TIMEOUT) {
             log::warn!("jsh execution journal did not flush before exit");
         }
-        if let Err(error) =
-            jterm_core::command_history::flush_pending(std::time::Duration::from_secs(2))
-        {
+        if let Err(error) = jterm_core::command_history::flush_pending(EXIT_FLUSH_TIMEOUT) {
             log::warn!("command history did not flush before exit: {error}");
         }
         iced::exit()
@@ -8693,35 +8799,12 @@ impl Frost {
         let Some(sess) = self.sessions.get(self.active) else {
             return Task::none();
         };
-        let Some(zone) = sess.terminal.zone_by_id(id) else {
+        let Some(semantic) = ad_hoc_block_semantic_context(sess, id, self.config.shell.as_deref())
+        else {
             self.push_toast("Block no longer available".to_string(), ToastKind::Info);
             return Task::none();
         };
-        let (output, output_truncated) = match sess.terminal.zone_output_export_capped(id) {
-            Some(terminal::ZoneOutputExport::Available { text, truncated }) => (text, truncated),
-            Some(terminal::ZoneOutputExport::Empty) => (String::new(), false),
-            Some(terminal::ZoneOutputExport::Unavailable) => (
-                "[output unavailable: retained snapshot and scrollback rows were evicted]"
-                    .to_string(),
-                true,
-            ),
-            None => {
-                self.push_toast("Block no longer available".to_string(), ToastKind::Info);
-                return Task::none();
-            }
-        };
-        let no_reported_status = zone.exit_code.is_none();
-        let (ai_output, ai_output_truncated) = bounded_ai_block_output(&output, no_reported_status);
-        let context = jterm_core::ai::BlockContext {
-            cmd: zone.command.clone().unwrap_or_default(),
-            output: ai_output,
-            cwd: zone.cwd.clone(),
-            // BlockContext currently has no Option status. -1 is the family
-            // sentinel for "the shell reported no exit status"; never turn an
-            // unknown/background lifecycle into a false success.
-            exit_code: zone.exit_code.unwrap_or(-1),
-            truncated: zone.command_truncated || output_truncated || ai_output_truncated,
-        };
+        let context = agent_task::context::ad_hoc_block_context(&semantic);
         let session_id = sess.id;
         if !self.agent.is_open || self.agent.bound_session_id != Some(session_id) {
             self.agent.open(&self.config, session_id);
@@ -8781,33 +8864,16 @@ impl Frost {
                             .to_string(),
                     );
                 }
-                let (output, output_truncated) =
-                    match sess.terminal.zone_output_export_capped(zone_id) {
-                        Some(terminal::ZoneOutputExport::Available { text, truncated }) => {
-                            (text, truncated)
-                        }
-                        Some(terminal::ZoneOutputExport::Empty) => (String::new(), false),
-                        Some(terminal::ZoneOutputExport::Unavailable) => (
-                            "[output unavailable: retained snapshot and scrollback rows were evicted]"
-                                .to_string(),
-                            true,
-                        ),
-                        None => {
-                            return Err("Block menu target is no longer available".to_string())
-                        }
-                    };
-                // A failed block always has a reported status.
-                let (ai_output, ai_output_truncated) = bounded_ai_block_output(&output, false);
-                Ok(jterm_core::ai::BlockContext {
-                    cmd: zone
-                        .command
-                        .clone()
-                        .expect("eligibility guarantees a command"),
-                    output: ai_output,
-                    cwd: Some(recorded),
-                    exit_code: zone.exit_code.unwrap_or(-1),
-                    truncated: output_truncated || ai_output_truncated,
-                })
+                let Some(mut semantic) =
+                    ad_hoc_block_semantic_context(sess, zone_id, self.config.shell.as_deref())
+                else {
+                    return Err("Block menu target is no longer available".to_string());
+                };
+                // The verified cwd, not the zone's self-reported one: the
+                // provenance check above is what makes this block eligible to
+                // anchor an Agent task at all.
+                semantic.cwd = Some(recorded);
+                Ok(agent_task::context::ad_hoc_block_context(&semantic))
             });
         let context = match prepared {
             Some(Ok(context)) => context,
@@ -12236,8 +12302,18 @@ impl Frost {
                 if refresh_block_search {
                     tasks.push(self.begin_block_search_rebuild());
                 }
+                // An OSC 52 SET is PTY output asking to replace the host
+                // clipboard, so it crosses the same trust boundary a read
+                // does, in the other direction: a program on the far side of
+                // an ssh connection choosing what the user's next paste
+                // produces. frost applied it unconditionally while gating
+                // reads; both siblings gate both. The decode still happened
+                // above, so the pending slot is cleared either way and a
+                // refused write cannot be replayed by a later allowed one.
                 if let Some(text) = clip_set {
-                    tasks.push(iced::clipboard::write(text));
+                    if self.config.allow_remote_clipboard_write {
+                        tasks.push(iced::clipboard::write(text));
+                    }
                 }
                 if clip_query && self.config.allow_clipboard_read {
                     let start_read = if let Some(sess) = self.session_by_identity(id, fd) {
@@ -12326,27 +12402,43 @@ impl Frost {
                     }
                 }
 
-                // Mirror captured command output into jsh's execution journal
-                // (no-op unless JSH_EXECUTION_JOURNAL is enabled).
-                for completed in &completed_commands {
-                    if completed.completion_provenance
-                        != block_mode::CompletionProvenance::ShellReported
-                    {
-                        continue;
-                    }
-                    let Some(id) = completed.id.clone() else {
-                        continue;
-                    };
-                    if let Err(error) = jterm_core::execution_journal::submit(
-                        jterm_core::execution_journal::CompletedExecution {
-                            id,
-                            output: completed.output.clone(),
-                            output_available: completed.output_available,
-                            truncated: completed.truncated,
-                            total_bytes: completed.total_bytes,
-                        },
-                    ) {
-                        log::warn!("cannot journal completed command output: {error:?}");
+                // Mirror captured command output into jsh's execution journal.
+                // The journal is on unless `JSH_EXECUTION_JOURNAL` explicitly
+                // turns it off, and the comment here used to say the opposite,
+                // which is how the clone below survived: `submit` repeats this
+                // check at the queue boundary, but only AFTER taking the whole
+                // block output by value. Asking first means a disabled journal
+                // costs nothing per finished command instead of one copy of up
+                // to `TerminalState::MAX_CAPTURED_OUTPUT_BYTES` on the UI
+                // thread.
+                if jterm_core::execution_journal::output_capture_enabled() {
+                    for completed in &completed_commands {
+                        if completed.completion_provenance
+                            != block_mode::CompletionProvenance::ShellReported
+                        {
+                            continue;
+                        }
+                        // Durable output may only be written against the exact
+                        // Start identity jsh announced on OSC 133 `C`; see
+                        // `journal_lifecycle` for why the plain `id` beside it
+                        // is not a substitute. A completion without one is
+                        // skipped rather than journalled against a guess.
+                        let Some(lifecycle) =
+                            completed.lifecycle.as_ref().and_then(journal_lifecycle)
+                        else {
+                            continue;
+                        };
+                        if let Err(error) = jterm_core::execution_journal::submit(
+                            jterm_core::execution_journal::CompletedExecution {
+                                lifecycle,
+                                output: completed.output.clone(),
+                                output_available: completed.output_available,
+                                truncated: completed.truncated,
+                                total_bytes: completed.total_bytes,
+                            },
+                        ) {
+                            log::warn!("cannot journal completed command output: {error:?}");
+                        }
                     }
                 }
 
@@ -14627,6 +14719,10 @@ impl Frost {
             }
             Message::SetAllowClipboardRead(allow) => {
                 self.config.allow_clipboard_read = allow;
+                self.config_dirty = true;
+            }
+            Message::SetAllowRemoteClipboardWrite(allow) => {
+                self.config.allow_remote_clipboard_write = allow;
                 self.config_dirty = true;
             }
             Message::SetNotifyLongBlocks(enabled) => {
@@ -19737,8 +19833,11 @@ impl Frost {
                 let mut info = row![labels, Space::new().width(Length::Fill)]
                     .spacing(10)
                     .align_y(iced::Alignment::Center);
-                if !item.shortcut.is_empty() {
-                    info = info.push(text(item.shortcut).size(11).style(text::secondary));
+                // Read from the live binding table, not from a baked-in
+                // default: a user who rebound or unbound this command must be
+                // shown what they actually have.
+                if let Some(shortcut) = item.shortcut_label(&self.keybindings) {
+                    info = info.push(text(shortcut).size(11).style(text::secondary));
                 }
                 let row_btn = button(info)
                     .on_press(Message::PaletteExecute(*idx))
@@ -19983,11 +20082,19 @@ impl Frost {
         let clipboard_row = responsive_control_row(
             compact,
             "Clipboard",
-            checkbox(self.config.allow_clipboard_read)
-                .label("Allow PTY reads (unsafe over SSH)")
-                .text_size(13)
-                .on_toggle(Message::SetAllowClipboardRead)
-                .into(),
+            row![
+                checkbox(self.config.allow_clipboard_read)
+                    .label("Allow PTY reads (unsafe over SSH)")
+                    .text_size(13)
+                    .on_toggle(Message::SetAllowClipboardRead),
+                checkbox(self.config.allow_remote_clipboard_write)
+                    .label("Allow PTY writes (unsafe over SSH)")
+                    .text_size(13)
+                    .on_toggle(Message::SetAllowRemoteClipboardWrite),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center)
+            .into(),
         );
 
         let tab_position_row = responsive_control_row(
@@ -20498,30 +20605,84 @@ impl Frost {
             .spacing(8)
             .into()
         };
+        // Every row whose chord is configurable reads the live binding table.
+        // These were literals, so the one panel whose whole job is to teach
+        // the keyboard showed frost's shipped defaults to a user who had
+        // rebound them — and still showed a chord for a command they had
+        // unbound. An unbound command now says so instead.
+        let bound = |command_id: &str, desc: &str| -> Element<'_, Message> {
+            let key = self
+                .keybindings
+                .shortcut_label(command_id)
+                .unwrap_or_else(|| "(unbound)".to_string());
+            kb(&key, desc)
+        };
+        // One row that stands for several related commands still names each
+        // one's real chord, in the order the description lists them.
+        let bound_group = |command_ids: &[&str], desc: &str| -> Element<'_, Message> {
+            let key = command_ids
+                .iter()
+                .map(|command_id| {
+                    self.keybindings
+                        .shortcut_label(command_id)
+                        .unwrap_or_else(|| "(unbound)".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            kb(&key, desc)
+        };
 
         let body = column![
             text("Keyboard Shortcuts").size(18),
             section("Tabs / Sessions"),
-            kb("Ctrl+Shift+T", "New tab"),
-            kb("Ctrl+Shift+W", "Close current tab"),
-            kb("Ctrl+Tab / Ctrl+PgDn", "Next tab"),
-            kb("Ctrl+Shift+Tab / Ctrl+PgUp", "Previous tab"),
-            kb("Ctrl+1 .. Ctrl+8", "Jump to tab 1-8"),
-            kb("Ctrl+9", "Jump to last tab"),
+            bound("session:new", "New tab"),
+            bound("session:close", "Close current tab"),
+            bound("session:next", "Next tab"),
+            bound("session:prev", "Previous tab"),
+            bound_group(
+                &["session:jump:0", "session:jump:7"],
+                "Jump to tab 1-8 (first .. eighth)"
+            ),
+            bound("session:last", "Jump to last tab"),
             kb("Ctrl+Shift+L", "Fuzzy tab switcher"),
             section("Splits / Panes"),
-            kb("Ctrl+Shift+E", "Add pane right (re-orients a row split)"),
-            kb("Ctrl+Shift+D", "Add pane below (re-orients a column split)"),
-            kb("Ctrl+Alt+Arrow", "Focus adjacent pane"),
-            kb("Ctrl+Alt+Shift+Arrow", "Resize focused pane"),
-            kb("Ctrl+Shift+Z", "Zoom focused pane (toggle)"),
-            kb("Ctrl+Shift+X", "Swap pane with the next one"),
+            bound(
+                "terminal:split_vertical",
+                "Add pane right (re-orients a row split)"
+            ),
+            bound(
+                "terminal:split_horizontal",
+                "Add pane below (re-orients a column split)"
+            ),
+            bound_group(
+                &[
+                    "pane:focus_left",
+                    "pane:focus_right",
+                    "pane:focus_up",
+                    "pane:focus_down",
+                ],
+                "Focus the pane left / right / up / down"
+            ),
+            bound_group(
+                &[
+                    "pane:resize_left",
+                    "pane:resize_right",
+                    "pane:resize_up",
+                    "pane:resize_down",
+                ],
+                "Resize the focused pane left / right / up / down"
+            ),
+            bound("pane:zoom_toggle", "Zoom focused pane (toggle)"),
+            bound("pane:swap", "Swap pane with the next one"),
             kb("Double-click divider", "Equalize all panes"),
-            kb("Ctrl+Shift+W", "Close focused pane / tab"),
+            bound("terminal:close_pane", "Close focused pane / tab"),
             section("Edit / Clipboard"),
-            kb("Ctrl+Shift+C", "Copy selection"),
-            kb("Ctrl+Shift+V", "Paste"),
-            kb("Ctrl+Shift+G", "Copy last command output (OSC 133)"),
+            bound("edit:copy", "Copy selection"),
+            bound("edit:paste", "Paste"),
+            bound(
+                "terminal:copy_last_output",
+                "Copy last command output (OSC 133)"
+            ),
             kb(
                 "Ctrl+Shift+H",
                 "Command history picker (types into the prompt)"
@@ -20544,29 +20705,36 @@ impl Frost {
                 "Right-click card",
                 "Open block actions without losing selection"
             ),
-            kb(
-                "Ctrl+Alt+F",
+            bound(
+                "block:search",
                 "Search/filter blocks and reveal the matching line"
             ),
-            kb("Ctrl+Shift+B", "Toggle bookmark on selected block"),
-            kb("Ctrl+, / Ctrl+.", "Previous / next bookmark (wraps)"),
-            kb(
-                "Ctrl+Alt+X / E",
+            bound("block:toggle_bookmark", "Toggle bookmark on selected block"),
+            bound_group(
+                &["block:jump_prev_bookmark", "block:jump_next_bookmark"],
+                "Previous / next bookmark (wraps)"
+            ),
+            bound_group(
+                &["block:fix_with_agent", "block:explain_with_agent"],
                 "Fix / explain selected (or latest) failed block with Agent"
             ),
-            kb(
-                "Ctrl+Alt+T",
+            bound(
+                "block:retry_failed",
                 "Retry selected (or latest) failed block's command"
             ),
-            kb(
-                "Ctrl+Shift+A / I / K",
+            bound_group(
+                &[
+                    "block:select_all",
+                    "block:reinput_selected_commands",
+                    "block:clear",
+                ],
                 "Select all / reinput / clear blocks"
             ),
             kb("Ctrl+↑", "Start selecting from the newest block"),
             kb("↑ / ↓", "Move the selection to the adjacent block"),
             kb("Shift+↑ / ↓", "Grow or shrink the selected range"),
-            kb(
-                "Ctrl+Alt+Z",
+            bound(
+                "block:toggle_collapse",
                 "Collapse / expand the selected block's output"
             ),
             kb("Ctrl+Shift+↑ / ↓", "Reveal selected block top / bottom"),
@@ -20575,14 +20743,17 @@ impl Frost {
             section("Scroll / Search"),
             kb("Shift+Home", "Scroll to top"),
             kb("Shift+End", "Scroll to bottom (live)"),
-            kb("Ctrl+Shift+Up / Down", "Previous / next prompt (OSC 133)"),
-            kb("Ctrl+Shift+F", "Find"),
-            kb(
-                "Ctrl+Alt+R",
+            bound_group(
+                &["terminal:prompt_prev", "terminal:prompt_next"],
+                "Previous / next prompt (OSC 133)"
+            ),
+            bound("search:open", "Find"),
+            bound(
+                "search:replace:toggle",
                 "Find & replace in selection (clipboard / prompt)"
             ),
             section("Panels"),
-            kb("Ctrl+\\", "Toggle tabs / files sidebar"),
+            bound("sidebar:toggle", "Toggle tabs / files sidebar"),
             kb("F5 over Files", "Refresh the current file-tree root"),
             kb(
                 "Alt+Left/Right/Up/Home over Files",
@@ -20590,15 +20761,18 @@ impl Frost {
             ),
             kb("Right-click folder → Open Folder", "Enter that directory"),
             kb("Ctrl+Shift+P", "Command palette"),
-            kb("Ctrl+Shift+O", "Settings"),
+            bound("config:toggle", "Settings"),
             kb("F12", "Debug / diagnostics"),
             kb("Ctrl+Shift+/", "This help"),
             kb("Esc", "Close any panel"),
             section("Appearance"),
-            kb("Ctrl+= / Ctrl+-", "Increase / decrease font size"),
-            kb("Ctrl+0", "Reset font size"),
-            kb(
-                "Ctrl+Alt+= / Ctrl+Alt+-",
+            bound_group(
+                &["font:zoom_in", "font:zoom_out"],
+                "Increase / decrease font size"
+            ),
+            bound("font:zoom_reset", "Reset font size"),
+            bound_group(
+                &["opacity:increase", "opacity:decrease"],
                 "Increase / decrease window opacity"
             ),
         ]
@@ -20854,13 +21028,12 @@ impl Frost {
             self.agent.is_open,
         );
         // `should_start` re-checks this, and it is the engine that owns every
-        // other refusal. Answering frost's own composite gate first is purely
-        // about the clone below: `CompletionFacts` takes the block output by
-        // value, this runs for every finished command, and a block holds up to
-        // `MAX_CAPTURED_OUTPUT_BYTES` — so with the toggle off (the default)
-        // that would be an 8 MiB copy per `ls` for a feature that is not on.
-        // Pre-sampling instead would be wrong: the engine samples, and
-        // sampling a sample elides real content a second time.
+        // other refusal. Answering frost's own composite gate first still pays
+        // for itself: this runs for every finished command, and the session
+        // lookup plus the command and cwd copies below are pure waste when the
+        // feature is off (the default). The block output itself is no longer
+        // part of that cost — `CompletionFacts::output` is a `&str` now, so the
+        // whole finished block is borrowed rather than copied on the UI thread.
         if !enabled {
             return None;
         }
@@ -20871,11 +21044,13 @@ impl Frost {
             // and inventing one would put a "did you mean" card under a
             // command that may well have succeeded.
             exit_code: completed.exit_code,
-            // Whole, not sampled: `should_start` reduces this to the engine's
-            // own bounded head/tail sample before anything classifies it, and
-            // sampling twice elides real content out of the middle of the
-            // first sample.
-            output: completed.output.clone(),
+            // Whole, not sampled, and borrowed: `should_start` reduces this to
+            // the engine's own bounded head/tail sample before anything
+            // classifies it, and sampling twice elides real content out of the
+            // middle of the first sample. Borrowing means a block at the
+            // `MAX_CAPTURED_OUTPUT_BYTES` ceiling costs nothing here even with
+            // the feature on.
+            output: &completed.output,
             cwd: sess
                 .cwd_cache
                 .clone()
@@ -21205,28 +21380,8 @@ impl Frost {
         sess: &Session,
     ) -> Option<jterm_core::ai::BlockContext> {
         let zone_id = sess.block_selection.active()?;
-        let zone = sess.terminal.zone_by_id(zone_id)?;
-        let (output, output_truncated) = match sess.terminal.zone_output_export_capped(zone_id) {
-            Some(terminal::ZoneOutputExport::Available { text, truncated }) => (text, truncated),
-            Some(terminal::ZoneOutputExport::Empty) => (String::new(), false),
-            Some(terminal::ZoneOutputExport::Unavailable) => (
-                "[output unavailable: retained snapshot and scrollback rows were evicted]"
-                    .to_string(),
-                true,
-            ),
-            None => return None,
-        };
-        let no_reported_status = zone.exit_code.is_none();
-        let (ai_output, ai_output_truncated) = bounded_ai_block_output(&output, no_reported_status);
-        Some(jterm_core::ai::BlockContext {
-            cmd: zone.command.clone().unwrap_or_default(),
-            output: ai_output,
-            cwd: zone.cwd.clone(),
-            // -1 is the family sentinel for "the shell reported no exit
-            // status"; never turn an unknown lifecycle into a false success.
-            exit_code: zone.exit_code.unwrap_or(-1),
-            truncated: zone.command_truncated || output_truncated || ai_output_truncated,
-        })
+        let semantic = ad_hoc_block_semantic_context(sess, zone_id, self.config.shell.as_deref())?;
+        Some(agent_task::context::ad_hoc_block_context(&semantic))
     }
 
     /// Launch the suggestion's drafting worker for the live generation. A
@@ -24868,6 +25023,348 @@ mod tests {
     use super::*;
     use iced::keyboard::key::Named;
 
+    /// There is exactly one way out of the process, and it is the one that
+    /// flushes.
+    ///
+    /// Closing the last session used to leave on its own after writing only
+    /// the session snapshot, so the Agent transcript, the AI-chat store, the
+    /// jsh execution journal and the command-history index were abandoned
+    /// mid-flight — the durability of a whole session depended on which quit
+    /// gesture the user happened to use. Nothing is observable once both paths
+    /// have exited the process, so the guard is structural: the exit task is
+    /// constructed in exactly one place, which is the function that flushes.
+    #[test]
+    fn the_process_has_exactly_one_exit_and_it_flushes_first() {
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let needle = format!("iced::{}()", "exit");
+        let source = frost_source();
+        let call_sites: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(&needle) && !line.starts_with("//"))
+            .collect();
+        assert_eq!(
+            call_sites,
+            [needle.as_str()],
+            "every quit gesture must return through exit_flushing_durable_state"
+        );
+
+        let exit_body = source
+            .split_once("fn exit_flushing_durable_state")
+            .expect("the single flushing exit exists")
+            .1;
+        let exit_body = &exit_body[..exit_body.find(&needle).expect("it ends by exiting")];
+        for durable in [
+            "self.agent.persist()",
+            "self.ai_chats.persist(",
+            "self.save_session_snapshot()",
+            "execution_journal::flush(",
+            "command_history::flush_pending(",
+        ] {
+            assert!(
+                exit_body.contains(durable),
+                "{durable} must run before the process leaves"
+            );
+        }
+    }
+
+    /// The last-session quit flushes while its child is still alive.
+    ///
+    /// `save_session_snapshot` records each pane's working directory, and for
+    /// a shell without OSC 7 integration — plain bash, say — that value can
+    /// only come from `/proc/<pid>/cwd` of the live child. `Pty::terminate`
+    /// returns as soon as SIGHUP/SIGTERM are away and its reaper waits 50 ms
+    /// before reaping, so a snapshot taken after it reads the cwd link of a
+    /// zombie: gone, and the session is persisted with no directory at all.
+    /// Signal ordering around a real child is not observable from a unit test,
+    /// so the guard is structural.
+    #[test]
+    fn the_last_session_close_flushes_before_it_signals_the_child() {
+        let source = frost_source();
+        let branch = braced_block_after(&source, "if self.sessions.len() == 1 {");
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let signal = format!("pty.{}()", "terminate");
+        let flush = format!("self.exit_flushing_durable_state{}", "()");
+        let signal_at = branch
+            .find(&signal)
+            .expect("the last session's child is still signalled");
+        let flush_at = branch
+            .find(&flush)
+            .expect("closing the last session is the flushing quit path");
+        assert!(
+            flush_at < signal_at,
+            "the durable flush must run while the child can still report its cwd"
+        );
+    }
+
+    /// A complete OSC 133 `C` envelope is the only thing that mints a durable
+    /// journal capability, and `journal_lifecycle` is the exact conversion the
+    /// PTY-output path performs before it submits. Drop any one of the four
+    /// slots on the way through and the capability is refused, so nothing is
+    /// ever written against a half-known Start.
+    #[test]
+    fn a_complete_osc_133_start_mints_the_capability_frost_journals_with() {
+        let session = agent_task_ui::terminal_session_id(7);
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        terminal.process_input(
+            format!(
+                "\x1b]133;C;id=jsh-b8c6-1;session_id={session};seq=3;\
+                 started_at_ms=1788571993465\x07hi\r\n"
+            )
+            .as_bytes(),
+        );
+        terminal.process_input(b"\x1b]133;D;0;id=jsh-b8c6-1;duration_ms=4\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].completion_provenance,
+            block_mode::CompletionProvenance::ShellReported
+        );
+        let start = completed[0]
+            .lifecycle
+            .as_ref()
+            .expect("a complete C envelope carries a Start identity");
+        let lifecycle =
+            journal_lifecycle(start).expect("frost converts the Start jsh announced as-is");
+        assert_eq!(lifecycle.id(), "jsh-b8c6-1");
+        assert_eq!(lifecycle.session_id(), session);
+        assert_eq!(lifecycle.seq(), 3);
+        assert_eq!(lifecycle.started_at_ms(), 1_788_571_993_465);
+
+        // A `D` that never arrives closes the block at the next prompt. That
+        // completion is a guess about where output ended, so it carries no
+        // Start and there is nothing to journal it against.
+        let mut inferred = TerminalState::new(40, 8);
+        inferred.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        inferred.process_input(
+            format!(
+                "\x1b]133;C;id=jsh-b8c6-2;session_id={session};seq=4;\
+                 started_at_ms=1788571993466\x07hi\r\n"
+            )
+            .as_bytes(),
+        );
+        inferred.process_input(b"\x1b]133;A\x07$ ");
+        let completed = inferred.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].completion_provenance,
+            block_mode::CompletionProvenance::BoundaryInferred
+        );
+        assert!(
+            completed[0].lifecycle.is_none(),
+            "a boundary-inferred completion must not carry a journal capability"
+        );
+    }
+
+    /// Durable journal writes happen in exactly one place, behind both gates.
+    ///
+    /// The conversion above is only reachable if the PTY-output path still
+    /// calls it: neutering the loop body, inverting the capture gate, or
+    /// submitting straight from `completed.id` all compile and leave every
+    /// other test green while frost silently journals nothing (or journals
+    /// against a Start it never saw). Neither the gate nor the skip is
+    /// observable after the fact, so pin the shape.
+    #[test]
+    fn durable_journal_writes_are_gated_on_capture_and_a_start_lifecycle() {
+        let source = frost_source();
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let submit = format!("execution_journal::{}(", "submit");
+        assert_eq!(
+            source.matches(&submit).count(),
+            1,
+            "journal output is published from one place or the gates below mean nothing"
+        );
+        let capture_gate = format!(
+            "if jterm_core::execution_journal::{}_enabled() {{",
+            "output_capture"
+        );
+        let gated = braced_block_after(&source, &capture_gate);
+        let submit_at = gated
+            .find(&submit)
+            .expect("the sole journal write sits inside the capture gate");
+        for (required, why) in [
+            (
+                "CompletionProvenance::ShellReported",
+                "a boundary-inferred completion is a guess and must never be journalled",
+            ),
+            (
+                "let Some(lifecycle) =",
+                "the write is bound to a capability, not to a bare id",
+            ),
+            (
+                "completed.lifecycle",
+                "the capability comes from the Start captured at OSC 133 C",
+            ),
+            (
+                "journal_lifecycle",
+                "the conversion under test is the one the submit path uses",
+            ),
+        ] {
+            let at = gated
+                .find(required)
+                .unwrap_or_else(|| panic!("{required} must guard the journal write: {why}"));
+            assert!(
+                at < submit_at,
+                "{required} must come before the write: {why}"
+            );
+        }
+    }
+
+    /// An OSC 52 SET is PTY output asking to replace the host clipboard, so it
+    /// crosses the same trust boundary a read does, in the other direction: a
+    /// program on the far side of an ssh connection choosing what the user's
+    /// next paste produces. `allow_remote_clipboard_write` defaults closed, but
+    /// a default only matters where it is consulted — frost applied the write
+    /// unconditionally while gating reads, and the config test alone never saw
+    /// it. The application site has no runtime handle, so pin it structurally.
+    #[test]
+    fn an_osc_52_clipboard_set_is_applied_only_behind_the_write_permission() {
+        let source = frost_source();
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let opener = format!("if let Some(text) = clip_{} {{", "set");
+        let applied = braced_block_after(&source, &opener);
+        let write = format!("iced::clipboard::{}(", "write");
+        assert_eq!(
+            applied.matches(&write).count(),
+            1,
+            "the OSC 52 SET path writes the clipboard once, or the gate below is bypassable"
+        );
+        let permitted =
+            braced_block_after(&applied, "if self.config.allow_remote_clipboard_write {");
+        assert!(
+            permitted.contains(&write),
+            "a remote clipboard SET may only be applied with the permission granted"
+        );
+    }
+
+    /// Every interactive shell frost spawns gets a `--session` identity, and
+    /// it is the same string the task reducer binds terminals with. Without
+    /// one, jsh omits `session_id=` from its OSC 133 `C` packets, the Start
+    /// envelope is permanently incomplete, and durable journal output can
+    /// never be published for anything frost runs.
+    #[test]
+    fn every_interactive_shell_is_launched_with_a_valid_jsh_session_identity() {
+        for id in [0usize, 1, 7, usize::from(u8::MAX)] {
+            let session = jsh_session_id(id, None).expect("an interactive shell gets a session");
+            assert_eq!(session, agent_task_ui::terminal_session_id(id));
+            assert!(
+                jterm_core::execution_journal::is_valid_jsh_session_id(&session),
+                "{session} must satisfy jsh's own session grammar"
+            );
+        }
+        assert_ne!(jsh_session_id(1, None), jsh_session_id(2, None));
+
+        // A one-shot helper argv is not the configured shell, and `pty` never
+        // appends `--session` to one, so it is never handed an identity here
+        // either.
+        let helper = vec!["/usr/bin/env".to_string(), "true".to_string()];
+        assert_eq!(jsh_session_id(1, Some(&helper)), None);
+
+        // Minting the identity is only half of it — the spawn has to carry it.
+        // The blocker this round fixed was `Pty::new_with_cwd_env(..., None,
+        // ...)`: jsh then omits `session_id=` from every OSC 133 `C`, no Start
+        // envelope is ever complete, and the journal submit is a permanent
+        // silent no-op. Nothing about a real spawn is observable from a unit
+        // test, so the wiring is guarded structurally.
+        let source = frost_source();
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let spawn = format!("Pty::new_with_cwd_env{}", "(");
+        let spawn_at: Vec<usize> = source
+            .match_indices(&spawn)
+            .map(|(at, _)| at)
+            // Prose about the call site is not a call site.
+            .filter(|at| {
+                let line_start = source[..*at].rfind('\n').map_or(0, |newline| newline + 1);
+                !source[line_start..*at].trim_start().starts_with("//")
+            })
+            .collect();
+        assert_eq!(
+            spawn_at.len(),
+            1,
+            "every session spawn goes through one PTY call site"
+        );
+        let spawn_at = spawn_at[0];
+        assert!(
+            paren_arguments(&source[spawn_at..]).contains("session_id.as_deref()"),
+            "the spawn must hand the minted identity to the PTY, not None"
+        );
+        let minted = source[..spawn_at]
+            .lines()
+            .rev()
+            .nth(1)
+            .expect("the spawn is not the first line of the file")
+            .trim();
+        assert!(
+            minted.starts_with("let session_id = jsh_session_id("),
+            "the identity the PTY receives is minted immediately above it, not \
+             smuggled in from somewhere that could go stale: {minted:?}"
+        );
+    }
+
+    /// frost's own source, for the structural guards over invariants that
+    /// nothing observable survives to assert at runtime.
+    fn frost_source() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("frost's own source is readable from its manifest directory")
+    }
+
+    /// The argument list of the call `source` starts with, paren-matched so a
+    /// nested call such as `as_deref()` does not end it early.
+    fn paren_arguments(source: &str) -> &str {
+        let mut depth = 0usize;
+        for (offset, character) in source.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[..offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the call is closed");
+    }
+
+    /// The body of the `{ ... }` block that `opener` (which must end in `{`)
+    /// opens, with `//` tails dropped first so a brace inside prose cannot
+    /// unbalance the walk. Only used over regions known to be free of `//`
+    /// inside string literals.
+    fn braced_block_after(source: &str, opener: &str) -> String {
+        let rest = source
+            .split_once(opener)
+            .unwrap_or_else(|| panic!("{opener} appears in frost's source"))
+            .1;
+        let code = rest
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut depth = 1usize;
+        for (offset, character) in code.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return code[..offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the block {opener} opens is closed");
+    }
+
     fn sidebar_remote_profile(name: &str, host: &str) -> jterm_core::jsh_remote::RemoteHostConfig {
         let mut profile = config::default_remote_hosts()[0].clone();
         profile.name = name.to_string();
@@ -26175,27 +26672,66 @@ mod tests {
         assert_eq!(active_bookmark_target(&ids, Some(99)), None);
     }
 
+    /// The three surfaces that attach a block as untrusted AI evidence used to
+    /// hand-roll a `BlockContext` each, with an unknown-status note none of
+    /// the other three apps used and a second local bounding helper. They now
+    /// share the family adapter, so this pins the properties that used to be
+    /// frost-local: the shared note, the shared head/tail bound, and the
+    /// sentinel the UI's own status label is written against.
     #[test]
-    fn ai_block_output_reports_secondary_context_truncation() {
+    fn ai_block_output_goes_through_the_shared_ad_hoc_adapter() {
+        use agent_task::context::{
+            ad_hoc_block_context, UNKNOWN_EXIT_STATUS_NOTE, UNKNOWN_EXIT_STATUS_SENTINEL,
+        };
+
+        let semantic = |output: &str, exit_code: Option<i32>| agent_task::SemanticCommandContext {
+            source_session_id: "frost-1-0".to_string(),
+            source_execution_id: "zone-1".to_string(),
+            source_sequence: 1,
+            source_shell: None,
+            command: Some("cargo test".to_string()),
+            command_exact: true,
+            command_truncated: false,
+            cwd: Some("/workspace/frost".to_string()),
+            cwd_after: None,
+            exit_code,
+            duration_ms: None,
+            output_text: output.to_string(),
+            output_available: true,
+            output_truncated: false,
+            output_total_bytes: output.len(),
+            started_at: None,
+            finished_at: None,
+        };
+
         let short = "one\ntwo";
-        assert_eq!(
-            bounded_ai_block_output(short, false),
-            (short.to_string(), false)
-        );
-        let (unknown, truncated) = bounded_ai_block_output(short, true);
-        assert!(!truncated);
-        assert_eq!(unknown, format!("{NO_REPORTED_EXIT_STATUS_NOTE}\n{short}"));
+        let reported = ad_hoc_block_context(&semantic(short, Some(0)));
+        assert_eq!(reported.output, short);
+        assert!(!reported.truncated);
+
+        let unknown = ad_hoc_block_context(&semantic(short, None));
+        assert_eq!(unknown.exit_code, UNKNOWN_EXIT_STATUS_SENTINEL);
+        assert_eq!(unknown.output, format!("{UNKNOWN_EXIT_STATUS_NOTE}{short}"));
+        assert!(!unknown.truncated);
 
         let long = (0..200)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (bounded, truncated) = bounded_ai_block_output(&long, true);
-        assert!(truncated);
-        assert_ne!(bounded, long);
-        assert!(bounded.starts_with(NO_REPORTED_EXIT_STATUS_NOTE));
-        assert!(bounded.contains("line 0"));
-        assert!(bounded.contains("line 199"));
+        let bounded = ad_hoc_block_context(&semantic(&long, None));
+        assert!(bounded.truncated);
+        assert_ne!(bounded.output, long);
+        assert!(bounded.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+        assert!(bounded.output.contains("line 0"));
+        assert!(bounded.output.contains("line 199"));
+
+        // The status line the panel renders is written against the same
+        // sentinel the adapter emits, so an unknown lifecycle never reads as
+        // "exit -1" and never reads as a success.
+        assert_eq!(
+            agent_context_exit_label(UNKNOWN_EXIT_STATUS_SENTINEL),
+            "no reported exit status"
+        );
     }
 
     #[test]

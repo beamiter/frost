@@ -27,6 +27,12 @@ thread_local! {
     static PROVENANCE_ORPHAN_SCAN_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Times the retained command zones were walked to rebase their absolute
+    /// row anchors after a scrollback trim. Past the scrollback cap this used
+    /// to be once per scrolled LINE; it is now once per ingest batch.
+    static ZONE_REBASE_SCAN_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Character class for word selection boundaries.
@@ -2568,6 +2574,9 @@ struct ClearedBlocksSnapshot {
 const MAX_CAPTURED_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_PENDING_COMPLETED_COMMANDS: usize = 32;
 const MAX_CONSUMED_EXECUTION_IDS: usize = 256;
+/// Decoded byte ceiling for an OSC 7 working directory. The same 4 KiB the
+/// OSC 133 `cwd` param uses, which is also Linux's own pathname limit.
+const MAX_OSC7_CWD_BYTES: usize = jterm_core::execution_journal::MAX_CWD_BYTES;
 /// Bound on retained finalized OSC 133 zones; the push path and the
 /// undo-clear restore both evict the oldest beyond it.
 const MAX_COMMAND_ZONES: usize = 256;
@@ -2585,23 +2594,6 @@ struct CommandCapture {
 }
 
 impl CommandCapture {
-    fn from_text(text: &str) -> Self {
-        if text.len() <= MAX_CAPTURED_COMMAND_BYTES {
-            return Self {
-                text: text.to_string(),
-                truncated: false,
-            };
-        }
-        let mut end = MAX_CAPTURED_COMMAND_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        Self {
-            text: text[..end].to_string(),
-            truncated: true,
-        }
-    }
-
     fn unavailable() -> Self {
         Self {
             text: UNAVAILABLE_COMMAND_TEXT.to_string(),
@@ -2881,11 +2873,34 @@ struct ActiveAgentExecution {
     execution_id: Option<String>,
 }
 
+/// The four identity slots one OSC 133 `C` packet must carry before a
+/// completed command can name an exact journal Start.
+///
+/// Held as one value rather than four separate options because that is the
+/// contract: `ExecutionLifecycle::from_command_meta` refuses unless all four
+/// arrived together, and keeping the pieces apart would invite a later `D` —
+/// which carries none of the last three — to fill whatever the Start left out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartLifecycle {
+    /// jsh's execution id, already through `is_valid_jsh_execution_id`.
+    pub id: String,
+    /// The shell session that owns this execution, already through
+    /// `is_valid_jsh_session_id`.
+    pub session_id: String,
+    /// Shell-local sequence number of this exact Start generation.
+    pub seq: u64,
+    /// Wall-clock start the shell recorded on its own journal Start.
+    pub started_at_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 struct CompletedCommandMetadata {
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     execution_id: Option<String>,
+    /// The Start identity captured at `C`, when the shell supplied a complete
+    /// one. Never assembled at `D`.
+    lifecycle: Option<StartLifecycle>,
     agent_generation: Option<u64>,
     completion_provenance: crate::block_mode::CompletionProvenance,
 }
@@ -3207,6 +3222,19 @@ pub struct TerminalState {
     /// `A`/`B`, so D correlation can prefer C and then fall back to the prompt
     /// identity without accepting a stale id.
     current_command_start_id: Option<String>,
+    /// The complete Start identity announced by OSC 133 `C`: the execution id
+    /// plus the session, sequence and start timestamp that pin which journal
+    /// Start generation it names. Captured once at `C` and cleared with
+    /// [`Self::current_command_start_id`]; `D` may only be compared against
+    /// it, never used to build one, because jsh's `D` packet carries none of
+    /// the last three slots and a completion that supplied them would be
+    /// naming a Start this terminal never saw.
+    current_command_start_lifecycle: Option<StartLifecycle>,
+    /// Scrollback rows trimmed from the front that [`Self::command_zones`] has
+    /// not been rebased for yet. Non-zero only inside one ingest batch or one
+    /// trimming call; every path that can observe a zone's rows settles it
+    /// first, so no reader ever sees a stale anchor.
+    pending_zone_row_trim: usize,
     /// Recently consumed shell execution ids. Command zones retain a distinct
     /// UI id, so this bounded tombstone deque prevents a delayed duplicate D
     /// from being adopted by a later anonymous lifecycle after the original
@@ -3241,6 +3269,11 @@ pub struct CompletedCommand {
     pub output: String,
     /// jsh correlation id from an OSC 133 `id=`/`execution_id=` param.
     pub id: Option<String>,
+    /// The exact journal Start this completion belongs to, when OSC 133 `C`
+    /// carried all four identity slots. Durable output may be written only
+    /// against this; [`Self::id`] alone can come from a `D` that named an
+    /// execution no `C` here ever started.
+    pub lifecycle: Option<StartLifecycle>,
     /// Internal, one-shot Agent approval identity. PTY output cannot choose
     /// this value; it is attached only after an armed command exactly matches
     /// the command captured at OSC 133 `C` (and C/D ids agree when present).
@@ -3453,6 +3486,8 @@ impl TerminalState {
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
             current_command_start_id: None,
+            current_command_start_lifecycle: None,
+            pending_zone_row_trim: 0,
             consumed_execution_ids: VecDeque::new(),
             current_command_started_at: None,
             current_command_cwd: None,
@@ -3723,6 +3758,23 @@ impl TerminalState {
         None
     }
 
+    /// Whether OSC 133 metadata text is unsafe to correlate on or to show.
+    ///
+    /// Control characters were the only thing this used to refuse, so a cwd or
+    /// execution id spelled with a zero-width joiner, a bidi override or an
+    /// interlinear annotation control reached the block menu, the Markdown
+    /// export and the agent prompt rendered raw — text that draws as one thing
+    /// and means another, chosen entirely by whatever wrote to the PTY. The
+    /// shared rule is `jterm_core`'s, and the terminal-specific variant is the
+    /// one that matters here because U+FFF9..=U+FFFB render as nothing in this
+    /// family's grids.
+    fn osc_metadata_is_ambiguous(text: &str) -> bool {
+        text.chars().any(|character| {
+            character.is_control()
+                || jterm_core::review_input::is_terminal_visual_spoofing_character(character)
+        })
+    }
+
     fn decode_osc_metadata(value: &str, max_bytes: usize) -> Option<String> {
         if value.len() > max_bytes.saturating_mul(3) {
             return None;
@@ -3792,7 +3844,7 @@ impl TerminalState {
         };
         decoded.truncate(valid_len);
         let text = String::from_utf8(decoded).ok()?;
-        if text.chars().any(char::is_control) {
+        if Self::osc_metadata_is_ambiguous(&text) {
             return None;
         }
         Some(CommandCapture { text, truncated })
@@ -4153,16 +4205,24 @@ impl TerminalState {
                 } else if command == "9" {
                     // Desktop notification (iTerm2/ConEmu)
                     if self.pending_notifications.len() < 8 {
-                        let title = "frost".to_string();
-                        let body = value.chars().take(256).collect();
+                        let title = jterm_core::identity::get().app_name.to_owned();
+                        let body = Self::safe_notification_field(value);
                         self.pending_notifications.push((title, body));
                     }
                 } else if command == "777" {
                     // rxvt notification: 777;notify;title;body
                     let parts: Vec<&str> = value.splitn(3, ';').collect();
                     if parts.len() >= 2 && parts[0] == "notify" {
-                        let title = parts.get(1).unwrap_or(&"").chars().take(256).collect();
-                        let body = parts.get(2).unwrap_or(&"").chars().take(256).collect();
+                        let title = Self::safe_notification_field(parts.get(1).unwrap_or(&""));
+                        // A field that sanitised away to nothing must not
+                        // become a nameless toast; fall back to the app's own
+                        // identity the way an OSC 9 notification already does.
+                        let title = if title.is_empty() {
+                            jterm_core::identity::get().app_name.to_owned()
+                        } else {
+                            title
+                        };
+                        let body = Self::safe_notification_field(parts.get(2).unwrap_or(&""));
                         if self.pending_notifications.len() < 8 {
                             self.pending_notifications.push((title, body));
                         }
@@ -4185,8 +4245,16 @@ impl TerminalState {
     }
 
     fn handle_osc_133(&mut self, value: &str) {
-        const MAX_EXECUTION_ID_BYTES: usize = 192;
-        const MAX_COMMAND_METADATA_BYTES: usize = 16 * 1024;
+        use jterm_core::execution_journal::{
+            is_valid_jsh_cwd, is_valid_jsh_execution_id, is_valid_jsh_session_id,
+            MAX_EXECUTION_ID_BYTES,
+        };
+        use jterm_core::parser::{MAX_OSC133_CWD_BYTES, MAX_OSC133_SESSION_ID_BYTES};
+
+        // Every mark reasons about absolute rows, and `D` reads and rewrites
+        // the retained zones, so the deferred trim is settled at the one point
+        // inside an ingest batch where zone geometry is consulted.
+        self.settle_zone_row_trim();
         // OSC 133 while the alternate screen is active is dropped entirely
         // (ember's rule): `absolute_row` would be computed against the alt
         // grid's cursor, and any zone it produced would corrupt the
@@ -4211,35 +4279,134 @@ impl TerminalState {
         let mut metadata_cwd = None;
         let mut metadata_duration_ms = None;
         let mut metadata_truncated = false;
+        // `session_id`, `seq` and `started_at_ms` name the exact journal Start
+        // generation this execution belongs to, and jsh emits all three on `C`
+        // and only on `C` — its `D` packet carries the id, a duration and the
+        // directory the command ENDED in, nothing more. Reading them off any
+        // other mark would let a late, replayed or forged completion assemble
+        // an identity for a Start this terminal never observed, so the slots
+        // are gated on the mark rather than merged across the lifecycle.
+        let start_identity = mark == 'C';
+        let mut metadata_session_id: Option<String> = None;
+        let mut metadata_seq: Option<u64> = None;
+        let mut metadata_started_at_ms: Option<u64> = None;
         // jsh correlation metadata rides on C/D as percent-encoded key/value
         // params. Parse it per mark instead of leaving an id in global state
         // where an unrelated later D could inherit it.
+        //
+        // Aliases name one semantic slot, so a repeat is ambiguity, not an
+        // update. Last-wins let PTY output retract a truncation disclosure
+        // with a second `cmd_truncated=0`, or choose which of two
+        // contradictory cwds a finished block is labelled with. Core's parser
+        // fails closed on a repeated slot and so does this one.
+        let mut seen_id = false;
+        let mut seen_session_id = false;
+        let mut seen_seq = false;
+        let mut seen_started_at_ms = false;
+        let mut seen_command = false;
+        let mut seen_cwd = false;
+        let mut seen_duration = false;
+        let mut seen_truncated = false;
         for part in parts {
-            if let Some((key, id)) = part.split_once('=') {
-                if matches!(key, "id" | "jsh_id" | "execution_id" | "command_id") {
+            let Some((key, raw)) = part.split_once('=') else {
+                continue;
+            };
+            match key {
+                "id" | "jsh_id" | "execution_id" | "command_id" => {
                     mark_id_present = true;
-                    mark_id = Self::decode_osc_metadata(id, MAX_EXECUTION_ID_BYTES)
-                        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
-                } else if key == "cmdline_url" {
-                    metadata_command = Self::decode_osc_command_metadata(id);
-                } else if key == "command" && !id.chars().any(char::is_control) {
-                    metadata_command = Some(CommandCapture::from_text(id));
-                } else if matches!(key, "cwd" | "cwd_url") {
+                    if std::mem::replace(&mut seen_id, true) {
+                        mark_id = None;
+                        continue;
+                    }
+                    mark_id = Self::decode_osc_metadata(raw, MAX_EXECUTION_ID_BYTES)
+                        .filter(|id| !id.is_empty() && !Self::osc_metadata_is_ambiguous(id));
+                }
+                "session_id" => {
+                    if !start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_session_id, true) {
+                        metadata_session_id = None;
+                        continue;
+                    }
+                    metadata_session_id =
+                        Self::decode_osc_metadata(raw, MAX_OSC133_SESSION_ID_BYTES)
+                            .filter(|id| is_valid_jsh_session_id(id));
+                }
+                "seq" => {
+                    if !start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_seq, true) {
+                        metadata_seq = None;
+                        continue;
+                    }
+                    // Deliberately not trimmed, so this accepts exactly the
+                    // spellings core's parser does; the value is later matched
+                    // against jsh's own on-disk Start.
+                    metadata_seq = raw.parse::<u64>().ok();
+                }
+                "started_at_ms" => {
+                    if !start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_started_at_ms, true) {
+                        metadata_started_at_ms = None;
+                        continue;
+                    }
+                    metadata_started_at_ms = raw.parse::<u64>().ok();
+                }
+                // All four spellings name the command line, and all four are
+                // percent-encoded: the bare `command=` used to be taken
+                // verbatim here, so a path or argument containing `%20` was
+                // recorded with the escape still in it while `cmdline_url`
+                // carrying the same text decoded correctly.
+                "cmdline_url" | "command_url" | "command" | "cmdline" => {
+                    if std::mem::replace(&mut seen_command, true) {
+                        metadata_command = None;
+                        continue;
+                    }
+                    metadata_command = Self::decode_osc_command_metadata(raw);
+                }
+                "cwd" | "cwd_url" => {
+                    if std::mem::replace(&mut seen_cwd, true) {
+                        metadata_cwd = None;
+                        continue;
+                    }
                     // Both spellings are percent-decoded, so a literal `%`
                     // in a plain `cwd` path is mangled. Family-consistent:
                     // ember decodes the bare key the same way, and shells
                     // that send `cwd` unencoded with a literal `%` are the
                     // ones off-contract.
-                    metadata_cwd = Self::decode_osc_metadata(id, MAX_COMMAND_METADATA_BYTES)
-                        .filter(|cwd| !cwd.chars().any(char::is_control));
-                } else if matches!(key, "duration" | "duration_ms") {
-                    metadata_duration_ms = id.trim().parse::<u64>().ok();
-                } else if matches!(key, "cmd_truncated" | "command_truncated") {
-                    metadata_truncated = matches!(
-                        id.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    );
+                    metadata_cwd = Self::decode_osc_metadata(raw, MAX_OSC133_CWD_BYTES)
+                        .filter(|cwd| is_valid_jsh_cwd(cwd));
                 }
+                "duration" | "duration_ms" => {
+                    if std::mem::replace(&mut seen_duration, true) {
+                        metadata_duration_ms = None;
+                        continue;
+                    }
+                    metadata_duration_ms = raw.trim().parse::<u64>().ok();
+                }
+                "cmd_truncated" | "command_truncated" => {
+                    if std::mem::replace(&mut seen_truncated, true) {
+                        // Ambiguous disclosure must not turn a known truncated
+                        // command back into an apparently complete one.
+                        metadata_truncated = true;
+                        continue;
+                    }
+                    metadata_truncated = match raw.trim() {
+                        "0" => false,
+                        "1" => true,
+                        value if value.eq_ignore_ascii_case("false") => false,
+                        value if value.eq_ignore_ascii_case("true") => true,
+                        // A producer chose to send the disclosure but did not
+                        // encode its state. Treat that as inexact, not as the
+                        // default `false` that claims a command is complete.
+                        _ => true,
+                    };
+                }
+                _ => {}
             }
         }
         match mark {
@@ -4279,6 +4446,7 @@ impl TerminalState {
                 self.current_command_exact = false;
                 self.current_command_id = mark_id;
                 self.current_command_start_id = None;
+                self.current_command_start_lifecycle = None;
                 self.current_command_cwd = metadata_cwd;
                 self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
@@ -4301,6 +4469,10 @@ impl TerminalState {
                     self.current_output_extent_row_id = None;
                     self.current_command_text = None;
                     self.current_command_exact = false;
+                    // A `B` can only follow the `A` that already cleared this,
+                    // but keep the two Start slots retired together so a future
+                    // prompt-side path cannot leave one of them behind.
+                    self.current_command_start_lifecycle = None;
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
                     }
@@ -4349,6 +4521,27 @@ impl TerminalState {
                     self.current_output_extent_col = None;
                     self.current_output_extent_row_id = None;
                     self.current_command_start_id.clone_from(&mark_id);
+                    // All four slots or nothing. A partial envelope has no
+                    // journal meaning, and retaining the pieces would let the
+                    // matching `D` — or a forged one — supply the rest.
+                    self.current_command_start_lifecycle = match (
+                        mark_id
+                            .as_deref()
+                            .filter(|id| is_valid_jsh_execution_id(id)),
+                        metadata_session_id.as_deref(),
+                        metadata_seq,
+                        metadata_started_at_ms,
+                    ) {
+                        (Some(id), Some(session_id), Some(seq), Some(started_at_ms)) => {
+                            Some(StartLifecycle {
+                                id: id.to_owned(),
+                                session_id: session_id.to_owned(),
+                                seq,
+                                started_at_ms,
+                            })
+                        }
+                        _ => None,
+                    };
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
                     }
@@ -4389,17 +4582,36 @@ impl TerminalState {
                 };
                 // Command finished. Exit code arrives positionally (`D;0`) or
                 // as an jsh-style `exit=`/`exit_code=` param.
-                let exit_code =
-                    value
-                        .split(';')
-                        .skip(1)
-                        .find_map(|part| match part.split_once('=') {
-                            Some(("exit" | "exit_code" | "exit_status", v)) => {
-                                v.trim().parse::<i32>().ok()
-                            }
-                            Some(_) => None,
-                            None => part.trim().parse::<i32>().ok(),
-                        });
+                //
+                // Decoded the way core's `parse_osc133_exit_status` does, and
+                // for the same two reasons. A second outcome slot is ambiguous
+                // even when one of the two values is malformed, so it must
+                // report Unknown rather than commit to whichever arrived
+                // first — otherwise `D;1;exit=0` renders a failed block green.
+                // And a malformed `exit=` OCCUPIES the slot: taking the next
+                // field instead let `D;exit=x;1` claim an authoritative status
+                // the producer never actually spelled.
+                let mut seen_exit = false;
+                let mut exit_code = None;
+                for field in value.split(';').skip(1) {
+                    let candidate = match field.split_once('=') {
+                        Some(("exit" | "exit_code" | "exit_status", raw)) => {
+                            Some(raw.trim().parse::<i32>().ok())
+                        }
+                        Some(_) => None,
+                        // Unknown bare extension flags are not outcome slots;
+                        // a numeric bare field is the portable positional one.
+                        None => field.trim().parse::<i32>().ok().map(Some),
+                    };
+                    let Some(candidate) = candidate else {
+                        continue;
+                    };
+                    if std::mem::replace(&mut seen_exit, true) {
+                        exit_code = None;
+                        break;
+                    }
+                    exit_code = candidate;
+                }
                 let d_mark_id = mark_id.clone();
                 // An explicitly empty, malformed, control-bearing, or
                 // oversized id is not the same as an omitted id. It cannot
@@ -4457,12 +4669,20 @@ impl TerminalState {
                     .map(|started| started.elapsed().as_millis() as u64);
                 let duration_ms = metadata_duration_ms.or(local_duration_ms);
                 let command_truncated = self.current_command_truncated || metadata_truncated;
-                let cwd = if metadata_cwd.is_some() {
-                    metadata_cwd
-                } else {
-                    self.current_command_cwd.take()
-                }
-                .or_else(|| self.control_free_osc7_cwd());
+                // D's `cwd_url` is jsh's cwd AFTER the command ran, so any
+                // command that changed directory reports its destination
+                // there. Overwriting C's cwd with it labelled every such block
+                // with the wrong directory — `cd /tmp` run from
+                // /home/u/proj recorded /tmp as "the working directory the
+                // command ran in" — and that value reaches the block menu, the
+                // Markdown export and the agent prompt. So D may only FILL an
+                // empty slot, for a shell that reports cwd on D but not on C;
+                // it may never replace one. ember and forge both guard this.
+                let cwd = self
+                    .current_command_cwd
+                    .take()
+                    .or(metadata_cwd)
+                    .or_else(|| self.control_free_osc7_cwd());
                 let output_start_col = self.current_output_start_col.unwrap_or(0);
                 let output_end = self.live_output_end_row(absolute_row);
                 let provenance = self.bind_live_output_provenance(
@@ -4496,6 +4716,10 @@ impl TerminalState {
                     rows_evicted: false,
                 };
                 self.push_command_zone_with_provenance(zone, provenance);
+                // Taken, not built: the identity was fixed at `C`, and the id
+                // comparison above already refused any `D` naming a different
+                // execution.
+                let start_lifecycle = self.current_command_start_lifecycle.take();
                 self.record_completed_command(
                     cmd_start,
                     out_start,
@@ -4504,6 +4728,7 @@ impl TerminalState {
                         exit_code,
                         duration_ms,
                         execution_id: finished_id,
+                        lifecycle: start_lifecycle,
                         agent_generation,
                         completion_provenance:
                             crate::block_mode::CompletionProvenance::ShellReported,
@@ -4521,6 +4746,7 @@ impl TerminalState {
                 self.current_command_text = None;
                 self.current_command_exact = false;
                 self.current_command_start_id = None;
+                self.current_command_start_lifecycle = None;
                 self.current_command_cwd = None;
                 self.current_command_truncated = false;
                 self.agent_prompt_input_tainted = false;
@@ -4561,6 +4787,9 @@ impl TerminalState {
         mut zone: CommandZone,
         mut provenance: Option<FinishedOutputProvenance>,
     ) {
+        // The incoming zone's anchors are current absolute rows, so the
+        // retained ones have to be in that same space before it joins them.
+        self.settle_zone_row_trim();
         let Some(next_zone_id) = self.next_zone_id.checked_add(1) else {
             // Stable ids are UI capabilities. Once the u64 space is exhausted,
             // seal block history instead of reusing an id that a stale menu,
@@ -4931,6 +5160,10 @@ impl TerminalState {
                 exit_code: None,
                 duration_ms: None,
                 execution_id,
+                // The shell never reported `D`, so nothing here corresponds to
+                // a journal Finish. Publishing durable output against the
+                // Start would attribute a boundary guess to jsh's own record.
+                lifecycle: None,
                 agent_generation,
                 completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
             },
@@ -5002,6 +5235,7 @@ impl TerminalState {
         }
         self.scrollback.drain(..rows);
         self.on_scrollback_rows_trimmed(rows);
+        self.settle_zone_row_trim();
         self.clear_text_selection();
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
         self.grid_version = self.grid_version.wrapping_add(1);
@@ -5031,19 +5265,22 @@ impl TerminalState {
         });
     }
 
-    fn on_scrollback_rows_trimmed(&mut self, count: usize) {
+    /// Rebase every retained command zone for the rows trimmed since the last
+    /// settle, in one pass.
+    ///
+    /// Applying the accumulated total once is exactly equivalent to applying
+    /// it a row at a time: the shift is uniform, and a zone ends up evicted
+    /// precisely when its original `prompt_start` is below the total, whether
+    /// that total arrives in one step or a thousand.
+    fn settle_zone_row_trim(&mut self) {
+        let count = std::mem::take(&mut self.pending_zone_row_trim);
         if count == 0 {
             return;
         }
-        // Rows the cap (or any other trim) already dropped are rows a deferred
-        // ED 3 must no longer count, or settling it would eat live content.
-        self.pending_saved_line_purge = self.pending_saved_line_purge.saturating_sub(count);
-        self.bump_history_revision();
-        self.kitty_graphics.on_buffer_rows_trimmed(count);
-        // Only a zone flipping to `rows_evicted` can orphan provenance, and a
-        // single-row trim flips at most one. Rescanning the whole deque on
-        // every trimmed row would be a fixed per-line tax on streaming output
-        // once scrollback is capped and zones have accumulated.
+        #[cfg(test)]
+        ZONE_REBASE_SCAN_COUNT.with(|scans| scans.set(scans.get().saturating_add(1)));
+        // Only a zone flipping to `rows_evicted` can orphan provenance, so the
+        // deque-wide provenance rescan is gated on that happening.
         let mut evicted_any = false;
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
@@ -5074,6 +5311,25 @@ impl TerminalState {
         if evicted_any {
             self.drop_orphaned_output_provenance();
         }
+    }
+
+    fn on_scrollback_rows_trimmed(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        // Rows the cap (or any other trim) already dropped are rows a deferred
+        // ED 3 must no longer count, or settling it would eat live content.
+        self.pending_saved_line_purge = self.pending_saved_line_purge.saturating_sub(count);
+        self.bump_history_revision();
+        self.kitty_graphics.on_buffer_rows_trimmed(count);
+        // The zone rebase is the one part of this that costs O(retained
+        // zones), and past the scrollback cap it used to run once per scrolled
+        // LINE: 256 zones rewritten for every line of streaming output, on the
+        // PTY ingest path, forever. Accumulate the shift instead and apply it
+        // once per batch — the same arithmetic, paid once. Everything else
+        // here is O(1) and stays immediate, because the live lifecycle state
+        // below is read again inside the same batch.
+        self.pending_zone_row_trim = self.pending_zone_row_trim.saturating_add(count);
         let live_prompt_trimmed = match self.current_zone_state {
             ZoneState::PromptStarted(prompt_start)
             | ZoneState::CommandStarted(prompt_start, _)
@@ -5132,6 +5388,9 @@ impl TerminalState {
         if count == 0 {
             return;
         }
+        // Rows coming back must not be netted against a trim the zones have
+        // not been rebased for yet; the two shifts are over different anchors.
+        self.settle_zone_row_trim();
         for zone in &mut self.command_zones {
             if zone.rows_evicted {
                 continue;
@@ -5364,6 +5623,7 @@ impl TerminalState {
         self.kitty_graphics
             .retain_placements_from_buffer_row(live_start);
         self.on_scrollback_rows_trimmed(retained_scrollback_start);
+        self.settle_zone_row_trim();
 
         if completed_grid_rows > 0 {
             let blank = TerminalCell::default();
@@ -5447,6 +5707,7 @@ impl TerminalState {
             self.scrollback.pop_front();
             self.on_scrollback_rows_trimmed(1);
         }
+        self.settle_zone_row_trim();
         self.enforce_captured_output_budget(Self::MAX_CAPTURED_OUTPUT_BYTES);
 
         self.bump_history_revision();
@@ -5767,6 +6028,7 @@ impl TerminalState {
             exit_code: metadata.exit_code,
             output,
             id: metadata.execution_id,
+            lifecycle: metadata.lifecycle,
             agent_generation: metadata.agent_generation,
             output_available,
             truncated,
@@ -5790,6 +6052,8 @@ impl TerminalState {
             exit_code: None,
             output: String::new(),
             id: execution_id.clone(),
+            // A termination frost synthesized, not a shell-reported `D`.
+            lifecycle: None,
             agent_generation: Some(generation),
             output_available: false,
             truncated: false,
@@ -6128,10 +6392,25 @@ impl TerminalState {
 
         // Percent-decode by hand: the alphabet is three characters wide and a
         // url crate is not worth linking for it.
+        //
+        // Bounded to the same ceiling the OSC 133 `cwd` param already had. The
+        // OSC 133 path beside this one was capped while this one was not, even
+        // though this value is the wider liability: it is retained for the
+        // life of the pane, cloned into every command zone that has no `cwd`
+        // of its own, written into the session snapshot, and inherited by
+        // every split — so an unbounded one is paid for repeatedly rather than
+        // once. A path this long cannot name a real directory either: Linux
+        // caps a pathname at 4096 bytes.
         let bytes = path_part.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
+        if bytes.len() > MAX_OSC7_CWD_BYTES.saturating_mul(3) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len().min(MAX_OSC7_CWD_BYTES));
         let mut i = 0;
         while i < bytes.len() {
+            if out.len() >= MAX_OSC7_CWD_BYTES {
+                return None;
+            }
             if bytes[i] == b'%' && i + 2 < bytes.len() {
                 let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
                 out.push(u8::from_str_radix(hex, 16).ok()?);
@@ -6160,6 +6439,39 @@ impl TerminalState {
                 .map(|hostname| hostname.trim().to_string())
         });
         local_hostname.is_some_and(|local| host.eq_ignore_ascii_case(&local))
+    }
+
+    /// Sanitise one OSC 9 / OSC 777 notification field.
+    ///
+    /// These two strings are the only PTY-authored text frost hands to a
+    /// process outside itself: they become `notify-send` operands and are
+    /// drawn by the desktop's notification server, which applies none of the
+    /// terminal's own display rules. They used to arrive with controls and
+    /// bidi overrides intact, so
+    /// `printf '\e]777;notify;<RLO>Security Update;<RLO>approve\a'` put
+    /// attacker-reordered text into a system toast wearing the desktop's
+    /// chrome rather than the terminal's.
+    ///
+    /// An offending scalar becomes U+FFFD rather than disappearing, so a
+    /// rewritten field reads as rewritten instead of as a shorter honest one.
+    /// This is core's own `bounded_notification_field` rule on the
+    /// terminal-strict spoofing class, because a toast raised by a terminal is
+    /// a terminal-adjacent rendered surface; ember applies the identical rule.
+    fn safe_notification_field(raw: &str) -> String {
+        raw.chars()
+            .map(|character| {
+                if character.is_control()
+                    || jterm_core::review_input::is_terminal_visual_spoofing_character(character)
+                {
+                    '\u{fffd}'
+                } else {
+                    character
+                }
+            })
+            .take(jterm_core::parser::MAX_NOTIFICATION_CHARS)
+            .collect::<String>()
+            .trim()
+            .to_owned()
     }
 
     fn sanitized_title(title: &str) -> String {
@@ -7397,7 +7709,19 @@ impl TerminalState {
         }
     }
 
+    /// Feed one PTY read batch to the parser.
+    ///
+    /// The wrapper exists so the deferred zone rebase settles exactly once per
+    /// batch no matter which of the parser's early returns the batch takes.
+    /// Everything a caller can observe afterwards — projections, the block
+    /// menu, prompt navigation, the session snapshot — reads zone anchors, so
+    /// none of them may see the batch's trims unapplied.
     pub fn process_input(&mut self, input: &[u8]) {
+        self.process_input_inner(input);
+        self.settle_zone_row_trim();
+    }
+
+    fn process_input_inner(&mut self, input: &[u8]) {
         // A fragmented kitty APC streams against its own bounded buffer; this
         // must run before the pending_escape merge so the APC never pays the
         // O(n^2) re-scan and its tail is never parsed as ordinary input.
@@ -8622,6 +8946,7 @@ impl TerminalState {
         self.pending_saved_line_purge = 0;
         self.provisional_alt_snapshot = None;
         self.command_zones.clear();
+        self.pending_zone_row_trim = 0;
         self.finished_output_provenance.clear();
         self.captured_output_bytes = 0;
         // RIS destroys the rows the undo stash points at; it cannot rebuild
@@ -8647,6 +8972,7 @@ impl TerminalState {
         self.current_command_exact = false;
         self.current_command_id = None;
         self.current_command_start_id = None;
+        self.current_command_start_lifecycle = None;
         self.current_command_started_at = None;
         self.last_archived_screen_snapshot.clear();
         self.last_synced_primary_screen_snapshot.clear();
@@ -9085,6 +9411,7 @@ impl TerminalState {
             trimmed += 1;
         }
         self.on_scrollback_rows_trimmed(trimmed);
+        self.settle_zone_row_trim();
 
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
     }
@@ -11850,6 +12177,16 @@ impl TerminalState {
                 self.cursor_row -= top_remove;
                 self.saved_cursor_row = self.saved_cursor_row.saturating_sub(top_remove);
             }
+            // Those pushes can evict the oldest scrollback rows, which only
+            // *accumulates* a zone rebase. Settle it before returning: this is
+            // a public entry point, and every caller that reads
+            // `command_zones` afterwards — the block menu, the agent's block
+            // context, the journal correlation — would otherwise see anchors
+            // pointing at rows that have already moved. The other trim sites
+            // each settle at their own boundary; this one is reached from the
+            // window manager rather than from the ingest path, so it settles
+            // here rather than inheriting one.
+            self.settle_zone_row_trim();
         }
 
         if self.use_alt_buffer {
@@ -12443,6 +12780,322 @@ mod tests {
         assert_eq!(completed[0].exit_code, Some(1));
     }
 
+    /// jsh puts all four Start identity slots on one OSC 133 `C` packet:
+    /// `id`, `session_id`, `seq` and `started_at_ms`. Its `D` carries the id, a
+    /// duration and the cwd it ended in, and nothing else. Durable journal
+    /// output may be published only when that whole envelope arrived at `C`.
+    /// OSC 9/777 text is the only PTY-authored string frost hands to another
+    /// process. The desktop's notification server applies none of the
+    /// terminal's display rules, so the sanitisation has to happen here.
+    #[test]
+    fn osc_notification_fields_are_sanitized_before_they_leave_the_terminal() {
+        let app = jterm_core::identity::get().app_name;
+
+        // A bidi override in the rxvt form: reordered "Security Update" and a
+        // reordered action word, inside desktop chrome.
+        let mut spoofed = super::TerminalState::new(40, 8);
+        spoofed.process_input(
+            "\x1b]777;notify;\u{202e}Security Update;\u{202e}approve\x07".as_bytes(),
+        );
+        assert_eq!(spoofed.pending_notifications.len(), 1);
+        let (title, body) = &spoofed.pending_notifications[0];
+        assert_eq!(title, "\u{fffd}Security Update");
+        assert_eq!(body, "\u{fffd}approve");
+
+        // Controls, and the interlinear annotation controls that draw as
+        // nothing, are replaced rather than dropped: a rewritten field must
+        // read as rewritten, not as a shorter honest one.
+        let mut controls = super::TerminalState::new(40, 8);
+        controls.process_input("\x1b]9;build \u{1}done\u{fff9}now\x07".as_bytes());
+        assert_eq!(
+            controls.pending_notifications[0],
+            (app.to_owned(), "build \u{fffd}done\u{fffd}now".to_string())
+        );
+
+        // A title that is only whitespace still names the application. A title
+        // that was rewritten keeps its replacement glyph instead: the toast
+        // says something was removed rather than quietly renaming itself.
+        let mut nameless = super::TerminalState::new(40, 8);
+        nameless.process_input("\x1b]777;notify;   ;body\x07".as_bytes());
+        assert_eq!(nameless.pending_notifications[0].0, app);
+        let mut rewritten = super::TerminalState::new(40, 8);
+        rewritten.process_input("\x1b]777;notify;\u{202e};body\x07".as_bytes());
+        assert_eq!(rewritten.pending_notifications[0].0, "\u{fffd}");
+
+        // Both fields stay bounded.
+        let mut long = super::TerminalState::new(40, 8);
+        let overlong = "x".repeat(2 * jterm_core::parser::MAX_NOTIFICATION_CHARS);
+        long.process_input(format!("\x1b]777;notify;{overlong};{overlong}\x07").as_bytes());
+        let (title, body) = &long.pending_notifications[0];
+        assert_eq!(
+            title.chars().count(),
+            jterm_core::parser::MAX_NOTIFICATION_CHARS
+        );
+        assert_eq!(
+            body.chars().count(),
+            jterm_core::parser::MAX_NOTIFICATION_CHARS
+        );
+    }
+
+    #[test]
+    fn osc_133_start_lifecycle_is_captured_only_from_a_complete_c_packet() {
+        // The `D` echoes whatever id the `C` announced, because a mismatched
+        // id is a separate refusal already covered elsewhere; what is under
+        // test here is the Start envelope alone.
+        let run = |c_params: &str, d_id: &str| {
+            let mut terminal = super::TerminalState::new(40, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+            terminal.process_input(format!("\x1b]133;C;{c_params}\x07hi\r\n").as_bytes());
+            terminal.process_input(format!("\x1b]133;D;0;{d_id}duration_ms=0\x07").as_bytes());
+            terminal.take_completed_commands()
+        };
+
+        let complete = concat!(
+            "id=jsh-b8c6-1;session_id=probe-session-1;seq=1;",
+            "started_at_ms=1788571993465;cmdline_url=echo%20hi"
+        );
+        let completed = run(complete, "id=jsh-b8c6-1;");
+        assert_eq!(completed.len(), 1);
+        let lifecycle = completed[0]
+            .lifecycle
+            .as_ref()
+            .expect("a complete C envelope yields a journal capability");
+        assert_eq!(lifecycle.id, "jsh-b8c6-1");
+        assert_eq!(lifecycle.session_id, "probe-session-1");
+        assert_eq!(lifecycle.seq, 1);
+        assert_eq!(lifecycle.started_at_ms, 1_788_571_993_465);
+
+        // Each slot is load-bearing. Missing, empty, or ungrammatical, the
+        // envelope is incomplete and there is no capability at all — the
+        // completion still records normally, it simply cannot be journalled.
+        for (partial, d_id) in [
+            // no session_id
+            (
+                "id=jsh-b8c6-1;seq=1;started_at_ms=1788571993465",
+                "id=jsh-b8c6-1;",
+            ),
+            // no seq
+            (
+                "id=jsh-b8c6-1;session_id=probe-session-1;started_at_ms=1788571993465",
+                "id=jsh-b8c6-1;",
+            ),
+            // no started_at_ms
+            (
+                "id=jsh-b8c6-1;session_id=probe-session-1;seq=1",
+                "id=jsh-b8c6-1;",
+            ),
+            // no id
+            (
+                "session_id=probe-session-1;seq=1;started_at_ms=1788571993465",
+                "",
+            ),
+            // a session id outside jsh's grammar is not a session id
+            (
+                "id=jsh-b8c6-1;session_id=probe/session;seq=1;started_at_ms=1788571993465",
+                "id=jsh-b8c6-1;",
+            ),
+            // an unparseable sequence number is not a sequence number
+            (
+                "id=jsh-b8c6-1;session_id=probe-session-1;seq=one;started_at_ms=1788571993465",
+                "id=jsh-b8c6-1;",
+            ),
+            // an id the terminal accepts for display but that is outside jsh's
+            // narrower journal grammar cannot correlate a durable record
+            (
+                "id=jsh b8c6;session_id=probe-session-1;seq=1;started_at_ms=1788571993465",
+                "id=jsh%20b8c6;",
+            ),
+        ] {
+            let completed = run(partial, d_id);
+            assert_eq!(completed.len(), 1, "{partial}");
+            assert!(
+                completed[0].lifecycle.is_none(),
+                "partial Start envelope {partial:?} must not mint a journal capability"
+            );
+        }
+    }
+
+    /// The three Start-only slots are gated on the mark, not merged across the
+    /// lifecycle. A `D` that supplies them is naming a Start this terminal
+    /// never observed, and an `A`/`B` that supplies them is naming one that
+    /// has not begun.
+    #[test]
+    fn osc_133_start_identity_slots_are_ignored_on_every_mark_but_c() {
+        let identity = "session_id=probe-session-1;seq=1;started_at_ms=1788571993465";
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(format!("\x1b]133;A;{identity}\x07$ ").as_bytes());
+        terminal.process_input(format!("\x1b]133;B;{identity}\x07echo hi\r\n").as_bytes());
+        terminal.process_input(b"\x1b]133;C;id=jsh-b8c6-1\x07hi\r\n");
+        terminal.process_input(format!("\x1b]133;D;0;id=jsh-b8c6-1;{identity}\x07").as_bytes());
+
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id.as_deref(), Some("jsh-b8c6-1"));
+        assert!(
+            completed[0].lifecycle.is_none(),
+            "identity slots outside C must never assemble a lifecycle"
+        );
+    }
+
+    /// Repeated keys used to be last-wins, so PTY output could retract a
+    /// truncation disclosure, choose between two contradictory directories, or
+    /// pick which of two exit statuses a block committed to. Core's parser
+    /// fails closed on a repeated slot and so does this decoder.
+    #[test]
+    fn osc_133_repeated_metadata_slots_fail_closed() {
+        // A second `cmd_truncated` cannot turn a known-truncated command back
+        // into an apparently complete one.
+        let mut retracted = super::TerminalState::new(40, 8);
+        retracted.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        retracted
+            .process_input(b"\x1b]133;C;cmdline_url=echo%20hi;cmd_truncated=1;cmd_truncated=0\x07");
+        retracted.process_input(b"\x1b]133;D;0\x07");
+        assert!(retracted.command_zones[0].command_truncated);
+        assert!(retracted.take_completed_commands().is_empty());
+
+        // Two contradictory directories name no directory.
+        let mut two_cwds = super::TerminalState::new(40, 8);
+        two_cwds.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n");
+        two_cwds.process_input(b"\x1b]133;C;cwd_url=%2Ftmp;cwd_url=%2Fetc\x07");
+        two_cwds.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(two_cwds.command_zones[0].cwd, None);
+
+        // A repeated session id leaves no Start identity.
+        let mut two_sessions = super::TerminalState::new(40, 8);
+        two_sessions.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        two_sessions.process_input(
+            b"\x1b]133;C;id=jsh-1;session_id=probe-session-1;session_id=probe-session-1;seq=1;started_at_ms=17\x07",
+        );
+        two_sessions.process_input(b"\x1b]133;D;0;id=jsh-1\x07");
+        let completed = two_sessions.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].lifecycle.is_none());
+
+        // A `D` naming the execution twice is as ambiguous as naming it wrong,
+        // and an ambiguous id may not close the live block.
+        let mut two_ids = super::TerminalState::new(40, 8);
+        two_ids.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        two_ids.process_input(b"\x1b]133;C;id=jsh-1\x07hi\r\n");
+        two_ids.process_input(b"\x1b]133;D;0;id=jsh-1;id=jsh-1\x07");
+        assert!(two_ids.is_command_running());
+        assert!(two_ids.take_completed_commands().is_empty());
+        two_ids.process_input(b"\x1b]133;D;0;id=jsh-1\x07");
+        assert_eq!(two_ids.take_completed_commands().len(), 1);
+    }
+
+    /// The outcome slot is decoded the way core's `parse_osc133_exit_status`
+    /// decodes it: a second slot is ambiguous even when one of the two values
+    /// is malformed, and a malformed `exit=` occupies the slot rather than
+    /// deferring to whatever field comes next.
+    #[test]
+    fn osc_133_contradictory_exit_slots_report_unknown() {
+        let exit_for = |d_params: &str| {
+            let mut terminal = super::TerminalState::new(40, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+            terminal.process_input(b"\x1b]133;C;cmdline_url=echo%20hi\x07hi\r\n");
+            terminal.process_input(format!("\x1b]133;D;{d_params}\x07").as_bytes());
+            terminal.command_zones[0].exit_code
+        };
+
+        assert_eq!(exit_for("0"), Some(0));
+        assert_eq!(exit_for("0;id=jsh-1;duration_ms=5"), Some(0));
+        assert_eq!(exit_for("exit_code=1"), Some(1));
+        // A failed block must not render green because a second slot claimed
+        // success.
+        assert_eq!(exit_for("1;exit=0"), None);
+        assert_eq!(exit_for("exit=0;exit_status=1"), None);
+        // The malformed slot is still the slot the producer chose to send.
+        assert_eq!(exit_for("exit=x;1"), None);
+        assert_eq!(exit_for("exit=x"), None);
+    }
+
+    /// `cwd_url` on `D` is jsh's cwd AFTER the command ran, so a command that
+    /// changed directory reports its destination there. Overwriting `C`'s cwd
+    /// with it labelled every such block with the wrong directory, and that
+    /// value reaches the block menu, the Markdown export and the agent prompt.
+    #[test]
+    fn osc_133_d_cwd_only_fills_a_cwd_the_start_never_reported() {
+        let mut changed_directory = super::TerminalState::new(40, 8);
+        changed_directory.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07cd /tmp\r\n");
+        changed_directory
+            .process_input(b"\x1b]133;C;cmdline_url=cd%20%2Ftmp;cwd_url=%2Fhome%2Fu%2Fproj\x07");
+        changed_directory.process_input(b"\x1b]133;D;0;cwd_url=%2Ftmp\x07");
+        assert_eq!(
+            changed_directory.command_zones[0].cwd.as_deref(),
+            Some("/home/u/proj"),
+            "the block must name the directory the command RAN in"
+        );
+
+        // A shell that reports its cwd only on `D` still gets one: this is
+        // fill-only, not a refusal.
+        let mut d_only = super::TerminalState::new(40, 8);
+        d_only.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n\x1b]133;C\x07");
+        d_only.process_input(b"\x1b]133;D;0;cwd_url=%2Ftmp\x07");
+        assert_eq!(d_only.command_zones[0].cwd.as_deref(), Some("/tmp"));
+    }
+
+    /// All four command spellings name the same slot and all four are
+    /// percent-encoded. The bare `command=` used to be taken verbatim, so a
+    /// command containing `%20` was recorded with the escape still in it while
+    /// `cmdline_url` carrying identical bytes decoded correctly.
+    #[test]
+    fn osc_133_command_metadata_decodes_every_alias() {
+        for field in [
+            "cmdline_url=echo%20a%20b",
+            "command_url=echo%20a%20b",
+            "command=echo%20a%20b",
+            "cmdline=echo%20a%20b",
+        ] {
+            let mut terminal = super::TerminalState::new(40, 8);
+            terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
+            terminal.process_input(format!("\x1b]133;C;{field}\x07out\r\n").as_bytes());
+            terminal.process_input(b"\x1b]133;D;0\x07");
+            assert_eq!(
+                terminal.command_zones[0].command.as_deref(),
+                Some("echo a b"),
+                "{field}"
+            );
+            assert!(terminal.command_zones[0].command_exact, "{field}");
+        }
+    }
+
+    /// OSC 133 text was filtered for control characters only, then rendered
+    /// raw in the block menu and the export. U+FFF9 and the bidi overrides are
+    /// not control characters but draw as nothing (or as reversed text) in
+    /// this family's grids, so a path or command spelled with one displays as
+    /// something other than what it names.
+    #[test]
+    fn osc_133_metadata_refuses_terminal_invisible_characters() {
+        // %EF%BF%B9 is U+FFF9 INTERLINEAR ANNOTATION ANCHOR; %E2%80%AE is
+        // U+202E RIGHT-TO-LEFT OVERRIDE.
+        let mut cwd = super::TerminalState::new(40, 8);
+        cwd.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n");
+        cwd.process_input(b"\x1b]133;C;cwd_url=%2Ftmp%EF%BF%B9\x07");
+        cwd.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(cwd.command_zones[0].cwd, None);
+
+        let mut command = super::TerminalState::new(40, 8);
+        command.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
+        command.process_input(b"\x1b]133;C;cmdline_url=echo%E2%80%AEhi\x07out\r\n");
+        command.process_input(b"\x1b]133;D;0\x07");
+        assert!(!command.command_zones[0].command_exact);
+        assert!(command.command_zones[0]
+            .command
+            .as_deref()
+            .is_none_or(|text| !text.contains('\u{202e}')));
+
+        // A spoofed execution id cannot correlate: the C leaves no start id,
+        // so nothing downstream can be keyed on the ambiguous spelling.
+        let mut id = super::TerminalState::new(40, 8);
+        id.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n");
+        id.process_input(b"\x1b]133;C;id=jsh%EF%BF%B91\x07hi\r\n");
+        id.process_input(b"\x1b]133;D;0\x07");
+        let completed = id.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, None);
+        assert!(completed[0].lifecycle.is_none());
+    }
+
     #[test]
     fn osc_133_duration_spans_command_execution() {
         let mut terminal = super::TerminalState::new(40, 8);
@@ -12705,6 +13358,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: None,
             execution_id: None,
+            lifecycle: None,
             agent_generation: None,
             completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
         };
@@ -13750,6 +14404,152 @@ mod tests {
         assert!(terminal.command_zones.iter().all(|zone| zone.rows_evicted));
         assert!(terminal.finished_output_provenance.is_empty());
         assert!(super::PROVENANCE_ORPHAN_SCAN_COUNT.with(|count| count.get()) > 0);
+    }
+
+    /// Past the scrollback cap every scrolled line trims a row, and rebasing
+    /// the retained zones for it used to be a per-line walk of the whole
+    /// 256-entry deque on the PTY ingest path. The shift is uniform, so it is
+    /// accumulated and applied once per batch — and the anchors a reader sees
+    /// afterwards must be exactly what the per-line walk produced.
+    #[test]
+    fn zone_rebase_is_amortised_per_batch_and_lands_on_the_same_anchors() {
+        let seed = |terminal: &mut TerminalState| {
+            terminal.set_max_scrollback(64);
+            for index in 0..4 {
+                terminal.process_input(
+                    format!(
+                        "\x1b]133;A\x07$ \x1b]133;B\x07cmd{index}\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+                    )
+                    .as_bytes(),
+                );
+            }
+        };
+        let anchors = |terminal: &TerminalState| -> Vec<_> {
+            terminal
+                .command_zones
+                .iter()
+                .map(|zone| {
+                    (
+                        zone.id,
+                        zone.prompt_start,
+                        zone.command_start,
+                        zone.output_start,
+                        zone.output_end,
+                        zone.rows_evicted,
+                    )
+                })
+                .collect()
+        };
+
+        // One batch that scrolls far past the cap.
+        let mut batched = TerminalState::new(20, 2);
+        seed(&mut batched);
+        let filler = "filler\r\n".repeat(200);
+        super::ZONE_REBASE_SCAN_COUNT.with(|scans| scans.set(0));
+        batched.process_input(filler.as_bytes());
+        let batched_scans = super::ZONE_REBASE_SCAN_COUNT.with(|scans| scans.get());
+
+        // The same 200 lines fed one at a time: 200 batches, so 200 rebases.
+        let mut per_line = TerminalState::new(20, 2);
+        seed(&mut per_line);
+        super::ZONE_REBASE_SCAN_COUNT.with(|scans| scans.set(0));
+        for _ in 0..200 {
+            per_line.process_input(b"filler\r\n");
+        }
+        let per_line_scans = super::ZONE_REBASE_SCAN_COUNT.with(|scans| scans.get());
+
+        assert_eq!(
+            anchors(&batched),
+            anchors(&per_line),
+            "the accumulated rebase must land exactly where the per-row one did"
+        );
+        assert_eq!(
+            batched_scans, 1,
+            "one ingest batch rebases the zone deque once, however many rows it trimmed"
+        );
+        assert!(
+            per_line_scans > batched_scans,
+            "the per-batch bound is what makes this amortised"
+        );
+
+        // A trim is never observable unsettled: the batch above ended with
+        // nothing outstanding, and so does an explicit cap change.
+        assert_eq!(batched.pending_zone_row_trim, 0);
+        batched.set_max_scrollback(4);
+        assert_eq!(batched.pending_zone_row_trim, 0);
+
+        // A zone recorded mid-batch joins the retained ones in the settled
+        // space, so its anchors stay consistent with theirs.
+        let mut mid_batch = TerminalState::new(20, 2);
+        seed(&mut mid_batch);
+        let mut stream = "filler\r\n".repeat(100);
+        stream.push_str("\x1b]133;A\x07$ \x1b]133;B\x07late\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        mid_batch.process_input(stream.as_bytes());
+        let live: Vec<_> = mid_batch
+            .command_zones
+            .iter()
+            .filter(|zone| !zone.rows_evicted)
+            .map(|zone| zone.prompt_start)
+            .collect();
+        assert!(
+            live.windows(2).all(|pair| pair[0] < pair[1]),
+            "retained prompts stay strictly ordered: {live:?}"
+        );
+        assert!(live
+            .iter()
+            .all(|&row| row < mid_batch.scrollback.len() + mid_batch.grid.rows()));
+
+        // `on_resize` is the one trimming entry point reached from the window
+        // manager rather than from the ingest path, so it has to settle on its
+        // own. A row shrink pushes on-screen rows into a full scrollback, which
+        // evicts from the front and accumulates a rebase; leaving it pending
+        // would hand every reader of `command_zones` anchors pointing at rows
+        // that have already moved.
+        // Scrollback must already be at its cap, and the zones must still be
+        // live, or a resize push evicts nothing and the fixture proves nothing.
+        let mut resized = TerminalState::new(20, 8);
+        resized.set_max_scrollback(16);
+        resized.process_input("filler\r\n".repeat(40).as_bytes());
+        for index in 0..4 {
+            resized.process_input(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07cmd{index}\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        assert_eq!(resized.scrollback.len(), 16, "the cap must be reached");
+        assert!(
+            resized.command_zones.iter().any(|zone| !zone.rows_evicted),
+            "the fixture must retain a live zone to rebase"
+        );
+        assert_eq!(resized.pending_zone_row_trim, 0);
+        let before = anchors(&resized);
+        for row in 0..6 {
+            resized.cursor_row = resized.grid.rows().saturating_sub(1);
+            resized.on_resize(20, 7 - row);
+            assert_eq!(
+                resized.pending_zone_row_trim, 0,
+                "a resize must not leave an unsettled rebase"
+            );
+        }
+        let after = anchors(&resized);
+        assert_ne!(
+            before, after,
+            "the fixture must really trim, or it proves nothing"
+        );
+        let live_after: Vec<_> = resized
+            .command_zones
+            .iter()
+            .filter(|zone| !zone.rows_evicted)
+            .map(|zone| zone.prompt_start)
+            .collect();
+        assert!(
+            live_after
+                .iter()
+                .all(|&row| row < resized.scrollback.len() + resized.grid.rows()),
+            "every retained anchor stays inside the buffer: {live_after:?}"
+        );
     }
 
     #[test]
@@ -16553,6 +17353,26 @@ mod tests {
         // A bare absolute path is accepted too; some shells emit only that.
         terminal.process_input(b"\x1b]7;/srv\x1b\\");
         assert_eq!(terminal.current_working_dir(), Some("/srv"));
+
+        // The retained cwd is bounded. It is cloned into every command zone
+        // with no `cwd` of its own, written into the session snapshot and
+        // inherited by every split, so an unbounded one is paid for over and
+        // over; and a path past Linux's own 4 KiB pathname limit cannot name a
+        // real directory anyway. An oversized report leaves the last accepted
+        // directory alone rather than blanking it.
+        let overlong = format!("/{}", "d".repeat(super::MAX_OSC7_CWD_BYTES));
+        terminal.process_input(format!("\x1b]7;{overlong}\x1b\\").as_bytes());
+        assert_eq!(terminal.current_working_dir(), Some("/srv"));
+        // Percent-encoding does not buy extra room either: the cap is on the
+        // decoded path.
+        let encoded = "%64".repeat(super::MAX_OSC7_CWD_BYTES);
+        terminal.process_input(format!("\x1b]7;file:///{encoded}\x1b\\").as_bytes());
+        assert_eq!(terminal.current_working_dir(), Some("/srv"));
+
+        // Exactly at the ceiling is still a directory.
+        let at_cap = format!("/{}", "d".repeat(super::MAX_OSC7_CWD_BYTES - 1));
+        terminal.process_input(format!("\x1b]7;{at_cap}\x1b\\").as_bytes());
+        assert_eq!(terminal.current_working_dir(), Some(at_cap.as_str()));
     }
 
     /// The reason OSC 7 could not be added without the host check: this value

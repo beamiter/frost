@@ -36,6 +36,6 @@ ignore = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = [
-  "https://github.com/beamiter/jagent.git?rev=ab7552d2bf287e330f67f7b75ab766b73aa6268e",
-  "https://github.com/beamiter/jterm_core.git?rev=f60c507df59129b281822dd97d2df3a709a02ce4",
+  "https://github.com/beamiter/jagent.git?rev=bdc8023faa535ee00bb972cdb0adc11ba280fdc5",
+  "https://github.com/beamiter/jterm_core.git?rev=9f94f77b694ef5e0b20b9fd4bd776b98220360c4",
 ]

