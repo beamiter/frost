@@ -8412,6 +8412,17 @@ impl TerminalState {
             }
             'L' => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                // Cap the repeat count at the size of the thing being edited.
+                // After that many iterations the region is already entirely
+                // blank, so a larger N only buys O(N · region · cols) cell
+                // copies on the UI thread — `printf '\e[65535L'`, or the same
+                // bytes out of a binary file or a hostile remote stream, is
+                // hundreds of millions of copies. ember caps all six of these.
+                let n = n.min(
+                    self.scroll_region_bottom
+                        .saturating_sub(self.cursor_row)
+                        .saturating_add(1),
+                );
                 let blank = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
@@ -8435,6 +8446,12 @@ impl TerminalState {
             }
             'M' => {
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                // Same cap as IL: see the comment there.
+                let n = n.min(
+                    self.scroll_region_bottom
+                        .saturating_sub(self.cursor_row)
+                        .saturating_add(1),
+                );
                 let blank = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_row >= self.scroll_region_top
@@ -8538,6 +8555,12 @@ impl TerminalState {
             'S' => {
                 // Scroll up (Scroll Up, SU) - content moves up, new lines appear at bottom
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                // Beyond the region height the region is already blank; see IL.
+                let n = n.min(
+                    self.scroll_region_bottom
+                        .saturating_sub(self.scroll_region_top)
+                        .saturating_add(1),
+                );
                 // Scroll within the scroll region by moving lines
                 for _ in 0..n {
                     self.scroll_region_up(self.scroll_region_top, self.scroll_region_bottom);
@@ -8546,6 +8569,12 @@ impl TerminalState {
             'T' => {
                 // Scroll down (Scroll Down, SD) - content moves down, new lines appear at top
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                // Beyond the region height the region is already blank; see IL.
+                let n = n.min(
+                    self.scroll_region_bottom
+                        .saturating_sub(self.scroll_region_top)
+                        .saturating_add(1),
+                );
                 for _ in 0..n {
                     self.scroll_region_down(self.scroll_region_top, self.scroll_region_bottom);
                 }
@@ -8661,6 +8690,8 @@ impl TerminalState {
                 // ICH - Insert Character(s)
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
                 let cols = self.grid.row_len();
+                // Beyond the remaining columns the row is already blank; see IL.
+                let n = n.min(cols.saturating_sub(self.cursor_col));
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
                     // Insert n blank cells at cursor position, shifting content right
@@ -8681,6 +8712,8 @@ impl TerminalState {
             'P' => {
                 // DCH - Delete Character(s)
                 let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                // Beyond the remaining columns the row is already blank; see IL.
+                let n = n.min(self.grid.row_len().saturating_sub(self.cursor_col));
                 let blank_cell = self.create_blank_cell();
                 for _ in 0..n {
                     if self.cursor_col < self.grid.row_len() {
@@ -15927,6 +15960,43 @@ mod tests {
 
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    /// A repeat count is an attacker-controlled u16. Every one of these edits
+    /// is idempotent past the size of the thing it edits, so an uncapped N is
+    /// pure O(N · region · cols) work on the UI thread — one `\e[65535L` out of
+    /// a binary file or a hostile stream used to be hundreds of millions of
+    /// cell copies. ember caps all six; these assert frost now does too.
+    #[test]
+    fn repeat_count_editors_are_capped_at_what_they_can_edit() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_input(b"row-one\r\nrow-two\r\nrow-three");
+
+        // Each of these would previously loop 65535 times.
+        terminal.process_input(b"\x1b[H\x1b[65535L");
+        terminal.process_input(b"\x1b[65535M");
+        terminal.process_input(b"\x1b[65535S");
+        terminal.process_input(b"\x1b[65535T");
+        terminal.process_input(b"\x1b[65535@");
+        terminal.process_input(b"\x1b[65535P");
+
+        // The grid survives, blanked, with its geometry intact.
+        assert_eq!(terminal.grid.rows(), 24);
+        assert_eq!(terminal.grid.row_len(), 80);
+    }
+
+    /// The cap must not change what a reasonable count does.
+    #[test]
+    fn a_capped_editor_still_performs_the_edit_it_was_asked_for() {
+        let mut terminal = TerminalState::new(10, 4);
+        terminal.process_input(b"aaaa\r\nbbbb\r\ncccc");
+        terminal.process_input(b"\x1b[H");
+
+        terminal.process_input(b"\x1b[2L");
+
+        // Two blank lines inserted at the top pushed the text down by two.
+        let row2: String = (0..4).map(|c| terminal.grid.get(2, c).character).collect();
+        assert_eq!(row2, "aaaa");
     }
 
     /// `CSI ? Pm r` is XTRESTORE, not DECSTBM. Executed as DECSTBM, restoring a
