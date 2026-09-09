@@ -7,15 +7,19 @@
 use std::fmt;
 
 pub(crate) const MAX_AGENT_COMMAND_BYTES: usize = 16 * 1024;
-/// The family-shared command-history JSONL index is written by
-/// `jterm_core::command_history`, and its record budget belongs to that
-/// writer: it accepts a command up to `review_input::MAX_REVIEW_INPUT_BYTES`
-/// and refuses anything longer. Read the number from core rather than
-/// re-declaring it — a local copy is exactly how this constant ended up four
-/// times apart between the siblings, which silently hid frost-written records
-/// from the other apps' history pickers.
+/// Budget for a command reconstructed from the OSC 133 replay channel — the
+/// text an agent may be handed to re-run. That channel's writer is
+/// `jterm_core::execution_journal`, so read its number rather than
+/// re-declaring one: a local copy is exactly how this constant ended up
+/// disagreeing between the siblings.
+///
+/// This is NOT the shared-history budget. The family's command-history JSONL
+/// is written by `jterm_core::command_history`, which accepts four times as
+/// much; a reader that applies the replay budget to that file silently drops
+/// every longer record a sibling wrote. That one lives beside its reader, as
+/// `history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES`.
 pub(crate) const MAX_HISTORY_COMMAND_BYTES: usize =
-    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
+    jterm_core::execution_journal::MAX_COMMAND_BYTES;
 pub(crate) const MAX_PROMPT_INSERT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

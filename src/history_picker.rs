@@ -21,14 +21,22 @@ pub const MAX_RESULTS: usize = 15;
 /// in the family file, so this must not drift below core's value.
 const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 
+/// A command's budget in the family-shared history JSONL, taken from that
+/// file's own writer: `jterm_core::command_history` accepts up to
+/// `review_input::MAX_REVIEW_INPUT_BYTES`. Reading it with the smaller OSC 133
+/// replay budget instead would drop every longer record a sibling terminal
+/// wrote — the record is valid, the reader just refuses it, and the user sees
+/// history entries missing with no explanation.
+pub(crate) const MAX_SHARED_HISTORY_COMMAND_BYTES: usize =
+    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
+
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
 /// 多行命令）——家族的 review-only 历史格式拒绝控制字符，这类文本也无法
 /// 安全地回填到提示符。
 pub fn sanitized_command(command: &str) -> Option<&str> {
     let trimmed = command.trim_matches(' ');
-    crate::review_text::validate_single_line(trimmed, crate::review_text::MAX_HISTORY_COMMAND_BYTES)
-        .ok()
+    crate::review_text::validate_single_line(trimmed, MAX_SHARED_HISTORY_COMMAND_BYTES).ok()
 }
 
 pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
@@ -46,7 +54,7 @@ pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
 /// 回填到提示符的始终是完整命令文本。
 pub fn display_command(command: &str) -> String {
     const MAX_DISPLAY_CHARS: usize = 120;
-    if command.len() > crate::review_text::MAX_HISTORY_COMMAND_BYTES {
+    if command.len() > MAX_SHARED_HISTORY_COMMAND_BYTES {
         return "(command omitted: exceeds review limit)".to_string();
     }
     let visible = crate::review_text::visible_bounded(command, 4 * 1024);
@@ -198,7 +206,7 @@ mod tests {
         assert_eq!(sanitized_command("printf safe\u{202e}txt"), None);
         assert_eq!(sanitized_command("echo\u{00a0}not-a-separator"), None);
         assert_eq!(
-            sanitized_command(&"x".repeat(crate::review_text::MAX_HISTORY_COMMAND_BYTES + 1)),
+            sanitized_command(&"x".repeat(MAX_SHARED_HISTORY_COMMAND_BYTES + 1)),
             None
         );
     }
@@ -212,7 +220,7 @@ mod tests {
         // The writer's own bounds: command <= MAX_REVIEW_INPUT_BYTES, cwd <=
         // 16 KiB.
         assert_eq!(
-            crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+            MAX_SHARED_HISTORY_COMMAND_BYTES,
             jterm_core::review_input::MAX_REVIEW_INPUT_BYTES
         );
         let command = "e".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES);

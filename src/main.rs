@@ -13709,9 +13709,11 @@ impl Frost {
                 }
             }
             Message::PromptRecall(id, command) => {
+                // Recall replays a row the history picker showed, so it must
+                // accept everything that picker accepts.
                 match crate::review_text::sanitize_untrusted_single_line(
                     &command,
-                    crate::review_text::MAX_HISTORY_COMMAND_BYTES,
+                    crate::history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES,
                 ) {
                     Ok(command) => {
                         if let Err(reason) = self.session_prompt_replace_ready(id) {
