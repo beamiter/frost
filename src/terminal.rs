@@ -4247,9 +4247,10 @@ impl TerminalState {
     fn handle_osc_133(&mut self, value: &str) {
         use jterm_core::execution_journal::{
             is_valid_jsh_cwd, is_valid_jsh_execution_id, is_valid_jsh_session_id,
-            MAX_EXECUTION_ID_BYTES,
         };
-        use jterm_core::parser::{MAX_OSC133_CWD_BYTES, MAX_OSC133_SESSION_ID_BYTES};
+        use jterm_core::parser::{
+            MAX_OSC133_CWD_BYTES, MAX_OSC133_ID_BYTES, MAX_OSC133_SESSION_ID_BYTES,
+        };
 
         // Every mark reasons about absolute rows, and `D` reads and rewrites
         // the retained zones, so the deferred trim is settled at the one point
@@ -4318,7 +4319,18 @@ impl TerminalState {
                         mark_id = None;
                         continue;
                     }
-                    mark_id = Self::decode_osc_metadata(raw, MAX_EXECUTION_ID_BYTES)
+                    // The wire cap, not the journal's. `parser` deliberately
+                    // keeps these apart: `id=` is an opaque correlation token a
+                    // producer other than jsh may make longer, and jsh's
+                    // narrower 192-byte grammar is applied where it belongs —
+                    // at the journal envelope below, via
+                    // `is_valid_jsh_execution_id`. Decoding the wire field with
+                    // the journal's cap made frost reject an id of 193..=1024
+                    // bytes that core, anvil, forge and ember all accept, and a
+                    // `D` carrying one is treated as forged: the zone is
+                    // finalized stale at the next prompt with no exit code,
+                    // duration or D-side metadata.
+                    mark_id = Self::decode_osc_metadata(raw, MAX_OSC133_ID_BYTES)
                         .filter(|id| !id.is_empty() && !Self::osc_metadata_is_ambiguous(id));
                 }
                 "session_id" => {
@@ -6944,6 +6956,44 @@ impl TerminalState {
         }
     }
 
+    /// Blank both halves of a double-width pair straddling `col`.
+    ///
+    /// A shift that moves one half without the other leaves an orphaned glyph
+    /// beside a stale spacer, and the row's column arithmetic goes one out per
+    /// orphan. `col` may be either half, or one past the row.
+    fn blank_wide_pair_at(&mut self, row: usize, col: usize) {
+        let cols = self.grid.row_len();
+        if row >= self.grid.rows() || col > cols || cols == 0 {
+            return;
+        }
+        let blank = self.create_blank_cell();
+        if col < cols && self.grid.get(row, col).flags.wide_continuation() && col > 0 {
+            *self.grid.get_mut(row, col - 1) = blank;
+            *self.grid.get_mut(row, col) = blank;
+        } else if col < cols && self.grid.get(row, col).flags.wide() && col + 1 < cols {
+            *self.grid.get_mut(row, col) = blank;
+            *self.grid.get_mut(row, col + 1) = blank;
+        } else if col > 0 && col <= cols && self.grid.get(row, col - 1).flags.wide() {
+            // The window's right edge sits between a lead and its continuation.
+            *self.grid.get_mut(row, col - 1) = blank;
+            if col < cols {
+                *self.grid.get_mut(row, col) = blank;
+            }
+        }
+    }
+
+    /// A lead in the final column has nowhere to keep its continuation.
+    fn blank_dangling_wide_at_row_end(&mut self, row: usize) {
+        let cols = self.grid.row_len();
+        if row >= self.grid.rows() || cols == 0 {
+            return;
+        }
+        if self.grid.get(row, cols - 1).flags.wide() {
+            let blank = self.create_blank_cell();
+            *self.grid.get_mut(row, cols - 1) = blank;
+        }
+    }
+
     fn create_blank_cell(&self) -> TerminalCell {
         self.blank_cell_with_bg(self.current_bg)
     }
@@ -8694,6 +8744,12 @@ impl TerminalState {
                 let n = n.min(cols.saturating_sub(self.cursor_col));
                 let blank_cell = self.create_blank_cell();
                 if self.cursor_col < cols {
+                    // A double-width character split by the insertion point
+                    // cannot survive the shift — its halves would end up n
+                    // columns apart, leaving an orphaned glyph beside a stale
+                    // spacer and every later column on the row off by one. Take
+                    // both halves out first, as ember does.
+                    self.blank_wide_pair_at(self.cursor_row, self.cursor_col);
                     // Insert n blank cells at cursor position, shifting content right
                     // insert_cell_in_row shifts cells right and discards the last cell
                     for _ in 0..n {
@@ -8705,6 +8761,9 @@ impl TerminalState {
                             );
                         }
                     }
+                    // The shift can push a lead into the last column while its
+                    // continuation falls off the end of the row.
+                    self.blank_dangling_wide_at_row_end(self.cursor_row);
                     // Mark row as dirty after modification
                     self.mark_row_dirty(self.cursor_row);
                 }
@@ -8715,6 +8774,12 @@ impl TerminalState {
                 // Beyond the remaining columns the row is already blank; see IL.
                 let n = n.min(self.grid.row_len().saturating_sub(self.cursor_col));
                 let blank_cell = self.create_blank_cell();
+                // Deleting one half of a double-width character has to take the
+                // other half with it, at both edges of the deleted window: the
+                // lead left standing to the left of it, and the continuation the
+                // shift would drag in from the right.
+                self.blank_wide_pair_at(self.cursor_row, self.cursor_col);
+                self.blank_wide_pair_at(self.cursor_row, self.cursor_col + n);
                 for _ in 0..n {
                     if self.cursor_col < self.grid.row_len() {
                         self.grid
@@ -12502,7 +12567,11 @@ mod tests {
             assert!(terminal.command_zones.is_empty());
             assert!(terminal.take_completed_commands().is_empty());
         }
-        let oversized = "x".repeat(193);
+        // Genuinely past the wire cap, so it never decodes to an id at all.
+        // 193 used to belong on this list, back when the wire field was bounded
+        // by the journal's grammar; it is a perfectly good correlation token
+        // that simply does not match, which the test below covers.
+        let oversized = "x".repeat(jterm_core::parser::MAX_OSC133_ID_BYTES + 1);
         terminal.process_input(format!("\x1b]133;D;0;id={oversized}\x07").as_bytes());
         assert!(terminal.is_command_running());
         assert!(terminal.command_zones.is_empty());
@@ -12510,6 +12579,99 @@ mod tests {
 
         terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
         assert_eq!(terminal.take_completed_commands().len(), 1);
+    }
+
+    /// A shift that moves one half of a double-width character without the
+    /// other leaves an orphaned glyph beside a stale spacer, and every column
+    /// after it on that row is one out. This is the path a line editor takes
+    /// when you type into the middle of an existing line, so it fires on
+    /// ordinary interactive use of any CJK prompt.
+    #[test]
+    fn ich_does_not_split_a_double_width_pair() {
+        let mut terminal = super::TerminalState::new(10, 2);
+        terminal.process_input("ab中cd".as_bytes());
+
+        // Insert with the cursor on the continuation half of 中.
+        terminal.process_input(b"\x1b[1;4H\x1b[2@");
+
+        for col in 0..terminal.grid.row_len() {
+            let cell = terminal.grid.get(0, col);
+            if cell.flags.wide() {
+                assert!(
+                    col + 1 < terminal.grid.row_len()
+                        && terminal.grid.get(0, col + 1).flags.wide_continuation(),
+                    "lead at {col} lost its continuation"
+                );
+            }
+            if cell.flags.wide_continuation() {
+                assert!(
+                    col > 0 && terminal.grid.get(0, col - 1).flags.wide(),
+                    "continuation at {col} lost its lead"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dch_takes_both_halves_of_a_pair_it_cuts() {
+        let mut terminal = super::TerminalState::new(10, 2);
+        terminal.process_input("ab中cd".as_bytes());
+
+        // Delete a window whose right edge falls inside 中.
+        terminal.process_input(b"\x1b[1;2H\x1b[2P");
+
+        for col in 0..terminal.grid.row_len() {
+            let cell = terminal.grid.get(0, col);
+            if cell.flags.wide() {
+                assert!(
+                    col + 1 < terminal.grid.row_len()
+                        && terminal.grid.get(0, col + 1).flags.wide_continuation(),
+                    "lead at {col} lost its continuation"
+                );
+            }
+            if cell.flags.wide_continuation() {
+                assert!(
+                    col > 0 && terminal.grid.get(0, col - 1).flags.wide(),
+                    "continuation at {col} lost its lead"
+                );
+            }
+        }
+    }
+
+    /// `parser` keeps two caps apart on purpose: `id=` is an opaque correlation
+    /// token on the wire, which a producer other than jsh may make longer, and
+    /// jsh's narrower journal grammar applies only where a record is persisted.
+    /// Bounding the wire field with the journal's cap made frost reject ids of
+    /// 193..=1024 bytes that core, anvil, forge and ember all accept — and a
+    /// `D` carrying one reads as forged, so the zone finalizes stale with no
+    /// exit code.
+    #[test]
+    fn an_osc_133_id_longer_than_the_journal_grammar_still_completes_its_block() {
+        let long_id = "x".repeat(300);
+        assert!(long_id.len() > jterm_core::execution_journal::MAX_EXECUTION_ID_BYTES);
+        assert!(long_id.len() <= jterm_core::parser::MAX_OSC133_ID_BYTES);
+
+        let mut terminal = super::TerminalState::new(40, 8);
+        terminal.process_input(
+            format!("\x1b]133;A\x07$ \x1b]133;B\x07echo ok\r\n\x1b]133;C;id={long_id}\x07ok\r\n")
+                .as_bytes(),
+        );
+        terminal.process_input(format!("\x1b]133;D;0;id={long_id}\x07").as_bytes());
+
+        assert!(!terminal.is_command_running());
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id.as_deref(), Some(long_id.as_str()));
+    }
+
+    /// The narrowing still happens, just at the boundary that owns it: an id
+    /// too long for jsh's grammar must not enter the journal envelope.
+    #[test]
+    fn a_long_wire_id_is_still_refused_by_the_journal_grammar() {
+        let long_id = "x".repeat(300);
+        assert!(!jterm_core::execution_journal::is_valid_jsh_execution_id(
+            &long_id
+        ));
     }
 
     #[test]
