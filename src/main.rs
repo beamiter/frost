@@ -26683,7 +26683,7 @@ mod tests {
     #[test]
     fn ai_block_output_goes_through_the_shared_ad_hoc_adapter() {
         use agent_task::context::{
-            ad_hoc_block_context, UNKNOWN_EXIT_STATUS_NOTE, UNKNOWN_EXIT_STATUS_SENTINEL,
+            ad_hoc_block_context, unknown_exit_status_note, UNKNOWN_EXIT_STATUS_SENTINEL,
         };
 
         let semantic = |output: &str, exit_code: Option<i32>| agent_task::SemanticCommandContext {
@@ -26713,7 +26713,10 @@ mod tests {
 
         let unknown = ad_hoc_block_context(&semantic(short, None));
         assert_eq!(unknown.exit_code, UNKNOWN_EXIT_STATUS_SENTINEL);
-        assert_eq!(unknown.output, format!("{UNKNOWN_EXIT_STATUS_NOTE}{short}"));
+        assert_eq!(
+            unknown.output,
+            format!("{}{short}", unknown_exit_status_note())
+        );
         assert!(!unknown.truncated);
 
         let long = (0..200)
@@ -26723,7 +26726,7 @@ mod tests {
         let bounded = ad_hoc_block_context(&semantic(&long, None));
         assert!(bounded.truncated);
         assert_ne!(bounded.output, long);
-        assert!(bounded.output.starts_with(UNKNOWN_EXIT_STATUS_NOTE));
+        assert!(bounded.output.starts_with(&unknown_exit_status_note()));
         assert!(bounded.output.contains("line 0"));
         assert!(bounded.output.contains("line 199"));
 

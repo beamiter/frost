@@ -110,6 +110,7 @@ pub struct AgentDiffPanel {
     pending: Option<Receiver<WorkerResult>>,
 }
 
+#[allow(dead_code)] // surface kept aligned with the sibling frontends
 impl AgentDiffPanel {
     pub fn new() -> Self {
         Self::default()
