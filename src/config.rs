@@ -25,10 +25,13 @@ pub struct ConfigLoad {
     pub revision: Option<FileRevision>,
 }
 
-// Nerd Font priority list
+// Nerd Font priority list. The head is what `default_font_family` ships, so it
+// must stay a `Mono` cut: those hold every icon to one cell, which is the only
+// shape that lines up in a terminal grid.
 const NERD_FONT_CANDIDATES: &[&str] = &[
-    "SauceCodePro Nerd Font",
+    "JetBrainsMono Nerd Font Mono",
     "SauceCodePro Nerd Font Mono",
+    "SauceCodePro Nerd Font",
     "Monokoi Nerd Font",
     "Monokoi Nerd Font Mono",
     "JetBrains Mono Nerd Font",
@@ -37,9 +40,11 @@ const NERD_FONT_CANDIDATES: &[&str] = &[
     "FiraCode Nerd Font",
 ];
 
+// Icons the text font misses. Kept in step with `NERD_FONT_CANDIDATES` so the
+// fallback matches the default text font's stroke weight rather than mixing cuts.
 const NERD_FONT_FALLBACK_CANDIDATES: &[&str] = &[
-    "SauceCodePro Nerd Font Mono",
     "JetBrainsMono Nerd Font Mono",
+    "SauceCodePro Nerd Font Mono",
     "JetBrains Mono Nerd Font",
     "JetBrainsMono Nerd Font",
     "SauceCodePro Nerd Font",
