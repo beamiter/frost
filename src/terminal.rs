@@ -8615,8 +8615,14 @@ impl TerminalState {
                     self.reset_mode(mode, private);
                 }
             }
-            'r' => {
-                // Set scroll region (DECSTBM)
+            'r' if private_prefix.is_none() && intermediates.is_empty() => {
+                // Set scroll region (DECSTBM). A private prefix makes this
+                // XTRESTORE (`CSI ? Pm r`, the counterpart of the XTSAVE the
+                // 's' arm below already guards), and an intermediate makes it
+                // DECCARA (`CSI Pm $ r`). Executing either as DECSTBM sets a
+                // scroll region from a mode number: restoring 1049 clamps to
+                // the bottom row, every line feed then scrolls inside that one
+                // row, and the screen looks frozen.
                 let top = match params.first().copied().unwrap_or(1) {
                     0 => 1,
                     v => v as usize,
@@ -8640,8 +8646,14 @@ impl TerminalState {
                     self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
                 }
 
-                // Move cursor to home position when setting scroll region
-                self.cursor_row = 0;
+                // Move cursor to home position when setting scroll region. In
+                // origin mode (DECOM) home is the top of the scroll region, not
+                // the absolute top of the screen.
+                self.cursor_row = if self.modes.contains(&6) {
+                    self.scroll_region_top
+                } else {
+                    0
+                };
                 self.cursor_col = 0;
                 self.pending_wrap = false;
             }
@@ -9165,6 +9177,18 @@ impl TerminalState {
                 self.sync_output_active = true;
                 self.sync_output_start = Some(std::time::Instant::now());
             }
+            6 => {
+                // DECOM origin mode. `place_cursor` and `set_cursor_row_abs`
+                // already read this bit, and `decrqm_private_mode_state`
+                // advertises the mode as recognized — but without an arm here it
+                // landed in the catch-all below, which records the bit and
+                // leaves the cursor where it was. Setting DECOM homes to the
+                // top of the scroll region.
+                self.modes.insert(6);
+                self.cursor_row = self.scroll_region_top;
+                self.cursor_col = 0;
+                self.pending_wrap = false;
+            }
             7 => {
                 // Autowrap mode
                 self.modes.insert(7);
@@ -9303,6 +9327,14 @@ impl TerminalState {
                 self.sync_output_active = false;
                 self.sync_output_start = None;
                 self.mark_rows_dirty(0, self.grid.rows().saturating_sub(1));
+            }
+            6 => {
+                // Resetting DECOM homes to the absolute top-left, not to the
+                // scroll region's top. See the matching arm in `set_mode`.
+                self.modes.remove(&6);
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+                self.pending_wrap = false;
             }
             7 => {
                 // Disable autowrap
@@ -15895,6 +15927,63 @@ mod tests {
 
         assert_eq!(terminal.scroll_region_top, 0);
         assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    /// `CSI ? Pm r` is XTRESTORE, not DECSTBM. Executed as DECSTBM, restoring a
+    /// mode number like 1049 clamps the region to the bottom row and every line
+    /// feed then scrolls inside that single row.
+    #[test]
+    fn xtrestore_is_not_mistaken_for_decstbm() {
+        let mut terminal = TerminalState::new(4, 4);
+        terminal.process_input(b"\x1b[2;3H");
+        let (row, col) = (terminal.cursor_row, terminal.cursor_col);
+
+        terminal.process_input(b"\x1b[?1049r");
+
+        assert_eq!(terminal.scroll_region_top, 0);
+        assert_eq!(terminal.scroll_region_bottom, 3);
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (row, col));
+    }
+
+    /// `CSI Pm $ r` is DECCARA — an intermediate byte rules DECSTBM out just as
+    /// a private prefix does.
+    #[test]
+    fn deccara_is_not_mistaken_for_decstbm() {
+        let mut terminal = TerminalState::new(4, 4);
+
+        terminal.process_input(b"\x1b[1;1;2;2$r");
+
+        assert_eq!(terminal.scroll_region_top, 0);
+        assert_eq!(terminal.scroll_region_bottom, 3);
+    }
+
+    /// Setting DECOM homes to the top of the scroll region; resetting it homes
+    /// to the absolute top-left. Without arms of its own the mode only ever
+    /// recorded its bit, leaving the cursor where it stood.
+    #[test]
+    fn decom_homes_the_cursor_on_set_and_reset() {
+        let mut terminal = TerminalState::new(8, 6);
+        terminal.process_input(b"\x1b[2;5r");
+        terminal.process_input(b"\x1b[4;4H");
+
+        terminal.process_input(b"\x1b[?6h");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (1, 0));
+
+        terminal.process_input(b"\x1b[3;3H");
+        terminal.process_input(b"\x1b[?6l");
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (0, 0));
+    }
+
+    /// Under DECOM, DECSTBM's home is the new region's top row, not row 0.
+    #[test]
+    fn decstbm_home_respects_origin_mode() {
+        let mut terminal = TerminalState::new(8, 6);
+        terminal.process_input(b"\x1b[?6h");
+
+        terminal.process_input(b"\x1b[3;6r");
+
+        assert_eq!(terminal.scroll_region_top, 2);
+        assert_eq!((terminal.cursor_row, terminal.cursor_col), (2, 0));
     }
 
     #[test]
