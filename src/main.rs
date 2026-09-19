@@ -21895,12 +21895,35 @@ impl Frost {
                 match self.task_manager.create(new_task) {
                     Ok(task_id) => {
                         self.task_panel.selected = Some(task_id);
-                        self.push_toast(
-                            format!(
-                                "Created an isolated {provider_name} task; choose Start {provider_name}"
-                            ),
-                            ToastKind::Success,
-                        );
+                        match prepared.provider {
+                            agent_task::AgentProvider::Codex => {
+                                self.push_toast(
+                                    format!(
+                                        "Created an isolated {provider_name} task; choose Start {provider_name}"
+                                    ),
+                                    ToastKind::Success,
+                                );
+                            }
+                            agent_task::AgentProvider::Claude
+                            | agent_task::AgentProvider::Kimi => {
+                                self.push_toast(
+                                    format!(
+                                        "Created an isolated {provider_name} task; starting native {provider_name}…"
+                                    ),
+                                    ToastKind::Success,
+                                );
+                                self.task_start_native(task_id);
+                            }
+                            agent_task::AgentProvider::OpenCode => {
+                                self.push_toast(
+                                    format!(
+                                        "Created an isolated {provider_name} task; starting {provider_name}…"
+                                    ),
+                                    ToastKind::Success,
+                                );
+                                self.task_open_terminal(task_id);
+                            }
+                        }
                     }
                     Err(error) => self.push_toast(
                         format!("Worktree was preserved, but task registration failed: {error}"),
