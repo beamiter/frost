@@ -581,6 +581,8 @@ command_correction_enabled = false
 # OpenCode/Kimi，创建独立 Git worktree 任务；Codex/Claude 可选原生会话，
 # OpenCode/Kimi 走 PTY。与云端 AI 授权相互独立。
 experimental_task_sidebar = false
+# Create task 优先推荐的 provider（codex / claude / opencode / kimi）
+preferred_agent_provider = "codex"
 ```
 
 ### 失败命令的评审式纠正

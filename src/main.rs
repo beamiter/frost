@@ -3137,6 +3137,7 @@ enum Message {
     SetAiRedactSecrets(bool),
     SetAiShareCommandContext(bool),
     SetExperimentalTaskSidebar(bool),
+    SetPreferredAgentProvider(String),
     SetAiStream(bool),
     SetAiKeyFile(String),
     SetAiKeyDraft(String),
@@ -13005,6 +13006,12 @@ impl Frost {
                     self.sidebar_panel = SidebarPanel::Tabs;
                 }
             }
+            Message::SetPreferredAgentProvider(provider) => {
+                if let Some(parsed) = agent_task::AgentProvider::from_config_value(&provider) {
+                    self.config.preferred_agent_provider = parsed.config_value().to_string();
+                    self.config_dirty = true;
+                }
+            }
             Message::SetAiStream(stream) => {
                 self.config.ai_stream = stream;
                 self.config_dirty = true;
@@ -20343,10 +20350,25 @@ impl Frost {
             compact,
             "Tasks",
             checkbox(self.config.experimental_task_sidebar)
-                .label("Experimental Tasks dashboard (Codex worktrees)")
+                .label("Experimental Tasks dashboard (Codex/Claude/OpenCode/Kimi)")
                 .text_size(13)
                 .on_toggle(Message::SetExperimentalTaskSidebar)
                 .into(),
+        );
+        let preferred_agent_choices: Vec<String> = agent_task::AgentProvider::ALL
+            .iter()
+            .map(|provider| provider.config_value().to_string())
+            .collect();
+        let preferred_agent_row = responsive_control_row(
+            compact,
+            "Preferred Agent",
+            pick_list(
+                preferred_agent_choices,
+                Some(self.config.preferred_agent_provider.clone()),
+                Message::SetPreferredAgentProvider,
+            )
+            .text_size(13)
+            .into(),
         );
         let agent_turns_row = responsive_slider_row(
             compact,
@@ -20544,6 +20566,7 @@ impl Frost {
             ai_share_row,
             ai_correction_row,
             task_sidebar_row,
+            preferred_agent_row,
             agent_turns_row,
             remote_hosts_section,
             buttons,
@@ -21704,6 +21727,8 @@ impl Frost {
             return;
         };
         let provider_name = provider.display_name();
+        self.config.preferred_agent_provider = provider.config_value().to_string();
+        self.config_dirty = true;
         match agent_task_ui::begin_worktree_creation(context, provider) {
             Ok(pending) => {
                 self.task_panel.pending_creation = Some(pending);
@@ -22166,11 +22191,27 @@ impl Frost {
                 .size(11)
                 .style(text::secondary),
             );
-            let mut providers = row![].spacing(6);
+            let preferred = agent_task::AgentProvider::from_config_value(
+                &self.config.preferred_agent_provider,
+            )
+            .unwrap_or(agent_task::AgentProvider::Codex);
+            let mut ordered = Vec::with_capacity(agent_task::AgentProvider::ALL.len());
+            ordered.push(preferred);
             for provider in agent_task::AgentProvider::ALL {
+                if provider != preferred {
+                    ordered.push(provider);
+                }
+            }
+            let mut providers = row![].spacing(6);
+            for (index, provider) in ordered.into_iter().enumerate() {
+                let style = if index == 0 {
+                    button::primary
+                } else {
+                    button::secondary
+                };
                 providers = providers.push(
                     button(text(provider.display_name()).size(11))
-                        .style(button::primary)
+                        .style(style)
                         .on_press(Message::TaskCreateWithProvider(provider)),
                 );
             }

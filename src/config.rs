@@ -192,6 +192,11 @@ pub struct Config {
     #[serde(default)]
     pub experimental_task_sidebar: bool,
 
+    /// Preferred coding-agent CLI for Create task / quick-launch hints
+    /// (`codex`, `claude`, `opencode`, or `kimi`).
+    #[serde(default = "default_preferred_agent_provider")]
+    pub preferred_agent_provider: String,
+
     #[serde(default = "default_font_size")]
     pub font_size: f32,
 
@@ -358,6 +363,10 @@ fn default_ai_base_url() -> String {
 
 fn default_ai_model() -> String {
     "claude-sonnet-4-6".to_string()
+}
+
+fn default_preferred_agent_provider() -> String {
+    "codex".to_string()
 }
 
 fn default_ai_max_tokens() -> u32 {
@@ -621,6 +630,7 @@ impl Default for Config {
             ai_share_command_context: false,
             command_correction_enabled: false,
             experimental_task_sidebar: false,
+            preferred_agent_provider: default_preferred_agent_provider(),
             font_size: default_font_size(),
             font_family: default_font_family(),
             font_weight: default_font_weight(),
@@ -705,6 +715,12 @@ impl Config {
             default_ai_base_url,
         );
         self.ai_model = normalized_text_or(self.ai_model, MAX_CONFIG_NAME_BYTES, default_ai_model);
+        self.preferred_agent_provider = jterm_core::agent_task::AgentProvider::from_config_value(
+            &self.preferred_agent_provider,
+        )
+        .unwrap_or(jterm_core::agent_task::AgentProvider::Codex)
+        .config_value()
+        .to_string();
         self.ai_api_key_file =
             normalized_optional_text(self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES);
         self.font_family = self.font_family.trim().to_string();
@@ -1607,6 +1623,21 @@ mod tests {
         assert!(!config.experimental_task_sidebar);
         assert!(!config.ai_share_command_context);
         assert!(config.ai_redact_secrets);
+        assert_eq!(config.preferred_agent_provider, "codex");
+    }
+
+    #[test]
+    fn preferred_agent_provider_normalizes_known_values() {
+        let config = Config::from_toml(r#"preferred_agent_provider = "Kimi""#)
+            .expect("preferred agent parses")
+            .normalized();
+        assert_eq!(config.preferred_agent_provider, "kimi");
+        let junk = Config {
+            preferred_agent_provider: "nope".into(),
+            ..Config::default()
+        }
+        .normalized();
+        assert_eq!(junk.preferred_agent_provider, "codex");
     }
 
     /// Both directions of the OSC 52 clipboard boundary are refused by
