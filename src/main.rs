@@ -21727,6 +21727,11 @@ impl Frost {
             return;
         };
         let provider_name = provider.display_name();
+        if let Err(error) = provider.ensure_executable_available() {
+            self.task_panel.provider_picker = Some(context);
+            self.push_toast(error.to_string(), ToastKind::Warning);
+            return;
+        }
         self.config.preferred_agent_provider = provider.config_value().to_string();
         self.config_dirty = true;
         match agent_task_ui::begin_worktree_creation(context, provider) {
@@ -21800,28 +21805,12 @@ impl Frost {
 
     /// Open a coding-agent CLI in a fresh tab at the active pane cwd.
     fn agent_launch_in_tab(&mut self, provider: agent_task::AgentProvider) {
-        let program = provider.executable_name();
-        let Some(executable) = jterm_core::host::find_executable_in(
-            program,
-            std::env::var_os("PATH").as_deref(),
-        ) else {
-            self.push_toast(
-                format!(
-                    "{} is not on PATH (`{}` not found); {}",
-                    provider.display_name(),
-                    program,
-                    provider.install_hint()
-                ),
-                ToastKind::Warning,
-            );
-            return;
-        };
-        let Ok(executable) = std::fs::canonicalize(&executable) else {
-            self.push_toast(
-                format!("Could not resolve {}", provider.display_name()),
-                ToastKind::Warning,
-            );
-            return;
+        let executable = match provider.ensure_executable_available() {
+            Ok(path) => path,
+            Err(error) => {
+                self.push_toast(error.to_string(), ToastKind::Warning);
+                return;
+            }
         };
         let Some(argv0) = executable.to_str().map(str::to_owned) else {
             self.push_toast(
