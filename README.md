@@ -632,7 +632,9 @@ Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡�
   **Open Codex** 走普通 PTY。原生路径细节见下方。
 - **Claude**：**Start Claude** 走实验性 print/`stream-json` 原生驱动（同样需要上述 AI 授权，
   无 Codex 级 private home / cgroup）；失败时可 **Open Claude** 回退到 PTY。
-- **OpenCode / Kimi**：**Start …** 与 **Open …** 都走 PATH 上的 CLI（PTY 兼容路径）。
+- **Kimi**：**Start Kimi** 同样走实验性 print/`stream-json` 原生驱动（授权与隔离边界同 Claude）；
+  失败时可 **Open Kimi** 回退到 PTY。
+- **OpenCode**：**Start …** 与 **Open …** 都走 PATH 上的 CLI（PTY 兼容路径）。
 
 也可随时从命令面板（`Ctrl+Shift+P`）用 **Open Codex/Claude/OpenCode/Kimi in new tab**
 在当前 pane 的工作目录新开对应 CLI（不依赖 Tasks 实验开关；命令 id 为

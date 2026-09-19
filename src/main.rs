@@ -21780,7 +21780,10 @@ impl Frost {
             agent_task::AgentProvider::Claude => self
                 .agent_runtime
                 .start_claude(&mut self.task_manager, task_id, policy),
-            agent_task::AgentProvider::OpenCode | agent_task::AgentProvider::Kimi => {
+            agent_task::AgentProvider::Kimi => self
+                .agent_runtime
+                .start_kimi(&mut self.task_manager, task_id, policy),
+            agent_task::AgentProvider::OpenCode => {
                 self.task_open_terminal(task_id);
                 return;
             }
@@ -22472,7 +22475,7 @@ impl Frost {
         }
 
         // Review feedback starts another sequential turn on the live native
-        // Codex session (Claude MVP is one-shot print mode).
+        // Codex session (Claude/Kimi MVP is one-shot print mode).
         if running
             && stream_active
             && task.status == TaskStatus::ReadyForReview

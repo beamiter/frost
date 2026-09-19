@@ -20,7 +20,7 @@ iced = { version = "0.14", features = ["canvas", "tokio", "advanced", "image", "
 cosmic-text = "0.15"
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "ce4cf8a46efbfcffd50366303e55c7f87d0c1a04" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "32f69844b34d829696290cd469289a3820c226a3" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"
