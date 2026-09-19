@@ -728,3 +728,36 @@ Round 70 closes the remaining argument-form affordance gap:
      `--session` identity handed to the one PTY spawn are pinned structurally,
      in the style of `the_process_has_exactly_one_exit_and_it_flushes_first`,
      because none of them is observable after the fact.
+
+Agent-TUI fidelity and family parity adds rounds 118–129 (2026-09-19). Real
+Claude Code, Codex and Kimi Code sessions recorded through a live emulator
+were replayed into frost and into libvte 0.76; screen text matched libvte
+everywhere except a resize, and an audit against ember found the rest.
+
+118. **Wide over wide keeps its pair** — writing a double-width character
+     whose right half lands on another wide lead orphaned that neighbour's
+     continuation, so a later write blanked the new glyph's right half (CJK
+     redraws in Claude Code shifted by one column). `put_char` now splits the
+     pairs around the write, as ember does.
+119. **IRM shifts respect wide pairs** — insert mode no longer leaves a lead
+     without its continuation at the cut or the row end.
+120. **Shrinking a pane drops blank rows first** — a height shrink evicted
+     the rows above the cursor into scrollback and jumped the prompt to the
+     top even with blank rows below; blank rows below the cursor now go first.
+121. **Colour queries report the theme** — OSC 10/11/12 and OSC 4 (0–15)
+     answered hard-coded white/black; frost now pushes the active theme into
+     every session, and explicit OSC sets still win.
+122. **Replies use the query's terminator** — BEL-terminated OSC queries get
+     BEL-terminated replies, including OSC 52 and 5522 status replies.
+123. **DSR 996 and mode 2031 notifications** — `CSI ? 996 n` reports
+     dark/light, and a theme flip sends the same report to mode 2031
+     subscribers unprompted.
+124. **DECXCPR keeps its marker** — `CSI ? 6 n` answers `CSI ? r ; c R`.
+125. **XTWINOPS 16t** — the cell size in pixels, which Claude Code requests.
+126. **ANSI-mode DECRQM** — IRM (4) and LNM (20) are answered alongside the
+     private-mode table.
+127. **VT and FF feed lines** — they act as LF instead of being dropped.
+128. **Three-byte escapes are consumed whole** — `ESC % G`, `ESC * B`,
+     `ESC # 3` no longer leak their final byte, including across reads.
+129. **Formatting gate** — rustfmt-only fixes to this evening's agent-task
+     code, which left `cargo fmt --check` failing on master.

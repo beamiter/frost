@@ -117,6 +117,27 @@ pub const MAX_TERMINAL_COLS: usize = 1024;
 pub const MAX_TERMINAL_ROWS: usize = 512;
 pub type DynamicColorPalette = [Option<(u8, u8, u8)>; 256];
 
+/// String Terminator (`ESC \`) and BEL: the two ways an OSC packet ends.
+const OSC_ST: &[u8] = b"\x1b\\";
+const OSC_BEL: &[u8] = b"\x07";
+
+/// Default foreground, background and cursor colours of the host theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DefaultColors {
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
+    cursor: (u8, u8, u8),
+}
+
+impl DefaultColors {
+    /// What colour queries reported before the host pushes its theme in.
+    const FALLBACK: Self = Self {
+        fg: (255, 255, 255),
+        bg: (0, 0, 0),
+        cursor: (255, 255, 255),
+    };
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Osc8Hyperlink {
     uri: String,
@@ -3208,6 +3229,22 @@ pub struct TerminalState {
     pub dynamic_bg: Option<(u8, u8, u8)>,
     pub dynamic_cursor_color: Option<(u8, u8, u8)>,
     pub dynamic_palette: DynamicColorPalette,
+    /// The host theme's default foreground, background and cursor colours,
+    /// pushed in by [`Self::set_default_colors`]. Colour queries report these
+    /// until an explicit OSC 10/11/12 set overrides them; a reply of fixed
+    /// white-on-black made light-theme users look dark to every app that
+    /// picks its palette from OSC 11.
+    theme_default_colors: DefaultColors,
+    /// The host theme's 16 ANSI colours, answered by OSC 4 queries for indexes
+    /// that no OSC 4 set has overridden. `None` falls back to xterm's table.
+    theme_ansi_colors: Option<[(u8, u8, u8); 16]>,
+    /// Terminator of the OSC packet being dispatched. xterm and VTE answer a
+    /// query with the terminator it arrived with, and clients that wait for a
+    /// BEL-terminated reply (they sent BEL) time out on an ST one.
+    osc_reply_terminator: &'static [u8],
+    /// Terminator of the pending OSC 52 query, whose answer is written later
+    /// by [`Self::respond_osc52_clipboard`].
+    osc52_query_terminator: &'static [u8],
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,
@@ -3482,6 +3519,10 @@ impl TerminalState {
             dynamic_bg: None,
             dynamic_cursor_color: None,
             dynamic_palette: [None; 256],
+            theme_default_colors: DefaultColors::FALLBACK,
+            theme_ansi_colors: None,
+            osc_reply_terminator: OSC_ST,
+            osc52_query_terminator: OSC_ST,
             pending_notifications: Vec::new(),
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
@@ -3504,8 +3545,48 @@ impl TerminalState {
         String::from_utf8(bytes).ok()
     }
 
+    /// Terminator for unsolicited OSC output (no query to echo).
     fn osc_terminator() -> &'static [u8] {
-        b"\x1b\\"
+        OSC_ST
+    }
+
+    /// Adopt the host theme's default colours. Called when a session is
+    /// created and whenever the theme changes, so OSC 10/11/12 queries and the
+    /// `CSI ? 996 n` colour-scheme report describe what is actually on screen.
+    /// Explicit OSC 10/11/12 sets are kept apart and still win.
+    pub fn set_default_colors(&mut self, fg: (u8, u8, u8), bg: (u8, u8, u8), cursor: (u8, u8, u8)) {
+        let was_dark = self.default_background_is_dark();
+        self.theme_default_colors = DefaultColors { fg, bg, cursor };
+        // Mode 2031 subscribers (Claude Code, neovim) learn about a dark/light
+        // flip unprompted, with the same report DSR 996 answers. The caller
+        // flushes it: nothing else drains the buffer while the PTY is quiet.
+        let is_dark = self.default_background_is_dark();
+        if self.modes.contains(&2031) && is_dark != was_dark {
+            let report: &[u8] = if is_dark {
+                b"\x1b[?997;1n"
+            } else {
+                b"\x1b[?997;2n"
+            };
+            self.output_buffer.extend_from_slice(report);
+        }
+    }
+
+    /// Adopt the host theme's 16 ANSI colours for OSC 4 queries.
+    pub fn set_ansi_colors(&mut self, colors: [(u8, u8, u8); 16]) {
+        self.theme_ansi_colors = Some(colors);
+    }
+
+    /// Effective default background: an OSC 11 set, else the theme's.
+    fn effective_default_bg(&self) -> (u8, u8, u8) {
+        self.dynamic_bg.unwrap_or(self.theme_default_colors.bg)
+    }
+
+    /// Whether the effective default background reads as dark, judged by its
+    /// relative luminance (ITU-R BT.709 weights) against the midpoint.
+    fn default_background_is_dark(&self) -> bool {
+        let (r, g, b) = self.effective_default_bg();
+        let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+        luma < 128.0
     }
 
     fn append_osc_5522_status(&mut self, metadata: &str, payload: Option<&str>) {
@@ -3515,29 +3596,34 @@ impl TerminalState {
             self.output_buffer.extend_from_slice(b";");
             self.output_buffer.extend_from_slice(payload.as_bytes());
         }
-        self.output_buffer.extend_from_slice(Self::osc_terminator());
+        self.output_buffer
+            .extend_from_slice(self.osc_reply_terminator);
     }
 
     fn append_osc_color_response(&mut self, command: &str, color: (u8, u8, u8)) {
         let response = format!(
-            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
             command,
             (color.0 as u16) * 257,
             (color.1 as u16) * 257,
             (color.2 as u16) * 257,
         );
         self.output_buffer.extend_from_slice(response.as_bytes());
+        self.output_buffer
+            .extend_from_slice(self.osc_reply_terminator);
     }
 
     fn append_osc_palette_response(&mut self, idx: u8, color: (u8, u8, u8)) {
         let response = format!(
-            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}",
             idx,
             (color.0 as u16) * 257,
             (color.1 as u16) * 257,
             (color.2 as u16) * 257,
         );
         self.output_buffer.extend_from_slice(response.as_bytes());
+        self.output_buffer
+            .extend_from_slice(self.osc_reply_terminator);
     }
 
     fn default_256_color(idx: u8) -> (u8, u8, u8) {
@@ -3580,9 +3666,11 @@ impl TerminalState {
         if value == "?" {
             // Query: respond with current color
             let color = match command {
-                "10" => self.dynamic_fg.unwrap_or((255, 255, 255)),
-                "11" => self.dynamic_bg.unwrap_or((0, 0, 0)),
-                "12" => self.dynamic_cursor_color.unwrap_or((255, 255, 255)),
+                "10" => self.dynamic_fg.unwrap_or(self.theme_default_colors.fg),
+                "11" => self.effective_default_bg(),
+                "12" => self
+                    .dynamic_cursor_color
+                    .unwrap_or(self.theme_default_colors.cursor),
                 _ => return,
             };
             self.append_osc_color_response(command, color);
@@ -3714,7 +3802,11 @@ impl TerminalState {
                 continue;
             };
             if color_s == "?" {
+                let theme = self
+                    .theme_ansi_colors
+                    .and_then(|ansi| ansi.get(idx as usize).copied());
                 let color = self.dynamic_palette[idx as usize]
+                    .or(theme)
                     .unwrap_or_else(|| Self::default_256_color(idx));
                 self.append_osc_palette_response(idx, color);
             } else if let Some(rgb) = Self::parse_color_spec(color_s) {
@@ -4167,7 +4259,8 @@ impl TerminalState {
     /// Dispatch a completed OSC payload (`ESC ]` and the BEL/ST terminator
     /// already stripped), shared by the in-buffer parse and the fragmented
     /// `pending_osc` resume path.
-    fn handle_osc_payload(&mut self, payload_bytes: &[u8]) {
+    fn handle_osc_payload(&mut self, payload_bytes: &[u8], terminator: &'static [u8]) {
+        self.osc_reply_terminator = terminator;
         if let Ok(payload) = std::str::from_utf8(payload_bytes) {
             let (command, value) = payload.split_once(';').unwrap_or((payload, ""));
             if !command.is_empty() {
@@ -6243,6 +6336,7 @@ impl TerminalState {
             if data == "?" {
                 // Query: signal main loop to read clipboard and respond
                 self.pending_osc52_clipboard_query = true;
+                self.osc52_query_terminator = self.osc_reply_terminator;
             } else if !data.is_empty() {
                 if data.len() > OSC52_MAX_BYTES.saturating_mul(4) / 3 + 8 {
                     // Reject before even attempting to decode.
@@ -6364,6 +6458,23 @@ impl TerminalState {
                     2
                 }
             }
+            _ => 0,
+        }
+    }
+
+    /// DECRQM state of an ANSI (non-private) mode: IRM is the only one
+    /// frost switches; LNM is answered as permanently reset (4) because a
+    /// line feed here never implies a carriage return.
+    fn decrqm_ansi_mode_state(&self, mode: u16) -> u8 {
+        match mode {
+            4 => {
+                if self.modes.contains(&4) {
+                    1
+                } else {
+                    2
+                }
+            }
+            20 => 4,
             _ => 0,
         }
     }
@@ -6567,6 +6678,14 @@ impl TerminalState {
                 );
                 self.output_buffer.extend_from_slice(response.as_bytes());
             }
+            // Report character cell size in pixels. The text area is laid
+            // out as whole cells, so the cell is that area over the grid.
+            16 => {
+                let cell_h = Self::cell_pixels(self.viewport_pixel_height, rows);
+                let cell_w = Self::cell_pixels(self.viewport_pixel_width, cols);
+                let response = format!("\x1b[6;{};{}t", cell_h, cell_w);
+                self.output_buffer.extend_from_slice(response.as_bytes());
+            }
             // Report text area size in characters.
             18 => {
                 let response = format!("\x1b[8;{};{}t", rows, cols);
@@ -6594,6 +6713,12 @@ impl TerminalState {
             23 => self.restore_titles(params.get(1).copied().unwrap_or(0)),
             _ => {}
         }
+    }
+
+    /// One cell's pixel extent along an axis of `pixels` split into `cells`.
+    fn cell_pixels(pixels: u32, cells: usize) -> u32 {
+        let cells = u32::try_from(cells.max(1)).unwrap_or(u32::MAX);
+        pixels.saturating_add(cells / 2) / cells
     }
 
     /// Advance to the start of the next line, honoring the DECSTBM scroll region.
@@ -6637,6 +6762,10 @@ impl TerminalState {
         if count == 0 || col >= cols {
             return;
         }
+        // A pair straddling `col` would come out `count` columns apart, and a
+        // lead pushed into the last column loses its continuation off the end;
+        // both halves go, exactly as ICH does.
+        self.blank_wide_pair_at(row, col);
         let blank = self.create_blank_cell();
         let line = &mut self.grid[row];
         if col + count < cols {
@@ -6645,6 +6774,7 @@ impl TerminalState {
         for cell in &mut line[col..(col + count).min(cols)] {
             *cell = blank;
         }
+        self.blank_dangling_wide_at_row_end(row);
         self.mark_row_dirty(row);
     }
 
@@ -6831,23 +6961,13 @@ impl TerminalState {
             self.shift_cells_right(self.cursor_row, self.cursor_col, width);
         }
 
-        // If current position has a continuation cell to its left, clear the wide character
-        if self.cursor_col > 0
-            && self
-                .grid
-                .get(self.cursor_row, self.cursor_col)
-                .flags
-                .wide_continuation()
-        {
-            *self.grid.get_mut(self.cursor_row, self.cursor_col - 1) = blank_cell;
-        }
-
-        // If current position has a wide character, clear its continuation cell
-        if self.grid.get(self.cursor_row, self.cursor_col).flags.wide()
-            && self.cursor_col + 1 < cols
-        {
-            *self.grid.get_mut(self.cursor_row, self.cursor_col + 1) = blank_cell;
-        }
+        // Overwriting either half of a double-width character must clear the
+        // other half. `width` covers both the cell written and, for a wide
+        // character, the cell claimed as its own continuation below: landing
+        // that continuation on somebody else's lead orphans *its* continuation
+        // one column further right, and a later write there would then blank
+        // this character's continuation while "repairing" the stale pair.
+        self.split_wide_pairs_around(self.cursor_row, self.cursor_col, self.cursor_col + width);
 
         // Write character
         let cell = self.grid.get_mut(self.cursor_row, self.cursor_col);
@@ -6979,6 +7099,27 @@ impl TerminalState {
             if col < cols {
                 *self.grid.get_mut(row, col) = blank;
             }
+        }
+    }
+
+    /// Blank the double-width halves that overwriting `start..end` orphans.
+    ///
+    /// Only the two edges of the span can have a partner outside it: a lead at
+    /// `start - 1` whose continuation is about to go, and a continuation at
+    /// `end` whose lead is about to go. Ported from ember
+    /// `src/terminal/state.rs::split_wide_pairs_around`.
+    fn split_wide_pairs_around(&mut self, row: usize, start: usize, end: usize) {
+        let cols = self.grid.row_len();
+        if row >= self.grid.rows() || start >= end || start >= cols {
+            return;
+        }
+        let end = end.min(cols);
+        let blank = self.create_blank_cell();
+        if start > 0 && self.grid.get(row, start - 1).flags.wide() {
+            *self.grid.get_mut(row, start - 1) = blank;
+        }
+        if end < cols && self.grid.get(row, end).flags.wide_continuation() {
+            *self.grid.get_mut(row, end) = blank;
         }
     }
 
@@ -7270,6 +7411,35 @@ impl TerminalState {
         }
     }
 
+    /// Dispatch a complete nF escape (`ESC <intermediates> <final>`).
+    fn handle_nf_escape(&mut self, intermediates: &[u8], final_byte: u8) {
+        match (intermediates, final_byte) {
+            // DECALN: fill the screen with 'E'.
+            (b"#", b'8') => self.decaln(),
+            // G0/G1 designation. Multi-byte designators (`ESC ( % 5`) and
+            // G2/G3 (`ESC *`, `ESC +`) name sets frost does not carry, so they
+            // are consumed without changing anything.
+            (b"(" | b")", designator) => {
+                let is_g0 = intermediates == b"(";
+                let charset = Self::charset_from_designator(designator);
+                crate::debug_log!(
+                    "[CHARSET] ESC {} designator={} (0x{:02x}) charset={:?}",
+                    if is_g0 { '(' } else { ')' },
+                    designator as char,
+                    designator,
+                    charset
+                );
+                if is_g0 {
+                    self.g0_charset = charset;
+                    self.active_charset = self.g0_charset;
+                } else {
+                    self.g1_charset = charset;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn charset_from_designator(byte: u8) -> Charset {
         match byte {
             b'0' => Charset::DecSpecialGraphics,
@@ -7371,7 +7541,8 @@ impl TerminalState {
         let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
         self.output_buffer.extend_from_slice(b"\x1b]52;c;");
         self.output_buffer.extend_from_slice(encoded.as_bytes());
-        self.output_buffer.extend_from_slice(Self::osc_terminator());
+        self.output_buffer
+            .extend_from_slice(self.osc52_query_terminator);
     }
 
     /// Feed one APC-G payload to the graphics state and write back whatever the
@@ -7600,7 +7771,12 @@ impl TerminalState {
             self.pending_osc.extend_from_slice(&input[..consumed]);
             let packet = std::mem::take(&mut self.pending_osc);
             self.pending_osc_scan_from = 0;
-            self.handle_osc_payload(&packet[2..payload_end]);
+            let terminator = if packet.last() == Some(&0x07) {
+                OSC_BEL
+            } else {
+                OSC_ST
+            };
+            self.handle_osc_payload(&packet[2..payload_end], terminator);
             if capture_idle_background && self.idle_background_capture_active() {
                 self.append_idle_background_bytes(&packet);
             }
@@ -7842,8 +8018,10 @@ impl TerminalState {
                     // DEL (0x7f) is a fill/padding character; xterm ignores it.
                     i += 1;
                 }
-                b'\n' => {
-                    // Linefeed - move cursor down or scroll the region.
+                b'\n' | b'\x0b' | b'\x0c' => {
+                    // Linefeed - move cursor down or scroll the region. VT and
+                    // FF are executed as LF, as in xterm and VTE (and as the
+                    // CSI parser below already does for them).
                     self.pending_wrap = false;
                     self.index();
                     i += 1;
@@ -7921,15 +8099,6 @@ impl TerminalState {
                             self.full_reset();
                             i += 2;
                         }
-                        b'#' => {
-                            // DEC private: ESC # 8 = DECALN (fill screen with 'E')
-                            if i + 2 < data_slice.len() && data_slice[i + 2] == b'8' {
-                                self.decaln();
-                                i += 3;
-                            } else {
-                                i += 2;
-                            }
-                        }
                         b']' => {
                             i += 2;
 
@@ -7961,13 +8130,16 @@ impl TerminalState {
                                 break;
                             }
 
-                            let payload_end = if data_slice[i - 1] == 0x07 {
-                                i - 1
+                            let (payload_end, terminator) = if data_slice[i - 1] == 0x07 {
+                                (i - 1, OSC_BEL)
                             } else {
-                                i - 2
+                                (i - 2, OSC_ST)
                             };
                             if payload_end >= payload_start {
-                                self.handle_osc_payload(&data_slice[payload_start..payload_end]);
+                                self.handle_osc_payload(
+                                    &data_slice[payload_start..payload_end],
+                                    terminator,
+                                );
                             }
                         }
                         b'P' | b'X' | b'^' | b'_' => {
@@ -8029,35 +8201,31 @@ impl TerminalState {
                             self.modes.insert(66);
                             i += 2;
                         }
-                        b'(' | b')' => {
-                            if i + 2 >= data_slice.len() {
+                        0x20..=0x2f => {
+                            // nF escape: ESC, one or more intermediates
+                            // (0x20..=0x2f), then one final byte. The whole
+                            // sequence is consumed even when frost does not
+                            // implement it; stopping after two bytes printed
+                            // the final as text (`ESC % G` left a "G").
+                            let mut end = i + 1;
+                            while end < data_slice.len() && (0x20..=0x2f).contains(&data_slice[end])
+                            {
+                                end += 1;
+                            }
+                            if end >= data_slice.len() {
                                 self.pending_escape
                                     .extend_from_slice(&data_slice[esc_start..]);
                                 break;
                             }
-
-                            // Character set selection: ESC ( X or ESC ) X
-                            // data_slice[i] = ESC, data_slice[i+1] = '(' or ')', data_slice[i+2] = designator
-                            let is_g0 = data_slice[i + 1] == b'(';
-                            let designator = data_slice[i + 2];
-                            let charset = Self::charset_from_designator(designator);
-
-                            crate::debug_log!(
-                                "[CHARSET] ESC {} designator={} (0x{:02x}) charset={:?}",
-                                if is_g0 { '(' } else { ')' },
-                                designator as char,
-                                designator,
-                                charset
-                            );
-
-                            if is_g0 {
-                                self.g0_charset = charset;
-                                self.active_charset = self.g0_charset;
+                            let final_byte = data_slice[end];
+                            if (0x30..=0x7e).contains(&final_byte) {
+                                self.handle_nf_escape(&data_slice[i + 1..end], final_byte);
+                                i = end + 1;
                             } else {
-                                self.g1_charset = charset;
+                                // A control or 8-bit byte aborts the sequence;
+                                // leave it for the outer loop to execute.
+                                i = end;
                             }
-
-                            i += 3;
                         }
                         b'[' => {
                             i += 2;
@@ -8634,7 +8802,34 @@ impl TerminalState {
                     self.handle_window_ops(params);
                 }
             }
-            'n' => {
+            'n' if private_prefix == Some(b'?') && intermediates.is_empty() => {
+                // DEC-private DSR.
+                match params.first().copied().unwrap_or(0) {
+                    6 => {
+                        // DECXCPR: the same position as CPR, but the reply
+                        // keeps the `?` so it cannot be mistaken for a
+                        // modified F3 key (`CSI 1 ; Pm R`).
+                        let row = self.cursor_row + 1;
+                        let col = self.cursor_col + 1;
+                        let response = format!("\x1b[?{};{}R", row, col);
+                        self.output_buffer.extend(response.as_bytes());
+                    }
+                    996 => {
+                        // Colour-scheme query (the report mode 2031 sends
+                        // unprompted): 1 = dark, 2 = light, judged from the
+                        // background actually painted behind default cells.
+                        let scheme = if self.default_background_is_dark() {
+                            1
+                        } else {
+                            2
+                        };
+                        let response = format!("\x1b[?997;{}n", scheme);
+                        self.output_buffer.extend(response.as_bytes());
+                    }
+                    _ => {}
+                }
+            }
+            'n' if private_prefix.is_none() && intermediates.is_empty() => {
                 // DSR - Device Status Report
                 match params.first().copied().unwrap_or(0) {
                     5 => {
@@ -8675,6 +8870,13 @@ impl TerminalState {
                 } else if private_prefix == Some(b'?') && intermediates == *b"$" {
                     for &mode in params {
                         self.report_private_mode_status(mode);
+                    }
+                } else if private_prefix.is_none() && intermediates == *b"$" {
+                    // DECRQM for ANSI modes: `CSI Pa ; Ps $ y`, no `?`.
+                    for &mode in params {
+                        let state = self.decrqm_ansi_mode_state(mode);
+                        let response = format!("\x1b[{};{}$y", mode, state);
+                        self.output_buffer.extend_from_slice(response.as_bytes());
                     }
                 }
             }
@@ -12285,9 +12487,17 @@ impl TerminalState {
         // on-screen. (Column reflow on width change is not done here.)
         if !self.use_alt_buffer && old_rows > rows {
             let to_remove = old_rows - rows;
-            // Take as many rows off the top as possible without scrolling the
-            // cursor above row 0; any remainder is truncated from the bottom.
-            let top_remove = to_remove.min(self.cursor_row);
+            // Blank rows below the cursor go first, as in xterm, VTE and
+            // alacritty: a prompt near the top of a mostly empty pane must not
+            // be scrolled up into history (which a later grow never restores)
+            // just because a split took some of its height.
+            let blank_below = (self.cursor_row + 1..old_rows)
+                .rev()
+                .take_while(|&r| Self::strip_trailing_blanks(&self.grid[r]).is_empty())
+                .count();
+            // Then take as many rows off the top as possible without scrolling
+            // the cursor above row 0; any remainder is truncated from the bottom.
+            let top_remove = to_remove.saturating_sub(blank_below).min(self.cursor_row);
             if top_remove > 0 {
                 let cols_now = self.grid.row_len();
                 for r in 0..top_remove {
@@ -19984,5 +20194,217 @@ mod tests {
         let mut terminal = terminal_at_prompt(32, 4, "echo hello");
         terminal.process_input(b"\x1b[?1h");
         assert_eq!(terminal.click_cursor_move(0, 11, true), b"\x1bOD".to_vec());
+    }
+
+    /// Every wide lead must own the continuation beside it, and every
+    /// continuation must follow a lead: the renderer relies on both.
+    fn assert_wide_pairs_intact(terminal: &TerminalState, row: usize) {
+        let cols = terminal.grid.row_len();
+        for col in 0..cols {
+            let cell = terminal.grid.get(row, col);
+            if cell.flags.wide() {
+                assert!(
+                    col + 1 < cols && terminal.grid.get(row, col + 1).flags.wide_continuation(),
+                    "lead at {col} lost its continuation"
+                );
+            }
+            if cell.flags.wide_continuation() {
+                assert!(
+                    col > 0 && terminal.grid.get(row, col - 1).flags.wide(),
+                    "continuation at {col} lost its lead"
+                );
+            }
+        }
+    }
+
+    /// A wide character whose continuation lands on another wide character's
+    /// lead used to leave that neighbour's continuation behind; the next
+    /// character written there then "repaired" the stale pair by blanking the
+    /// new character's own continuation.
+    #[test]
+    fn wide_char_over_a_shifted_wide_pair_keeps_its_continuation() {
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.process_input("中文\r 中文".as_bytes());
+
+        let lead = terminal.grid.get(0, 1);
+        assert_eq!(lead.character, '中');
+        assert!(lead.flags.wide());
+        assert!(terminal.grid.get(0, 2).flags.wide_continuation());
+        assert_eq!(terminal.grid.get(0, 3).character, '文');
+        assert_wide_pairs_intact(&terminal, 0);
+    }
+
+    /// IRM shifts the row one cell per character; a pair cut by the shift
+    /// has to go as a whole, like ICH.
+    #[test]
+    fn insert_mode_does_not_split_a_double_width_pair() {
+        let mut terminal = TerminalState::new(10, 2);
+        terminal.process_input("ab中cd".as_bytes());
+
+        // Insert with the cursor on the continuation half of 中.
+        terminal.process_input(b"\x1b[1;4H\x1b[4hX");
+
+        assert_eq!(terminal.grid.get(0, 3).character, 'X');
+        assert_wide_pairs_intact(&terminal, 0);
+    }
+
+    #[test]
+    fn vertical_tab_and_form_feed_act_as_line_feed() {
+        let mut terminal = TerminalState::new(10, 4);
+        terminal.process_input(b"a\x0bb\x0cc\x00");
+
+        assert_eq!(terminal.grid.get(0, 0).character, 'a');
+        assert_eq!(terminal.grid.get(1, 1).character, 'b');
+        assert_eq!(terminal.grid.get(2, 2).character, 'c');
+        assert_eq!(terminal.get_cursor_pos(), (2, 3));
+    }
+
+    /// `ESC <intermediates> <final>` is one sequence however many bytes it
+    /// takes; stopping after two printed the final as text.
+    #[test]
+    fn three_byte_escapes_are_consumed_whole() {
+        let mut terminal = TerminalState::new(20, 2);
+        terminal.process_input(b"a\x1b%Gb\x1b*Bc\x1b#3d\x1b(%5e\x1b");
+        terminal.process_input(b" ");
+        terminal.process_input(b"Ff");
+
+        let row: String = (0..6).map(|c| terminal.grid.get(0, c).character).collect();
+        assert_eq!(row, "abcdef");
+
+        // Designations frost implements still switch the character set.
+        terminal.process_input(b"\x1b(0q\x1b(Bq");
+        assert_eq!(terminal.grid.get(0, 6).character, '─');
+        assert_eq!(terminal.grid.get(0, 7).character, 'q');
+    }
+
+    #[test]
+    fn decxcpr_keeps_the_private_marker() {
+        let mut terminal = TerminalState::new(20, 5);
+        terminal.process_input(b"\x1b[3;7H\x1b[?6n\x1b[6n");
+
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b[?3;7R\x1b[3;7R"
+        );
+    }
+
+    /// Kimi Code picks its palette from `CSI ? 996 n`.
+    /// Mode 2031 subscribers get the DSR 996 report unprompted on a
+    /// dark/light flip of the theme background, and only then.
+    #[test]
+    fn mode_2031_reports_a_theme_flip_unprompted() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(b"\x1b[?2031h");
+        let _ = terminal.get_output();
+        terminal.set_default_colors((0xdd, 0xdd, 0xdd), (0x10, 0x10, 0x10), (0xff, 0xff, 0xff));
+        assert!(terminal.get_output().is_empty());
+        terminal.set_default_colors((0x20, 0x20, 0x20), (0xf5, 0xf5, 0xf0), (0, 0, 0));
+        assert_eq!(terminal.get_output(), b"\x1b[?997;2n");
+        terminal.set_default_colors((0x20, 0x20, 0x20), (0xf5, 0xf5, 0xf0), (0, 0, 0));
+        assert!(terminal.get_output().is_empty());
+        terminal.process_input(b"\x1b[?2031l");
+        terminal.set_default_colors((0xdd, 0xdd, 0xdd), (0x10, 0x10, 0x10), (0xff, 0xff, 0xff));
+        assert!(terminal.get_output().is_empty());
+    }
+
+    #[test]
+    fn colour_scheme_query_follows_the_default_background() {
+        let mut terminal = TerminalState::new(20, 5);
+        terminal.process_input(b"\x1b[?996n");
+        assert_eq!(terminal.get_output(), b"\x1b[?997;1n");
+
+        terminal.set_default_colors((0x20, 0x20, 0x20), (0xfd, 0xf6, 0xe3), (0, 0, 0));
+        terminal.process_input(b"\x1b[?996n");
+        assert_eq!(terminal.get_output(), b"\x1b[?997;2n");
+
+        // An app's own OSC 11 background is what is painted, so it decides.
+        terminal.process_input(b"\x1b]11;#101010\x07\x1b[?996n");
+        assert_eq!(terminal.get_output(), b"\x1b[?997;1n");
+    }
+
+    /// Colour queries report the theme, an explicit set still wins, and the
+    /// reply ends with the terminator the query used.
+    #[test]
+    fn osc_colour_queries_report_theme_colours_with_the_query_terminator() {
+        let mut terminal = TerminalState::new(20, 5);
+        terminal.set_default_colors((0x11, 0x22, 0x33), (0xfd, 0xf6, 0xe3), (0xaa, 0xbb, 0xcc));
+        let mut ansi = [(0, 0, 0); 16];
+        ansi[1] = (0xdc, 0x32, 0x2f);
+        terminal.set_ansi_colors(ansi);
+
+        terminal.process_input(b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\x1b]4;1;?\x07");
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b]10;rgb:1111/2222/3333\x07\
+             \x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\\
+             \x1b]12;rgb:aaaa/bbbb/cccc\x07\
+             \x1b]4;1;rgb:dcdc/3232/2f2f\x07"
+        );
+
+        // Fragmented across reads, the BEL still reaches the reply.
+        terminal.process_input(b"\x1b]10;#");
+        terminal.process_input(b"010203\x07\x1b]10");
+        terminal.process_input(b";?\x07");
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b]10;rgb:0101/0202/0303\x07"
+        );
+    }
+
+    #[test]
+    fn xtwinops_16_reports_cell_size_in_pixels() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.set_viewport_pixel_size(80 * 9, 24 * 18);
+        terminal.process_input(b"\x1b[16t");
+
+        assert_eq!(terminal.get_output(), b"\x1b[6;18;9t");
+    }
+
+    #[test]
+    fn decrqm_reports_implemented_modes_truthfully() {
+        let mut terminal = TerminalState::new(20, 5);
+        terminal.process_input(b"\x1b[?1004h\x1b[?2031h\x1b[?25l\x1b[4h");
+        terminal.process_input(
+            b"\x1b[?1004$p\x1b[?2031$p\x1b[?25$p\x1b[?7$p\x1b[?2004$p\x1b[?1016$p\x1b[4$p\x1b[20$p",
+        );
+
+        assert_eq!(
+            String::from_utf8(terminal.get_output()).unwrap(),
+            "\x1b[?1004;1$y\x1b[?2031;1$y\x1b[?25;2$y\x1b[?7;1$y\x1b[?2004;2$y\
+             \x1b[?1016;0$y\x1b[4;1$y\x1b[20;4$y"
+        );
+    }
+
+    /// Shrinking a mostly empty pane drops the blank rows under the prompt
+    /// instead of pushing the rows above it into history.
+    #[test]
+    fn shrinking_rows_drops_blank_rows_below_the_cursor_first() {
+        let mut terminal = TerminalState::new(60, 20);
+        terminal.process_input(b"\x1b[H\x1b[J\r\nline two\r\nline three\r\n$ ");
+        terminal.on_resize(60, 12);
+
+        let row = |t: &TerminalState, r: usize| -> String {
+            let text: String = (0..t.grid.row_len())
+                .map(|c| t.grid.get(r, c).character)
+                .collect();
+            text.trim_end().to_string()
+        };
+        assert_eq!(row(&terminal, 1), "line two");
+        assert_eq!(row(&terminal, 2), "line three");
+        assert_eq!(terminal.get_cursor_pos(), (3, 2));
+        assert_eq!(terminal.scrollback_len(), 0);
+
+        // A full screen still pushes its top rows into history and keeps the
+        // cursor row visible.
+        let mut full = TerminalState::new(60, 20);
+        for n in 0..19 {
+            full.process_input(format!("row {n}\r\n").as_bytes());
+        }
+        full.process_input(b"$ ");
+        full.on_resize(60, 12);
+        assert_eq!(full.scrollback_len(), 8);
+        assert_eq!(full.get_cursor_pos(), (11, 2));
+        assert_eq!(row(&full, 11), "$");
+        assert_eq!(row(&full, 0), "row 8");
     }
 }

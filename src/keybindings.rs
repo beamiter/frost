@@ -1231,7 +1231,10 @@ mod tests {
         assert_eq!(Command::PaneFocusLeft.to_string(), "pane:focus_left");
         assert_eq!(Command::PaneResizeDown.to_string(), "pane:resize_down");
         assert_eq!(Command::AgentLaunchCodex.to_string(), "agent:launch:codex");
-        assert_eq!(Command::AgentLaunchClaude.to_string(), "agent:launch:claude");
+        assert_eq!(
+            Command::AgentLaunchClaude.to_string(),
+            "agent:launch:claude"
+        );
         assert_eq!(
             Command::AgentLaunchOpenCode.to_string(),
             "agent:launch:opencode"

@@ -3685,6 +3685,20 @@ fn journal_lifecycle(
     )
 }
 
+/// Tell a session's emulator which colours the theme paints for its defaults
+/// and ANSI palette. OSC 10/11/12/4 queries and the `CSI ? 996 n` colour
+/// scheme report read these; the renderer takes them from the theme directly.
+fn apply_theme_colors(terminal: &mut TerminalState, theme: &Theme) {
+    let rgb = |c: [u8; 3]| (c[0], c[1], c[2]);
+    let colors = &theme.terminal;
+    terminal.set_default_colors(
+        rgb(colors.foreground),
+        rgb(colors.background),
+        rgb(colors.cursor),
+    );
+    terminal.set_ansi_colors(colors.ansi_colors.map(rgb));
+}
+
 impl Session {
     fn spawn(
         config: &Config,
@@ -4796,6 +4810,7 @@ impl Frost {
         // Re-apply the saved tabs once the sessions exist. The snapshot is
         // external input, so every index is validated before use.
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
+        app.sync_theme_colors();
         app.relayout();
         // The file tree carries a snapshot of the configured remote hosts.
         app.sidebar.set_hosts(app.config.remote_hosts.clone());
@@ -4855,6 +4870,16 @@ impl Frost {
         self.config.ui_scale.unwrap_or(1.0)
     }
 
+    /// Push the current theme's terminal colours into every session, so
+    /// colour queries answer with what is on screen after a theme change.
+    fn sync_theme_colors(&mut self) {
+        for sess in &mut self.sessions {
+            apply_theme_colors(&mut sess.terminal, &self.theme);
+            // A dark/light flip queues a mode-2031 notification.
+            sess.flush_responses();
+        }
+    }
+
     fn effective_font_size(&self) -> f32 {
         Config::clamp_font_size(self.config.font_size)
     }
@@ -4871,6 +4896,7 @@ impl Frost {
             }
         }
         self.theme = Theme::get_theme(&self.config.theme).unwrap_or_default();
+        self.sync_theme_colors();
         self.mono = resolve_mono_font(&self.config.font_family);
         self.cjk_mono = resolve_optional_font(Config::cjk_monospace_font_family());
         self.symbol_mono = resolve_optional_font(Config::symbol_monospace_font_family());
@@ -6400,6 +6426,7 @@ impl Frost {
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
                 self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
                 self.reindex_tabs_after_insert(insert);
                 // A new session opens its own tab; it is never grafted into
                 // the current tab's split.
@@ -6446,6 +6473,7 @@ impl Frost {
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
                 self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
                 self.reindex_tabs_after_insert(insert);
                 // A new session opens its own tab; it is never grafted into
                 // the current tab's split.
@@ -6886,6 +6914,7 @@ impl Frost {
                         self.next_id += 1;
                         let insert = (source + 1).min(self.sessions.len());
                         self.sessions.insert(insert, session);
+                        apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
                         self.reindex_tabs_after_insert(insert);
                         self.active_tab = tab;
                         self.open_tab_with(insert);
@@ -7513,6 +7542,9 @@ impl Frost {
                 self.session_diagnostic = None;
                 self.next_id += 1;
                 self.sessions.push(session);
+                if let Some(session) = self.sessions.last_mut() {
+                    apply_theme_colors(&mut session.terminal, &self.theme);
+                }
                 // Appending keeps every existing index valid, so no tab needs
                 // reindexing here.
                 let new_idx = self.sessions.len() - 1;
@@ -8044,7 +8076,9 @@ impl Frost {
                 }
             }
             C::AiChatToggle => self.toggle_ai_chats(),
-            C::AgentLaunchCodex => Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex)),
+            C::AgentLaunchCodex => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
+            }
             C::AgentLaunchClaude => {
                 Task::done(Message::AgentLaunch(agent_task::AgentProvider::Claude))
             }
@@ -8253,6 +8287,7 @@ impl Frost {
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
                 self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
                 self.reindex_tabs_after_insert(insert);
                 // A remote session opens its own tab; it is never grafted into
                 // the current tab's split.
@@ -20838,7 +20873,10 @@ impl Frost {
             kb("Right-click folder → Open Folder", "Enter that directory"),
             kb("Ctrl+Shift+P", "Command palette"),
             bound("config:toggle", "Settings"),
-            kb("Ctrl+Shift+P → Open Codex/Claude/OpenCode/Kimi", "Launch agent CLI in a new tab"),
+            kb(
+                "Ctrl+Shift+P → Open Codex/Claude/OpenCode/Kimi",
+                "Launch agent CLI in a new tab"
+            ),
             kb("F12", "Debug / diagnostics"),
             kb("Ctrl+Shift+/", "This help"),
             kb("Esc", "Close any panel"),
@@ -21723,7 +21761,10 @@ impl Frost {
             return;
         }
         let Some(context) = self.task_panel.provider_picker.take() else {
-            self.push_toast("No failed-block context waiting for a provider", ToastKind::Info);
+            self.push_toast(
+                "No failed-block context waiting for a provider",
+                ToastKind::Info,
+            );
             return;
         };
         let provider_name = provider.display_name();
@@ -21774,15 +21815,18 @@ impl Frost {
             return;
         }
         let start = match provider {
-            agent_task::AgentProvider::Codex => self
-                .agent_runtime
-                .start_codex(&mut self.task_manager, task_id, policy),
-            agent_task::AgentProvider::Claude => self
-                .agent_runtime
-                .start_claude(&mut self.task_manager, task_id, policy),
-            agent_task::AgentProvider::Kimi => self
-                .agent_runtime
-                .start_kimi(&mut self.task_manager, task_id, policy),
+            agent_task::AgentProvider::Codex => {
+                self.agent_runtime
+                    .start_codex(&mut self.task_manager, task_id, policy)
+            }
+            agent_task::AgentProvider::Claude => {
+                self.agent_runtime
+                    .start_claude(&mut self.task_manager, task_id, policy)
+            }
+            agent_task::AgentProvider::Kimi => {
+                self.agent_runtime
+                    .start_kimi(&mut self.task_manager, task_id, policy)
+            }
             agent_task::AgentProvider::OpenCode => {
                 self.task_open_terminal(task_id);
                 return;
@@ -21790,10 +21834,7 @@ impl Frost {
         };
         match start {
             Ok(()) => self.push_toast(
-                format!(
-                    "Preparing an isolated {} session…",
-                    provider.display_name()
-                ),
+                format!("Preparing an isolated {} session…", provider.display_name()),
                 ToastKind::Info,
             ),
             Err(error) => self.push_toast(
@@ -21836,6 +21877,7 @@ impl Frost {
                 self.next_id += 1;
                 let insert = (self.active + 1).min(self.sessions.len());
                 self.sessions.insert(insert, session);
+                apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
                 self.reindex_tabs_after_insert(insert);
                 self.open_tab_with(insert);
                 self.relayout();
@@ -21904,8 +21946,7 @@ impl Frost {
                                     ToastKind::Success,
                                 );
                             }
-                            agent_task::AgentProvider::Claude
-                            | agent_task::AgentProvider::Kimi => {
+                            agent_task::AgentProvider::Claude | agent_task::AgentProvider::Kimi => {
                                 self.push_toast(
                                     format!(
                                         "Created an isolated {provider_name} task; starting native {provider_name}…"
@@ -22092,6 +22133,7 @@ impl Frost {
         self.next_id += 1;
         let insert = (self.active + 1).min(self.sessions.len());
         self.sessions.insert(insert, session);
+        apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
         self.reindex_tabs_after_insert(insert);
         self.open_tab_with(insert);
         self.relayout();
@@ -22175,6 +22217,7 @@ impl Frost {
         self.next_id += 1;
         let insert = (self.active + 1).min(self.sessions.len());
         self.sessions.insert(insert, session);
+        apply_theme_colors(&mut self.sessions[insert].terminal, &self.theme);
         self.reindex_tabs_after_insert(insert);
         self.open_tab_with(insert);
         self.relayout();
@@ -22206,10 +22249,9 @@ impl Frost {
                 .size(11)
                 .style(text::secondary),
             );
-            let preferred = agent_task::AgentProvider::from_config_value(
-                &self.config.preferred_agent_provider,
-            )
-            .unwrap_or(agent_task::AgentProvider::Codex);
+            let preferred =
+                agent_task::AgentProvider::from_config_value(&self.config.preferred_agent_provider)
+                    .unwrap_or(agent_task::AgentProvider::Codex);
             let mut ordered = Vec::with_capacity(agent_task::AgentProvider::ALL.len());
             ordered.push(preferred);
             for provider in agent_task::AgentProvider::ALL {
