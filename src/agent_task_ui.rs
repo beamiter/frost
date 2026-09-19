@@ -230,6 +230,8 @@ pub(crate) struct TaskPanel {
     /// Draft review feedback for the selected task's next native turn.
     pub(crate) follow_up: String,
     pub(crate) pending_creation: Option<PendingTaskCreation>,
+    /// Failed-block context waiting for an explicit provider choice.
+    pub(crate) provider_picker: Option<SemanticCommandContext>,
     /// Bounded read-only `git status`/`git diff` surface for the selected
     /// task's worktree (worker-owned; polled from the iced tick).
     pub(crate) diff: crate::agent_task::AgentDiffPanel,
@@ -241,6 +243,7 @@ impl TaskPanel {
             selected: None,
             follow_up: String::new(),
             pending_creation: None,
+            provider_picker: None,
             diff: crate::agent_task::AgentDiffPanel::new(),
         }
     }

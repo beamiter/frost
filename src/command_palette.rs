@@ -73,6 +73,10 @@ pub enum PaletteAction {
     OpenWorkflows,
     ClearScreen,
     InstallJsh,
+    LaunchCodex,
+    LaunchClaude,
+    LaunchOpenCode,
+    LaunchKimi,
 }
 
 /// 面板中的一条命令项（展示信息 + 关联动作）。
@@ -609,6 +613,34 @@ impl PaletteState {
                 binding: None,
                 shortcut: "",
                 action: PaletteAction::InstallJsh,
+            },
+            PaletteItem {
+                name: "Open Codex in new tab",
+                description: "Launch the Codex CLI at the active pane working directory",
+                binding: Some("agent:launch:codex"),
+                shortcut: "",
+                action: PaletteAction::LaunchCodex,
+            },
+            PaletteItem {
+                name: "Open Claude in new tab",
+                description: "Launch Claude Code at the active pane working directory",
+                binding: Some("agent:launch:claude"),
+                shortcut: "",
+                action: PaletteAction::LaunchClaude,
+            },
+            PaletteItem {
+                name: "Open OpenCode in new tab",
+                description: "Launch OpenCode at the active pane working directory",
+                binding: Some("agent:launch:opencode"),
+                shortcut: "",
+                action: PaletteAction::LaunchOpenCode,
+            },
+            PaletteItem {
+                name: "Open Kimi in new tab",
+                description: "Launch Kimi Code at the active pane working directory",
+                binding: Some("agent:launch:kimi"),
+                shortcut: "",
+                action: PaletteAction::LaunchKimi,
             },
         ];
         Self {

@@ -17844,6 +17844,10 @@ mod tests {
 
     #[test]
     fn kitty_keyboard_flags_can_be_set_queried_and_popped() {
+        // Inline agent TUIs (codex, kimi, claude, opencode on crossterm/ratatui)
+        // push Kitty progressive-enhancement flags so Shift+Enter inserts a
+        // newline instead of submitting. frost must honour disambiguate and
+        // answer the query with the flags actually in effect.
         let mut terminal = TerminalState::new(8, 2);
 
         terminal.process_input(b"\x1b[=1u");

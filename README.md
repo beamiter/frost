@@ -577,8 +577,9 @@ ai_share_command_context = false
 # provider 时跳过）。卡片上可编辑，确认后才运行或插入提示符（未验证或编辑过的
 # 候选仅插入，仍需自己按回车）。详见下方“失败命令的评审式纠正”。
 command_correction_enabled = false
-# 实验性 Tasks 面板（侧栏 "Tasks" 页）：为失败命令块创建独立 Git worktree
-# 任务，并可选地运行原生 Codex 会话。与云端 AI 授权相互独立。
+# 实验性 Tasks 面板（侧栏 "Tasks" 页）：为失败命令块选择 Codex/Claude/
+# OpenCode/Kimi，创建独立 Git worktree 任务；Codex/Claude 可选原生会话，
+# OpenCode/Kimi 走 PTY。与云端 AI 授权相互独立。
 experimental_task_sidebar = false
 ```
 
@@ -619,10 +620,22 @@ experimental_task_sidebar = false
 代价照旧——把 `apt-cache` 放在别处的非 FHS 主机拿不到 APT 证据，卡片会退化为未验证候选或干脆
 不出现。对一个“任何命令失败都会自动拉起子进程”的界面来说，这是正确的取舍。
 
-### 实验性 Tasks 面板（原生 Codex 运行时）
+### 实验性 Tasks 面板（多 Agent）
 
 开启 `experimental_task_sidebar` 后，失败命令块的右键菜单会出现 **Create task**：
-frost 为该命令创建独立的 Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记一个任务卡片。
+frost 打开 Tasks 侧栏让你选择 **Codex / Claude / OpenCode / Kimi**，再为该命令创建独立的
+Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡片。
+
+- **Codex**：**Start Codex** 走原生 app-server（需 `ai_enabled` 与 `ai_share_command_context`）；
+  **Open Codex** 走普通 PTY。原生路径细节见下方。
+- **Claude**：**Start Claude** 走实验性 print/`stream-json` 原生驱动（同样需要上述 AI 授权，
+  无 Codex 级 private home / cgroup）；失败时可 **Open Claude** 回退到 PTY。
+- **OpenCode / Kimi**：**Start …** 与 **Open …** 都走 PATH 上的 CLI（PTY 兼容路径）。
+
+也可随时从命令面板（`Ctrl+Shift+P`）用 **Open Codex/Claude/OpenCode/Kimi in new tab**
+在当前 pane 的工作目录新开对应 CLI（不依赖 Tasks 实验开关；命令 id 为
+`agent:launch:codex|claude|opencode|kimi`，默认不绑快捷键）。
+
 任务卡片上的 **Start Codex** 在 `ai_enabled` 与 `ai_share_command_context` 都已开启时可用，
 进入可取消的后台准备阶段（校验已注册 worktree、固定目录描述符、解析可信 codex/node 启动链、
 构造受限 prompt、创建私有 0700 CODEX_HOME），全程不阻塞 UI；准备完成时任务代际与当前的
@@ -646,7 +659,7 @@ Git 注册与分支；通过打开的目录描述符 + fchdir 传递 cwd，shell
 验证结果为 running/passed/failed/needs-review/cancelled；即使验证通过，也必须显式点击
 **Mark complete** 才算接受任务。**Review diff** 显示相对任务基准提交的有界
 `git status --short` 与已跟踪文件的 `git diff HEAD`（未跟踪文件只列出路径）。
-原生会话失败或退出不成功时，可以用 **Open terminal Agent** 在终端中显式继续（PTY 兼容路径）。
+原生会话失败或退出不成功时，可以用 **Open Codex**（或其他 provider 的 Open …）在终端中显式继续。
 任务元数据仅存在于运行时；**Hide task** 只隐藏元数据，不会删除 worktree。
 任务终端（Agent 或验证）的子进程退出后标签页会保留为只读副本供回看：标题带 "(exited)" 后缀、
 pane 头部显示 `■ exited`，键盘与粘贴输入不再写入已死的 PTY，只会弹出一条节流提示；任务终端

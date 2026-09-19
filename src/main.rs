@@ -3086,13 +3086,15 @@ enum Message {
     AiSuggestionInsert,
     AiSuggestionRegenerate,
     AiSuggestionDismiss,
-    // Experimental Tasks dashboard (native Codex runtime + isolated worktrees).
+    // Experimental Tasks dashboard (native Codex/Claude runtime + isolated worktrees).
     TaskPanelToggle,
     TaskSelect(agent_task::TaskId),
     TaskHide(agent_task::TaskId),
-    TaskStartCodex(agent_task::TaskId),
-    TaskCancelCodex(agent_task::TaskId),
-    TaskFinishCodex(agent_task::TaskId),
+    TaskCreateWithProvider(agent_task::AgentProvider),
+    TaskCreateProviderCancel,
+    TaskStartNative(agent_task::TaskId),
+    TaskCancelNative(agent_task::TaskId),
+    TaskFinishNative(agent_task::TaskId),
     TaskFollowUpInput(String),
     TaskFollowUpSend(agent_task::TaskId),
     TaskApprovalDeny(agent_task::TaskId, agent_task::ApprovalId),
@@ -3101,6 +3103,8 @@ enum Message {
     TaskValidationStart(agent_task::TaskId),
     TaskMarkComplete(agent_task::TaskId),
     TaskTerminalOpen(agent_task::TaskId),
+    /// Open a coding-agent CLI in a new tab at the active pane cwd.
+    AgentLaunch(agent_task::AgentProvider),
     /// Periodic reducer/driver poll while the dashboard is open or a provider
     /// session is active.
     TaskTick,
@@ -8039,6 +8043,14 @@ impl Frost {
                 }
             }
             C::AiChatToggle => self.toggle_ai_chats(),
+            C::AgentLaunchCodex => Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex)),
+            C::AgentLaunchClaude => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Claude))
+            }
+            C::AgentLaunchOpenCode => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::OpenCode))
+            }
+            C::AgentLaunchKimi => Task::done(Message::AgentLaunch(agent_task::AgentProvider::Kimi)),
             C::FontZoomIn => {
                 self.adjust_font_size(1.0);
                 Task::none()
@@ -10875,6 +10887,18 @@ impl Frost {
                 self.install_or_update_jsh();
                 Task::none()
             }
+            PaletteAction::LaunchCodex => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Codex))
+            }
+            PaletteAction::LaunchClaude => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Claude))
+            }
+            PaletteAction::LaunchOpenCode => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::OpenCode))
+            }
+            PaletteAction::LaunchKimi => {
+                Task::done(Message::AgentLaunch(agent_task::AgentProvider::Kimi))
+            }
             PaletteAction::CloseTab => self.request_close_session(self.active),
             PaletteAction::NextTab => {
                 self.next_session();
@@ -12770,17 +12794,36 @@ impl Frost {
                     self.task_panel.selected = None;
                 }
             }
-            Message::TaskStartCodex(task_id) => self.task_start_codex(task_id),
-            Message::TaskCancelCodex(task_id) => {
+            Message::TaskCreateWithProvider(provider) => {
+                self.task_create_with_provider(provider);
+            }
+            Message::TaskCreateProviderCancel => {
+                self.task_panel.provider_picker = None;
+            }
+            Message::TaskStartNative(task_id) => self.task_start_native(task_id),
+            Message::TaskCancelNative(task_id) => {
                 if let Err(error) = self.agent_runtime.cancel(task_id) {
-                    self.push_toast(error.to_string(), ToastKind::Warning);
+                    self.push_toast(
+                        format!(
+                            "Could not cancel native session: {error}. You can still Open the provider CLI in a terminal."
+                        ),
+                        ToastKind::Warning,
+                    );
+                } else {
+                    self.push_toast("Cancelling native Agent session…", ToastKind::Info);
                 }
             }
-            Message::TaskFinishCodex(task_id) => {
+            Message::TaskFinishNative(task_id) => {
                 if let Err(error) = self.agent_runtime.finish_codex(&self.task_manager, task_id) {
-                    self.push_toast(error.to_string(), ToastKind::Warning);
+                    self.push_toast(
+                        format!(
+                            "Could not finish native session: {error}. Deny any pending approval or Open the provider CLI."
+                        ),
+                        ToastKind::Warning,
+                    );
                 }
             }
+            Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
             Message::TaskFollowUpInput(value) => {
                 if value.len() <= agent_task::NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
                     self.task_panel.follow_up = value;
@@ -12804,7 +12847,15 @@ impl Frost {
                     approval_id,
                     agent_task::ApprovalDecision::Deny { reason: None },
                 ) {
-                    self.push_toast(error.to_string(), ToastKind::Warning);
+                    self.push_toast(
+                        format!("Could not deny approval: {error}"),
+                        ToastKind::Warning,
+                    );
+                } else {
+                    self.push_toast(
+                        "Denied managed approval request (accepting stays disabled)",
+                        ToastKind::Info,
+                    );
                 }
             }
             Message::TaskDiffOpen(task_id) => {
@@ -20764,6 +20815,7 @@ impl Frost {
             kb("Right-click folder → Open Folder", "Enter that directory"),
             kb("Ctrl+Shift+P", "Command palette"),
             bound("config:toggle", "Settings"),
+            kb("Ctrl+Shift+P → Open Codex/Claude/OpenCode/Kimi", "Launch agent CLI in a new tab"),
             kb("F12", "Debug / diagnostics"),
             kb("Ctrl+Shift+/", "This help"),
             kb("Esc", "Close any panel"),
@@ -21625,14 +21677,41 @@ impl Frost {
                 return;
             }
         };
-        match agent_task_ui::begin_worktree_creation(context, agent_task::AgentProvider::Codex) {
+        self.task_panel.provider_picker = Some(context);
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar_open = true;
+        self.sidebar_panel = SidebarPanel::Tasks;
+        self.push_toast(
+            "Choose Codex, Claude, OpenCode, or Kimi for the new task",
+            ToastKind::Info,
+        );
+    }
+
+    /// Finish Create task after the user picks a provider in the Tasks panel.
+    fn task_create_with_provider(&mut self, provider: agent_task::AgentProvider) {
+        if !self.config.experimental_task_sidebar {
+            return;
+        }
+        if self.task_panel.pending_creation.is_some() {
+            self.push_toast(
+                "Another task worktree is still being created",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let Some(context) = self.task_panel.provider_picker.take() else {
+            self.push_toast("No failed-block context waiting for a provider", ToastKind::Info);
+            return;
+        };
+        let provider_name = provider.display_name();
+        match agent_task_ui::begin_worktree_creation(context, provider) {
             Ok(pending) => {
                 self.task_panel.pending_creation = Some(pending);
                 self.invalidate_sidebar_remote_follow_intent();
                 self.sidebar_open = true;
                 self.sidebar_panel = SidebarPanel::Tasks;
                 self.push_toast(
-                    "Creating an isolated Git worktree for Codex…",
+                    format!("Creating an isolated Git worktree for {provider_name}…"),
                     ToastKind::Info,
                 );
             }
@@ -21641,23 +21720,121 @@ impl Frost {
     }
 
     /// Enter the bounded, cancellable background preparation phase for a
-    /// native Codex session. Consent is re-evaluated here and again when the
-    /// prepared result lands; a revoked policy never spawns a provider.
-    fn task_start_codex(&mut self, task_id: agent_task::TaskId) {
+    /// native provider session (Codex app-server or Claude stream-json MVP).
+    /// Consent is re-evaluated here and again when the prepared result lands.
+    fn task_start_native(&mut self, task_id: agent_task::TaskId) {
         let policy = agent_task_ui::prompt_policy(&self.config);
+        let provider = self.task_manager.get(task_id).map(|task| task.provider);
+        let Some(provider) = provider else {
+            self.push_toast("Agent task is no longer available", ToastKind::Warning);
+            return;
+        };
+        if !provider.supports_native_driver() {
+            self.task_open_terminal(task_id);
+            return;
+        }
         if !policy.share_command_context {
             self.push_toast(
-                "Start Codex requires AI and command-context sharing in Settings",
+                format!(
+                    "Start {} requires AI and command-context sharing in Settings",
+                    provider.display_name()
+                ),
                 ToastKind::Warning,
             );
             return;
         }
-        match self
-            .agent_runtime
-            .start_codex(&mut self.task_manager, task_id, policy)
-        {
-            Ok(()) => self.push_toast("Preparing an isolated Codex session…", ToastKind::Info),
-            Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+        let start = match provider {
+            agent_task::AgentProvider::Codex => self
+                .agent_runtime
+                .start_codex(&mut self.task_manager, task_id, policy),
+            agent_task::AgentProvider::Claude => self
+                .agent_runtime
+                .start_claude(&mut self.task_manager, task_id, policy),
+            agent_task::AgentProvider::OpenCode | agent_task::AgentProvider::Kimi => {
+                self.task_open_terminal(task_id);
+                return;
+            }
+        };
+        match start {
+            Ok(()) => self.push_toast(
+                format!(
+                    "Preparing an isolated {} session…",
+                    provider.display_name()
+                ),
+                ToastKind::Info,
+            ),
+            Err(error) => self.push_toast(
+                format!(
+                    "{error}. You can Open {} in a terminal instead.",
+                    provider.display_name()
+                ),
+                ToastKind::Warning,
+            ),
+        }
+    }
+
+    /// Open a coding-agent CLI in a fresh tab at the active pane cwd.
+    fn agent_launch_in_tab(&mut self, provider: agent_task::AgentProvider) {
+        let program = provider.executable_name();
+        let Some(executable) = jterm_core::host::find_executable_in(
+            program,
+            std::env::var_os("PATH").as_deref(),
+        ) else {
+            self.push_toast(
+                format!(
+                    "{} is not on PATH (`{}` not found); {}",
+                    provider.display_name(),
+                    program,
+                    provider.install_hint()
+                ),
+                ToastKind::Warning,
+            );
+            return;
+        };
+        let Ok(executable) = std::fs::canonicalize(&executable) else {
+            self.push_toast(
+                format!("Could not resolve {}", provider.display_name()),
+                ToastKind::Warning,
+            );
+            return;
+        };
+        let Some(argv0) = executable.to_str().map(str::to_owned) else {
+            self.push_toast(
+                format!("{} path is not valid UTF-8", provider.display_name()),
+                ToastKind::Warning,
+            );
+            return;
+        };
+        let cwd = self.sessions.get(self.active).and_then(|s| s.cwd());
+        match Session::spawn_argv(
+            &self.config,
+            self.next_id,
+            self.cols,
+            self.rows,
+            cwd.as_deref(),
+            Some(&[argv0]),
+        ) {
+            Ok(session) => {
+                self.session_diagnostic = None;
+                self.next_id += 1;
+                let insert = (self.active + 1).min(self.sessions.len());
+                self.sessions.insert(insert, session);
+                self.reindex_tabs_after_insert(insert);
+                self.open_tab_with(insert);
+                self.relayout();
+                self.refresh_active_context();
+                self.save_session_snapshot();
+                self.push_toast(
+                    format!("Opened {} in a new tab", provider.display_name()),
+                    ToastKind::Success,
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                log::error!("[PTY] {message}");
+                self.session_diagnostic = Some(message.clone());
+                self.push_toast(message, ToastKind::Warning);
+            }
         }
     }
 
@@ -21702,7 +21879,9 @@ impl Frost {
                     Ok(task_id) => {
                         self.task_panel.selected = Some(task_id);
                         self.push_toast(
-                            format!("Created an isolated {provider_name} task; choose Start Codex"),
+                            format!(
+                                "Created an isolated {provider_name} task; choose Start {provider_name}"
+                            ),
                             ToastKind::Success,
                         );
                     }
@@ -21734,7 +21913,16 @@ impl Frost {
                     agent_task::AgentSessionOutcome::Failed => "failed",
                     agent_task::AgentSessionOutcome::Cancelled => "was cancelled",
                 };
-                self.push_toast(format!("Codex session {outcome}"), ToastKind::Info);
+                self.push_toast(
+                    format!(
+                        "{} session {outcome}",
+                        self.task_manager
+                            .get(completion.task_id)
+                            .map(|task| task.provider.display_name())
+                            .unwrap_or("Agent")
+                    ),
+                    ToastKind::Info,
+                );
             }
         }
 
@@ -21749,7 +21937,7 @@ impl Frost {
     fn task_open_terminal(&mut self, task_id: agent_task::TaskId) {
         if self.agent_runtime.has_preparing(task_id) {
             self.push_toast(
-                "Cancel native Codex preparation before starting a terminal",
+                "Cancel native Agent preparation before starting a terminal",
                 ToastKind::Info,
             );
             return;
@@ -21967,6 +22155,32 @@ impl Frost {
                 .into();
         }
         let mut body = column![].spacing(6);
+        if let Some(context) = self.task_panel.provider_picker.as_ref() {
+            let command = context.command.as_deref().unwrap_or("failed command");
+            body = body.push(text("Create task with").size(13));
+            body = body.push(
+                text(crate::review_text::visible_bounded(
+                    command,
+                    agent_task_ui::MAX_TASK_TITLE_DISPLAY_BYTES,
+                ))
+                .size(11)
+                .style(text::secondary),
+            );
+            let mut providers = row![].spacing(6);
+            for provider in agent_task::AgentProvider::ALL {
+                providers = providers.push(
+                    button(text(provider.display_name()).size(11))
+                        .style(button::primary)
+                        .on_press(Message::TaskCreateWithProvider(provider)),
+                );
+            }
+            body = body.push(providers);
+            body = body.push(
+                button(text("Cancel").size(11))
+                    .style(button::secondary)
+                    .on_press(Message::TaskCreateProviderCancel),
+            );
+        }
         if self.task_panel.pending_creation.is_some() {
             body = body.push(
                 text("Creating isolated worktree…")
@@ -21981,10 +22195,13 @@ impl Frost {
             .filter(|task| task.status != agent_task::TaskStatus::Archived)
             .collect();
         tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
-        if tasks.is_empty() && self.task_panel.pending_creation.is_none() {
+        if tasks.is_empty()
+            && self.task_panel.pending_creation.is_none()
+            && self.task_panel.provider_picker.is_none()
+        {
             body = body.push(text("No Agent tasks yet").size(13));
             body = body.push(
-                text("Create one from a failed command block's menu (Create task). Each task gets its own Git worktree.")
+                text("Create one from a failed command block's menu (Create task). Pick Codex, Claude, OpenCode, or Kimi; each task gets its own Git worktree.")
                     .size(11)
                     .style(text::secondary),
             );
@@ -22164,50 +22381,73 @@ impl Frost {
         }
 
         // Action rows.
+        let provider_name = task.provider.display_name();
+        let share_context = agent_task_ui::prompt_policy(&self.config).share_command_context;
         let mut actions = row![].spacing(6);
         if preparing {
             actions = actions.push(text("Preparing…").size(11).style(text::secondary));
             actions = actions.push(
                 button(text("Cancel").size(11))
                     .style(button::secondary)
-                    .on_press(Message::TaskCancelCodex(task.id)),
+                    .on_press(Message::TaskCancelNative(task.id)),
             );
         } else if task.status == TaskStatus::Created
             && task.runtime_kind == TaskRuntimeKind::Unassigned
         {
-            let mut start = button(text("Start Codex").size(11)).style(button::primary);
-            if agent_task_ui::prompt_policy(&self.config).share_command_context {
-                start = start.on_press(Message::TaskStartCodex(task.id));
+            let start_label = format!("Start {provider_name}");
+            let mut start = button(text(start_label).size(11)).style(button::primary);
+            if task.provider.supports_native_driver() {
+                if share_context {
+                    start = start.on_press(Message::TaskStartNative(task.id));
+                }
+            } else {
+                start = start.on_press(Message::TaskTerminalOpen(task.id));
             }
             actions = actions.push(start);
             actions = actions.push(
-                button(text("Open terminal Agent").size(11))
+                button(text(format!("Open {provider_name}")).size(11))
                     .style(button::secondary)
                     .on_press(Message::TaskTerminalOpen(task.id)),
             );
         }
         if running && stream_active {
             actions = actions.push(
-                button(text("Cancel Codex").size(11))
+                button(text(format!("Cancel {provider_name}")).size(11))
                     .style(button::danger)
-                    .on_press(Message::TaskCancelCodex(task.id)),
+                    .on_press(Message::TaskCancelNative(task.id)),
             );
-            if task.status == TaskStatus::ReadyForReview {
+            if task.status == TaskStatus::ReadyForReview
+                && matches!(task.provider, agent_task::AgentProvider::Codex)
+            {
                 actions = actions.push(
-                    button(text("Finish Codex").size(11))
+                    button(text(format!("Finish {provider_name}")).size(11))
                         .style(button::primary)
-                        .on_press(Message::TaskFinishCodex(task.id)),
+                        .on_press(Message::TaskFinishNative(task.id)),
                 );
             }
         }
         card = card.push(actions);
+        if task.status == TaskStatus::Created
+            && task.runtime_kind == TaskRuntimeKind::Unassigned
+            && task.provider.supports_native_driver()
+            && !share_context
+        {
+            card = card.push(
+                text(format!(
+                    "Start {provider_name} needs AI enabled and command-context sharing in Settings. Open {provider_name} still works in a terminal."
+                ))
+                .size(10)
+                .style(text::secondary),
+            );
+        }
 
         // Review feedback starts another sequential turn on the live native
-        // session.
+        // Codex session (Claude MVP is one-shot print mode).
         if running
             && stream_active
             && task.status == TaskStatus::ReadyForReview
             && task.runtime_kind == TaskRuntimeKind::Native
+            && matches!(task.provider, agent_task::AgentProvider::Codex)
         {
             let completed_turns = self
                 .agent_runtime

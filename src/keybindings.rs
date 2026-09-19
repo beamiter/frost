@@ -125,6 +125,11 @@ pub enum Command {
     /// a per-app spelling makes a shared keybindings file mean different
     /// things in different windows.
     AiChatToggle,
+    /// Open a coding-agent CLI in a new tab at the active pane cwd.
+    AgentLaunchCodex,
+    AgentLaunchClaude,
+    AgentLaunchOpenCode,
+    AgentLaunchKimi,
 
     // === 字体缩放 ===
     FontZoomIn,
@@ -214,6 +219,10 @@ impl std::fmt::Display for Command {
             Command::SidebarToggle => write!(f, "sidebar:toggle"),
             Command::AgentToggle => write!(f, "agent:toggle"),
             Command::AiChatToggle => write!(f, "ai_chat:toggle"),
+            Command::AgentLaunchCodex => write!(f, "agent:launch:codex"),
+            Command::AgentLaunchClaude => write!(f, "agent:launch:claude"),
+            Command::AgentLaunchOpenCode => write!(f, "agent:launch:opencode"),
+            Command::AgentLaunchKimi => write!(f, "agent:launch:kimi"),
             Command::FontZoomIn => write!(f, "font:zoom_in"),
             Command::FontZoomOut => write!(f, "font:zoom_out"),
             Command::FontZoomReset => write!(f, "font:zoom_reset"),
@@ -298,6 +307,10 @@ impl std::str::FromStr for Command {
             "sidebar:toggle" => Ok(Command::SidebarToggle),
             "agent:toggle" => Ok(Command::AgentToggle),
             "ai_chat:toggle" => Ok(Command::AiChatToggle),
+            "agent:launch:codex" => Ok(Command::AgentLaunchCodex),
+            "agent:launch:claude" => Ok(Command::AgentLaunchClaude),
+            "agent:launch:opencode" => Ok(Command::AgentLaunchOpenCode),
+            "agent:launch:kimi" => Ok(Command::AgentLaunchKimi),
             "font:zoom_in" => Ok(Command::FontZoomIn),
             "font:zoom_out" => Ok(Command::FontZoomOut),
             "font:zoom_reset" => Ok(Command::FontZoomReset),
@@ -1217,5 +1230,16 @@ mod tests {
         assert_eq!(Command::SessionLast.to_string(), "session:last");
         assert_eq!(Command::PaneFocusLeft.to_string(), "pane:focus_left");
         assert_eq!(Command::PaneResizeDown.to_string(), "pane:resize_down");
+        assert_eq!(Command::AgentLaunchCodex.to_string(), "agent:launch:codex");
+        assert_eq!(Command::AgentLaunchClaude.to_string(), "agent:launch:claude");
+        assert_eq!(
+            Command::AgentLaunchOpenCode.to_string(),
+            "agent:launch:opencode"
+        );
+        assert_eq!(Command::AgentLaunchKimi.to_string(), "agent:launch:kimi");
+        assert_eq!(
+            "agent:launch:kimi".parse::<Command>().unwrap(),
+            Command::AgentLaunchKimi
+        );
     }
 }
