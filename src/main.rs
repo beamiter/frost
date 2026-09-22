@@ -3566,6 +3566,9 @@ struct Session {
     /// Busy/disabled OSC 52 replies wait behind the untagged asynchronous read.
     /// The bounded queue persists across PTY batches and belongs to this session.
     osc52_pending_refusals: Option<std::collections::VecDeque<&'static [u8]>>,
+    /// Later OSC 5522 requests receive bounded busy refusals after the active
+    /// MIME read completes; these responses carry no correlation identifier.
+    osc5522_pending_refusals: Option<usize>,
     /// True for a connection Frost launched from its own remote picker. The
     /// automatic Files follower targets SSH typed inside an ordinary local
     /// shell and must not open a duplicate sidecar for managed remote tabs.
@@ -3603,6 +3606,73 @@ fn complete_osc52_read(
     terminal.respond_osc52_clipboard(content, terminator);
     for terminator in pending.take().into_iter().flatten() {
         terminal.respond_osc52_clipboard("", terminator);
+    }
+}
+
+/// Return the MIME type only when a new asynchronous host read should start.
+fn service_osc5522_read(
+    terminal: &mut TerminalState,
+    in_flight: &mut bool,
+    pending_refusals: &mut Option<usize>,
+    allow_clipboard_read: bool,
+    kind: terminal::ClipboardReadKind,
+) -> Option<String> {
+    if let Some(refusals) = pending_refusals {
+        // Apply this before permission and MIME checks: any OSC 5522 reply
+        // here would otherwise be mistaken for the older unresolved read.
+        // Match the parser's eight-request bound across asynchronous batches.
+        *refusals = (*refusals + 1).min(8);
+        return None;
+    }
+    let response = if !allow_clipboard_read {
+        osc_5522_packet("type=read:status=EPERM", None)
+    } else {
+        match kind {
+            terminal::ClipboardReadKind::MimeList => {
+                terminal.build_paste_event(&["text/plain;charset=utf-8".to_string()])
+            }
+            terminal::ClipboardReadKind::MimeData(mime) => {
+                if mime.starts_with("text") {
+                    if *in_flight {
+                        osc_5522_packet("type=read:status=EBUSY", None)
+                    } else {
+                        *in_flight = true;
+                        *pending_refusals = Some(0);
+                        return Some(mime);
+                    }
+                } else {
+                    osc_5522_packet("type=read:status=ENOSYS", None)
+                }
+            }
+        }
+    };
+    terminal.output_buffer.extend_from_slice(&response);
+    None
+}
+
+fn complete_osc5522_read(
+    terminal: &mut TerminalState,
+    in_flight: &mut bool,
+    pending_refusals: &mut Option<usize>,
+    allow_clipboard_read: bool,
+    mime: &str,
+    data: &str,
+) {
+    *in_flight = false;
+    let response = if !allow_clipboard_read {
+        osc_5522_packet("type=read:status=EPERM", None)
+    } else if data.len() > MAX_CLIPBOARD_RESPONSE_BYTES {
+        osc_5522_packet("type=read:status=EFBIG", None)
+    } else if data.is_empty() {
+        osc_5522_packet("type=read:status=ENOSYS", None)
+    } else {
+        clipboard_5522_response_for_mime(mime, data.as_bytes())
+    };
+    terminal.output_buffer.extend_from_slice(&response);
+    for _ in 0..pending_refusals.take().unwrap_or_default() {
+        terminal
+            .output_buffer
+            .extend_from_slice(&osc_5522_packet("type=read:status=EBUSY", None));
     }
 }
 
@@ -3831,6 +3901,7 @@ impl Session {
             queued_response_bytes: 0,
             clipboard_read_in_flight: false,
             osc52_pending_refusals: None,
+            osc5522_pending_refusals: None,
             managed_remote: false,
         })
     }
@@ -12457,56 +12528,22 @@ impl Frost {
                 // text-only, so we advertise a text MIME and serve text reads via
                 // an async clipboard read; non-text MIME types get ENOSYS.
                 for kind in clip_requests {
-                    if !self.config.allow_clipboard_read {
-                        if let Some(sess) = self.session_by_identity(id, fd) {
-                            let resp = osc_5522_packet("type=read:status=EPERM", None);
-                            sess.terminal.output_buffer.extend_from_slice(&resp);
-                            sess.flush_responses();
-                            sess.refresh();
+                    let allow_clipboard_read = self.config.allow_clipboard_read;
+                    if let Some(sess) = self.session_by_identity(id, fd) {
+                        if let Some(mime) = service_osc5522_read(
+                            &mut sess.terminal,
+                            &mut sess.clipboard_read_in_flight,
+                            &mut sess.osc5522_pending_refusals,
+                            allow_clipboard_read,
+                            kind,
+                        ) {
+                            tasks.push(
+                                iced::clipboard::read()
+                                    .map(move |c| Message::Osc5522Data(id, fd, mime.clone(), c)),
+                            );
                         }
-                        continue;
-                    }
-                    match kind {
-                        terminal::ClipboardReadKind::MimeList => {
-                            if let Some(sess) = self.session_by_identity(id, fd) {
-                                let resp = sess
-                                    .terminal
-                                    .build_paste_event(&["text/plain;charset=utf-8".to_string()]);
-                                sess.terminal.output_buffer.extend_from_slice(&resp);
-                                sess.flush_responses();
-                                sess.refresh();
-                            }
-                        }
-                        terminal::ClipboardReadKind::MimeData(mime) => {
-                            if mime.starts_with("text") {
-                                let start_read =
-                                    if let Some(sess) = self.session_by_identity(id, fd) {
-                                        if sess.clipboard_read_in_flight {
-                                            false
-                                        } else {
-                                            sess.clipboard_read_in_flight = true;
-                                            true
-                                        }
-                                    } else {
-                                        false
-                                    };
-                                if start_read {
-                                    tasks.push(iced::clipboard::read().map(move |c| {
-                                        Message::Osc5522Data(id, fd, mime.clone(), c)
-                                    }));
-                                } else if let Some(sess) = self.session_by_identity(id, fd) {
-                                    let resp = osc_5522_packet("type=read:status=EBUSY", None);
-                                    sess.terminal.output_buffer.extend_from_slice(&resp);
-                                    sess.flush_responses();
-                                    sess.refresh();
-                                }
-                            } else if let Some(sess) = self.session_by_identity(id, fd) {
-                                let resp = osc_5522_packet("type=read:status=ENOSYS", None);
-                                sess.terminal.output_buffer.extend_from_slice(&resp);
-                                sess.flush_responses();
-                                sess.refresh();
-                            }
-                        }
+                        sess.flush_responses();
+                        sess.refresh();
                     }
                 }
 
@@ -13198,18 +13235,14 @@ impl Frost {
             Message::Osc5522Data(id, fd, mime, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
                 if let Some(sess) = self.session_by_identity(id, fd) {
-                    sess.clipboard_read_in_flight = false;
-                    let data = content.unwrap_or_default();
-                    let resp = if !allow_clipboard_read {
-                        osc_5522_packet("type=read:status=EPERM", None)
-                    } else if data.len() > MAX_CLIPBOARD_RESPONSE_BYTES {
-                        osc_5522_packet("type=read:status=EFBIG", None)
-                    } else if data.is_empty() {
-                        osc_5522_packet("type=read:status=ENOSYS", None)
-                    } else {
-                        clipboard_5522_response_for_mime(&mime, data.as_bytes())
-                    };
-                    sess.terminal.output_buffer.extend_from_slice(&resp);
+                    complete_osc5522_read(
+                        &mut sess.terminal,
+                        &mut sess.clipboard_read_in_flight,
+                        &mut sess.osc5522_pending_refusals,
+                        allow_clipboard_read,
+                        &mime,
+                        content.as_deref().unwrap_or_default(),
+                    );
                     sess.flush_responses();
                     sess.refresh();
                 }
@@ -25411,6 +25444,114 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn osc5522_slow_read_precedes_later_mime_read_refusal() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut in_flight = false;
+        let mut pending = None;
+        let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
+        assert_eq!(
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, request()),
+            Some("text/plain".to_string())
+        );
+        // A second PTY batch arrives before iced returns the first read.
+        assert!(
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, request())
+                .is_none()
+        );
+        assert!(
+            terminal.output_buffer.is_empty(),
+            "EBUSY must not overtake the first read"
+        );
+        complete_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            "text/plain",
+            "first",
+        );
+        let mut expected = clipboard_5522_response_for_mime("text/plain", b"first");
+        expected.extend_from_slice(&osc_5522_packet("type=read:status=EBUSY", None));
+        assert_eq!(terminal.output_buffer, expected);
+        assert!(!in_flight);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn osc5522_disabled_completion_keeps_bounded_refusals_on_its_session() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut in_flight = false;
+        let mut pending = None;
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            terminal::ClipboardReadKind::MimeData("text/plain".into()),
+        )
+        .is_some());
+        // Both discovery and unsupported data requests share the same reply
+        // stream, even when permission changes during the outstanding read.
+        for index in 0..100 {
+            let request = if index % 2 == 0 {
+                terminal::ClipboardReadKind::MimeList
+            } else {
+                terminal::ClipboardReadKind::MimeData("image/png".into())
+            };
+            assert!(service_osc5522_read(
+                &mut terminal,
+                &mut in_flight,
+                &mut pending,
+                index < 50,
+                request,
+            )
+            .is_none());
+        }
+        assert_eq!(pending, Some(8));
+        assert!(terminal.output_buffer.is_empty());
+
+        let mut other_terminal = TerminalState::new(80, 24);
+        let mut other_in_flight = false;
+        let mut other_pending = None;
+        assert!(service_osc5522_read(
+            &mut other_terminal,
+            &mut other_in_flight,
+            &mut other_pending,
+            true,
+            terminal::ClipboardReadKind::MimeData("text/plain".into()),
+        )
+        .is_some());
+        assert_eq!(other_pending, Some(0));
+
+        complete_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            false,
+            "text/plain",
+            "secret",
+        );
+        let mut expected = osc_5522_packet("type=read:status=EPERM", None);
+        expected.extend_from_slice(&osc_5522_packet("type=read:status=EBUSY", None).repeat(8));
+        assert_eq!(terminal.output_buffer, expected);
+        assert!(pending.is_none());
+        assert!(!in_flight);
+        assert!(other_terminal.output_buffer.is_empty());
+        assert!(other_in_flight);
+        assert_eq!(other_pending, Some(0));
+
+        // Completing this read releases its own slot for a fresh request.
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            terminal::ClipboardReadKind::MimeData("text/plain".into()),
+        )
+        .is_some());
+    }
 
     #[test]
     fn osc52_slow_read_keeps_cross_batch_refusals_in_request_order() {
