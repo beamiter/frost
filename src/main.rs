@@ -3563,10 +3563,41 @@ struct Session {
     /// Host clipboard access is asynchronous. Limit PTY-originated reads to one
     /// per session so a hostile child cannot accumulate work across UI batches.
     clipboard_read_in_flight: bool,
+    /// Busy/disabled OSC 52 replies wait behind the untagged asynchronous read.
+    /// The bounded queue persists across PTY batches and belongs to this session.
+    osc52_pending_refusals: Option<std::collections::VecDeque<&'static [u8]>>,
     /// True for a connection Frost launched from its own remote picker. The
     /// automatic Files follower targets SSH typed inside an ordinary local
     /// shell and must not open a duplicate sidecar for managed remote tabs.
     managed_remote: bool,
+}
+
+/// An OSC 52 query has no correlation ID. Retain at most eight refusal
+/// terminators while the older read is unresolved, dropping overflow instead
+/// of returning a response that the child would mistake for that read.
+fn defer_osc52_refusal(
+    pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    terminator: &'static [u8],
+) -> bool {
+    let Some(refusals) = pending else {
+        return false;
+    };
+    if refusals.len() < 8 {
+        refusals.push_back(terminator);
+    }
+    true
+}
+
+fn complete_osc52_read(
+    terminal: &mut TerminalState,
+    pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    content: &str,
+    terminator: &'static [u8],
+) {
+    terminal.respond_osc52_clipboard(content, terminator);
+    for terminator in pending.take().into_iter().flatten() {
+        terminal.respond_osc52_clipboard("", terminator);
+    }
 }
 
 /// Cached output of the per-frame block-chrome builders, stored per session.
@@ -3793,6 +3824,7 @@ impl Session {
             queued_write_bytes: 0,
             queued_response_bytes: 0,
             clipboard_read_in_flight: false,
+            osc52_pending_refusals: None,
             managed_remote: false,
         })
     }
@@ -12377,12 +12409,18 @@ impl Frost {
                     }
                 }
                 for terminator in clip_queries {
+                    if let Some(sess) = self.session_by_identity(id, fd) {
+                        if defer_osc52_refusal(&mut sess.osc52_pending_refusals, terminator) {
+                            continue;
+                        }
+                    }
                     if self.config.allow_clipboard_read {
                         let start_read = if let Some(sess) = self.session_by_identity(id, fd) {
                             if sess.clipboard_read_in_flight {
                                 false
                             } else {
                                 sess.clipboard_read_in_flight = true;
+                                sess.osc52_pending_refusals = Some(Default::default());
                                 true
                             }
                         } else {
@@ -13145,7 +13183,12 @@ impl Frost {
                             allow_clipboard_read && value.len() <= MAX_CLIPBOARD_RESPONSE_BYTES
                         })
                         .unwrap_or("");
-                    sess.terminal.respond_osc52_clipboard(content, terminator);
+                    complete_osc52_read(
+                        &mut sess.terminal,
+                        &mut sess.osc52_pending_refusals,
+                        content,
+                        terminator,
+                    );
                     sess.flush_responses();
                     sess.refresh();
                 }
@@ -25366,6 +25409,45 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn osc52_slow_read_keeps_cross_batch_refusals_in_request_order() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut pending = Some(Default::default());
+        // Separate invocations stand for separate PTY batches while iced's
+        // read remains unresolved; the callback has not emitted any bytes.
+        assert!(defer_osc52_refusal(&mut pending, b"\x07"));
+        assert!(defer_osc52_refusal(&mut pending, b"\x1b\\"));
+        assert!(terminal.output_buffer.is_empty());
+        let mut other_session = None;
+        assert!(!defer_osc52_refusal(&mut other_session, b"\x07"));
+        complete_osc52_read(&mut terminal, &mut pending, "first", b"\x1b\\");
+        assert_eq!(
+            terminal.output_buffer,
+            b"\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;c;\x07\x1b]52;c;\x1b\\"
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn osc52_disabled_completion_remains_ordered_and_refusals_are_bounded() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut pending = Some(Default::default());
+        // The disabled policy passes an empty original result. Refusals
+        // arriving after permission is revoked still cannot jump ahead.
+        for _ in 0..100 {
+            assert!(defer_osc52_refusal(&mut pending, b"\x07"));
+        }
+        assert_eq!(pending.as_ref().unwrap().len(), 8);
+        complete_osc52_read(&mut terminal, &mut pending, "", b"\x1b\\");
+        let expected = [
+            b"\x1b]52;c;\x1b\\".as_slice(),
+            b"\x1b]52;c;\x07".repeat(8).as_slice(),
+        ]
+        .concat();
+        assert_eq!(terminal.output_buffer, expected);
+        assert!(!defer_osc52_refusal(&mut pending, b"\x07"));
+    }
 
     /// There is exactly one way out of the process, and it is the one that
     /// flushes.
