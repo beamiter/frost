@@ -3591,9 +3591,15 @@ fn defer_osc52_refusal(
 fn complete_osc52_read(
     terminal: &mut TerminalState,
     pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    allow_clipboard_read: bool,
     content: &str,
     terminator: &'static [u8],
 ) {
+    let content = if allow_clipboard_read && content.len() <= MAX_CLIPBOARD_RESPONSE_BYTES {
+        content
+    } else {
+        ""
+    };
     terminal.respond_osc52_clipboard(content, terminator);
     for terminator in pending.take().into_iter().flatten() {
         terminal.respond_osc52_clipboard("", terminator);
@@ -13177,15 +13183,11 @@ impl Frost {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.clipboard_read_in_flight = false;
-                    let content = content
-                        .as_deref()
-                        .filter(|value| {
-                            allow_clipboard_read && value.len() <= MAX_CLIPBOARD_RESPONSE_BYTES
-                        })
-                        .unwrap_or("");
+                    let content = content.as_deref().unwrap_or("");
                     complete_osc52_read(
                         &mut sess.terminal,
                         &mut sess.osc52_pending_refusals,
+                        allow_clipboard_read,
                         content,
                         terminator,
                     );
@@ -25421,7 +25423,7 @@ mod tests {
         assert!(terminal.output_buffer.is_empty());
         let mut other_session = None;
         assert!(!defer_osc52_refusal(&mut other_session, b"\x07"));
-        complete_osc52_read(&mut terminal, &mut pending, "first", b"\x1b\\");
+        complete_osc52_read(&mut terminal, &mut pending, true, "first", b"\x1b\\");
         assert_eq!(
             terminal.output_buffer,
             b"\x1b]52;c;Zmlyc3Q=\x1b\\\x1b]52;c;\x07\x1b]52;c;\x1b\\"
@@ -25433,13 +25435,13 @@ mod tests {
     fn osc52_disabled_completion_remains_ordered_and_refusals_are_bounded() {
         let mut terminal = TerminalState::new(80, 24);
         let mut pending = Some(Default::default());
-        // The disabled policy passes an empty original result. Refusals
-        // arriving after permission is revoked still cannot jump ahead.
+        // A read launched while allowed returns a secret after revocation.
+        // The completion gate must refuse it before flushing the FIFO suffix.
         for _ in 0..100 {
             assert!(defer_osc52_refusal(&mut pending, b"\x07"));
         }
         assert_eq!(pending.as_ref().unwrap().len(), 8);
-        complete_osc52_read(&mut terminal, &mut pending, "", b"\x1b\\");
+        complete_osc52_read(&mut terminal, &mut pending, false, "secret", b"\x1b\\");
         let expected = [
             b"\x1b]52;c;\x1b\\".as_slice(),
             b"\x1b]52;c;\x07".repeat(8).as_slice(),
