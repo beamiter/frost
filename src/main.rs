@@ -3169,7 +3169,7 @@ enum Message {
     PromptRecall(usize, String),
     /// System clipboard contents read in response to an OSC 52 query from the
     /// app running in the session identified by the file descriptor.
-    Osc52Query(usize, RawFd, Option<String>),
+    Osc52Query(usize, RawFd, &'static [u8], Option<String>),
     /// System clipboard contents read in response to an OSC 5522 MIME-data read
     /// request. Carries the requesting fd and the MIME type that was requested.
     Osc5522Data(usize, RawFd, String, Option<String>),
@@ -12242,7 +12242,7 @@ impl Frost {
                     .get(self.active)
                     .is_some_and(|session| session.id == id && session.master_fd == fd);
                 let mut clip_set: Option<String> = None;
-                let mut clip_query = false;
+                let mut clip_queries = Vec::new();
                 let mut clip_requests: Vec<terminal::ClipboardReadKind> = Vec::new();
                 let mut notifications: Vec<(String, String)> = Vec::new();
                 let mut completed_commands: Vec<terminal::CompletedCommand> = Vec::new();
@@ -12259,7 +12259,8 @@ impl Frost {
                     sess.flush_responses();
                     sess.refresh();
                     clip_set = sess.terminal.take_osc52_clipboard_set();
-                    clip_query = sess.terminal.take_osc52_clipboard_query();
+                    clip_queries =
+                        std::iter::from_fn(|| sess.terminal.take_osc52_clipboard_query()).collect();
                     clip_requests = sess
                         .terminal
                         .take_clipboard_read_requests()
@@ -12375,33 +12376,36 @@ impl Frost {
                         tasks.push(iced::clipboard::write(text));
                     }
                 }
-                if clip_query && self.config.allow_clipboard_read {
-                    let start_read = if let Some(sess) = self.session_by_identity(id, fd) {
-                        if sess.clipboard_read_in_flight {
-                            false
+                for terminator in clip_queries {
+                    if self.config.allow_clipboard_read {
+                        let start_read = if let Some(sess) = self.session_by_identity(id, fd) {
+                            if sess.clipboard_read_in_flight {
+                                false
+                            } else {
+                                sess.clipboard_read_in_flight = true;
+                                true
+                            }
                         } else {
-                            sess.clipboard_read_in_flight = true;
-                            true
+                            false
+                        };
+                        if start_read {
+                            tasks.push(
+                                iced::clipboard::read()
+                                    .map(move |c| Message::Osc52Query(id, fd, terminator, c)),
+                            );
+                        } else if let Some(sess) = self.session_by_identity(id, fd) {
+                            // OSC 52 has no structured busy status; an empty response
+                            // is the interoperable refusal while another read runs.
+                            sess.terminal.respond_osc52_clipboard("", terminator);
+                            sess.flush_responses();
                         }
                     } else {
-                        false
-                    };
-                    if start_read {
-                        tasks.push(
-                            iced::clipboard::read().map(move |c| Message::Osc52Query(id, fd, c)),
-                        );
-                    } else if let Some(sess) = self.session_by_identity(id, fd) {
-                        // OSC 52 has no structured busy status; an empty response
-                        // is the interoperable refusal while another read runs.
-                        sess.terminal.respond_osc52_clipboard("");
-                        sess.flush_responses();
-                    }
-                } else if clip_query {
-                    // An empty OSC 52 response reports that clipboard reads are
-                    // unavailable without exposing host clipboard contents.
-                    if let Some(sess) = self.session_by_identity(id, fd) {
-                        sess.terminal.respond_osc52_clipboard("");
-                        sess.flush_responses();
+                        // An empty OSC 52 response reports that clipboard reads are
+                        // unavailable without exposing host clipboard contents.
+                        if let Some(sess) = self.session_by_identity(id, fd) {
+                            sess.terminal.respond_osc52_clipboard("", terminator);
+                            sess.flush_responses();
+                        }
                     }
                 }
 
@@ -13131,7 +13135,7 @@ impl Frost {
                 self.config.agent_max_turns = turns.clamp(1, 100);
                 self.config_dirty = true;
             }
-            Message::Osc52Query(id, fd, content) => {
+            Message::Osc52Query(id, fd, terminator, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.clipboard_read_in_flight = false;
@@ -13141,7 +13145,7 @@ impl Frost {
                             allow_clipboard_read && value.len() <= MAX_CLIPBOARD_RESPONSE_BYTES
                         })
                         .unwrap_or("");
-                    sess.terminal.respond_osc52_clipboard(content);
+                    sess.terminal.respond_osc52_clipboard(content, terminator);
                     sess.flush_responses();
                     sess.refresh();
                 }

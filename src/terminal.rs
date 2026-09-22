@@ -3163,8 +3163,8 @@ pub struct TerminalState {
 
     // OSC 52 clipboard set requests (selection_param, decoded_text)
     pub pending_osc52_clipboard_set: Option<String>,
-    // OSC 52 clipboard query pending (needs clipboard read + response)
-    pub pending_osc52_clipboard_query: bool,
+    // OSC 52 clipboard queries pending (each needs one read/refusal response).
+    pending_osc52_clipboard_queries: VecDeque<&'static [u8]>,
 
     // OSC 133 shell integration: command zones for prompt navigation
     pub command_zones: VecDeque<CommandZone>,
@@ -3242,9 +3242,6 @@ pub struct TerminalState {
     /// query with the terminator it arrived with, and clients that wait for a
     /// BEL-terminated reply (they sent BEL) time out on an ST one.
     osc_reply_terminator: &'static [u8],
-    /// Terminator of the pending OSC 52 query, whose answer is written later
-    /// by [`Self::respond_osc52_clipboard`].
-    osc52_query_terminator: &'static [u8],
 
     // OSC 9/777 pending notifications
     pub pending_notifications: Vec<(String, String)>,
@@ -3492,7 +3489,7 @@ impl TerminalState {
             last_archived_screen_snapshot: Vec::new(),
             last_synced_primary_screen_snapshot: Vec::new(),
             pending_osc52_clipboard_set: None,
-            pending_osc52_clipboard_query: false,
+            pending_osc52_clipboard_queries: VecDeque::new(),
             command_zones: VecDeque::new(),
             finished_output_provenance: HashMap::new(),
             next_zone_id: 0,
@@ -3522,7 +3519,6 @@ impl TerminalState {
             theme_default_colors: DefaultColors::FALLBACK,
             theme_ansi_colors: None,
             osc_reply_terminator: OSC_ST,
-            osc52_query_terminator: OSC_ST,
             pending_notifications: Vec::new(),
             pending_completed_commands: std::collections::VecDeque::new(),
             current_command_id: None,
@@ -6335,8 +6331,10 @@ impl TerminalState {
         if let Some((_sel, data)) = value.split_once(';') {
             if data == "?" {
                 // Query: signal main loop to read clipboard and respond
-                self.pending_osc52_clipboard_query = true;
-                self.osc52_query_terminator = self.osc_reply_terminator;
+                if self.pending_osc52_clipboard_queries.len() < 8 {
+                    self.pending_osc52_clipboard_queries
+                        .push_back(self.osc_reply_terminator);
+                }
             } else if !data.is_empty() {
                 if data.len() > OSC52_MAX_BYTES.saturating_mul(4) / 3 + 8 {
                     // Reject before even attempting to decode.
@@ -7530,19 +7528,16 @@ impl TerminalState {
         self.pending_osc52_clipboard_set.take()
     }
 
-    pub fn take_osc52_clipboard_query(&mut self) -> bool {
-        let q = self.pending_osc52_clipboard_query;
-        self.pending_osc52_clipboard_query = false;
-        q
+    pub fn take_osc52_clipboard_query(&mut self) -> Option<&'static [u8]> {
+        self.pending_osc52_clipboard_queries.pop_front()
     }
 
-    pub fn respond_osc52_clipboard(&mut self, content: &str) {
+    pub fn respond_osc52_clipboard(&mut self, content: &str, terminator: &[u8]) {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
         self.output_buffer.extend_from_slice(b"\x1b]52;c;");
         self.output_buffer.extend_from_slice(encoded.as_bytes());
-        self.output_buffer
-            .extend_from_slice(self.osc52_query_terminator);
+        self.output_buffer.extend_from_slice(terminator);
     }
 
     /// Feed one APC-G payload to the graphics state and write back whatever the
@@ -16986,7 +16981,27 @@ mod tests {
         );
 
         terminal.process_input(b"\x1b]52;c;?\x07");
-        assert!(terminal.take_osc52_clipboard_query());
+        assert_eq!(
+            terminal.take_osc52_clipboard_query(),
+            Some(b"\x07".as_slice())
+        );
+
+        terminal.process_input(b"\x1b]52;c;?\x07\x1b]52;c;?\x1b\\");
+        assert_eq!(
+            terminal.take_osc52_clipboard_query(),
+            Some(b"\x07".as_slice())
+        );
+        assert_eq!(
+            terminal.take_osc52_clipboard_query(),
+            Some(b"\x1b\\".as_slice())
+        );
+        assert_eq!(terminal.take_osc52_clipboard_query(), None);
+
+        terminal.process_input(b"\x1b]52;c;?\x07".repeat(10).as_slice());
+        assert_eq!(
+            std::iter::from_fn(|| terminal.take_osc52_clipboard_query()).count(),
+            8
+        );
     }
 
     #[test]
