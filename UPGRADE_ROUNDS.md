@@ -799,3 +799,8 @@ everywhere except a resize, and an audit against ember found the rest.
      clipboard completions stay behind the default-closed read gate; a structural
      regression pins `complete_osc52_read` clearing host data when reads are
      disabled.
+
+136. **OSC 52 SET write rate limit** — once `allow_remote_clipboard_write` is
+     granted, OSC 52 SETs are still capped at two host writes per rolling
+     second so a remote PTY cannot spam-replace the user's paste buffer. A unit
+     regression pins refusal of a third write inside the same window.

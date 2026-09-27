@@ -3609,6 +3609,28 @@ fn complete_osc52_read(
     }
 }
 
+/// Admit at most two OSC 52 SET writes per rolling second. A remote PTY that
+/// spam-sets the host clipboard would otherwise replace the user's paste
+/// buffer unboundedly once writes are permitted.
+fn admit_osc52_clipboard_write(
+    window_started: &mut std::time::Instant,
+    writes_in_window: &mut usize,
+) -> bool {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_WRITES_PER_WINDOW: usize = 2;
+
+    let now = std::time::Instant::now();
+    if now.duration_since(*window_started) >= WINDOW {
+        *window_started = now;
+        *writes_in_window = 0;
+    }
+    if *writes_in_window >= MAX_WRITES_PER_WINDOW {
+        return false;
+    }
+    *writes_in_window += 1;
+    true
+}
+
 /// Return the MIME type only when a new asynchronous host read should start.
 fn service_osc5522_read(
     terminal: &mut TerminalState,
@@ -4475,6 +4497,9 @@ struct Frost {
     /// iced's clipboard read is process-global. PTY-originated OSC 52/5522 reads
     /// must share one in-flight host read across every session.
     host_clipboard_read_owner: Option<(usize, RawFd)>,
+    /// Rolling window for OSC 52 SET rate limiting (two writes per second).
+    osc52_write_window_started: std::time::Instant,
+    osc52_writes_in_window: usize,
     agent: agent::AgentUi,
     /// Review-first command-correction requests and presented cards, keyed by
     /// stable terminal-session id (per-pane, generation-guarded).
@@ -4816,6 +4841,8 @@ impl Frost {
             palette: command_palette::PaletteState::new(),
             block_export_in_flight: false,
             host_clipboard_read_owner: None,
+            osc52_write_window_started: std::time::Instant::now(),
+            osc52_writes_in_window: 0,
             agent: agent::AgentUi::new(),
             command_corrections: command_correction::CorrectionRegistry::default(),
             ai_chats: ai_chats::AiChatsUi::new(is_first_instance),
@@ -12522,7 +12549,12 @@ impl Frost {
                 // refused write cannot be replayed by a later allowed one.
                 if let Some(text) = clip_set {
                     if self.config.allow_remote_clipboard_write {
-                        tasks.push(iced::clipboard::write(text));
+                        if admit_osc52_clipboard_write(
+                            &mut self.osc52_write_window_started,
+                            &mut self.osc52_writes_in_window,
+                        ) {
+                            tasks.push(iced::clipboard::write(text));
+                        }
                     }
                 }
                 for terminator in clip_queries {
@@ -25945,6 +25977,32 @@ mod tests {
             service_body.contains("terminal.respond_osc52_clipboard(content, terminator)"),
             "OSC 52 completions must answer through the bounded response path"
         );
+    }
+
+    #[test]
+    fn osc52_clipboard_writes_are_rate_limited_within_a_window() {
+        let mut window_started = std::time::Instant::now();
+        let mut writes_in_window = 0usize;
+        assert!(admit_osc52_clipboard_write(
+            &mut window_started,
+            &mut writes_in_window
+        ));
+        assert!(admit_osc52_clipboard_write(
+            &mut window_started,
+            &mut writes_in_window
+        ));
+        assert!(
+            !admit_osc52_clipboard_write(&mut window_started, &mut writes_in_window),
+            "a third OSC 52 SET inside the same second must be refused"
+        );
+        assert_eq!(writes_in_window, 2);
+        // A new window resets the budget so a later permitted SET can land.
+        window_started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(admit_osc52_clipboard_write(
+            &mut window_started,
+            &mut writes_in_window
+        ));
+        assert_eq!(writes_in_window, 1);
     }
 
     #[test]

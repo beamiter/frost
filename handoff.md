@@ -18,6 +18,10 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- **OSC 52 SET write rate limit (2026-09-28, wave 8, round 136)** — permitted
+  remote clipboard SETs are capped at two per rolling second so a PTY cannot
+  spam-replace the host paste buffer; a unit regression pins the window.
+
 - **OSC 52 read completion permission (2026-09-28, wave 7, round 135)** —
   async OSC 52 completions stay behind the default-closed read gate; a
   structural regression pins `complete_osc52_read` clearing host data when
