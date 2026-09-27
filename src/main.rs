@@ -25446,6 +25446,28 @@ mod tests {
     use iced::keyboard::key::Named;
 
     #[test]
+    fn osc5522_pending_read_counts_refusals_before_eperm() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut in_flight = false;
+        let mut pending = None;
+        let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
+        assert_eq!(
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, request()),
+            Some("text/plain".to_string())
+        );
+        // Permission is revoked while the host read is still outstanding.
+        assert!(
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, false, request())
+                .is_none()
+        );
+        assert!(
+            terminal.output_buffer.is_empty(),
+            "EPERM must not answer a later batch while the first read is still in flight"
+        );
+        assert_eq!(pending, Some(1));
+    }
+
+    #[test]
     fn osc5522_slow_read_precedes_later_mime_read_refusal() {
         let mut terminal = TerminalState::new(80, 24);
         let mut in_flight = false;

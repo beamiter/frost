@@ -761,3 +761,10 @@ everywhere except a resize, and an audit against ember found the rest.
      `ESC # 3` no longer leak their final byte, including across reads.
 129. **Formatting gate** — rustfmt-only fixes to this evening's agent-task
      code, which left `cargo fmt --check` failing on master.
+
+130. **Pending OSC 5522 reads precede EPERM** — while an asynchronous host read
+     is still outstanding, later MIME-data batches in the same session are
+     counted as bounded refusals rather than answered with an immediate EPERM,
+     so a permission flip mid-flight cannot be mistaken for the older read's
+     completion. A focused regression drives the outstanding-read path with
+     consent revoked between batches.
