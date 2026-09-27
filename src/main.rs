@@ -25929,6 +25929,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_osc_5522_clipboard_read_is_started_only_behind_the_read_permission() {
+        let source = frost_source();
+        let service = "fn service_osc5522_read(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("service_osc5522_read must exist");
+        assert!(
+            service_body.contains("if !allow_clipboard_read"),
+            "OSC 5522 reads must fail closed when the read permission is denied"
+        );
+        assert!(
+            service_body.contains("type=read:status=EPERM"),
+            "read-disabled OSC 5522 paths must answer EPERM without touching the host clipboard"
+        );
+        let call_site = source
+            .find("service_osc5522_read(")
+            .expect("OSC 5522 reads must go through service_osc5522_read");
+        let before_call = &source[..call_site];
+        assert!(
+            before_call.contains("allow_clipboard_read"),
+            "call sites must thread the read permission into service_osc5522_read"
+        );
+    }
+
     /// An OSC 52 SET is PTY output asking to replace the host clipboard, so it
     /// crosses the same trust boundary a read does, in the other direction: a
     /// program on the far side of an ssh connection choosing what the user's

@@ -782,3 +782,10 @@ everywhere except a resize, and an audit against ember found the rest.
      regression now proves `iced::clipboard::read()` is enqueued only inside
      the read-permission block and never from the host-read-blocked refusal
      path, matching the write-permission pin added earlier.
+
+133. **OSC 5522 read permission pinned structurally** — extended MIME reads
+     share the same default-closed permission and process-global host-read
+     owner as OSC 52 GET. A structural regression now proves
+     `service_osc5522_read` stays behind `allow_clipboard_read`, host-read
+     blocking cannot enqueue another `iced::clipboard::read()`, and read-disabled
+     paths answer EPERM without touching the clipboard.
