@@ -789,3 +789,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `service_osc5522_read` stays behind `allow_clipboard_read`, host-read
      blocking cannot enqueue another `iced::clipboard::read()`, and read-disabled
      paths answer EPERM without touching the clipboard.
+
+134. **OSC 5522 completion stays behind read permission** — async clipboard
+     completions for extended MIME reads now pin `complete_osc5522_read` behind
+     the same default-closed permission, answering EPERM without touching host
+     data when reads are disabled.

@@ -25930,6 +25930,24 @@ mod tests {
     }
 
     #[test]
+    fn an_osc_5522_read_completion_honors_the_read_permission() {
+        let source = frost_source();
+        let service = "fn complete_osc5522_read(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("complete_osc5522_read must exist");
+        assert!(
+            service_body.contains("if !allow_clipboard_read"),
+            "OSC 5522 completions must fail closed when the read permission is denied"
+        );
+        assert!(
+            service_body.contains("type=read:status=EPERM"),
+            "read-disabled OSC 5522 completions must answer EPERM without host data"
+        );
+    }
+
+    #[test]
     fn an_osc_5522_clipboard_read_is_started_only_behind_the_read_permission() {
         let source = frost_source();
         let service = "fn service_osc5522_read(";

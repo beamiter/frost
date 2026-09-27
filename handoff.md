@@ -18,6 +18,11 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- **OSC 5522 read completion permission (2026-09-28, wave 6, round 134)** —
+  async MIME read completions stay behind the default-closed read gate; a
+  structural regression pins `complete_osc5522_read` answering EPERM without
+  host data when reads are disabled.
+
 - **The execution journal's Start identity, and the `--session` flag without
   which none of it was reachable (2026-09-05)**: `jterm_core` moves to
   `9f94f77b694ef5e0b20b9fd4bd776b98220360c4` (transitively `jagent`
