@@ -25930,6 +25930,24 @@ mod tests {
     }
 
     #[test]
+    fn an_osc_52_read_completion_honors_the_read_permission() {
+        let source = frost_source();
+        let service = "fn complete_osc52_read(";
+        let service_body = source
+            .split_once(service)
+            .and_then(|(_, rest)| rest.split("\nfn ").next())
+            .expect("complete_osc52_read must exist");
+        assert!(
+            service_body.contains("if allow_clipboard_read && content.len()"),
+            "OSC 52 completions must fail closed when the read permission is denied"
+        );
+        assert!(
+            service_body.contains("terminal.respond_osc52_clipboard(content, terminator)"),
+            "OSC 52 completions must answer through the bounded response path"
+        );
+    }
+
+    #[test]
     fn an_osc_5522_read_completion_honors_the_read_permission() {
         let source = frost_source();
         let service = "fn complete_osc5522_read(";

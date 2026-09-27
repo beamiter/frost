@@ -794,3 +794,8 @@ everywhere except a resize, and an audit against ember found the rest.
      completions for extended MIME reads now pin `complete_osc5522_read` behind
      the same default-closed permission, answering EPERM without touching host
      data when reads are disabled.
+
+135. **OSC 52 completion read permission pinned structurally** — async OSC 52
+     clipboard completions stay behind the default-closed read gate; a structural
+     regression pins `complete_osc52_read` clearing host data when reads are
+     disabled.

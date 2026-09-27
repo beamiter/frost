@@ -18,6 +18,11 @@ stale UI targets fail closed, and automatic helper resolution no longer trusts `
 
 ## Completed since the previous handoff
 
+- **OSC 52 read completion permission (2026-09-28, wave 7, round 135)** —
+  async OSC 52 completions stay behind the default-closed read gate; a
+  structural regression pins `complete_osc52_read` clearing host data when
+  reads are disabled.
+
 - **OSC 5522 read completion permission (2026-09-28, wave 6, round 134)** —
   async MIME read completions stay behind the default-closed read gate; a
   structural regression pins `complete_osc5522_read` answering EPERM without
