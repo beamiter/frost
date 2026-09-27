@@ -762,6 +762,15 @@ everywhere except a resize, and an audit against ember found the rest.
 129. **Formatting gate** — rustfmt-only fixes to this evening's agent-task
      code, which left `cargo fmt --check` failing on master.
 
+130. **Process-global OSC clipboard reads** — iced's clipboard API is one
+     in-flight read per process, but frost tracked `clipboard_read_in_flight`
+     per session, so two panes could each spawn `iced::clipboard::read()` and
+     race the host clipboard. A single owner `(session id, PTY fd)` now gates
+     every OSC 52 and OSC 5522 host read; other sessions receive the
+     interoperable busy/empty refusal without starting another read, closing a
+     pane releases an outstanding owner, and late async completions clear the
+     slot even when the originating session is already gone.
+
 130. **Pending OSC 5522 reads precede EPERM** — while an asynchronous host read
      is still outstanding, later MIME-data batches in the same session are
      counted as bounded refusals rather than answered with an immediate EPERM,

@@ -3615,6 +3615,7 @@ fn service_osc5522_read(
     in_flight: &mut bool,
     pending_refusals: &mut Option<usize>,
     allow_clipboard_read: bool,
+    host_read_blocked: bool,
     kind: terminal::ClipboardReadKind,
 ) -> Option<String> {
     if let Some(refusals) = pending_refusals {
@@ -3633,7 +3634,7 @@ fn service_osc5522_read(
             }
             terminal::ClipboardReadKind::MimeData(mime) => {
                 if mime.starts_with("text") {
-                    if *in_flight {
+                    if *in_flight || host_read_blocked {
                         osc_5522_packet("type=read:status=EBUSY", None)
                     } else {
                         *in_flight = true;
@@ -4471,6 +4472,9 @@ struct Frost {
     /// serialized buffer. Keep only one worker in flight across the window so
     /// a repeated shortcut cannot queue unbounded copies of terminal output.
     block_export_in_flight: bool,
+    /// iced's clipboard read is process-global. PTY-originated OSC 52/5522 reads
+    /// must share one in-flight host read across every session.
+    host_clipboard_read_owner: Option<(usize, RawFd)>,
     agent: agent::AgentUi,
     /// Review-first command-correction requests and presented cards, keyed by
     /// stable terminal-session id (per-pane, generation-guarded).
@@ -4811,6 +4815,7 @@ impl Frost {
             search_replace: search_replace_panel::SearchReplacePanelState::new(),
             palette: command_palette::PaletteState::new(),
             block_export_in_flight: false,
+            host_clipboard_read_owner: None,
             agent: agent::AgentUi::new(),
             command_corrections: command_correction::CorrectionRegistry::default(),
             ai_chats: ai_chats::AiChatsUi::new(is_first_instance),
@@ -6273,6 +6278,32 @@ impl Frost {
         }
     }
 
+    fn host_clipboard_read_blocked_for(&self, id: usize, fd: RawFd) -> bool {
+        self.host_clipboard_read_owner
+            .is_some_and(|(owner_id, owner_fd)| owner_id != id || owner_fd != fd)
+    }
+
+    fn try_begin_host_clipboard_read(&mut self, id: usize, fd: RawFd) -> bool {
+        if self.host_clipboard_read_owner.is_some() {
+            return false;
+        }
+        self.host_clipboard_read_owner = Some((id, fd));
+        true
+    }
+
+    fn finish_host_clipboard_read(&mut self, id: usize, fd: RawFd) {
+        if self
+            .host_clipboard_read_owner
+            .is_some_and(|(owner_id, owner_fd)| owner_id == id && owner_fd == fd)
+        {
+            self.host_clipboard_read_owner = None;
+        }
+    }
+
+    fn release_host_clipboard_read(&mut self, id: usize, fd: RawFd) {
+        self.finish_host_clipboard_read(id, fd);
+    }
+
     fn session_by_identity(&mut self, id: usize, fd: RawFd) -> Option<&mut Session> {
         self.sessions
             .iter_mut()
@@ -6710,6 +6741,11 @@ impl Frost {
         }
         let mut sess = self.sessions.remove(index);
         let closed_id = sess.id;
+        let closed_fd = sess.master_fd;
+        if sess.clipboard_read_in_flight {
+            sess.clipboard_read_in_flight = false;
+            self.release_host_clipboard_read(closed_id, closed_fd);
+        }
         // A user-initiated close of a task-bound terminal cancels the binding
         // (no child exit status was observed). Sessions already reported
         // through `handle_terminal_session_exit` are in a terminal state, so
@@ -12469,6 +12505,10 @@ impl Frost {
                 // system clipboard asynchronously and writes the base64
                 // response back to the originating session's PTY.
                 let mut tasks: Vec<Task<Message>> = Vec::new();
+                let session_index = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id && session.master_fd == fd);
                 if refresh_block_search {
                     tasks.push(self.begin_block_search_rebuild());
                 }
@@ -12492,23 +12532,25 @@ impl Frost {
                         }
                     }
                     if self.config.allow_clipboard_read {
-                        let start_read = if let Some(sess) = self.session_by_identity(id, fd) {
-                            if sess.clipboard_read_in_flight {
-                                false
-                            } else {
+                        let host_blocked = self.host_clipboard_read_blocked_for(id, fd);
+                        let session_busy = session_index
+                            .and_then(|index| self.sessions.get(index))
+                            .is_some_and(|session| session.clipboard_read_in_flight);
+                        let start_read = !session_busy
+                            && !host_blocked
+                            && self.try_begin_host_clipboard_read(id, fd);
+                        if start_read {
+                            if let Some(index) = session_index {
+                                let sess = &mut self.sessions[index];
                                 sess.clipboard_read_in_flight = true;
                                 sess.osc52_pending_refusals = Some(Default::default());
-                                true
                             }
-                        } else {
-                            false
-                        };
-                        if start_read {
                             tasks.push(
                                 iced::clipboard::read()
                                     .map(move |c| Message::Osc52Query(id, fd, terminator, c)),
                             );
-                        } else if let Some(sess) = self.session_by_identity(id, fd) {
+                        } else if let Some(index) = session_index {
+                            let sess = &mut self.sessions[index];
                             // OSC 52 has no structured busy status; an empty response
                             // is the interoperable refusal while another read runs.
                             sess.terminal.respond_osc52_clipboard("", terminator);
@@ -12529,19 +12571,35 @@ impl Frost {
                 // an async clipboard read; non-text MIME types get ENOSYS.
                 for kind in clip_requests {
                     let allow_clipboard_read = self.config.allow_clipboard_read;
-                    if let Some(sess) = self.session_by_identity(id, fd) {
-                        if let Some(mime) = service_osc5522_read(
+                    let host_blocked = self.host_clipboard_read_blocked_for(id, fd);
+                    let mime = session_index.and_then(|index| {
+                        let sess = &mut self.sessions[index];
+                        service_osc5522_read(
                             &mut sess.terminal,
                             &mut sess.clipboard_read_in_flight,
                             &mut sess.osc5522_pending_refusals,
                             allow_clipboard_read,
+                            host_blocked,
                             kind,
-                        ) {
+                        )
+                    });
+                    if let Some(mime) = mime {
+                        if self.try_begin_host_clipboard_read(id, fd) {
                             tasks.push(
                                 iced::clipboard::read()
                                     .map(move |c| Message::Osc5522Data(id, fd, mime.clone(), c)),
                             );
+                        } else if let Some(index) = session_index {
+                            let sess = &mut self.sessions[index];
+                            sess.clipboard_read_in_flight = false;
+                            sess.osc5522_pending_refusals = None;
+                            sess.terminal.output_buffer.extend_from_slice(
+                                &osc_5522_packet("type=read:status=EBUSY", None),
+                            );
                         }
+                    }
+                    if let Some(index) = session_index {
+                        let sess = &mut self.sessions[index];
                         sess.flush_responses();
                         sess.refresh();
                     }
@@ -13218,6 +13276,7 @@ impl Frost {
             }
             Message::Osc52Query(id, fd, terminator, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
+                self.finish_host_clipboard_read(id, fd);
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.clipboard_read_in_flight = false;
                     let content = content.as_deref().unwrap_or("");
@@ -13234,6 +13293,7 @@ impl Frost {
             }
             Message::Osc5522Data(id, fd, mime, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
+                self.finish_host_clipboard_read(id, fd);
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     complete_osc5522_read(
                         &mut sess.terminal,
@@ -25452,12 +25512,12 @@ mod tests {
         let mut pending = None;
         let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
         assert_eq!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, request()),
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, false, request()),
             Some("text/plain".to_string())
         );
         // Permission is revoked while the host read is still outstanding.
         assert!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, false, request())
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, false, false, request())
                 .is_none()
         );
         assert!(
@@ -25474,12 +25534,12 @@ mod tests {
         let mut pending = None;
         let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
         assert_eq!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, request()),
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, false, request()),
             Some("text/plain".to_string())
         );
         // A second PTY batch arrives before iced returns the first read.
         assert!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, request())
+            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, false, request())
                 .is_none()
         );
         assert!(
@@ -25511,6 +25571,7 @@ mod tests {
             &mut in_flight,
             &mut pending,
             true,
+            false,
             terminal::ClipboardReadKind::MimeData("text/plain".into()),
         )
         .is_some());
@@ -25527,6 +25588,7 @@ mod tests {
                 &mut in_flight,
                 &mut pending,
                 index < 50,
+                false,
                 request,
             )
             .is_none());
@@ -25542,10 +25604,16 @@ mod tests {
             &mut other_in_flight,
             &mut other_pending,
             true,
+            true,
             terminal::ClipboardReadKind::MimeData("text/plain".into()),
         )
-        .is_some());
-        assert_eq!(other_pending, Some(0));
+        .is_none());
+        assert_eq!(
+            other_terminal.output_buffer,
+            osc_5522_packet("type=read:status=EBUSY", None)
+        );
+        assert!(!other_in_flight);
+        assert!(other_pending.is_none());
 
         complete_osc5522_read(
             &mut terminal,
@@ -25560,19 +25628,52 @@ mod tests {
         assert_eq!(terminal.output_buffer, expected);
         assert!(pending.is_none());
         assert!(!in_flight);
-        assert!(other_terminal.output_buffer.is_empty());
-        assert!(other_in_flight);
-        assert_eq!(other_pending, Some(0));
-
         // Completing this read releases its own slot for a fresh request.
         assert!(service_osc5522_read(
             &mut terminal,
             &mut in_flight,
             &mut pending,
             true,
+            false,
             terminal::ClipboardReadKind::MimeData("text/plain".into()),
         )
         .is_some());
+    }
+
+    #[test]
+    fn osc5522_host_read_is_globally_single_flight() {
+        let mut first = TerminalState::new(80, 24);
+        let mut first_in_flight = false;
+        let mut first_pending = None;
+        let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
+        assert_eq!(
+            service_osc5522_read(
+                &mut first,
+                &mut first_in_flight,
+                &mut first_pending,
+                true,
+                false,
+                request(),
+            ),
+            Some("text/plain".to_string())
+        );
+
+        let mut second = TerminalState::new(80, 24);
+        let mut second_in_flight = false;
+        let mut second_pending = None;
+        assert!(service_osc5522_read(
+            &mut second,
+            &mut second_in_flight,
+            &mut second_pending,
+            true,
+            true,
+            request(),
+        )
+        .is_none());
+        assert_eq!(
+            second.output_buffer,
+            osc_5522_packet("type=read:status=EBUSY", None)
+        );
     }
 
     #[test]
