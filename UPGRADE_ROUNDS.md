@@ -776,3 +776,9 @@ everywhere except a resize, and an audit against ember found the rest.
      interoperable busy/empty refusal without starting another read, closing a
      pane releases an outstanding owner, and late async completions clear the
      slot even when the originating session is already gone.
+
+132. **OSC 52 GET permission pinned structurally** — `allow_clipboard_read`
+     defaults closed, but only runtime config tests saw it. A structural
+     regression now proves `iced::clipboard::read()` is enqueued only inside
+     the read-permission block and never from the host-read-blocked refusal
+     path, matching the write-permission pin added earlier.

@@ -25906,6 +25906,29 @@ mod tests {
         }
     }
 
+    /// OSC 52 GET crosses the same trust boundary as a write, in the other
+    /// direction. `allow_clipboard_read` defaults closed; pin both the
+    /// permission check and the async host read it guards structurally.
+    #[test]
+    fn an_osc_52_clipboard_get_is_started_only_behind_the_read_permission() {
+        let source = frost_source();
+        let read = format!("iced::clipboard::{}(", "read");
+        let permitted =
+            braced_block_after(&source, "if self.config.allow_clipboard_read {");
+        assert!(
+            permitted.contains(&read),
+            "an OSC 52 GET may only start a host read when the permission is granted"
+        );
+        let blocked = braced_block_after(
+            &source,
+            "if self.host_clipboard_read_blocked_for(id, fd) {",
+        );
+        assert!(
+            !blocked.contains(&read),
+            "a blocked host read must not enqueue another iced clipboard read"
+        );
+    }
+
     /// An OSC 52 SET is PTY output asking to replace the host clipboard, so it
     /// crosses the same trust boundary a read does, in the other direction: a
     /// program on the far side of an ssh connection choosing what the user's
