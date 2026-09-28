@@ -1238,6 +1238,31 @@ fn glyph_shaping(content: &str) -> text::Shaping {
     }
 }
 
+/// Layout width for a batched glyph run of `len` cells.
+///
+/// iced 0.14 lays out `fill_text` through its text cache, which ignores
+/// `Text::wrapping`, so cosmic-text word-wraps at `bounds.width`. The run's
+/// summed advances can land a few ULPs past `cw * len` (more so under a UI
+/// scale), and a path then breaks at `/` or `-` with its tail drawn over the
+/// next row. Left-aligned glyph placement never depends on this width and
+/// clipping comes from `clip`, so one spare cell of headroom is free.
+fn run_layout_width(cw: f32, len: usize) -> f32 {
+    cw * (len + 1) as f32
+}
+
+/// Clip for the collapsed-summary label. The label lays out with unbounded
+/// width (like iced's own canvas text) because a finite width would wrap it
+/// onto the next row for the reason `run_layout_width` gives; it is cut off
+/// at `right` instead. `None` when no horizontal room is left.
+fn summary_label_clip(clip: Rectangle, left: f32, right: f32) -> Option<Rectangle> {
+    clip.intersection(&Rectangle {
+        x: left,
+        y: clip.y,
+        width: right - left,
+        height: clip.height,
+    })
+}
+
 fn solid_quad(bounds: Rectangle) -> Quad {
     Quad {
         bounds,
@@ -1254,11 +1279,12 @@ mod tests {
         app_mouse_surface_eligible, block_card_geometry, block_card_hover_contains,
         block_card_segments, block_card_shadow, block_card_stripe_bounds, block_card_visual,
         block_mouse_action, clipped_block_card_border_bounds, ctrl_link_eligible, glyph_joins_run,
-        glyph_shaping, link_surface_eligible, owns_mouse_release, should_use_cjk_fallback_font,
-        should_use_math_symbol_fallback_font, should_use_nerd_symbol_fallback_font,
-        should_use_symbol_fallback_font, stable_summary_activation, terminal_glyph_font,
-        BlockCardKind, BlockCardSegment, BlockMouseAction, BlockPaintRow, CollapsedSummaryPaint,
-        Metrics, MouseButton, SummaryPress, BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS,
+        glyph_shaping, link_surface_eligible, measure_mono_ascii_advance, owns_mouse_release,
+        run_layout_width, should_use_cjk_fallback_font, should_use_math_symbol_fallback_font,
+        should_use_nerd_symbol_fallback_font, should_use_symbol_fallback_font,
+        stable_summary_activation, summary_label_clip, terminal_glyph_font, BlockCardKind,
+        BlockCardSegment, BlockMouseAction, BlockPaintRow, CollapsedSummaryPaint, Metrics,
+        MouseButton, SummaryPress, BLOCK_CARD_COMPACT_INSET, BLOCK_CARD_COMPACT_RADIUS,
         BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Point, Rectangle};
@@ -1651,6 +1677,104 @@ mod tests {
             0.0,
             "viewport clipping must not manufacture a horizontal shadow cap"
         );
+    }
+
+    #[test]
+    fn batched_runs_never_wrap_inside_iced_text_cache() {
+        use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics as TextMetrics, Shaping};
+
+        // Mirror iced 0.14's cached `fill_text` layout: bounds and size are
+        // multiplied by the UI scale, and cosmic-text's default wrap applies
+        // because the cache drops `Text::wrapping`.
+        let runs = [
+            "/home/ubuntu/projects/frost/data/io.github.beamiter.frost.desktop",
+            "/home/ubuntu/.local/share/frost/workflows/.docker-tail-logs.yaml.install.s77abc",
+            "/home/ubuntu/.local/share/icons/hicolor/128x128/apps/.io.github.beamiter.frost.png.install.FjDCJb",
+            "--ignore-theme-index",
+        ];
+        let mut font_system = FontSystem::new();
+        let mut checked = 0;
+        for font_size in [12.0f32, 14.0, 19.0, 20.0, 21.0, 22.0] {
+            let Some(cw) = measure_mono_ascii_advance(iced::Font::MONOSPACE, font_size) else {
+                continue;
+            };
+            for scale in [0.9f32, 1.0, 1.1, 1.25, 1.5, 2.0] {
+                for run in runs {
+                    let size = font_size * scale;
+                    let mut buffer =
+                        Buffer::new(&mut font_system, TextMetrics::new(size, size * 1.2));
+                    buffer.set_size(
+                        &mut font_system,
+                        Some(run_layout_width(cw, run.chars().count()) * scale),
+                        Some(size * 1.2),
+                    );
+                    buffer.set_text(
+                        &mut font_system,
+                        run,
+                        &Attrs::new().family(Family::Monospace),
+                        Shaping::Basic,
+                        None,
+                    );
+                    assert_eq!(
+                        buffer.layout_runs().count(),
+                        1,
+                        "{run:?} wrapped at font size {font_size}, scale {scale}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        // Fontless environments keep per-cell emission and never batch.
+        if checked == 0 {
+            assert!(
+                !Metrics::with_font(iced::Font::MONOSPACE, 14.0, 1.0, 2.0, false)
+                    .mono_advance_exact
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_summary_label_is_clipped_not_wrapped() {
+        use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics as TextMetrics, Shaping};
+
+        let clip = Rectangle {
+            x: 0.0,
+            y: 10.0,
+            width: 800.0,
+            height: 400.0,
+        };
+        let label = summary_label_clip(clip, 20.0, 300.0).expect("room for the label");
+        assert_eq!((label.x, label.width), (20.0, 280.0));
+        assert_eq!((label.y, label.height), (clip.y, clip.height));
+        assert_eq!(
+            summary_label_clip(clip, 20.0, 900.0).map(|r| r.width),
+            Some(780.0),
+            "the label never paints outside the widget clip"
+        );
+        assert!(summary_label_clip(clip, 300.0, 300.0).is_none());
+        assert!(summary_label_clip(clip, 300.0, 200.0).is_none());
+
+        // The unbounded layout iced's cache receives stays one line with
+        // finite glyph positions, however narrow the pane is.
+        let mut font_system = FontSystem::new();
+        let mut buffer = Buffer::new(&mut font_system, TextMetrics::new(18.9, 25.2));
+        buffer.set_size(&mut font_system, Some(f32::INFINITY), Some(25.2));
+        buffer.set_text(
+            &mut font_system,
+            "▸ 1234 output rows hidden — click to expand",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        let runs: Vec<_> = buffer.layout_runs().collect();
+        assert!(runs.len() <= 1);
+        for run in runs {
+            assert!(run.line_w.is_finite());
+            assert!(run
+                .glyphs
+                .iter()
+                .all(|g| g.x.is_finite() && g.w.is_finite()));
+        }
     }
 
     #[test]
@@ -2482,7 +2606,7 @@ where
                 renderer.fill_text(
                     Text {
                         content,
-                        bounds: Size::new(cw * *len as f32, ch),
+                        bounds: Size::new(run_layout_width(cw, *len), ch),
                         size: Pixels(font_size),
                         line_height: text::LineHeight::Absolute(Pixels(ch)),
                         font: run_font,
@@ -2680,26 +2804,29 @@ where
                     "▸ {} output rows hidden — click to expand",
                     summary.hidden_display_rows
                 );
+                let text_left = ox + cw;
                 let text_right = scrollbar_track_left - 8.0;
-                renderer.fill_text(
-                    Text {
-                        content,
-                        bounds: Size::new((text_right - ox - cw).max(0.0), ch),
-                        size: Pixels((font_size * 0.9).max(8.0)),
-                        line_height: text::LineHeight::Absolute(Pixels(ch)),
-                        font,
-                        align_x: text::Alignment::Left,
-                        align_y: iced::alignment::Vertical::Center,
-                        shaping: text::Shaping::Advanced,
-                        wrapping: text::Wrapping::None,
-                    },
-                    Point::new(ox + cw, y + ch / 2.0),
-                    Color {
-                        a: 0.82,
-                        ..default_fg
-                    },
-                    clip,
-                );
+                if let Some(label_clip) = summary_label_clip(clip, text_left, text_right) {
+                    renderer.fill_text(
+                        Text {
+                            content,
+                            bounds: Size::new(f32::INFINITY, ch),
+                            size: Pixels((font_size * 0.9).max(8.0)),
+                            line_height: text::LineHeight::Absolute(Pixels(ch)),
+                            font,
+                            align_x: text::Alignment::Left,
+                            align_y: iced::alignment::Vertical::Center,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                        },
+                        Point::new(text_left, y + ch / 2.0),
+                        Color {
+                            a: 0.82,
+                            ..default_fg
+                        },
+                        label_clip,
+                    );
+                }
             }
         }
 
