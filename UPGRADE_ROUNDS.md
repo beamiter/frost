@@ -874,3 +874,9 @@ everywhere except a resize, and an audit against ember found the rest.
      STAGE 71 + timeout/nice nest, Inspect/Sit→Unknown `between()` 93, anvil
      117–121 / forge 151–155 sticky/find/organism edges, and prior waves.
      Manifests stay on published pins.
+
+149. **Evolve round-39 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     openvt/daemonize busybox applet + pipe-to-bash deepenings, DISPATCHES
+     STAGE 71 set-eq beside CLASSIFY_FORMS, and prior waves. Manifests stay
+     on published pins.
