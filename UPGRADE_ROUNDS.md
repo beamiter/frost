@@ -804,3 +804,8 @@ everywhere except a resize, and an audit against ember found the rest.
      granted, OSC 52 SETs are still capped at two host writes per rolling
      second so a remote PTY cannot spam-replace the user's paste buffer. A unit
      regression pins refusal of a third write inside the same window.
+
+137. **Evolve round-25 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` `f2d2ce0`
+     + jagent `a7474e9` after `between()` 76, Find continue bookmark-empty,
+     and STAGE 64 handoff sync. Manifests stay on published pins.
