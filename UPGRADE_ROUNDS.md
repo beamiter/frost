@@ -1013,3 +1013,9 @@ everywhere except a resize, and an audit against ember found the rest.
      find + MAX-10/Unknown→GuardStuck beside round-60 wave-38. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
 
+171. **Evolve round-62 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` `00fde9b` +
+     jagent `49655f5` after anvil 204–207 / forge 256–260 sticky 1805 + 1804
+     find + MAX-11/Unknown→GuardFailure beside round-61. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
+
