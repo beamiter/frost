@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align: core cohort `33093da` + jagent `628811b`; local path-patch)
+Updated: 2026-09-29 (family pin align smoke on path-patched core `99e24c0`)
 
 ## 2026-09-29 (family pin align)
 
@@ -8,6 +8,7 @@ Updated: 2026-09-29 (family pin align: core cohort `33093da` + jagent `628811b`;
   Local `.cargo/config.toml` path-patches `../jterm_core` (gitignored) so builds
   see organism vigil HEAD `99e24c0`. Secondary repin to `99e24c0` remains
   **pending push** of core. Transitive jagent is `628811b` under the path patch.
+- **Smoke**: `cargo test --bin frost` — 888 passed against path-patched local core.
 
 Updated: 2026-09-05 (the jsh execution-journal lifecycle token and the
 `--session` identity that makes it reachable at all; an untrusted-archive
