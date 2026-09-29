@@ -919,3 +919,10 @@ everywhere except a resize, and an audit against ember found the rest.
      CrossBlock/Retry/FVS/NBSP pins, STAGE 71 / between() 93, and prior waves.
      Manifests stay on published pins.
 
+
+156. **Evolve round-45 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after anvil
+     152–154 / forge 192–195 bidi sticky/find/notice + ambient disposition
+     completeness beside anvil 148–151 / forge 188–191 Idle/Rest Guard pins,
+     wave-32 PATH leftovers + aa-exec/socket-activate deepen, STAGE 71 /
+     between() 93, and prior waves. Manifests stay on published pins.
