@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-43 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-43 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `c660336` + jagent `40dc4d3`;
+  manifests still published pins): `cargo test --bin frost -- workflows
+  command_correction` — 12 passed after PATH wave-31 ctl/utility leftovers out
+  of STAGE beside CLASSIFY/DISPATCHES lockstep at 71, anvil 133–136 / forge
+  170–174 Hangul/whitespace/Watch* pins, and prior waves. Core/jagent tips
+  still **pending push/repin**.
+
+
 Updated: 2026-09-29 (evolve round-41 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-41 smoke)
