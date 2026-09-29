@@ -850,3 +850,9 @@ everywhere except a resize, and an audit against ember found the rest.
      busybox applet + pipe-to-bash nest deepenings for uclampset/gamemoderun/
      gnome-session-inhibit, CLASSIFY_FORMS set-equality with STAGE 70, and
      timeout/nice classify peels. Manifests stay on published pins.
+
+145. **Evolve round-34 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     ambient→vigil/celebrate None, PATH wave-27 identity/agent leftovers
+     out of STAGE, and anvil 105–107 / forge 139–141 organism/find/history
+     edges. Manifests stay on published pins.
