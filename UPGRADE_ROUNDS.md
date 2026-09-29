@@ -932,3 +932,9 @@ everywhere except a resize, and an audit against ember found the rest.
      155–157 / forge 196–199 sticky VS/FVS4 + find marks + GlanceAside ambient
      beside anvil 152–154 / forge 192–195 bidi/ambient, STAGE 71 / between()
      93, and prior waves. Manifests stay on published pins.
+
+158. **Evolve round-49 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after PATH
+     wave-33 device/sysctl leftovers + setsid busybox/timeout/nice deepen
+     beside anvil 158–160 / forge 200–202 CrossBlock cancel + Celebrate survey,
+     STAGE 71 / between() 93, and prior waves. Manifests stay on published pins.
