@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (family pin align: core cohort `33093da` + jagent `628811b`; local path-patch)
+
+## 2026-09-29 (family pin align)
+
+- **jterm_core pin → `33093da`** (Cargo.toml / lock / deny) to match anvil/forge.
+  Local `.cargo/config.toml` path-patches `../jterm_core` (gitignored) so builds
+  see organism vigil HEAD `99e24c0`. Secondary repin to `99e24c0` remains
+  **pending push** of core. Transitive jagent is `628811b` under the path patch.
+
 Updated: 2026-09-05 (the jsh execution-journal lifecycle token and the
 `--session` identity that makes it reachable at all; an untrusted-archive
 staging boundary and OSC 52/OSC 9/OSC 133 hardening; the amortised command-zone
