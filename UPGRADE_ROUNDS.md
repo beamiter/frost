@@ -951,3 +951,9 @@ everywhere except a resize, and an audit against ember found the rest.
      171–174 / forge 215–219 sticky FE04/syllable + FE03 find + MAX-3 cancel +
      Celebrate→Unknown beside anvil 165–170 / forge 208–214, STAGE 71 /
      between() 93, and prior waves. Manifests stay on published pins.
+
+161. **Evolve round-51 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after anvil
+     175–178 / forge 220–224 sticky FE05/Manchu + FE04 find + MAX-4 cancel +
+     Rest→Unknown beside anvil 171–174 / forge 215–219, STAGE 71 /
+     between() 93, and prior waves. Manifests stay on published pins.
