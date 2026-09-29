@@ -862,3 +862,9 @@ everywhere except a resize, and an audit against ember found the rest.
      wave-28 systemd inspector leftovers out of STAGE, systemd-cat/inhibit
      busybox + timeout/nice nest deepenings, and prior waves. Manifests stay
      on published pins.
+
+147. **Evolve round-36 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     ambient→hold/rest None, CelebrateBig fifteen/`between()` 91 UI lockstep,
+     anvil 111–116 / forge 145–150 sticky/find/organism edges, and PATH
+     wave-28. Manifests stay on published pins.
