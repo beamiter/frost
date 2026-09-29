@@ -4,9 +4,10 @@ Updated: 2026-09-29 (evolve round-54 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-54 smoke)
 
-- **Smoke** (path-patched local  HEAD  + jagent ;
-  manifests still published pins):  — 12 passed after wave-35 host/hw inventory leftover pin
-  + chrt/ionice STAGE deepen beside prior sticky/round-52 cohort, STAGE 71 /
+- **Smoke** (path-patched local `jterm_core` HEAD `85bbcac` + jagent `c773911`;
+  manifests still published pins): `cargo test --bin frost -- workflows
+  command_correction` — 12 passed after wave-35 host/hw inventory leftover pin
+  + chrt/ionice STAGE deepen beside prior sticky/round-52/53 cohort, STAGE 71 /
   between() 93. Core/jagent tips still **pending push/repin**.
 
 
