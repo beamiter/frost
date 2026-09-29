@@ -856,3 +856,9 @@ everywhere except a resize, and an audit against ember found the rest.
      ambient→vigil/celebrate None, PATH wave-27 identity/agent leftovers
      out of STAGE, and anvil 105–107 / forge 139–141 organism/find/history
      edges. Manifests stay on published pins.
+
+146. **Evolve round-35 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after PATH
+     wave-28 systemd inspector leftovers out of STAGE, systemd-cat/inhibit
+     busybox + timeout/nice nest deepenings, and prior waves. Manifests stay
+     on published pins.
