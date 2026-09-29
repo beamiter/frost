@@ -938,3 +938,10 @@ everywhere except a resize, and an audit against ember found the rest.
      wave-33 device/sysctl leftovers + setsid busybox/timeout/nice deepen
      beside anvil 158–160 / forge 200–202 CrossBlock cancel + Celebrate survey,
      STAGE 71 / between() 93, and prior waves. Manifests stay on published pins.
+
+159. **Evolve round-48 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after anvil
+     161–164 / forge 203–207 sticky FE02/nirugu + Hangul find + Watch* Unknown
+     + near-wrap finished beside anvil 158–160 / forge 200–202, STAGE 71 /
+     between() 93, and prior waves (fills gap before round-49). Manifests stay
+     on published pins.
