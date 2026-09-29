@@ -926,3 +926,9 @@ everywhere except a resize, and an audit against ember found the rest.
      completeness beside anvil 148–151 / forge 188–191 Idle/Rest Guard pins,
      wave-32 PATH leftovers + aa-exec/socket-activate deepen, STAGE 71 /
      between() 93, and prior waves. Manifests stay on published pins.
+
+157. **Evolve round-47 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after anvil
+     155–157 / forge 196–199 sticky VS/FVS4 + find marks + GlanceAside ambient
+     beside anvil 152–154 / forge 192–195 bidi/ambient, STAGE 71 / between()
+     93, and prior waves. Manifests stay on published pins.
