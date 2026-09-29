@@ -826,3 +826,9 @@ everywhere except a resize, and an audit against ember found the rest.
      `jterm_core` `ee39a12` + jagent `543415b` after STAGE 70 (`uclampset`/
      `gamemoderun`), Guard*→Celebrate* None survey, and anvil/forge sticky/
      find polish (rounds 95–97 / 129–130). Manifests stay on published pins.
+
+141. **Evolve round-30 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     gnome-session-inhibit STAGE arity edges, timeout/nice classify/jagent
+     nest, and membership/DISPATCHES/CLASSIFY_FORMS len-70 lockstep. Round
+     29 already sat on the handoff tip. Manifests stay on published pins.
