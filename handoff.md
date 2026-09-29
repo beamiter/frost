@@ -1,5 +1,21 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (evolve round-33 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-33 smoke)
+
+- **Smoke** (path-patched local  HEAD  + jagent ;
+  manifests still published pins): 
+running 3 tests
+test workflows::tests::frost_pins_its_search_path_and_its_load_order ... ok
+test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
+test workflows::tests::precedence_order_keeps_the_users_directory_first ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 885 filtered out; finished in 0.00s — 12 passed after busybox applet + pipe-to-bash nest
+  deepenings for uclampset/gamemoderun/gnome-session-inhibit, CLASSIFY_FORMS
+  set-equality with STAGE 70, timeout/nice classify peels, and prior waves.
+  Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (evolve round-31 smoke on path-patched core tip)
 
 ## 2026-09-29 (evolve round-31 smoke)
