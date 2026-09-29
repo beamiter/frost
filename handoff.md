@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-16 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-17 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-17 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD `4878172` + jagent `476c015`;
+  manifests still published pins): `cargo test --bin frost` — 888 passed after
+  WatchAgent→CelebrateBig None pin, STAGE_PREFIXES len == 55, anvil
+  Block-history sticky deferred note, forge idle cross-block TODO close, and
+  prior waves. Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-16 smoke)
 
