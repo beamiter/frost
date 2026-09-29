@@ -868,3 +868,9 @@ everywhere except a resize, and an audit against ember found the rest.
      ambient→hold/rest None, CelebrateBig fifteen/`between()` 91 UI lockstep,
      anvil 111–116 / forge 145–150 sticky/find/organism edges, and PATH
      wave-28. Manifests stay on published pins.
+
+148. **Evolve round-37 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after openvt
+     STAGE 71 + timeout/nice nest, Inspect/Sit→Unknown `between()` 93, anvil
+     117–121 / forge 151–155 sticky/find/organism edges, and prior waves.
+     Manifests stay on published pins.
