@@ -844,3 +844,9 @@ everywhere except a resize, and an audit against ember found the rest.
      `68982a3` + jagent `9cd0211` (busybox/pipe nest + CLASSIFY/STAGE 70
      set-eq; anvil 101–104 / forge 135–138 pins). Manifests stay on
      published pins.
+
+144. **Evolve round-33 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     busybox applet + pipe-to-bash nest deepenings for uclampset/gamemoderun/
+     gnome-session-inhibit, CLASSIFY_FORMS set-equality with STAGE 70, and
+     timeout/nice classify peels. Manifests stay on published pins.
