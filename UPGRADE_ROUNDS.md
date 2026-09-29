@@ -911,3 +911,11 @@ everywhere except a resize, and an audit against ember found the rest.
      Guard/Celebrate Full-motion + notice catch-up beside STAGE 71 /
      between() 93 / prior waves (fills gap before round-43). Manifests stay
      on published pins.
+
+155. **Evolve round-44 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after anvil
+     148–151 / forge 188–191 Idle/Rest Guard + hold→Watch + Failure→holds
+     Full-motion beside anvil 141–147 / forge 180–187 hold/ambient/Watch/
+     CrossBlock/Retry/FVS/NBSP pins, STAGE 71 / between() 93, and prior waves.
+     Manifests stay on published pins.
+
