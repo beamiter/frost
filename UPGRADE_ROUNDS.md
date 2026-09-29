@@ -990,7 +990,7 @@ everywhere except a resize, and an audit against ember found the rest.
      between() 93 held. Manifests stay on published pins.
 
 167. **Evolve round-58 path-patch smoke** — `cargo test --bin frost --
-     workflows command_correction` (12) against local `jterm_core` `2422ec0` +
-     jagent `8752794` after anvil 196–199 / forge 246–250 sticky 1803 + 1802
+     workflows command_correction` (12) against local `jterm_core` `8a8e607` +
+     jagent `8825c4f` after anvil 196–199 / forge 246–250 sticky 1803 + 1802
      find + MAX-9/Unknown→GuardCautious beside prior waves. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
