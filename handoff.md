@@ -4,14 +4,9 @@ Updated: 2026-09-30 (evolve round-61 smoke on path-patched core tip)
 
 ## 2026-09-30 (evolve round-61 smoke)
 
-- **Smoke** (path-patched local  HEAD  + jagent ;
-  manifests still published pins): 
-running 3 tests
-test workflows::tests::frost_pins_its_search_path_and_its_load_order ... ok
-test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
-test workflows::tests::precedence_order_keeps_the_users_directory_first ... ok
-
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 885 filtered out; finished in 0.00s — 12 passed after anvil 200–203 / forge 251–255 sticky
+- **Smoke** (path-patched local `jterm_core` HEAD `bbb361e` + jagent `cbbe241`;
+  manifests still published pins): `cargo test --bin frost -- workflows
+  command_correction` — 12 passed after anvil 200–203 / forge 251–255 sticky
   1804/colon + 1803 find + MAX-10 cancel + Unknown→GuardStuck beside round-60
   PATH wave-38, STAGE 71 / between() 93, and prior waves.
   Core/jagent tips still **pending push/repin**.
