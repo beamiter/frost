@@ -838,3 +838,9 @@ everywhere except a resize, and an audit against ember found the rest.
      wave-26 PATH non-launcher leftover pins, anvil sticky whitespace (100)
      + forge file-tree permission/missing (134), and STAGE 70 docs already
      present. Manifests stay on published pins.
+
+143. **Evolve round-32 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` HEAD
+     `68982a3` + jagent `9cd0211` (busybox/pipe nest + CLASSIFY/STAGE 70
+     set-eq; anvil 101–104 / forge 135–138 pins). Manifests stay on
+     published pins.
