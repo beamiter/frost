@@ -958,14 +958,10 @@ everywhere except a resize, and an audit against ember found the rest.
      Rest→Unknown beside anvil 171–174 / forge 215–219, STAGE 71 /
      between() 93, and prior waves. Manifests stay on published pins.
 
-162. **Evolve round-52 path-patch smoke** — 
-running 3 tests
-test workflows::tests::frost_pins_its_search_path_and_its_load_order ... ok
-test workflows::tests::every_bundled_workflow_is_parseable_and_review_only ... ok
-test workflows::tests::precedence_order_keeps_the_users_directory_first ... ok
-
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 885 filtered out; finished in 0.00s — 12 passed against path-patched local jterm_core
-      + jagent  after anvil 179–183 / forge 225–230 sticky
-     FE06/FE05/MAX-5/Celebrate-Rest/SitNear-Inspect beside prior waves (fills
-     gap wave-34 skipped). STAGE 71 / between() 93 held.
+162. **Evolve round-52 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` `4c5700c` +
+     jagent `d62a9da` after anvil 179–183 / forge 225–230 sticky FE06/FE05/
+     MAX-5/Celebrate-Rest/SitNear-Inspect beside prior waves (fills gap
+     wave-34 skipped). STAGE 71 / between() 93 held. Manifests stay on
+     published pins.
 
