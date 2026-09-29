@@ -1007,3 +1007,9 @@ everywhere except a resize, and an audit against ember found the rest.
      softlimit/cgexec STAGE deepen beside sticky 1804/MAX-10 / round-59.
      STAGE 71 / between() 93 held. Manifests stay on published pins.
 
+170. **Evolve round-61 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` `bbb361e` +
+     jagent `cbbe241` after anvil 200–203 / forge 251–255 sticky 1804 + 1803
+     find + MAX-10/Unknown→GuardStuck beside round-60 wave-38. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
+
