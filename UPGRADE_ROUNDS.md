@@ -945,3 +945,9 @@ everywhere except a resize, and an audit against ember found the rest.
      + near-wrap finished beside anvil 158–160 / forge 200–202, STAGE 71 /
      between() 93, and prior waves (fills gap before round-49). Manifests stay
      on published pins.
+
+160. **Evolve round-50 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after anvil
+     171–174 / forge 215–219 sticky FE04/syllable + FE03 find + MAX-3 cancel +
+     Celebrate→Unknown beside anvil 165–170 / forge 208–214, STAGE 71 /
+     between() 93, and prior waves. Manifests stay on published pins.
