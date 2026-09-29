@@ -965,3 +965,9 @@ everywhere except a resize, and an audit against ember found the rest.
      wave-34 skipped). STAGE 71 / between() 93 held. Manifests stay on
      published pins.
 
+163. **Evolve round-53 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` `94f01b3` +
+     jagent `d5be714` after anvil 184–187 / forge 231–235 sticky FE07/birga +
+     FE06 find + MAX-6/GuardRecovery→Unknown beside prior waves. STAGE 71 /
+     between() 93 held. Manifests stay on published pins.
+
