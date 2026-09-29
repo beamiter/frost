@@ -832,3 +832,9 @@ everywhere except a resize, and an audit against ember found the rest.
      gnome-session-inhibit STAGE arity edges, timeout/nice classify/jagent
      nest, and membership/DISPATCHES/CLASSIFY_FORMS len-70 lockstep. Round
      29 already sat on the handoff tip. Manifests stay on published pins.
+
+142. **Evolve round-31 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     wave-26 PATH non-launcher leftover pins, anvil sticky whitespace (100)
+     + forge file-tree permission/missing (134), and STAGE 70 docs already
+     present. Manifests stay on published pins.
