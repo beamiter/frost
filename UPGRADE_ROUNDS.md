@@ -1002,8 +1002,8 @@ everywhere except a resize, and an audit against ember found the rest.
      between() 93 held. Manifests stay on published pins.
 
 169. **Evolve round-60 path-patch smoke** — `cargo test --bin frost --
-     workflows command_correction` (12) against local `jterm_core` `46c602c` +
-     jagent `b323602` after PATH wave-38 process-table monitor leftovers +
+     workflows command_correction` (12) against local `jterm_core` `4844296` +
+     jagent `cedee08` after PATH wave-38 process-table monitor leftovers +
      softlimit/cgexec STAGE deepen beside sticky 1804/MAX-10 / round-59.
      STAGE 71 / between() 93 held. Manifests stay on published pins.
 
