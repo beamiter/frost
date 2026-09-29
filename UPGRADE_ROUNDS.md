@@ -889,6 +889,6 @@ everywhere except a resize, and an audit against ember found the rest.
 
 151. **Evolve round-40 path-patch smoke** — `cargo test --bin frost --
      workflows command_correction` (12) against local `jterm_core` after
-     anvil 126–127 / forge 161–163 sticky punct/thin/hair + find empty-query
+     anvil 129–130 / forge 164–166 sticky punct/thin/hair + find empty-query
      + notice catch-up beside STAGE 71 / between() 93 / prior waves.
      Manifests stay on published pins.
