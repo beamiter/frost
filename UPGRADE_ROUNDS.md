@@ -821,3 +821,8 @@ everywhere except a resize, and an audit against ember found the rest.
      STAGE 68 (`gnome-session-inhibit`), fail-closed nest/transparency deepen,
      Find/organism polish, and anvil/forge STAGE 68 docs (rounds 92 / 126).
      Manifests stay on published pins.
+
+140. **Evolve round-29 path-patch smoke** — `cargo test --bin frost -- workflows command_correction` (12) against local
+     `jterm_core` `ee39a12` + jagent `543415b` after STAGE 70 (`uclampset`/
+     `gamemoderun`), Guard*→Celebrate* None survey, and anvil/forge sticky/
+     find polish (rounds 95–97 / 129–130). Manifests stay on published pins.
