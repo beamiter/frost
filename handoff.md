@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-10 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-11 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-11 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD + jagent `3b7ebda`;
+  manifests still published pins): `cargo test --bin frost` — 888 passed after
+  torsocks/proxychains STAGE_PREFIXES, classify_command see-through, and
+  UnknownOutcome Full-motion bridges. Core/jagent tips still **pending
+  push/repin**.
 
 ## 2026-09-29 (evolve round-10 smoke)
 
