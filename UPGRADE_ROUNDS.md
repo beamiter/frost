@@ -875,14 +875,14 @@ everywhere except a resize, and an audit against ember found the rest.
      117–121 / forge 151–155 sticky/find/organism edges, and prior waves.
      Manifests stay on published pins.
 
-149. **Evolve round-39 path-patch smoke** — `cargo test --bin frost --
-     workflows command_correction` (12) against local `jterm_core` after
-     openvt/daemonize busybox applet + pipe-to-bash deepenings, DISPATCHES
-     STAGE 71 set-eq beside CLASSIFY_FORMS, and prior waves. Manifests stay
-     on published pins.
-
 149. **Evolve round-38 path-patch smoke** — `cargo test --bin frost --
      workflows command_correction` (12) against local `jterm_core` after STAGE
      71 busybox/DISPATCHES set-eq + openvt pipe nests, anvil 122–125 / forge
      156–160 sticky/find/cancel/notice + STAGE 71 tip docs, and
      Inspect/Sit→Unknown `between()` 93. Manifests stay on published pins.
+
+150. **Evolve round-39 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     openvt/daemonize busybox applet + pipe-to-bash deepenings, DISPATCHES
+     STAGE 71 set-eq beside CLASSIFY_FORMS, and prior waves. Manifests stay
+     on published pins.
