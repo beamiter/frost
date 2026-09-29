@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-8 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-9 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-9 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD + jagent `2e966a9`;
+  manifests still published pins): `cargo test --bin frost` — 888 passed after
+  fakeroot/proot/firejail STAGE_PREFIXES and classify_command see-through.
+  Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-8 smoke)
 
