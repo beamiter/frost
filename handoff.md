@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (evolve round-5 smoke on path-patched core tip)
+Updated: 2026-09-29 (evolve round-6 smoke on path-patched core tip)
+
+## 2026-09-29 (evolve round-6 smoke)
+
+- **Smoke** (path-patched local `jterm_core` HEAD + jagent `bde9376`;
+  manifests still published pins): `cargo test --bin frost` — 888 passed after
+  eatmydata/chronic/numactl/flock prefixes and WatchSettled/idle organism
+  bridges. Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (evolve round-5 smoke)
 
