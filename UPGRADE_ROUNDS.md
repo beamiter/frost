@@ -815,3 +815,9 @@ everywhere except a resize, and an audit against ember found the rest.
      STAGE 67 classify `--` peel, daemonize flag-only `-a`/`-v`, leftover
      `s6-envdir` pin, and anvil/forge STAGE 67 docs (rounds 88 / 122). Round
      26 already sat on the handoff tip. Manifests stay on published pins.
+
+139. **Evolve round-28 path-patch smoke** — `cargo test --bin frost --
+     workflows command_correction` (12) against local `jterm_core` after
+     STAGE 68 (`gnome-session-inhibit`), fail-closed nest/transparency deepen,
+     Find/organism polish, and anvil/forge STAGE 68 docs (rounds 92 / 126).
+     Manifests stay on published pins.
