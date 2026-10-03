@@ -20201,8 +20201,13 @@ impl Frost {
             .into_iter()
             .map(|s| s.to_string())
             .collect();
-        themes.extend(Theme::custom_theme_names());
-        let current_theme = Some(self.config.theme.clone());
+        themes.extend(
+            Theme::custom_theme_names()
+                .into_iter()
+                .map(crate::theme::bound_custom_theme_name)
+                .filter(|name| !name.is_empty()),
+        );
+        let current_theme = Some(crate::theme::bound_custom_theme_name(self.config.theme.clone()));
         let is_custom = !Theme::is_builtin(&self.config.theme);
 
         // Keep the modal inside the current window and switch to a stacked form

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 256 — bounded settings theme-picker names)
+
+## 2026-10-04 (upgrade round 256)
+
+- Settings theme pick_list sanitizes custom theme names from disk.
+- `cargo test --locked --bin frost -- theme::tests::custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 255 — bounded native-session snapshot chrome)
 
 ## 2026-10-04 (upgrade round 255)

@@ -1437,3 +1437,7 @@ everywhere except a resize, and an audit against ember found the rest.
      status, and approval-kind Debug were interpolated as iced text. Those now
      use the toast / visible_bounded envelopes.
 
+256. **Bounded settings theme-picker names** — custom theme filenames from
+     disk were listed in the iced pick_list verbatim. Names now run
+     `bound_custom_theme_name` before display.
+

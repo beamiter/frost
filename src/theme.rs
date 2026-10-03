@@ -176,6 +176,11 @@ mod tests {
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
         assert!(Theme::validate_custom_theme_name(&filled).is_ok());
+        let listed = bound_custom_theme_name(format!("dusk\u{1b}[31m\u{202e}{}", "n".repeat(400)));
+        assert!(!listed.contains('\u{1b}'));
+        assert!(!listed.contains('\u{202e}'));
+        assert!(listed.len() <= MAX_CUSTOM_THEME_NAME_BYTES);
+        assert!(listed.starts_with("dusk"));
     }
 
     #[test]
