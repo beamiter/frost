@@ -1490,3 +1490,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi. Filter ingest now replaces spoofing
      with U+FFFD.
 
+269. **AI chat library search strips visual spoofing** — the library filter
+     dropped controls but kept bidi. Search ingest now replaces spoofing
+     with U+FFFD.
+

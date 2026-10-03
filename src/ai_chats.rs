@@ -326,7 +326,15 @@ impl AiChatsUi {
     pub(crate) fn set_search(&mut self, query: String) {
         let mut query: String = query
             .chars()
-            .filter(|character| !character.is_control())
+            .filter_map(|character| {
+                if character.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(character)
+                }
+            })
             .collect();
         if query.len() > MAX_SEARCH_BYTES {
             let mut end = MAX_SEARCH_BYTES;
@@ -1193,6 +1201,10 @@ mod tests {
         assert!(panel.search.len() <= MAX_SEARCH_BYTES);
         assert!(panel.search.is_char_boundary(panel.search.len()));
         assert!(!panel.search.contains('z'));
+        panel.set_search("chat\u{202e}".into());
+        assert!(!panel.search.contains('\u{202e}'));
+        assert!(panel.search.contains('\u{fffd}'));
+        assert!(panel.search.starts_with("chat"));
     }
 
     #[test]

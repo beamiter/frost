@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 269 — AI chat library search strips visual spoofing)
+
+## 2026-10-04 (upgrade round 269)
+
+- AI chat library search replaces visual spoofing at ingest.
+- `cargo test --locked --bin frost -- ai_chats::tests::library_search_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 268 — Files-tree filter strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 268)
