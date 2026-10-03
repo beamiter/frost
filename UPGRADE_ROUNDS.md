@@ -1574,3 +1574,7 @@ everywhere except a resize, and an audit against ember found the rest.
 290. **Kitty associated-text drops visual spoofing** — CSI-u reports stripped
      control bytes but forwarded bidi/zero-width as associated text. Spoofing
      is now dropped before those fields are encoded.
+
+291. **xterm modifyOtherKeys skips visual spoofing in committed text** — the
+     report used the first non-control scalar, including bidi. Spoofing is
+     skipped so the real layout character remains the key codepoint.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 291 — xterm modifyOtherKeys skips visual spoofing in committed text)
+
+## 2026-10-04 (upgrade round 291)
+
+- xterm modifyOtherKeys committed-text lookup skips visual spoofing when choosing the key codepoint.
+- `cargo test --locked --bin frost -- tests::modify_other_keys_handles_shifted_text_and_level_three` passed.
+
 Updated: 2026-10-04 (upgrade round 290 — Kitty associated-text drops visual spoofing)
 
 ## 2026-10-04 (upgrade round 290)

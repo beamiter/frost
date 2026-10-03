@@ -25564,12 +25564,12 @@ fn text_key_code(
 ) -> Option<u32> {
     let codepoint = kitty_text_key_code(key)?;
     if !(mods.control() || mods.alt() || mods.logo()) {
-        if let Some(character) = text.and_then(|value| value.chars().find(|c| !c.is_control())) {
+        if let Some(character) = first_committed_key_char(text) {
             return Some(character as u32);
         }
     }
     if mods.shift() {
-        if let Some(character) = text.and_then(|value| value.chars().find(|c| !c.is_control())) {
+        if let Some(character) = first_committed_key_char(text) {
             return Some(character as u32);
         }
         if let keyboard::Key::Character(s) = key {
@@ -25577,6 +25577,15 @@ fn text_key_code(
         }
     }
     Some(codepoint)
+}
+
+fn first_committed_key_char(text: Option<&str>) -> Option<char> {
+    text.and_then(|value| {
+        value.chars().find(|character| {
+            !character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(*character)
+        })
+    })
 }
 
 /// The CSI-u / modifyOtherKeys modifier value: a bitfield + 1.
@@ -29325,6 +29334,23 @@ mod tests {
         assert_eq!(
             unmodified_level_three.as_deref(),
             Some(&b"\x1b[27;1;120~"[..])
+        );
+
+        let spoofed_level_three = encode_key(
+            &keyboard::Key::Character("x".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::NONE,
+            Some("\u{202e}x"),
+            false,
+            KeyboardEnhancements {
+                modify_other_keys: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            spoofed_level_three.as_deref(),
+            Some(&b"\x1b[27;1;120~"[..]),
+            "bidi must not become the xterm key codepoint"
         );
     }
 
