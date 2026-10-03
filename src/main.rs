@@ -17587,10 +17587,7 @@ impl Frost {
         let mut body = column![].spacing(7);
         if let Some((sess, zone)) = target {
             let command = zone.command.as_deref().unwrap_or("Background output");
-            let mut preview: String = command.chars().take(240).collect();
-            if command.chars().count() > 240 {
-                preview.push('…');
-            }
+            let preview = history_picker::display_command(command);
             let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
             let status = block_mode::badge_text_with_lifecycle(
                 outcome,
@@ -17606,7 +17603,7 @@ impl Frost {
             }
             if let Some(cwd) = zone.cwd.as_deref() {
                 meta.push_str(" · ");
-                meta.push_str(cwd);
+                meta.push_str(&history_picker::display_cwd(&abbreviate_home(cwd)));
             }
             // Metadata-only: rendering an open menu must not clone/extract up
             // to 1 MiB of output every frame. Copy/AI actions do the bounded
@@ -25669,6 +25666,22 @@ mod tests {
         assert!(!shown.contains('\u{202e}'));
         assert!(shown.len() <= crate::review_text::MAX_TOAST_BYTES);
         assert!(shown.starts_with("~/src/"));
+    }
+
+    #[test]
+    fn block_menu_preview_strips_command_and_cwd_spoofing() {
+        let preview = history_picker::display_command(&format!(
+            "ls \u{1b}[31m\u{202e}{}",
+            "n".repeat(400)
+        ));
+        assert!(!preview.contains('\u{1b}'));
+        assert!(!preview.contains('\u{202e}'));
+        assert!(preview.starts_with("ls "));
+        let cwd = history_picker::display_cwd(&abbreviate_home(&format!(
+            "/tmp/\u{202e}{}",
+            "p".repeat(400)
+        )));
+        assert!(!cwd.contains('\u{202e}'));
     }
 
     #[test]

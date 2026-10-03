@@ -1395,3 +1395,7 @@ everywhere except a resize, and an audit against ember found the rest.
      remote/local filenames as iced text. Names now share the sidebar
      envelope (without the empty-notice fallback).
 
+245. **Bounded command-block menu preview** — the overlay truncated the
+     command to 240 chars but left OSC/bidi and the zone cwd raw. Preview
+     and cwd now reuse `display_command` / `display_cwd`.
+

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 245 — bounded command-block menu preview)
+
+## 2026-10-03 (upgrade round 245)
+
+- Command-block menu preview/cwd reuse history-picker display sanitizers.
+- `cargo test --locked --bin frost -- tests::block_menu_preview_strips_command_and_cwd_spoofing` passed.
+
 Updated: 2026-10-03 (upgrade round 244 — bounded Files-tree filenames)
 
 ## 2026-10-03 (upgrade round 244)
