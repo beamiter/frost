@@ -1412,6 +1412,24 @@ mod tests {
     }
 
     #[test]
+    fn live_remote_host_name_uses_the_name_envelope() {
+        assert_eq!(
+            bound_config_text("prod\n\u{1b}box", MAX_CONFIG_NAME_BYTES),
+            "prodbox"
+        );
+        assert_eq!(
+            bound_config_text("lab\u{202e}", MAX_CONFIG_NAME_BYTES),
+            "lab"
+        );
+        let filled = bound_config_text(
+            format!("{}y", "n".repeat(MAX_CONFIG_NAME_BYTES)),
+            MAX_CONFIG_NAME_BYTES,
+        );
+        assert_eq!(filled.len(), MAX_CONFIG_NAME_BYTES);
+        assert!(!filled.contains('y'));
+    }
+
+    #[test]
     fn visual_spoofing_config_strings_never_reach_labels_or_paths() {
         let config = Config {
             ai_model: "safe-model\u{202e}gpj".to_string(),

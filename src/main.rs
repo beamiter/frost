@@ -12783,7 +12783,8 @@ impl Frost {
             }
             Message::RemoteHostName(index, name) => {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
-                    host.name = name;
+                    host.name =
+                        crate::config::bound_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES);
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
                         return self.queue_sidebar_load(request);

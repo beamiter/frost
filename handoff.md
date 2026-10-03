@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 204 — bounded remote host name field)
+
+## 2026-10-03 (upgrade round 204)
+
+- Settings remote-host name drops controls and visual spoofing and truncates
+  at 256 bytes so iced cannot hold more than `validate_remote_host` accepts.
+- `cargo test --locked --bin frost -- config::tests::live_remote_host_name_uses_the_name_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 203 — bounded API-key file path field)
 
 ## 2026-10-03 (upgrade round 203)

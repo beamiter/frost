@@ -1210,3 +1210,8 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped it. `SetAiKeyFile` now uses `bound_config_text` at
      `MAX_CONFIG_VALUE_BYTES`.
 
+204. **Bounded remote host name field** — iced assigned the display name
+     unbounded, so ESC/bidi and a 256-byte+1 paste sat in config until
+     `validate_remote_host` refused every consumer. `RemoteHostName` now uses
+     `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
+
