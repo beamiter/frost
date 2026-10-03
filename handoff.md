@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 296 — Kitty graphics errors strip visual spoofing)
+
+## 2026-10-04 (upgrade round 296)
+
+- Kitty graphics protocol error replies drop controls and replace visual spoofing before they go back to the PTY.
+- `cargo test --locked --bin frost -- kitty_graphics::tests::protocol_error_text_strips_controls_and_visual_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 295 — Block-search queries strip visual spoofing)
 
 ## 2026-10-04 (upgrade round 295)

@@ -26,6 +26,22 @@ const MAX_PENDING_RESPONSE_BYTES: usize = 64 * 1024;
 /// 应答里回显的错误文本长度上限。
 const MAX_RESPONSE_MESSAGE_CHARS: usize = 160;
 
+fn bound_protocol_message(message: &str) -> String {
+    message
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .take(MAX_RESPONSE_MESSAGE_CHARS)
+        .collect()
+}
+
 /// Kitty 图像。`data` 始终是解码后的 RGBA8。
 #[derive(Debug, Clone)]
 pub struct KittyImage {
@@ -705,12 +721,7 @@ impl KittyGraphicsState {
             None => "OK".to_string(),
             Some(_) if target.quiet >= 2 => return,
             Some(failure) => {
-                let message: String = failure
-                    .message
-                    .chars()
-                    .filter(|ch| !ch.is_control())
-                    .take(MAX_RESPONSE_MESSAGE_CHARS)
-                    .collect();
+                let message = bound_protocol_message(&failure.message);
                 format!("{}:{message}", failure.code)
             }
         };
@@ -1338,5 +1349,18 @@ mod tests {
             let _ = state.parse_graphics_payload(b"Ga=q,i=90");
         }
         assert!(state.take_responses().len() <= MAX_PENDING_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn protocol_error_text_strips_controls_and_visual_spoofing() {
+        let shown = bound_protocol_message("failed \u{1b}[31m\u{202e}png");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.starts_with("failed "));
+        let overflow =
+            bound_protocol_message(&format!("{}z", "x".repeat(MAX_RESPONSE_MESSAGE_CHARS)));
+        assert_eq!(overflow.chars().count(), MAX_RESPONSE_MESSAGE_CHARS);
+        assert!(!overflow.contains('z'));
     }
 }

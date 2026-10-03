@@ -1594,3 +1594,7 @@ everywhere except a resize, and an audit against ember found the rest.
 295. **Block-search queries strip visual spoofing** — the overlay query was
      length-bounded but kept bidi. Query ingest now drops controls and
      replaces spoofing with U+FFFD.
+
+296. **Kitty graphics errors strip visual spoofing** — protocol error replies
+     dropped controls but kept bidi. Spoofing is now replaced with U+FFFD
+     before the APC response is written to the PTY.
