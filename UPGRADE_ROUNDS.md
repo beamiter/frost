@@ -1345,3 +1345,7 @@ everywhere except a resize, and an audit against ember found the rest.
      `display_name()` raw. Feedback is now 256-byte `safe_inline_display`; the
      badge uses `bound_provider_label`.
 
+233. **Bounded command-correction card chrome** — accept refusals and the
+     destructive-risk line interpolated engine/PTY reasons as danger chrome.
+     Store and draw now run `bound_correction_feedback` at 256 bytes.
+

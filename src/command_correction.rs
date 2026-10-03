@@ -110,6 +110,12 @@ fn bound_correction_draft(draft: impl Into<String>) -> String {
     draft
 }
 
+const MAX_CORRECTION_FEEDBACK_BYTES: usize = 256;
+
+pub(crate) fn bound_correction_feedback(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_CORRECTION_FEEDBACK_BYTES)
+}
+
 /// One pane's live correction request, and the card it resolved into.
 pub(crate) struct CorrectionSession {
     generation: u64,
@@ -532,5 +538,18 @@ mod tests {
         let (generation, _) = registry.begin(4, "gti".to_string(), 127, deadline);
         std::thread::sleep(Duration::from_millis(5));
         assert!(!registry.present(4, generation, candidate()));
+    }
+
+    #[test]
+    fn correction_feedback_replaces_controls_and_stays_bounded() {
+        let shown = bound_correction_feedback(format!(
+            "Cannot accept correction: \u{1b}[31m\u{202e}{}",
+            "x".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_CORRECTION_FEEDBACK_BYTES);
+        assert!(shown.starts_with("Cannot accept correction:"));
     }
 }

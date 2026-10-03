@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 233 — bounded command-correction card chrome)
+
+## 2026-10-03 (upgrade round 233)
+
+- Command-correction accept refusals and the destructive-risk line drop
+  controls/spoofing and truncate at 256 bytes before they restyle the card.
+- `cargo test --locked --bin frost -- command_correction::tests::correction_feedback_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 232 — bounded AI-suggestion card chrome)
 
 ## 2026-10-03 (upgrade round 232)

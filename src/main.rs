@@ -21501,7 +21501,9 @@ impl Frost {
             match proposal.accept() {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    proposal.set_feedback(Some(format!("Cannot accept correction: {error}")));
+                    proposal.set_feedback(Some(crate::command_correction::bound_correction_feedback(
+                        format!("Cannot accept correction: {error}"),
+                    )));
                     return Task::none();
                 }
             }
@@ -21512,7 +21514,11 @@ impl Frost {
         if let Err(reason) = self.session_prompt_replace_ready(session_id) {
             if let Some(session) = self.command_corrections.get_mut(session_id) {
                 if let Some(proposal) = session.proposal.as_mut() {
-                    proposal.set_feedback(Some(format!("Cannot accept correction: {reason}")));
+                    proposal.set_feedback(Some(
+                        crate::command_correction::bound_correction_feedback(format!(
+                            "Cannot accept correction: {reason}"
+                        )),
+                    ));
                 }
             }
             return Task::none();
@@ -21527,9 +21533,9 @@ impl Frost {
             self.dismiss_active_correction();
         } else if let Some(session) = self.command_corrections.get_mut(session_id) {
             if let Some(proposal) = session.proposal.as_mut() {
-                proposal.set_feedback(Some(
-                    "The target prompt changed before the command could be queued.".into(),
-                ));
+                proposal.set_feedback(Some(crate::command_correction::bound_correction_feedback(
+                    "The target prompt changed before the command could be queued.",
+                )));
             }
         }
         Task::none()
@@ -23346,7 +23352,10 @@ impl Frost {
         // this card and used to arrive in exactly the chrome `git status` got.
         if let Some(reason) = proposal.risk() {
             card = card.push(
-                text(format!("⚠ destructive: {reason}"))
+                text(format!(
+                    "⚠ destructive: {}",
+                    crate::command_correction::bound_correction_feedback(reason)
+                ))
                     .size(12)
                     .style(text::danger),
             );
@@ -23356,7 +23365,11 @@ impl Frost {
         // the way in, which matters because a provider-shaped parse error is
         // one of the strings that lands here.
         if let Some(feedback) = proposal.feedback() {
-            card = card.push(text(feedback.to_string()).size(11).style(text::danger));
+            card = card.push(
+                text(crate::command_correction::bound_correction_feedback(feedback))
+                    .size(11)
+                    .style(text::danger),
+            );
         }
 
         let inner = container(card)
