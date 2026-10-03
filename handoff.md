@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 219 — bounded files-panel notice store)
+
+## 2026-10-03 (upgrade round 219)
+
+- Files panel notices from worker errors, transfer ticks, and paste/delete
+  failures now go through `set_sidebar_notice` / `bound_sidebar_notice` (192
+  bytes, controls/spoofing stripped) both at store and at draw.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 218 — bounded AI provider chrome label)
 
 ## 2026-10-03 (upgrade round 218)

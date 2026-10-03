@@ -5404,7 +5404,7 @@ impl Frost {
         let request = self
             .sidebar
             .reset_to_local_with_hosts(self.local_sidebar_fallback_root(), hosts);
-        self.sidebar_notice = Some((notice, false));
+        self.set_sidebar_notice(notice, false);
         request
     }
 
@@ -5673,7 +5673,7 @@ impl Frost {
                     "Files could not join {}: {detail}. Non-interactive SSH needs a key, agent, or reusable control socket; the current tree was kept.{suffix}",
                     pending.source_profile.display_name()
                 );
-                self.sidebar_notice = Some((message.clone(), false));
+                self.set_sidebar_notice(message.clone(), false);
                 self.push_toast(message, ToastKind::Warning);
                 if retrying {
                     self.sidebar_follow_retry_once =
@@ -5695,7 +5695,7 @@ impl Frost {
                 .rebind_same_namespace_preserving_tree(pending.target_location.clone())
         {
             self.invalidate_sidebar_pending_work();
-            self.sidebar_notice = Some((format!("Following {label}"), true));
+            self.set_sidebar_notice(format!("Following {label}"), true);
             self.apply_config();
             return Task::none();
         }
@@ -5704,7 +5704,7 @@ impl Frost {
         let Some(request) = self.sidebar.resolve_location(generation, Ok(start)) else {
             return Task::none();
         };
-        self.sidebar_notice = Some((format!("Following {label}"), true));
+        self.set_sidebar_notice(format!("Following {label}"), true);
         self.apply_config();
         self.queue_sidebar_load(request)
     }
@@ -5857,7 +5857,7 @@ impl Frost {
         let path = match sidebar::validate_absolute_navigation_path(input) {
             Ok(path) => path,
             Err(error) => {
-                self.sidebar_notice = Some((error.to_string(), false));
+                self.set_sidebar_notice(error.to_string(), false);
                 return iced::widget::operation::focus(SIDEBAR_PATH_INPUT_ID.clone());
             }
         };
@@ -6074,7 +6074,7 @@ impl Frost {
                 let op = match sidebar_paste_op(&clipboard, &target_dir) {
                     Ok(op) => op,
                     Err(problem) => {
-                        self.sidebar_notice = Some((problem, false));
+                        self.set_sidebar_notice(problem, false);
                         return Task::none();
                     }
                 };
@@ -6127,7 +6127,7 @@ impl Frost {
                         name,
                         total,
                     };
-                    self.sidebar_notice = Some((ui.status_text(), true));
+                    self.set_sidebar_notice(ui.status_text(), true);
                     self.sidebar_transfer = Some(ui);
                     progress = Some(handle);
                 }
@@ -6298,7 +6298,7 @@ impl Frost {
         let paths = confirmation.paths;
         for path in &paths {
             if let Err(problem) = remote_fs::validate_delete_path(path) {
-                self.sidebar_notice = Some((problem, false));
+                self.set_sidebar_notice(problem, false);
                 return Task::none();
             }
         }
@@ -7018,6 +7018,10 @@ impl Frost {
     /// Alt+N selects the Nth tab, matching the order in the strip.
     fn jump_session(&mut self, index: usize) {
         self.activate_tab(index);
+    }
+
+    fn set_sidebar_notice(&mut self, text: impl Into<String>, neutral: bool) {
+        self.sidebar_notice = Some((crate::sidebar::bound_sidebar_notice(text.into()), neutral));
     }
 
     /// Push a transient bottom-right toast. Auto-expires; dismissable.
@@ -14639,20 +14643,24 @@ impl Frost {
                     // Neutral abort, not an error; the clipboard survives a
                     // cancelled cut so nothing is silently consumed. A batch
                     // brings its own "cancelled after k of N" summary.
-                    self.sidebar_notice = Some(
-                        report
-                            .warning
-                            .unwrap_or(("Transfer cancelled".to_string(), true)),
-                    );
+                    let (text, neutral) = report
+                        .warning
+                        .unwrap_or(("Transfer cancelled".to_string(), true));
+                    self.set_sidebar_notice(text, neutral);
                     return refresh;
                 } else {
                     match report.result {
                         Ok(()) => {
-                            self.sidebar_notice = report.warning;
+                            match report.warning {
+                                Some((text, neutral)) => {
+                                    self.set_sidebar_notice(text, neutral);
+                                }
+                                None => self.sidebar_notice = None,
+                            }
                             return refresh;
                         }
                         Err(error) => {
-                            self.sidebar_notice = Some((error, false));
+                            self.set_sidebar_notice(error, false);
                             return refresh;
                         }
                     }
@@ -14660,7 +14668,7 @@ impl Frost {
             }
             Message::SidebarTransferTick => {
                 if let Some(transfer) = &self.sidebar_transfer {
-                    self.sidebar_notice = Some((transfer.status_text(), true));
+                    self.set_sidebar_notice(transfer.status_text(), true);
                 }
             }
             Message::SidebarTransferCancel => {
@@ -14764,7 +14772,7 @@ impl Frost {
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(problem) => {
-                        self.sidebar_notice = Some((problem, false));
+                        self.set_sidebar_notice(problem, false);
                         return Task::none();
                     }
                 };
@@ -14794,7 +14802,7 @@ impl Frost {
                     ),
                     total: Some(plan.total_bytes),
                 };
-                self.sidebar_notice = Some((ui.status_text(), true));
+                self.set_sidebar_notice(ui.status_text(), true);
                 self.sidebar_transfer = Some(ui);
                 return sidebar_op_task(
                     context_epoch,
@@ -14823,7 +14831,7 @@ impl Frost {
                         .sidebar_drop_target()
                         .map(|dir| dir.display().to_string())
                         .unwrap_or_else(|| self.sidebar.current_dir.display().to_string());
-                    self.sidebar_notice = Some((format!("Release to import into {target}"), true));
+                    self.set_sidebar_notice(format!("Release to import into {target}"), true);
                     self.sidebar_drop_hint = true;
                 } else if !inside && self.sidebar_drop_hint {
                     self.sidebar_drop_hint = false;
@@ -18932,7 +18940,7 @@ impl Frost {
             rows.push(
                 container(
                     row![
-                        text(notice.clone())
+                        text(crate::sidebar::bound_sidebar_notice(notice))
                             .size(11)
                             .wrapping(text::Wrapping::Word)
                             .width(Length::Fill)

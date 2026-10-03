@@ -3245,5 +3245,8 @@ mod tests {
         let busy = DirectoryError::busy(format!("queue full \u{1b}{}", "x".repeat(400)));
         assert!(!busy.message.contains('\u{1b}'));
         assert!(busy.message.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        let again = bound_sidebar_notice(&shown);
+        assert_eq!(again, shown);
+        assert_eq!(bound_sidebar_notice(""), "Files panel notice");
     }
 }

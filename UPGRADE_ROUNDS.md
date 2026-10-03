@@ -1280,3 +1280,8 @@ everywhere except a resize, and an audit against ember found the rest.
      Agent and AI Chats headers verbatim, so a hostile local-provider name
      could restyle the panel. Both now use `bound_provider_label` at 256 bytes.
 
+219. **Bounded files-panel notice store** — worker errors, transfer ticks, and
+     paste/delete failures were assigned into `sidebar_notice` raw, so ESC/bidi
+     could restyle the Files chrome even when a later busy path was bounded.
+     `set_sidebar_notice` and the notice view now run `bound_sidebar_notice`.
+
