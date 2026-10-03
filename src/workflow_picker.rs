@@ -403,5 +403,9 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_WORKFLOW_FEEDBACK_BYTES);
         assert!(shown.starts_with("Workflow could not be rendered"));
+        let name = bound_workflow_feedback(format!("deploy \u{1b}[31m{}", "n".repeat(400)));
+        assert!(!name.contains('\u{1b}'));
+        assert!(name.len() <= MAX_WORKFLOW_FEEDBACK_BYTES);
+        assert!(name.starts_with("deploy"));
     }
 }

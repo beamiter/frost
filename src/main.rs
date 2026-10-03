@@ -16961,7 +16961,9 @@ impl Frost {
         } else {
             for (pos, workflow) in filtered.iter().enumerate() {
                 let selected = pos == state.selected();
-                let mut info = row![text(workflow.name.clone()).size(13)]
+                let mut info = row![
+                    text(crate::workflow_picker::bound_workflow_feedback(&workflow.name)).size(13)
+                ]
                     .spacing(10)
                     .align_y(iced::Alignment::Center);
                 if !workflow.args.is_empty() {
@@ -16973,12 +16975,18 @@ impl Frost {
                 }
                 info = info.push(Space::new().width(Length::Fill));
                 for tag in workflow.tags.iter().take(3) {
-                    info = info.push(text(tag.clone()).size(11).style(text::secondary));
+                    info = info.push(
+                        text(crate::workflow_picker::bound_workflow_feedback(tag))
+                            .size(11)
+                            .style(text::secondary),
+                    );
                 }
                 let mut rows = column![info].spacing(2);
                 if !workflow.description.is_empty() {
                     rows = rows.push(
-                        text(workflow.description.clone())
+                        text(crate::workflow_picker::bound_workflow_feedback(
+                            workflow.description.clone(),
+                        ))
                             .size(11)
                             .style(text::secondary),
                     );
@@ -17029,7 +17037,11 @@ impl Frost {
         form: &workflow_picker::WorkflowArgsState,
     ) -> Element<'_, Message> {
         let header = row![
-            text(format!("Workflow: {}", form.workflow().name)).size(14),
+            text(format!(
+                "Workflow: {}",
+                crate::workflow_picker::bound_workflow_feedback(&form.workflow().name)
+            ))
+            .size(14),
             Space::new().width(Length::Fill),
             button(text("✕").size(12))
                 .style(button::secondary)
@@ -17041,7 +17053,9 @@ impl Frost {
         let mut card = column![header].spacing(8);
         if !form.workflow().description.is_empty() {
             card = card.push(
-                text(form.workflow().description.clone())
+                text(crate::workflow_picker::bound_workflow_feedback(
+                    form.workflow().description.clone(),
+                ))
                     .size(12)
                     .wrapping(text::Wrapping::Word)
                     .style(text::secondary),

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 238 — bounded workflow picker name chrome)
+
+## 2026-10-03 (upgrade round 238)
+
+- Workflow picker names, tags, descriptions, and the argument-form header
+  drop controls/spoofing and truncate at 256 bytes before they restyle the overlay.
+- `cargo test --locked --bin frost -- workflow_picker::tests::workflow_feedback_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 237 — bounded tab labels and close-confirm)
 
 ## 2026-10-03 (upgrade round 237)

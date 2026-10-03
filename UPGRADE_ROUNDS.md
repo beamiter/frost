@@ -1367,3 +1367,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped Cc but not bidi, and close-confirm interpolated process names
      verbatim. Drafts and session/pane labels now strip bidi like OSC titles.
 
+238. **Bounded workflow picker name chrome** — list names, tags, descriptions,
+     and the argument-form header were drawn from disk files verbatim. Those
+     strings now run `bound_workflow_feedback` at 256 bytes.
+
