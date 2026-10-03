@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 180 — fail-closed link columns and per-row cap)
+
+## 2026-10-03 (upgrade round 180)
+
+- Link column mapping skips mid-codepoint/out-of-range byte offsets; one row
+  keeps at most 64 actionable highlights.
+- `cargo test --locked --bin frost -- link::tests` — 11 passed.
+
 Updated: 2026-10-03 (upgrade round 179 — complete numeric config clamp matrix)
 
 ## 2026-10-03 (upgrade round 179)

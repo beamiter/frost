@@ -1067,3 +1067,10 @@ everywhere except a resize, and an audit against ember found the rest.
      scrollback 100–100_000), and the live clamp helpers no longer need a
      stale `dead_code` allow.
 
+180. **Fail-closed link columns and a per-row cap** — highlight mapping used
+     `line[..byte_offset]`, which panics on a mid-codepoint or past-the-end
+     offset after trimming a URL or path. Offsets now go through `str::get`
+     and invalid spans are skipped. One row also stops at 64 actionable
+     highlights so a paste of thousands of URLs cannot unbounded-allocate
+     click targets.
+

@@ -2,6 +2,9 @@
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
+/// Hard cap on actionable highlights produced from one terminal row.
+const MAX_LINKS_PER_LINE: usize = 64;
+
 /// 链接类型
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum LinkType {
@@ -88,9 +91,14 @@ impl LinkDetector {
         }
     }
 
-    /// 将字节偏移转换为字符（列）偏移
-    fn byte_offset_to_char_offset(line: &str, byte_offset: usize) -> usize {
-        line[..byte_offset].chars().count()
+    /// Map a byte offset to a display column. Offsets past the line or off a
+    /// UTF-8 boundary are skipped instead of slicing-panic.
+    fn byte_offset_to_char_offset(line: &str, byte_offset: usize) -> Option<usize> {
+        Some(line.get(..byte_offset)?.chars().count())
+    }
+
+    fn at_link_cap(links: &[Link]) -> bool {
+        links.len() >= MAX_LINKS_PER_LINE
     }
 
     /// 在单行文本中检测所有链接
@@ -109,12 +117,23 @@ impl LinkDetector {
             while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
                 url = &url[..url.len() - 1];
             }
-            let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-            let col_end = Self::byte_offset_to_char_offset(line, mat.start() + url.len());
+            let Some(col_start) = Self::byte_offset_to_char_offset(line, mat.start()) else {
+                continue;
+            };
+            let Some(col_end) = Self::byte_offset_to_char_offset(line, mat.start() + url.len())
+            else {
+                continue;
+            };
+            if col_end < col_start {
+                continue;
+            }
             // Reserve the whole URL-shaped span even when policy rejects it.
             // Otherwise `https://user@192.0.2.1` could activate its inner IP.
             url_spans.push((col_start, col_end));
             if self.config.detect_urls && is_openable_url(url) {
+                if Self::at_link_cap(&links) {
+                    break;
+                }
                 links.push(Link {
                     line: line_idx,
                     col_start,
@@ -128,8 +147,18 @@ impl LinkDetector {
         // 检测 IP 地址
         if self.config.detect_ip_addresses {
             for mat in self.ip_regex.find_iter(line) {
-                let col_start = Self::byte_offset_to_char_offset(line, mat.start());
-                let col_end = Self::byte_offset_to_char_offset(line, mat.end());
+                if Self::at_link_cap(&links) {
+                    break;
+                }
+                let Some(col_start) = Self::byte_offset_to_char_offset(line, mat.start()) else {
+                    continue;
+                };
+                let Some(col_end) = Self::byte_offset_to_char_offset(line, mat.end()) else {
+                    continue;
+                };
+                if col_end < col_start {
+                    continue;
+                }
                 // 避免与 URL 重复
                 if !url_spans
                     .iter()
@@ -152,6 +181,9 @@ impl LinkDetector {
         // 检测文件路径
         if self.config.detect_file_paths {
             for mat in self.file_path_regex.find_iter(line) {
+                if Self::at_link_cap(&links) {
+                    break;
+                }
                 let raw = mat.as_str();
                 let matched_text = raw.trim().trim_end_matches([',', ';', '!', '?']);
                 if matched_text.is_empty() {
@@ -161,9 +193,17 @@ impl LinkDetector {
                 // highlight columns cover only the path, not the preceding space.
                 let lead_ws = raw.len() - raw.trim_start().len();
                 let start_byte = mat.start() + lead_ws;
-                let col_start = Self::byte_offset_to_char_offset(line, start_byte);
-                let col_end =
-                    Self::byte_offset_to_char_offset(line, start_byte + matched_text.len());
+                let Some(col_start) = Self::byte_offset_to_char_offset(line, start_byte) else {
+                    continue;
+                };
+                let Some(col_end) =
+                    Self::byte_offset_to_char_offset(line, start_byte + matched_text.len())
+                else {
+                    continue;
+                };
+                if col_end < col_start {
+                    continue;
+                }
 
                 // 避免与 URL 重复
                 if !url_spans
@@ -615,5 +655,25 @@ mod tests {
             .detect_links_in_line("ok https://example.com bad ftp://example.com/archive", 0);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].text, "https://example.com");
+    }
+
+    #[test]
+    fn mid_codepoint_offsets_are_skipped_instead_of_panicking() {
+        assert_eq!(LinkDetector::byte_offset_to_char_offset("雪", 1), None);
+        assert_eq!(LinkDetector::byte_offset_to_char_offset("雪", 3), Some(1));
+        assert_eq!(LinkDetector::byte_offset_to_char_offset("雪", 99), None);
+        assert_eq!(LinkDetector::byte_offset_to_char_offset("ok", 0), Some(0));
+    }
+
+    #[test]
+    fn one_row_keeps_at_most_sixty_four_actionable_links() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let line = (0..80)
+            .map(|i| format!("https://example.com/{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let links = detector.detect_links_in_line(&line, 0);
+        assert_eq!(links.len(), MAX_LINKS_PER_LINE);
+        assert!(links.iter().all(|link| link.link_type == LinkType::Url));
     }
 }
