@@ -1524,3 +1524,6 @@ everywhere except a resize, and an audit against ember found the rest.
 277. **Settings text fields replace visual spoofing** — live config ingest
      dropped bidi silently. Settings drafts now replace spoofing with U+FFFD.
 
+278. **Custom theme names replace visual spoofing** — the theme-editor name
+     dropped bidi silently. Name ingest now replaces spoofing with U+FFFD.
+

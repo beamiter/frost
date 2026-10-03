@@ -13,12 +13,14 @@ pub(crate) const MAX_CUSTOM_THEME_NAME_BYTES: usize = 160;
 pub(crate) fn bound_custom_theme_name(name: impl Into<String>) -> String {
     let mut bounded = String::new();
     for ch in name.into().chars() {
-        if ch.is_control()
-            || matches!(ch, '/' | '\\')
-            || jterm_core::review_input::is_visual_spoofing_character(ch)
-        {
+        if ch.is_control() || matches!(ch, '/' | '\\') {
             continue;
         }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
         if bounded.len().saturating_add(ch.len_utf8()) > MAX_CUSTOM_THEME_NAME_BYTES {
             break;
         }
@@ -165,7 +167,9 @@ mod tests {
     #[test]
     fn custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope() {
         assert_eq!(bound_custom_theme_name("dusk\n\u{1b}/night\\"), "dusknight");
-        assert_eq!(bound_custom_theme_name("ok\u{202e}"), "ok");
+        let spoofed = bound_custom_theme_name("ok\u{202e}");
+        assert_eq!(spoofed, "ok\u{fffd}");
+        assert!(!spoofed.contains('\u{202e}'));
         let filled =
             bound_custom_theme_name(format!("{}y", "x".repeat(MAX_CUSTOM_THEME_NAME_BYTES)));
         assert_eq!(filled.len(), MAX_CUSTOM_THEME_NAME_BYTES);
@@ -179,6 +183,7 @@ mod tests {
         let listed = bound_custom_theme_name(format!("dusk\u{1b}[31m\u{202e}{}", "n".repeat(400)));
         assert!(!listed.contains('\u{1b}'));
         assert!(!listed.contains('\u{202e}'));
+        assert!(listed.contains('\u{fffd}'));
         assert!(listed.len() <= MAX_CUSTOM_THEME_NAME_BYTES);
         assert!(listed.starts_with("dusk"));
     }

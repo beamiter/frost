@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 278 — Custom theme names replace visual spoofing)
+
+## 2026-10-04 (upgrade round 278)
+
+- Custom theme-editor names replace visual spoofing at ingest instead of dropping it.
+- `cargo test --locked --bin frost -- theme::tests::custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 277 — Settings text fields replace visual spoofing)
 
 ## 2026-10-04 (upgrade round 277)
