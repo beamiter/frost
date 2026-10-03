@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 246 — bounded block-search hit previews)
+
+## 2026-10-03 (upgrade round 246)
+
+- Block-search picker rows escape command/output preview spoofing at draw.
+- `cargo test --locked --bin frost -- block_mode::tests::display_block_search_text_escapes_controls_and_visual_spoofing` passed.
+
 Updated: 2026-10-03 (upgrade round 245 — bounded command-block menu preview)
 
 ## 2026-10-03 (upgrade round 245)

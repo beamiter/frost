@@ -17449,7 +17449,7 @@ impl Frost {
                     let command = if hit.command_preview.is_empty() {
                         "(no command)".to_string()
                     } else {
-                        hit.command_preview.clone()
+                        block_mode::display_block_search_text(&hit.command_preview)
                     };
                     format!("{command} · L{}", hit.line_no)
                 } else {
@@ -17463,7 +17463,7 @@ impl Frost {
                     context.push_str(badge);
                 }
                 let info = column![
-                    text(hit.line_text.clone())
+                    text(block_mode::display_block_search_text(&hit.line_text))
                         .size(13)
                         .wrapping(text::Wrapping::None)
                         .style(if stale {

@@ -1793,6 +1793,10 @@ fn clipped(text: &str, max_chars: usize) -> String {
     }
 }
 
+pub(crate) fn display_block_search_text(text: &str) -> String {
+    crate::review_text::visible_bounded(text, 8 * 1024)
+}
+
 fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
     text.lines()
         .enumerate()
@@ -3414,6 +3418,15 @@ mod tests {
             BLOCK_SEARCH_LINE_CHARS
         );
         assert!(output_hit.line_text.ends_with('…'));
+    }
+
+    #[test]
+    fn display_block_search_text_escapes_controls_and_visual_spoofing() {
+        let shown = display_block_search_text("grep \u{1b}[31m\u{202e}needle");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains("\\u{1B}") || shown.contains("\\u{202E}"));
+        assert!(shown.starts_with("grep "));
     }
 
     #[test]

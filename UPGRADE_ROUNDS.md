@@ -1399,3 +1399,7 @@ everywhere except a resize, and an audit against ember found the rest.
      command to 240 chars but left OSC/bidi and the zone cwd raw. Preview
      and cwd now reuse `display_command` / `display_cwd`.
 
+246. **Bounded block-search hit previews** — picker rows clipped length but
+     interpolated OSC/bidi from command/output lines. Overlay draw now runs
+     `visible_bounded` (match spans stay on the stored original).
+
