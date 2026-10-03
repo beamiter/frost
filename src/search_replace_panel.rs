@@ -7,6 +7,22 @@
 //! 本模块只保存状态并提供纯的面板到引擎胶水 [`SearchReplacePanelState::apply`]。
 use crate::search_replace::{ReplaceOptions, SearchAndReplaceEngine, SearchConfig};
 
+fn bound_field(text: impl Into<String>, max_bytes: usize) -> String {
+    let mut text: String = text
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// 调用方需要执行的动作（面板本身不持有终端/剪贴板）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchReplaceAction {
@@ -47,6 +63,14 @@ impl SearchReplacePanelState {
 
     pub fn toggle(&mut self) {
         self.is_open = !self.is_open;
+    }
+
+    pub fn set_search_input(&mut self, text: impl Into<String>) {
+        self.search_input = bound_field(text, crate::search::MAX_SEARCH_QUERY_BYTES);
+    }
+
+    pub fn set_replace_input(&mut self, text: impl Into<String>) {
+        self.replace_input = bound_field(text, crate::review_text::MAX_PROMPT_INSERT_BYTES);
     }
 
     /// 对给定文本执行替换，更新状态行，返回替换后的文本（失败返回 `None`）。
@@ -175,5 +199,33 @@ mod tests {
         panel.toggle();
         assert!(!panel.is_open);
         assert_eq!(panel.search_input, "kept");
+    }
+
+    #[test]
+    fn find_and_replace_fields_drop_controls_and_truncate() {
+        let mut panel = SearchReplacePanelState::new();
+        panel.set_search_input("er\nr\u{1b}or");
+        assert_eq!(panel.search_input, "error");
+        panel.set_search_input(format!(
+            "{}y",
+            "x".repeat(crate::search::MAX_SEARCH_QUERY_BYTES)
+        ));
+        assert_eq!(
+            panel.search_input.len(),
+            crate::search::MAX_SEARCH_QUERY_BYTES
+        );
+        assert!(!panel.search_input.contains('y'));
+
+        panel.set_replace_input("hi\n\u{1b}");
+        assert_eq!(panel.replace_input, "hi");
+        panel.set_replace_input(format!(
+            "{}z",
+            "x".repeat(crate::review_text::MAX_PROMPT_INSERT_BYTES)
+        ));
+        assert_eq!(
+            panel.replace_input.len(),
+            crate::review_text::MAX_PROMPT_INSERT_BYTES
+        );
+        assert!(!panel.replace_input.contains('z'));
     }
 }

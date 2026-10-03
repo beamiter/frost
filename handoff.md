@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 185 — bounded find-replace fields)
+
+## 2026-10-03 (upgrade round 185)
+
+- Find-replace find field uses the 4 KiB search-query cap; replace uses the
+  256 KiB prompt-insert cap; both drop controls.
+- `cargo test --locked --bin frost -- search_replace_panel::tests` — 9 passed.
+
 Updated: 2026-10-03 (upgrade round 184 — bounded terminal-find query)
 
 ## 2026-10-03 (upgrade round 184)

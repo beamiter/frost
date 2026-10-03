@@ -1102,3 +1102,9 @@ everywhere except a resize, and an audit against ember found the rest.
      boundary at the same 4 KiB budget as block search, and history recall
      applies the same bound without dropping the navigation index.
 
+185. **Bounded find-replace fields** — Ctrl+Alt+R assigned iced `text_input`
+     into unbounded find and replace strings, so a paste could compile an
+     unbounded regex or grow a prompt/clipboard payload without the review
+     budget. Find now shares the 4 KiB search-query cap; replace shares the
+     256 KiB prompt-insert cap; both drop control characters.
+

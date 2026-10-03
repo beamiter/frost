@@ -14851,10 +14851,10 @@ impl Frost {
                 self.reveal_current_search_match();
             }
             Message::SearchReplaceFindInput(value) => {
-                self.search_replace.search_input = value;
+                self.search_replace.set_search_input(value);
             }
             Message::SearchReplaceReplaceInput(value) => {
-                self.search_replace.replace_input = value;
+                self.search_replace.set_replace_input(value);
             }
             Message::SearchReplaceToggleRegex => {
                 self.search_replace.config.use_regex = !self.search_replace.config.use_regex;
