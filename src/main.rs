@@ -12528,7 +12528,7 @@ impl Frost {
                         };
                         if ms >= self.config.notify_long_block_threshold_ms {
                             jterm_core::notify::long_block_finished(
-                                &completed.command,
+                                &history_picker::display_command(&completed.command),
                                 exit_code,
                                 ms,
                             );
@@ -25682,6 +25682,17 @@ mod tests {
             "p".repeat(400)
         )));
         assert!(!cwd.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn long_block_notification_command_strips_spoofing() {
+        let shown = history_picker::display_command(&format!(
+            "sleep 30 \u{1b}[31m\u{202e}{}",
+            "n".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.starts_with("sleep 30"));
     }
 
     #[test]

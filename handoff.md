@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 247 — bounded long-block notify command)
+
+## 2026-10-03 (upgrade round 247)
+
+- Long-running command completion toasts sanitize the command via `display_command`.
+- `cargo test --locked --bin frost -- tests::long_block_notification_command_strips_spoofing` passed.
+
 Updated: 2026-10-03 (upgrade round 246 — bounded block-search hit previews)
 
 ## 2026-10-03 (upgrade round 246)

@@ -1403,3 +1403,7 @@ everywhere except a resize, and an audit against ember found the rest.
      interpolated OSC/bidi from command/output lines. Overlay draw now runs
      `visible_bounded` (match spans stay on the stored original).
 
+247. **Bounded long-block desktop-notification command** — OSC 133 completion
+     toasts forwarded the raw command to `notify-send`. The title now uses
+     `display_command`.
+
