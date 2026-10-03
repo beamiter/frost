@@ -1285,3 +1285,8 @@ everywhere except a resize, and an audit against ember found the rest.
      could restyle the Files chrome even when a later busy path was bounded.
      `set_sidebar_notice` and the notice view now run `bound_sidebar_notice`.
 
+220. **Bounded AI-chats lifecycle status** — store Thinking/Info/Error text was
+     drawn verbatim in the panel status line, so a persisted or transport error
+     with ESC/bidi could restyle the library chrome. `status_line` now runs
+     `bound_chat_notice` at 256 bytes.
+

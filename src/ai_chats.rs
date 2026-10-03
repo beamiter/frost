@@ -658,13 +658,15 @@ impl AiChatsUi {
 
     /// The one status line under the transcript: a panel notice wins, then the
     /// store's per-chat lifecycle status.
-    pub(crate) fn status_line(&self) -> &str {
+    pub(crate) fn status_line(&self) -> String {
         if !self.notice.is_empty() {
-            return &self.notice;
+            return self.notice.clone();
         }
         match self.store.active_status() {
-            ChatStatus::Idle => "",
-            ChatStatus::Thinking(text) | ChatStatus::Info(text) | ChatStatus::Error(text) => text,
+            ChatStatus::Idle => String::new(),
+            ChatStatus::Thinking(text) | ChatStatus::Info(text) | ChatStatus::Error(text) => {
+                bound_chat_notice(text)
+            }
         }
     }
 
@@ -1224,5 +1226,23 @@ mod tests {
         assert!(panel.notice.contains('\u{fffd}'));
         assert!(panel.notice.len() <= MAX_CHAT_NOTICE_BYTES);
         assert!(panel.notice.starts_with("Saved AI chats"));
+    }
+
+    #[test]
+    fn lifecycle_status_line_replaces_controls_and_stays_bounded() {
+        let mut panel = fresh_panel();
+        panel.set_draft("hello".into());
+        let token = panel.submit(&ai_config()).unwrap().token;
+        panel.complete(
+            token,
+            Err(format!("offline \u{1b}[31m\u{202e}{}", "e".repeat(400))),
+        );
+        let line = panel.status_line();
+        assert!(!line.contains('\u{1b}'));
+        assert!(!line.contains('\u{202e}'));
+        assert!(line.contains('\u{fffd}'));
+        assert!(line.len() <= MAX_CHAT_NOTICE_BYTES);
+        assert!(line.starts_with("AI error:"));
+        assert!(panel.status_is_error());
     }
 }

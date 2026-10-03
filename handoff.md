@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 220 — bounded AI-chats lifecycle status)
+
+## 2026-10-03 (upgrade round 220)
+
+- AI Chats lifecycle status (thinking/info/error from the store) drops
+  controls/spoofing and truncates at 256 bytes before it is drawn.
+- `cargo test --locked --bin frost -- ai_chats::tests::lifecycle_status_line_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 219 — bounded files-panel notice store)
 
 ## 2026-10-03 (upgrade round 219)
