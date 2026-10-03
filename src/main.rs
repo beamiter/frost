@@ -17875,7 +17875,7 @@ impl Frost {
 
         // One label per segment, colored by its tone — the renderer contract.
         let segment = |seg: &jterm_core::bottom_bar::Segment| {
-            text(seg.text.clone())
+            text(crate::review_text::bound_toast_text(seg.text.clone()))
                 .size(11)
                 .color(Theme::rgb_to_color32(seg.tone.color(&self.theme)))
         };
@@ -25654,6 +25654,18 @@ mod tests {
         assert!(body.len() <= crate::review_text::MAX_TOAST_BYTES);
         assert!(title.starts_with("bell"));
         assert!(body.starts_with("from PTY"));
+    }
+
+    #[test]
+    fn status_bar_segment_strips_cwd_spoofing() {
+        let shown = crate::review_text::bound_toast_text(format!(
+            "~/src/\u{1b}[31m\u{202e}{}",
+            "d".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(shown.starts_with("~/src/"));
     }
 
     #[test]

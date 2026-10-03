@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 242 — bounded status-bar segments)
+
+## 2026-10-03 (upgrade round 242)
+
+- Status-bar cwd/git/grid labels share the toast envelope before iced draw.
+- `cargo test --locked --bin frost -- tests::status_bar_segment_strips_cwd_spoofing` passed.
+
 Updated: 2026-10-03 (upgrade round 241 — bounded OSC desktop notifications)
 
 ## 2026-10-03 (upgrade round 241)

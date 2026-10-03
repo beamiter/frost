@@ -1383,3 +1383,7 @@ everywhere except a resize, and an audit against ember found the rest.
      PTY were forwarded to `notify-send` verbatim. Title and body now share
      the toast envelope (controls/spoofing stripped, 256 bytes).
 
+242. **Bounded status-bar segment chrome** — bottom-bar cwd/git/grid labels
+     from `jterm_core::bottom_bar::compose` were drawn as iced text verbatim.
+     Each segment now uses the toast envelope.
+
