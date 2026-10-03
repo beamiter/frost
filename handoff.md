@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 270 — tab-switcher query strips visual spoofing)
+
+## 2026-10-04 (upgrade round 270)
+
+- Tab-switcher queries replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- tests::tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 269 — AI chat library search strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 269)

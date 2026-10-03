@@ -1155,7 +1155,15 @@ impl TabSwitcherState {
         let mut query: String = query
             .into()
             .chars()
-            .filter(|character| !character.is_control())
+            .filter_map(|character| {
+                if character.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(character)
+                }
+            })
             .collect();
         if query.len() > Self::MAX_QUERY_BYTES {
             let mut end = Self::MAX_QUERY_BYTES;
@@ -31241,5 +31249,9 @@ mod tests {
         assert_eq!(state.query, filled);
         assert!(state.backspace());
         assert_eq!(state.query.len(), filled.len() - 1);
+        state.set_query("tab\u{202e}");
+        assert!(!state.query.contains('\u{202e}'));
+        assert!(state.query.contains('\u{fffd}'));
+        assert!(state.query.starts_with("tab"));
     }
 }

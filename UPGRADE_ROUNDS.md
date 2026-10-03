@@ -1494,3 +1494,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi. Search ingest now replaces spoofing
      with U+FFFD.
 
+270. **Tab-switcher query strips visual spoofing** — the jump-to-tab overlay
+     dropped controls but kept bidi in the filter. Query ingest now replaces
+     spoofing with U+FFFD.
+
