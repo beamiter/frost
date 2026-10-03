@@ -1327,3 +1327,8 @@ everywhere except a resize, and an audit against ember found the rest.
      could restyle the attention banner. Store and draw now run
      `bound_diagnostic_text` (keeps newlines, 1 KiB).
 
+229. **Bounded drop-plan path problems** — import refusals interpolated
+     `path.display()` into IO and plan errors, so a hostile dropped name could
+     restyle later Files notices. Those messages now use
+     `bound_sidebar_path_label` / `bound_sidebar_notice`.
+

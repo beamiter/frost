@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 229 — bounded drop-plan path problems)
+
+## 2026-10-03 (upgrade round 229)
+
+- Drop-import plan errors sanitize source/destination paths so a hostile
+  filename cannot restyle later Files notices.
+- `cargo test --locked --bin frost -- tests::plan_drop_refuses_bad_bursts_wholesale` passed.
+
 Updated: 2026-10-03 (upgrade round 228 — bounded startup diagnostics overlay)
 
 ## 2026-10-03 (upgrade round 228)

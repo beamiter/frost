@@ -2185,7 +2185,10 @@ fn drop_item_size(path: &std::path::Path, depth: usize, max_bytes: u64) -> std::
     if depth >= MAX_DROP_WALK_DEPTH {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{} is nested too deeply to import", path.display()),
+            format!(
+                "{} is nested too deeply to import",
+                crate::sidebar::bound_sidebar_path_label(path)
+            ),
         ));
     }
     let mut total = 0u64;
@@ -2195,7 +2198,10 @@ fn drop_item_size(path: &std::path::Path, depth: usize, max_bytes: u64) -> std::
         if total > max_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("{} is too large to import", path.display()),
+                format!(
+                    "{} is too large to import",
+                    crate::sidebar::bound_sidebar_path_label(path)
+                ),
             ));
         }
     }
@@ -2236,20 +2242,34 @@ fn plan_drop_with_caps(
     let mut total_bytes = 0u64;
     for path in paths {
         if !path.is_absolute() {
-            return Err(format!("{} is not an absolute path", path.display()));
+            return Err(format!(
+                "{} is not an absolute path",
+                crate::sidebar::bound_sidebar_path_label(&path)
+            ));
         }
         let Some(name) = path.file_name() else {
-            return Err(format!("{} has no file name to import", path.display()));
+            return Err(format!(
+                "{} has no file name to import",
+                crate::sidebar::bound_sidebar_path_label(&path)
+            ));
         };
         let dst = target_dir.join(name);
         let mut error = None;
         let mut is_dir = false;
         match std::fs::symlink_metadata(&path) {
-            Err(problem) => error = Some(format!("cannot inspect {}: {problem}", path.display())),
+            Err(problem) => {
+                error = Some(crate::sidebar::bound_sidebar_notice(format!(
+                    "cannot inspect {}: {problem}",
+                    crate::sidebar::bound_sidebar_path_label(&path)
+                )))
+            }
             Ok(metadata) => {
                 is_dir = metadata.is_dir();
                 if std::fs::symlink_metadata(&dst).is_ok() {
-                    error = Some(format!("{} already exists", dst.display()));
+                    error = Some(crate::sidebar::bound_sidebar_notice(format!(
+                        "{} already exists",
+                        crate::sidebar::bound_sidebar_path_label(&dst)
+                    )));
                 } else {
                     match drop_item_size(&path, 0, max_bytes) {
                         Ok(size) => {
@@ -2261,7 +2281,9 @@ fn plan_drop_with_caps(
                                 ));
                             }
                         }
-                        Err(problem) => error = Some(problem.to_string()),
+                        Err(problem) => {
+                            error = Some(crate::sidebar::bound_sidebar_notice(problem.to_string()))
+                        }
                     }
                 }
             }
@@ -30844,6 +30866,15 @@ mod tests {
         )
         .expect_err("relative");
         assert!(error.contains("absolute"));
+        let hostile = plan_drop_with_caps(
+            vec![std::path::PathBuf::from(format!("rel/\u{1b}{}", "x".repeat(400)))],
+            root.join("target"),
+            4,
+            1024,
+        )
+        .expect_err("hostile relative");
+        assert!(!hostile.contains('\u{1b}'));
+        assert!(hostile.contains("absolute"));
         // Total size over the byte cap refuses the whole burst.
         let error = plan_drop_with_caps(vec![root.join("a.txt")], root.join("target"), 4, 2)
             .expect_err("oversize");
