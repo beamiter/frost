@@ -34,7 +34,9 @@ use crate::ai_chat_store::{self, ChatStatus, ChatStore, ChatStoreError, RequestT
 use crate::config::Config;
 
 pub(crate) const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
-pub(crate) const MAX_SEARCH_CHARS: usize = 1_024;
+/// One-line library filter budget, matching the other overlay queries so a
+/// paste cannot grow the iced field without bound.
+pub(crate) const MAX_SEARCH_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
 /// anvil compacts to 1 MiB because the snapshot embeds in its 4 MiB
 /// window-state envelope; frost's standalone file answers only to the shared
 /// schema cap, so the compaction target is the core limit itself.
@@ -313,7 +315,18 @@ impl AiChatsUi {
     }
 
     pub(crate) fn set_search(&mut self, query: String) {
-        self.search = query.chars().take(MAX_SEARCH_CHARS).collect();
+        let mut query: String = query
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if query.len() > MAX_SEARCH_BYTES {
+            let mut end = MAX_SEARCH_BYTES;
+            while end > 0 && !query.is_char_boundary(end) {
+                end -= 1;
+            }
+            query.truncate(end);
+        }
+        self.search = query;
     }
 
     pub(crate) fn include_recent(&self, chat_id: u64) -> bool {
@@ -1081,5 +1094,19 @@ mod tests {
             draft_without_retry_message("failed", "edited failed"),
             "edited failed"
         );
+    }
+
+    #[test]
+    fn library_search_drops_controls_and_truncates_on_a_char_boundary() {
+        let mut panel = fresh_panel();
+        panel.set_search("ch\n\u{1b}at".into());
+        assert_eq!(panel.search, "chat");
+        panel.set_search(format!("{}y", "x".repeat(MAX_SEARCH_BYTES)));
+        assert_eq!(panel.search.len(), MAX_SEARCH_BYTES);
+        assert!(!panel.search.contains('y'));
+        panel.set_search(format!("{}z", "界".repeat(MAX_SEARCH_BYTES)));
+        assert!(panel.search.len() <= MAX_SEARCH_BYTES);
+        assert!(panel.search.is_char_boundary(panel.search.len()));
+        assert!(!panel.search.contains('z'));
     }
 }

@@ -1132,3 +1132,9 @@ everywhere except a resize, and an audit against ember found the rest.
      newlines and tabs, drops other controls, and truncates on a UTF-8
      boundary at `NATIVE_AGENT_FOLLOW_UP_MAX_BYTES`.
 
+190. **Bounded AI-chats library filter** — the panel search kept the first
+     1,024 Unicode scalars including ESC/newline, so a paste could restyle
+     the filter and disagreed with the family's 4 KiB overlay budget.
+     `set_search` now drops controls and truncates on a UTF-8 boundary at
+     `MAX_PICKER_QUERY_BYTES`.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 190 — bounded AI-chats library filter)
+
+## 2026-10-03 (upgrade round 190)
+
+- AI Chats library search drops controls and truncates at 4 KiB on a char
+  boundary instead of keeping 1,024 raw Unicode scalars.
+- `cargo test --locked --bin frost -- ai_chats::tests::library_search_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-03 (upgrade round 189 — bounded Tasks follow-up composer)
 
 ## 2026-10-03 (upgrade round 189)
