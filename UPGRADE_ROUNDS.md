@@ -1257,3 +1257,8 @@ everywhere except a resize, and an audit against ember found the rest.
      errors verbatim, so ESC/bidi and a long `io::Error` could restyle the
      overlay. Every toast now goes through `safe_inline_display` at 256 bytes.
 
+214. **Bounded AI-chats composer** — iced assigned the draft through
+     `set_active_draft`, which truncates at 64 KiB but keeps ESC, so a paste
+     could restyle the composer until send. `set_draft` now keeps newlines and
+     tabs, drops other controls, and truncates at `MAX_LIVE_MESSAGE_BYTES`.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 214 — bounded AI-chats composer)
+
+## 2026-10-03 (upgrade round 214)
+
+- AI Chats composer keeps newlines/tabs, drops other controls, and truncates
+  at 64 KiB so iced cannot hold more than `set_active_draft` stores.
+- `cargo test --locked --bin frost -- ai_chats::tests::composer_keeps_newlines_and_matches_the_live_message_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 213 — bounded toast chrome)
 
 ## 2026-10-03 (upgrade round 213)

@@ -313,7 +313,7 @@ impl AiChatsUi {
     }
 
     pub(crate) fn set_draft(&mut self, draft: String) {
-        if self.store.set_active_draft(draft) {
+        if self.store.set_active_draft(bound_chat_draft(draft)) {
             self.dirty = true;
         }
     }
@@ -672,6 +672,22 @@ impl AiChatsUi {
     fn sync_title_draft(&mut self) {
         self.title_draft = self.store.active_title().to_string();
     }
+}
+
+fn bound_chat_draft(draft: impl Into<String>) -> String {
+    let mut draft: String = draft
+        .into()
+        .chars()
+        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .collect();
+    if draft.len() > jterm_core::ai::MAX_LIVE_MESSAGE_BYTES {
+        let mut end = jterm_core::ai::MAX_LIVE_MESSAGE_BYTES;
+        while end > 0 && !draft.is_char_boundary(end) {
+            end -= 1;
+        }
+        draft.truncate(end);
+    }
+    draft
 }
 
 fn bound_title_draft(title: String) -> String {
@@ -1155,5 +1171,33 @@ mod tests {
         panel.rename("ok\u{200b}title".into());
         assert!(!panel.title_draft.contains('\u{200b}'));
         assert!(panel.title_draft.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn composer_keeps_newlines_and_matches_the_live_message_envelope() {
+        let mut panel = fresh_panel();
+        panel.set_draft("please\n\u{1b}fix".into());
+        assert_eq!(panel.store.active_draft(), "please\nfix");
+        panel.set_draft("a\tb".into());
+        assert_eq!(panel.store.active_draft(), "a\tb");
+        panel.set_draft(format!(
+            "{}y",
+            "x".repeat(jterm_core::ai::MAX_LIVE_MESSAGE_BYTES)
+        ));
+        assert_eq!(
+            panel.store.active_draft().len(),
+            jterm_core::ai::MAX_LIVE_MESSAGE_BYTES
+        );
+        assert!(!panel.store.active_draft().contains('y'));
+        panel.set_draft(format!(
+            "{}z",
+            "界".repeat(jterm_core::ai::MAX_LIVE_MESSAGE_BYTES)
+        ));
+        assert!(panel.store.active_draft().len() <= jterm_core::ai::MAX_LIVE_MESSAGE_BYTES);
+        assert!(panel
+            .store
+            .active_draft()
+            .is_char_boundary(panel.store.active_draft().len()));
+        assert!(!panel.store.active_draft().contains('z'));
     }
 }
