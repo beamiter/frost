@@ -1614,3 +1614,7 @@ everywhere except a resize, and an audit against ember found the rest.
 300. **Restored tab titles refuse spoofing** — snapshot titles with controls,
      bidi marks, or U+FFFD are discarded instead of becoming custom labels.
      Rename persist uses the same fail-closed check.
+
+301. **OSC 9/777 refuse rewritten toasts** — PTY-authored desktop notifications
+     whose title or body contained controls or visual spoofing are dropped
+     instead of being handed to notify-send as U+FFFD text.

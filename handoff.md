@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 301 — OSC 9/777 refuse rewritten toasts)
+
+## 2026-10-04 (upgrade round 301)
+
+- Desktop notifications from OSC 9/777 are dropped when title or body had to be rewritten (controls or visual spoofing).
+- `cargo test --locked --bin frost -- osc_notification_fields_are_sanitized_before_they_leave_the_terminal` passed.
+
 Updated: 2026-10-04 (upgrade round 300 — Restored tab titles refuse spoofing)
 
 ## 2026-10-04 (upgrade round 300)

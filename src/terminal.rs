@@ -4303,7 +4303,9 @@ impl TerminalState {
                     if self.pending_notifications.len() < 8 {
                         let title = jterm_core::identity::get().app_name.to_owned();
                         let body = Self::safe_notification_field(value);
-                        self.pending_notifications.push((title, body));
+                        if !Self::notification_field_is_rewritten(&body) {
+                            self.pending_notifications.push((title, body));
+                        }
                     }
                 } else if command == "777" {
                     // rxvt notification: 777;notify;title;body
@@ -4319,7 +4321,10 @@ impl TerminalState {
                             title
                         };
                         let body = Self::safe_notification_field(parts.get(2).unwrap_or(&""));
-                        if self.pending_notifications.len() < 8 {
+                        if self.pending_notifications.len() < 8
+                            && !Self::notification_field_is_rewritten(&title)
+                            && !Self::notification_field_is_rewritten(&body)
+                        {
                             self.pending_notifications.push((title, body));
                         }
                     }
@@ -6613,6 +6618,10 @@ impl TerminalState {
             .collect::<String>()
             .trim()
             .to_owned()
+    }
+
+    fn notification_field_is_rewritten(field: &str) -> bool {
+        field.contains('\u{fffd}')
     }
 
     fn sanitized_title(title: &str) -> String {
@@ -13247,30 +13256,22 @@ mod tests {
         spoofed.process_input(
             "\x1b]777;notify;\u{202e}Security Update;\u{202e}approve\x07".as_bytes(),
         );
-        assert_eq!(spoofed.pending_notifications.len(), 1);
-        let (title, body) = &spoofed.pending_notifications[0];
-        assert_eq!(title, "\u{fffd}Security Update");
-        assert_eq!(body, "\u{fffd}approve");
+        assert!(spoofed.pending_notifications.is_empty());
 
         // Controls, and the interlinear annotation controls that draw as
-        // nothing, are replaced rather than dropped: a rewritten field must
-        // read as rewritten, not as a shorter honest one.
+        // nothing, must not become a desktop toast after replacement.
         let mut controls = super::TerminalState::new(40, 8);
         controls.process_input("\x1b]9;build \u{1}done\u{fff9}now\x07".as_bytes());
-        assert_eq!(
-            controls.pending_notifications[0],
-            (app.to_owned(), "build \u{fffd}done\u{fffd}now".to_string())
-        );
+        assert!(controls.pending_notifications.is_empty());
 
         // A title that is only whitespace still names the application. A title
-        // that was rewritten keeps its replacement glyph instead: the toast
-        // says something was removed rather than quietly renaming itself.
+        // that was rewritten is refused rather than sent as U+FFFD.
         let mut nameless = super::TerminalState::new(40, 8);
         nameless.process_input("\x1b]777;notify;   ;body\x07".as_bytes());
         assert_eq!(nameless.pending_notifications[0].0, app);
         let mut rewritten = super::TerminalState::new(40, 8);
         rewritten.process_input("\x1b]777;notify;\u{202e};body\x07".as_bytes());
-        assert_eq!(rewritten.pending_notifications[0].0, "\u{fffd}");
+        assert!(rewritten.pending_notifications.is_empty());
 
         // Both fields stay bounded.
         let mut long = super::TerminalState::new(40, 8);
