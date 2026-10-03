@@ -1427,6 +1427,18 @@ pub const BLOCK_SEARCH_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// past the accepted limit. The sentinel preserves a visible `TooLong` error
 /// and Backspace recovery without keeping an arbitrary clipboard paste alive.
 pub fn bounded_block_search_query(query: String) -> String {
+    let query: String = query
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
     if query.len() <= BLOCK_SEARCH_QUERY_MAX_BYTES {
         return query;
     }
@@ -3680,6 +3692,10 @@ mod tests {
         assert!(compact.len() > BLOCK_SEARCH_QUERY_MAX_BYTES);
         assert_eq!(compact.capacity(), compact.len());
         assert!(validated_block_search_query(&compact).is_err());
+        let spoofed = bounded_block_search_query("cargo\u{202e} test\u{1b}".into());
+        assert_eq!(spoofed, "cargo\u{fffd} test");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(!spoofed.contains('\u{1b}'));
     }
 
     #[test]

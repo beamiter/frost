@@ -1590,3 +1590,7 @@ everywhere except a resize, and an audit against ember found the rest.
 294. **File-path detection skips visual spoofing** — highlighted paths still
      became clickable when they contained bidi or zero-width marks. Spoofed
      paths are no longer detected as file links.
+
+295. **Block-search queries strip visual spoofing** — the overlay query was
+     length-bounded but kept bidi. Query ingest now drops controls and
+     replaces spoofing with U+FFFD.

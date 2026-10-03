@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 295 — Block-search queries strip visual spoofing)
+
+## 2026-10-04 (upgrade round 295)
+
+- Block-search overlay queries drop controls and replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- block_mode::tests::invalid_or_oversized_regex_is_not_a_false_empty_result` passed.
+
 Updated: 2026-10-04 (upgrade round 294 — File-path detection skips visual spoofing)
 
 ## 2026-10-04 (upgrade round 294)
