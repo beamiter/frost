@@ -1513,3 +1513,7 @@ everywhere except a resize, and an audit against ember found the rest.
      field kept newlines but also kept bidi. Follow-up ingest now replaces
      spoofing with U+FFFD.
 
+275. **New-file name drafts strip visual spoofing** — New File / Rename dialogs
+     dropped slashes and controls but kept bidi. Name ingest now replaces
+     spoofing with U+FFFD.
+

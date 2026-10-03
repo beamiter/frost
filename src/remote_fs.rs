@@ -1297,7 +1297,15 @@ pub fn bound_new_name(name: impl Into<String>) -> String {
     let mut name: String = name
         .into()
         .chars()
-        .filter(|character| *character != '/' && !character.is_control())
+        .filter_map(|character| {
+            if character == '/' || character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if name.len() > MAX_NEW_NAME_BYTES {
         let mut end = MAX_NEW_NAME_BYTES;
@@ -3441,6 +3449,10 @@ mod tests {
         assert!(overflow.len() <= MAX_NEW_NAME_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        let spoofed = bound_new_name("notes\u{202e}file.txt");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(spoofed.contains('\u{fffd}'));
+        assert!(spoofed.starts_with("notes"));
     }
 
     #[test]

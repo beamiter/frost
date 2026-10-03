@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 275 — New-file name drafts strip visual spoofing)
+
+## 2026-10-04 (upgrade round 275)
+
+- New File / Rename drafts replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- remote_fs::tests::new_name_draft_drops_controls_and_slashes_and_stays_inside_255_bytes` passed.
+
 Updated: 2026-10-04 (upgrade round 274 — Task follow-up composer strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 274)
