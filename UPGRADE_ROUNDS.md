@@ -1200,3 +1200,8 @@ everywhere except a resize, and an audit against ember found the rest.
      reached config. `SetAiTemperature` now drops controls and visual spoofing
      and truncates at `MAX_AI_TEMPERATURE_DRAFT_BYTES`.
 
+202. **Bounded AI provider settings field** — iced assigned the provider name
+     unbounded, so ESC/bidi and a 256-byte+1 paste sat until `normalized()`
+     replaced it with the default. `SetAiProvider` now uses `bound_config_text`
+     at `MAX_CONFIG_NAME_BYTES`.
+

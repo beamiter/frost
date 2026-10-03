@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 202 — bounded AI provider settings field)
+
+## 2026-10-03 (upgrade round 202)
+
+- Settings AI provider drops controls and visual spoofing and truncates at
+  256 bytes so iced cannot hold more than `normalized()` keeps.
+- `cargo test --locked --bin frost -- config::tests::live_ai_provider_field_uses_the_name_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 201 — bounded AI temperature draft)
 
 ## 2026-10-03 (upgrade round 201)

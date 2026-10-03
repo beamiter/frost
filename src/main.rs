@@ -13182,7 +13182,10 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetAiProvider(provider) => {
-                self.config.ai_provider = provider;
+                self.config.ai_provider = crate::config::bound_config_text(
+                    provider,
+                    crate::config::MAX_CONFIG_NAME_BYTES,
+                );
                 self.config_dirty = true;
             }
             Message::SetAiModel(model) => {
