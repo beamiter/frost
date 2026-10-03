@@ -1150,3 +1150,9 @@ everywhere except a resize, and an audit against ember found the rest.
      keeps newlines and tabs, drops other controls, and truncates on a UTF-8
      boundary at `NATIVE_AGENT_FOLLOW_UP_MAX_BYTES`.
 
+193. **Bounded command-correction draft** — the iced card assigned the edited
+     command into `CorrectionProposal` unbounded, so a paste could sit past
+     the engine's 16 KiB single-line gate and carry ESC until accept refused.
+     `set_draft` now drops controls and truncates on a UTF-8 boundary at
+     `MAX_CORRECTION_COMMAND_BYTES`.
+

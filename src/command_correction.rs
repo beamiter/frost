@@ -45,7 +45,8 @@ use jterm_core::command_correction::{
 
 pub(crate) use jterm_core::command_correction::{
     compact_one_line, correction_monitor_enabled, resolve_correction_blocking, should_start,
-    CompletionFacts, CorrectionCandidate, CORRECTION_REQUEST_TIMEOUT, MAX_CORRECTION_CWD_BYTES,
+    CompletionFacts, CorrectionCandidate, CORRECTION_REQUEST_TIMEOUT, MAX_CORRECTION_COMMAND_BYTES,
+    MAX_CORRECTION_CWD_BYTES,
 };
 
 /// Names the probe's stdout reader thread, so a reader still blocked on a
@@ -93,6 +94,22 @@ pub(crate) fn correction_policy(share_command_context: bool) -> CorrectionPolicy
     )
 }
 
+fn bound_correction_draft(draft: impl Into<String>) -> String {
+    let mut draft: String = draft
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if draft.len() > MAX_CORRECTION_COMMAND_BYTES {
+        let mut end = MAX_CORRECTION_COMMAND_BYTES;
+        while end > 0 && !draft.is_char_boundary(end) {
+            end -= 1;
+        }
+        draft.truncate(end);
+    }
+    draft
+}
+
 /// One pane's live correction request, and the card it resolved into.
 pub(crate) struct CorrectionSession {
     generation: u64,
@@ -107,6 +124,16 @@ pub(crate) struct CorrectionSession {
 impl CorrectionSession {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Bound the iced correction-card draft to the engine's 16 KiB single-line
+    /// envelope so a paste cannot sit past `validate_edited_command`.
+    pub(crate) fn set_draft(&mut self, draft: String) {
+        let Some(proposal) = self.proposal.as_mut() else {
+            return;
+        };
+        *proposal.draft_mut() = bound_correction_draft(draft);
+        proposal.set_feedback(None);
     }
 }
 
@@ -363,6 +390,20 @@ mod tests {
         *proposal.draft_mut() = "x".repeat(17 * 1024);
         assert!(proposal.accept().is_err());
         assert!(!proposal.run_allowed());
+    }
+
+    #[test]
+    fn the_card_draft_drops_controls_and_stays_inside_the_engine_envelope() {
+        assert_eq!(bound_correction_draft("git\n\u{1b} status"), "git status");
+        let filled =
+            bound_correction_draft(format!("{}y", "x".repeat(MAX_CORRECTION_COMMAND_BYTES)));
+        assert_eq!(filled.len(), MAX_CORRECTION_COMMAND_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow =
+            bound_correction_draft(format!("{}z", "界".repeat(MAX_CORRECTION_COMMAND_BYTES)));
+        assert!(overflow.len() <= MAX_CORRECTION_COMMAND_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
     }
 
     /// The verified branch — the one frost could not reach hermetically

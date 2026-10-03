@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 193 — bounded command-correction draft)
+
+## 2026-10-03 (upgrade round 193)
+
+- Command-correction card draft drops controls and truncates at 16 KiB so
+  iced cannot hold more than `validate_edited_command` accepts.
+- `cargo test --locked --bin frost -- command_correction::tests::the_card_draft_drops_controls_and_stays_inside_the_engine_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 192 — bounded Agent-panel composer)
 
 ## 2026-10-03 (upgrade round 192)

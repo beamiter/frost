@@ -12917,10 +12917,7 @@ impl Frost {
             Message::CommandCorrectionInput(draft) => {
                 if let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) {
                     if let Some(session) = self.command_corrections.get_mut(session_id) {
-                        if let Some(proposal) = session.proposal.as_mut() {
-                            *proposal.draft_mut() = draft;
-                            proposal.set_feedback(None);
-                        }
+                        session.set_draft(draft);
                     }
                 }
             }
