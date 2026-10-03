@@ -23338,9 +23338,14 @@ impl Frost {
         let direct_run = proposal.run_allowed();
 
         let header = row![
-            text(candidate.display_title()).size(14),
+            text(crate::command_correction::bound_correction_feedback(
+                candidate.display_title()
+            ))
+            .size(14),
             Space::new().width(Length::Fill),
-            text(candidate.display_badge(session.exit_code))
+            text(crate::command_correction::bound_correction_feedback(
+                candidate.display_badge(session.exit_code)
+            ))
                 .size(11)
                 .style(text::secondary),
             button(text("✕").size(12))
@@ -23354,7 +23359,9 @@ impl Frost {
         // model prose at all: this card used to interpolate a
         // provider-controlled message straight into a label sitting directly
         // above an editable, pre-filled, auto-focused command field.
-        let description = text(candidate.display_description(&session.original_command))
+        let description = text(crate::command_correction::bound_correction_feedback(
+            candidate.display_description(&session.original_command),
+        ))
             .size(12)
             .wrapping(text::Wrapping::Word)
             .style(text::secondary);

@@ -551,5 +551,11 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_CORRECTION_FEEDBACK_BYTES);
         assert!(shown.starts_with("Cannot accept correction:"));
+        let title =
+            bound_correction_feedback(format!("Fix typo \u{1b}[31m\u{202e}{}", "t".repeat(400)));
+        assert!(!title.contains('\u{1b}'));
+        assert!(!title.contains('\u{202e}'));
+        assert!(title.len() <= MAX_CORRECTION_FEEDBACK_BYTES);
+        assert!(title.starts_with("Fix typo"));
     }
 }

@@ -1441,3 +1441,7 @@ everywhere except a resize, and an audit against ember found the rest.
      disk were listed in the iced pick_list verbatim. Names now run
      `bound_custom_theme_name` before display.
 
+257. **Bounded command-correction card title chrome** — title, badge, and
+     description were drawn from the engine as iced text. Those now share the
+     correction-feedback envelope at draw.
+

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 257 — bounded command-correction card chrome)
+
+## 2026-10-04 (upgrade round 257)
+
+- Correction-card title, badge, and description sanitize at iced draw.
+- `cargo test --locked --bin frost -- command_correction::tests::correction_feedback_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 256 — bounded settings theme-picker names)
 
 ## 2026-10-04 (upgrade round 256)
