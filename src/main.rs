@@ -24838,10 +24838,18 @@ fn abbreviate_home(path: &str) -> String {
 /// Submit an OSC 9/777 notification to one bounded worker. The worker owns and
 /// waits for every `notify-send` child, preventing zombies; a stuck notifier can
 /// fill at most this small queue instead of spawning unbounded processes/threads.
+fn bound_desktop_notification_pair(title: String, body: String) -> (String, String) {
+    (
+        crate::review_text::bound_toast_text(title),
+        crate::review_text::bound_toast_text(body),
+    )
+}
+
 fn enqueue_desktop_notification(title: String, body: String) {
     type Notification = (String, String);
     static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Notification>> =
         std::sync::OnceLock::new();
+    let (title, body) = bound_desktop_notification_pair(title, body);
 
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Notification>(8);
@@ -25631,6 +25639,22 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn desktop_notification_pair_strips_osc_payload_controls() {
+        let (title, body) = bound_desktop_notification_pair(
+            format!("bell\u{1b}[31m\u{202e}{}", "t".repeat(400)),
+            format!("from PTY\n\u{07}{}", "b".repeat(400)),
+        );
+        assert!(!title.contains('\u{1b}'));
+        assert!(!title.contains('\u{202e}'));
+        assert!(title.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(!body.contains('\n'));
+        assert!(!body.contains('\u{07}'));
+        assert!(body.len() <= crate::review_text::MAX_TOAST_BYTES);
+        assert!(title.starts_with("bell"));
+        assert!(body.starts_with("from PTY"));
+    }
 
     #[test]
     fn osc5522_pending_read_counts_refusals_before_eperm() {

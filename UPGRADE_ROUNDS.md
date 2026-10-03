@@ -1379,3 +1379,7 @@ everywhere except a resize, and an audit against ember found the rest.
      header interpolated `cwd_display()`, `format_strip`, and the foreground
      process verbatim. Those now use the tab-title envelope / toast bound.
 
+241. **Bounded OSC desktop-notification chrome** — OSC 9/777 strings from the
+     PTY were forwarded to `notify-send` verbatim. Title and body now share
+     the toast envelope (controls/spoofing stripped, 256 bytes).
+

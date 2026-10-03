@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 241 — bounded OSC desktop notifications)
+
+## 2026-10-03 (upgrade round 241)
+
+- OSC 9/777 title and body are sanitized before `notify-send`.
+- `cargo test --locked --bin frost -- tests::desktop_notification_pair_strips_osc_payload_controls` passed.
+
 Updated: 2026-10-03 (upgrade round 240 — bounded pane-header path chrome)
 
 ## 2026-10-03 (upgrade round 240)
