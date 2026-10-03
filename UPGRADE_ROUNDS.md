@@ -1050,3 +1050,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `replace_all` cannot insert the replacement at every empty match the regex
      crate would otherwise report.
 
+177. **Out-of-range ANSI theme fallback** — `ThemeExt::ansi_color` is pinned to
+     return the terminal foreground for every index outside 0–15, including
+     `usize::MAX`, instead of relying on an untested `else` arm. RGBA iced
+     conversion is also pinned so alpha is `u8 / 255`.
+

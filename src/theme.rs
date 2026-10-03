@@ -9,7 +9,7 @@ pub use jterm_core::theme::*;
 /// iced color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color;
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rgba_to_color32(rgba: [u8; 4]) -> Color;
     fn terminal_foreground(&self) -> Color;
     fn terminal_background(&self) -> Color;
@@ -77,3 +77,31 @@ impl ThemeExt for Theme {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Theme, ThemeExt as _};
+    use iced::Color;
+
+    #[test]
+    fn rgba_converts_with_alpha_scale() {
+        let color = Theme::rgba_to_color32([10, 20, 30, 128]);
+        assert_eq!(color.r, Color::from_rgba8(10, 20, 30, 128.0 / 255.0).r);
+        assert_eq!(color.g, Color::from_rgba8(10, 20, 30, 128.0 / 255.0).g);
+        assert_eq!(color.b, Color::from_rgba8(10, 20, 30, 128.0 / 255.0).b);
+        assert!((color.a - 128.0 / 255.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ansi_color_out_of_range_falls_back_to_foreground() {
+        let theme = Theme::default();
+        assert_eq!(theme.ansi_color(0), Theme::rgb_to_color32(theme.terminal.ansi_colors[0]));
+        assert_eq!(
+            theme.ansi_color(15),
+            Theme::rgb_to_color32(theme.terminal.ansi_colors[15])
+        );
+        assert_eq!(theme.ansi_color(16), theme.terminal_foreground());
+        assert_eq!(theme.ansi_color(usize::MAX), theme.terminal_foreground());
+    }
+}
+

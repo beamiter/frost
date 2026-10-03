@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 177 — out-of-range ANSI theme fallback)
+
+## 2026-10-03 (upgrade round 177)
+
+- `ansi_color` out of 0–15 returns the terminal foreground; RGBA conversion is
+  pinned.
+- `cargo test --locked --bin frost -- theme::tests` — 2 passed.
+
 Updated: 2026-10-03 (upgrade round 176 — empty regex replace is a no-op)
 
 ## 2026-10-03 (upgrade round 176)
