@@ -981,6 +981,7 @@ impl Config {
 fn valid_config_text(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
+        && !value.contains('\u{fffd}')
         && !value.chars().any(char::is_control)
         && !jterm_core::review_input::contains_visual_spoofing(value)
 }
@@ -1021,7 +1022,7 @@ fn validate_remote_host_text(value: &str, field: &str, max_bytes: usize) -> Resu
     if value.chars().any(char::is_control) {
         return Err(format!("{field} must not contain control characters"));
     }
-    if jterm_core::review_input::contains_visual_spoofing(value) {
+    if value.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(value) {
         return Err(format!(
             "{field} must not contain invisible or direction-changing formatting"
         ));
@@ -1169,6 +1170,7 @@ fn bounded_path(path: Option<PathBuf>) -> Option<PathBuf> {
         !value.is_empty()
             && value.len() <= MAX_CONFIG_VALUE_BYTES
             && !value.chars().any(char::is_control)
+            && !value.contains('\u{fffd}')
             && !jterm_core::review_input::contains_visual_spoofing(&value)
     })
 }
@@ -1315,6 +1317,26 @@ mod tests {
         assert_eq!(normalized.session_history_file, None);
         assert_eq!(normalized.command_history_path, None);
         assert_eq!(normalized.jsh_update_check, "daily");
+    }
+
+    #[test]
+    fn replacement_characters_never_reach_config_consumers() {
+        let config = Config {
+            ai_model: "model\u{fffd}spoof".to_string(),
+            theme: "bad\u{fffd}theme".to_string(),
+            session_history_file: Some(PathBuf::from("/tmp/\u{fffd}history")),
+            ..Config::default()
+        };
+        let normalized = config.normalized();
+        assert_eq!(normalized.ai_model, default_ai_model());
+        assert_eq!(normalized.theme, default_theme());
+        assert_eq!(normalized.session_history_file, None);
+
+        let mut host = remote_host("safe", "ok\u{fffd}.example.com", false);
+        assert!(validate_remote_host(&host).is_err());
+        host = remote_host("safe", "safe.example.com", false);
+        host.user = Some("ok\u{fffd}".to_string());
+        assert!(validate_remote_host(&host).is_err());
     }
 
     #[test]

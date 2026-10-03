@@ -1634,3 +1634,7 @@ everywhere except a resize, and an audit against ember found the rest.
 305. **Find-replace output refuses spoofing** — apply refuses a replacement
      that still contains U+FFFD, odd controls, or visual spoofing so it cannot
      reach the clipboard or be typed into the prompt.
+
+306. **Config persist refuses U+FFFD** — normalized settings, history paths,
+     and remote-host validation refuse replacement characters so a neutralized
+     draft cannot become a model name, theme, path, or ssh operand.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 306 — Config persist refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 306)
+
+- Normalized settings, paths, and remote-host validation refuse U+FFFD so a neutralized draft cannot become a model name, theme, history path, or ssh operand.
+- `cargo test --locked --bin frost -- config::tests::replacement_characters_never_reach_config_consumers` passed.
+
 Updated: 2026-10-04 (upgrade round 305 — Find-replace output refuses spoofing)
 
 ## 2026-10-04 (upgrade round 305)
