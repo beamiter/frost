@@ -1359,3 +1359,7 @@ everywhere except a resize, and an audit against ember found the rest.
      were drawn verbatim. They now run `bound_transcript_text` (keep newlines,
      1 KiB) including streamed proposed commands.
 
+236. **Bounded Files-tree scan-error rows** — root and child Error/RefreshError
+     rows interpolated `DirectoryError` as danger chrome. Those lines now run
+     `bound_sidebar_notice`.
+

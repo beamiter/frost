@@ -18992,7 +18992,7 @@ impl Frost {
             sidebar::DirectoryState::Error(error) => rows.push(
                 container(
                     row![
-                        text(error.to_string())
+                        text(crate::sidebar::bound_sidebar_notice(error.to_string()))
                             .size(11)
                             .wrapping(text::Wrapping::Word)
                             .width(Length::Fill)
@@ -19014,7 +19014,9 @@ impl Frost {
             sidebar::DirectoryState::RefreshError(error) => rows.push(
                 container(
                     row![
-                        text(format!("Refresh failed: {error}"))
+                        text(crate::sidebar::bound_sidebar_notice(format!(
+                            "Refresh failed: {error}"
+                        )))
                             .size(11)
                             .wrapping(text::Wrapping::Word)
                             .width(Length::Fill)
@@ -19286,11 +19288,15 @@ impl Frost {
                     .0
                 });
                 match age {
-                    Some(age) => format!("Refresh failed: {error} · {age}"),
-                    None => format!("Refresh failed: {error}"),
+                    Some(age) => crate::sidebar::bound_sidebar_notice(format!(
+                        "Refresh failed: {error} · {age}"
+                    )),
+                    None => crate::sidebar::bound_sidebar_notice(format!(
+                        "Refresh failed: {error}"
+                    )),
                 }
             } else {
-                error.to_string()
+                crate::sidebar::bound_sidebar_notice(error.to_string())
             };
             out.push(
                 container(

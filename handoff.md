@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 236 — bounded Files-tree scan-error rows)
+
+## 2026-10-03 (upgrade round 236)
+
+- Files tree Error/RefreshError rows sanitize `DirectoryError` text through
+  `bound_sidebar_notice` before drawing danger chrome.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 235 — bounded Agent transcript chrome)
 
 ## 2026-10-03 (upgrade round 235)

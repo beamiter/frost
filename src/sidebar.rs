@@ -3250,6 +3250,11 @@ mod tests {
         let busy = DirectoryError::busy(format!("queue full \u{1b}{}", "x".repeat(400)));
         assert!(!busy.message.contains('\u{1b}'));
         assert!(busy.message.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        let refresh =
+            bound_sidebar_notice(format!("Refresh failed: \u{1b}[31m{}", "e".repeat(400)));
+        assert!(!refresh.contains('\u{1b}'));
+        assert!(refresh.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        assert!(refresh.starts_with("Refresh failed:"));
         let again = bound_sidebar_notice(&shown);
         assert_eq!(again, shown);
         assert_eq!(bound_sidebar_notice(""), "Files panel notice");
