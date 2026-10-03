@@ -36,6 +36,25 @@ pub(crate) fn bound_suggestion_request(text: impl Into<String>) -> String {
     text
 }
 
+/// Bound the review card's editable draft. Same 256 KiB review-insert budget
+/// as `jterm_core::review_input::validate`, but truncate instead of rejecting
+/// so an oversized paste or model reply remains editable.
+pub(crate) fn bound_suggestion_draft(text: impl Into<String>) -> String {
+    let mut text: String = text
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if text.len() > jterm_core::review_input::MAX_REVIEW_INPUT_BYTES {
+        let mut end = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// Status copy for the card while the worker runs; also the retry affordance's
 /// pre-request state.
 pub(crate) const DRAFTING_STATUS: &str = "Drafting a command for review…";
@@ -182,7 +201,7 @@ impl CommandSuggestion {
         }
         match reply {
             Ok(command) => {
-                self.draft = command;
+                self.draft = bound_suggestion_draft(command);
                 self.phase = SuggestionPhase::Review;
                 self.feedback = None;
             }
@@ -304,6 +323,24 @@ mod tests {
         assert!(cjk.len() <= MAX_SUGGESTION_REQUEST_BYTES);
         assert!(cjk.is_char_boundary(cjk.len()));
         assert!(!cjk.contains('x'));
+    }
+
+    #[test]
+    fn overlay_draft_drops_controls_and_truncates() {
+        assert_eq!(bound_suggestion_draft("ls\n\u{1b} -l"), "ls -l");
+        let filled = bound_suggestion_draft(format!(
+            "{}y",
+            "x".repeat(jterm_core::review_input::MAX_REVIEW_INPUT_BYTES)
+        ));
+        assert_eq!(
+            filled.len(),
+            jterm_core::review_input::MAX_REVIEW_INPUT_BYTES
+        );
+        assert!(!filled.contains('y'));
+        let (mut session, generation) = begin();
+        assert!(session.apply_reply(generation, Ok("echo one\necho two".into())));
+        assert_eq!(session.draft, "echo oneecho two");
+        assert_eq!(session.phase(), SuggestionPhase::Review);
     }
 
     /// The card that replaced another must never accept its predecessor's

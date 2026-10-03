@@ -13001,10 +13001,8 @@ impl Frost {
             }
             Message::AiSuggestionInput(draft) => {
                 if let Some(session) = self.ai_suggestion.as_mut() {
-                    if draft.len() <= jterm_core::review_input::MAX_REVIEW_INPUT_BYTES {
-                        session.draft = draft;
-                        session.feedback = None;
-                    }
+                    session.draft = ai_command::bound_suggestion_draft(draft);
+                    session.feedback = None;
                 }
             }
             Message::AiSuggestionInsert => return self.insert_ai_suggestion(),

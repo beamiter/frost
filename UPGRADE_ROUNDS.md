@@ -1120,3 +1120,9 @@ everywhere except a resize, and an audit against ember found the rest.
      controls and truncate on a UTF-8 boundary at
      `MAX_SUGGESTION_REQUEST_BYTES`.
 
+188. **Bounded AI suggestion draft** — the review card rejected an oversized
+     iced paste wholesale and stored a model reply verbatim, so a 256 KiB+1
+     edit bounced and a newline in the generated command sat in the card until
+     insert failed. Both the widget and `apply_reply` now drop controls and
+     truncate on a UTF-8 boundary at `MAX_REVIEW_INPUT_BYTES`.
+

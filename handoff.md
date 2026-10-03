@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 188 — bounded AI suggestion draft)
+
+## 2026-10-03 (upgrade round 188)
+
+- Suggestion-card draft truncates at 256 KiB on a char boundary and drops
+  controls, including model replies applied onto the card.
+- `cargo test --locked --bin frost -- ai_command::tests` — 11 passed.
+
 Updated: 2026-10-03 (upgrade round 187 — bounded Ask-AI request overlay)
 
 ## 2026-10-03 (upgrade round 187)
