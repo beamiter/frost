@@ -10777,7 +10777,7 @@ impl Frost {
             &mut self.search.regex_cache,
         );
         self.search.matches = matches;
-        self.search.error_message = error;
+        self.search.set_error_message(error);
         if self.search.matches.is_empty()
             || self.search.current_match_index >= self.search.matches.len()
         {
@@ -10807,9 +10807,9 @@ impl Frost {
                 .locate_raw_cell_in_projection(&sess.projection, origin)
             {
                 terminal::ProjectedRawCellLocation::Hidden { zone_id } => {
-                    self.search.error_message = Some(format!(
+                    self.search.set_error_message(Some(format!(
                         "Match is hidden in collapsed block #{zone_id}; expand its output to reveal"
-                    ));
+                    )));
                 }
                 terminal::ProjectedRawCellLocation::Visible(_) => {}
                 terminal::ProjectedRawCellLocation::Retained => {
@@ -19987,7 +19987,7 @@ impl Frost {
     /// (the input deliberately has no `on_submit` so Shift+Enter can mean "prev").
     fn search_bar(&self) -> Element<'_, Message> {
         let status = if let Some(err) = &self.search.error_message {
-            err.clone()
+            crate::review_text::bound_query_error(err)
         } else if !self.search.matches.is_empty() {
             format!(
                 "{}/{}",

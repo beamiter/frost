@@ -204,6 +204,11 @@ impl SearchState {
         self.error_message = None;
     }
 
+    /// Find-bar diagnostic: regex compile failures quote the draft.
+    pub fn set_error_message(&mut self, error: Option<String>) {
+        self.error_message = error.map(crate::review_text::bound_query_error);
+    }
+
     /// 保存当前搜索词到历史
     fn save_to_history(&mut self) {
         if self.query.is_empty() {
@@ -835,19 +840,23 @@ mod tests {
     fn invalid_regex_error_does_not_echo_controls() {
         let lines = vec![SearchLine::Text("text")];
         let mut cache = None;
-        let (matches, error) = SearchEngine::search_lines(
-            lines,
-            "(\u{1b}[31m\u{202e}",
-            true,
-            true,
-            &mut cache,
-        );
+        let (matches, error) =
+            SearchEngine::search_lines(lines, "(\u{1b}[31m\u{202e}", true, true, &mut cache);
         assert!(matches.is_empty());
         let error = error.expect("compile failure");
         assert!(error.contains("Invalid regex"));
         assert!(!error.contains('\u{1b}'));
         assert!(!error.contains('\u{202e}'));
         assert!(error.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);
+        let mut state = SearchState::new();
+        state.set_error_message(Some(format!(
+            "Invalid regex: \u{1b}[31m{}",
+            "x".repeat(400)
+        )));
+        let shown = state.error_message.expect("bounded error");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(shown.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);
+        assert!(shown.starts_with("Invalid regex"));
     }
 
     #[test]

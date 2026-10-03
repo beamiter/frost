@@ -1332,3 +1332,7 @@ everywhere except a resize, and an audit against ember found the rest.
      restyle later Files notices. Those messages now use
      `bound_sidebar_path_label` / `bound_sidebar_notice`.
 
+230. **Bounded Find-bar error chrome** — scrollback search assigned engine
+     errors into the overlay status verbatim. `set_error_message` and the Find
+     bar now run `bound_query_error` so a quoted pattern cannot restyle it.
+

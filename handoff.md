@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 230 — bounded Find-bar error chrome)
+
+## 2026-10-03 (upgrade round 230)
+
+- Find-bar diagnostics drop controls/spoofing and truncate at 160 bytes
+  before they restyle the overlay status.
+- `cargo test --locked --bin frost -- search::tests::invalid_regex_error_does_not_echo_controls` passed.
+
 Updated: 2026-10-03 (upgrade round 229 — bounded drop-plan path problems)
 
 ## 2026-10-03 (upgrade round 229)
