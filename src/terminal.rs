@@ -5195,7 +5195,12 @@ impl TerminalState {
     fn control_free_osc7_cwd(&self) -> Option<String> {
         self.current_working_dir
             .clone()
-            .filter(|cwd| !cwd.chars().any(char::is_control))
+            .filter(|cwd| {
+                !cwd.chars().any(|character| {
+                    character.is_control()
+                        || jterm_core::review_input::is_visual_spoofing_character(character)
+                })
+            })
     }
 
     /// Close out a lifecycle whose command really ran (`C` fired) but whose
@@ -6551,7 +6556,15 @@ impl TerminalState {
         let decoded = String::from_utf8(out).ok()?;
         // A decoded path with an interior NUL cannot be opened and would be
         // truncated by any C API it reached, so reject it rather than store it.
-        if decoded.is_empty() || decoded.contains('\0') {
+        // Visual spoofing and other controls are the same class of authority
+        // confusion for the sidebar and inherited splits.
+        if decoded.is_empty()
+            || decoded.contains('\0')
+            || decoded.chars().any(|character| {
+                character.is_control()
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
+            })
+        {
             return None;
         }
         Some(decoded)
@@ -17932,6 +17945,13 @@ mod tests {
         // Exactly at the ceiling is still a directory.
         let at_cap = format!("/{}", "d".repeat(super::MAX_OSC7_CWD_BYTES - 1));
         terminal.process_input(format!("\x1b]7;{at_cap}\x1b\\").as_bytes());
+        assert_eq!(terminal.current_working_dir(), Some(at_cap.as_str()));
+
+        terminal.process_input("\x1b]7;/tmp/\u{202e}hidden\x1b\\".as_bytes());
+        assert_eq!(terminal.current_working_dir(), Some(at_cap.as_str()));
+        terminal.process_input("\x1b]7;/tmp/\u{200b}zwsp\x1b\\".as_bytes());
+        assert_eq!(terminal.current_working_dir(), Some(at_cap.as_str()));
+        terminal.process_input("\x1b]7;/tmp/\nhidden\x1b\\".as_bytes());
         assert_eq!(terminal.current_working_dir(), Some(at_cap.as_str()));
     }
 

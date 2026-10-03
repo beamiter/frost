@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 285 — OSC 7 cwd reports reject visual spoofing)
+
+## 2026-10-04 (upgrade round 285)
+
+- OSC 7 cwd decode rejects controls and visual spoofing instead of storing them as pane authority.
+- `cargo test --locked --bin frost -- terminal::tests::osc7_reports_the_childs_cwd_through_the_terminal_state` passed.
+
 Updated: 2026-10-04 (upgrade round 284 — OSC 8 hyperlinks reject visual spoofing)
 
 ## 2026-10-04 (upgrade round 284)

@@ -1551,3 +1551,7 @@ everywhere except a resize, and an audit against ember found the rest.
      were size-checked but still admitted bidi and zero-width marks. Spoofed
      OSC 8 fields now close the current link instead of being interned.
 
+285. **OSC 7 cwd reports reject visual spoofing** — decoded pane cwd rejected
+     only NUL. Newlines, bidi, and zero-width marks now refuse the report and
+     keep the last accepted directory.
+
