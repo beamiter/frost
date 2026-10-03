@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 224 — bounded block-search query errors)
+
+## 2026-10-03 (upgrade round 224)
+
+- Block-search regex compile failures no longer echo ESC/bidi from the draft
+  into the picker danger line; store and draw run `bound_query_error`.
+- `cargo test --locked --bin frost -- review_text::tests::regex_error_replaces_controls_and_stays_bounded block_mode::tests::invalid_or_oversized_regex_is_not_a_false_empty_result` passed.
+
 Updated: 2026-10-03 (upgrade round 223 — bounded files-dialog path chrome)
 
 ## 2026-10-03 (upgrade round 223)

@@ -1890,7 +1890,14 @@ impl BlockSearchMatcher {
                 .case_insensitive(!options.case_sensitive)
                 .size_limit(BLOCK_SEARCH_REGEX_SIZE_LIMIT)
                 .build()
-                .map_err(|error| BlockSearchQueryError::InvalidRegex(error.to_string()))?;
+                .map_err(|error| {
+                    BlockSearchQueryError::InvalidRegex(
+                        jterm_core::review_input::safe_inline_display(
+                            &error.to_string(),
+                            crate::review_text::MAX_REGEX_ERROR_BYTES,
+                        ),
+                    )
+                })?;
             Ok(Some(Self {
                 engine: BlockSearchEngine::Regex(regex),
                 whole_word: options.whole_word,
@@ -3596,6 +3603,22 @@ mod tests {
             ),
             Err(BlockSearchQueryError::InvalidRegex(_))
         ));
+        let hostile = match search_blocks_with_options(
+            &cache,
+            "(\u{1b}[31m\u{202e}",
+            BlockSearchOptions {
+                case_sensitive: false,
+                regex: true,
+                whole_word: false,
+            },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid regex"),
+        };
+        let shown = hostile.to_string();
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
         let oversized = "x".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
         assert!(matches!(
             search_blocks_with_options(

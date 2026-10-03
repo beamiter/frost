@@ -160,6 +160,12 @@ pub(crate) fn safe_regex_error(error: impl fmt::Display) -> String {
     )
 }
 
+/// Block-search and other picker compile failures quote the draft. Bound the
+/// Display text without adding a second "Invalid regex" prefix.
+pub(crate) fn bound_query_error(error: impl fmt::Display) -> String {
+    jterm_core::review_input::safe_inline_display(&error.to_string(), MAX_REGEX_ERROR_BYTES)
+}
+
 /// Transient toast chrome: interpolated paths and error strings must not
 /// restyle the overlay or grow without bound.
 pub(crate) const MAX_TOAST_BYTES: usize = 256;
@@ -270,6 +276,13 @@ mod tests {
         assert!(!shown.contains('\u{202e}'));
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_REGEX_ERROR_BYTES);
+        let picker = bound_query_error(format!(
+            "Invalid regular expression: unclosed group for `(\u{1b}[31m{}`",
+            "n".repeat(400)
+        ));
+        assert!(!picker.contains('\u{1b}'));
+        assert!(picker.len() <= MAX_REGEX_ERROR_BYTES);
+        assert!(picker.starts_with("Invalid regular expression:"));
     }
 
     #[test]

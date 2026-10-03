@@ -1304,3 +1304,8 @@ everywhere except a resize, and an audit against ember found the rest.
      filename or quoted problem could restyle the modal. Both now run
      `bound_sidebar_notice`.
 
+224. **Bounded block-search query-error chrome** — regex compile failures quote
+     the draft and were drawn as danger chrome verbatim. The matcher now
+     sanitizes `InvalidRegex` payloads; the picker stores and draws
+     `bound_query_error` at 160 bytes.
+

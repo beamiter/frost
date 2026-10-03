@@ -9565,7 +9565,7 @@ impl Frost {
             Err(error) => {
                 // Preserve the last valid result/index so correcting one
                 // character is cheap. The error gates Enter/click activation.
-                state.query_error = Some(error.to_string());
+                state.query_error = Some(crate::review_text::bound_query_error(error));
             }
         }
     }
@@ -17363,7 +17363,11 @@ impl Frost {
         if state.loading && state.hits.is_empty() {
             body = body.push(text("Indexing blocks…").size(13).style(text::secondary));
         } else if let Some(error) = &state.query_error {
-            body = body.push(text(error.clone()).size(12).style(text::danger));
+            body = body.push(
+                text(crate::review_text::bound_query_error(error))
+                    .size(12)
+                    .style(text::danger),
+            );
         } else if !pane_has_blocks {
             body = body.push(
                 text(
