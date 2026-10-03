@@ -1190,3 +1190,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `normalized()` replaced it with the default. `SetAiModel` now drops
      controls and visual spoofing and truncates at `MAX_CONFIG_NAME_BYTES`.
 
+200. **Bounded AI base-URL settings field** — iced assigned the endpoint URL
+     unbounded, so ESC/newline and a 4 KiB+1 paste sat until `normalized()`
+     replaced it with the default. `SetAiBaseUrl` now uses `bound_config_text`
+     at `MAX_CONFIG_VALUE_BYTES`.
+

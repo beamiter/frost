@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_CONFIG_NAME_BYTES: usize = 256;
-const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
 const MAX_REMOTE_SSH_ARGS: usize = 64;
 const MAX_REMOTE_PROFILE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
@@ -1325,6 +1325,27 @@ mod tests {
             MAX_CONFIG_NAME_BYTES,
         );
         assert!(overflow.len() <= MAX_CONFIG_NAME_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
+    }
+
+    #[test]
+    fn live_config_text_truncates_urls_to_the_value_envelope() {
+        assert_eq!(
+            bound_config_text("http://127.0.0.1\n:11434", MAX_CONFIG_VALUE_BYTES),
+            "http://127.0.0.1:11434"
+        );
+        let filled = bound_config_text(
+            format!("{}y", "x".repeat(MAX_CONFIG_VALUE_BYTES)),
+            MAX_CONFIG_VALUE_BYTES,
+        );
+        assert_eq!(filled.len(), MAX_CONFIG_VALUE_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow = bound_config_text(
+            format!("{}z", "界".repeat(MAX_CONFIG_VALUE_BYTES)),
+            MAX_CONFIG_VALUE_BYTES,
+        );
+        assert!(overflow.len() <= MAX_CONFIG_VALUE_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
     }

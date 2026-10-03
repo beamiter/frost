@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 200 — bounded AI base-URL settings field)
+
+## 2026-10-03 (upgrade round 200)
+
+- Settings AI base URL drops controls and visual spoofing and truncates at
+  4 KiB so iced cannot hold more than `normalized()` keeps.
+- `cargo test --locked --bin frost -- config::tests::live_config_text_truncates_urls_to_the_value_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 199 — bounded AI model settings field)
 
 ## 2026-10-03 (upgrade round 199)
