@@ -699,7 +699,17 @@ fn bound_chat_draft(draft: impl Into<String>) -> String {
     let mut draft: String = draft
         .into()
         .chars()
-        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .filter_map(|character| {
+            if matches!(character, '\n' | '\t') {
+                Some(character)
+            } else if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if draft.len() > jterm_core::ai::MAX_LIVE_MESSAGE_BYTES {
         let mut end = jterm_core::ai::MAX_LIVE_MESSAGE_BYTES;
@@ -1255,6 +1265,10 @@ mod tests {
             .active_draft()
             .is_char_boundary(panel.store.active_draft().len()));
         assert!(!panel.store.active_draft().contains('z'));
+        panel.set_draft("please\n\u{202e}fix".into());
+        assert!(!panel.store.active_draft().contains('\u{202e}'));
+        assert!(panel.store.active_draft().contains('\u{fffd}'));
+        assert!(panel.store.active_draft().starts_with("please\n"));
     }
 
     #[test]

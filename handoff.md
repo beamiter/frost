@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 272 — AI chat composer strips visual spoofing)
+
+## 2026-10-04 (upgrade round 272)
+
+- Live chat drafts keep newlines and replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- ai_chats::tests::composer_keeps_newlines_and_matches_the_live_message_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 271 — API-key draft strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 271)

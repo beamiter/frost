@@ -1501,3 +1501,7 @@ everywhere except a resize, and an audit against ember found the rest.
 271. **API-key draft strips visual spoofing** — the settings key field dropped
      controls but kept bidi. Draft ingest now replaces spoofing with U+FFFD.
 
+272. **AI chat composer strips visual spoofing** — the live chat draft kept
+     newlines but also kept bidi. Composer ingest now replaces spoofing with
+     U+FFFD.
+
