@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 303 — OSC 5522 mime refuses spoofing)
+
+## 2026-10-04 (upgrade round 303)
+
+- OSC 5522 clipboard-read mime types that are empty, overlong, non-ASCII, or visually spoofed are refused with ENOSYS instead of being queued.
+- `cargo test --locked --bin frost -- osc_5522_read_rejects_spoofed_or_non_ascii_mime` passed.
+
 Updated: 2026-10-04 (upgrade round 302 — OSC 52 clipboard refuses spoofing)
 
 ## 2026-10-04 (upgrade round 302)

@@ -1622,3 +1622,7 @@ everywhere except a resize, and an audit against ember found the rest.
 302. **OSC 52 clipboard refuses spoofing** — decoded clipboard sets that carry
      bidi marks, replacement characters, or odd controls are dropped before
      they reach the host clipboard. Newlines and tabs remain allowed.
+
+303. **OSC 5522 mime refuses spoofing** — clipboard-read mime types that are
+     empty, overlong, non-ASCII, or visually spoofed are refused with ENOSYS
+     instead of being queued for a host clipboard read.

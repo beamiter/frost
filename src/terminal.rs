@@ -6415,6 +6415,10 @@ impl TerminalState {
         }
 
         let kind = if let Some(mime_type) = mime {
+            if Self::osc_5522_mime_is_unsafe(&mime_type) {
+                self.append_osc_5522_status("type=read:status=ENOSYS", None);
+                return;
+            }
             if let Some(expected) = &self.pending_paste_password {
                 if password.as_deref() != Some(expected.as_str()) {
                     self.append_osc_5522_status("type=read:status=EPERM", None);
@@ -6434,6 +6438,17 @@ impl TerminalState {
             self.pending_clipboard_requests
                 .push(ClipboardReadRequest { kind });
         }
+    }
+
+    fn osc_5522_mime_is_unsafe(mime: &str) -> bool {
+        mime.is_empty()
+            || mime.len() > 128
+            || mime.chars().any(|character| {
+                !character.is_ascii()
+                    || character.is_ascii_control()
+                    || character == '\u{fffd}'
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
+            })
     }
 
     fn set_keyboard_enhancement_flags(&mut self, flags: u16, mode: u16) {
@@ -18215,6 +18230,36 @@ mod tests {
         }
 
         assert_eq!(terminal.take_clipboard_read_requests().len(), 8);
+    }
+
+    #[test]
+    fn osc_5522_read_rejects_spoofed_or_non_ascii_mime() {
+        use base64::Engine as _;
+        let mut terminal = TerminalState::new(8, 2);
+        let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+
+        terminal.process_input(
+            format!(
+                "\x1b]5522;type=read:mime={}\x1b\\",
+                encode("text/plain\u{202e}")
+            )
+            .as_bytes(),
+        );
+        assert!(terminal.take_clipboard_read_requests().is_empty());
+
+        terminal.process_input(
+            format!(
+                "\x1b]5522;type=read:mime={}\x1b\\",
+                encode("text/plain")
+            )
+            .as_bytes(),
+        );
+        let requests = terminal.take_clipboard_read_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].kind,
+            ClipboardReadKind::MimeData("text/plain".to_string())
+        );
     }
 
     #[test]
