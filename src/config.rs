@@ -1451,6 +1451,27 @@ mod tests {
     }
 
     #[test]
+    fn live_remote_host_user_uses_the_value_envelope() {
+        assert_eq!(
+            bound_config_text("yj\n\u{1b}", MAX_CONFIG_VALUE_BYTES),
+            "yj"
+        );
+        let filled = bound_config_text(
+            format!("{}y", "u".repeat(MAX_CONFIG_VALUE_BYTES)),
+            MAX_CONFIG_VALUE_BYTES,
+        );
+        assert_eq!(filled.len(), MAX_CONFIG_VALUE_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow = bound_config_text(
+            format!("{}z", "界".repeat(MAX_CONFIG_VALUE_BYTES)),
+            MAX_CONFIG_VALUE_BYTES,
+        );
+        assert!(overflow.len() <= MAX_CONFIG_VALUE_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
+    }
+
+    #[test]
     fn visual_spoofing_config_strings_never_reach_labels_or_paths() {
         let config = Config {
             ai_model: "safe-model\u{202e}gpj".to_string(),

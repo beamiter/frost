@@ -1220,3 +1220,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `validate_remote_host` refused. `RemoteHostHost` now uses
      `bound_config_text` at `MAX_CONFIG_VALUE_BYTES`.
 
+206. **Bounded remote host user field** — iced assigned the login name
+     unbounded, so ESC/newline and a 4 KiB+1 paste sat until
+     `validate_remote_host` refused. `RemoteHostUser` now uses
+     `bound_config_text` at `MAX_CONFIG_VALUE_BYTES`.
+

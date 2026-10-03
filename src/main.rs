@@ -12806,6 +12806,10 @@ impl Frost {
             Message::RemoteHostUser(index, user) => {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     // Blank clears the login/exec user rather than storing "".
+                    let user = crate::config::bound_config_text(
+                        user,
+                        crate::config::MAX_CONFIG_VALUE_BYTES,
+                    );
                     host.user = Some(user).filter(|u| !u.trim().is_empty());
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
