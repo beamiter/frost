@@ -1543,3 +1543,7 @@ everywhere except a resize, and an audit against ember found the rest.
      loads stripped bidi marks but kept zero-width spoofing. Restore now
      replaces all visual spoofing with U+FFFD.
 
+283. **Agent git-diff display replaces controls with U+FFFD** — review diffs
+     mapped ESC/bidi to ASCII `?`, which could hide the neutralization. Diff
+     display now uses U+FFFD and re-truncates after the wider replacement.
+

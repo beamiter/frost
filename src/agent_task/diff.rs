@@ -829,20 +829,30 @@ fn bounded_lossy_text(bytes: Vec<u8>, limit: usize) -> String {
     }
     // Repository paths and file contents are attacker-influenced review data.
     // Preserve multiline/tab layout, but neutralize terminal controls and
-    // invisible/bidirectional formatting before the UI displays the diff. `?`
-    // is one byte, so this pass cannot exceed the retention ceiling above.
-    text.chars()
+    // invisible/bidirectional formatting before the UI displays the diff.
+    // Replacement is U+FFFD (three UTF-8 bytes), so the display string is
+    // truncated again onto a character boundary.
+    let mut text: String = text
+        .chars()
         .map(|character| match character {
             '\n' | '\t' => character,
             unsafe_character
                 if unsafe_character.is_control()
                     || jterm_core::review_input::is_visual_spoofing_character(unsafe_character) =>
             {
-                '?'
+                '\u{fffd}'
             }
             visible => visible,
         })
-        .collect()
+        .collect();
+    if text.len() > limit {
+        let mut end = limit;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 pub(crate) fn visible_diff_cwd(cwd: &Path) -> String {
@@ -891,9 +901,14 @@ mod tests {
     fn diff_display_neutralizes_controls_and_bidi_without_flattening_lines() {
         let text = bounded_lossy_text(b"safe\n\x1b[31mred\tend\xe2\x80\xae".to_vec(), 128);
 
-        assert_eq!(text, "safe\n?[31mred\tend?");
+        assert_eq!(text, "safe\n\u{fffd}[31mred\tend\u{fffd}");
         assert!(!text.contains('\u{1b}'));
         assert!(!text.contains('\u{202e}'));
+        let expanded = bounded_lossy_text(vec![0x1b; 64], 17);
+        assert!(expanded.len() <= 17);
+        assert!(expanded.is_char_boundary(expanded.len()));
+        assert!(!expanded.contains('\u{1b}'));
+        assert!(expanded.contains('\u{fffd}'));
     }
 
     #[test]

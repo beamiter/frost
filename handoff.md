@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 283 — Agent git-diff display replaces controls with U+FFFD)
+
+## 2026-10-04 (upgrade round 283)
+
+- Agent git-diff review text replaces controls/bidi with U+FFFD and re-truncates after expansion.
+- `cargo test --locked --bin frost -- agent_task::diff::tests::diff_display_neutralizes_controls_and_bidi_without_flattening_lines` passed.
+
 Updated: 2026-10-04 (upgrade round 282 — Restored tab titles replace remaining visual spoofing)
 
 ## 2026-10-04 (upgrade round 282)
