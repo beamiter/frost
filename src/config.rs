@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MAX_CONFIG_NAME_BYTES: usize = 256;
+pub(crate) const MAX_CONFIG_NAME_BYTES: usize = 256;
 const MAX_CONFIG_VALUE_BYTES: usize = 4 * 1024;
 const MAX_REMOTE_SSH_ARGS: usize = 64;
 const MAX_REMOTE_PROFILE_BYTES: usize = 64 * 1024;
@@ -985,6 +985,22 @@ fn valid_config_text(value: &str, max_bytes: usize) -> bool {
         && !jterm_core::review_input::contains_visual_spoofing(value)
 }
 
+/// Bound a live settings iced field to the same envelope `normalized()` will
+/// keep, without snapping to a fallback while the user is still typing.
+pub(crate) fn bound_config_text(value: impl Into<String>, max_bytes: usize) -> String {
+    let mut bounded = String::new();
+    for ch in value.into().chars() {
+        if ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch) {
+            continue;
+        }
+        if bounded.len().saturating_add(ch.len_utf8()) > max_bytes {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
 fn validate_remote_host_text(value: &str, field: &str, max_bytes: usize) -> Result<(), String> {
     if value.len() > max_bytes {
         return Err(format!("{field} exceeds the {max_bytes}-byte limit"));
@@ -1286,6 +1302,31 @@ mod tests {
         assert_eq!(normalized.session_history_file, None);
         assert_eq!(normalized.command_history_path, None);
         assert_eq!(normalized.jsh_update_check, "daily");
+    }
+
+    #[test]
+    fn live_config_text_drops_controls_and_stays_inside_the_name_envelope() {
+        assert_eq!(
+            bound_config_text("codellama\n\u{1b}:7b", MAX_CONFIG_NAME_BYTES),
+            "codellama:7b"
+        );
+        assert_eq!(
+            bound_config_text("safe-model\u{202e}gpj", MAX_CONFIG_NAME_BYTES),
+            "safe-modelgpj"
+        );
+        let filled = bound_config_text(
+            format!("{}y", "x".repeat(MAX_CONFIG_NAME_BYTES)),
+            MAX_CONFIG_NAME_BYTES,
+        );
+        assert_eq!(filled.len(), MAX_CONFIG_NAME_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow = bound_config_text(
+            format!("{}z", "界".repeat(MAX_CONFIG_NAME_BYTES)),
+            MAX_CONFIG_NAME_BYTES,
+        );
+        assert!(overflow.len() <= MAX_CONFIG_NAME_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
     }
 
     #[test]

@@ -13186,7 +13186,8 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetAiModel(model) => {
-                self.config.ai_model = model;
+                self.config.ai_model =
+                    crate::config::bound_config_text(model, crate::config::MAX_CONFIG_NAME_BYTES);
                 self.config_dirty = true;
             }
             Message::SetAiBaseUrl(url) => {

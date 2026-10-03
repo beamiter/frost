@@ -1185,3 +1185,8 @@ everywhere except a resize, and an audit against ember found the rest.
      the file cap. `SetAiKeyDraft` now drops controls and truncates on a UTF-8
      boundary at `MAX_API_KEY_DRAFT_BYTES`.
 
+199. **Bounded AI model settings field** — iced assigned the model name into
+     config unbounded, so ESC/bidi and a 256-byte+1 paste sat until
+     `normalized()` replaced it with the default. `SetAiModel` now drops
+     controls and visual spoofing and truncates at `MAX_CONFIG_NAME_BYTES`.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 199 — bounded AI model settings field)
+
+## 2026-10-03 (upgrade round 199)
+
+- Settings AI model field drops controls and visual spoofing and truncates
+  at 256 bytes so iced cannot hold more than `normalized()` keeps.
+- `cargo test --locked --bin frost -- config::tests::live_config_text_drops_controls_and_stays_inside_the_name_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 198 — bounded API-key draft)
 
 ## 2026-10-03 (upgrade round 198)
