@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 240 — bounded pane-header path chrome)
+
+## 2026-10-03 (upgrade round 240)
+
+- Split pane headers sanitize cwd, git strip, and foreground process names
+  so a hostile path or branch cannot restyle the chrome.
+- `cargo test --locked --bin frost -- session_persistence::tests::tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 239 — bounded history-picker cwd chrome)
 
 ## 2026-10-03 (upgrade round 239)

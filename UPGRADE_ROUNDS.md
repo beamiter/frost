@@ -1375,3 +1375,7 @@ everywhere except a resize, and an audit against ember found the rest.
      16 KiB-index cwd as iced text. `display_cwd` now escapes spoofing and
      truncates to 80 characters.
 
+240. **Bounded pane-header cwd, git, and process chrome** — the split pane
+     header interpolated `cwd_display()`, `format_strip`, and the foreground
+     process verbatim. Those now use the tab-title envelope / toast bound.
+

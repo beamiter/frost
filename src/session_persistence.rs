@@ -2507,6 +2507,10 @@ mod tests {
         assert!(overflow.len() <= MAX_RESTORED_TAB_TITLE_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        let cwd = bound_tab_title_draft(format!("~/src/\u{202e}{}", "p".repeat(400)));
+        assert!(!cwd.contains('\u{202e}'));
+        assert!(cwd.len() <= MAX_RESTORED_TAB_TITLE_BYTES);
+        assert!(cwd.starts_with("~/src/"));
     }
 
     /// Cf bidi overrides/isolates are not Cc, so the `is_control` check lets

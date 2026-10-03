@@ -4036,11 +4036,11 @@ impl Session {
     fn cwd_display(&self) -> Option<String> {
         let cwd = self.cwd_cache.as_deref()?;
         let Some(home) = std::env::var_os("HOME") else {
-            return Some(cwd.to_string());
+            return Some(session_persistence::bound_tab_title_draft(cwd));
         };
         let home = home.to_string_lossy();
         if home.is_empty() {
-            return Some(cwd.to_string());
+            return Some(session_persistence::bound_tab_title_draft(cwd));
         }
         if cwd == home {
             return Some("~".to_string());
@@ -4048,8 +4048,10 @@ impl Session {
         // Only substitute at a component boundary: `/home/user2` merely shares
         // a prefix with `/home/user` and is a different directory.
         match cwd.strip_prefix(home.as_ref()) {
-            Some(rest) if rest.starts_with('/') => Some(format!("~{rest}")),
-            _ => Some(cwd.to_string()),
+            Some(rest) if rest.starts_with('/') => {
+                Some(session_persistence::bound_tab_title_draft(format!("~{rest}")))
+            }
+            _ => Some(session_persistence::bound_tab_title_draft(cwd)),
         }
     }
 
@@ -19531,7 +19533,9 @@ impl Frost {
         // cache (refreshed on the periodic tick and after command completion).
         if self.config.show_repo_strip {
             if let Some(meta) = sess.git_meta_cache.as_ref() {
-                let git = jterm_core::git_meta::format_strip(meta);
+                let git = crate::review_text::bound_toast_text(
+                    jterm_core::git_meta::format_strip(meta),
+                );
                 line = line.push(text(git).size(11).color(blend(
                     self.c_text_dim(),
                     self.c_accent(),
@@ -19540,7 +19544,13 @@ impl Frost {
             }
         }
         if let Some(command) = sess.fg_proc_cache.as_deref() {
-            line = line.push(text(format!("▶ {command}")).size(11).color(blend(
+            line = line.push(
+                text(format!(
+                    "▶ {}",
+                    session_persistence::bound_tab_title_draft(command)
+                ))
+                .size(11)
+                .color(blend(
                 self.c_text_dim(),
                 self.c_accent(),
                 0.6,
