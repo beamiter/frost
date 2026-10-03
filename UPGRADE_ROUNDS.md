@@ -1450,3 +1450,7 @@ everywhere except a resize, and an audit against ember found the rest.
      review card interpolated `compact_one_line` verbatim). Request ingest
      now replaces spoofing; the card line uses the toast envelope.
 
+259. **Ask-AI draft strips visual spoofing** — the reviewable command draft
+     dropped controls but kept bidi in model replies and user edits. Draft
+     ingest now replaces spoofing with U+FFFD.
+

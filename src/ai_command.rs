@@ -51,7 +51,15 @@ pub(crate) fn bound_suggestion_draft(text: impl Into<String>) -> String {
     let mut text: String = text
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if text.len() > jterm_core::review_input::MAX_REVIEW_INPUT_BYTES {
         let mut end = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
@@ -358,6 +366,10 @@ mod tests {
         assert!(session.apply_reply(generation, Ok("echo one\necho two".into())));
         assert_eq!(session.draft, "echo oneecho two");
         assert_eq!(session.phase(), SuggestionPhase::Review);
+        let spoofed = bound_suggestion_draft("rm -rf \u{202e}/");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(spoofed.contains('\u{fffd}'));
+        assert!(spoofed.starts_with("rm -rf "));
     }
 
     /// The card that replaced another must never accept its predecessor's

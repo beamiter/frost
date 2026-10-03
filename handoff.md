@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 259 — Ask-AI draft strips visual spoofing)
+
+## 2026-10-04 (upgrade round 259)
+
+- Ask-AI suggestion drafts replace visual spoofing at ingest (model reply and edits).
+- `cargo test --locked --bin frost -- ai_command::tests::overlay_draft_drops_controls_and_truncates` passed.
+
 Updated: 2026-10-04 (upgrade round 258 — Ask-AI request strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 258)
