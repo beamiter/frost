@@ -1535,3 +1535,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped bidi marks but kept zero-width spoofing. Title ingest now
      replaces all visual spoofing with U+FFFD.
 
+281. **Tab-rename drafts replace remaining visual spoofing** — the rename
+     field stripped bidi marks but kept zero-width spoofing. Draft ingest
+     now replaces all visual spoofing with U+FFFD.
+

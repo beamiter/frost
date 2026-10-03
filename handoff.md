@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 281 — Tab-rename drafts replace remaining visual spoofing)
+
+## 2026-10-04 (upgrade round 281)
+
+- Tab-rename drafts replace visual spoofing at ingest, including zero-width marks.
+- `cargo test --locked --bin frost -- session_persistence::tests::tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 280 — OSC window titles replace remaining visual spoofing)
 
 ## 2026-10-04 (upgrade round 280)

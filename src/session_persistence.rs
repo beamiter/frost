@@ -23,12 +23,16 @@ pub const MAX_RESTORED_TAB_TITLE_BYTES: usize = 256;
 /// Bound the iced tab-rename field to the snapshot title envelope so a paste
 /// cannot sit unbounded next to a 256-byte persisted label.
 pub fn bound_tab_title_draft(raw: impl Into<String>) -> String {
-    let stripped = strip_bidi_display_controls(&raw.into());
     let mut bounded = String::new();
-    for ch in stripped.chars() {
+    for ch in raw.into().chars() {
         if ch.is_control() {
             continue;
         }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
         if bounded.len().saturating_add(ch.len_utf8()) > MAX_RESTORED_TAB_TITLE_BYTES {
             break;
         }
@@ -2496,8 +2500,9 @@ mod tests {
     #[test]
     fn tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope() {
         assert_eq!(bound_tab_title_draft("build\n\u{1b} me"), "build me");
-        assert_eq!(bound_tab_title_draft("ok\u{202e}title"), "oktitle");
+        assert_eq!(bound_tab_title_draft("ok\u{202e}title"), "ok\u{fffd}title");
         assert!(!bound_tab_title_draft("x\u{2066}y").contains('\u{2066}'));
+        assert!(bound_tab_title_draft("x\u{2066}y").contains('\u{fffd}'));
         let filled =
             bound_tab_title_draft(format!("{}y", "x".repeat(MAX_RESTORED_TAB_TITLE_BYTES)));
         assert_eq!(filled.len(), MAX_RESTORED_TAB_TITLE_BYTES);
@@ -2509,6 +2514,7 @@ mod tests {
         assert!(!overflow.contains('z'));
         let cwd = bound_tab_title_draft(format!("~/src/\u{202e}{}", "p".repeat(400)));
         assert!(!cwd.contains('\u{202e}'));
+        assert!(cwd.contains('\u{fffd}'));
         assert!(cwd.len() <= MAX_RESTORED_TAB_TITLE_BYTES);
         assert!(cwd.starts_with("~/src/"));
     }
