@@ -1887,7 +1887,10 @@ fn archive_member_is_contained(member: &str, expected_top: &str) -> bool {
     if member.is_empty()
         || member.len() > MAX_ARCHIVE_MEMBER_BYTES
         || member.starts_with('/')
-        || member.chars().any(char::is_control)
+        || member.chars().any(|character| {
+            character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
     {
         return false;
     }
@@ -3034,6 +3037,8 @@ mod tests {
             // A control character in a name that will be shown and joined
             // onto a local path.
             "nested/a\u{1b}[2Kb",
+            "nested/a\u{202e}txt",
+            "nested/\u{200b}hidden",
         ] {
             assert!(
                 !archive_member_is_contained(refused, "nested"),

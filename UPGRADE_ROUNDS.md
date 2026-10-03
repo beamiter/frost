@@ -1559,3 +1559,7 @@ everywhere except a resize, and an audit against ember found the rest.
      strings reached the pane header raw. Names are now display-bounded and
      visual spoofing is replaced before the ▶ chip is drawn.
 
+287. **Remote archive members reject visual spoofing** — download containment
+     refused controls but still admitted bidi and zero-width names. Spoofed
+     members now fail the archive instead of extracting.
+

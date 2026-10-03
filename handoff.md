@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 287 — Remote archive members reject visual spoofing)
+
+## 2026-10-04 (upgrade round 287)
+
+- Remote download archives refuse members whose names contain visual spoofing.
+- `cargo test --locked --bin frost -- remote_fs::tests::archive_members_must_sit_under_the_requested_top_level` passed.
+
 Updated: 2026-10-04 (upgrade round 286 — Foreground process names are bounded for pane chrome)
 
 ## 2026-10-04 (upgrade round 286)
