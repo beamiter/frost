@@ -1174,3 +1174,8 @@ everywhere except a resize, and an audit against ember found the rest.
      directional marks and truncates on a UTF-8 boundary at
      `MAX_NAVIGATION_PATH_BYTES`.
 
+197. **Bounded sidebar create/rename name** — the New File / New Folder /
+     Rename dialog assigned iced `text_input` unbounded, so `/`, ESC, and a
+     255-byte+1 paste could sit until submit refused. `bound_new_name` now
+     drops controls and slashes and truncates on a UTF-8 boundary at 255 bytes.
+

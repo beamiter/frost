@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 197 — bounded sidebar create/rename name)
+
+## 2026-10-03 (upgrade round 197)
+
+- Files-panel New File / New Folder / Rename name drops controls and `/`
+  and truncates at 255 bytes so iced cannot hold more than `validate_new_name`.
+- `cargo test --locked --bin frost -- remote_fs::tests::new_name_draft_drops_controls_and_slashes_and_stays_inside_255_bytes` passed.
+
 Updated: 2026-10-03 (upgrade round 196 — bounded sidebar path bar)
 
 ## 2026-10-03 (upgrade round 196)

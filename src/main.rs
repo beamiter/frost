@@ -14584,7 +14584,7 @@ impl Frost {
             }
             Message::SidebarDialogInput(value) => {
                 if let Some(dialog) = self.sidebar_dialog.as_mut() {
-                    dialog.input = value;
+                    dialog.input = crate::remote_fs::bound_new_name(value);
                     dialog.error = None;
                 }
             }

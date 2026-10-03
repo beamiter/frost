@@ -1291,11 +1291,29 @@ pub fn create_file(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) ->
 
 /// A name typed into a New File / New Folder / Rename dialog. Reused by the
 /// dialogs so what they accept is exactly what the ops will run.
+pub const MAX_NEW_NAME_BYTES: usize = 255;
+
+pub fn bound_new_name(name: impl Into<String>) -> String {
+    let mut name: String = name
+        .into()
+        .chars()
+        .filter(|character| *character != '/' && !character.is_control())
+        .collect();
+    if name.len() > MAX_NEW_NAME_BYTES {
+        let mut end = MAX_NEW_NAME_BYTES;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    name
+}
+
 pub fn validate_new_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name must not be empty".to_string());
     }
-    if name.len() > 255 {
+    if name.len() > MAX_NEW_NAME_BYTES {
         return Err("name must be at most 255 bytes".to_string());
     }
     if name == "." || name == ".." {
@@ -3411,6 +3429,18 @@ mod tests {
         assert!(validate_new_name("a\0b").is_err());
         assert!(validate_new_name(&"x".repeat(256)).is_err());
         assert!(validate_new_name(&"x".repeat(255)).is_ok());
+    }
+
+    #[test]
+    fn new_name_draft_drops_controls_and_slashes_and_stays_inside_255_bytes() {
+        assert_eq!(bound_new_name("notes\n\u{1b}/file.txt"), "notesfile.txt");
+        let filled = bound_new_name(format!("{}y", "x".repeat(MAX_NEW_NAME_BYTES)));
+        assert_eq!(filled.len(), MAX_NEW_NAME_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow = bound_new_name(format!("{}z", "界".repeat(MAX_NEW_NAME_BYTES)));
+        assert!(overflow.len() <= MAX_NEW_NAME_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
     }
 
     #[test]
