@@ -14977,7 +14977,8 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetFontFamily(name) => {
-                self.config.font_family = name;
+                self.config.font_family =
+                    crate::config::bound_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES);
                 self.config_dirty = true;
                 self.apply_config();
             }

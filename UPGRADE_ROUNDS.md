@@ -1244,3 +1244,7 @@ everywhere except a resize, and an audit against ember found the rest.
      and a 256-byte+1 name could restyle chrome until `normalized()` reset it.
      The handler now uses `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
 
+211. **Bounded font-family picker value** — `SetFontFamily` assigned the
+     pick-list string unbounded, then `apply_config()` ran immediately.
+     The handler now uses `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
+

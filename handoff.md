@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 211 — bounded font-family picker value)
+
+## 2026-10-03 (upgrade round 211)
+
+- Settings font-family picker drops controls and visual spoofing and
+  truncates at 256 bytes before `apply_config()`.
+- `cargo test --locked --bin frost -- config::tests::live_font_family_settings_field_uses_the_name_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 210 — bounded theme picker value)
 
 ## 2026-10-03 (upgrade round 210)
