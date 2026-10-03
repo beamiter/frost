@@ -1570,3 +1570,7 @@ everywhere except a resize, and an audit against ember found the rest.
 289. **API key files reject visual spoofing** — credential IO dropped controls
      but still stored bidi and zero-width marks. Read and write now refuse
      spoofed keys instead of persisting them.
+
+290. **Kitty associated-text drops visual spoofing** — CSI-u reports stripped
+     control bytes but forwarded bidi/zero-width as associated text. Spoofing
+     is now dropped before those fields are encoded.

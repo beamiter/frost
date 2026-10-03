@@ -25634,10 +25634,24 @@ fn kitty_encode_key(
     // travel in the fields the app asked for: the alternate-key field (flag 4)
     // and/or the associated-text field (flag 16). Without them an app in
     // report-all-keys mode has to derive the case itself.
-    let committed = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+    let committed: Option<String> = text.and_then(|t| {
+        let cleaned: String = t
+            .chars()
+            .filter(|character| {
+                !character.is_control()
+                    && !jterm_core::review_input::is_visual_spoofing_character(*character)
+            })
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    });
     let mut key_field = codepoint.to_string();
     if report_alternate_keys && mods.shift() {
         if let Some(shifted) = committed
+            .as_deref()
             .and_then(|t| t.chars().next())
             .map(u32::from)
             .filter(|shifted| *shifted != codepoint)
@@ -25647,7 +25661,7 @@ fn kitty_encode_key(
     }
     let mut sequence = format!("\x1b[{};{}", key_field, keyboard_modifier_value(mods));
     if report_associated_text {
-        if let Some(t) = committed {
+        if let Some(t) = committed.as_deref() {
             let codepoints: Vec<String> = t.chars().map(|c| u32::from(c).to_string()).collect();
             sequence.push(';');
             sequence.push_str(&codepoints.join(":"));
@@ -29405,6 +29419,37 @@ mod tests {
             },
         );
         assert_eq!(ctrl_letter.as_deref(), Some(&b"\x1b[116;5u"[..]));
+
+        let spoofed_text = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("T\u{202e}"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            spoofed_text.as_deref(),
+            Some(&b"\x1b[116:84;2;84u"[..]),
+            "bidi in associated text must not be forwarded"
+        );
+        let only_spoofing = encode_key(
+            &keyboard::Key::Character("t".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::SHIFT,
+            Some("\u{200b}"),
+            false,
+            KeyboardEnhancements {
+                kitty_flags: 0b11100,
+                report_all_keys: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(only_spoofing.as_deref(), Some(&b"\x1b[116;2u"[..]));
     }
 
     #[test]

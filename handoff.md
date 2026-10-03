@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 290 — Kitty associated-text drops visual spoofing)
+
+## 2026-10-04 (upgrade round 290)
+
+- Kitty keyboard associated-text/alternate-key fields drop visual spoofing before encoding.
+- `cargo test --locked --bin frost -- tests::kitty_reports_the_shifted_character_when_the_app_asks_for_it` passed.
+
 Updated: 2026-10-04 (upgrade round 289 — API key files reject visual spoofing)
 
 ## 2026-10-04 (upgrade round 289)
