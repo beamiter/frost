@@ -17,6 +17,25 @@ use jterm_core::ai::AiCancellationToken;
 /// and display rows sane (the sources bound only at display time).
 pub(crate) const MAX_SUGGESTION_REQUEST_BYTES: usize = 4 * 1024;
 
+/// Bound overlay typing for the Ask-AI request. Control characters are
+/// dropped and overflow truncates on a UTF-8 boundary so a paste cannot
+/// silently bounce or store a newline until submit.
+pub(crate) fn bound_suggestion_request(text: impl Into<String>) -> String {
+    let mut text: String = text
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if text.len() > MAX_SUGGESTION_REQUEST_BYTES {
+        let mut end = MAX_SUGGESTION_REQUEST_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// Status copy for the card while the worker runs; also the retry affordance's
 /// pre-request state.
 pub(crate) const DRAFTING_STATUS: &str = "Drafting a command for review…";
@@ -269,6 +288,22 @@ mod tests {
             )
             .is_none());
         }
+    }
+
+    #[test]
+    fn overlay_request_drops_controls_and_truncates() {
+        assert_eq!(bound_suggestion_request("ls\n\u{1b} -l"), "ls -l");
+        let filled = bound_suggestion_request(format!(
+            "{}y",
+            "x".repeat(MAX_SUGGESTION_REQUEST_BYTES)
+        ));
+        assert_eq!(filled.len(), MAX_SUGGESTION_REQUEST_BYTES);
+        assert!(!filled.contains('y'));
+        assert!(filled.is_char_boundary(filled.len()));
+        let cjk = bound_suggestion_request(format!("{}x", "界".repeat(MAX_SUGGESTION_REQUEST_BYTES)));
+        assert!(cjk.len() <= MAX_SUGGESTION_REQUEST_BYTES);
+        assert!(cjk.is_char_boundary(cjk.len()));
+        assert!(!cjk.contains('x'));
     }
 
     /// The card that replaced another must never accept its predecessor's

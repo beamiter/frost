@@ -12980,9 +12980,7 @@ impl Frost {
             }
             Message::AiAskInput(text) => {
                 if let Some(query) = self.ai_ask.as_mut() {
-                    if text.len() <= ai_command::MAX_SUGGESTION_REQUEST_BYTES {
-                        *query = text;
-                    }
+                    *query = ai_command::bound_suggestion_request(text);
                 }
             }
             Message::AiAskSubmit => return self.submit_ai_ask(),
@@ -21596,13 +21594,9 @@ impl Frost {
             _ => {
                 if !mods.control() && !mods.alt() && !mods.logo() {
                     if let Some(t) = text {
-                        let printable: String = t.chars().filter(|c| !c.is_control()).collect();
-                        if !printable.is_empty()
-                            && query.len() + printable.len()
-                                <= ai_command::MAX_SUGGESTION_REQUEST_BYTES
-                        {
-                            query.push_str(&printable);
-                        }
+                        let next =
+                            ai_command::bound_suggestion_request(format!("{query}{t}"));
+                        *query = next;
                         return Some(Task::none());
                     }
                 }

@@ -1113,3 +1113,10 @@ everywhere except a resize, and an audit against ember found the rest.
      memory until render refused it. `set_value` now drops controls and
      truncates on a UTF-8 boundary at `MAX_WORKFLOW_FIELD_BYTES` (4 KiB).
 
+187. **Bounded Ask-AI request overlay** — the iced field rejected an oversized
+     paste wholesale and the raw-key path dropped extra bytes without
+     truncating, so a 4 KiB+1 paste left the previous request intact and a
+     newline could sit in the overlay until submit. Both paths now drop
+     controls and truncate on a UTF-8 boundary at
+     `MAX_SUGGESTION_REQUEST_BYTES`.
+

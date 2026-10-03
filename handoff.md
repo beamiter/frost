@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 187 — bounded Ask-AI request overlay)
+
+## 2026-10-03 (upgrade round 187)
+
+- Ask-AI overlay typing truncates at 4 KiB on a char boundary and drops
+  controls instead of ignoring an oversized paste.
+- `cargo test --locked --bin frost -- ai_command::tests` — 10 passed.
+
 Updated: 2026-10-03 (upgrade round 186 — bounded workflow argument fields)
 
 ## 2026-10-03 (upgrade round 186)
