@@ -1407,3 +1407,7 @@ everywhere except a resize, and an audit against ember found the rest.
      toasts forwarded the raw command to `notify-send`. The title now uses
      `display_command`.
 
+248. **Bounded workflow-arg form labels** — argument names/descriptions from
+     disk workflows were interpolated as iced labels and placeholders.
+     They now share the workflow-feedback envelope.
+

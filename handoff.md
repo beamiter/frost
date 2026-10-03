@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 248 — bounded workflow-arg form labels)
+
+## 2026-10-03 (upgrade round 248)
+
+- Workflow argument names and descriptions are sanitized before form draw.
+- `cargo test --locked --bin frost -- workflow_picker::tests::workflow_feedback_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 247 — bounded long-block notify command)
 
 ## 2026-10-03 (upgrade round 247)

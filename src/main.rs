@@ -17075,7 +17075,8 @@ impl Frost {
 
         let missing = form.missing();
         for (index, arg) in form.workflow().args.iter().enumerate() {
-            let input = text_input(&arg.name, form.value(index))
+            let name = crate::workflow_picker::bound_workflow_feedback(&arg.name);
+            let input = text_input(&name, form.value(index))
                 .on_input(move |value| Message::WorkflowArgInput(index, value))
                 .on_submit(Message::WorkflowArgSubmit)
                 .size(13)
@@ -17087,16 +17088,11 @@ impl Frost {
             } else {
                 input
             };
-            let mut label = arg.name.clone();
-            if !arg.description.is_empty() {
-                label = format!("{label} — {}", arg.description);
-            }
-            // An argument whose file declares no default is not filled by a
-            // blank string (see `workflows`): say so on the row, so the
-            // `missing values:` refusal on Insert is never a surprise.
-            if missing.contains(&arg.name.as_str()) {
-                label = format!("{label} (required)");
-            }
+            let label = crate::workflow_picker::bound_workflow_arg_label(
+                &arg.name,
+                &arg.description,
+                missing.contains(&arg.name.as_str()),
+            );
             let field = row![
                 input,
                 button(text("Reset").size(11))

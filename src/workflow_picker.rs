@@ -51,6 +51,17 @@ pub(crate) fn bound_workflow_feedback(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_WORKFLOW_FEEDBACK_BYTES)
 }
 
+pub(crate) fn bound_workflow_arg_label(name: &str, description: &str, required: bool) -> String {
+    let mut label = bound_workflow_feedback(name);
+    if !description.is_empty() {
+        label = format!("{label} — {}", bound_workflow_feedback(description));
+    }
+    if required {
+        label = format!("{label} (required)");
+    }
+    bound_workflow_feedback(label)
+}
+
 /// 选择器状态。`entries` 保持 `workflows::load_all` 的目录优先级顺序（与
 /// anvil 一致：更早的目录胜出同名项，目录内按文件名排序）；期间磁盘上的
 /// 变更在下一次打开时生效。
@@ -407,5 +418,13 @@ mod tests {
         assert!(!name.contains('\u{1b}'));
         assert!(name.len() <= MAX_WORKFLOW_FEEDBACK_BYTES);
         assert!(name.starts_with("deploy"));
+        let arg = bound_workflow_arg_label("host\u{1b}[31m", "ssh target\u{202e}", true);
+        assert!(!arg.contains('\u{1b}'));
+        assert!(!arg.contains('\u{202e}'));
+        assert!(arg.contains("(required)"));
+        assert!(arg.len() <= MAX_WORKFLOW_FEEDBACK_BYTES);
+        assert!(arg.starts_with("host"));
+        let overflow = bound_workflow_arg_label(&format!("host{}", "n".repeat(400)), "desc", true);
+        assert!(overflow.len() <= MAX_WORKFLOW_FEEDBACK_BYTES);
     }
 }
