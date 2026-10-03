@@ -1025,3 +1025,11 @@ everywhere except a resize, and an audit against ember found the rest.
      find + MAX-12/Unknown→Idle beside round-62. STAGE 71 /
      between() 93 held. Manifests stay on published pins.
 
+173. **Fail-closed named ANSI color resolution** — `src/color.rs` no longer
+     `unwrap()`s a partial named-color map after matching Default/Indexed/RGB.
+     Named slots are an exhaustive `Color` match that returns `None` for the
+     three non-named variants; a miss falls back to the theme default instead
+     of panicking. Bold-brightening, dim attenuation, OSC palette overrides,
+     and the 256-color cube/gray ramps are pinned by unit tests; the palette-less
+     wrappers stay live through those tests rather than `allow(dead_code)`.
+

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 173 — fail-closed ANSI color resolution)
+
+## 2026-10-03 (upgrade round 173)
+
+- Named ANSI foreground/background resolution is exhaustive over `Color` and
+  falls back to the theme default instead of `unwrap()` on a partial map.
+- `cargo test --locked --bin frost -- color::tests` — 5 passed.
+
 Updated: 2026-09-30 (evolve round-63 smoke on path-patched core tip)
 
 ## 2026-09-30 (evolve round-63 smoke)
