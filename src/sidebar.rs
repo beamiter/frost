@@ -1640,6 +1640,26 @@ fn path_has_unsafe_directional_mark(character: char) -> bool {
     )
 }
 
+/// Bound the files-panel path bar so iced cannot hold more than the
+/// navigation validator will accept.
+pub fn bound_sidebar_path_input(input: impl Into<String>) -> String {
+    let mut input: String = input
+        .into()
+        .chars()
+        .filter(|character| {
+            !character.is_control() && !path_has_unsafe_directional_mark(*character)
+        })
+        .collect();
+    if input.len() > MAX_NAVIGATION_PATH_BYTES {
+        let mut end = MAX_NAVIGATION_PATH_BYTES;
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        input.truncate(end);
+    }
+    input
+}
+
 /// Validate path-bar input before it can become filesystem authority. Remote
 /// probes require absolute POSIX paths; rejecting dot/parent components keeps
 /// the displayed target identical to the directory actually requested.
@@ -3177,6 +3197,23 @@ mod tests {
         assert!(!filled.contains('y'));
         let overflow = bound_sidebar_filter(format!("{}z", "界".repeat(MAX_SIDEBAR_FILTER_BYTES)));
         assert!(overflow.len() <= MAX_SIDEBAR_FILTER_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
+    }
+
+    #[test]
+    fn sidebar_path_bar_drops_controls_and_truncates_to_the_navigation_envelope() {
+        assert_eq!(
+            bound_sidebar_path_input("/srv\n\u{1b}/project\u{202e}"),
+            "/srv/project"
+        );
+        let filled =
+            bound_sidebar_path_input(format!("{}y", "x".repeat(MAX_NAVIGATION_PATH_BYTES)));
+        assert_eq!(filled.len(), MAX_NAVIGATION_PATH_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow =
+            bound_sidebar_path_input(format!("{}z", "界".repeat(MAX_NAVIGATION_PATH_BYTES)));
+        assert!(overflow.len() <= MAX_NAVIGATION_PATH_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
     }

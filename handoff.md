@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 196 — bounded sidebar path bar)
+
+## 2026-10-03 (upgrade round 196)
+
+- Files-panel path bar drops controls and bidi marks and truncates at 4 KiB
+  so iced cannot hold more than `validate_absolute_navigation_path` accepts.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_path_bar_drops_controls_and_truncates_to_the_navigation_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 195 — bounded sidebar filter)
 
 ## 2026-10-03 (upgrade round 195)

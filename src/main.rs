@@ -14370,7 +14370,9 @@ impl Frost {
             Message::SidebarGoHome => return self.navigate_sidebar_home(),
             Message::SidebarNavigatePath(path) => return self.navigate_sidebar_to(path),
             Message::SidebarPathEdit => return self.begin_sidebar_path_edit(),
-            Message::SidebarPathInput(input) => self.sidebar_path_input = Some(input),
+            Message::SidebarPathInput(input) => {
+                self.sidebar_path_input = Some(crate::sidebar::bound_sidebar_path_input(input));
+            }
             Message::SidebarPathSubmit => return self.submit_sidebar_path(),
             Message::SidebarPathCancel => self.sidebar_path_input = None,
             Message::SidebarRefresh => {

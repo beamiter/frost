@@ -1168,3 +1168,9 @@ everywhere except a resize, and an audit against ember found the rest.
      `bound_sidebar_filter` now drops controls and truncates on a UTF-8
      boundary at `MAX_PICKER_QUERY_BYTES`.
 
+196. **Bounded sidebar path bar** — the files-panel path editor assigned iced
+     `text_input` unbounded, so ESC/bidi and a 4 KiB+1 paste could sit until
+     submit refused. `bound_sidebar_path_input` now drops controls and
+     directional marks and truncates on a UTF-8 boundary at
+     `MAX_NAVIGATION_PATH_BYTES`.
+
