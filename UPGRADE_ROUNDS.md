@@ -1527,3 +1527,7 @@ everywhere except a resize, and an audit against ember found the rest.
 278. **Custom theme names replace visual spoofing** — the theme-editor name
      dropped bidi silently. Name ingest now replaces spoofing with U+FFFD.
 
+279. **Files path bar replaces remaining visual spoofing** — the path field
+     dropped bidi marks but kept zero-width spoofing. Ingest now replaces all
+     visual spoofing with U+FFFD, and navigation rejects replacement text.
+

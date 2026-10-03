@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 279 — Files path bar replaces remaining visual spoofing)
+
+## 2026-10-04 (upgrade round 279)
+
+- Files path-bar ingest replaces visual spoofing; navigation rejects U+FFFD and remaining spoofing.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_path_bar_drops_controls_and_truncates_to_the_navigation_envelope sidebar::tests::absolute_navigation_path_rejects_ambiguous_or_unsafe_authority` passed.
+
 Updated: 2026-10-04 (upgrade round 278 — Custom theme names replace visual spoofing)
 
 ## 2026-10-04 (upgrade round 278)

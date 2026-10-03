@@ -1664,25 +1664,20 @@ fn collect_stale_visible_directories(
     }
 }
 
-fn path_has_unsafe_directional_mark(character: char) -> bool {
-    matches!(
-        character,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
-}
-
 /// Bound the files-panel path bar so iced cannot hold more than the
 /// navigation validator will accept.
 pub fn bound_sidebar_path_input(input: impl Into<String>) -> String {
     let mut input: String = input
         .into()
         .chars()
-        .filter(|character| {
-            !character.is_control() && !path_has_unsafe_directional_mark(*character)
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
         })
         .collect();
     if input.len() > MAX_NAVIGATION_PATH_BYTES {
@@ -1705,10 +1700,11 @@ pub fn validate_absolute_navigation_path(input: &str) -> Result<PathBuf, &'stati
     if input.len() > MAX_NAVIGATION_PATH_BYTES {
         return Err("Path is too long");
     }
-    if input
-        .chars()
-        .any(|character| character.is_control() || path_has_unsafe_directional_mark(character))
-    {
+    if input.chars().any(|character| {
+        character.is_control()
+            || character == '\u{fffd}'
+            || jterm_core::review_input::is_visual_spoofing_character(character)
+    }) {
         return Err("Path contains unsafe control or direction characters");
     }
     if !input.starts_with('/') || !Path::new(input).is_absolute() {
@@ -3217,6 +3213,8 @@ mod tests {
         assert!(validate_absolute_navigation_path("/srv/./project").is_err());
         assert!(validate_absolute_navigation_path("/srv/\nproject").is_err());
         assert!(validate_absolute_navigation_path("/srv/\u{202e}txt").is_err());
+        assert!(validate_absolute_navigation_path("/srv/\u{200b}txt").is_err());
+        assert!(validate_absolute_navigation_path("/srv/\u{fffd}txt").is_err());
         assert!(validate_absolute_navigation_path(&format!(
             "/{}",
             "a".repeat(MAX_NAVIGATION_PATH_BYTES)
@@ -3242,10 +3240,12 @@ mod tests {
 
     #[test]
     fn sidebar_path_bar_drops_controls_and_truncates_to_the_navigation_envelope() {
-        assert_eq!(
-            bound_sidebar_path_input("/srv\n\u{1b}/project\u{202e}"),
-            "/srv/project"
-        );
+        let spoofed = bound_sidebar_path_input("/srv\n\u{1b}/project\u{202e}");
+        assert_eq!(spoofed, "/srv/project\u{fffd}");
+        assert!(!spoofed.contains('\u{202e}'));
+        let zwsp = bound_sidebar_path_input("/srv/\u{200b}project");
+        assert!(!zwsp.contains('\u{200b}'));
+        assert!(zwsp.contains('\u{fffd}'));
         let filled =
             bound_sidebar_path_input(format!("{}y", "x".repeat(MAX_NAVIGATION_PATH_BYTES)));
         assert_eq!(filled.len(), MAX_NAVIGATION_PATH_BYTES);
