@@ -10837,8 +10837,7 @@ impl Frost {
                 return true;
             }
             Key::Named(Named::Backspace) => {
-                self.search.query.pop();
-                self.search.history_nav_index = None;
+                self.search.backspace();
                 self.recompute_search();
                 return true;
             }
@@ -10879,11 +10878,7 @@ impl Frost {
         // Printable input appends to the query.
         if !mods.control() && !mods.alt() {
             if let Some(t) = text {
-                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !printable.is_empty() {
-                    self.search.query.push_str(&printable);
-                    self.search.history_nav_index = None;
-                    self.search.current_match_index = 0;
+                if self.search.push_query_text(t) {
                     self.recompute_search();
                     self.reveal_current_search_match();
                     return true;
@@ -14851,9 +14846,7 @@ impl Frost {
                 self.reveal_current_search_match();
             }
             Message::SearchInput(value) => {
-                self.search.query = value;
-                self.search.history_nav_index = None;
-                self.search.current_match_index = 0;
+                self.search.set_query(value);
                 self.recompute_search();
                 self.reveal_current_search_match();
             }

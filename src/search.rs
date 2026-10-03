@@ -8,6 +8,25 @@ use std::collections::VecDeque;
 
 const MAX_SEARCH_MATCHES: usize = 20_000;
 const MATCH_LIMIT_MESSAGE: &str = "Showing the first 20,000 matches";
+/// One-line find query budget, matching block search and the overlay pickers
+/// so a paste cannot compile an unbounded regex against scrollback.
+pub(crate) const MAX_SEARCH_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+fn bound_query_text(query: impl Into<String>) -> String {
+    let mut query: String = query
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if query.len() > MAX_SEARCH_QUERY_BYTES {
+        let mut end = MAX_SEARCH_QUERY_BYTES;
+        while end > 0 && !query.is_char_boundary(end) {
+            end -= 1;
+        }
+        query.truncate(end);
+    }
+    query
+}
 
 /// Compiled-regex cache slot. Held by `SearchState` so consecutive
 /// `recompute_search` calls with the same pattern reuse the same `Regex`
@@ -116,6 +135,35 @@ impl SearchState {
         }
     }
 
+    /// Replace the find query; the current-match highlight resets. Control
+    /// characters are dropped and the byte budget is enforced on a char
+    /// boundary so iced `text_input` and the raw-key path share one contract.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        self.query = bound_query_text(query);
+        self.history_nav_index = None;
+        self.current_match_index = 0;
+    }
+
+    /// Append typed text. Returns whether the stored query changed.
+    pub fn push_query_text(&mut self, text: &str) -> bool {
+        let previous = self.query.clone();
+        let mut query = previous.clone();
+        query.push_str(text);
+        self.set_query(query);
+        self.query != previous
+    }
+
+    /// Delete the last character of the query. Returns whether anything was
+    /// deleted.
+    pub fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.history_nav_index = None;
+        self.current_match_index = 0;
+        true
+    }
+
     /// 获取当前匹配项（如果有）
     pub fn current_match(&self) -> Option<SearchMatch> {
         if self.matches.is_empty() {
@@ -193,14 +241,14 @@ impl SearchState {
             if idx + 1 < self.history.len() {
                 self.history_nav_index = Some(idx + 1);
                 let entry = &self.history[idx + 1];
-                self.query = entry.query.clone();
+                self.query = bound_query_text(entry.query.clone());
                 self.use_regex = entry.is_regex;
                 self.case_sensitive = entry.case_sensitive;
             }
         } else {
             self.history_nav_index = Some(0);
             let entry = &self.history[0];
-            self.query = entry.query.clone();
+            self.query = bound_query_text(entry.query.clone());
             self.use_regex = entry.is_regex;
             self.case_sensitive = entry.case_sensitive;
         }
@@ -212,7 +260,7 @@ impl SearchState {
             if idx > 0 {
                 self.history_nav_index = Some(idx - 1);
                 let entry = &self.history[idx - 1];
-                self.query = entry.query.clone();
+                self.query = bound_query_text(entry.query.clone());
                 self.use_regex = entry.is_regex;
                 self.case_sensitive = entry.case_sensitive;
             } else {
@@ -800,5 +848,41 @@ mod tests {
         assert!(!error.contains('\u{1b}'));
         assert!(!error.contains('\u{202e}'));
         assert!(error.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);
+    }
+
+    #[test]
+    fn query_drops_controls_and_truncates_on_a_char_boundary() {
+        let mut state = SearchState::new();
+        state.current_match_index = 3;
+        assert!(state.push_query_text("er\nr\u{1b}or"));
+        assert_eq!(state.query, "error");
+        assert_eq!(state.current_match_index, 0);
+        assert!(!state.push_query_text("\n"));
+        assert_eq!(state.query, "error");
+
+        state.set_query(format!("{}x", "界".repeat(MAX_SEARCH_QUERY_BYTES)));
+        assert!(state.query.len() <= MAX_SEARCH_QUERY_BYTES);
+        assert!(state.query.is_char_boundary(state.query.len()));
+        assert!(!state.query.contains('x'));
+
+        state.set_query(format!("{}y", "x".repeat(MAX_SEARCH_QUERY_BYTES)));
+        assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
+        assert!(!state.query.contains('y'));
+        let filled = state.query.clone();
+        assert!(!state.push_query_text("z"));
+        assert_eq!(state.query, filled);
+        assert!(state.backspace());
+        assert_eq!(state.query.len(), filled.len() - 1);
+
+        state.history.push_front(SearchHistoryEntry {
+            query: format!("{}!", "x".repeat(MAX_SEARCH_QUERY_BYTES + 8)),
+            is_regex: false,
+            case_sensitive: false,
+            timestamp: "0".into(),
+        });
+        state.history_prev();
+        assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
+        assert!(!state.query.contains('!'));
+        assert_eq!(state.history_nav_index, Some(0));
     }
 }

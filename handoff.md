@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 184 — bounded terminal-find query)
+
+## 2026-10-03 (upgrade round 184)
+
+- In-buffer find query shares the 4 KiB one-line overlay budget; history
+  recall truncates on a char boundary without losing the nav index.
+- `cargo test --locked --bin frost -- search::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-03 (upgrade round 183 — bounded tab-switcher query)
 
 ## 2026-10-03 (upgrade round 183)
