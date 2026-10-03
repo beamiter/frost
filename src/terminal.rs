@@ -3541,6 +3541,18 @@ impl TerminalState {
         String::from_utf8(bytes).ok()
     }
 
+    fn osc52_clipboard_text_is_unsafe(text: &str) -> bool {
+        text.chars().any(|character| {
+            if matches!(character, '\n' | '\t' | '\r') {
+                false
+            } else {
+                character.is_control()
+                    || character == '\u{fffd}'
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
+            }
+        })
+    }
+
     /// Terminator for unsolicited OSC output (no query to echo).
     fn osc_terminator() -> &'static [u8] {
         OSC_ST
@@ -6363,9 +6375,11 @@ impl TerminalState {
                 }
                 // Set: decode base64 and store for main loop to apply
                 if let Some(decoded) = Self::decode_base64(data) {
-                    if decoded.len() <= OSC52_MAX_BYTES {
+                    if decoded.len() <= OSC52_MAX_BYTES
+                        && !Self::osc52_clipboard_text_is_unsafe(&decoded)
+                    {
                         self.pending_osc52_clipboard_set = Some(decoded);
-                    } else {
+                    } else if decoded.len() > OSC52_MAX_BYTES {
                         crate::debug_log!(
                             "[OSC52] rejecting clipboard set: decoded {} bytes exceeds {}",
                             decoded.len(),
@@ -16986,6 +17000,25 @@ mod tests {
         // matches the boundary payload) but exceeds the decoded cap.
         let payload = base64::engine::general_purpose::STANDARD.encode("x".repeat(100 * 1024 + 1));
         terminal.process_input(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        assert_eq!(terminal.take_osc52_clipboard_set(), None);
+    }
+
+    #[test]
+    fn osc52_set_rejects_visual_spoofing_and_odd_controls() {
+        use base64::Engine as _;
+        let mut terminal = TerminalState::new(8, 2);
+        let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+
+        terminal.process_input(format!("\x1b]52;c;{}\x07", encode("line\nbreak")).as_bytes());
+        assert_eq!(
+            terminal.take_osc52_clipboard_set().as_deref(),
+            Some("line\nbreak")
+        );
+
+        terminal.process_input(format!("\x1b]52;c;{}\x07", encode("ok\u{202e}hidden")).as_bytes());
+        assert_eq!(terminal.take_osc52_clipboard_set(), None);
+
+        terminal.process_input(format!("\x1b]52;c;{}\x07", encode("ok\u{1b}hidden")).as_bytes());
         assert_eq!(terminal.take_osc52_clipboard_set(), None);
     }
 

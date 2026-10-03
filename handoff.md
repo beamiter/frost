@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 302 — OSC 52 clipboard refuses spoofing)
+
+## 2026-10-04 (upgrade round 302)
+
+- OSC 52 clipboard sets with visual spoofing, U+FFFD, or odd controls are refused; newlines and tabs still copy.
+- `cargo test --locked --bin frost -- osc52_set_rejects_visual_spoofing_and_odd_controls` passed.
+
 Updated: 2026-10-04 (upgrade round 301 — OSC 9/777 refuse rewritten toasts)
 
 ## 2026-10-04 (upgrade round 301)

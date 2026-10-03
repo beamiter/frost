@@ -1618,3 +1618,7 @@ everywhere except a resize, and an audit against ember found the rest.
 301. **OSC 9/777 refuse rewritten toasts** — PTY-authored desktop notifications
      whose title or body contained controls or visual spoofing are dropped
      instead of being handed to notify-send as U+FFFD text.
+
+302. **OSC 52 clipboard refuses spoofing** — decoded clipboard sets that carry
+     bidi marks, replacement characters, or odd controls are dropped before
+     they reach the host clipboard. Newlines and tabs remain allowed.
