@@ -23665,7 +23665,10 @@ impl Frost {
         let header = row![
             text("AI command suggestion").size(14),
             Space::new().width(Length::Fill),
-            text(format!("{} · review only", session.provider))
+            text(format!(
+                "{} · review only",
+                crate::review_text::bound_provider_label(&session.provider)
+            ))
                 .size(11)
                 .style(text::secondary),
             button(text("✕").size(12))
@@ -23757,7 +23760,7 @@ impl Frost {
         }
         if let Some(feedback) = session.feedback.as_deref() {
             card = card.push(
-                text(feedback.to_string())
+                text(crate::review_text::bound_toast_text(feedback))
                     .size(11)
                     .wrapping(text::Wrapping::Word)
                     .style(text::danger),

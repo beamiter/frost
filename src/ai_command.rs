@@ -55,6 +55,12 @@ pub(crate) fn bound_suggestion_draft(text: impl Into<String>) -> String {
     text
 }
 
+const MAX_SUGGESTION_FEEDBACK_BYTES: usize = 256;
+
+fn bound_suggestion_feedback(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_SUGGESTION_FEEDBACK_BYTES)
+}
+
 /// Status copy for the card while the worker runs; also the retry affordance's
 /// pre-request state.
 pub(crate) const DRAFTING_STATUS: &str = "Drafting a command for review…";
@@ -140,7 +146,7 @@ impl CommandSuggestion {
             generation,
             session_id,
             request,
-            provider,
+            provider: crate::review_text::bound_provider_label(provider),
             cwd,
             shell,
             block_context,
@@ -207,10 +213,7 @@ impl CommandSuggestion {
             }
             Err(error) => {
                 self.phase = SuggestionPhase::Failed;
-                self.feedback = Some(jterm_core::review_input::safe_inline_display(
-                    &error,
-                    2 * 1024,
-                ));
+                self.feedback = Some(bound_suggestion_feedback(error));
             }
         }
         true
@@ -244,7 +247,10 @@ impl CommandSuggestion {
 
     /// Record why an insert attempt was refused at the prompt boundary.
     pub(crate) fn reject_insert(&mut self, reason: impl Into<String>) {
-        self.feedback = Some(format!("Cannot insert: {}", reason.into()));
+        self.feedback = Some(bound_suggestion_feedback(format!(
+            "Cannot insert: {}",
+            reason.into()
+        )));
     }
 
     pub(crate) fn cancel(&self) {
@@ -312,14 +318,13 @@ mod tests {
     #[test]
     fn overlay_request_drops_controls_and_truncates() {
         assert_eq!(bound_suggestion_request("ls\n\u{1b} -l"), "ls -l");
-        let filled = bound_suggestion_request(format!(
-            "{}y",
-            "x".repeat(MAX_SUGGESTION_REQUEST_BYTES)
-        ));
+        let filled =
+            bound_suggestion_request(format!("{}y", "x".repeat(MAX_SUGGESTION_REQUEST_BYTES)));
         assert_eq!(filled.len(), MAX_SUGGESTION_REQUEST_BYTES);
         assert!(!filled.contains('y'));
         assert!(filled.is_char_boundary(filled.len()));
-        let cjk = bound_suggestion_request(format!("{}x", "界".repeat(MAX_SUGGESTION_REQUEST_BYTES)));
+        let cjk =
+            bound_suggestion_request(format!("{}x", "界".repeat(MAX_SUGGESTION_REQUEST_BYTES)));
         assert!(cjk.len() <= MAX_SUGGESTION_REQUEST_BYTES);
         assert!(cjk.is_char_boundary(cjk.len()));
         assert!(!cjk.contains('x'));
@@ -445,6 +450,38 @@ mod tests {
         // The failed generation's late reply can no longer publish.
         assert!(!session.apply_reply(generation, Ok("ls".into())));
         assert!(!session.regenerate(next + 1));
+    }
+
+    #[test]
+    fn suggestion_feedback_and_provider_chrome_stay_bounded() {
+        let (mut session, generation) = begin();
+        assert!(session.apply_reply(
+            generation,
+            Err(format!("offline \u{1b}[31m\u{202e}{}", "e".repeat(400)))
+        ));
+        let shown = session.feedback.as_deref().expect("feedback");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_SUGGESTION_FEEDBACK_BYTES);
+        assert!(shown.starts_with("offline"));
+        session.reject_insert(format!("prompt busy \u{1b}{}", "x".repeat(400)));
+        let insert = session.feedback.as_deref().expect("insert");
+        assert!(!insert.contains('\u{1b}'));
+        assert!(insert.len() <= MAX_SUGGESTION_FEEDBACK_BYTES);
+        assert!(insert.starts_with("Cannot insert:"));
+        let hostile = CommandSuggestion::begin(
+            1,
+            7,
+            "list files".into(),
+            format!("ollama\u{1b}[31m{}", "n".repeat(400)),
+            ".".into(),
+            "sh".into(),
+            None,
+        )
+        .expect("begin");
+        assert!(!hostile.provider.contains('\u{1b}'));
+        assert!(hostile.provider.len() <= crate::review_text::MAX_PROVIDER_LABEL_BYTES);
     }
 
     #[test]

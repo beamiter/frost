@@ -1340,3 +1340,8 @@ everywhere except a resize, and an audit against ember found the rest.
      into the argument overlay as danger chrome, quoting the template/values.
      `set_feedback` now uses `safe_inline_display` at 256 bytes.
 
+232. **Bounded AI-suggestion card chrome** — insert refusals interpolated the
+     prompt-boundary reason verbatim, and the provider badge copied
+     `display_name()` raw. Feedback is now 256-byte `safe_inline_display`; the
+     badge uses `bound_provider_label`.
+

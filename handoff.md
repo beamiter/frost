@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 232 — bounded AI-suggestion card chrome)
+
+## 2026-10-03 (upgrade round 232)
+
+- AI command-suggestion insert refusals and provider badges drop
+  controls/spoofing and stay within 256 bytes before they restyle the card.
+- `cargo test --locked --bin frost -- ai_command::tests::suggestion_feedback_and_provider_chrome_stay_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 231 — bounded workflow-form render feedback)
 
 ## 2026-10-03 (upgrade round 231)
