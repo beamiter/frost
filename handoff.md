@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 239 — bounded history-picker cwd chrome)
+
+## 2026-10-03 (upgrade round 239)
+
+- History recall rows sanitize and truncate cwd labels so a 16 KiB or
+  bidi-bearing path cannot restyle the overlay.
+- `cargo test --locked --bin frost -- history_picker::tests::display_cwd_escapes_spoofing_and_truncates` passed.
+
 Updated: 2026-10-03 (upgrade round 238 — bounded workflow picker name chrome)
 
 ## 2026-10-03 (upgrade round 238)

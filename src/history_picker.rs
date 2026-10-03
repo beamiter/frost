@@ -70,6 +70,22 @@ pub fn display_command(command: &str) -> String {
     shortened
 }
 
+/// Compact cwd chrome for picker rows. The index may store 16 KiB paths; the
+/// overlay only needs a short, formatting-safe suffix.
+pub fn display_cwd(cwd: &str) -> String {
+    const MAX_DISPLAY_CHARS: usize = 80;
+    if cwd.len() > MAX_HISTORY_CWD_BYTES {
+        return "(cwd omitted: exceeds history limit)".to_string();
+    }
+    let visible = crate::review_text::visible_bounded(cwd, 256);
+    if visible.chars().count() <= MAX_DISPLAY_CHARS {
+        return visible;
+    }
+    let mut shortened: String = visible.chars().take(MAX_DISPLAY_CHARS - 1).collect();
+    shortened.push('…');
+    shortened
+}
+
 /// 历史选择器状态。`entries` 最新在前（`read_recent` 的顺序），在打开浮层
 /// 时加载一次；期间新完成的命令会在下一次打开时出现。
 pub struct HistoryPickerState {
@@ -283,6 +299,17 @@ mod tests {
         assert_eq!(shown.chars().count(), 120);
         assert!(shown.ends_with('…'));
         assert_eq!(display_command("safe\u{202e}hidden"), "safe\\u{202E}hidden");
+    }
+
+    #[test]
+    fn display_cwd_escapes_spoofing_and_truncates() {
+        assert_eq!(display_cwd("/tmp/frost"), "/tmp/frost");
+        assert_eq!(display_cwd("/tmp/\u{202e}spoof"), "/tmp/\\u{202E}spoof");
+        let long = format!("/{}", "x".repeat(400));
+        let shown = display_cwd(&long);
+        assert_eq!(shown.chars().count(), 80);
+        assert!(shown.ends_with('…'));
+        assert!(!shown.contains('\u{202e}'));
     }
 
     #[test]

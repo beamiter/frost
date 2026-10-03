@@ -17184,7 +17184,9 @@ impl Frost {
                     );
                 }
                 if let Some(cwd) = record.cwd.as_deref() {
-                    info = info.push(text(abbreviate_home(cwd)).size(12).style(text::secondary));
+                    info = info.push(
+                        text(history_picker::display_cwd(&abbreviate_home(cwd))).size(12).style(text::secondary),
+                    );
                 }
                 let accent = self.c_accent();
                 let body = container(info).width(Length::Fill).padding([3, 8]).style(

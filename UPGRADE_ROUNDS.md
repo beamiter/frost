@@ -1371,3 +1371,7 @@ everywhere except a resize, and an audit against ember found the rest.
      and the argument-form header were drawn from disk files verbatim. Those
      strings now run `bound_workflow_feedback` at 256 bytes.
 
+239. **Bounded history-picker cwd chrome** — recall rows interpolated the
+     16 KiB-index cwd as iced text. `display_cwd` now escapes spoofing and
+     truncates to 80 characters.
+
