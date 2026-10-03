@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 252 — bounded Agent-task provider chrome)
+
+## 2026-10-04 (upgrade round 252)
+
+- Agent-task provider names share the provider-label envelope in list, buttons, and toasts.
+- `cargo test --locked --bin frost -- review_text::tests::provider_label_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 251 — bounded Files-panel header leaf)
 
 ## 2026-10-04 (upgrade round 251)

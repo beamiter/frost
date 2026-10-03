@@ -351,6 +351,10 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_PROVIDER_LABEL_BYTES);
         assert!(shown.starts_with("ollama"));
+        let native = bound_provider_label(format!("Codex\u{202e}{}", "x".repeat(400)));
+        assert!(!native.contains('\u{202e}'));
+        assert!(native.len() <= MAX_PROVIDER_LABEL_BYTES);
+        assert!(native.starts_with("Codex"));
     }
 
     #[test]

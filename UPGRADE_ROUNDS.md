@@ -1420,3 +1420,7 @@ everywhere except a resize, and an audit against ember found the rest.
      current directory's raw `file_name()`. It now shares the sidebar
      filename envelope (breadcrumbs were already `safe_inline_display`).
 
+252. **Bounded Agent-task provider chrome** — task list, action buttons, and
+     toasts interpolated `provider.display_name()` verbatim. Those now share
+     the provider-label envelope.
+

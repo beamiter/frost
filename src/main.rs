@@ -21991,7 +21991,7 @@ impl Frost {
             );
             return;
         };
-        let provider_name = provider.display_name();
+        let provider_name = crate::review_text::bound_provider_label(provider.display_name());
         if let Err(error) = provider.ensure_executable_available() {
             self.task_panel.provider_picker = Some(context);
             self.push_toast(error.to_string(), ToastKind::Warning);
@@ -22032,7 +22032,7 @@ impl Frost {
             self.push_toast(
                 format!(
                     "Start {} requires AI and command-context sharing in Settings",
-                    provider.display_name()
+                    crate::review_text::bound_provider_label(provider.display_name())
                 ),
                 ToastKind::Warning,
             );
@@ -22058,13 +22058,16 @@ impl Frost {
         };
         match start {
             Ok(()) => self.push_toast(
-                format!("Preparing an isolated {} session…", provider.display_name()),
+                format!(
+                    "Preparing an isolated {} session…",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
                 ToastKind::Info,
             ),
             Err(error) => self.push_toast(
                 format!(
                     "{error}. You can Open {} in a terminal instead.",
-                    provider.display_name()
+                    crate::review_text::bound_provider_label(provider.display_name())
                 ),
                 ToastKind::Warning,
             ),
@@ -22082,7 +22085,10 @@ impl Frost {
         };
         let Some(argv0) = executable.to_str().map(str::to_owned) else {
             self.push_toast(
-                format!("{} path is not valid UTF-8", provider.display_name()),
+                format!(
+                    "{} path is not valid UTF-8",
+                    crate::review_text::bound_provider_label(provider.display_name())
+                ),
                 ToastKind::Warning,
             );
             return;
@@ -22108,7 +22114,10 @@ impl Frost {
                 self.refresh_active_context();
                 self.save_session_snapshot();
                 self.push_toast(
-                    format!("Opened {} in a new tab", provider.display_name()),
+                    format!(
+                        "Opened {} in a new tab",
+                        crate::review_text::bound_provider_label(provider.display_name())
+                    ),
                     ToastKind::Success,
                 );
             }
@@ -22147,7 +22156,8 @@ impl Frost {
             }
             Some(Ok(Ok(prepared))) => {
                 self.task_panel.pending_creation = None;
-                let provider_name = prepared.provider.display_name();
+                let provider_name =
+                    crate::review_text::bound_provider_label(prepared.provider.display_name());
                 let worktree = prepared.worktree;
                 let new_task = agent_task::NewTask {
                     title: prepared.title,
@@ -22223,8 +22233,10 @@ impl Frost {
                         "{} session {outcome}",
                         self.task_manager
                             .get(completion.task_id)
-                            .map(|task| task.provider.display_name())
-                            .unwrap_or("Agent")
+                            .map(|task| {
+                                crate::review_text::bound_provider_label(task.provider.display_name())
+                            })
+                            .unwrap_or_else(|| "Agent".to_string())
                     ),
                     ToastKind::Info,
                 );
@@ -22319,7 +22331,10 @@ impl Frost {
                     );
                 }
                 self.push_toast(
-                    format!("Could not start {}: {error}", provider.display_name()),
+                    format!(
+                        "Could not start {}: {error}",
+                        crate::review_text::bound_provider_label(provider.display_name())
+                    ),
                     ToastKind::Warning,
                 );
                 return;
@@ -22366,7 +22381,7 @@ impl Frost {
         self.push_toast(
             format!(
                 "Opened {} in an isolated task terminal; task context stays in Frost",
-                provider.display_name()
+                crate::review_text::bound_provider_label(provider.display_name())
             ),
             ToastKind::Success,
         );
@@ -22491,7 +22506,7 @@ impl Frost {
                     button::secondary
                 };
                 providers = providers.push(
-                    button(text(provider.display_name()).size(11))
+                    button(text(crate::review_text::bound_provider_label(provider.display_name())).size(11))
                         .style(style)
                         .on_press(Message::TaskCreateWithProvider(provider)),
                 );
@@ -22545,7 +22560,7 @@ impl Frost {
                     row_button,
                     text(format!(
                         "{} · {}",
-                        task.provider.display_name(),
+                        crate::review_text::bound_provider_label(task.provider.display_name()),
                         task.status.label()
                     ))
                     .size(10)
@@ -22703,7 +22718,7 @@ impl Frost {
         }
 
         // Action rows.
-        let provider_name = task.provider.display_name();
+        let provider_name = crate::review_text::bound_provider_label(task.provider.display_name());
         let share_context = agent_task_ui::prompt_policy(&self.config).share_command_context;
         let mut actions = row![].spacing(6);
         if preparing {
