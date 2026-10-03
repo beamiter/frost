@@ -15086,14 +15086,14 @@ impl Frost {
                 if let Some(ed) = &mut self.theme_editor {
                     let name = ed.name.trim().to_string();
                     if let Err(message) = Theme::validate_custom_theme_name(&name) {
-                        ed.error = Some(message);
+                        ed.error = Some(crate::theme::bound_theme_editor_error(message));
                     } else if Theme::is_builtin(&name) {
-                        ed.error = Some("Name collides with a builtin theme".to_string());
+                        ed.error = Some(crate::theme::bound_theme_editor_error("Name collides with a builtin theme".to_string()));
                     } else if let Some(bad) =
                         ed.hexes.iter().position(|h| Theme::hex_to_rgb(h).is_none())
                     {
                         let labels = Theme::editable_color_labels();
-                        ed.error = Some(format!("Invalid hex for {}", labels[bad]));
+                        ed.error = Some(crate::theme::bound_theme_editor_error(format!("Invalid hex for {}", labels[bad])));
                     } else {
                         let mut theme = ed.base.clone();
                         theme.name = name.clone();
@@ -15113,7 +15113,7 @@ impl Frost {
                             }
                             Err(e) => {
                                 let msg = format!("Save failed: {}", e);
-                                ed.error = Some(msg.clone());
+                                ed.error = Some(crate::theme::bound_theme_editor_error(msg.clone()));
                                 save_error = Some(msg);
                             }
                         }
@@ -20878,7 +20878,7 @@ impl Frost {
         ]
         .spacing(12);
         if let Some(err) = &ed.error {
-            content = content.push(text(err.clone()).size(12).style(text::danger));
+            content = content.push(text(crate::theme::bound_theme_editor_error(err)).size(12).style(text::danger));
         }
         content = content.push(buttons);
 

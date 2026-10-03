@@ -50,6 +50,14 @@ pub(crate) fn bound_theme_hex_draft(hex: impl Into<String>) -> String {
     bounded
 }
 
+/// Theme-editor error line: IO and validation messages are drawn as danger
+/// chrome, so they cannot carry ESC/bidi or grow without bound.
+pub(crate) const MAX_THEME_EDITOR_ERROR_BYTES: usize = 256;
+
+pub(crate) fn bound_theme_editor_error(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_THEME_EDITOR_ERROR_BYTES)
+}
+
 /// iced color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color;
@@ -125,8 +133,8 @@ impl ThemeExt for Theme {
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_custom_theme_name, bound_theme_hex_draft, Theme, ThemeExt as _,
-        MAX_CUSTOM_THEME_NAME_BYTES,
+        bound_custom_theme_name, bound_theme_editor_error, bound_theme_hex_draft, Theme,
+        ThemeExt as _, MAX_CUSTOM_THEME_NAME_BYTES, MAX_THEME_EDITOR_ERROR_BYTES,
     };
     use iced::Color;
 
@@ -175,6 +183,22 @@ mod tests {
         assert_eq!(bound_theme_hex_draft("#aA\n\u{1b}bbcczz"), "#aAbbcc");
         assert_eq!(bound_theme_hex_draft("1122334455"), "112233");
         assert_eq!(bound_theme_hex_draft("##ff00aa"), "#ff00aa");
-        assert_eq!(Theme::hex_to_rgb(&bound_theme_hex_draft("#00ff00")), Some([0, 255, 0]));
+        assert_eq!(
+            Theme::hex_to_rgb(&bound_theme_hex_draft("#00ff00")),
+            Some([0, 255, 0])
+        );
+    }
+
+    #[test]
+    fn theme_editor_error_replaces_controls_and_stays_bounded() {
+        let shown = bound_theme_editor_error(format!(
+            "Save failed: \u{1b}[31m\u{202e}{}",
+            "x".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_THEME_EDITOR_ERROR_BYTES);
+        assert!(shown.starts_with("Save failed:"));
     }
 }

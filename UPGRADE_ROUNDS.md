@@ -1295,3 +1295,7 @@ everywhere except a resize, and an audit against ember found the rest.
      a control, so Edit never opened. It now uses `prepared_agent_edit_command`
      so an oversized paste still opens a truncated, control-stripped buffer.
 
+222. **Bounded theme-editor error line** — save/validation failures were drawn
+     as danger chrome verbatim, so an IO error with ESC/bidi could restyle the
+     overlay. Store and draw now run `bound_theme_editor_error` at 256 bytes.
+

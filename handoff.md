@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 222 — bounded theme-editor error line)
+
+## 2026-10-03 (upgrade round 222)
+
+- Theme editor save/validation errors drop controls/spoofing and truncate at
+  256 bytes before they restyle the overlay as danger chrome.
+- `cargo test --locked --bin frost -- theme::tests::theme_editor_error_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 221 — Agent edit start truncates)
 
 ## 2026-10-03 (upgrade round 221)
