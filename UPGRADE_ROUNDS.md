@@ -1458,3 +1458,7 @@ everywhere except a resize, and an audit against ember found the rest.
      `requested_base()` as iced text. The header now uses the toast envelope
      (`display_requested_base`).
 
+261. **Correction-card draft strips visual spoofing** — overlay typing
+     dropped controls but kept bidi in the editable correction command. Draft
+     ingest now replaces spoofing with U+FFFD.
+

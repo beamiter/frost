@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 261 — correction-card draft strips visual spoofing)
+
+## 2026-10-04 (upgrade round 261)
+
+- Command-correction drafts replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- command_correction::tests::the_card_draft_drops_controls_and_stays_inside_the_engine_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 260 — bounded Agent-task git-diff header)
 
 ## 2026-10-04 (upgrade round 260)

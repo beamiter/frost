@@ -98,7 +98,15 @@ fn bound_correction_draft(draft: impl Into<String>) -> String {
     let mut draft: String = draft
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if draft.len() > MAX_CORRECTION_COMMAND_BYTES {
         let mut end = MAX_CORRECTION_COMMAND_BYTES;
@@ -410,6 +418,10 @@ mod tests {
         assert!(overflow.len() <= MAX_CORRECTION_COMMAND_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        let spoofed = bound_correction_draft("git \u{202e}status");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(spoofed.contains('\u{fffd}'));
+        assert!(spoofed.starts_with("git "));
     }
 
     /// The verified branch — the one frost could not reach hermetically
