@@ -964,6 +964,10 @@ pub(crate) fn bound_transcript_text(text: impl Into<String>) -> String {
     crate::review_text::bound_diagnostic_text(text)
 }
 
+pub(crate) fn bound_attached_context_cmd(cmd: impl Into<String>) -> String {
+    bound_transcript_text(cmd)
+}
+
 fn bound_agent_status(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_AGENT_STATUS_BYTES)
 }
@@ -2016,5 +2020,18 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= crate::review_text::MAX_DIAGNOSTIC_BYTES);
         assert!(shown.starts_with("thought:"));
+    }
+
+    #[test]
+    fn attached_context_cmd_strips_spoofing_and_stays_bounded() {
+        let shown = bound_attached_context_cmd(format!(
+            "cargo test \u{1b}[31m\u{202e}{}",
+            "x".repeat(2000)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= crate::review_text::MAX_DIAGNOSTIC_BYTES);
+        assert!(shown.starts_with("cargo test"));
     }
 }

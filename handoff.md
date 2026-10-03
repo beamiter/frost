@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 243 — bounded Agent attached-context cmd)
+
+## 2026-10-03 (upgrade round 243)
+
+- Agent "attached context" command names share the diagnostic envelope before draw.
+- `cargo test --locked --bin frost -- agent::tests::attached_context_cmd_strips_spoofing_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 242 — bounded status-bar segments)
 
 ## 2026-10-03 (upgrade round 242)

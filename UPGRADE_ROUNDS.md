@@ -1387,3 +1387,7 @@ everywhere except a resize, and an audit against ember found the rest.
      from `jterm_core::bottom_bar::compose` were drawn as iced text verbatim.
      Each segment now uses the toast envelope.
 
+243. **Bounded Agent attached-context command chrome** — the sidebar card
+     interpolated `last_manual_completed.cmd` (up to the history command
+     budget) as iced text. Display now uses the diagnostic envelope.
+

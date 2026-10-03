@@ -23213,7 +23213,10 @@ impl Frost {
             Some(context) => {
                 let status = agent_context_exit_label(context.exit_code);
                 row![
-                    text(format!("attached context: `{}` ({status})", context.cmd))
+                    text(format!(
+                        "attached context: `{}` ({status})",
+                        crate::agent::bound_attached_context_cmd(context.cmd.clone())
+                    ))
                         .size(10)
                         .style(text::secondary),
                     button(text("✕").size(10))
