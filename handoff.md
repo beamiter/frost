@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 194 — bounded tab-rename draft)
+
+## 2026-10-03 (upgrade round 194)
+
+- Tab rename drops controls and truncates at 256 bytes so the iced field
+  matches the session-snapshot title envelope.
+- `cargo test --locked --bin frost -- session_persistence::tests::tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 193 — bounded command-correction draft)
 
 ## 2026-10-03 (upgrade round 193)

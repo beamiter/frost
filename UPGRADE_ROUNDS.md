@@ -1156,3 +1156,9 @@ everywhere except a resize, and an audit against ember found the rest.
      `set_draft` now drops controls and truncates on a UTF-8 boundary at
      `MAX_CORRECTION_COMMAND_BYTES`.
 
+194. **Bounded tab-rename draft** — the iced rename field stored the raw paste
+     while only submit applied a 64-char filter, so ESC/newline and a 256-byte+1
+     title could sit in the strip editor next to the snapshot envelope.
+     `TabRenameInput` and `apply_tab_rename` now share `bound_tab_title_draft`
+     (drop controls, truncate at `MAX_RESTORED_TAB_TITLE_BYTES`).
+

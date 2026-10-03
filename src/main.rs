@@ -7222,15 +7222,9 @@ impl Frost {
         };
         // The title is persisted and drawn verbatim in the strip; hold it to
         // the same contract the snapshot loader enforces on the way back in.
-        // `take` counts chars while the snapshot bound counts bytes, and a char
-        // is at most 4 bytes, so this can never exceed that bound.
-        let max_chars = session_persistence::MAX_RESTORED_TAB_TITLE_BYTES / 4;
-        let cleaned: String = raw
+        let cleaned = session_persistence::bound_tab_title_draft(raw)
             .trim()
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(max_chars)
-            .collect();
+            .to_string();
         self.tabs[tab].title = (!cleaned.is_empty()).then_some(cleaned);
         self.session_dirty = true;
     }
@@ -15327,7 +15321,7 @@ impl Frost {
             }
             Message::TabRenameInput(draft) => {
                 if let Some((_, current)) = self.tab_rename.as_mut() {
-                    *current = draft;
+                    *current = crate::session_persistence::bound_tab_title_draft(draft);
                 }
             }
             Message::TabRenameSubmit => {

@@ -19,6 +19,22 @@ const MAX_RESTORED_LAYOUT_NODES: usize = 64;
 const MAX_RESTORED_CWD_BYTES: usize = 4096;
 /// 标签页自定义标题的上限。标题只是一行标签文字，不需要更多。
 pub const MAX_RESTORED_TAB_TITLE_BYTES: usize = 256;
+
+/// Bound the iced tab-rename field to the snapshot title envelope so a paste
+/// cannot sit unbounded next to a 256-byte persisted label.
+pub fn bound_tab_title_draft(raw: impl Into<String>) -> String {
+    let mut bounded = String::new();
+    for ch in raw.into().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if bounded.len().saturating_add(ch.len_utf8()) > MAX_RESTORED_TAB_TITLE_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
 const MAX_RESTORED_AXIS_BYTES: usize = 10;
 const MAX_LEGAL_RESTORED_TEXT_BYTES: usize = MAX_RESTORED_SESSIONS * MAX_RESTORED_CWD_BYTES
     + MAX_RESTORED_TABS * MAX_RESTORED_TAB_TITLE_BYTES
@@ -2474,6 +2490,20 @@ mod tests {
         assert_eq!(restored.tabs[2].title, None);
         assert_eq!(restored.tabs[3].title, None);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope() {
+        assert_eq!(bound_tab_title_draft("build\n\u{1b} me"), "build me");
+        let filled =
+            bound_tab_title_draft(format!("{}y", "x".repeat(MAX_RESTORED_TAB_TITLE_BYTES)));
+        assert_eq!(filled.len(), MAX_RESTORED_TAB_TITLE_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow =
+            bound_tab_title_draft(format!("{}z", "界".repeat(MAX_RESTORED_TAB_TITLE_BYTES)));
+        assert!(overflow.len() <= MAX_RESTORED_TAB_TITLE_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
     }
 
     /// Cf bidi overrides/isolates are not Cc, so the `is_control` check lets
