@@ -1271,3 +1271,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `AgentUi.status` verbatim, so ESC/bidi and a long transport error could
      restyle the panel. `set_status` now uses `safe_inline_display` at 256 bytes.
 
+217. **Bounded AI-chats notice line** — restore/provider errors were assigned
+     into the panel notice verbatim, so ESC/bidi and a long decode error could
+     restyle the library chrome. `set_notice` now uses `safe_inline_display`
+     at 256 bytes.
+

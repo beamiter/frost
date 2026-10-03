@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 217 — bounded AI-chats notice line)
+
+## 2026-10-03 (upgrade round 217)
+
+- AI Chats panel notices drop controls/spoofing and truncate at 256 bytes so
+  restore/provider errors cannot restyle the library chrome.
+- `cargo test --locked --bin frost -- ai_chats::tests` — 17 passed.
+
 Updated: 2026-10-03 (upgrade round 216 — bounded Agent status line)
 
 ## 2026-10-03 (upgrade round 216)

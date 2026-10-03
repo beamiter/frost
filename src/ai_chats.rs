@@ -177,9 +177,9 @@ impl AiChatsUi {
         // republishes it, because its write would be a whole-file overwrite
         // of whatever the lock holder has saved since.
         if !self.owns_persistence && self.notice.is_empty() {
-            self.notice =
-                "Another frost window owns the saved chat library; chats started here are not saved."
-                    .to_string();
+            self.set_notice(
+                "Another frost window owns the saved chat library; chats started here are not saved.",
+            );
         }
         self.sync_title_draft();
         match agent::client_from_config(config) {
@@ -188,7 +188,7 @@ impl AiChatsUi {
             }
             Err(error) => {
                 self.provider_label.clear();
-                self.notice = error;
+                self.set_notice(error);
             }
         }
     }
@@ -232,10 +232,10 @@ impl AiChatsUi {
     /// Refuse every later write and say so, once, in the panel's notice line.
     fn block_persistence(&mut self, reason: &str) {
         self.persist_state = PersistState::Blocked;
-        self.notice = format!(
+        self.set_notice(format!(
             "Saved AI chats were not restored: {reason}. Saving is disabled this run so the \
              existing file is not overwritten."
-        );
+        ));
     }
 
     /// The two questions every write has to answer before it replaces the
@@ -318,6 +318,10 @@ impl AiChatsUi {
         }
     }
 
+    fn set_notice(&mut self, text: impl Into<String>) {
+        self.notice = bound_chat_notice(text);
+    }
+
     pub(crate) fn set_search(&mut self, query: String) {
         let mut query: String = query
             .chars()
@@ -379,7 +383,7 @@ impl AiChatsUi {
         let client = match agent::client_from_config(config) {
             Ok(client) => client,
             Err(error) => {
-                self.notice = error;
+                self.set_notice(error);
                 return None;
             }
         };
@@ -392,15 +396,15 @@ impl AiChatsUi {
             {
                 Ok(start) => start,
                 Err(ChatStoreError::Archived) => {
-                    self.notice = "Unarchive this chat before sending.".to_string();
+                    self.set_notice("Unarchive this chat before sending.");
                     return None;
                 }
                 Err(ChatStoreError::EmptyMessage) => {
-                    self.notice = "Message is empty.".to_string();
+                    self.set_notice("Message is empty.");
                     return None;
                 }
                 Err(ChatStoreError::MessageTooLarge) => {
-                    self.notice = "Message is too large (64 KiB limit).".to_string();
+                    self.set_notice("Message is too large (64 KiB limit).");
                     return None;
                 }
                 Err(
@@ -566,8 +570,7 @@ impl AiChatsUi {
                 self.persist(redact);
             }
             Err(ChatStoreError::LimitReached) => {
-                self.notice =
-                    "50 chats are already saved. Delete one before creating another.".to_string();
+                self.set_notice("50 chats are already saved. Delete one before creating another.");
             }
             Err(_) => {}
         }
@@ -607,14 +610,15 @@ impl AiChatsUi {
                 self.persist(redact);
             }
             Err(ChatStoreError::Busy) => {
-                self.notice = "Stop this response before archiving the chat.".to_string();
+                self.set_notice("Stop this response before archiving the chat.");
             }
             // Archiving the last writable chat has to allocate its
             // replacement; the core refuses before mutating rather than
             // leaving a library with nothing writable in it.
             Err(ChatStoreError::LimitReached) => {
-                self.notice = "50 chats are already saved. Delete one before archiving this chat."
-                    .to_string();
+                self.set_notice(
+                    "50 chats are already saved. Delete one before archiving this chat.",
+                );
             }
             Err(_) => {}
         }
@@ -645,7 +649,7 @@ impl AiChatsUi {
                 self.persist(redact);
             }
             Err(ChatStoreError::Busy) => {
-                self.notice = "Stop this response before deleting the chat.".to_string();
+                self.set_notice("Stop this response before deleting the chat.");
             }
             Err(_) => {}
         }
@@ -672,6 +676,12 @@ impl AiChatsUi {
     fn sync_title_draft(&mut self) {
         self.title_draft = self.store.active_title().to_string();
     }
+}
+
+const MAX_CHAT_NOTICE_BYTES: usize = 256;
+
+fn bound_chat_notice(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_CHAT_NOTICE_BYTES)
 }
 
 fn bound_chat_draft(draft: impl Into<String>) -> String {
@@ -1199,5 +1209,19 @@ mod tests {
             .active_draft()
             .is_char_boundary(panel.store.active_draft().len()));
         assert!(!panel.store.active_draft().contains('z'));
+    }
+
+    #[test]
+    fn panel_notice_replaces_controls_and_stays_bounded() {
+        let mut panel = fresh_panel();
+        panel.set_notice(format!(
+            "Saved AI chats were not restored: \u{1b}[31m\u{202e}{}",
+            "x".repeat(400)
+        ));
+        assert!(!panel.notice.contains('\u{1b}'));
+        assert!(!panel.notice.contains('\u{202e}'));
+        assert!(panel.notice.contains('\u{fffd}'));
+        assert!(panel.notice.len() <= MAX_CHAT_NOTICE_BYTES);
+        assert!(panel.notice.starts_with("Saved AI chats"));
     }
 }
