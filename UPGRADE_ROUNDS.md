@@ -1248,3 +1248,8 @@ everywhere except a resize, and an audit against ember found the rest.
      pick-list string unbounded, then `apply_config()` ran immediately.
      The handler now uses `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
 
+212. **Bounded remote host deploy field** — iced assigned the deploy mode
+     unbounded, so ESC/bidi and a 256-byte+1 paste sat until
+     `validate_remote_host` refused. `RemoteHostDeploy` now uses
+     `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
+

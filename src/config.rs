@@ -1508,6 +1508,24 @@ mod tests {
     }
 
     #[test]
+    fn live_remote_host_deploy_uses_the_name_envelope() {
+        assert_eq!(
+            bound_config_text("persist\n\u{1b}", MAX_CONFIG_NAME_BYTES),
+            "persist"
+        );
+        assert_eq!(
+            bound_config_text("off\u{202e}", MAX_CONFIG_NAME_BYTES),
+            "off"
+        );
+        let filled = bound_config_text(
+            format!("{}y", "d".repeat(MAX_CONFIG_NAME_BYTES)),
+            MAX_CONFIG_NAME_BYTES,
+        );
+        assert_eq!(filled.len(), MAX_CONFIG_NAME_BYTES);
+        assert!(!filled.contains('y'));
+    }
+
+    #[test]
     fn visual_spoofing_config_strings_never_reach_labels_or_paths() {
         let config = Config {
             ai_model: "safe-model\u{202e}gpj".to_string(),
