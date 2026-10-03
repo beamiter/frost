@@ -3696,14 +3696,21 @@ impl TerminalState {
         // Check borrowed fields before any owned allocation enters the
         // interner. URI truncation is deliberately forbidden: it could turn a
         // rejected target into a different, valid destination.
-        if uri.len() > MAX_OSC8_URI_BYTES || !crate::link::is_openable_url(uri) {
+        if uri.len() > MAX_OSC8_URI_BYTES
+            || !crate::link::is_openable_url(uri)
+            || jterm_core::review_input::contains_visual_spoofing(uri)
+        {
             self.current_hyperlink = None;
             return;
         }
         let id = params
             .split(':')
             .find_map(|parameter| parameter.strip_prefix("id="));
-        if id.is_some_and(|id| id.len() > MAX_OSC8_ID_BYTES) {
+        if id.is_some_and(|id| {
+            id.len() > MAX_OSC8_ID_BYTES
+                || id.chars().any(char::is_control)
+                || jterm_core::review_input::contains_visual_spoofing(id)
+        }) {
             self.current_hyperlink = None;
             return;
         }
@@ -14102,6 +14109,15 @@ mod tests {
             "x".repeat(MAX_OSC8_ID_BYTES + 1)
         );
         terminal.process_batch(oversized_id.as_bytes());
+        assert_eq!(terminal.osc8_interned_count(), 0);
+        assert!(osc8_spans(&mut terminal).is_empty());
+
+        terminal.process_batch(
+            "\x1b]8;;https://example.com/\u{202e}hidden\x1b\\Spoofed\x1b]8;;\x1b\\".as_bytes(),
+        );
+        terminal.process_batch(
+            "\x1b]8;id=ok\u{200b};https://example.com\x1b\\Marked\x1b]8;;\x1b\\".as_bytes(),
+        );
         assert_eq!(terminal.osc8_interned_count(), 0);
         assert!(osc8_spans(&mut terminal).is_empty());
     }

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 284 — OSC 8 hyperlinks reject visual spoofing)
+
+## 2026-10-04 (upgrade round 284)
+
+- OSC 8 URIs and ids with visual spoofing close the current hyperlink instead of being interned.
+- `cargo test --locked --bin frost -- terminal::tests::osc8_rejects_unsafe_or_oversized_fields_before_interning` passed.
+
 Updated: 2026-10-04 (upgrade round 283 — Agent git-diff display replaces controls with U+FFFD)
 
 ## 2026-10-04 (upgrade round 283)

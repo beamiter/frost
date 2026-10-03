@@ -1547,3 +1547,7 @@ everywhere except a resize, and an audit against ember found the rest.
      mapped ESC/bidi to ASCII `?`, which could hide the neutralization. Diff
      display now uses U+FFFD and re-truncates after the wider replacement.
 
+284. **OSC 8 hyperlinks reject visual spoofing** — interned link URIs and ids
+     were size-checked but still admitted bidi and zero-width marks. Spoofed
+     OSC 8 fields now close the current link instead of being interned.
+
