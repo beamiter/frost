@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 198 — bounded API-key draft)
+
+## 2026-10-03 (upgrade round 198)
+
+- Settings API-key field drops controls and truncates at 16 KiB − 1 so iced
+  cannot hold more than `write_api_key_file` will store.
+- `cargo test --locked --bin frost -- persistence::tests::api_key_draft_drops_controls_and_leaves_room_for_the_file_newline` passed.
+
 Updated: 2026-10-03 (upgrade round 197 — bounded sidebar create/rename name)
 
 ## 2026-10-03 (upgrade round 197)

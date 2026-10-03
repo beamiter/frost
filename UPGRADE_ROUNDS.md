@@ -1179,3 +1179,9 @@ everywhere except a resize, and an audit against ember found the rest.
      255-byte+1 paste could sit until submit refused. `bound_new_name` now
      drops controls and slashes and truncates on a UTF-8 boundary at 255 bytes.
 
+198. **Bounded API-key draft** — the settings field stored the raw paste while
+     only `write_api_key_file` refused, so ESC/newline and a 16 KiB paste could
+     sit in RAM next to a credential that must be one line and one byte under
+     the file cap. `SetAiKeyDraft` now drops controls and truncates on a UTF-8
+     boundary at `MAX_API_KEY_DRAFT_BYTES`.
+

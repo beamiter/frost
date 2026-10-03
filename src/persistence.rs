@@ -17,6 +17,25 @@ use std::time::{Duration, Instant};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_KEY_FILE_BYTES: u64 = 16 * 1024;
+/// Live settings-field budget: the file stores one trailing newline, so the
+/// iced draft cannot hold more than the writer will accept.
+pub const MAX_API_KEY_DRAFT_BYTES: usize = (MAX_API_KEY_FILE_BYTES - 1) as usize;
+
+pub fn bound_api_key_draft(value: impl Into<String>) -> String {
+    let mut value: String = value
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if value.len() > MAX_API_KEY_DRAFT_BYTES {
+        let mut end = MAX_API_KEY_DRAFT_BYTES;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Exact content identity for optimistic concurrency checks.
@@ -1368,5 +1387,17 @@ mod tests {
             .expect("snapshot lock remained held after every writer returned");
         assert_eq!(fs::read(&path).unwrap(), b"lock released");
         assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn api_key_draft_drops_controls_and_leaves_room_for_the_file_newline() {
+        assert_eq!(bound_api_key_draft("sk-\n\u{1b}secret"), "sk-secret");
+        let filled = bound_api_key_draft(format!("{}y", "x".repeat(MAX_API_KEY_DRAFT_BYTES)));
+        assert_eq!(filled.len(), MAX_API_KEY_DRAFT_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow = bound_api_key_draft(format!("{}z", "界".repeat(MAX_API_KEY_DRAFT_BYTES)));
+        assert!(overflow.len() <= MAX_API_KEY_DRAFT_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
     }
 }
