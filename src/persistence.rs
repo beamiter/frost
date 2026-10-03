@@ -360,16 +360,20 @@ pub fn read_api_key_file(raw_path: &str) -> io::Result<String> {
             format!("{} is empty", path.display()),
         ));
     }
-    if key.chars().any(char::is_control) {
+    if key.chars().any(api_key_char_is_unsafe) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} must contain one line without control characters",
+                "{} must contain one line without control or visual-spoofing characters",
                 path.display()
             ),
         ));
     }
     Ok(key.to_string())
+}
+
+fn api_key_char_is_unsafe(character: char) -> bool {
+    character.is_control() || jterm_core::review_input::is_visual_spoofing_character(character)
 }
 
 /// Store one settings-entered key using the bounded, locked private snapshot
@@ -384,10 +388,10 @@ pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
             "API key must not be empty",
         ));
     }
-    if key.chars().any(char::is_control) {
+    if key.chars().any(api_key_char_is_unsafe) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "API key must be one line without control characters",
+            "API key must be one line without control or visual-spoofing characters",
         ));
     }
     if key.len() as u64 + 1 > MAX_API_KEY_FILE_BYTES {
@@ -1219,6 +1223,12 @@ mod tests {
             read_api_key_file(path.to_str().unwrap()).unwrap(),
             "sk-secret"
         );
+        assert!(write_api_key_file(path.to_str().unwrap(), "sk-\u{202e}secret").is_err());
+        assert!(write_api_key_file(path.to_str().unwrap(), "sk-\u{200b}secret").is_err());
+        fs::write(&path, "sk-\u{202e}secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_api_key_file(path.to_str().unwrap()).is_err());
+        write_api_key_file(path.to_str().unwrap(), "sk-secret").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"sk-secret\n");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

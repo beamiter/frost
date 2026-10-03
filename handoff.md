@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 289 — API key files reject visual spoofing)
+
+## 2026-10-04 (upgrade round 289)
+
+- API key file read/write refuse visual spoofing rather than storing or loading it.
+- `cargo test --locked --bin frost -- persistence::tests::api_key_io_is_private_bounded_and_rejects_links_and_fifos` passed.
+
 Updated: 2026-10-04 (upgrade round 288 — Remote home probe rejects remaining visual spoofing)
 
 ## 2026-10-04 (upgrade round 288)

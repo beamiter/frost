@@ -1567,3 +1567,6 @@ everywhere except a resize, and an audit against ember found the rest.
      ingest dropped bidi marks but kept zero-width spoofing. The probe now
      refuses any visually spoofed absolute path.
 
+289. **API key files reject visual spoofing** — credential IO dropped controls
+     but still stored bidi and zero-width marks. Read and write now refuse
+     spoofed keys instead of persisting them.
