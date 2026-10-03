@@ -1416,3 +1416,7 @@ everywhere except a resize, and an audit against ember found the rest.
      keeps newlines, replaces spoofing, and stays inside the live-message
      budget.
 
+250. **Bounded AI chat library row chrome** — saved-chat titles and preview
+     snippets were interpolated as iced text. Titles use the rename envelope;
+     previews use the toast envelope.
+

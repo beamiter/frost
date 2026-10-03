@@ -23677,8 +23677,12 @@ impl Frost {
             };
             let row_body = container(
                 column![
-                    text(summary.title).size(13).style(title_style),
-                    text(meta).size(11).style(text::secondary),
+                    text(crate::ai_chats::bound_title_draft(summary.title))
+                        .size(13)
+                        .style(title_style),
+                    text(crate::review_text::bound_toast_text(meta))
+                        .size(11)
+                        .style(text::secondary),
                 ]
                 .spacing(2),
             )

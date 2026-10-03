@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 250 — bounded AI chat library rows)
+
+## 2026-10-03 (upgrade round 250)
+
+- AI chat library titles and preview snippets are sanitized before iced draw.
+- `cargo test --locked --bin frost -- ai_chats::tests::rename_draft_drops_controls_and_stays_inside_the_store_title_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 249 — bounded AI chat turn chrome)
 
 ## 2026-10-03 (upgrade round 249)

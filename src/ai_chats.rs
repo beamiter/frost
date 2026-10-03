@@ -730,7 +730,7 @@ pub(crate) fn display_chat_turn(text: &str) -> String {
     bounded
 }
 
-fn bound_title_draft(title: String) -> String {
+pub(crate) fn bound_title_draft(title: String) -> String {
     let mut bounded = String::new();
     let mut chars = 0usize;
     for ch in title.chars() {
@@ -1211,6 +1211,10 @@ mod tests {
         panel.rename("ok\u{200b}title".into());
         assert!(!panel.title_draft.contains('\u{200b}'));
         assert!(panel.title_draft.contains('\u{fffd}'));
+        let listed = bound_title_draft(format!("chat \u{202e}{}", "t".repeat(400)));
+        assert!(!listed.contains('\u{202e}'));
+        assert!(listed.len() <= MAX_TITLE_DRAFT_BYTES);
+        assert!(listed.starts_with("chat "));
     }
 
     #[test]
