@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 235 — bounded Agent transcript chrome)
+
+## 2026-10-03 (upgrade round 235)
+
+- Agent panel transcript, streaming preview, observation samples, and
+  destructive-risk labels drop controls/spoofing (newlines kept) at 1 KiB.
+- `cargo test --locked --bin frost -- agent::tests::agent_transcript_keeps_newlines_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 234 — Files notices store through one setter)
 
 ## 2026-10-03 (upgrade round 234)

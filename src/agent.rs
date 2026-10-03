@@ -960,6 +960,10 @@ impl AgentUi {
 
 const MAX_AGENT_STATUS_BYTES: usize = 256;
 
+pub(crate) fn bound_transcript_text(text: impl Into<String>) -> String {
+    crate::review_text::bound_diagnostic_text(text)
+}
+
 fn bound_agent_status(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_AGENT_STATUS_BYTES)
 }
@@ -1998,5 +2002,19 @@ mod tests {
         assert!(agent.status.contains('\u{fffd}'));
         assert!(agent.status.len() <= MAX_AGENT_STATUS_BYTES);
         assert!(agent.status.starts_with("failed"));
+    }
+
+    #[test]
+    fn agent_transcript_keeps_newlines_and_stays_bounded() {
+        let shown = bound_transcript_text(format!(
+            "thought: line\n\u{1b}[31m\u{202e}{}",
+            "x".repeat(2000)
+        ));
+        assert!(shown.contains('\n'));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= crate::review_text::MAX_DIAGNOSTIC_BYTES);
+        assert!(shown.starts_with("thought:"));
     }
 }

@@ -22910,18 +22910,34 @@ impl Frost {
         if let Some(session) = session {
             for (index, turn) in session.transcript().iter().enumerate() {
                 let element: Element<'_, Message> = match turn {
-                    AgentTurn::User(message) => text(format!("You: {message}")).size(13).into(),
-                    AgentTurn::AssistantThought(thought) => text(format!("thought: {thought}"))
+                    AgentTurn::User(message) => {
+                        text(crate::agent::bound_transcript_text(format!("You: {message}")))
+                            .size(13)
+                            .into()
+                    }
+                    AgentTurn::AssistantThought(thought) => {
+                        text(crate::agent::bound_transcript_text(format!(
+                            "thought: {thought}"
+                        )))
                         .size(12)
                         .style(text::secondary)
-                        .into(),
-                    AgentTurn::AssistantSay(message) => {
-                        text(format!("Agent: {message}")).size(13).into()
+                        .into()
                     }
-                    AgentTurn::ProtocolError(message) => text(format!("protocol: {message}"))
+                    AgentTurn::AssistantSay(message) => {
+                        text(crate::agent::bound_transcript_text(format!(
+                            "Agent: {message}"
+                        )))
+                        .size(13)
+                        .into()
+                    }
+                    AgentTurn::ProtocolError(message) => {
+                        text(crate::agent::bound_transcript_text(format!(
+                            "protocol: {message}"
+                        )))
                         .size(12)
                         .style(text::danger)
-                        .into(),
+                        .into()
+                    }
                     AgentTurn::Observation {
                         exit_code,
                         output_sample,
@@ -22937,7 +22953,7 @@ impl Frost {
                         } else {
                             text::danger
                         });
-                        let body = text(output_sample.clone())
+                        let body = text(crate::agent::bound_transcript_text(output_sample.clone()))
                             .size(12)
                             .font(iced::Font::MONOSPACE);
                         container(column![head, body].spacing(4))
@@ -22960,7 +22976,10 @@ impl Frost {
                         let mut card = column![].spacing(6);
                         if let Some(reason) = danger {
                             card = card.push(
-                                text(format!("⚠ destructive: {reason}"))
+                                text(format!(
+                                    "⚠ destructive: {}",
+                                    crate::agent::bound_transcript_text(reason)
+                                ))
                                     .size(12)
                                     .style(text::danger),
                             );
@@ -23066,20 +23085,29 @@ impl Frost {
             Some(preview) => {
                 if let Some(thought) = &preview.thought {
                     transcript = transcript.push(
-                        text(format!("thought: {thought}"))
+                        text(crate::agent::bound_transcript_text(format!(
+                            "thought: {thought}"
+                        )))
                             .size(12)
                             .style(text::secondary),
                     );
                 }
                 if let Some(command) = &preview.command {
                     transcript = transcript.push(
-                        text(format!("proposing: {command}"))
+                        text(crate::agent::bound_transcript_text(format!(
+                            "proposing: {command}"
+                        )))
                             .size(13)
                             .font(iced::Font::MONOSPACE),
                     );
                 }
                 if let Some(message) = &preview.message {
-                    transcript = transcript.push(text(format!("Agent: {message}")).size(13));
+                    transcript = transcript.push(
+                        text(crate::agent::bound_transcript_text(format!(
+                            "Agent: {message}"
+                        )))
+                        .size(13),
+                    );
                 }
                 if !self.agent.loading {
                     transcript =

@@ -1354,3 +1354,8 @@ everywhere except a resize, and an audit against ember found the rest.
      navigation errors. They now call `set_sidebar_notice`, including follow
      destination labels.
 
+235. **Bounded Agent transcript chrome** — user/thought/say/protocol lines,
+     observation samples, streaming preview, and the destructive-risk label
+     were drawn verbatim. They now run `bound_transcript_text` (keep newlines,
+     1 KiB) including streamed proposed commands.
+
