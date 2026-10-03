@@ -990,9 +990,14 @@ fn valid_config_text(value: &str, max_bytes: usize) -> bool {
 pub(crate) fn bound_config_text(value: impl Into<String>, max_bytes: usize) -> String {
     let mut bounded = String::new();
     for ch in value.into().chars() {
-        if ch.is_control() || jterm_core::review_input::is_visual_spoofing_character(ch) {
+        if ch.is_control() {
             continue;
         }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
         if bounded.len().saturating_add(ch.len_utf8()) > max_bytes {
             break;
         }
@@ -1320,7 +1325,7 @@ mod tests {
         );
         assert_eq!(
             bound_config_text("safe-model\u{202e}gpj", MAX_CONFIG_NAME_BYTES),
-            "safe-modelgpj"
+            "safe-model\u{fffd}gpj"
         );
         let filled = bound_config_text(
             format!("{}y", "x".repeat(MAX_CONFIG_NAME_BYTES)),
@@ -1380,7 +1385,7 @@ mod tests {
         );
         assert_eq!(
             bound_config_text("openai\u{202e}", MAX_CONFIG_NAME_BYTES),
-            "openai"
+            "openai\u{fffd}"
         );
         let filled = bound_config_text(
             format!("{}y", "p".repeat(MAX_CONFIG_NAME_BYTES)),
@@ -1419,7 +1424,7 @@ mod tests {
         );
         assert_eq!(
             bound_config_text("lab\u{202e}", MAX_CONFIG_NAME_BYTES),
-            "lab"
+            "lab\u{fffd}"
         );
         let filled = bound_config_text(
             format!("{}y", "n".repeat(MAX_CONFIG_NAME_BYTES)),
@@ -1479,7 +1484,7 @@ mod tests {
         );
         assert_eq!(
             bound_config_text("Nord\u{202e}", MAX_CONFIG_NAME_BYTES),
-            "Nord"
+            "Nord\u{fffd}"
         );
         let filled = bound_config_text(
             format!("{}y", "t".repeat(MAX_CONFIG_NAME_BYTES)),
@@ -1497,7 +1502,7 @@ mod tests {
         );
         assert_eq!(
             bound_config_text("Iosevka\u{202e}", MAX_CONFIG_NAME_BYTES),
-            "Iosevka"
+            "Iosevka\u{fffd}"
         );
         let filled = bound_config_text(
             format!("{}y", "f".repeat(MAX_CONFIG_NAME_BYTES)),
@@ -1515,7 +1520,7 @@ mod tests {
         );
         assert_eq!(
             bound_config_text("off\u{202e}", MAX_CONFIG_NAME_BYTES),
-            "off"
+            "off\u{fffd}"
         );
         let filled = bound_config_text(
             format!("{}y", "d".repeat(MAX_CONFIG_NAME_BYTES)),

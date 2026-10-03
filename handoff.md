@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 277 — Settings text fields replace visual spoofing)
+
+## 2026-10-04 (upgrade round 277)
+
+- Live settings drafts replace visual spoofing at ingest instead of dropping it.
+- `cargo test --locked --bin frost -- config::tests::live_config_text_drops_controls_and_stays_inside_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 276 — Agent edit-command drafts replace visual spoofing)
 
 ## 2026-10-04 (upgrade round 276)
