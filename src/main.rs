@@ -3820,11 +3820,12 @@ fn user_input_blocked(hold_after_exit: bool) -> bool {
 /// A session's strip/window label with the read-only suffix applied when the
 /// session shows a held-open task transcript.
 fn session_label(base: String, transcript_read_only: bool) -> String {
-    if transcript_read_only {
+    let base = if transcript_read_only {
         format!("{base}{READ_ONLY_LABEL_SUFFIX}")
     } else {
         base
-    }
+    };
+    session_persistence::bound_tab_title_draft(base)
 }
 
 /// The `--session` identity a newly spawned interactive shell is launched with.
@@ -4019,13 +4020,15 @@ impl Session {
     /// repeating it there would crowd out the directory.
     fn pane_title(&self) -> String {
         let title = self.terminal.window_title.trim();
-        if !title.is_empty() {
-            return title.to_string();
-        }
-        self.cwd_cache
-            .as_deref()
-            .and_then(Self::cwd_basename)
-            .unwrap_or_else(|| format!("Session {}", self.id + 1))
+        let title = if !title.is_empty() {
+            title.to_string()
+        } else {
+            self.cwd_cache
+                .as_deref()
+                .and_then(Self::cwd_basename)
+                .unwrap_or_else(|| format!("Session {}", self.id + 1))
+        };
+        session_persistence::bound_tab_title_draft(title)
     }
 
     /// Full working directory for the pane header, with `$HOME` collapsed to
@@ -16534,12 +16537,14 @@ impl Frost {
     /// Centered modal: "Tab is running `<proc>`. Close anyway?". Esc / outside
     /// click cancel; only TabCloseConfirmYes proceeds with the close.
     fn tab_close_confirm_view(&self, id: usize, proc_name: &str) -> Element<'_, Message> {
-        let label = self
-            .sessions
-            .iter()
-            .find(|session| session.id == id)
-            .map(|s| s.label())
-            .unwrap_or_else(|| format!("Session {}", id + 1));
+        let label = session_persistence::bound_tab_title_draft(
+            self.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|s| s.label())
+                .unwrap_or_else(|| format!("Session {}", id + 1)),
+        );
+        let proc_name = session_persistence::bound_tab_title_draft(proc_name);
         let body = column![
             text(format!("Close \"{}\"?", label)).size(14),
             text(format!("Foreground process: {}", proc_name))

@@ -23,8 +23,9 @@ pub const MAX_RESTORED_TAB_TITLE_BYTES: usize = 256;
 /// Bound the iced tab-rename field to the snapshot title envelope so a paste
 /// cannot sit unbounded next to a 256-byte persisted label.
 pub fn bound_tab_title_draft(raw: impl Into<String>) -> String {
+    let stripped = strip_bidi_display_controls(&raw.into());
     let mut bounded = String::new();
-    for ch in raw.into().chars() {
+    for ch in stripped.chars() {
         if ch.is_control() {
             continue;
         }
@@ -2495,6 +2496,8 @@ mod tests {
     #[test]
     fn tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope() {
         assert_eq!(bound_tab_title_draft("build\n\u{1b} me"), "build me");
+        assert_eq!(bound_tab_title_draft("ok\u{202e}title"), "oktitle");
+        assert!(!bound_tab_title_draft("x\u{2066}y").contains('\u{2066}'));
         let filled =
             bound_tab_title_draft(format!("{}y", "x".repeat(MAX_RESTORED_TAB_TITLE_BYTES)));
         assert_eq!(filled.len(), MAX_RESTORED_TAB_TITLE_BYTES);

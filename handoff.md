@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 237 — bounded tab labels and close-confirm)
+
+## 2026-10-03 (upgrade round 237)
+
+- Tab rename drafts, session/pane labels, and the close-anyway dialog strip
+  bidi/controls and stay inside the 256-byte title envelope.
+- `cargo test --locked --bin frost -- session_persistence::tests::tab_rename_draft_drops_controls_and_stays_inside_the_snapshot_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 236 — bounded Files-tree scan-error rows)
 
 ## 2026-10-03 (upgrade round 236)

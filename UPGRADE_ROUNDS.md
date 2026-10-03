@@ -1363,3 +1363,7 @@ everywhere except a resize, and an audit against ember found the rest.
      rows interpolated `DirectoryError` as danger chrome. Those lines now run
      `bound_sidebar_notice`.
 
+237. **Bounded tab labels including close-confirm chrome** — `bound_tab_title_draft`
+     dropped Cc but not bidi, and close-confirm interpolated process names
+     verbatim. Drafts and session/pane labels now strip bidi like OSC titles.
+
