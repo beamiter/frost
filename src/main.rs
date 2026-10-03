@@ -5574,13 +5574,15 @@ impl Frost {
         let preserve_loaded_tree =
             same_target && !already_following && self.sidebar.has_loaded_snapshot();
         if already_following {
-            self.sidebar_notice = Some((
+            self.set_sidebar_notice(
                 format!(
                     "Following {}",
-                    self.sidebar.location.label(self.sidebar.hosts_snapshot())
+                    crate::sidebar::bound_sidebar_path_label(std::path::Path::new(
+                        &self.sidebar.location.label(self.sidebar.hosts_snapshot())
+                    ))
                 ),
                 true,
-            ));
+            );
             self.apply_config();
             return Task::none();
         }
@@ -5774,11 +5776,8 @@ impl Frost {
                 }
                 None => {
                     self.sidebar_clipboard = None;
-                    self.sidebar_notice = Some((
-                        "File clipboard cleared because its remote profile changed or became ambiguous"
-                            .to_string(),
-                        false,
-                    ));
+                    self.set_sidebar_notice("File clipboard cleared because its remote profile changed or became ambiguous"
+                            .to_string(), false);
                 }
             }
         }
@@ -5855,17 +5854,11 @@ impl Frost {
 
     fn begin_sidebar_path_edit(&mut self) -> Task<Message> {
         let Some(path) = self.sidebar.current_dir.to_str().map(ToOwned::to_owned) else {
-            self.sidebar_notice = Some((
-                "This path is not valid UTF-8 and cannot be edited safely".to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("This path is not valid UTF-8 and cannot be edited safely".to_string(), false);
             return Task::none();
         };
         if sidebar::validate_absolute_navigation_path(&path).is_err() {
-            self.sidebar_notice = Some((
-                "This path contains characters that cannot be edited safely".to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("This path contains characters that cannot be edited safely".to_string(), false);
             return Task::none();
         }
         self.sidebar_path_input = Some(path);
@@ -5986,10 +5979,7 @@ impl Frost {
     ) -> Task<Message> {
         self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(menu.generation) {
-            self.sidebar_notice = Some((
-                "Files changed; reopen the menu before modifying anything".to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("Files changed; reopen the menu before modifying anything".to_string(), false);
             return Task::none();
         }
         let target_dir = if menu.is_dir {
@@ -6051,11 +6041,8 @@ impl Frost {
             SidebarMenuAction::Copy | SidebarMenuAction::Cut => {
                 let Some(next_id) = next_sidebar_clipboard_id(self.sidebar_next_clipboard_id)
                 else {
-                    self.sidebar_notice = Some((
-                        "Files clipboard identity exhausted; restart Frost before copying again"
-                            .to_string(),
-                        false,
-                    ));
+                    self.set_sidebar_notice("Files clipboard identity exhausted; restart Frost before copying again"
+                            .to_string(), false);
                     return Task::none();
                 };
                 self.sidebar_next_clipboard_id = next_id;
@@ -6084,10 +6071,7 @@ impl Frost {
                     .as_ref()
                     .map(|clipboard| clipboard.id);
                 if !sidebar_menu_clipboard_is_current(menu.clipboard_id, live_clipboard_id) {
-                    self.sidebar_notice = Some((
-                        "Files clipboard changed; reopen the menu before pasting".to_string(),
-                        false,
-                    ));
+                    self.set_sidebar_notice("Files clipboard changed; reopen the menu before pasting".to_string(), false);
                     return Task::none();
                 }
                 let Some(clipboard) = self.sidebar_clipboard.clone() else {
@@ -6101,11 +6085,8 @@ impl Frost {
                     }
                 };
                 let Some(context_epoch) = self.sidebar_context_epoch else {
-                    self.sidebar_notice = Some((
-                        "Files operation identity exhausted; restart Frost before modifying files"
-                            .to_string(),
-                        false,
-                    ));
+                    self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(), false);
                     return Task::none();
                 };
                 // Cross-location transfers can run long: give them a progress
@@ -6119,8 +6100,7 @@ impl Frost {
                     self.sidebar.hosts_snapshot(),
                 ) {
                     if self.sidebar_transfer.is_some() {
-                        self.sidebar_notice =
-                            Some(("A transfer is already running".to_string(), false));
+                        self.set_sidebar_notice("A transfer is already running".to_string(), false);
                         return Task::none();
                     }
                     let handle = remote_fs::TransferProgress::new();
@@ -6178,10 +6158,7 @@ impl Frost {
         self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(dialog.generation) {
             self.sidebar_dialog = None;
-            self.sidebar_notice = Some((
-                "Files changed; reopen the action before modifying anything".to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("Files changed; reopen the action before modifying anything".to_string(), false);
             return Task::none();
         }
         if let Err(problem) = remote_fs::validate_new_name(&dialog.input) {
@@ -6191,11 +6168,8 @@ impl Frost {
             return Task::none();
         }
         let Some(context_epoch) = self.sidebar_context_epoch else {
-            self.sidebar_notice = Some((
-                "Files operation identity exhausted; restart Frost before modifying files"
-                    .to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(), false);
             return Task::none();
         };
         self.sidebar_dialog = None;
@@ -6311,10 +6285,7 @@ impl Frost {
         };
         self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(confirmation.generation) {
-            self.sidebar_notice = Some((
-                "Files changed; select the items again before deleting".to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("Files changed; select the items again before deleting".to_string(), false);
             return Task::none();
         }
         let paths = confirmation.paths;
@@ -6325,11 +6296,8 @@ impl Frost {
             }
         }
         let Some(context_epoch) = self.sidebar_context_epoch else {
-            self.sidebar_notice = Some((
-                "Files operation identity exhausted; restart Frost before modifying files"
-                    .to_string(),
-                false,
-            ));
+            self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(), false);
             return Task::none();
         };
         let consumed_clipboard_id = sidebar_clipboard_id_at_location(
@@ -14483,23 +14451,17 @@ impl Frost {
                     self.sidebar_notice = None;
                 } else if outcome == SidebarLoadApply::NavigationFailed {
                     if let Some(failure) = self.sidebar.navigation_failure() {
-                        self.sidebar_notice = Some((
-                            format!(
+                        self.set_sidebar_notice(format!(
                                 "Could not open folder: {}. Current files were kept.",
                                 failure.error
-                            ),
-                            false,
-                        ));
+                            ), false);
                     }
                 }
                 return self.dispatch_sidebar_scans();
             }
             Message::SidebarSetLocation(hosts_epoch, location) => {
                 if hosts_epoch != self.sidebar_hosts_epoch {
-                    self.sidebar_notice = Some((
-                        "Remote profiles changed; choose the destination again".to_string(),
-                        false,
-                    ));
+                    self.set_sidebar_notice("Remote profiles changed; choose the destination again".to_string(), false);
                     return Task::none();
                 }
                 if location != self.sidebar.location {
@@ -14528,13 +14490,10 @@ impl Frost {
                     return self.queue_sidebar_load(request);
                 }
                 if let Some(failure) = self.sidebar.navigation_failure() {
-                    self.sidebar_notice = Some((
-                        format!(
+                    self.set_sidebar_notice(format!(
                             "Could not open location: {}. Current files were kept.",
                             failure.error
-                        ),
-                        false,
-                    ));
+                        ), false);
                 }
             }
             Message::SidebarRemoteFollowResolved(token, start) => {
@@ -14553,8 +14512,7 @@ impl Frost {
             Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
             Message::SidebarRowClick(generation, path, is_dir) => {
                 if !self.sidebar.accepts_generation(generation) {
-                    self.sidebar_notice =
-                        Some(("Files changed; select the item again".to_string(), false));
+                    self.set_sidebar_notice("Files changed; select the item again".to_string(), false);
                     return Task::none();
                 }
                 return self.sidebar_row_click(path, is_dir);
@@ -14804,16 +14762,12 @@ impl Frost {
                     }
                 };
                 if self.sidebar_transfer.is_some() {
-                    self.sidebar_notice =
-                        Some(("A transfer is already running".to_string(), false));
+                    self.set_sidebar_notice("A transfer is already running".to_string(), false);
                     return Task::none();
                 }
                 let Some(context_epoch) = self.sidebar_context_epoch else {
-                    self.sidebar_notice = Some((
-                        "Files operation identity exhausted; restart Frost before modifying files"
-                            .to_string(),
-                        false,
-                    ));
+                    self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(), false);
                     return Task::none();
                 };
                 let total_items = plan.items.len();

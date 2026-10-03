@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 234 — Files notices store through one setter)
+
+## 2026-10-03 (upgrade round 234)
+
+- Remaining Files-panel notice assignments go through `set_sidebar_notice`,
+  including SSH follow labels and navigation-failure text.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 233 — bounded command-correction card chrome)
 
 ## 2026-10-03 (upgrade round 233)

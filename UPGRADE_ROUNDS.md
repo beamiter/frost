@@ -1349,3 +1349,8 @@ everywhere except a resize, and an audit against ember found the rest.
      destructive-risk line interpolated engine/PTY reasons as danger chrome.
      Store and draw now run `bound_correction_feedback` at 256 bytes.
 
+234. **Files notices store through one setter** — leftover multiline
+     `sidebar_notice = Some((…))` assignments still stored raw labels and
+     navigation errors. They now call `set_sidebar_notice`, including follow
+     destination labels.
+
