@@ -37,6 +37,10 @@ pub(crate) const STOPPED_STATUS: &str = "Response stopped. You can retry when re
 /// One-line library filter budget, matching the other overlay queries so a
 /// paste cannot grow the iced field without bound.
 pub(crate) const MAX_SEARCH_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+/// Matches the ChatStore live-title envelope so the iced rename field cannot
+/// grow past what `rename_active` will persist (80 chars / 256 bytes).
+pub(crate) const MAX_TITLE_DRAFT_BYTES: usize = 256;
+pub(crate) const MAX_TITLE_DRAFT_CHARS: usize = 80;
 /// anvil compacts to 1 MiB because the snapshot embeds in its 4 MiB
 /// window-state envelope; frost's standalone file answers only to the shared
 /// schema cap, so the compaction target is the core limit itself.
@@ -583,9 +587,10 @@ impl AiChatsUi {
 
     /// The rename editor types into `title_draft`; the store normalizes every
     /// change into its own title (whitespace collapse, spoof replacement,
-    /// 80-char/256-byte bounds).
+    /// 80-char/256-byte bounds). The iced field is truncated to the same
+    /// envelope first so a paste cannot sit unbounded next to the store.
     pub(crate) fn rename(&mut self, title: String) {
-        self.title_draft = title;
+        self.title_draft = bound_title_draft(title);
         if self.store.rename_active(&self.title_draft) {
             self.dirty = true;
         }
@@ -667,6 +672,30 @@ impl AiChatsUi {
     fn sync_title_draft(&mut self) {
         self.title_draft = self.store.active_title().to_string();
     }
+}
+
+fn bound_title_draft(title: String) -> String {
+    let mut bounded = String::new();
+    let mut chars = 0usize;
+    for ch in title.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if chars >= MAX_TITLE_DRAFT_CHARS {
+            break;
+        }
+        if bounded.len().saturating_add(ch.len_utf8()) > MAX_TITLE_DRAFT_BYTES {
+            break;
+        }
+        bounded.push(ch);
+        chars += 1;
+    }
+    bounded
 }
 
 /// anvil's `draft_without_retry_message`: a retry's recovered text is stripped
@@ -1108,5 +1137,23 @@ mod tests {
         assert!(panel.search.len() <= MAX_SEARCH_BYTES);
         assert!(panel.search.is_char_boundary(panel.search.len()));
         assert!(!panel.search.contains('z'));
+    }
+
+    #[test]
+    fn rename_draft_drops_controls_and_stays_inside_the_store_title_envelope() {
+        let mut panel = fresh_panel();
+        panel.rename("hello\n\u{1b} world".into());
+        assert_eq!(panel.title_draft, "hello world");
+        panel.rename(format!("{}y", "x".repeat(MAX_TITLE_DRAFT_CHARS)));
+        assert_eq!(panel.title_draft.chars().count(), MAX_TITLE_DRAFT_CHARS);
+        assert!(!panel.title_draft.contains('y'));
+        panel.rename(format!("{}z", "界".repeat(MAX_TITLE_DRAFT_BYTES)));
+        assert!(panel.title_draft.len() <= MAX_TITLE_DRAFT_BYTES);
+        assert!(panel.title_draft.chars().count() <= MAX_TITLE_DRAFT_CHARS);
+        assert!(panel.title_draft.is_char_boundary(panel.title_draft.len()));
+        assert!(!panel.title_draft.contains('z'));
+        panel.rename("ok\u{200b}title".into());
+        assert!(!panel.title_draft.contains('\u{200b}'));
+        assert!(panel.title_draft.contains('\u{fffd}'));
     }
 }

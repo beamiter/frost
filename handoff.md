@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 191 — bounded AI-chats title draft)
+
+## 2026-10-03 (upgrade round 191)
+
+- AI Chats rename editor drops controls, replaces visual spoofing with
+  U+FFFD, and stays inside the store's 80-char / 256-byte title envelope.
+- `cargo test --locked --bin frost -- ai_chats::tests::rename_draft_drops_controls_and_stays_inside_the_store_title_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 190 — bounded AI-chats library filter)
 
 ## 2026-10-03 (upgrade round 190)

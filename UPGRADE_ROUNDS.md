@@ -1138,3 +1138,9 @@ everywhere except a resize, and an audit against ember found the rest.
      `set_search` now drops controls and truncates on a UTF-8 boundary at
      `MAX_PICKER_QUERY_BYTES`.
 
+191. **Bounded AI-chats title draft** — the rename iced field stored the raw
+     paste while only the ChatStore title was normalised, so ESC/newline and
+     a 256-byte+1 paste could sit in the widget next to an 80-char/256-byte
+     persisted title. `rename` now drops controls, replaces visual spoofing
+     with U+FFFD, and truncates at the store envelope before the field updates.
+
