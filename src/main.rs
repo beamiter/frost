@@ -6164,7 +6164,7 @@ impl Frost {
         }
         if let Err(problem) = remote_fs::validate_new_name(&dialog.input) {
             if let Some(current) = self.sidebar_dialog.as_mut() {
-                current.error = Some(problem);
+                current.error = Some(crate::sidebar::bound_sidebar_notice(problem));
             }
             return Task::none();
         }
@@ -16432,7 +16432,9 @@ impl Frost {
         };
         let mut body = column![
             text(title).size(14),
-            text(state.path.display().to_string())
+            text(crate::sidebar::bound_sidebar_notice(
+                state.path.display().to_string(),
+            ))
                 .size(11)
                 .wrapping(text::Wrapping::Word)
                 .style(text::secondary),
@@ -16444,7 +16446,11 @@ impl Frost {
         ]
         .spacing(8);
         if let Some(error) = &state.error {
-            body = body.push(text(error.clone()).size(11).style(text::danger));
+            body = body.push(
+                text(crate::sidebar::bound_sidebar_notice(error))
+                    .size(11)
+                    .style(text::danger),
+            );
         }
         body = body.push(
             row![

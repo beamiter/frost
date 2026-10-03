@@ -1299,3 +1299,8 @@ everywhere except a resize, and an audit against ember found the rest.
      as danger chrome verbatim, so an IO error with ESC/bidi could restyle the
      overlay. Store and draw now run `bound_theme_editor_error` at 256 bytes.
 
+223. **Bounded files-dialog path and error chrome** — New File / Rename overlays
+     drew `path.display()` and validation errors as iced text, so a hostile
+     filename or quoted problem could restyle the modal. Both now run
+     `bound_sidebar_notice`.
+

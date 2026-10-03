@@ -3248,5 +3248,9 @@ mod tests {
         let again = bound_sidebar_notice(&shown);
         assert_eq!(again, shown);
         assert_eq!(bound_sidebar_notice(""), "Files panel notice");
+        let path_label = bound_sidebar_notice(format!("/tmp/\u{1b}[31m{}", "n".repeat(400)));
+        assert!(!path_label.contains('\u{1b}'));
+        assert!(path_label.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        assert!(path_label.starts_with("/tmp/"));
     }
 }

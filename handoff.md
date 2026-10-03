@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 223 — bounded files-dialog path chrome)
+
+## 2026-10-03 (upgrade round 223)
+
+- Files New/Rename dialogs sanitize `path.display()` and inline validation
+  errors through `bound_sidebar_notice` so a hostile filename cannot restyle
+  the modal.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 222 — bounded theme-editor error line)
 
 ## 2026-10-03 (upgrade round 222)
