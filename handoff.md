@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 305 — Find-replace output refuses spoofing)
+
+## 2026-10-04 (upgrade round 305)
+
+- Find & Replace apply refuses results that still contain U+FFFD, odd controls, or visual spoofing so they cannot reach the clipboard or the prompt.
+- `cargo test --locked --bin frost -- search_replace_panel::tests` passed.
+
 Updated: 2026-10-04 (upgrade round 304 — Review text refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 304)

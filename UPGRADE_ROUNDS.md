@@ -1630,3 +1630,7 @@ everywhere except a resize, and an audit against ember found the rest.
 304. **Review text refuses U+FFFD** — single-line review validation and prompt
      payload sanitization refuse replacement characters so a neutralized
      spoofed draft cannot be approved or inserted into the shell.
+
+305. **Find-replace output refuses spoofing** — apply refuses a replacement
+     that still contains U+FFFD, odd controls, or visual spoofing so it cannot
+     reach the clipboard or be typed into the prompt.

@@ -31,6 +31,18 @@ fn bound_field(text: impl Into<String>, max_bytes: usize) -> String {
     text
 }
 
+fn replacement_output_is_unsafe(text: &str) -> bool {
+    text.chars().any(|character| {
+        if matches!(character, '\n' | '\t' | '\r') {
+            false
+        } else {
+            character.is_control()
+                || character == '\u{fffd}'
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
+}
+
 /// 调用方需要执行的动作（面板本身不持有终端/剪贴板）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchReplaceAction {
@@ -91,6 +103,12 @@ impl SearchReplacePanelState {
             &self.options,
         ) {
             Ok((result, count)) => {
+                if replacement_output_is_unsafe(&result) {
+                    self.status = crate::review_text::bound_query_error(
+                        "replacement contains control or visual-spoofing characters",
+                    );
+                    return None;
+                }
                 self.status = format!("{} replacement(s)", count);
                 Some(result)
             }
@@ -245,5 +263,17 @@ mod tests {
         panel.set_replace_input("ok\u{202e}");
         assert!(!panel.replace_input.contains('\u{202e}'));
         assert!(panel.replace_input.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn apply_refuses_spoofed_replacement_output() {
+        let mut panel = SearchReplacePanelState::new();
+        panel.search_input = "hello".to_string();
+        panel.replace_input = "ok\u{fffd}".to_string();
+        assert_eq!(panel.apply("hello world"), None);
+
+        panel.replace_input = "hi".to_string();
+        assert_eq!(panel.apply("hello\u{202e} world"), None);
+        assert_eq!(panel.apply("hello world").as_deref(), Some("hi world"));
     }
 }
