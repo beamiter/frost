@@ -1509,3 +1509,7 @@ everywhere except a resize, and an audit against ember found the rest.
      newlines but also kept bidi. Composer ingest now replaces spoofing with
      U+FFFD.
 
+274. **Task follow-up composer strips visual spoofing** — the Tasks follow-up
+     field kept newlines but also kept bidi. Follow-up ingest now replaces
+     spoofing with U+FFFD.
+

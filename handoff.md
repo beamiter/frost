@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 274 — Task follow-up composer strips visual spoofing)
+
+## 2026-10-04 (upgrade round 274)
+
+- Task follow-up composer keeps newlines and replaces visual spoofing at ingest.
+- `cargo test --locked --bin frost -- agent_task_ui::tests::follow_up_composer_keeps_newlines_and_truncates` passed.
+
 Updated: 2026-10-04 (upgrade round 273 — Agent composer strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 273)

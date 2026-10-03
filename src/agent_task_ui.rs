@@ -62,7 +62,17 @@ pub(crate) fn bound_follow_up(text: impl Into<String>) -> String {
     let mut text: String = text
         .into()
         .chars()
-        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .filter_map(|character| {
+            if matches!(character, '\n' | '\t') {
+                Some(character)
+            } else if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if text.len() > NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
         let mut end = NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
@@ -325,15 +335,16 @@ mod tests {
     fn follow_up_composer_keeps_newlines_and_truncates() {
         assert_eq!(bound_follow_up("please\n\u{1b}adjust"), "please\nadjust");
         assert_eq!(bound_follow_up("a\tb"), "a\tb");
-        let filled = bound_follow_up(format!(
-            "{}y",
-            "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES)
-        ));
+        let filled = bound_follow_up(format!("{}y", "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES)));
         assert_eq!(filled.len(), NATIVE_AGENT_FOLLOW_UP_MAX_BYTES);
         assert!(!filled.contains('y'));
         let mut panel = TaskPanel::new();
         panel.set_follow_up("ok\n\u{07}go");
         assert_eq!(panel.follow_up, "ok\ngo");
+        panel.set_follow_up("please\n\u{202e}adjust");
+        assert!(!panel.follow_up.contains('\u{202e}'));
+        assert!(panel.follow_up.contains('\u{fffd}'));
+        assert!(panel.follow_up.starts_with("please\n"));
     }
 
     #[test]
