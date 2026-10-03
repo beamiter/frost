@@ -1309,3 +1309,7 @@ everywhere except a resize, and an audit against ember found the rest.
      sanitizes `InvalidRegex` payloads; the picker stores and draws
      `bound_query_error` at 160 bytes.
 
+225. **Bounded delete-confirm path list** — the Files delete modal drew up to
+     five `path.display()` values as iced text, so a hostile filename could
+     restyle the confirmation. Those rows now use `bound_sidebar_path_label`.
+

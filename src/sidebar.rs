@@ -65,6 +65,11 @@ pub fn bound_sidebar_notice(text: impl AsRef<str>) -> String {
     }
 }
 
+/// Filenames drawn as Files-panel chrome (dialog path, delete list).
+pub fn bound_sidebar_path_label(path: impl AsRef<std::path::Path>) -> String {
+    bound_sidebar_notice(path.as_ref().display().to_string())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryRequestPriority {
     High,
@@ -3252,5 +3257,12 @@ mod tests {
         assert!(!path_label.contains('\u{1b}'));
         assert!(path_label.len() <= MAX_SIDEBAR_NOTICE_BYTES);
         assert!(path_label.starts_with("/tmp/"));
+        let listed = bound_sidebar_path_label(std::path::Path::new(&format!(
+            "/tmp/\u{202e}{}",
+            "p".repeat(400)
+        )));
+        assert!(!listed.contains('\u{202e}'));
+        assert!(listed.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        assert!(listed.starts_with("/tmp/"));
     }
 }

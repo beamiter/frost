@@ -16495,7 +16495,7 @@ impl Frost {
         let mut body = column![text(title).size(14)].spacing(10);
         for path in paths.iter().take(5) {
             body = body.push(
-                text(path.display().to_string())
+                text(crate::sidebar::bound_sidebar_path_label(path))
                     .size(12)
                     .wrapping(text::Wrapping::Word)
                     .style(text::secondary),

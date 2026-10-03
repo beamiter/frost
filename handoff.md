@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 225 — bounded delete-confirm path list)
+
+## 2026-10-03 (upgrade round 225)
+
+- Files delete confirmation lists sanitize each path through
+  `bound_sidebar_path_label` so a hostile filename cannot restyle the modal.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 224 — bounded block-search query errors)
 
 ## 2026-10-03 (upgrade round 224)
