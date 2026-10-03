@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 226 — bounded drop-import target path)
+
+## 2026-10-03 (upgrade round 226)
+
+- Files drop-import hover and transfer labels sanitize the destination path
+  through `bound_sidebar_path_label` before it is interpolated into notices.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 225 — bounded delete-confirm path list)
 
 ## 2026-10-03 (upgrade round 225)

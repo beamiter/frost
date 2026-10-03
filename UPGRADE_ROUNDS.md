@@ -1313,3 +1313,8 @@ everywhere except a resize, and an audit against ember found the rest.
      five `path.display()` values as iced text, so a hostile filename could
      restyle the confirmation. Those rows now use `bound_sidebar_path_label`.
 
+226. **Bounded drop-import target path chrome** — hover/import notices and the
+     transfer label interpolated `target_dir.display()` raw. Those now use
+     `bound_sidebar_path_label` so a hostile drop destination cannot restyle
+     the Files notice.
+

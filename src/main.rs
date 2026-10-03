@@ -14686,8 +14686,13 @@ impl Frost {
                 // pointer while files are dragged over the panel.
                 if self.sidebar_drop_hint && self.sidebar_transfer.is_none() {
                     if let Some(target) = self.sidebar_drop_target() {
-                        self.sidebar_notice =
-                            Some((format!("Release to import into {}", target.display()), true));
+                        self.set_sidebar_notice(
+                            format!(
+                                "Release to import into {}",
+                                crate::sidebar::bound_sidebar_path_label(&target)
+                            ),
+                            true,
+                        );
                     }
                 }
             }
@@ -14795,7 +14800,7 @@ impl Frost {
                     name: format!(
                         "{total_items} {} into {}",
                         if total_items == 1 { "item" } else { "items" },
-                        target_dir.display()
+                        crate::sidebar::bound_sidebar_path_label(&target_dir)
                     ),
                     total: Some(plan.total_bytes),
                 };
@@ -14826,8 +14831,10 @@ impl Frost {
                 {
                     let target = self
                         .sidebar_drop_target()
-                        .map(|dir| dir.display().to_string())
-                        .unwrap_or_else(|| self.sidebar.current_dir.display().to_string());
+                        .map(|dir| crate::sidebar::bound_sidebar_path_label(dir))
+                        .unwrap_or_else(|| {
+                            crate::sidebar::bound_sidebar_path_label(&self.sidebar.current_dir)
+                        });
                     self.set_sidebar_notice(format!("Release to import into {target}"), true);
                     self.sidebar_drop_hint = true;
                 } else if !inside && self.sidebar_drop_hint {
