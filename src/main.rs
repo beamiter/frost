@@ -20092,7 +20092,9 @@ impl Frost {
         let mut body = column![title, inputs, toggles, actions].spacing(10);
         if !self.search_replace.status.is_empty() {
             body = body.push(
-                text(self.search_replace.status.clone())
+                text(crate::review_text::bound_query_error(
+                    self.search_replace.status.clone(),
+                ))
                     .size(12)
                     .style(text::secondary),
             );

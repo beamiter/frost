@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 264 — bounded Find & Replace status chrome)
+
+## 2026-10-04 (upgrade round 264)
+
+- Find & Replace status/errors share the query-error envelope at ingest and draw.
+- `cargo test --locked --bin frost -- search_replace_panel::tests::apply_invalid_regex_does_not_echo_controls_from_the_pattern` passed.
+
 Updated: 2026-10-04 (upgrade round 263 — Find & Replace fields strip visual spoofing)
 
 ## 2026-10-04 (upgrade round 263)

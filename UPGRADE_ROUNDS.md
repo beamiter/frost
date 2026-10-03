@@ -1470,3 +1470,7 @@ everywhere except a resize, and an audit against ember found the rest.
      inputs dropped controls but kept bidi. Field ingest now replaces
      spoofing with U+FFFD.
 
+264. **Bounded Find & Replace status chrome** — engine errors were stored
+     and drawn as iced text. Status now uses the query-error envelope at
+     ingest and draw.
+

@@ -95,7 +95,7 @@ impl SearchReplacePanelState {
                 Some(result)
             }
             Err(e) => {
-                self.status = e;
+                self.status = crate::review_text::bound_query_error(e);
                 None
             }
         }
@@ -196,6 +196,10 @@ mod tests {
         assert!(!panel.status.contains('\u{1b}'));
         assert!(!panel.status.contains('\u{202e}'));
         assert!(panel.status.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);
+        panel.status = format!("Invalid regex: \u{1b}[31m{}", "n".repeat(400));
+        let shown = crate::review_text::bound_query_error(panel.status.clone());
+        assert!(!shown.contains('\u{1b}'));
+        assert!(shown.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);
     }
 
     #[test]
