@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 218 — bounded AI provider chrome label)
+
+## 2026-10-03 (upgrade round 218)
+
+- Agent and AI Chats provider labels drop controls/spoofing and truncate at
+  256 bytes so a hostile `display_name()` cannot restyle the panel header.
+- `cargo test --locked --bin frost -- review_text::tests::provider_label_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 217 — bounded AI-chats notice line)
 
 ## 2026-10-03 (upgrade round 217)

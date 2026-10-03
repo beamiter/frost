@@ -157,6 +157,14 @@ pub(crate) fn bound_toast_text(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_TOAST_BYTES)
 }
 
+/// Settings/chrome label for the configured AI provider. Display names are
+/// untrusted (local Ollama tags, custom OpenAI-compatible servers).
+pub(crate) const MAX_PROVIDER_LABEL_BYTES: usize = 256;
+
+pub(crate) fn bound_provider_label(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_PROVIDER_LABEL_BYTES)
+}
+
 pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
     let mut visible = String::with_capacity(text.len().min(max_bytes));
     let mut truncated = false;
@@ -264,6 +272,16 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_TOAST_BYTES);
         assert!(shown.starts_with("Remote host"));
+    }
+
+    #[test]
+    fn provider_label_replaces_controls_and_stays_bounded() {
+        let shown = bound_provider_label(format!("ollama\u{1b}[31m\u{202e}{}", "n".repeat(400)));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_PROVIDER_LABEL_BYTES);
+        assert!(shown.starts_with("ollama"));
     }
 
     #[test]

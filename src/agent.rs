@@ -428,7 +428,10 @@ impl AgentUi {
             None => self.session = Some(AgentSession::new(config.agent_max_turns)),
         }
         match client_from_config(config) {
-            Ok(client) => self.provider_label = client.display_name(),
+            Ok(client) => {
+                self.provider_label =
+                    crate::review_text::bound_provider_label(client.display_name())
+            }
             Err(error) => {
                 self.provider_label.clear();
                 self.set_status(error);
@@ -494,7 +497,8 @@ impl AgentUi {
         }
         // Validate the provider before replacing a finished task: a config
         // error must not destroy the transcript the user is still reviewing.
-        let provider_label = client_from_config(config)?.display_name();
+        let provider_label =
+            crate::review_text::bound_provider_label(client_from_config(config)?.display_name());
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err("initial Agent prompt is empty".to_string());
@@ -637,7 +641,7 @@ impl AgentUi {
                 return None;
             }
         };
-        self.provider_label = client.display_name();
+        self.provider_label = crate::review_text::bound_provider_label(client.display_name());
         let session = self.session.as_ref()?;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
         // Cached repo probe with a bounded UI wait; None outside a repo.

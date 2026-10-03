@@ -1276,3 +1276,7 @@ everywhere except a resize, and an audit against ember found the rest.
      restyle the library chrome. `set_notice` now uses `safe_inline_display`
      at 256 bytes.
 
+218. **Bounded AI provider chrome label** — `display_name()` was copied into
+     Agent and AI Chats headers verbatim, so a hostile local-provider name
+     could restyle the panel. Both now use `bound_provider_label` at 256 bytes.
+

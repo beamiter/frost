@@ -184,7 +184,8 @@ impl AiChatsUi {
         self.sync_title_draft();
         match agent::client_from_config(config) {
             Ok(client) => {
-                self.provider_label = client.display_name();
+                self.provider_label =
+                    crate::review_text::bound_provider_label(client.display_name());
             }
             Err(error) => {
                 self.provider_label.clear();
@@ -387,8 +388,8 @@ impl AiChatsUi {
                 return None;
             }
         };
-        self.provider_label = client.display_name();
-        let provider = jterm_core::review_input::safe_inline_display(&client.display_name(), 256);
+        let provider = crate::review_text::bound_provider_label(client.display_name());
+        self.provider_label = provider.clone();
         let start =
             match self
                 .store
