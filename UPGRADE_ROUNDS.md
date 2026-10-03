@@ -1215,3 +1215,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `validate_remote_host` refused every consumer. `RemoteHostName` now uses
      `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
 
+205. **Bounded remote host address field** — iced assigned the hostname
+     unbounded, so ESC/newline and a 4 KiB+1 paste sat until
+     `validate_remote_host` refused. `RemoteHostHost` now uses
+     `bound_config_text` at `MAX_CONFIG_VALUE_BYTES`.
+
