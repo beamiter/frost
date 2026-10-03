@@ -1,8 +1,7 @@
-use std::sync::OnceLock;
-
 // Only called from the debug_log! macro, which compiles to a no-op in release builds.
-#[allow(dead_code)]
+#[cfg(debug_assertions)]
 pub fn enabled() -> bool {
+    use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
 
     *ENABLED.get_or_init(|| {
@@ -12,7 +11,6 @@ pub fn enabled() -> bool {
     })
 }
 
-#[allow(dead_code)]
 pub fn format_bytes(bytes: &[u8]) -> String {
     const MAX_BYTES: usize = 96;
 
@@ -51,4 +49,26 @@ macro_rules! debug_log {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_bytes;
+
+    #[test]
+    fn control_bytes_are_named_not_echoed() {
+        assert_eq!(
+            format_bytes(b"\x1b[31mhi\r\n\t\x07"),
+            "<ESC>[31mhi<CR><LF><TAB><0x07>"
+        );
+    }
+
+    #[test]
+    fn long_payloads_are_truncated_with_remainder() {
+        let bytes = vec![b'A'; 100];
+        let rendered = format_bytes(&bytes);
+        assert!(rendered.starts_with(&"A".repeat(96)));
+        assert!(rendered.ends_with("...(+4 bytes)"));
+        assert!(!rendered.contains(&*"A".repeat(97)));
+    }
 }

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 175 — release-clean debug dump)
+
+## 2026-10-03 (upgrade round 175)
+
+- `debug::enabled` is debug-only; `format_bytes` names control bytes and
+  truncates at 96 bytes.
+- `cargo test --locked --bin frost -- debug::tests` — 2 passed.
+
 Updated: 2026-10-03 (upgrade round 174 — bounded find-preview windows)
 
 ## 2026-10-03 (upgrade round 174)

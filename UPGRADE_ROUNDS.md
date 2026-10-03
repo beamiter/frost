@@ -1039,3 +1039,9 @@ everywhere except a resize, and an audit against ember found the rest.
      patterns now return nothing, each window is capped at 8 neighbor lines,
      and only the first 64 matches are previewed with an explicit omitted count.
 
+175. **Release-clean debug dump** — `debug::enabled` is compiled only under
+     `debug_assertions`, matching `debug_log!`, so a release build no longer
+     carries a dead OnceLock probe. `format_bytes` now names ESC/CR/LF/TAB,
+     hex-escapes the rest, and truncates at 96 bytes with a remainder marker,
+     pinned so a control byte cannot be echoed raw into a debug line.
+
