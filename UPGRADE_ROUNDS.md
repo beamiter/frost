@@ -1411,3 +1411,8 @@ everywhere except a resize, and an audit against ember found the rest.
      disk workflows were interpolated as iced labels and placeholders.
      They now share the workflow-feedback envelope.
 
+249. **Bounded AI chat turn chrome** — library transcript/partial replies were
+     drawn as iced text with stored spoofing/control characters. Display now
+     keeps newlines, replaces spoofing, and stays inside the live-message
+     budget.
+

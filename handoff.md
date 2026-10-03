@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 249 — bounded AI chat turn chrome)
+
+## 2026-10-03 (upgrade round 249)
+
+- AI chat transcript, streaming partial, and interrupted partial sanitize at draw.
+- `cargo test --locked --bin frost -- ai_chats::tests::chat_turn_display_keeps_newlines_and_strips_spoofing` passed.
+
 Updated: 2026-10-03 (upgrade round 248 — bounded workflow-arg form labels)
 
 ## 2026-10-03 (upgrade round 248)

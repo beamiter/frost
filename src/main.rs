@@ -23472,10 +23472,15 @@ impl Frost {
         // which is exactly the lifetime the returned Element already carries.
         for turn in store.active_history() {
             let (label, body): (&str, Element<'_, Message>) = match turn.role {
-                jterm_core::ai::Role::User => ("You", text(turn.text.as_str()).size(13).into()),
+                jterm_core::ai::Role::User => (
+                    "You",
+                    text(crate::ai_chats::display_chat_turn(turn.text.as_str()))
+                        .size(13)
+                        .into(),
+                ),
                 jterm_core::ai::Role::Assistant => (
                     "Assistant",
-                    text(turn.text.as_str())
+                    text(crate::ai_chats::display_chat_turn(turn.text.as_str()))
                         .size(13)
                         .wrapping(text::Wrapping::Word)
                         .into(),
@@ -23499,7 +23504,11 @@ impl Frost {
             transcript = transcript.push(
                 column![
                     text("Assistant").size(11).style(text::secondary),
-                    container(text(partial).size(13).wrapping(text::Wrapping::Word))
+                    container(
+                        text(crate::ai_chats::display_chat_turn(partial))
+                            .size(13)
+                            .wrapping(text::Wrapping::Word),
+                    )
                         .padding(6)
                         .style(container::bordered_box)
                         .width(Length::Fill),
@@ -23515,7 +23524,11 @@ impl Frost {
                     text("Assistant (reply interrupted)")
                         .size(11)
                         .style(text::secondary),
-                    container(text(partial).size(13).wrapping(text::Wrapping::Word))
+                    container(
+                        text(crate::ai_chats::display_chat_turn(partial))
+                            .size(13)
+                            .wrapping(text::Wrapping::Word),
+                    )
                         .padding(6)
                         .style(container::bordered_box)
                         .width(Length::Fill),

@@ -703,6 +703,33 @@ fn bound_chat_draft(draft: impl Into<String>) -> String {
     draft
 }
 
+pub(crate) fn display_chat_turn(text: &str) -> String {
+    let max_bytes = jterm_core::ai::MAX_LIVE_MESSAGE_BYTES;
+    let mut bounded = String::new();
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\t' {
+            if bounded.len().saturating_add(ch.len_utf8()) > max_bytes {
+                break;
+            }
+            bounded.push(ch);
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if bounded.len().saturating_add(ch.len_utf8()) > max_bytes {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
 fn bound_title_draft(title: String) -> String {
     let mut bounded = String::new();
     let mut chars = 0usize;
@@ -1244,5 +1271,16 @@ mod tests {
         assert!(line.len() <= MAX_CHAT_NOTICE_BYTES);
         assert!(line.starts_with("AI error:"));
         assert!(panel.status_is_error());
+    }
+
+    #[test]
+    fn chat_turn_display_keeps_newlines_and_strips_spoofing() {
+        let shown = display_chat_turn(&format!("hello\n\u{1b}[31m\u{202e}{}", "x".repeat(400)));
+        assert!(shown.contains('\n'));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.starts_with("hello"));
+        assert!(shown.len() <= jterm_core::ai::MAX_LIVE_MESSAGE_BYTES);
     }
 }
