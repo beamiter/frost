@@ -1424,3 +1424,7 @@ everywhere except a resize, and an audit against ember found the rest.
      toasts interpolated `provider.display_name()` verbatim. Those now share
      the provider-label envelope.
 
+253. **Bounded shortcut-label chrome** — help overlay grouped chords and the
+     palette reverse-lookup join were drawn as iced text. Labels now share a
+     256-byte `safe_inline_display` envelope.
+

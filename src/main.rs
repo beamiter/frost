@@ -20953,15 +20953,17 @@ impl Frost {
         // One row that stands for several related commands still names each
         // one's real chord, in the order the description lists them.
         let bound_group = |command_ids: &[&str], desc: &str| -> Element<'_, Message> {
-            let key = command_ids
-                .iter()
-                .map(|command_id| {
-                    self.keybindings
-                        .shortcut_label(command_id)
-                        .unwrap_or_else(|| "(unbound)".to_string())
-                })
-                .collect::<Vec<_>>()
-                .join(" / ");
+            let key = crate::keybindings::bound_shortcut_display(
+                command_ids
+                    .iter()
+                    .map(|command_id| {
+                        self.keybindings
+                            .shortcut_label(command_id)
+                            .unwrap_or_else(|| "(unbound)".to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+            );
             kb(&key, desc)
         };
 

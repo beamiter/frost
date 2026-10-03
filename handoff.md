@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 253 — bounded shortcut-label chrome)
+
+## 2026-10-04 (upgrade round 253)
+
+- Palette/help shortcut labels sanitize spoofing and stay inside 256 bytes.
+- `cargo test --locked --bin frost -- keybindings::tests::shortcut_display_strips_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 252 — bounded Agent-task provider chrome)
 
 ## 2026-10-04 (upgrade round 252)

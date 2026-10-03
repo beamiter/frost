@@ -377,6 +377,12 @@ pub struct KeyBindingsLoad {
     pub revision: Option<FileRevision>,
 }
 
+const MAX_SHORTCUT_DISPLAY_BYTES: usize = 256;
+
+pub(crate) fn bound_shortcut_display(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_SHORTCUT_DISPLAY_BYTES)
+}
+
 impl KeyBindings {
     pub fn new() -> Self {
         Self {
@@ -629,7 +635,7 @@ impl KeyBindings {
     /// user who removed the binding.
     pub fn shortcut_label(&self, command_id: &str) -> Option<String> {
         let chords = self.chords_for(command_id);
-        (!chords.is_empty()).then(|| chords.join(" / "))
+        (!chords.is_empty()).then(|| bound_shortcut_display(chords.join(" / ")))
     }
 
     /// 获取快捷键对应的命令
@@ -1221,6 +1227,15 @@ mod tests {
             .bindings
             .insert("not a chord".to_string(), "edit:copy".to_string());
         assert_eq!(broken.shortcut_label("edit:copy"), None);
+    }
+
+    #[test]
+    fn shortcut_display_strips_controls_and_stays_bounded() {
+        let shown = bound_shortcut_display(format!("Ctrl+C\u{1b}[31m\u{202e}{}", "k".repeat(400)));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.len() <= MAX_SHORTCUT_DISPLAY_BYTES);
+        assert!(shown.starts_with("Ctrl+C"));
     }
 
     #[test]
