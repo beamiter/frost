@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 183 — bounded tab-switcher query)
+
+## 2026-10-03 (upgrade round 183)
+
+- Quick tab switcher query shares the 4 KiB one-line overlay budget; controls
+  are dropped and overflow truncates on a char boundary.
+- `cargo test --locked --bin frost -- tests::tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-03 (upgrade round 182 — bounded command-palette query)
 
 ## 2026-10-03 (upgrade round 182)

@@ -1147,6 +1147,44 @@ struct TabSwitcherState {
     selected: usize,
 }
 
+impl TabSwitcherState {
+    /// One-line overlay query budget, shared with the other pickers.
+    const MAX_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+    fn set_query(&mut self, query: impl Into<String>) {
+        let mut query: String = query
+            .into()
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if query.len() > Self::MAX_QUERY_BYTES {
+            let mut end = Self::MAX_QUERY_BYTES;
+            while end > 0 && !query.is_char_boundary(end) {
+                end -= 1;
+            }
+            query.truncate(end);
+        }
+        self.query = query;
+        self.selected = 0;
+    }
+
+    fn push_query_text(&mut self, text: &str) -> bool {
+        let previous = self.query.clone();
+        let mut query = previous.clone();
+        query.push_str(text);
+        self.set_query(query);
+        self.query != previous
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.selected = 0;
+        true
+    }
+}
+
 /// State for the `block:search` cross-block search picker (Ctrl+Alt+F): a
 /// case-insensitive substring query over every completed zone's command and
 /// output (captured-snapshot-first, so trimmed-away zones still match).
@@ -8526,18 +8564,14 @@ impl Frost {
                 return Some(Task::none());
             }
             Key::Named(Named::Backspace) => {
-                state.query.pop();
-                state.selected = 0;
+                state.backspace();
                 return Some(Task::none());
             }
             _ => {}
         }
         if !mods.control() && !mods.alt() {
             if let Some(t) = text {
-                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !printable.is_empty() {
-                    state.query.push_str(&printable);
-                    state.selected = 0;
+                if state.push_query_text(t) {
                     return Some(Task::none());
                 }
             }
@@ -15327,8 +15361,7 @@ impl Frost {
             Message::TabSwitcherClose => self.tab_switcher = None,
             Message::TabSwitcherInput(q) => {
                 if let Some(s) = self.tab_switcher.as_mut() {
-                    s.query = q;
-                    s.selected = 0;
+                    s.set_query(q);
                 }
             }
             Message::TabSwitcherJump(id) => {
@@ -30983,5 +31016,36 @@ mod tests {
 
         drop(pty);
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[test]
+    fn tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary() {
+        let mut state = TabSwitcherState::default();
+        state.selected = 3;
+        assert!(state.push_query_text("ta\nb\u{1b}"));
+        assert_eq!(state.query, "tab");
+        assert_eq!(state.selected, 0);
+        assert!(!state.push_query_text("\n"));
+        assert_eq!(state.query, "tab");
+
+        state.set_query(format!(
+            "{}x",
+            "界".repeat(TabSwitcherState::MAX_QUERY_BYTES)
+        ));
+        assert!(state.query.len() <= TabSwitcherState::MAX_QUERY_BYTES);
+        assert!(state.query.is_char_boundary(state.query.len()));
+        assert!(!state.query.contains('x'));
+
+        state.set_query(format!(
+            "{}y",
+            "x".repeat(TabSwitcherState::MAX_QUERY_BYTES)
+        ));
+        assert_eq!(state.query.len(), TabSwitcherState::MAX_QUERY_BYTES);
+        assert!(!state.query.contains('y'));
+        let filled = state.query.clone();
+        assert!(!state.push_query_text("z"));
+        assert_eq!(state.query, filled);
+        assert!(state.backspace());
+        assert_eq!(state.query.len(), filled.len() - 1);
     }
 }
