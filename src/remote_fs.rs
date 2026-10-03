@@ -1330,6 +1330,13 @@ pub fn validate_new_name(name: &str) -> Result<(), String> {
     if name.contains('/') || name.contains('\0') {
         return Err("name must not contain '/' or NUL".to_string());
     }
+    if name.chars().any(|character| {
+        character.is_control()
+            || character == '\u{fffd}'
+            || jterm_core::review_input::is_visual_spoofing_character(character)
+    }) {
+        return Err("name must not contain control or visual-spoofing characters".to_string());
+    }
     Ok(())
 }
 
@@ -3446,6 +3453,9 @@ mod tests {
         assert!(validate_new_name("a\0b").is_err());
         assert!(validate_new_name(&"x".repeat(256)).is_err());
         assert!(validate_new_name(&"x".repeat(255)).is_ok());
+        assert!(validate_new_name("notes\u{202e}file.txt").is_err());
+        assert!(validate_new_name("notes\u{fffd}file.txt").is_err());
+        assert!(validate_new_name("notes\u{200b}file.txt").is_err());
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 298 — New-file names refuse visual spoofing)
+
+## 2026-10-04 (upgrade round 298)
+
+- New File / Rename validation refuses spoofing and U+FFFD so a neutralized draft cannot create the file.
+- `cargo test --locked --bin frost -- remote_fs::tests::new_name_validation_rejects_paths_and_oddities` passed.
+
 Updated: 2026-10-04 (upgrade round 297 — Restored session cwds reject visual spoofing)
 
 ## 2026-10-04 (upgrade round 297)

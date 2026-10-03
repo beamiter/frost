@@ -1602,3 +1602,7 @@ everywhere except a resize, and an audit against ember found the rest.
 297. **Restored session cwds reject visual spoofing** — snapshot working
      directories were only checked for size and NUL. Bidi and zero-width
      marks now discard the cwd before a pane is spawned there.
+
+298. **New-file names refuse visual spoofing** — dialog ingest replaced bidi
+     with U+FFFD, but create/rename still accepted the neutralized string.
+     Validation now refuses spoofing and replacement characters.
