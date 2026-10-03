@@ -45,6 +45,12 @@ fn bound_arg_value(value: impl Into<String>) -> String {
     value
 }
 
+const MAX_WORKFLOW_FEEDBACK_BYTES: usize = 256;
+
+pub(crate) fn bound_workflow_feedback(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_WORKFLOW_FEEDBACK_BYTES)
+}
+
 /// 选择器状态。`entries` 保持 `workflows::load_all` 的目录优先级顺序（与
 /// anvil 一致：更早的目录胜出同名项，目录内按文件名排序）；期间磁盘上的
 /// 变更在下一次打开时生效。
@@ -172,6 +178,10 @@ impl WorkflowArgsState {
     pub(crate) fn set_value(&mut self, index: usize, value: String) {
         self.form.set(index, bound_arg_value(value));
         self.feedback = None;
+    }
+
+    pub(crate) fn set_feedback(&mut self, text: impl Into<String>) {
+        self.feedback = Some(bound_workflow_feedback(text));
     }
 
     /// Return one row to the value declared by the workflow. For an argument
@@ -378,5 +388,20 @@ mod tests {
             jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES
         );
         assert!(!form.value(1).contains('!'));
+    }
+
+    #[test]
+    fn workflow_feedback_replaces_controls_and_stays_bounded() {
+        let mut form = WorkflowArgsState::new(workflow("echo", "", &[]));
+        form.set_feedback(format!(
+            "Workflow could not be rendered: \u{1b}[31m\u{202e}{}",
+            "x".repeat(400)
+        ));
+        let shown = form.feedback.expect("feedback");
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_WORKFLOW_FEEDBACK_BYTES);
+        assert!(shown.starts_with("Workflow could not be rendered"));
     }
 }

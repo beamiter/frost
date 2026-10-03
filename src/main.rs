@@ -10163,7 +10163,7 @@ impl Frost {
                 Ok(command) => command,
                 Err(error) => {
                     log::warn!("workflow render failed: {error}");
-                    form.feedback = Some(format!("Workflow could not be rendered: {error}"));
+                    form.set_feedback(format!("Workflow could not be rendered: {error}"));
                     return Task::none();
                 }
             },
@@ -17135,7 +17135,11 @@ impl Frost {
         }
 
         if let Some(feedback) = form.feedback.as_deref() {
-            card = card.push(text(feedback.to_string()).size(11).style(text::danger));
+            card = card.push(
+                text(crate::workflow_picker::bound_workflow_feedback(feedback))
+                    .size(11)
+                    .style(text::danger),
+            );
         }
 
         let actions = row![

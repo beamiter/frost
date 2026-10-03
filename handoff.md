@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 231 — bounded workflow-form render feedback)
+
+## 2026-10-03 (upgrade round 231)
+
+- Workflow argument-form render errors drop controls/spoofing and truncate at
+  256 bytes before they restyle the overlay as danger chrome.
+- `cargo test --locked --bin frost -- workflow_picker::tests::workflow_feedback_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 230 — bounded Find-bar error chrome)
 
 ## 2026-10-03 (upgrade round 230)

@@ -1336,3 +1336,7 @@ everywhere except a resize, and an audit against ember found the rest.
      errors into the overlay status verbatim. `set_error_message` and the Find
      bar now run `bound_query_error` so a quoted pattern cannot restyle it.
 
+231. **Bounded workflow-form render feedback** — `render()` errors were copied
+     into the argument overlay as danger chrome, quoting the template/values.
+     `set_feedback` now uses `safe_inline_display` at 256 bytes.
+
