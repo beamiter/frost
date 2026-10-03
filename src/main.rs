@@ -16332,7 +16332,7 @@ impl Frost {
         let header = if multi > 1 {
             format!("{multi} items selected")
         } else {
-            state.path.display().to_string()
+            crate::sidebar::bound_sidebar_path_label(&state.path)
         };
         let mut menu = column![text(header).size(12).style(text::secondary)].spacing(2);
         if multi == 1 && state.is_dir {

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 227 — bounded files context-menu path header)
+
+## 2026-10-03 (upgrade round 227)
+
+- Files right-click menu headers sanitize the selected path through
+  `bound_sidebar_path_label` so a hostile filename cannot restyle the overlay.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 226 — bounded drop-import target path)
 
 ## 2026-10-03 (upgrade round 226)

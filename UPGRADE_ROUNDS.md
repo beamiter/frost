@@ -1318,3 +1318,7 @@ everywhere except a resize, and an audit against ember found the rest.
      `bound_sidebar_path_label` so a hostile drop destination cannot restyle
      the Files notice.
 
+227. **Bounded files context-menu path header** — the right-click menu drew
+     `path.display()` as the header, so a hostile filename could restyle the
+     overlay. Single-item headers now use `bound_sidebar_path_label`.
+
