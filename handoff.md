@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 203 — bounded API-key file path field)
+
+## 2026-10-03 (upgrade round 203)
+
+- Settings API-key file path drops controls and visual spoofing and truncates
+  at 4 KiB so iced cannot hold more than `normalized()` keeps.
+- `cargo test --locked --bin frost -- config::tests::live_api_key_file_field_uses_the_value_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 202 — bounded AI provider settings field)
 
 ## 2026-10-03 (upgrade round 202)

@@ -13240,6 +13240,8 @@ impl Frost {
             }
             Message::SetAiKeyFile(path) => {
                 // Keep the raw editing text; only fully-blank clears the key.
+                let path =
+                    crate::config::bound_config_text(path, crate::config::MAX_CONFIG_VALUE_BYTES);
                 self.config.ai_api_key_file = Some(path).filter(|p| !p.trim().is_empty());
                 self.config_dirty = true;
             }

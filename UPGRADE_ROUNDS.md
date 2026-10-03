@@ -1205,3 +1205,8 @@ everywhere except a resize, and an audit against ember found the rest.
      replaced it with the default. `SetAiProvider` now uses `bound_config_text`
      at `MAX_CONFIG_NAME_BYTES`.
 
+203. **Bounded API-key file path field** — iced assigned the credential path
+     unbounded, so ESC/newline and a 4 KiB+1 paste sat until `normalized()`
+     dropped it. `SetAiKeyFile` now uses `bound_config_text` at
+     `MAX_CONFIG_VALUE_BYTES`.
+
