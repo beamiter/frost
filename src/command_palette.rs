@@ -770,7 +770,15 @@ impl PaletteState {
         let mut query: String = query
             .into()
             .chars()
-            .filter(|character| !character.is_control())
+            .filter_map(|character| {
+                if character.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(character)
+                }
+            })
             .collect();
         if query.len() > MAX_PALETTE_QUERY_BYTES {
             let mut end = MAX_PALETTE_QUERY_BYTES;
@@ -962,5 +970,9 @@ mod tests {
         assert_eq!(palette.query, filled);
         assert!(palette.backspace());
         assert_eq!(palette.query.len(), filled.len() - 1);
+        palette.set_query("new\u{202e}tab");
+        assert!(!palette.query.contains('\u{202e}'));
+        assert!(palette.query.contains('\u{fffd}'));
+        assert!(palette.query.starts_with("new"));
     }
 }

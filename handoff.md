@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 265 — command-palette query strips visual spoofing)
+
+## 2026-10-04 (upgrade round 265)
+
+- Command-palette queries replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- command_palette::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 264 — bounded Find & Replace status chrome)
 
 ## 2026-10-04 (upgrade round 264)

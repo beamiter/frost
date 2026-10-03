@@ -1474,3 +1474,7 @@ everywhere except a resize, and an audit against ember found the rest.
      and drawn as iced text. Status now uses the query-error envelope at
      ingest and draw.
 
+265. **Command-palette query strips visual spoofing** — overlay typing
+     dropped controls but kept bidi in the fuzzy query. Query ingest now
+     replaces spoofing with U+FFFD.
+
