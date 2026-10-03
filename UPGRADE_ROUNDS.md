@@ -1234,3 +1234,8 @@ everywhere except a resize, and an audit against ember found the rest.
      ESC and a megabyte hex string sat until save called `hex_to_rgb`.
      `ThemeEditColor` now keeps an optional `#` plus six hex digits.
 
+209. **Bounded Agent proposal-edit field** — iced `validate_single_line` on
+     every keystroke cleared the buffer on an oversized or control-bearing
+     paste, wiping the reviewed command. `bound_agent_edit_command` now drops
+     controls and visual spoofing and truncates at `MAX_AGENT_COMMAND_BYTES`.
+

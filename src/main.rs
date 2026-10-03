@@ -13132,21 +13132,7 @@ impl Frost {
             }
             Message::AgentEditInput(value) => {
                 if let Some((_, buffer)) = self.agent.edit.as_mut() {
-                    if value.is_empty() {
-                        buffer.clear();
-                    } else {
-                        match crate::review_text::validate_single_line(
-                            &value,
-                            crate::review_text::MAX_AGENT_COMMAND_BYTES,
-                        ) {
-                            Ok(_) => *buffer = value,
-                            Err(error) => {
-                                buffer.clear();
-                                self.agent.status =
-                                    format!("Agent edit cleared before display: {error}");
-                            }
-                        }
-                    }
+                    *buffer = crate::review_text::bound_agent_edit_command(value);
                 }
             }
             Message::AgentEditCancel => self.agent.edit = None,

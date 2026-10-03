@@ -62,6 +62,27 @@ pub(crate) fn validate_single_line(text: &str, max_bytes: usize) -> Result<&str,
     Ok(text)
 }
 
+/// Bound the Agent proposal-edit iced field so an oversized or control-bearing
+/// paste truncates instead of wiping the reviewed command.
+pub(crate) fn bound_agent_edit_command(value: impl Into<String>) -> String {
+    let mut value: String = value
+        .into()
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !jterm_core::review_input::is_visual_spoofing_character(*character)
+        })
+        .collect();
+    if value.len() > MAX_AGENT_COMMAND_BYTES {
+        let mut end = MAX_AGENT_COMMAND_BYTES;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
+
 fn is_c0_or_c1(character: char) -> bool {
     matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f)
 }
@@ -212,7 +233,10 @@ mod tests {
 
     #[test]
     fn regex_error_replaces_controls_and_stays_bounded() {
-        let error = format!("unclosed group for `(\u{1b}[31m\u{202e}{}`", "x".repeat(400));
+        let error = format!(
+            "unclosed group for `(\u{1b}[31m\u{202e}{}`",
+            "x".repeat(400)
+        );
         let shown = safe_regex_error(error);
         assert!(shown.starts_with("Invalid regex:"));
         assert!(!shown.contains('\u{1b}'));
@@ -254,5 +278,20 @@ mod tests {
             "safe\\u{202E}\\ttext"
         );
         assert!(visible_bounded(&"\u{202e}".repeat(100), 32).len() <= 32);
+    }
+
+    #[test]
+    fn agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls() {
+        assert_eq!(bound_agent_edit_command("ls\n\u{1b} -la"), "ls -la");
+        assert_eq!(bound_agent_edit_command("git \u{202e}status"), "git status");
+        let filled = bound_agent_edit_command(format!("{}y", "x".repeat(MAX_AGENT_COMMAND_BYTES)));
+        assert_eq!(filled.len(), MAX_AGENT_COMMAND_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow =
+            bound_agent_edit_command(format!("{}z", "界".repeat(MAX_AGENT_COMMAND_BYTES)));
+        assert!(overflow.len() <= MAX_AGENT_COMMAND_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
+        assert!(bound_agent_edit_command("").is_empty());
     }
 }

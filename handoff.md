@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 209 — bounded Agent proposal-edit field)
+
+## 2026-10-03 (upgrade round 209)
+
+- Agent proposal-edit truncates at 16 KiB and drops controls/spoofing instead
+  of clearing the reviewed command on an oversized paste.
+- `cargo test --locked --bin frost -- review_text::tests::agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls` passed.
+
 Updated: 2026-10-03 (upgrade round 208 — bounded theme hex draft)
 
 ## 2026-10-03 (upgrade round 208)
