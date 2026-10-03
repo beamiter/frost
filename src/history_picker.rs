@@ -30,6 +30,10 @@ const MAX_HISTORY_CWD_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_SHARED_HISTORY_COMMAND_BYTES: usize =
     jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 
+/// One-line overlay query budget, shared with the workflow picker so a paste
+/// cannot grow the iced field and the per-entry fuzzy match without bound.
+pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
 /// 多行命令）——家族的 review-only 历史格式拒绝控制字符，这类文本也无法
@@ -169,6 +173,45 @@ impl HistoryPickerState {
             .get(self.selected)
             .and_then(|record| sanitized_command(&record.command))
             .map(str::to_string)
+    }
+
+    /// Replace the query; the highlight returns to the first row. Control
+    /// characters are dropped and the byte budget is enforced on a char
+    /// boundary so iced `text_input` and the raw-key path share one contract.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        let mut query: String = query
+            .into()
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if query.len() > MAX_HISTORY_QUERY_BYTES {
+            let mut end = MAX_HISTORY_QUERY_BYTES;
+            while end > 0 && !query.is_char_boundary(end) {
+                end -= 1;
+            }
+            query.truncate(end);
+        }
+        self.query = query;
+        self.selected = 0;
+    }
+
+    /// Append typed text. Returns whether the stored query changed.
+    pub fn push_query_text(&mut self, text: &str) -> bool {
+        let previous = self.query.clone();
+        let mut query = previous.clone();
+        query.push_str(text);
+        self.set_query(query);
+        self.query != previous
+    }
+
+    /// Delete the last character of the query. Returns whether anything was
+    /// deleted.
+    pub fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.selected = 0;
+        true
     }
 }
 
@@ -362,5 +405,32 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("remove history fixture");
         assert!(state.filtered().is_empty());
         assert_eq!(state.selected_command(), None);
+    }
+
+    #[test]
+    fn query_drops_controls_and_truncates_on_a_char_boundary() {
+        let mut state = HistoryPickerState::new(vec![record("cargo test", None, 0)]);
+        state.selected = 3;
+        assert!(state.push_query_text("ca\nrg\u{1b}o"));
+        assert_eq!(state.query, "cargo");
+        assert_eq!(state.selected, 0);
+        assert!(!state.push_query_text("\n"));
+        assert_eq!(state.query, "cargo");
+
+        state.set_query(format!("{}x", "界".repeat(MAX_HISTORY_QUERY_BYTES)));
+        assert!(state.query.len() <= MAX_HISTORY_QUERY_BYTES);
+        assert!(state.query.is_char_boundary(state.query.len()));
+        assert!(!state.query.contains('x'));
+        assert_eq!(state.query.chars().next(), Some('界'));
+
+        state.set_query(format!("{}y", "x".repeat(MAX_HISTORY_QUERY_BYTES)));
+        assert_eq!(state.query.len(), MAX_HISTORY_QUERY_BYTES);
+        assert!(!state.query.contains('y'));
+        let filled = state.query.clone();
+        assert!(!state.push_query_text("z"));
+        assert_eq!(state.query, filled);
+
+        assert!(state.backspace());
+        assert_eq!(state.query.len(), filled.len() - 1);
     }
 }

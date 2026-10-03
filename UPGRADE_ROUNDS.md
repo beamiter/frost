@@ -1074,3 +1074,10 @@ everywhere except a resize, and an audit against ember found the rest.
      highlights so a paste of thousands of URLs cannot unbounded-allocate
      click targets.
 
+181. **Bounded history-picker query** — the Ctrl+Shift+H overlay accepted iced
+     `text_input` and raw key text into an unbounded `String`, so a paste could
+     grow the fuzzy haystack without the workflow picker's 4 KiB one-line
+     budget. `set_query` / `push_query_text` / `backspace` now drop controls,
+     truncate on a UTF-8 boundary, and are the only write path from both the
+     widget and the keyboard handler.
+

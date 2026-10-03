@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 181 — bounded history-picker query)
+
+## 2026-10-03 (upgrade round 181)
+
+- History picker query shares the workflow picker's 4 KiB one-line budget;
+  controls are dropped and overflow truncates on a char boundary.
+- `cargo test --locked --bin frost -- history_picker::tests` — 11 passed.
+
 Updated: 2026-10-03 (upgrade round 180 — fail-closed link columns and per-row cap)
 
 ## 2026-10-03 (upgrade round 180)

@@ -10027,18 +10027,14 @@ impl Frost {
                 return Some(Task::none());
             }
             Key::Named(Named::Backspace) => {
-                state.query.pop();
-                state.selected = 0;
+                state.backspace();
                 return Some(Task::none());
             }
             _ => {}
         }
         if !mods.control() && !mods.alt() {
             if let Some(t) = text {
-                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !printable.is_empty() {
-                    state.query.push_str(&printable);
-                    state.selected = 0;
+                if state.push_query_text(t) {
                     return Some(Task::none());
                 }
             }
@@ -15528,8 +15524,7 @@ impl Frost {
             }
             Message::HistoryPickerInput(q) => {
                 if let Some(s) = self.history_picker.as_mut() {
-                    s.query = q;
-                    s.selected = 0;
+                    s.set_query(q);
                 }
             }
             Message::HistoryPickerAccept(command) => {
