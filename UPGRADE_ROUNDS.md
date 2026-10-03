@@ -1445,3 +1445,8 @@ everywhere except a resize, and an audit against ember found the rest.
      description were drawn from the engine as iced text. Those now share the
      correction-feedback envelope at draw.
 
+258. **Ask-AI request strips visual spoofing** — overlay typing dropped
+     controls but kept bidi/invisible characters in the NL request (and the
+     review card interpolated `compact_one_line` verbatim). Request ingest
+     now replaces spoofing; the card line uses the toast envelope.
+

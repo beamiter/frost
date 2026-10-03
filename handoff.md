@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 258 — Ask-AI request strips visual spoofing)
+
+## 2026-10-04 (upgrade round 258)
+
+- Ask-AI overlay requests replace visual spoofing; the suggestion card request line is toast-bounded.
+- `cargo test --locked --bin frost -- ai_command::tests::overlay_request_drops_controls_and_truncates` passed.
+
 Updated: 2026-10-04 (upgrade round 257 — bounded command-correction card chrome)
 
 ## 2026-10-04 (upgrade round 257)

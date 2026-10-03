@@ -23760,7 +23760,10 @@ impl Frost {
 
         let request = text(format!(
             "Request: {}",
-            command_correction::compact_one_line(&session.request, 180)
+            crate::review_text::bound_toast_text(command_correction::compact_one_line(
+                &session.request,
+                180
+            ))
         ))
         .size(12)
         .wrapping(text::Wrapping::Word)

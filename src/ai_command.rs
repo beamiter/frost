@@ -24,7 +24,15 @@ pub(crate) fn bound_suggestion_request(text: impl Into<String>) -> String {
     let mut text: String = text
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if text.len() > MAX_SUGGESTION_REQUEST_BYTES {
         let mut end = MAX_SUGGESTION_REQUEST_BYTES;
@@ -328,6 +336,10 @@ mod tests {
         assert!(cjk.len() <= MAX_SUGGESTION_REQUEST_BYTES);
         assert!(cjk.is_char_boundary(cjk.len()));
         assert!(!cjk.contains('x'));
+        let spoofed = bound_suggestion_request("list files \u{202e}secret");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(spoofed.contains('\u{fffd}'));
+        assert!(spoofed.starts_with("list files "));
     }
 
     #[test]
