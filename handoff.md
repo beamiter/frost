@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 267 — workflow overlay typing strips visual spoofing)
+
+## 2026-10-04 (upgrade round 267)
+
+- Workflow picker queries and argument fields replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- workflow_picker::tests::iced_query_input_crosses_the_shared_query_boundary workflow_picker::tests::args_form_prefills_defaults_and_withholds_the_undeclared_ones` passed.
+
 Updated: 2026-10-04 (upgrade round 266 — history-picker query strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 266)

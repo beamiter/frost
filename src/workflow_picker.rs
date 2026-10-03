@@ -29,20 +29,32 @@ use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
 pub(crate) const MAX_RESULTS: usize = 15;
 const PICKER_POLICY: PickerPolicy = PickerPolicy::new(MAX_RESULTS, false);
 
-fn bound_arg_value(value: impl Into<String>) -> String {
-    let mut value: String = value
+fn bound_overlay_line(text: impl Into<String>, max_bytes: usize) -> String {
+    let mut value: String = text
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
-    if value.len() > jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES {
-        let mut end = jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES;
+    if value.len() > max_bytes {
+        let mut end = max_bytes;
         while end > 0 && !value.is_char_boundary(end) {
             end -= 1;
         }
         value.truncate(end);
     }
     value
+}
+
+fn bound_arg_value(value: impl Into<String>) -> String {
+    bound_overlay_line(value, jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES)
 }
 
 const MAX_WORKFLOW_FEEDBACK_BYTES: usize = 256;
@@ -104,11 +116,17 @@ impl WorkflowPickerState {
     /// Iced `text_input` and accessibility/programmatic input both cross the
     /// core's one-line and byte-budget boundary here.
     pub(crate) fn set_query(&mut self, query: impl Into<String>) {
-        self.picker.set_query(query);
+        self.picker.set_query(bound_overlay_line(
+            query,
+            jterm_core::workflows::MAX_PICKER_QUERY_BYTES,
+        ));
     }
 
     pub(crate) fn push_query_text(&mut self, text: &str) -> bool {
-        self.picker.push_query_text(text)
+        self.picker.push_query_text(&bound_overlay_line(
+            text,
+            jterm_core::workflows::MAX_PICKER_QUERY_BYTES,
+        ))
     }
 
     pub(crate) fn backspace(&mut self) -> bool {
@@ -297,6 +315,9 @@ mod tests {
         assert_eq!(state.selected(), 0);
         assert_eq!(state.picker.policy(), PICKER_POLICY);
         assert!(!state.picker.policy().search_command());
+        state.set_query("deploy\u{202e}");
+        assert!(!state.query().contains('\u{202e}'));
+        assert!(state.query().contains('\u{fffd}'));
     }
 
     #[test]
@@ -399,6 +420,9 @@ mod tests {
             jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES
         );
         assert!(!form.value(1).contains('!'));
+        form.set_value(0, "api\u{202e}".to_string());
+        assert!(!form.value(0).contains('\u{202e}'));
+        assert!(form.value(0).contains('\u{fffd}'));
     }
 
     #[test]

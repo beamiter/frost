@@ -1482,3 +1482,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi in the filter query. Query ingest now
      replaces spoofing with U+FFFD.
 
+267. **Workflow overlay typing strips visual spoofing** — picker queries and
+     argument fields dropped controls but kept bidi. Ingest now replaces
+     spoofing with U+FFFD before the core picker/form.
+
