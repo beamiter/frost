@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 282 — Restored tab titles replace remaining visual spoofing)
+
+## 2026-10-04 (upgrade round 282)
+
+- Session snapshot tab titles replace visual spoofing at restore, matching live rename/OSC titles.
+- `cargo test --locked --bin frost -- session_persistence::tests::restored_tab_titles_strip_bidi_formatting_characters` passed.
+
 Updated: 2026-10-04 (upgrade round 281 — Tab-rename drafts replace remaining visual spoofing)
 
 ## 2026-10-04 (upgrade round 281)

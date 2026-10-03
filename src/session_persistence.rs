@@ -1113,29 +1113,6 @@ fn decode_tree(
     decode_tree_node(raw, budget, &mut TreeBudget::new(), 0)
 }
 
-/// Unicode Cf 双向/格式控制符：不是 `char::is_control`（Cc）覆盖的范围，
-/// 但能在标签栏里不可见地重排或隐藏文字。与 `terminal.rs` 实时 OSC 标题
-/// 路径 `sanitized_title` 过滤的是同一组。
-fn is_bidi_display_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-    )
-}
-
-/// 剥掉 Cf 双向控制符后的展示文本。恢复的标签标题与实时 OSC 标题走同一
-/// 处置（剥离而非整体拒绝），同一个标题在保存→重启往返后看起来一致。
-fn strip_bidi_display_controls(value: &str) -> String {
-    value
-        .chars()
-        .filter(|&ch| !is_bidi_display_control(ch))
-        .collect()
-}
-
 /// Optional title validation mirrors `sanitize`: invalid text becomes `None`
 /// and does not invalidate an otherwise usable tab.
 struct TitleSeed<'a> {
@@ -1193,20 +1170,16 @@ impl serde::de::Visitor<'_> for TitleValueVisitor<'_> {
     }
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        // Cf bidi overrides/isolates are not Cc, so `is_control` lets them
-        // through; strip them (like the live OSC-title path) before the
-        // usual bounds instead of letting them reach the tab strip.
-        let stripped = strip_bidi_display_controls(value);
-        let value = stripped.as_str();
-        if value.trim().is_empty()
-            || value.len() > MAX_RESTORED_TAB_TITLE_BYTES
-            || value.chars().any(char::is_control)
+        let bounded = bound_tab_title_draft(value);
+        if bounded.trim().is_empty()
+            || bounded.len() > MAX_RESTORED_TAB_TITLE_BYTES
+            || bounded.chars().any(char::is_control)
         {
             self.budget.invalid_titles += 1;
             return Ok(None);
         }
-        self.budget.charge_text::<E>("tab title", value.len())?;
-        Ok(Some(value.to_owned()))
+        self.budget.charge_text::<E>("tab title", bounded.len())?;
+        Ok(Some(bounded))
     }
 
     fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
@@ -1675,13 +1648,12 @@ impl SessionsSnapshot {
         self.tabs
             .retain_mut(|tab| sanitize_tree_shape(&mut tab.tree));
         // 标题是自由文本，会原样出现在标签栏上：控制字符和超长串在这里就
-        // 丢弃，而不是等到渲染时才发现。Cf 双向控制符不在 Cc 之内，与实时
-        // OSC 标题路径一样剥离；剥完为空的标题按无效处理。
+        // 丢弃，而不是等到渲染时才发现。视觉欺骗字符与实时路径一样替换为
+        // U+FFFD；替换后为空的标题按无效处理。
         let mut invalid_titles = 0usize;
         for tab in &mut self.tabs {
             if let Some(title) = tab.title.as_mut() {
-                let stripped = strip_bidi_display_controls(title);
-                *title = stripped;
+                *title = bound_tab_title_draft(title.as_str());
             }
             if tab.title.as_ref().is_some_and(|title| {
                 title.trim().is_empty()
@@ -2520,9 +2492,8 @@ mod tests {
     }
 
     /// Cf bidi overrides/isolates are not Cc, so the `is_control` check lets
-    /// them through. Restored titles get the same stripping as the live
-    /// OSC-title path: the invisible marks never reach the tab strip, while
-    /// the visible text around them survives.
+    /// them through. Restored titles get the same replacement as the live
+    /// OSC-title path: invisible marks become U+FFFD on the tab strip.
     #[test]
     fn restored_tab_titles_strip_bidi_formatting_characters() {
         let root = scratch("tab-titles-bidi");
@@ -2555,11 +2526,17 @@ mod tests {
         let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
             panic!("bounded valid JSON should load");
         };
-        assert_eq!(restored.tabs[0].title.as_deref(), Some("build"));
-        // A title that was nothing but bidi marks is empty after stripping
-        // and falls back to the session's own label.
-        assert_eq!(restored.tabs[1].title, None);
-        assert_eq!(restored.tabs[2].title.as_deref(), Some("build"));
+        assert_eq!(restored.tabs[0].title.as_deref(), Some("bu\u{fffd}ild"));
+        // A title that was nothing but bidi marks becomes replacement chars
+        // so the spoofing stays visible instead of disappearing.
+        assert_eq!(
+            restored.tabs[1].title.as_deref(),
+            Some("\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}")
+        );
+        assert_eq!(
+            restored.tabs[2].title.as_deref(),
+            Some("\u{fffd}build\u{fffd}")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

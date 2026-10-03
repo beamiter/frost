@@ -1539,3 +1539,7 @@ everywhere except a resize, and an audit against ember found the rest.
      field stripped bidi marks but kept zero-width spoofing. Draft ingest
      now replaces all visual spoofing with U+FFFD.
 
+282. **Restored tab titles replace remaining visual spoofing** — snapshot
+     loads stripped bidi marks but kept zero-width spoofing. Restore now
+     replaces all visual spoofing with U+FFFD.
+
