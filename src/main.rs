@@ -5204,7 +5204,7 @@ impl Frost {
     fn block_config_writes(&mut self, diagnostic: String) {
         let changed = self.config_diagnostic.as_deref() != Some(diagnostic.as_str());
         self.config_write_blocked = true;
-        self.config_diagnostic = Some(diagnostic);
+        self.config_diagnostic = Some(crate::review_text::bound_diagnostic_text(diagnostic));
         if changed {
             self.push_toast(
                 "Config changed or became unreadable; keeping last-known-good values",
@@ -6416,7 +6416,7 @@ impl Frost {
             },
             Err(error) => RestoredState {
                 next_id: id_start,
-                diagnostic: Some(error.to_string()),
+                diagnostic: Some(crate::review_text::bound_diagnostic_text(error.to_string())),
                 ..RestoredState::default()
             },
         };
@@ -6460,10 +6460,12 @@ impl Frost {
                         )
                     }
                 };
-                state.diagnostic = Some(match state.diagnostic.take() {
-                    Some(existing) => format!("{note}\n{existing}"),
-                    None => note,
-                });
+                state.diagnostic = Some(crate::review_text::bound_diagnostic_text(
+                    match state.diagnostic.take() {
+                        Some(existing) => format!("{note}\n{existing}"),
+                        None => note,
+                    },
+                ));
                 return state;
             }
         };
@@ -6526,7 +6528,8 @@ impl Frost {
             active_tab: snapshot.active_tab,
             legacy_tree: snapshot.tree,
             legacy_split: snapshot.split,
-            diagnostic: (!restore_warnings.is_empty()).then(|| restore_warnings.join("\n")),
+            diagnostic: (!restore_warnings.is_empty())
+                .then(|| crate::review_text::bound_diagnostic_text(restore_warnings.join("\n"))),
             session_writes_blocked: false,
         }
     }
@@ -6646,7 +6649,7 @@ impl Frost {
             Err(error) => {
                 let message = error.to_string();
                 log::error!("[PTY] {message}");
-                self.session_diagnostic = Some(message.clone());
+                self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
                 self.push_toast(message, ToastKind::Warning);
             }
         }
@@ -7144,7 +7147,7 @@ impl Frost {
                     Err(error) => {
                         let message = error.to_string();
                         log::error!("[PTY] {message}");
-                        self.session_diagnostic = Some(message.clone());
+                        self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
                         self.push_toast(message, ToastKind::Warning);
                     }
                 }
@@ -7771,7 +7774,7 @@ impl Frost {
             Err(error) => {
                 let message = error.to_string();
                 log::error!("[PTY] {message}");
-                self.session_diagnostic = Some(message.clone());
+                self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
                 self.push_toast(message, ToastKind::Warning);
             }
         }
@@ -16695,7 +16698,7 @@ impl Frost {
             .width(Length::Fill);
         if let Some(error) = &self.config_diagnostic {
             content = content.push(
-                text(error.clone())
+                text(crate::review_text::bound_diagnostic_text(error))
                     .size(11)
                     .wrapping(text::Wrapping::Word)
                     .style(text::warning),
@@ -16709,7 +16712,7 @@ impl Frost {
         }
         if let Some(error) = &self.session_diagnostic {
             content = content.push(
-                text(error.clone())
+                text(crate::review_text::bound_diagnostic_text(error))
                     .size(11)
                     .wrapping(text::Wrapping::Word)
                     .style(text::danger),
@@ -16717,7 +16720,7 @@ impl Frost {
         }
         for diagnostic in self.keybindings_diagnostics.iter().take(3) {
             content = content.push(
-                text(diagnostic.clone())
+                text(crate::review_text::bound_diagnostic_text(diagnostic))
                     .size(11)
                     .wrapping(text::Wrapping::Word)
                     .style(text::warning),
@@ -19715,7 +19718,7 @@ impl Frost {
             let empty: Element<'_, Message> = container(
                 column![
                     text("Terminal could not start").size(20),
-                    text(message.to_string())
+                    text(crate::review_text::bound_diagnostic_text(message))
                         .size(12)
                         .wrapping(text::Wrapping::Word)
                         .style(text::danger),
@@ -22096,7 +22099,7 @@ impl Frost {
             Err(error) => {
                 let message = error.to_string();
                 log::error!("[PTY] {message}");
-                self.session_diagnostic = Some(message.clone());
+                self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
                 self.push_toast(message, ToastKind::Warning);
             }
         }

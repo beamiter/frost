@@ -174,6 +174,36 @@ pub(crate) fn bound_toast_text(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_TOAST_BYTES)
 }
 
+/// Persistent startup diagnostics overlay: keep newlines so restore/config
+/// notes stay readable, but drop other controls/spoofing and cap the payload.
+pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+
+pub(crate) fn bound_diagnostic_text(text: impl Into<String>) -> String {
+    let mut bounded = String::new();
+    for ch in text.into().chars() {
+        if ch == '\n' || ch == '\t' {
+            if bounded.len().saturating_add(ch.len_utf8()) > MAX_DIAGNOSTIC_BYTES {
+                break;
+            }
+            bounded.push(ch);
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if bounded.len().saturating_add(ch.len_utf8()) > MAX_DIAGNOSTIC_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
 /// Settings/chrome label for the configured AI provider. Display names are
 /// untrusted (local Ollama tags, custom OpenAI-compatible servers).
 pub(crate) const MAX_PROVIDER_LABEL_BYTES: usize = 256;
@@ -296,6 +326,21 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_TOAST_BYTES);
         assert!(shown.starts_with("Remote host"));
+    }
+
+    #[test]
+    fn diagnostic_text_keeps_newlines_replaces_spoofing_and_stays_bounded() {
+        let shown = bound_diagnostic_text(format!(
+            "Could not read\n\u{1b}[31m\u{202e}{}",
+            "x".repeat(2000)
+        ));
+        assert!(shown.contains('\n'));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(shown.starts_with("Could not read"));
+        assert_eq!(bound_diagnostic_text("ok\tpath"), "ok\tpath");
     }
 
     #[test]

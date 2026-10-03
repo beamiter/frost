@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 228 — bounded startup diagnostics overlay)
+
+## 2026-10-03 (upgrade round 228)
+
+- Config, session, and keybinding load diagnostics keep newlines but drop
+  controls/spoofing and truncate at 1 KiB before the attention overlay.
+- `cargo test --locked --bin frost -- review_text::tests::diagnostic_text_keeps_newlines_replaces_spoofing_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 227 — bounded files context-menu path header)
 
 ## 2026-10-03 (upgrade round 227)
