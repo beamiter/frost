@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 207 — bounded custom theme name draft)
+
+## 2026-10-03 (upgrade round 207)
+
+- Custom theme name drops controls, `/` `\`, and visual spoofing, and
+  truncates at 160 bytes so iced cannot hold more than
+  `Theme::validate_custom_theme_name` accepts.
+- `cargo test --locked --bin frost -- theme::tests::custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 206 — bounded remote host user field)
 
 ## 2026-10-03 (upgrade round 206)

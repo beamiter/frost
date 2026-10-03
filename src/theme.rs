@@ -6,6 +6,27 @@ use iced::Color;
 
 pub use jterm_core::theme::*;
 
+/// Matches core's custom-theme filename envelope so the iced editor cannot
+/// hold more than `Theme::validate_custom_theme_name` will accept.
+pub(crate) const MAX_CUSTOM_THEME_NAME_BYTES: usize = 160;
+
+pub(crate) fn bound_custom_theme_name(name: impl Into<String>) -> String {
+    let mut bounded = String::new();
+    for ch in name.into().chars() {
+        if ch.is_control()
+            || matches!(ch, '/' | '\\')
+            || jterm_core::review_input::is_visual_spoofing_character(ch)
+        {
+            continue;
+        }
+        if bounded.len().saturating_add(ch.len_utf8()) > MAX_CUSTOM_THEME_NAME_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
 /// iced color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color;
@@ -80,7 +101,7 @@ impl ThemeExt for Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{Theme, ThemeExt as _};
+    use super::{bound_custom_theme_name, Theme, ThemeExt as _, MAX_CUSTOM_THEME_NAME_BYTES};
     use iced::Color;
 
     #[test]
@@ -95,7 +116,10 @@ mod tests {
     #[test]
     fn ansi_color_out_of_range_falls_back_to_foreground() {
         let theme = Theme::default();
-        assert_eq!(theme.ansi_color(0), Theme::rgb_to_color32(theme.terminal.ansi_colors[0]));
+        assert_eq!(
+            theme.ansi_color(0),
+            Theme::rgb_to_color32(theme.terminal.ansi_colors[0])
+        );
         assert_eq!(
             theme.ansi_color(15),
             Theme::rgb_to_color32(theme.terminal.ansi_colors[15])
@@ -103,5 +127,20 @@ mod tests {
         assert_eq!(theme.ansi_color(16), theme.terminal_foreground());
         assert_eq!(theme.ansi_color(usize::MAX), theme.terminal_foreground());
     }
-}
 
+    #[test]
+    fn custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope() {
+        assert_eq!(bound_custom_theme_name("dusk\n\u{1b}/night\\"), "dusknight");
+        assert_eq!(bound_custom_theme_name("ok\u{202e}"), "ok");
+        let filled =
+            bound_custom_theme_name(format!("{}y", "x".repeat(MAX_CUSTOM_THEME_NAME_BYTES)));
+        assert_eq!(filled.len(), MAX_CUSTOM_THEME_NAME_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow =
+            bound_custom_theme_name(format!("{}z", "界".repeat(MAX_CUSTOM_THEME_NAME_BYTES)));
+        assert!(overflow.len() <= MAX_CUSTOM_THEME_NAME_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
+        assert!(Theme::validate_custom_theme_name(&filled).is_ok());
+    }
+}

@@ -1225,3 +1225,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `validate_remote_host` refused. `RemoteHostUser` now uses
      `bound_config_text` at `MAX_CONFIG_VALUE_BYTES`.
 
+207. **Bounded custom theme name draft** — the theme editor assigned iced
+     `text_input` unbounded, so `/`, ESC, and a 160-byte+1 paste sat until
+     save refused. `ThemeEditName` now drops controls, path separators, and
+     visual spoofing, and truncates at the core filename envelope.
+
