@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 216 — bounded Agent status line)
+
+## 2026-10-03 (upgrade round 216)
+
+- Agent panel status drops controls/spoofing and truncates at 256 bytes so
+  transport errors cannot restyle the panel.
+- `cargo test --locked --bin frost -- agent::tests` — 30 passed.
+
 Updated: 2026-10-03 (upgrade round 215 — bounded sidebar transfer/busy notices)
 
 ## 2026-10-03 (upgrade round 215)

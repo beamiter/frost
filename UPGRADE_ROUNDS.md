@@ -1267,3 +1267,7 @@ everywhere except a resize, and an audit against ember found the rest.
      ESC/bidi and a long name could restyle the files panel. Both now go
      through `safe_inline_display` at 192 bytes.
 
+216. **Bounded Agent status line** — protocol and IO errors were assigned into
+     `AgentUi.status` verbatim, so ESC/bidi and a long transport error could
+     restyle the panel. `set_status` now uses `safe_inline_display` at 256 bytes.
+

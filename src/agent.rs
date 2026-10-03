@@ -423,7 +423,7 @@ impl AgentUi {
         match restored {
             Some(session) => {
                 self.session = Some(session);
-                self.status = "restored the previous agent session".to_string();
+                self.set_status("restored the previous agent session".to_string());
             }
             None => self.session = Some(AgentSession::new(config.agent_max_turns)),
         }
@@ -431,7 +431,7 @@ impl AgentUi {
             Ok(client) => self.provider_label = client.display_name(),
             Err(error) => {
                 self.provider_label.clear();
-                self.status = error;
+                self.set_status(error);
             }
         }
     }
@@ -555,7 +555,7 @@ impl AgentUi {
         if let Some(session) = self.session.as_mut() {
             session.cancel();
         }
-        self.status = "Agent model request identities are exhausted".to_string();
+        self.set_status("Agent model request identities are exhausted".to_string());
     }
 
     fn accepts_model_callback(&mut self, identity: ModelRequestIdentity) -> bool {
@@ -588,6 +588,10 @@ impl AgentUi {
         self.input = bound_composer(text);
     }
 
+    pub fn set_status(&mut self, text: impl Into<String>) {
+        self.status = bound_agent_status(text);
+    }
+
     pub fn submit_input(&mut self) {
         let message = self.input.trim().to_string();
         if message.is_empty() {
@@ -601,7 +605,7 @@ impl AgentUi {
                 self.input.clear();
                 self.status.clear();
             }
-            Err(error) => self.status = error.to_string(),
+            Err(error) => self.set_status(error.to_string()),
         }
     }
 
@@ -626,7 +630,7 @@ impl AgentUi {
         let client = match client_from_config(config) {
             Ok(client) => client,
             Err(error) => {
-                self.status = error.clone();
+                self.set_status(error.clone());
                 if let Some(session) = self.session.as_mut() {
                     let _ = session.model_failed(error);
                 }
@@ -689,11 +693,11 @@ impl AgentUi {
             let message = format!("AI reply exceeded the {MAX_AGENT_MODEL_REPLY_BYTES}-byte limit");
             if let Some(session) = self.session.as_mut() {
                 if let Err(error) = session.model_failed(message.clone()) {
-                    self.status = error.to_string();
+                    self.set_status(error.to_string());
                     return;
                 }
             }
-            self.status = format!("{message}; request cancelled");
+            self.set_status(format!("{message}; request cancelled"));
             return;
         }
         self.stream_raw.push_str(fragment);
@@ -745,7 +749,7 @@ impl AgentUi {
                 .map_err(|error| error.to_string()),
         };
         if let Err(error) = outcome {
-            self.status = error;
+            self.set_status(error);
         }
     }
 
@@ -760,14 +764,14 @@ impl AgentUi {
         let session = self.session.as_mut()?;
         let candidate = edited.as_deref().or_else(|| proposal_command(session, id));
         let Some(candidate) = candidate else {
-            self.status = "proposal command is unavailable".to_string();
+            self.set_status("proposal command is unavailable".to_string());
             return None;
         };
         if let Err(error) = crate::review_text::validate_single_line(
             candidate,
             crate::review_text::MAX_AGENT_COMMAND_BYTES,
         ) {
-            self.status = format!("Agent command rejected: {error}");
+            self.set_status(format!("Agent command rejected: {error}"));
             return None;
         }
         let approved = match edited {
@@ -781,7 +785,7 @@ impl AgentUi {
                     crate::review_text::MAX_AGENT_COMMAND_BYTES,
                 ) {
                     session.cancel();
-                    self.status = format!("Agent command rejected after approval: {error}");
+                    self.set_status(format!("Agent command rejected after approval: {error}"));
                     return None;
                 }
                 // Checked, never wrapped: a reused generation would let a late
@@ -791,7 +795,7 @@ impl AgentUi {
                 let Some(generation) = self.execution_generation.checked_add(1) else {
                     session.cancel();
                     self.awaiting = None;
-                    self.status = "Agent execution identities are exhausted".to_string();
+                    self.set_status("Agent execution identities are exhausted".to_string());
                     return None;
                 };
                 self.execution_generation = generation;
@@ -808,7 +812,7 @@ impl AgentUi {
                 Some(execution)
             }
             Err(error) => {
-                self.status = error.to_string();
+                self.set_status(error.to_string());
                 None
             }
         }
@@ -827,14 +831,14 @@ impl AgentUi {
             if let Some(session) = self.session.as_mut() {
                 session.cancel();
             }
-            self.status = message.into();
+            self.set_status(message.into());
         }
     }
 
     pub fn reject(&mut self, id: ProposalId) {
         if let Some(session) = self.session.as_mut() {
             if let Err(error) = session.reject(id) {
-                self.status = error.to_string();
+                self.set_status(error.to_string());
             }
         }
     }
@@ -846,7 +850,7 @@ impl AgentUi {
         if let Some(session) = self.session.as_mut() {
             match session.continue_after_completion() {
                 Ok(()) => self.status.clear(),
-                Err(error) => self.status = error.to_string(),
+                Err(error) => self.set_status(error.to_string()),
             }
         }
     }
@@ -858,7 +862,7 @@ impl AgentUi {
         if let Some(session) = self.session.as_mut() {
             match session.start_new_task() {
                 Ok(()) => self.status.clear(),
-                Err(error) => self.status = error.to_string(),
+                Err(error) => self.set_status(error.to_string()),
             }
         }
     }
@@ -911,7 +915,7 @@ impl AgentUi {
                     if let Err(error) =
                         session.observe(pending.proposal_id, exit_code, &completed.output)
                     {
-                        self.status = error.to_string();
+                        self.set_status(error.to_string());
                     }
                 }
                 return;
@@ -948,6 +952,12 @@ impl AgentUi {
             truncated: completed.output.len() >= MANUAL_OUTPUT_TRUNCATION_HINT,
         });
     }
+}
+
+const MAX_AGENT_STATUS_BYTES: usize = 256;
+
+fn bound_agent_status(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_AGENT_STATUS_BYTES)
 }
 
 fn bound_composer(text: impl Into<String>) -> String {
@@ -1973,5 +1983,16 @@ mod tests {
         assert!(agent.input.len() <= MAX_AGENT_COMPOSER_BYTES);
         assert!(agent.input.is_char_boundary(agent.input.len()));
         assert!(!agent.input.contains('z'));
+    }
+
+    #[test]
+    fn agent_status_replaces_controls_and_stays_bounded() {
+        let mut agent = AgentUi::new();
+        agent.set_status(format!("failed \u{1b}[31m\u{202e}{}", "x".repeat(400)));
+        assert!(!agent.status.contains('\u{1b}'));
+        assert!(!agent.status.contains('\u{202e}'));
+        assert!(agent.status.contains('\u{fffd}'));
+        assert!(agent.status.len() <= MAX_AGENT_STATUS_BYTES);
+        assert!(agent.status.starts_with("failed"));
     }
 }

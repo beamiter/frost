@@ -13131,7 +13131,7 @@ impl Frost {
                 ) {
                     Ok(_) => self.agent.edit = Some((id, command)),
                     Err(error) => {
-                        self.agent.status = format!("Agent edit rejected: {error}");
+                        self.agent.set_status(format!("Agent edit rejected: {error}"));
                         self.agent.edit = None;
                     }
                 }
@@ -21253,7 +21253,7 @@ impl Frost {
         let bound = self.agent.bound_session_id?;
         let Some(session_index) = self.sessions.iter().position(|session| session.id == bound)
         else {
-            self.agent.status = "Agent session's terminal no longer exists".to_string();
+            self.agent.set_status("Agent session's terminal no longer exists".to_string());
             return None;
         };
 
@@ -21261,11 +21261,11 @@ impl Frost {
         // gate therefore leaves the proposal pending and reviewable.
         let prompt_status = self.sessions[session_index].agent_prompt_status();
         if !prompt_status.is_ready() {
-            self.agent.status = prompt_status.blocked_message().to_string();
+            self.agent.set_status(prompt_status.blocked_message().to_string());
             return None;
         }
         if !self.sessions[session_index].can_queue_user_bytes(MAX_AGENT_APPROVAL_PAYLOAD_BYTES) {
-            self.agent.status = "Agent command not run: PTY input queue is full".to_string();
+            self.agent.set_status("Agent command not run: PTY input queue is full".to_string());
             return None;
         }
 
