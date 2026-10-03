@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 254 — bounded block overlay meta chrome)
+
+## 2026-10-04 (upgrade round 254)
+
+- Block-search secondary context and command-block menu meta sanitize the full line.
+- `cargo test --locked --bin frost -- block_mode::tests::display_block_search_text_escapes_controls_and_visual_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 253 — bounded shortcut-label chrome)
 
 ## 2026-10-04 (upgrade round 253)

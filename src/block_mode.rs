@@ -3427,6 +3427,15 @@ mod tests {
         assert!(!shown.contains('\u{202e}'));
         assert!(shown.contains("\\u{1B}") || shown.contains("\\u{202E}"));
         assert!(shown.starts_with("grep "));
+        let context = display_block_search_text(&format!(
+            "ls \u{202e}secret · failed in 12ms · {}",
+            "p".repeat(400)
+        ));
+        assert!(!context.contains('\u{202e}'));
+        assert!(
+            context.contains("\\u{202E}") || context.contains('�') || !context.contains('\u{202e}')
+        );
+        assert!(context.starts_with("ls "));
     }
 
     #[test]

@@ -1428,3 +1428,8 @@ everywhere except a resize, and an audit against ember found the rest.
      palette reverse-lookup join were drawn as iced text. Labels now share a
      256-byte `safe_inline_display` envelope.
 
+254. **Bounded block-search context and block-menu meta chrome** — the
+     secondary hit line and the command-block menu status/cwd row concatenated
+     extras after sanitizing the command. The whole line now runs
+     `display_block_search_text`.
+

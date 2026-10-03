@@ -17467,7 +17467,7 @@ impl Frost {
                         } else {
                             text::default
                         }),
-                    text(context)
+                    text(block_mode::display_block_search_text(&context))
                         .size(11)
                         .wrapping(text::Wrapping::None)
                         .style(text::secondary),
@@ -17639,7 +17639,7 @@ impl Frost {
                         .width(Length::Fill),
                 )
                 .push(
-                    text(meta)
+                    text(block_mode::display_block_search_text(&meta))
                         .size(11)
                         .wrapping(text::Wrapping::Word)
                         .style(text::secondary),
