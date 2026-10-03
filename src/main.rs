@@ -13053,9 +13053,7 @@ impl Frost {
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
             Message::TaskFollowUpInput(value) => {
-                if value.len() <= agent_task::NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
-                    self.task_panel.follow_up = value;
-                }
+                self.task_panel.set_follow_up(value);
             }
             Message::TaskFollowUpSend(task_id) => {
                 let text = self.task_panel.follow_up.clone();

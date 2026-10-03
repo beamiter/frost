@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 189 — bounded Tasks follow-up composer)
+
+## 2026-10-03 (upgrade round 189)
+
+- Tasks follow-up composer truncates at 16 KiB, keeps newlines/tabs, and
+  drops other controls instead of bouncing an oversized paste.
+- `cargo test --locked --bin frost -- agent_task_ui::tests` — 5 passed.
+
 Updated: 2026-10-03 (upgrade round 188 — bounded AI suggestion draft)
 
 ## 2026-10-03 (upgrade round 188)

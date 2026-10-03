@@ -55,6 +55,25 @@ pub(crate) fn native_follow_up_can_send(text: &str, completed_turns: usize) -> b
         && completed_turns < CODEX_APP_SERVER_LIVE_TURN_MAX
 }
 
+/// Bound the Tasks follow-up composer. Newlines and tabs stay (the send gate
+/// already treats them as structural whitespace); other controls are dropped
+/// and overflow truncates on a UTF-8 boundary so a paste cannot bounce.
+pub(crate) fn bound_follow_up(text: impl Into<String>) -> String {
+    let mut text: String = text
+        .into()
+        .chars()
+        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .collect();
+    if text.len() > NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
+        let mut end = NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// Fully prepared task registration produced by the background worktree
 /// worker. The UI thread only registers it with the task manager.
 pub(crate) struct PreparedTask {
@@ -247,6 +266,10 @@ impl TaskPanel {
             diff: crate::agent_task::AgentDiffPanel::new(),
         }
     }
+
+    pub(crate) fn set_follow_up(&mut self, text: impl Into<String>) {
+        self.follow_up = bound_follow_up(text);
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +319,21 @@ mod tests {
             "ok",
             CODEX_APP_SERVER_LIVE_TURN_MAX
         ));
+    }
+
+    #[test]
+    fn follow_up_composer_keeps_newlines_and_truncates() {
+        assert_eq!(bound_follow_up("please\n\u{1b}adjust"), "please\nadjust");
+        assert_eq!(bound_follow_up("a\tb"), "a\tb");
+        let filled = bound_follow_up(format!(
+            "{}y",
+            "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES)
+        ));
+        assert_eq!(filled.len(), NATIVE_AGENT_FOLLOW_UP_MAX_BYTES);
+        assert!(!filled.contains('y'));
+        let mut panel = TaskPanel::new();
+        panel.set_follow_up("ok\n\u{07}go");
+        assert_eq!(panel.follow_up, "ok\ngo");
     }
 
     #[test]

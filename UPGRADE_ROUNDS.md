@@ -1126,3 +1126,9 @@ everywhere except a resize, and an audit against ember found the rest.
      insert failed. Both the widget and `apply_reply` now drop controls and
      truncate on a UTF-8 boundary at `MAX_REVIEW_INPUT_BYTES`.
 
+189. **Bounded Tasks follow-up composer** — the iced field rejected an oversized
+     paste wholesale, so a 16 KiB+1 edit left the previous draft intact and
+     ESC/BEL could sit in the composer until send. `set_follow_up` now keeps
+     newlines and tabs, drops other controls, and truncates on a UTF-8
+     boundary at `NATIVE_AGENT_FOLLOW_UP_MAX_BYTES`.
+
