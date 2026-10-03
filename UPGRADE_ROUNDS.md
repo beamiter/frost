@@ -1582,3 +1582,7 @@ everywhere except a resize, and an audit against ember found the rest.
 292. **Files listings skip control and spoofed names** — remote/local directory
      rows kept newline and bidi filenames. Those names are now omitted before
      they can become clickable tree entries.
+
+293. **File-path links refuse visual spoofing before open** — a click resolved
+     any existing path, including bidi filenames. Spoofed file links now fail
+     closed instead of launching the opener.

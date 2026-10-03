@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 293 — File-path links refuse visual spoofing before open)
+
+## 2026-10-04 (upgrade round 293)
+
+- Clicked file-path links refuse control and visual-spoofing text before the opener runs.
+- `cargo test --locked --bin frost -- link::tests::file_links_with_visual_spoofing_are_not_opened` passed.
+
 Updated: 2026-10-04 (upgrade round 292 — Files listings skip control and spoofed names)
 
 ## 2026-10-04 (upgrade round 292)

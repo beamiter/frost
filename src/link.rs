@@ -506,6 +506,15 @@ fn resolve_existing_file_path(
     path: &str,
     cwd: Option<&Path>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if path.chars().any(|character| {
+        character.is_control() || jterm_core::review_input::is_visual_spoofing_character(character)
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file link contains unsafe formatting",
+        )
+        .into());
+    }
     let exact = absolutize_file_path(expand_path(path), cwd);
     if exact.exists() {
         return Ok(exact);
@@ -599,6 +608,32 @@ mod tests {
         assert_eq!(strip_source_location("notes:today"), None);
         assert_eq!(strip_source_location("src/main.rs:42"), Some("src/main.rs"));
 
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn file_links_with_visual_spoofing_are_not_opened() {
+        let unique = format!(
+            "frost-link-spoof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let spoofed = root.join("ok\u{202e}hidden.rs");
+        std::fs::write(&spoofed, "fn main() {}\n").expect("write spoofed name");
+        let err = resolve_existing_file_path(spoofed.to_str().expect("utf-8"), None)
+            .expect_err("spoofed file names must not open");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .expect("io error")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(resolve_existing_file_path("src/\u{200b}main.rs", Some(&root)).is_err());
         std::fs::remove_dir_all(root).expect("remove test directory");
     }
 
