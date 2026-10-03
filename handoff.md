@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 294 — File-path detection skips visual spoofing)
+
+## 2026-10-04 (upgrade round 294)
+
+- Detected file-path highlights skip bidi and zero-width spoofing so they never become clickable.
+- `cargo test --locked --bin frost -- link::tests::file_path_detection_skips_visual_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 293 — File-path links refuse visual spoofing before open)
 
 ## 2026-10-04 (upgrade round 293)

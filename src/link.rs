@@ -239,6 +239,10 @@ impl LinkDetector {
         if trimmed.starts_with("//")
             || trimmed.contains("://")
             || trimmed.chars().all(|ch| matches!(ch, '/' | '.'))
+            || trimmed.chars().any(|character| {
+                character.is_control()
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
+            })
         {
             return false;
         }
@@ -563,6 +567,22 @@ mod tests {
         let links = detector.detect_links_in_line(line, 0);
 
         assert!(links.iter().any(|l| l.link_type == LinkType::FilePath));
+    }
+
+    #[test]
+    fn file_path_detection_skips_visual_spoofing() {
+        let detector = LinkDetector::new(LinkDetectionConfig::default());
+        let links = detector.detect_links_in_line("Check /tmp/\u{202e}hidden.rs later", 0);
+        assert!(
+            !links
+                .iter()
+                .any(|link| link.link_type == LinkType::FilePath),
+            "bidi file paths must not become clickable"
+        );
+        let zwsp = detector.detect_links_in_line("open src/\u{200b}main.rs", 0);
+        assert!(!zwsp.iter().any(|link| link.link_type == LinkType::FilePath));
+        let safe = detector.detect_links_in_line("Check /etc/hosts file", 0);
+        assert!(safe.iter().any(|link| link.link_type == LinkType::FilePath));
     }
 
     #[test]

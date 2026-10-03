@@ -1586,3 +1586,7 @@ everywhere except a resize, and an audit against ember found the rest.
 293. **File-path links refuse visual spoofing before open** — a click resolved
      any existing path, including bidi filenames. Spoofed file links now fail
      closed instead of launching the opener.
+
+294. **File-path detection skips visual spoofing** — highlighted paths still
+     became clickable when they contained bidi or zero-width marks. Spoofed
+     paths are no longer detected as file links.
