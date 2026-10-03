@@ -976,7 +976,17 @@ fn bound_composer(text: impl Into<String>) -> String {
     let mut text: String = text
         .into()
         .chars()
-        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .filter_map(|character| {
+            if matches!(character, '\n' | '\t') {
+                Some(character)
+            } else if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if text.len() > MAX_AGENT_COMPOSER_BYTES {
         let mut end = MAX_AGENT_COMPOSER_BYTES;
@@ -1995,6 +2005,10 @@ mod tests {
         assert!(agent.input.len() <= MAX_AGENT_COMPOSER_BYTES);
         assert!(agent.input.is_char_boundary(agent.input.len()));
         assert!(!agent.input.contains('z'));
+        agent.set_input("please\n\u{202e}fix");
+        assert!(!agent.input.contains('\u{202e}'));
+        assert!(agent.input.contains('\u{fffd}'));
+        assert!(agent.input.starts_with("please\n"));
     }
 
     #[test]

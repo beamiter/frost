@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 273 — Agent composer strips visual spoofing)
+
+## 2026-10-04 (upgrade round 273)
+
+- Agent session composer keeps newlines and replaces visual spoofing at ingest.
+- `cargo test --locked --bin frost -- agent::tests::composer_keeps_newlines_and_truncates_to_the_session_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 272 — AI chat composer strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 272)

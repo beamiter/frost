@@ -1505,3 +1505,7 @@ everywhere except a resize, and an audit against ember found the rest.
      newlines but also kept bidi. Composer ingest now replaces spoofing with
      U+FFFD.
 
+273. **Agent composer strips visual spoofing** — the session composer kept
+     newlines but also kept bidi. Composer ingest now replaces spoofing with
+     U+FFFD.
+
