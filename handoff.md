@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 176 — empty regex replace is a no-op)
+
+## 2026-10-03 (upgrade round 176)
+
+- Empty search patterns no-op on the public replace entry for both engines.
+- `cargo test --locked --bin frost -- search_replace::tests::empty_regex_pattern_is_a_noop` passed.
+
 Updated: 2026-10-03 (upgrade round 175 — release-clean debug dump)
 
 ## 2026-10-03 (upgrade round 175)

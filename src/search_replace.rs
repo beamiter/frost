@@ -27,6 +27,11 @@ impl SearchAndReplaceEngine {
         config: &SearchConfig,
         options: &ReplaceOptions,
     ) -> Result<(String, usize), String> {
+        // Empty pattern would match endlessly in both the literal scanner and
+        // rustc's regex engine; treat it as a no-op on the public entry.
+        if search_pattern.is_empty() {
+            return Ok((text.to_string(), 0));
+        }
         if config.use_regex {
             Self::regex_replace(text, search_pattern, replacement, config, options)
         } else {
@@ -301,6 +306,25 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(result, "İX");
+    }
+
+    #[test]
+    fn empty_regex_pattern_is_a_noop() {
+        let config = SearchConfig {
+            use_regex: true,
+            ..Default::default()
+        };
+        let options = ReplaceOptions { replace_all: true };
+        let (result, count) = SearchAndReplaceEngine::search_and_replace(
+            "abc",
+            "",
+            "x",
+            &config,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(result, "abc");
     }
 
     #[test]

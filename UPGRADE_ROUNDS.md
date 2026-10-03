@@ -1045,3 +1045,8 @@ everywhere except a resize, and an audit against ember found the rest.
      hex-escapes the rest, and truncates at 96 bytes with a remainder marker,
      pinned so a control byte cannot be echoed raw into a debug line.
 
+176. **Empty regex replace is a no-op** — the public search-and-replace entry now
+     refuses an empty pattern before choosing the literal or regex engine, so
+     `replace_all` cannot insert the replacement at every empty match the regex
+     crate would otherwise report.
+
