@@ -117,6 +117,17 @@ pub(crate) fn sanitize_untrusted_single_line(
     Ok(stripped)
 }
 
+/// Regex compile failures quote the pattern. Keep that text on one UI line
+/// without letting ESC or bidi marks in the draft alter surrounding chrome.
+pub(crate) const MAX_REGEX_ERROR_BYTES: usize = 160;
+
+pub(crate) fn safe_regex_error(error: impl fmt::Display) -> String {
+    jterm_core::review_input::safe_inline_display(
+        &format!("Invalid regex: {error}"),
+        MAX_REGEX_ERROR_BYTES,
+    )
+}
+
 pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
     let mut visible = String::with_capacity(text.len().min(max_bytes));
     let mut truncated = false;
@@ -197,6 +208,17 @@ mod tests {
             );
         }
         assert!(validate_single_line("printf '编译🙂'", 256 * 1024).is_ok());
+    }
+
+    #[test]
+    fn regex_error_replaces_controls_and_stays_bounded() {
+        let error = format!("unclosed group for `(\u{1b}[31m\u{202e}{}`", "x".repeat(400));
+        let shown = safe_regex_error(error);
+        assert!(shown.starts_with("Invalid regex:"));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_REGEX_ERROR_BYTES);
     }
 
     #[test]

@@ -400,7 +400,7 @@ impl SearchEngine {
                 }
                 Err(e) => {
                     *cache = None;
-                    return (Vec::new(), Some(format!("Invalid regex: {}", e)));
+                    return (Vec::new(), Some(crate::review_text::safe_regex_error(e)));
                 }
             }
         }
@@ -781,5 +781,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn invalid_regex_error_does_not_echo_controls() {
+        let lines = vec![SearchLine::Text("text")];
+        let mut cache = None;
+        let (matches, error) = SearchEngine::search_lines(
+            lines,
+            "(\u{1b}[31m\u{202e}",
+            true,
+            true,
+            &mut cache,
+        );
+        assert!(matches.is_empty());
+        let error = error.expect("compile failure");
+        assert!(error.contains("Invalid regex"));
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains('\u{202e}'));
+        assert!(error.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);
     }
 }

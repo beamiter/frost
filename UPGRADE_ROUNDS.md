@@ -1055,3 +1055,8 @@ everywhere except a resize, and an audit against ember found the rest.
      `usize::MAX`, instead of relying on an untested `else` arm. RGBA iced
      conversion is also pinned so alpha is `u8 / 255`.
 
+178. **Sanitized regex compile errors** — find and find-replace both quoted the
+     regex crate's error, which echoes the draft pattern. ESC and bidi marks in
+     an invalid pattern now go through `safe_inline_display` (160 bytes) before
+     reaching the search bar or the replace-panel status line.
+

@@ -104,7 +104,7 @@ impl SearchAndReplaceEngine {
             .case_insensitive(!config.case_sensitive)
             .multi_line(config.multi_line)
             .build()
-            .map_err(|e| format!("Invalid regex: {}", e))?;
+            .map_err(crate::review_text::safe_regex_error)?;
 
         let result = if options.replace_all {
             regex.replace_all(text, replacement).to_string()

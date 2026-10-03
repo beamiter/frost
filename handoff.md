@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 178 — sanitized regex compile errors)
+
+## 2026-10-03 (upgrade round 178)
+
+- Invalid regex errors from find and find-replace are display-sanitized
+  (controls/bidi → U+FFFD, 160-byte cap) so a hostile pattern cannot restyle
+  the status line.
+- `cargo test --locked --bin frost -- review_text::tests::regex_error search::tests::invalid_regex search_replace_panel::tests::apply_invalid_regex` — 4 passed.
+
 Updated: 2026-10-03 (upgrade round 177 — out-of-range ANSI theme fallback)
 
 ## 2026-10-03 (upgrade round 177)
