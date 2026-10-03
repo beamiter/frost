@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 286 — Foreground process names are bounded for pane chrome)
+
+## 2026-10-04 (upgrade round 286)
+
+- Pane-header foreground process names are display-bounded; spoofing is replaced at ingest.
+- `cargo test --locked --bin frost -- review_text::tests::foreground_process_names_replace_spoofing_and_drop_empty` passed.
+
 Updated: 2026-10-04 (upgrade round 285 — OSC 7 cwd reports reject visual spoofing)
 
 ## 2026-10-04 (upgrade round 285)

@@ -4103,7 +4103,7 @@ impl Session {
         if SHELLS.contains(&comm.as_str()) {
             return None;
         }
-        Some(comm)
+        crate::review_text::bound_foreground_process_name(comm)
     }
 
     fn observed_ssh_command(&self) -> Option<jterm_core::process::ObservedSshCommand> {

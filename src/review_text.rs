@@ -217,6 +217,23 @@ pub(crate) fn bound_provider_label(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_PROVIDER_LABEL_BYTES)
 }
 
+/// `/proc` comm names reach the pane header. Bound and neutralize them so a
+/// hostile process name cannot reorder chrome.
+pub(crate) const MAX_FOREGROUND_PROCESS_NAME_BYTES: usize = 256;
+
+pub(crate) fn bound_foreground_process_name(name: impl AsRef<str>) -> Option<String> {
+    let shown = jterm_core::review_input::safe_inline_display(
+        name.as_ref(),
+        MAX_FOREGROUND_PROCESS_NAME_BYTES,
+    );
+    let shown = shown.trim();
+    if shown.is_empty() {
+        None
+    } else {
+        Some(shown.to_string())
+    }
+}
+
 pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
     let mut visible = String::with_capacity(text.len().min(max_bytes));
     let mut truncated = false;
@@ -430,5 +447,26 @@ mod tests {
             prepared_agent_edit_command("ls\n\u{1b} -la").as_deref(),
             Some("ls -la")
         );
+    }
+
+    #[test]
+    fn foreground_process_names_replace_spoofing_and_drop_empty() {
+        assert_eq!(
+            bound_foreground_process_name("cargo"),
+            Some("cargo".to_string())
+        );
+        let shown = bound_foreground_process_name("nvim\u{202e}").expect("visible name");
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.starts_with("nvim"));
+        assert!(bound_foreground_process_name("").is_none());
+        assert!(bound_foreground_process_name("   ").is_none());
+        let overflow = bound_foreground_process_name(format!(
+            "{}z",
+            "x".repeat(MAX_FOREGROUND_PROCESS_NAME_BYTES)
+        ))
+        .expect("truncated name");
+        assert!(overflow.len() <= MAX_FOREGROUND_PROCESS_NAME_BYTES);
+        assert!(!overflow.contains('z'));
     }
 }

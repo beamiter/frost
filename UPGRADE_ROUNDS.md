@@ -1555,3 +1555,7 @@ everywhere except a resize, and an audit against ember found the rest.
      only NUL. Newlines, bidi, and zero-width marks now refuse the report and
      keep the last accepted directory.
 
+286. **Foreground process names are bounded for pane chrome** — `/proc` comm
+     strings reached the pane header raw. Names are now display-bounded and
+     visual spoofing is replaced before the ▶ chip is drawn.
+
