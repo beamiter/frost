@@ -14934,7 +14934,8 @@ impl Frost {
                 }
             }
             Message::SetTheme(name) => {
-                self.config.theme = name;
+                self.config.theme =
+                    crate::config::bound_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES);
                 self.config_dirty = true;
                 self.apply_config();
             }

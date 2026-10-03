@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 210 — bounded theme picker value)
+
+## 2026-10-03 (upgrade round 210)
+
+- Settings theme picker drops controls and visual spoofing and truncates at
+  256 bytes before `apply_config()`.
+- `cargo test --locked --bin frost -- config::tests::live_theme_settings_field_uses_the_name_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 209 — bounded Agent proposal-edit field)
 
 ## 2026-10-03 (upgrade round 209)

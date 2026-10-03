@@ -1239,3 +1239,8 @@ everywhere except a resize, and an audit against ember found the rest.
      paste, wiping the reviewed command. `bound_agent_edit_command` now drops
      controls and visual spoofing and truncates at `MAX_AGENT_COMMAND_BYTES`.
 
+210. **Bounded theme picker value** — `SetTheme` assigned the pick-list string
+     into config unbounded, then `apply_config()` ran immediately, so ESC/bidi
+     and a 256-byte+1 name could restyle chrome until `normalized()` reset it.
+     The handler now uses `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
+
