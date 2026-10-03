@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 268 — Files-tree filter strips visual spoofing)
+
+## 2026-10-04 (upgrade round 268)
+
+- Files-tree name filter replaces visual spoofing at ingest.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_filter_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 267 — workflow overlay typing strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 267)

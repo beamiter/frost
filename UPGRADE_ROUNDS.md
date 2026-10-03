@@ -1486,3 +1486,7 @@ everywhere except a resize, and an audit against ember found the rest.
      argument fields dropped controls but kept bidi. Ingest now replaces
      spoofing with U+FFFD before the core picker/form.
 
+268. **Files-tree filter strips visual spoofing** — the inline name filter
+     dropped controls but kept bidi. Filter ingest now replaces spoofing
+     with U+FFFD.
+
