@@ -149,6 +149,14 @@ pub(crate) fn safe_regex_error(error: impl fmt::Display) -> String {
     )
 }
 
+/// Transient toast chrome: interpolated paths and error strings must not
+/// restyle the overlay or grow without bound.
+pub(crate) const MAX_TOAST_BYTES: usize = 256;
+
+pub(crate) fn bound_toast_text(text: impl Into<String>) -> String {
+    jterm_core::review_input::safe_inline_display(&text.into(), MAX_TOAST_BYTES)
+}
+
 pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
     let mut visible = String::with_capacity(text.len().min(max_bytes));
     let mut truncated = false;
@@ -243,6 +251,19 @@ mod tests {
         assert!(!shown.contains('\u{202e}'));
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_REGEX_ERROR_BYTES);
+    }
+
+    #[test]
+    fn toast_text_replaces_controls_and_stays_bounded() {
+        let shown = bound_toast_text(format!(
+            "Remote host \u{1b}[31m\u{202e}{}: failed",
+            "n".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_TOAST_BYTES);
+        assert!(shown.starts_with("Remote host"));
     }
 
     #[test]

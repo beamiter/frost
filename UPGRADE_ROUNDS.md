@@ -1253,3 +1253,7 @@ everywhere except a resize, and an audit against ember found the rest.
      `validate_remote_host` refused. `RemoteHostDeploy` now uses
      `bound_config_text` at `MAX_CONFIG_NAME_BYTES`.
 
+213. **Bounded toast chrome** — `push_toast` stored interpolated paths and
+     errors verbatim, so ESC/bidi and a long `io::Error` could restyle the
+     overlay. Every toast now goes through `safe_inline_display` at 256 bytes.
+

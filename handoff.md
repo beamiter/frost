@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 213 — bounded toast chrome)
+
+## 2026-10-03 (upgrade round 213)
+
+- Toasts drop controls/spoofing and truncate at 256 bytes so interpolated
+  errors cannot restyle the overlay.
+- `cargo test --locked --bin frost -- review_text::tests::toast_text_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 212 — bounded remote host deploy field)
 
 ## 2026-10-03 (upgrade round 212)

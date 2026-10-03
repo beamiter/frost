@@ -7021,7 +7021,7 @@ impl Frost {
     fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         const TOAST_TTL_MS: u64 = 2400;
         const MAX_TOASTS: usize = 4;
-        let text = text.into();
+        let text = crate::review_text::bound_toast_text(text);
         let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(TOAST_TTL_MS);
         // Key auto-repeat — holding a chord that refuses, like prompt
         // navigation at the oldest prompt — would otherwise stack four copies
