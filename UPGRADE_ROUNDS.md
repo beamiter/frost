@@ -1108,3 +1108,8 @@ everywhere except a resize, and an audit against ember found the rest.
      budget. Find now shares the 4 KiB search-query cap; replace shares the
      256 KiB prompt-insert cap; both drop control characters.
 
+186. **Bounded workflow argument fields** — the parameter form assigned iced
+     `text_input` into `ArgsForm` without a byte cap, so a paste could sit in
+     memory until render refused it. `set_value` now drops controls and
+     truncates on a UTF-8 boundary at `MAX_WORKFLOW_FIELD_BYTES` (4 KiB).
+

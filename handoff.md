@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 186 — bounded workflow argument fields)
+
+## 2026-10-03 (upgrade round 186)
+
+- Workflow argument rows drop controls and truncate at 4 KiB before they
+  reach `ArgsForm`.
+- `cargo test --locked --bin frost -- workflow_picker::tests::args_form_prefills_defaults_and_withholds_the_undeclared_ones` passed.
+
 Updated: 2026-10-03 (upgrade round 185 — bounded find-replace fields)
 
 ## 2026-10-03 (upgrade round 185)

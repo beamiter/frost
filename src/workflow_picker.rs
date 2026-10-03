@@ -29,6 +29,22 @@ use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
 pub(crate) const MAX_RESULTS: usize = 15;
 const PICKER_POLICY: PickerPolicy = PickerPolicy::new(MAX_RESULTS, false);
 
+fn bound_arg_value(value: impl Into<String>) -> String {
+    let mut value: String = value
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if value.len() > jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES {
+        let mut end = jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
+
 /// 选择器状态。`entries` 保持 `workflows::load_all` 的目录优先级顺序（与
 /// anvil 一致：更早的目录胜出同名项，目录内按文件名排序）；期间磁盘上的
 /// 变更在下一次打开时生效。
@@ -154,7 +170,7 @@ impl WorkflowArgsState {
     }
 
     pub(crate) fn set_value(&mut self, index: usize, value: String) {
-        self.form.set(index, value);
+        self.form.set(index, bound_arg_value(value));
         self.feedback = None;
     }
 
@@ -344,9 +360,23 @@ mod tests {
         assert!(form.missing().contains(&"env"));
         assert!(form.render().unwrap_err().contains("missing values: env"));
 
-        // 值同样要过 review-only 边界：控制字符直接失败。
+        // Overlay typing drops controls instead of storing a value that can
+        // only fail later at render.
         form.set_value(1, "staging".to_string());
         form.set_value(0, "ok\nrm -rf /".to_string());
-        assert!(form.render().unwrap_err().contains("unsafe"));
+        assert_eq!(form.value(0), "okrm -rf /");
+
+        form.set_value(
+            1,
+            format!(
+                "{}!",
+                "x".repeat(jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES)
+            ),
+        );
+        assert_eq!(
+            form.value(1).len(),
+            jterm_core::workflows::MAX_WORKFLOW_FIELD_BYTES
+        );
+        assert!(!form.value(1).contains('!'));
     }
 }
