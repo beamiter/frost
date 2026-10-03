@@ -1144,3 +1144,9 @@ everywhere except a resize, and an audit against ember found the rest.
      persisted title. `rename` now drops controls, replaces visual spoofing
      with U+FFFD, and truncates at the store envelope before the field updates.
 
+192. **Bounded Agent-panel composer** — iced assigned the prompt into
+     `AgentUi.input` unbounded, so a paste could sit past the 16 KiB
+     `submit_user` envelope and carry ESC into the session. `set_input` now
+     keeps newlines and tabs, drops other controls, and truncates on a UTF-8
+     boundary at `NATIVE_AGENT_FOLLOW_UP_MAX_BYTES`.
+

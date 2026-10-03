@@ -26,6 +26,11 @@ use jterm_core::ai::{AiCancellationToken, AiClient, BlockContext, Provider};
 use std::path::Path;
 
 const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
+/// Live Agent-panel composer budget: same 16 KiB envelope `submit_user`
+/// and native follow-up already refuse, so iced cannot hold more than the
+/// session will accept.
+pub(crate) const MAX_AGENT_COMPOSER_BYTES: usize =
+    crate::agent_task::NATIVE_AGENT_FOLLOW_UP_MAX_BYTES;
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
     Some(dirs::config_dir()?.join("frost").join("agent_session.json"))
@@ -579,6 +584,10 @@ impl AgentUi {
         self.loading
     }
 
+    pub fn set_input(&mut self, text: impl Into<String>) {
+        self.input = bound_composer(text);
+    }
+
     pub fn submit_input(&mut self) {
         let message = self.input.trim().to_string();
         if message.is_empty() {
@@ -939,6 +948,22 @@ impl AgentUi {
             truncated: completed.output.len() >= MANUAL_OUTPUT_TRUNCATION_HINT,
         });
     }
+}
+
+fn bound_composer(text: impl Into<String>) -> String {
+    let mut text: String = text
+        .into()
+        .chars()
+        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .collect();
+    if text.len() > MAX_AGENT_COMPOSER_BYTES {
+        let mut end = MAX_AGENT_COMPOSER_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1932,5 +1957,21 @@ mod tests {
             .next_model_request(&ai_config(), Some("/tmp"))
             .is_some());
         assert!(agent.reply_preview().is_none());
+    }
+
+    #[test]
+    fn composer_keeps_newlines_and_truncates_to_the_session_envelope() {
+        let mut agent = AgentUi::new();
+        agent.set_input("please\n\u{1b}fix");
+        assert_eq!(agent.input, "please\nfix");
+        agent.set_input("a\tb");
+        assert_eq!(agent.input, "a\tb");
+        agent.set_input(format!("{}y", "x".repeat(MAX_AGENT_COMPOSER_BYTES)));
+        assert_eq!(agent.input.len(), MAX_AGENT_COMPOSER_BYTES);
+        assert!(!agent.input.contains('y'));
+        agent.set_input(format!("{}z", "界".repeat(MAX_AGENT_COMPOSER_BYTES)));
+        assert!(agent.input.len() <= MAX_AGENT_COMPOSER_BYTES);
+        assert!(agent.input.is_char_boundary(agent.input.len()));
+        assert!(!agent.input.contains('z'));
     }
 }

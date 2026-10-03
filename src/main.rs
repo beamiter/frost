@@ -13107,7 +13107,7 @@ impl Frost {
             }
             Message::TaskTerminalOpen(task_id) => self.task_open_terminal(task_id),
             Message::TaskTick => self.tasks_tick(),
-            Message::AgentInput(value) => self.agent.input = value,
+            Message::AgentInput(value) => self.agent.set_input(value),
             Message::AgentSubmit => {
                 self.agent.submit_input();
                 if let Some(task) = self.agent_drive_task() {

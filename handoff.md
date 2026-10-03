@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 192 — bounded Agent-panel composer)
+
+## 2026-10-03 (upgrade round 192)
+
+- Agent-panel composer keeps newlines/tabs, drops other controls, and
+  truncates at 16 KiB so iced cannot hold more than `submit_user` accepts.
+- `cargo test --locked --bin frost -- agent::tests::composer_keeps_newlines_and_truncates_to_the_session_envelope` passed.
+
 Updated: 2026-10-03 (upgrade round 191 — bounded AI-chats title draft)
 
 ## 2026-10-03 (upgrade round 191)
