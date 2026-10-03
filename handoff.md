@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 208 — bounded theme hex draft)
+
+## 2026-10-03 (upgrade round 208)
+
+- Theme editor hex fields keep an optional `#` plus six hex digits so iced
+  cannot hold more than `Theme::hex_to_rgb` will parse.
+- `cargo test --locked --bin frost -- theme::tests::theme_hex_draft_keeps_an_optional_hash_and_six_digits` passed.
+
 Updated: 2026-10-03 (upgrade round 207 — bounded custom theme name draft)
 
 ## 2026-10-03 (upgrade round 207)

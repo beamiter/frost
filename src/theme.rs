@@ -27,6 +27,29 @@ pub(crate) fn bound_custom_theme_name(name: impl Into<String>) -> String {
     bounded
 }
 
+/// Live theme-editor hex field: optional `#` plus six digits, matching
+/// `Theme::hex_to_rgb` so a paste cannot sit unbounded next to a swatch.
+pub(crate) const MAX_THEME_HEX_DIGITS: usize = 6;
+
+pub(crate) fn bound_theme_hex_draft(hex: impl Into<String>) -> String {
+    let mut bounded = String::new();
+    let mut digits = 0usize;
+    for ch in hex.into().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if ch == '#' && bounded.is_empty() {
+            bounded.push('#');
+            continue;
+        }
+        if ch.is_ascii_hexdigit() && digits < MAX_THEME_HEX_DIGITS {
+            bounded.push(ch);
+            digits += 1;
+        }
+    }
+    bounded
+}
+
 /// iced color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color;
@@ -101,7 +124,10 @@ impl ThemeExt for Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{bound_custom_theme_name, Theme, ThemeExt as _, MAX_CUSTOM_THEME_NAME_BYTES};
+    use super::{
+        bound_custom_theme_name, bound_theme_hex_draft, Theme, ThemeExt as _,
+        MAX_CUSTOM_THEME_NAME_BYTES,
+    };
     use iced::Color;
 
     #[test]
@@ -142,5 +168,13 @@ mod tests {
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
         assert!(Theme::validate_custom_theme_name(&filled).is_ok());
+    }
+
+    #[test]
+    fn theme_hex_draft_keeps_an_optional_hash_and_six_digits() {
+        assert_eq!(bound_theme_hex_draft("#aA\n\u{1b}bbcczz"), "#aAbbcc");
+        assert_eq!(bound_theme_hex_draft("1122334455"), "112233");
+        assert_eq!(bound_theme_hex_draft("##ff00aa"), "#ff00aa");
+        assert_eq!(Theme::hex_to_rgb(&bound_theme_hex_draft("#00ff00")), Some([0, 255, 0]));
     }
 }

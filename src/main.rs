@@ -15078,7 +15078,7 @@ impl Frost {
             Message::ThemeEditColor(idx, hex) => {
                 if let Some(ed) = &mut self.theme_editor {
                     if let Some(slot) = ed.hexes.get_mut(idx) {
-                        *slot = hex;
+                        *slot = crate::theme::bound_theme_hex_draft(hex);
                     }
                 }
             }

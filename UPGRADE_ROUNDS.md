@@ -1230,3 +1230,7 @@ everywhere except a resize, and an audit against ember found the rest.
      save refused. `ThemeEditName` now drops controls, path separators, and
      visual spoofing, and truncates at the core filename envelope.
 
+208. **Bounded theme hex draft** — each color slot stored the raw paste, so
+     ESC and a megabyte hex string sat until save called `hex_to_rgb`.
+     `ThemeEditColor` now keeps an optional `#` plus six hex digits.
+
