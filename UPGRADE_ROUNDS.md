@@ -1095,3 +1095,10 @@ everywhere except a resize, and an audit against ember found the rest.
      boundary, and are the only write path from both the widget and the
      keyboard handler.
 
+184. **Bounded terminal-find query** — the in-buffer search bar assigned iced
+     `text_input` and raw key text to an unbounded `String`, so a paste could
+     compile an unbounded regex against scrollback. `set_query` /
+     `push_query_text` / `backspace` now drop controls, truncate on a UTF-8
+     boundary at the same 4 KiB budget as block search, and history recall
+     applies the same bound without dropping the navigation index.
+
