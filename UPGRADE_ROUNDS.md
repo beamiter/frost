@@ -1162,3 +1162,9 @@ everywhere except a resize, and an audit against ember found the rest.
      `TabRenameInput` and `apply_tab_rename` now share `bound_tab_title_draft`
      (drop controls, truncate at `MAX_RESTORED_TAB_TITLE_BYTES`).
 
+195. **Bounded sidebar filter** — the files-panel filter assigned iced
+     `text_input` into `sidebar_filter` unbounded, so a paste could restyle
+     the tree match and grow without the family's 4 KiB overlay budget.
+     `bound_sidebar_filter` now drops controls and truncates on a UTF-8
+     boundary at `MAX_PICKER_QUERY_BYTES`.
+

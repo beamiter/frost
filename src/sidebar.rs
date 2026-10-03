@@ -31,6 +31,25 @@ const DIRECTORY_RETRY_CAP: Duration = Duration::from_secs(60);
 const MAX_NAVIGATION_HISTORY: usize = 32;
 const MAX_CACHED_ROOTS: usize = 8;
 pub const MAX_NAVIGATION_PATH_BYTES: usize = 4_096;
+/// One-line files-panel filter, same overlay budget as pickers so a paste
+/// cannot grow the iced field without bound.
+pub const MAX_SIDEBAR_FILTER_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
+pub fn bound_sidebar_filter(query: impl Into<String>) -> String {
+    let mut query: String = query
+        .into()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if query.len() > MAX_SIDEBAR_FILTER_BYTES {
+        let mut end = MAX_SIDEBAR_FILTER_BYTES;
+        while end > 0 && !query.is_char_boundary(end) {
+            end -= 1;
+        }
+        query.truncate(end);
+    }
+    query
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryRequestPriority {
@@ -3148,5 +3167,17 @@ mod tests {
             "a".repeat(MAX_NAVIGATION_PATH_BYTES)
         ))
         .is_err());
+    }
+
+    #[test]
+    fn sidebar_filter_drops_controls_and_truncates_on_a_char_boundary() {
+        assert_eq!(bound_sidebar_filter("src\n\u{1b}/lib"), "src/lib");
+        let filled = bound_sidebar_filter(format!("{}y", "x".repeat(MAX_SIDEBAR_FILTER_BYTES)));
+        assert_eq!(filled.len(), MAX_SIDEBAR_FILTER_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow = bound_sidebar_filter(format!("{}z", "界".repeat(MAX_SIDEBAR_FILTER_BYTES)));
+        assert!(overflow.len() <= MAX_SIDEBAR_FILTER_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
     }
 }

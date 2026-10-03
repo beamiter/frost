@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 195 — bounded sidebar filter)
+
+## 2026-10-03 (upgrade round 195)
+
+- Files-panel filter drops controls and truncates at 4 KiB so iced cannot
+  grow past the overlay query budget.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_filter_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-03 (upgrade round 194 — bounded tab-rename draft)
 
 ## 2026-10-03 (upgrade round 194)
