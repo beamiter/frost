@@ -25,7 +25,15 @@ pub fn bound_api_key_draft(value: impl Into<String>) -> String {
     let mut value: String = value
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if value.len() > MAX_API_KEY_DRAFT_BYTES {
         let mut end = MAX_API_KEY_DRAFT_BYTES;
@@ -1399,5 +1407,9 @@ mod tests {
         assert!(overflow.len() <= MAX_API_KEY_DRAFT_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        let spoofed = bound_api_key_draft("sk-\u{202e}secret");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(spoofed.contains('\u{fffd}'));
+        assert!(spoofed.starts_with("sk-"));
     }
 }

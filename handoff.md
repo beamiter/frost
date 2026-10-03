@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 271 — API-key draft strips visual spoofing)
+
+## 2026-10-04 (upgrade round 271)
+
+- Settings API-key drafts replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- persistence::tests::api_key_draft_drops_controls_and_leaves_room_for_the_file_newline` passed.
+
 Updated: 2026-10-04 (upgrade round 270 — tab-switcher query strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 270)

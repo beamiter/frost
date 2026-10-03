@@ -1498,3 +1498,6 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi in the filter. Query ingest now replaces
      spoofing with U+FFFD.
 
+271. **API-key draft strips visual spoofing** — the settings key field dropped
+     controls but kept bidi. Draft ingest now replaces spoofing with U+FFFD.
+
