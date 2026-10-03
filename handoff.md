@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 215 — bounded sidebar transfer/busy notices)
+
+## 2026-10-03 (upgrade round 215)
+
+- Files-panel transfer status and busy scan errors drop controls/spoofing
+  and truncate at 192 bytes.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 214 — bounded AI-chats composer)
 
 ## 2026-10-03 (upgrade round 214)

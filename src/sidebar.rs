@@ -51,6 +51,20 @@ pub fn bound_sidebar_filter(query: impl Into<String>) -> String {
     query
 }
 
+/// Files-panel status/error chrome: interpolated names and backend errors
+/// must not restyle the tree or grow without bound.
+pub const MAX_SIDEBAR_NOTICE_BYTES: usize = 192;
+
+pub fn bound_sidebar_notice(text: impl AsRef<str>) -> String {
+    let text =
+        jterm_core::review_input::safe_inline_display(text.as_ref(), MAX_SIDEBAR_NOTICE_BYTES);
+    if text.is_empty() {
+        "Files panel notice".to_string()
+    } else {
+        text
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryRequestPriority {
     High,
@@ -134,7 +148,7 @@ impl DirectoryError {
     pub fn busy(message: impl Into<String>) -> Self {
         Self {
             kind: DirectoryErrorKind::Busy,
-            message: message.into(),
+            message: bound_sidebar_notice(message.into()),
             retryable: true,
         }
     }
@@ -3216,5 +3230,20 @@ mod tests {
         assert!(overflow.len() <= MAX_NAVIGATION_PATH_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+    }
+
+    #[test]
+    fn sidebar_notice_replaces_controls_and_stays_bounded() {
+        let shown = bound_sidebar_notice(format!(
+            "download \u{1b}[31m\u{202e}{}… 1 KiB",
+            "n".repeat(400)
+        ));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        let busy = DirectoryError::busy(format!("queue full \u{1b}{}", "x".repeat(400)));
+        assert!(!busy.message.contains('\u{1b}'));
+        assert!(busy.message.len() <= MAX_SIDEBAR_NOTICE_BYTES);
     }
 }

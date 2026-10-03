@@ -1262,3 +1262,8 @@ everywhere except a resize, and an audit against ember found the rest.
      could restyle the composer until send. `set_draft` now keeps newlines and
      tabs, drops other controls, and truncates at `MAX_LIVE_MESSAGE_BYTES`.
 
+215. **Bounded sidebar transfer/busy notices** — transfer progress interpolated
+     filenames and `DirectoryError::busy` stored backend text verbatim, so
+     ESC/bidi and a long name could restyle the files panel. Both now go
+     through `safe_inline_display` at 192 bytes.
+

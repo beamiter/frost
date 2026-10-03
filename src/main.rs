@@ -2135,14 +2135,17 @@ impl SidebarTransferUi {
     fn status_text(&self) -> String {
         let done = remote_fs::format_bytes(self.progress.bytes());
         match self.total {
-            Some(total) => format!(
+            Some(total) => crate::sidebar::bound_sidebar_notice(format!(
                 "{} {}… {} / {}",
                 self.verb,
                 self.name,
                 done,
                 remote_fs::format_bytes(total)
-            ),
-            None => format!("{} {}… {}", self.verb, self.name, done),
+            )),
+            None => crate::sidebar::bound_sidebar_notice(format!(
+                "{} {}… {}",
+                self.verb, self.name, done
+            )),
         }
     }
 }
