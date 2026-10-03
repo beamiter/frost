@@ -11,7 +11,15 @@ fn bound_field(text: impl Into<String>, max_bytes: usize) -> String {
     let mut text: String = text
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if text.len() > max_bytes {
         let mut end = max_bytes;
@@ -227,5 +235,11 @@ mod tests {
             crate::review_text::MAX_PROMPT_INSERT_BYTES
         );
         assert!(!panel.replace_input.contains('z'));
+        panel.set_search_input("err\u{202e}or");
+        assert!(!panel.search_input.contains('\u{202e}'));
+        assert!(panel.search_input.contains('\u{fffd}'));
+        panel.set_replace_input("ok\u{202e}");
+        assert!(!panel.replace_input.contains('\u{202e}'));
+        assert!(panel.replace_input.contains('\u{fffd}'));
     }
 }

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 263 — Find & Replace fields strip visual spoofing)
+
+## 2026-10-04 (upgrade round 263)
+
+- Find & Replace search/replace fields replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- search_replace_panel::tests::find_and_replace_fields_drop_controls_and_truncate` passed.
+
 Updated: 2026-10-04 (upgrade round 262 — Find-bar query strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 262)

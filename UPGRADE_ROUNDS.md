@@ -1466,3 +1466,7 @@ everywhere except a resize, and an audit against ember found the rest.
      controls but kept bidi in the regex/literal query (and history restore).
      Query ingest now replaces spoofing with U+FFFD.
 
+263. **Find & Replace fields strip visual spoofing** — search and replace
+     inputs dropped controls but kept bidi. Field ingest now replaces
+     spoofing with U+FFFD.
+
