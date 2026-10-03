@@ -1578,3 +1578,7 @@ everywhere except a resize, and an audit against ember found the rest.
 291. **xterm modifyOtherKeys skips visual spoofing in committed text** — the
      report used the first non-control scalar, including bidi. Spoofing is
      skipped so the real layout character remains the key codepoint.
+
+292. **Files listings skip control and spoofed names** — remote/local directory
+     rows kept newline and bidi filenames. Those names are now omitted before
+     they can become clickable tree entries.

@@ -1028,7 +1028,7 @@ fn parse_list_listing(bytes: &[u8], dir: &Path, show_hidden: bool) -> DirectoryL
         let Ok(name) = std::str::from_utf8(name) else {
             continue;
         };
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        if !listing_name_is_safe(name) {
             continue;
         }
         // Match the sidebar behavior. Hidden files remain available by typing
@@ -1052,6 +1052,17 @@ fn parse_list_listing(bytes: &[u8], dir: &Path, show_hidden: bool) -> DirectoryL
     }
     sort_entries(&mut entries);
     DirectoryListing { entries, truncated }
+}
+
+fn listing_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.chars().any(|character| {
+            character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
 }
 
 /// Local one-level listing with the same policy (dotfiles hidden, same sort,
@@ -1104,6 +1115,9 @@ fn local_list_dir_listing_with_cancel(
             )
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !listing_name_is_safe(&name) {
+            continue;
+        }
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -3341,15 +3355,18 @@ mod tests {
         bytes.extend_from_slice("f\0�� raw\0".as_bytes());
         bytes.extend_from_slice(b"f\0dir one\0");
         bytes.extend_from_slice(b"f\0nested/name\0");
+        bytes.extend_from_slice("f\0ok\u{202e}name\0".as_bytes());
         bytes.extend_from_slice(b"x\0unknown kind\0");
         // A dangling half-pair (as a capped read leaves) is simply dropped.
         bytes.extend_from_slice(b"d\0");
         let entries = parse_list(&bytes, dir);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["dir one", "line\nbreak", "sym link", "�� raw"]);
+        assert_eq!(names, vec!["dir one", "sym link", "�� raw"]);
         assert!(entries[0].is_dir);
         assert!(!entries[1].is_dir && !entries[2].is_dir);
-        assert_eq!(entries[3].path, dir.join("�� raw"));
+        assert_eq!(entries[2].path, dir.join("�� raw"));
+        assert!(entries.iter().all(|entry| !entry.name.contains('\u{202e}')));
+        assert!(entries.iter().all(|entry| !entry.name.contains('\n')));
         assert_eq!(
             entries
                 .iter()

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 292 — Files listings skip control and spoofed names)
+
+## 2026-10-04 (upgrade round 292)
+
+- Remote and local directory listings omit control-bearing and visually spoofed names.
+- `cargo test --locked --bin frost -- remote_fs::tests::parse_list_skips_unsafe_names_and_deduplicates_paths` passed.
+
 Updated: 2026-10-04 (upgrade round 291 — xterm modifyOtherKeys skips visual spoofing in committed text)
 
 ## 2026-10-04 (upgrade round 291)
