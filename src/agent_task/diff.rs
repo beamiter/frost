@@ -211,6 +211,13 @@ impl AgentDiffPanel {
         self.requested_base.as_deref()
     }
 
+    pub(crate) fn display_requested_base(&self) -> String {
+        crate::review_text::bound_toast_text(format!(
+            "git diff {}",
+            self.requested_base().unwrap_or("HEAD")
+        ))
+    }
+
     fn apply_result(&mut self, result: WorkerResult) {
         self.state.loading = false;
         match result {
@@ -1148,6 +1155,13 @@ mod tests {
             );
         }
         assert!(valid_diff_base("0123456789abcdef0123456789abcdef01234567"));
+        let mut shown = AgentDiffPanel::new();
+        shown.requested_base = Some(format!("HEAD\u{1b}[31m\u{202e}{}", "x".repeat(400)));
+        let line = shown.display_requested_base();
+        assert!(!line.contains('\u{1b}'));
+        assert!(!line.contains('\u{202e}'));
+        assert!(line.starts_with("git diff "));
+        assert!(line.len() <= crate::review_text::MAX_TOAST_BYTES);
     }
 
     #[cfg(unix)]

@@ -22899,10 +22899,7 @@ impl Frost {
             let mut diff_card = column![].spacing(4);
             diff_card = diff_card.push(
                 row![
-                    text(format!(
-                        "git diff {}",
-                        self.task_panel.diff.requested_base().unwrap_or("HEAD")
-                    ))
+                    text(self.task_panel.diff.display_requested_base())
                     .size(10)
                     .style(text::secondary),
                     Space::new().width(Length::Fill),

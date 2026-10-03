@@ -1454,3 +1454,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi in model replies and user edits. Draft
      ingest now replaces spoofing with U+FFFD.
 
+260. **Bounded Agent-task git-diff header** — the diff card interpolated
+     `requested_base()` as iced text. The header now uses the toast envelope
+     (`display_requested_base`).
+

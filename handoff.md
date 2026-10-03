@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 260 — bounded Agent-task git-diff header)
+
+## 2026-10-04 (upgrade round 260)
+
+- Agent-task diff card header sanitizes the requested git base before iced draw.
+- `cargo test --locked --bin frost -- agent_task::diff::tests::task_diff_base_requires_a_full_object_id` passed.
+
 Updated: 2026-10-04 (upgrade round 259 — Ask-AI draft strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 259)
