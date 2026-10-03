@@ -1610,3 +1610,7 @@ everywhere except a resize, and an audit against ember found the rest.
 299. **Custom theme names refuse U+FFFD** — editor ingest replaced bidi with
      replacement characters, but save still accepted them as filenames.
      Persist validation now refuses U+FFFD.
+
+300. **Restored tab titles refuse spoofing** — snapshot titles with controls,
+     bidi marks, or U+FFFD are discarded instead of becoming custom labels.
+     Rename persist uses the same fail-closed check.

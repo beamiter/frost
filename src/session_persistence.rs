@@ -49,6 +49,28 @@ pub fn bound_tab_title_draft(raw: impl Into<String>) -> String {
     }
     bounded
 }
+
+fn restored_tab_title_raw_is_invalid(title: &str) -> bool {
+    title.len() > MAX_RESTORED_TAB_TITLE_BYTES
+        || title.chars().any(|character| {
+            character.is_control()
+                || character == '\u{fffd}'
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
+}
+
+fn restored_tab_title_is_invalid(title: &str) -> bool {
+    title.trim().is_empty() || restored_tab_title_raw_is_invalid(title)
+}
+
+/// Apply a rename only when the bounded draft is a persistable label.
+/// Replacement characters stay in the iced field; they do not become the
+/// snapshot title.
+pub fn persistable_tab_title(raw: impl Into<String>) -> Option<String> {
+    let cleaned = bound_tab_title_draft(raw).trim().to_string();
+    (!restored_tab_title_is_invalid(&cleaned)).then_some(cleaned)
+}
+
 const MAX_RESTORED_AXIS_BYTES: usize = 10;
 const MAX_LEGAL_RESTORED_TEXT_BYTES: usize = MAX_RESTORED_SESSIONS * MAX_RESTORED_CWD_BYTES
     + MAX_RESTORED_TABS * MAX_RESTORED_TAB_TITLE_BYTES
@@ -1179,11 +1201,12 @@ impl serde::de::Visitor<'_> for TitleValueVisitor<'_> {
     }
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if restored_tab_title_raw_is_invalid(value) {
+            self.budget.invalid_titles += 1;
+            return Ok(None);
+        }
         let bounded = bound_tab_title_draft(value);
-        if bounded.trim().is_empty()
-            || bounded.len() > MAX_RESTORED_TAB_TITLE_BYTES
-            || bounded.chars().any(char::is_control)
-        {
+        if restored_tab_title_is_invalid(&bounded) {
             self.budget.invalid_titles += 1;
             return Ok(None);
         }
@@ -1663,16 +1686,14 @@ impl SessionsSnapshot {
         // U+FFFD；替换后为空的标题按无效处理。
         let mut invalid_titles = 0usize;
         for tab in &mut self.tabs {
-            if let Some(title) = tab.title.as_mut() {
-                *title = bound_tab_title_draft(title.as_str());
-            }
             if tab.title.as_ref().is_some_and(|title| {
-                title.trim().is_empty()
-                    || title.len() > MAX_RESTORED_TAB_TITLE_BYTES
-                    || title.chars().any(|c| c.is_control())
+                restored_tab_title_raw_is_invalid(title)
+                    || restored_tab_title_is_invalid(&bound_tab_title_draft(title.as_str()))
             }) {
                 tab.title = None;
                 invalid_titles += 1;
+            } else if let Some(title) = tab.title.as_mut() {
+                *title = bound_tab_title_draft(title.as_str());
             }
         }
         if invalid_titles > 0 {
@@ -2537,10 +2558,10 @@ mod tests {
     }
 
     /// Cf bidi overrides/isolates are not Cc, so the `is_control` check lets
-    /// them through. Restored titles get the same replacement as the live
-    /// OSC-title path: invisible marks become U+FFFD on the tab strip.
+    /// them through. Restored titles that still contain U+FFFD after ingest
+    /// are discarded rather than drawn as a custom label.
     #[test]
-    fn restored_tab_titles_strip_bidi_formatting_characters() {
+    fn restored_tab_titles_reject_visual_spoofing() {
         let root = scratch("tab-titles-bidi");
         let path = root.join("session_history.json");
         let tab = |title: Option<&str>| TabSnapshot {
@@ -2571,17 +2592,12 @@ mod tests {
         let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
             panic!("bounded valid JSON should load");
         };
-        assert_eq!(restored.tabs[0].title.as_deref(), Some("bu\u{fffd}ild"));
-        // A title that was nothing but bidi marks becomes replacement chars
-        // so the spoofing stays visible instead of disappearing.
-        assert_eq!(
-            restored.tabs[1].title.as_deref(),
-            Some("\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}")
-        );
-        assert_eq!(
-            restored.tabs[2].title.as_deref(),
-            Some("\u{fffd}build\u{fffd}")
-        );
+        assert_eq!(restored.tabs[0].title, None);
+        assert_eq!(restored.tabs[1].title, None);
+        assert_eq!(restored.tabs[2].title, None);
+        assert!(persistable_tab_title("ok\u{202e}title").is_none());
+        assert_eq!(persistable_tab_title("build").as_deref(), Some("build"));
+        assert!(persistable_tab_title("   ").is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

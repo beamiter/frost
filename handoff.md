@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 300 — Restored tab titles refuse spoofing)
+
+## 2026-10-04 (upgrade round 300)
+
+- Restored and renamed tab titles refuse controls, visual spoofing, and U+FFFD instead of persisting neutralized labels.
+- `cargo test --locked --bin frost -- session_persistence::tests::restored_tab_titles_reject_visual_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 299 — Custom theme names refuse U+FFFD)
 
 ## 2026-10-04 (upgrade round 299)

@@ -7235,10 +7235,7 @@ impl Frost {
         };
         // The title is persisted and drawn verbatim in the strip; hold it to
         // the same contract the snapshot loader enforces on the way back in.
-        let cleaned = session_persistence::bound_tab_title_draft(raw)
-            .trim()
-            .to_string();
-        self.tabs[tab].title = (!cleaned.is_empty()).then_some(cleaned);
+        self.tabs[tab].title = session_persistence::persistable_tab_title(raw);
         self.session_dirty = true;
     }
 
