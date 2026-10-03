@@ -56,7 +56,7 @@ pub(crate) fn validate_single_line(text: &str, max_bytes: usize) -> Result<&str,
     if text.chars().any(char::is_control) {
         return Err(ReviewTextError::ControlCharacter);
     }
-    if jterm_core::review_input::contains_visual_spoofing(text) {
+    if text.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(text) {
         return Err(ReviewTextError::VisualSpoof);
     }
     Ok(text)
@@ -126,7 +126,10 @@ pub(crate) fn sanitize_prompt_payload(
             }
             '\n' | '\t' => sanitized.push(character),
             control if is_c0_or_c1(control) => {}
-            visual if jterm_core::review_input::is_visual_spoofing_character(visual) => {
+            visual
+                if visual == '\u{fffd}'
+                    || jterm_core::review_input::is_visual_spoofing_character(visual) =>
+            {
                 return Err(ReviewTextError::VisualSpoof);
             }
             visible => sanitized.push(visible),
@@ -314,6 +317,14 @@ mod tests {
             );
         }
         assert!(validate_single_line("printf '编译🙂'", 256 * 1024).is_ok());
+        assert_eq!(
+            validate_single_line("printf ok\u{fffd}", 256 * 1024),
+            Err(ReviewTextError::VisualSpoof)
+        );
+        assert_eq!(
+            sanitize_prompt_payload("echo ok\u{fffd}\n", 256 * 1024),
+            Err(ReviewTextError::VisualSpoof)
+        );
     }
 
     #[test]

@@ -1626,3 +1626,7 @@ everywhere except a resize, and an audit against ember found the rest.
 303. **OSC 5522 mime refuses spoofing** — clipboard-read mime types that are
      empty, overlong, non-ASCII, or visually spoofed are refused with ENOSYS
      instead of being queued for a host clipboard read.
+
+304. **Review text refuses U+FFFD** — single-line review validation and prompt
+     payload sanitization refuse replacement characters so a neutralized
+     spoofed draft cannot be approved or inserted into the shell.

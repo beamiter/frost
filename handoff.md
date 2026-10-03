@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 304 — Review text refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 304)
+
+- Single-line review validation and prompt-payload sanitization refuse U+FFFD so a neutralized draft cannot be approved or inserted.
+- `cargo test --locked --bin frost -- review_text::tests::validator_rejects_the_complete_visual_spoof_contract` passed.
+
 Updated: 2026-10-04 (upgrade round 303 — OSC 5522 mime refuses spoofing)
 
 ## 2026-10-04 (upgrade round 303)
