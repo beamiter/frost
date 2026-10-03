@@ -1433,3 +1433,7 @@ everywhere except a resize, and an audit against ember found the rest.
      extras after sanitizing the command. The whole line now runs
      `display_block_search_text`.
 
+255. **Bounded native-session snapshot chrome** — phase Debug, command
+     status, and approval-kind Debug were interpolated as iced text. Those now
+     use the toast / visible_bounded envelopes.
+

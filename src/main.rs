@@ -22623,7 +22623,10 @@ impl Frost {
         // approvals (display-and-deny) and bounded completed-turn history.
         if let Some(snapshot) = self.agent_runtime.snapshot(task.id) {
             card = card.push(
-                text(format!("Native session: {:?}", snapshot.phase))
+                text(crate::review_text::bound_toast_text(format!(
+                    "Native session: {:?}",
+                    snapshot.phase
+                )))
                     .size(11)
                     .style(text::secondary),
             );
@@ -22658,7 +22661,10 @@ impl Frost {
                     text(format!(
                         "$ {} · {}",
                         crate::review_text::visible_bounded(&command.command, 512),
-                        command.status
+                        crate::review_text::visible_bounded(
+                            &command.status.to_string(),
+                            64
+                        )
                     ))
                     .size(10)
                     .style(text::secondary),
@@ -22667,10 +22673,10 @@ impl Frost {
             for approval in &snapshot.pending_approvals {
                 let mut approval_card = column![].spacing(4);
                 approval_card = approval_card.push(
-                    text(format!(
+                    text(crate::review_text::bound_toast_text(format!(
                         "Managed approval request ({:?}); accepting is disabled",
                         approval.kind
-                    ))
+                    )))
                     .size(11)
                     .style(text::danger),
                 );

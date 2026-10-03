@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 255 — bounded native-session snapshot chrome)
+
+## 2026-10-04 (upgrade round 255)
+
+- Native session phase, command status, and approval-kind labels sanitize before iced draw.
+- `cargo test --locked --bin frost -- review_text::tests::toast_text_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 254 — bounded block overlay meta chrome)
 
 ## 2026-10-04 (upgrade round 254)

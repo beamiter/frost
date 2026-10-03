@@ -326,6 +326,14 @@ mod tests {
         assert!(shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_TOAST_BYTES);
         assert!(shown.starts_with("Remote host"));
+        let phase = bound_toast_text(format!(
+            "Native session: Running\u{1b}[31m\u{202e}{}",
+            "x".repeat(400)
+        ));
+        assert!(!phase.contains('\u{1b}'));
+        assert!(!phase.contains('\u{202e}'));
+        assert!(phase.len() <= MAX_TOAST_BYTES);
+        assert!(phase.starts_with("Native session:"));
     }
 
     #[test]
