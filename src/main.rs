@@ -13129,13 +13129,10 @@ impl Frost {
                 }
             }
             Message::AgentEditStart(id, command) => {
-                match crate::review_text::validate_single_line(
-                    &command,
-                    crate::review_text::MAX_AGENT_COMMAND_BYTES,
-                ) {
-                    Ok(_) => self.agent.edit = Some((id, command)),
-                    Err(error) => {
-                        self.agent.set_status(format!("Agent edit rejected: {error}"));
+                match crate::review_text::prepared_agent_edit_command(command) {
+                    Some(command) => self.agent.edit = Some((id, command)),
+                    None => {
+                        self.agent.set_status("Agent edit rejected: empty command");
                         self.agent.edit = None;
                     }
                 }

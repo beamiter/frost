@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 221 — Agent edit start truncates)
+
+## 2026-10-03 (upgrade round 221)
+
+- Opening Agent proposal edit truncates oversized/control-bearing commands
+  instead of refusing the whole edit, matching the live iced field.
+- `cargo test --locked --bin frost -- review_text::tests::agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls` passed.
+
 Updated: 2026-10-03 (upgrade round 220 — bounded AI-chats lifecycle status)
 
 ## 2026-10-03 (upgrade round 220)

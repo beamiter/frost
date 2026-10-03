@@ -1290,3 +1290,8 @@ everywhere except a resize, and an audit against ember found the rest.
      with ESC/bidi could restyle the library chrome. `status_line` now runs
      `bound_chat_notice` at 256 bytes.
 
+221. **Agent edit start truncates instead of bouncing** — `AgentEditStart`
+     refused the whole proposal when the command was over budget or contained
+     a control, so Edit never opened. It now uses `prepared_agent_edit_command`
+     so an oversized paste still opens a truncated, control-stripped buffer.
+

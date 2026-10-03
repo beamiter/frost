@@ -83,6 +83,17 @@ pub(crate) fn bound_agent_edit_command(value: impl Into<String>) -> String {
     value
 }
 
+/// Open the Agent edit field from a proposal command. Oversized or
+/// control-bearing text truncates instead of refusing the whole edit.
+pub(crate) fn prepared_agent_edit_command(command: impl Into<String>) -> Option<String> {
+    let command = bound_agent_edit_command(command);
+    if command.trim_matches(' ').is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
 fn is_c0_or_c1(character: char) -> bool {
     matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f)
 }
@@ -332,5 +343,14 @@ mod tests {
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
         assert!(bound_agent_edit_command("").is_empty());
+        let oversized = format!("{}y", "x".repeat(MAX_AGENT_COMMAND_BYTES));
+        let opened = prepared_agent_edit_command(oversized).expect("truncate opens edit");
+        assert_eq!(opened.len(), MAX_AGENT_COMMAND_BYTES);
+        assert!(!opened.contains('y'));
+        assert!(prepared_agent_edit_command("\u{1b}\n").is_none());
+        assert_eq!(
+            prepared_agent_edit_command("ls\n\u{1b} -la").as_deref(),
+            Some("ls -la")
+        );
     }
 }
