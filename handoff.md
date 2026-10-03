@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 244 — bounded Files-tree filenames)
+
+## 2026-10-03 (upgrade round 244)
+
+- Files-tree row names sanitize spoofing at ingest and draw.
+- `cargo test --locked --bin frost -- sidebar::tests::file_tree_filename_strips_spoofing_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 243 — bounded Agent attached-context cmd)
 
 ## 2026-10-03 (upgrade round 243)

@@ -19243,7 +19243,7 @@ impl Frost {
         let mut label = row![
             Space::new().width(Length::Fixed(indent)),
             text(icon).size(12).width(Length::Fixed(14.0)),
-            text(node.name.clone()).size(12),
+            text(crate::sidebar::bound_sidebar_filename(node.name.clone())).size(12),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);

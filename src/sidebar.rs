@@ -70,6 +70,12 @@ pub fn bound_sidebar_path_label(path: impl AsRef<std::path::Path>) -> String {
     bound_sidebar_notice(path.as_ref().display().to_string())
 }
 
+/// File-tree row labels: same envelope as notices, but empty stays empty so a
+/// nameless entry is not rewritten as "Files panel notice".
+pub fn bound_sidebar_filename(name: impl AsRef<str>) -> String {
+    jterm_core::review_input::safe_inline_display(name.as_ref(), MAX_SIDEBAR_NOTICE_BYTES)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryRequestPriority {
     High,
@@ -233,7 +239,7 @@ impl FileTreeNode {
 
     fn entry(name: String, path: PathBuf, is_dir: bool) -> Self {
         Self {
-            name,
+            name: bound_sidebar_filename(name),
             path,
             is_dir,
             children: Vec::new(),
@@ -1604,11 +1610,13 @@ fn find_node<'a>(node: &'a FileTreeNode, path: &Path) -> Option<&'a FileTreeNode
 }
 
 fn display_name(path: &Path) -> String {
-    path.file_name()
+    let raw = path
+        .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| path.display().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    bound_sidebar_filename(raw)
 }
 
 fn push_navigation_history(history: &mut VecDeque<PathBuf>, path: PathBuf) {
@@ -3269,5 +3277,25 @@ mod tests {
         assert!(!listed.contains('\u{202e}'));
         assert!(listed.len() <= MAX_SIDEBAR_NOTICE_BYTES);
         assert!(listed.starts_with("/tmp/"));
+    }
+
+    #[test]
+    fn file_tree_filename_strips_spoofing_and_stays_bounded() {
+        let shown = bound_sidebar_filename(format!("secret\u{1b}[31m\u{202e}{}", "n".repeat(400)));
+        assert!(!shown.contains('\u{1b}'));
+        assert!(!shown.contains('\u{202e}'));
+        assert!(shown.contains('\u{fffd}'));
+        assert!(shown.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        assert!(shown.starts_with("secret"));
+        assert_eq!(bound_sidebar_filename(""), "");
+        let node = FileTreeNode::entry(
+            format!("\u{202e}{}", "x".repeat(400)),
+            PathBuf::from("/tmp/x"),
+            false,
+        );
+        assert!(!node.name.contains('\u{202e}'));
+        assert!(node.name.len() <= MAX_SIDEBAR_NOTICE_BYTES);
+        let leaf = display_name(Path::new("/tmp/\u{202e}readme"));
+        assert!(!leaf.contains('\u{202e}'));
     }
 }

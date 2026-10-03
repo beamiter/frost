@@ -1391,3 +1391,7 @@ everywhere except a resize, and an audit against ember found the rest.
      interpolated `last_manual_completed.cmd` (up to the history command
      budget) as iced text. Display now uses the diagnostic envelope.
 
+244. **Bounded Files-tree entry names** — directory listings interpolated
+     remote/local filenames as iced text. Names now share the sidebar
+     envelope (without the empty-notice fallback).
+
