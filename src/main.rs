@@ -18653,13 +18653,13 @@ impl Frost {
     /// right-clicking a row (or the empty area below it) opens the file-ops
     /// menu.
     fn sidebar_files_view(&self) -> Element<'_, Message> {
-        let title = self
-            .sidebar
-            .current_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("/")
-            .to_string();
+        let title = crate::sidebar::bound_sidebar_filename(
+            self.sidebar
+                .current_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("/"),
+        );
         let mut back_button = button(text("←").size(12))
             .padding([2, 6])
             .style(self.ghost_btn_style());

@@ -3297,5 +3297,9 @@ mod tests {
         assert!(node.name.len() <= MAX_SIDEBAR_NOTICE_BYTES);
         let leaf = display_name(Path::new("/tmp/\u{202e}readme"));
         assert!(!leaf.contains('\u{202e}'));
+        let header = bound_sidebar_filename("proj\u{1b}[31m\u{202e}src");
+        assert!(!header.contains('\u{1b}'));
+        assert!(!header.contains('\u{202e}'));
+        assert!(header.starts_with("proj"));
     }
 }

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 251 — bounded Files-panel header leaf)
+
+## 2026-10-04 (upgrade round 251)
+
+- Files panel header leaf uses `bound_sidebar_filename`.
+- `cargo test --locked --bin frost -- sidebar::tests::file_tree_filename_strips_spoofing_and_stays_bounded` passed.
+
 Updated: 2026-10-03 (upgrade round 250 — bounded AI chat library rows)
 
 ## 2026-10-03 (upgrade round 250)
