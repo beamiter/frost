@@ -1563,3 +1563,7 @@ everywhere except a resize, and an audit against ember found the rest.
      refused controls but still admitted bidi and zero-width names. Spoofed
      members now fail the archive instead of extracting.
 
+288. **Remote home probe rejects remaining visual spoofing** — login-home
+     ingest dropped bidi marks but kept zero-width spoofing. The probe now
+     refuses any visually spoofed absolute path.
+

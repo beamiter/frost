@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 288 — Remote home probe rejects remaining visual spoofing)
+
+## 2026-10-04 (upgrade round 288)
+
+- Remote login-home probes refuse zero-width and other visual spoofing, not only bidi marks.
+- `cargo test --locked --bin frost -- remote_fs::tests::remote_home_output_is_strict_absolute_utf8_and_single_line` passed.
+
 Updated: 2026-10-04 (upgrade round 287 — Remote archive members reject visual spoofing)
 
 ## 2026-10-04 (upgrade round 287)

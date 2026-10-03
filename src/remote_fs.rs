@@ -1211,23 +1211,9 @@ fn parse_start_dir_output(stdout: &[u8]) -> io::Result<PathBuf> {
     let home = text.strip_suffix('\n').unwrap_or(text);
     let home = home.strip_suffix('\r').unwrap_or(home);
     let unsafe_text = home.is_empty()
-        || home.chars().any(char::is_control)
-        || home.chars().any(|ch| {
-            matches!(
-                ch,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'
-                    | '\u{202b}'
-                    | '\u{202c}'
-                    | '\u{202d}'
-                    | '\u{202e}'
-                    | '\u{2066}'
-                    | '\u{2067}'
-                    | '\u{2068}'
-                    | '\u{2069}'
-            )
+        || home.chars().any(|character| {
+            character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
         });
     if unsafe_text || !Path::new(home).is_absolute() {
         return Err(io::Error::new(
@@ -2542,6 +2528,7 @@ mod tests {
             assert!(parse_start_dir_output(unsafe_output).is_err());
         }
         assert!(parse_start_dir_output("/safe\u{202e}txt\n".as_bytes()).is_err());
+        assert!(parse_start_dir_output("/safe\u{200b}txt\n".as_bytes()).is_err());
     }
 
     #[test]
