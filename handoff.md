@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 201 — bounded AI temperature draft)
+
+## 2026-10-03 (upgrade round 201)
+
+- Settings temperature field keeps half-typed numbers but drops controls
+  and truncates at 32 bytes so iced cannot hold a paste next to a 0..=2 value.
+- `cargo test --locked --bin frost -- config::tests::live_temperature_draft_drops_controls_and_stays_short` passed.
+
 Updated: 2026-10-03 (upgrade round 200 — bounded AI base-URL settings field)
 
 ## 2026-10-03 (upgrade round 200)

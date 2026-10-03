@@ -1195,3 +1195,8 @@ everywhere except a resize, and an audit against ember found the rest.
      replaced it with the default. `SetAiBaseUrl` now uses `bound_config_text`
      at `MAX_CONFIG_VALUE_BYTES`.
 
+201. **Bounded AI temperature draft** — the settings field kept the raw paste
+     so a 32-byte+1 edit sat in the widget while only a parsed 0..=2 value
+     reached config. `SetAiTemperature` now drops controls and visual spoofing
+     and truncates at `MAX_AI_TEMPERATURE_DRAFT_BYTES`.
+

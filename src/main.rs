@@ -13201,6 +13201,7 @@ impl Frost {
             }
             Message::SetAiTemperature(raw) => {
                 // Keep the raw editing text; only a valid value reaches config.
+                let raw = crate::config::bound_ai_temperature_draft(raw);
                 self.config.ai_temperature = raw
                     .trim()
                     .parse::<f32>()

@@ -1001,6 +1001,14 @@ pub(crate) fn bound_config_text(value: impl Into<String>, max_bytes: usize) -> S
     bounded
 }
 
+/// Live temperature field: keep the raw editing text so a half-typed "0." is
+/// not discarded, but never hold a paste larger than a numeric literal.
+pub(crate) const MAX_AI_TEMPERATURE_DRAFT_BYTES: usize = 32;
+
+pub(crate) fn bound_ai_temperature_draft(raw: impl Into<String>) -> String {
+    bound_config_text(raw, MAX_AI_TEMPERATURE_DRAFT_BYTES)
+}
+
 fn validate_remote_host_text(value: &str, field: &str, max_bytes: usize) -> Result<(), String> {
     if value.len() > max_bytes {
         return Err(format!("{field} exceeds the {max_bytes}-byte limit"));
@@ -1346,6 +1354,20 @@ mod tests {
             MAX_CONFIG_VALUE_BYTES,
         );
         assert!(overflow.len() <= MAX_CONFIG_VALUE_BYTES);
+        assert!(overflow.is_char_boundary(overflow.len()));
+        assert!(!overflow.contains('z'));
+    }
+
+    #[test]
+    fn live_temperature_draft_drops_controls_and_stays_short() {
+        assert_eq!(bound_ai_temperature_draft("0.\n\u{1b}7"), "0.7");
+        let filled =
+            bound_ai_temperature_draft(format!("{}y", "1".repeat(MAX_AI_TEMPERATURE_DRAFT_BYTES)));
+        assert_eq!(filled.len(), MAX_AI_TEMPERATURE_DRAFT_BYTES);
+        assert!(!filled.contains('y'));
+        let overflow =
+            bound_ai_temperature_draft(format!("{}z", "界".repeat(MAX_AI_TEMPERATURE_DRAFT_BYTES)));
+        assert!(overflow.len() <= MAX_AI_TEMPERATURE_DRAFT_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
     }
