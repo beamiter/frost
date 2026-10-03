@@ -15084,7 +15084,7 @@ impl Frost {
                 let mut save_error: Option<String> = None;
                 if let Some(ed) = &mut self.theme_editor {
                     let name = ed.name.trim().to_string();
-                    if let Err(message) = Theme::validate_custom_theme_name(&name) {
+                    if let Err(message) = crate::theme::validate_saved_custom_theme_name(&name) {
                         ed.error = Some(crate::theme::bound_theme_editor_error(message));
                     } else if Theme::is_builtin(&name) {
                         ed.error = Some(crate::theme::bound_theme_editor_error("Name collides with a builtin theme".to_string()));

@@ -29,6 +29,18 @@ pub(crate) fn bound_custom_theme_name(name: impl Into<String>) -> String {
     bounded
 }
 
+/// Persist-time check: iced may show U+FFFD after ingest, but a replacement
+/// character must not become a theme filename.
+pub(crate) fn validate_saved_custom_theme_name(name: &str) -> Result<(), String> {
+    if name.contains('\u{fffd}') {
+        return Err(
+            "Name cannot contain path separators, controls, or invisible formatting characters"
+                .to_string(),
+        );
+    }
+    Theme::validate_custom_theme_name(name)
+}
+
 /// Live theme-editor hex field: optional `#` plus six digits, matching
 /// `Theme::hex_to_rgb` so a paste cannot sit unbounded next to a swatch.
 pub(crate) const MAX_THEME_HEX_DIGITS: usize = 6;
@@ -135,8 +147,9 @@ impl ThemeExt for Theme {
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_custom_theme_name, bound_theme_editor_error, bound_theme_hex_draft, Theme,
-        ThemeExt as _, MAX_CUSTOM_THEME_NAME_BYTES, MAX_THEME_EDITOR_ERROR_BYTES,
+        bound_custom_theme_name, bound_theme_editor_error, bound_theme_hex_draft,
+        validate_saved_custom_theme_name, Theme, ThemeExt as _, MAX_CUSTOM_THEME_NAME_BYTES,
+        MAX_THEME_EDITOR_ERROR_BYTES,
     };
     use iced::Color;
 
@@ -180,6 +193,9 @@ mod tests {
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
         assert!(Theme::validate_custom_theme_name(&filled).is_ok());
+        assert!(validate_saved_custom_theme_name(&filled).is_ok());
+        assert!(validate_saved_custom_theme_name("ok\u{fffd}").is_err());
+        assert!(validate_saved_custom_theme_name("ok\u{202e}").is_err());
         let listed = bound_custom_theme_name(format!("dusk\u{1b}[31m\u{202e}{}", "n".repeat(400)));
         assert!(!listed.contains('\u{1b}'));
         assert!(!listed.contains('\u{202e}'));

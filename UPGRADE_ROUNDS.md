@@ -1606,3 +1606,7 @@ everywhere except a resize, and an audit against ember found the rest.
 298. **New-file names refuse visual spoofing** — dialog ingest replaced bidi
      with U+FFFD, but create/rename still accepted the neutralized string.
      Validation now refuses spoofing and replacement characters.
+
+299. **Custom theme names refuse U+FFFD** — editor ingest replaced bidi with
+     replacement characters, but save still accepted them as filenames.
+     Persist validation now refuses U+FFFD.

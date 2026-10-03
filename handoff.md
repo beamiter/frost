@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 299 — Custom theme names refuse U+FFFD)
+
+## 2026-10-04 (upgrade round 299)
+
+- Theme save validation refuses U+FFFD so a neutralized editor draft cannot become a filename.
+- `cargo test --locked --bin frost -- theme::tests::custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 298 — New-file names refuse visual spoofing)
 
 ## 2026-10-04 (upgrade round 298)
