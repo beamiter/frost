@@ -118,24 +118,48 @@ impl SearchAndReplaceEngine {
         Ok((result, count))
     }
 
-    /// 获取搜索匹配的上下文（用于预览；面板暂未接入）
-    #[allow(dead_code)]
+    /// Preview windows around literal substring matches.
+    ///
+    /// An empty pattern is a no-op: `str::contains("")` is true for every line
+    /// and would otherwise dump the whole buffer. Context is clamped so a
+    /// hostile `context_lines` cannot allocate a quadratic preview.
     pub fn get_match_context(text: &str, pattern: &str, context_lines: usize) -> Vec<String> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+        const MAX_CONTEXT_LINES: usize = 8;
+        const MAX_MATCH_WINDOWS: usize = 64;
+        let context_lines = context_lines.min(MAX_CONTEXT_LINES);
         let lines: Vec<&str> = text.lines().collect();
         let mut result = Vec::new();
+        let mut windows = 0;
 
         for (idx, line) in lines.iter().enumerate() {
-            if line.contains(pattern) {
-                let start = idx.saturating_sub(context_lines);
-                let end = std::cmp::min(idx + context_lines + 1, lines.len());
-
-                for (offset, line) in lines[start..end].iter().enumerate() {
-                    let i = start + offset;
-                    let prefix = if i == idx { "→ " } else { "  " };
-                    result.push(format!("{}{:3}: {}", prefix, i + 1, line));
-                }
-                result.push(String::new()); // 空行分隔
+            if !line.contains(pattern) {
+                continue;
             }
+            if windows >= MAX_MATCH_WINDOWS {
+                result.push(format!(
+                    "  … {} more match window(s) omitted",
+                    // Saturating: we stop counting once the cap is hit.
+                    lines
+                        .iter()
+                        .skip(idx)
+                        .filter(|line| line.contains(pattern))
+                        .count()
+                ));
+                break;
+            }
+            windows += 1;
+            let start = idx.saturating_sub(context_lines);
+            let end = std::cmp::min(idx + context_lines + 1, lines.len());
+
+            for (offset, line) in lines[start..end].iter().enumerate() {
+                let i = start + offset;
+                let prefix = if i == idx { "→ " } else { "  " };
+                result.push(format!("{}{:3}: {}", prefix, i + 1, line));
+            }
+            result.push(String::new());
         }
 
         result
@@ -277,5 +301,46 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(result, "İX");
+    }
+
+    #[test]
+    fn empty_pattern_does_not_preview_every_line() {
+        let preview = SearchAndReplaceEngine::get_match_context("a\nb\nc", "", 2);
+        assert!(preview.is_empty());
+    }
+
+    #[test]
+    fn match_context_marks_hit_and_keeps_neighbors() {
+        let preview = SearchAndReplaceEngine::get_match_context("alpha\nbeta\ngamma", "beta", 1);
+        assert_eq!(
+            preview,
+            vec![
+                "    1: alpha".to_string(),
+                "→   2: beta".to_string(),
+                "    3: gamma".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn match_context_clamps_window_and_caps_matches() {
+        let text = (0..80)
+            .map(|i| format!("hit-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = SearchAndReplaceEngine::get_match_context(&text, "hit-", usize::MAX);
+        let arrows = preview.iter().filter(|line| line.starts_with("→ ")).count();
+        assert_eq!(arrows, 64);
+        assert!(
+            preview
+                .iter()
+                .any(|line| line.contains("more match window(s) omitted")),
+            "overflow must be stated rather than silently dropped"
+        );
+        assert!(
+            !preview.iter().any(|line| line.contains("hit-79")),
+            "context clamp must not expand each window to the whole file"
+        );
     }
 }

@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 174 — bounded find-preview windows)
+
+## 2026-10-03 (upgrade round 174)
+
+- Find-preview context refuses empty patterns, clamps neighbor radius, and
+  stops after 64 match windows with an omitted count.
+- `cargo test --locked --bin frost -- search_replace::tests` — 8 passed.
+
 Updated: 2026-10-03 (upgrade round 173 — fail-closed ANSI color resolution)
 
 ## 2026-10-03 (upgrade round 173)

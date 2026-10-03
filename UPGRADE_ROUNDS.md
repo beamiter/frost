@@ -1033,3 +1033,9 @@ everywhere except a resize, and an audit against ember found the rest.
      and the 256-color cube/gray ramps are pinned by unit tests; the palette-less
      wrappers stay live through those tests rather than `allow(dead_code)`.
 
+174. **Bounded find-preview windows** — `get_match_context` treated `contains("")`
+     as a hit on every line and accepted an unbounded context radius, so an
+     empty pattern or `usize::MAX` neighbors could dump the whole buffer. Empty
+     patterns now return nothing, each window is capped at 8 neighbor lines,
+     and only the first 64 matches are previewed with an explicit omitted count.
+
