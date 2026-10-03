@@ -2,6 +2,11 @@
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
+/// One-line overlay query budget, shared with the workflow and history
+/// pickers so a paste cannot grow the iced field and the fuzzy haystack
+/// without bound.
+pub(crate) const MAX_PALETTE_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
+
 /// 面板可分发的动作，每一项都 1:1 对应一个已有的 frost 操作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
@@ -757,6 +762,45 @@ impl PaletteState {
     pub fn action_at(&self, index: usize) -> Option<PaletteAction> {
         self.all.get(index).map(|item| item.action)
     }
+
+    /// Replace the query; the highlight returns to the first row. Control
+    /// characters are dropped and the byte budget is enforced on a char
+    /// boundary so iced `text_input` and the raw-key path share one contract.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        let mut query: String = query
+            .into()
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        if query.len() > MAX_PALETTE_QUERY_BYTES {
+            let mut end = MAX_PALETTE_QUERY_BYTES;
+            while end > 0 && !query.is_char_boundary(end) {
+                end -= 1;
+            }
+            query.truncate(end);
+        }
+        self.query = query;
+        self.selected = 0;
+    }
+
+    /// Append typed text. Returns whether the stored query changed.
+    pub fn push_query_text(&mut self, text: &str) -> bool {
+        let previous = self.query.clone();
+        let mut query = previous.clone();
+        query.push_str(text);
+        self.set_query(query);
+        self.query != previous
+    }
+
+    /// Delete the last character of the query. Returns whether anything was
+    /// deleted.
+    pub fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.selected = 0;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -893,5 +937,30 @@ mod tests {
             .expect("the palette offers the AI chats panel");
         assert_eq!(hint, rendered);
         assert_eq!(rendered, "Ctrl+Shift+Alt+A");
+    }
+
+    #[test]
+    fn query_drops_controls_and_truncates_on_a_char_boundary() {
+        let mut palette = PaletteState::new();
+        palette.selected = 3;
+        assert!(palette.push_query_text("ne\nw\u{1b}"));
+        assert_eq!(palette.query, "new");
+        assert_eq!(palette.selected, 0);
+        assert!(!palette.push_query_text("\n"));
+        assert_eq!(palette.query, "new");
+
+        palette.set_query(format!("{}x", "界".repeat(MAX_PALETTE_QUERY_BYTES)));
+        assert!(palette.query.len() <= MAX_PALETTE_QUERY_BYTES);
+        assert!(palette.query.is_char_boundary(palette.query.len()));
+        assert!(!palette.query.contains('x'));
+
+        palette.set_query(format!("{}y", "x".repeat(MAX_PALETTE_QUERY_BYTES)));
+        assert_eq!(palette.query.len(), MAX_PALETTE_QUERY_BYTES);
+        assert!(!palette.query.contains('y'));
+        let filled = palette.query.clone();
+        assert!(!palette.push_query_text("z"));
+        assert_eq!(palette.query, filled);
+        assert!(palette.backspace());
+        assert_eq!(palette.query.len(), filled.len() - 1);
     }
 }

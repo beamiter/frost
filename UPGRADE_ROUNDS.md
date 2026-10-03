@@ -1081,3 +1081,10 @@ everywhere except a resize, and an audit against ember found the rest.
      truncate on a UTF-8 boundary, and are the only write path from both the
      widget and the keyboard handler.
 
+182. **Bounded command-palette query** — Ctrl+Shift+P assigned iced `text_input`
+     and raw key text to an unbounded `String`, so a paste could grow the
+     fuzzy haystack without the shared 4 KiB one-line budget. `set_query` /
+     `push_query_text` / `backspace` now drop controls, truncate on a UTF-8
+     boundary, and are the only write path from both the widget and the
+     keyboard handler.
+

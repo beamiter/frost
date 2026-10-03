@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 182 — bounded command-palette query)
+
+## 2026-10-03 (upgrade round 182)
+
+- Command palette query shares the 4 KiB one-line overlay budget; controls
+  are dropped and overflow truncates on a char boundary.
+- `cargo test --locked --bin frost -- command_palette::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-03 (upgrade round 181 — bounded history-picker query)
 
 ## 2026-10-03 (upgrade round 181)

@@ -11031,8 +11031,7 @@ impl Frost {
                 return Some(self.palette_snap_task());
             }
             Key::Named(Named::Backspace) => {
-                self.palette.query.pop();
-                self.palette.selected = 0;
+                self.palette.backspace();
                 return Some(self.palette_snap_task());
             }
             _ => {}
@@ -11040,10 +11039,7 @@ impl Frost {
         // Printable input filters the list.
         if !mods.control() && !mods.alt() {
             if let Some(t) = text {
-                let printable: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !printable.is_empty() {
-                    self.palette.query.push_str(&printable);
-                    self.palette.selected = 0;
+                if self.palette.push_query_text(t) {
                     return Some(self.palette_snap_task());
                 }
             }
@@ -14851,8 +14847,7 @@ impl Frost {
             }
             Message::SearchReplaceClose => self.search_replace.is_open = false,
             Message::PaletteInput(value) => {
-                self.palette.query = value;
-                self.palette.selected = 0;
+                self.palette.set_query(value);
                 return self.palette_snap_task();
             }
             Message::PaletteExecute(i) => {
