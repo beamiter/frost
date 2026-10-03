@@ -1060,3 +1060,10 @@ everywhere except a resize, and an audit against ember found the rest.
      an invalid pattern now go through `safe_inline_display` (160 bytes) before
      reaching the search bar or the replace-panel status line.
 
+179. **Complete numeric config clamp matrix** — load-time normalization already
+     bounded font/line-spacing/window size, but padding, opacity, scrollback,
+     and scroll speed were untested. NaN/∞ now fall back, overflow clamps to
+     the documented extrema (font 72, padding 20, opacity 1.0, speed 10,
+     scrollback 100–100_000), and the live clamp helpers no longer need a
+     stale `dead_code` allow.
+

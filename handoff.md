@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (upgrade round 179 — complete numeric config clamp matrix)
+
+## 2026-10-03 (upgrade round 179)
+
+- Config normalization now has regressions for padding/opacity/scrollback/
+  scroll-speed (NaN/∞ fallback and overflow extrema).
+- `cargo test --locked --bin frost -- config::tests::normalization_bounds_untrusted_numeric_values` passed.
+
 Updated: 2026-10-03 (upgrade round 178 — sanitized regex compile errors)
 
 ## 2026-10-03 (upgrade round 178)

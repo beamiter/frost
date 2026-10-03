@@ -933,32 +933,26 @@ impl Config {
     }
 
     // 配置值约束方法
-    #[allow(dead_code)]
     pub fn clamp_font_size(size: f32) -> f32 {
         finite_clamp(size, default_font_size(), 8.0, 72.0)
     }
 
-    #[allow(dead_code)]
     pub fn clamp_line_spacing(spacing: f32) -> f32 {
         finite_clamp(spacing, default_line_spacing(), 0.8, 3.0)
     }
 
-    #[allow(dead_code)]
     pub fn clamp_padding(padding: f32) -> f32 {
         finite_clamp(padding, default_padding(), 0.0, 20.0)
     }
 
-    #[allow(dead_code)]
     pub fn clamp_scrollback_lines(lines: usize) -> usize {
         lines.clamp(100, 100_000)
     }
 
-    #[allow(dead_code)]
     pub fn clamp_opacity(opacity: f32) -> f32 {
         finite_clamp(opacity, default_opacity(), 0.05, 1.0)
     }
 
-    #[allow(dead_code)]
     pub fn clamp_scroll_speed(speed: u32) -> u32 {
         speed.clamp(1, 10)
     }
@@ -1201,6 +1195,10 @@ mod tests {
         let config = Config {
             font_size: f32::NAN,
             line_spacing: f32::INFINITY,
+            padding: -1.0,
+            opacity: f32::NEG_INFINITY,
+            scrollback_lines: usize::MAX,
+            scroll_speed: 0,
             initial_width: -1.0,
             cols: usize::MAX,
             rows: 0,
@@ -1215,6 +1213,10 @@ mod tests {
 
         assert_eq!(normalized.font_size, default_font_size());
         assert_eq!(normalized.line_spacing, default_line_spacing());
+        assert_eq!(normalized.padding, 0.0);
+        assert_eq!(normalized.opacity, default_opacity());
+        assert_eq!(normalized.scrollback_lines, 100_000);
+        assert_eq!(normalized.scroll_speed, 1);
         assert_eq!(normalized.initial_width, 320.0);
         assert_eq!(normalized.cols, crate::terminal::MAX_TERMINAL_COLS);
         assert_eq!(normalized.rows, 1);
@@ -1222,6 +1224,21 @@ mod tests {
         assert_eq!(normalized.ai_max_tokens, 32_768);
         assert_eq!(normalized.ai_temperature, None);
         assert_eq!(normalized.agent_max_turns, 100);
+
+        let oversized = Config {
+            font_size: 1_000.0,
+            padding: 99.0,
+            opacity: 2.0,
+            scroll_speed: 99,
+            scrollback_lines: 0,
+            ..Config::default()
+        }
+        .normalized();
+        assert_eq!(oversized.font_size, 72.0);
+        assert_eq!(oversized.padding, 20.0);
+        assert_eq!(oversized.opacity, 1.0);
+        assert_eq!(oversized.scroll_speed, 10);
+        assert_eq!(oversized.scrollback_lines, 100);
     }
 
     #[test]
