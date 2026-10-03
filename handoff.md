@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 266 — history-picker query strips visual spoofing)
+
+## 2026-10-04 (upgrade round 266)
+
+- History-picker queries replace visual spoofing at ingest.
+- `cargo test --locked --bin frost -- history_picker::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 265 — command-palette query strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 265)

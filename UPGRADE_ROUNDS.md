@@ -1478,3 +1478,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi in the fuzzy query. Query ingest now
      replaces spoofing with U+FFFD.
 
+266. **History-picker query strips visual spoofing** — recall overlay typing
+     dropped controls but kept bidi in the filter query. Query ingest now
+     replaces spoofing with U+FFFD.
+

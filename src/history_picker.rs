@@ -198,7 +198,15 @@ impl HistoryPickerState {
         let mut query: String = query
             .into()
             .chars()
-            .filter(|character| !character.is_control())
+            .filter_map(|character| {
+                if character.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(character)
+                }
+            })
             .collect();
         if query.len() > MAX_HISTORY_QUERY_BYTES {
             let mut end = MAX_HISTORY_QUERY_BYTES;
@@ -459,5 +467,9 @@ mod tests {
 
         assert!(state.backspace());
         assert_eq!(state.query.len(), filled.len() - 1);
+        state.set_query("cargo\u{202e}test");
+        assert!(!state.query.contains('\u{202e}'));
+        assert!(state.query.contains('\u{fffd}'));
+        assert!(state.query.starts_with("cargo"));
     }
 }
