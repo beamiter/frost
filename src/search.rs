@@ -16,7 +16,15 @@ fn bound_query_text(query: impl Into<String>) -> String {
     let mut query: String = query
         .into()
         .chars()
-        .filter(|character| !character.is_control())
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
         .collect();
     if query.len() > MAX_SEARCH_QUERY_BYTES {
         let mut end = MAX_SEARCH_QUERY_BYTES;
@@ -893,5 +901,9 @@ mod tests {
         assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
         assert!(!state.query.contains('!'));
         assert_eq!(state.history_nav_index, Some(0));
+        state.set_query("err\u{202e}or");
+        assert!(!state.query.contains('\u{202e}'));
+        assert!(state.query.contains('\u{fffd}'));
+        assert!(state.query.starts_with("err"));
     }
 }

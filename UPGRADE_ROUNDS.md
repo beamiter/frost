@@ -1462,3 +1462,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped controls but kept bidi in the editable correction command. Draft
      ingest now replaces spoofing with U+FFFD.
 
+262. **Find-bar query strips visual spoofing** — the Find overlay dropped
+     controls but kept bidi in the regex/literal query (and history restore).
+     Query ingest now replaces spoofing with U+FFFD.
+

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 262 — Find-bar query strips visual spoofing)
+
+## 2026-10-04 (upgrade round 262)
+
+- Find-bar queries replace visual spoofing at ingest (including history restore).
+- `cargo test --locked --bin frost -- search::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 261 — correction-card draft strips visual spoofing)
 
 ## 2026-10-04 (upgrade round 261)
