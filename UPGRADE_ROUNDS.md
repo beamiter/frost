@@ -1517,3 +1517,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped slashes and controls but kept bidi. Name ingest now replaces
      spoofing with U+FFFD.
 
+276. **Agent edit-command drafts replace visual spoofing** — the proposal
+     editor dropped bidi silently. Edit ingest now replaces spoofing with
+     U+FFFD so the reviewed command stays visible.
+

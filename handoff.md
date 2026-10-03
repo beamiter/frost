@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 276 — Agent edit-command drafts replace visual spoofing)
+
+## 2026-10-04 (upgrade round 276)
+
+- Agent proposal-edit drafts replace visual spoofing at ingest instead of dropping it.
+- `cargo test --locked --bin frost -- review_text::tests::agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls` passed.
+
 Updated: 2026-10-04 (upgrade round 275 — New-file name drafts strip visual spoofing)
 
 ## 2026-10-04 (upgrade round 275)

@@ -68,9 +68,14 @@ pub(crate) fn bound_agent_edit_command(value: impl Into<String>) -> String {
     let mut value: String = value
         .into()
         .chars()
-        .filter(|character| {
-            !character.is_control()
-                && !jterm_core::review_input::is_visual_spoofing_character(*character)
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
         })
         .collect();
     if value.len() > MAX_AGENT_COMMAND_BYTES {
@@ -403,7 +408,10 @@ mod tests {
     #[test]
     fn agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls() {
         assert_eq!(bound_agent_edit_command("ls\n\u{1b} -la"), "ls -la");
-        assert_eq!(bound_agent_edit_command("git \u{202e}status"), "git status");
+        let spoofed = bound_agent_edit_command("git \u{202e}status");
+        assert!(!spoofed.contains('\u{202e}'));
+        assert!(spoofed.contains('\u{fffd}'));
+        assert!(spoofed.starts_with("git "));
         let filled = bound_agent_edit_command(format!("{}y", "x".repeat(MAX_AGENT_COMMAND_BYTES)));
         assert_eq!(filled.len(), MAX_AGENT_COMMAND_BYTES);
         assert!(!filled.contains('y'));
