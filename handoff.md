@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 297 — Restored session cwds reject visual spoofing)
+
+## 2026-10-04 (upgrade round 297)
+
+- Session snapshot cwds with control or visual-spoofing characters are discarded before spawn.
+- `cargo test --locked --bin frost -- session_persistence::tests::restored_cwds_reject_visual_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 296 — Kitty graphics errors strip visual spoofing)
 
 ## 2026-10-04 (upgrade round 296)

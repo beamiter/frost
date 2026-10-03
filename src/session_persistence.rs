@@ -17,6 +17,15 @@ const MAX_RESTORED_PANES_PER_TAB: usize = 12;
 const MAX_RESTORED_LAYOUT_DEPTH: usize = 64;
 const MAX_RESTORED_LAYOUT_NODES: usize = 64;
 const MAX_RESTORED_CWD_BYTES: usize = 4096;
+
+fn restored_cwd_is_unsafe(cwd: &str) -> bool {
+    cwd.len() > MAX_RESTORED_CWD_BYTES
+        || cwd.as_bytes().contains(&0)
+        || cwd.chars().any(|character| {
+            character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        })
+}
 /// 标签页自定义标题的上限。标题只是一行标签文字，不需要更多。
 pub const MAX_RESTORED_TAB_TITLE_BYTES: usize = 256;
 
@@ -355,7 +364,7 @@ impl serde::de::Visitor<'_> for CwdValueVisitor<'_> {
     }
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        if value.len() > MAX_RESTORED_CWD_BYTES || value.as_bytes().contains(&0) {
+        if restored_cwd_is_unsafe(value) {
             self.budget.invalid_cwds += 1;
             return Ok(None);
         }
@@ -1623,9 +1632,11 @@ impl SessionsSnapshot {
         }
         let mut invalid_cwds = 0usize;
         for session in &mut self.sessions {
-            if session.cwd.as_ref().is_some_and(|cwd| {
-                cwd.len() > MAX_RESTORED_CWD_BYTES || cwd.as_bytes().contains(&0)
-            }) {
+            if session
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| restored_cwd_is_unsafe(cwd))
+            {
                 session.cwd = None;
                 invalid_cwds += 1;
             }
@@ -2489,6 +2500,40 @@ mod tests {
         assert!(cwd.contains('\u{fffd}'));
         assert!(cwd.len() <= MAX_RESTORED_TAB_TITLE_BYTES);
         assert!(cwd.starts_with("~/src/"));
+    }
+
+    #[test]
+    fn restored_cwds_reject_visual_spoofing() {
+        let root = scratch("cwd-bidi");
+        let path = root.join("session_history.json");
+        let snapshot = SessionsSnapshot {
+            version: 2,
+            sessions: vec![
+                SessionSnapshot {
+                    cwd: Some("/tmp/\u{202e}hidden".to_string()),
+                },
+                SessionSnapshot {
+                    cwd: Some("/tmp/\u{200b}zwsp".to_string()),
+                },
+                SessionSnapshot {
+                    cwd: Some("/tmp/safe".to_string()),
+                },
+            ],
+            active_index: Some(0),
+            split: None,
+            tree: None,
+            tabs: Vec::new(),
+            active_tab: None,
+        };
+        write_private(&path, serde_json::to_vec(&snapshot).unwrap());
+
+        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+            panic!("bounded valid JSON should load");
+        };
+        assert_eq!(restored.sessions[0].cwd, None);
+        assert_eq!(restored.sessions[1].cwd, None);
+        assert_eq!(restored.sessions[2].cwd.as_deref(), Some("/tmp/safe"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Cf bidi overrides/isolates are not Cc, so the `is_control` check lets

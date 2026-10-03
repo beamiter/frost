@@ -1598,3 +1598,7 @@ everywhere except a resize, and an audit against ember found the rest.
 296. **Kitty graphics errors strip visual spoofing** — protocol error replies
      dropped controls but kept bidi. Spoofing is now replaced with U+FFFD
      before the APC response is written to the PTY.
+
+297. **Restored session cwds reject visual spoofing** — snapshot working
+     directories were only checked for size and NUL. Bidi and zero-width
+     marks now discard the cwd before a pane is spawned there.
