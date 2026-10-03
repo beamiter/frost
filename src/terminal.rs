@@ -6599,18 +6599,16 @@ impl TerminalState {
         title
             .chars()
             // Titles are rendered in trusted app chrome. Drop line/layout
-            // controls and bidi overrides/isolation marks so PTY output cannot
+            // controls and replace visual spoofing so PTY output cannot
             // create multiline tabs or visually reorder the window title.
-            .filter(|&ch| {
-                !ch.is_control()
-                    && !matches!(
-                        ch,
-                        '\u{061c}'
-                            | '\u{200e}'
-                            | '\u{200f}'
-                            | '\u{202a}'..='\u{202e}'
-                            | '\u{2066}'..='\u{2069}'
-                    )
+            .filter_map(|ch| {
+                if ch.is_control() {
+                    None
+                } else if jterm_core::review_input::is_visual_spoofing_character(ch) {
+                    Some('\u{fffd}')
+                } else {
+                    Some(ch)
+                }
             })
             .take(MAX_TERMINAL_TITLE_CHARS)
             .collect()
@@ -17969,7 +17967,12 @@ mod tests {
         assert!(terminal.window_title.starts_with("safe"));
         assert!(!terminal.window_title.contains('\n'));
         assert!(!terminal.window_title.contains('\u{202e}'));
+        assert!(terminal.window_title.contains('\u{fffd}'));
         assert!(!terminal.window_title.ends_with("tail"));
+        terminal.process_input("\x1b]2;ok\u{200b}title\x1b\\".as_bytes());
+        assert!(!terminal.window_title.contains('\u{200b}'));
+        assert!(terminal.window_title.contains('\u{fffd}'));
+        assert!(terminal.window_title.starts_with("ok"));
     }
 
     #[test]

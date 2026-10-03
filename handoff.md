@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 280 — OSC window titles replace remaining visual spoofing)
+
+## 2026-10-04 (upgrade round 280)
+
+- OSC window/icon titles replace visual spoofing at ingest, including zero-width marks.
+- `cargo test --locked --bin frost -- terminal::tests::osc_titles_are_bounded_and_safe_for_app_chrome` passed.
+
 Updated: 2026-10-04 (upgrade round 279 — Files path bar replaces remaining visual spoofing)
 
 ## 2026-10-04 (upgrade round 279)

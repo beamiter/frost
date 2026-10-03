@@ -1531,3 +1531,7 @@ everywhere except a resize, and an audit against ember found the rest.
      dropped bidi marks but kept zero-width spoofing. Ingest now replaces all
      visual spoofing with U+FFFD, and navigation rejects replacement text.
 
+280. **OSC window titles replace remaining visual spoofing** — PTY titles
+     dropped bidi marks but kept zero-width spoofing. Title ingest now
+     replaces all visual spoofing with U+FFFD.
+
