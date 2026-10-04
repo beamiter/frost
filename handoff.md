@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 325 — AI chat send refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 325)
+
+- Sending an AI Chats composer draft that still contains U+FFFD or visual spoofing is refused so a neutralized paste cannot leave the machine.
+- `cargo test --locked --bin frost -- ai_chats::tests::composer_keeps_newlines_and_matches_the_live_message_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 324 — Files Copy Path refuses spoofing)
 
 ## 2026-10-04 (upgrade round 324)

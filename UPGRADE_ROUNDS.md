@@ -1710,3 +1710,7 @@ everywhere except a resize, and an audit against ember found the rest.
 324. **Files Copy Path refuses spoofing** — Files "Copy Path" refuses visual
      spoofing and U+FFFD so a neutralized listing path cannot reach the host
      clipboard.
+
+325. **AI chat send refuses U+FFFD** — sending an AI Chats composer draft that
+     still contains U+FFFD or visual spoofing is refused so a neutralized paste
+     cannot leave the machine.

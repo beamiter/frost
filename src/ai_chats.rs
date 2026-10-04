@@ -387,6 +387,12 @@ impl AiChatsUi {
         clear_draft: bool,
     ) -> Option<ChatRequest> {
         let text = text.trim().to_string();
+        if chat_payload_is_unsafe(&text) {
+            self.set_notice(
+                "Message contains control or visual-spoofing characters and was not sent.",
+            );
+            return None;
+        }
         // Provider preflight precedes `begin_turn` (anvil's order): a failed
         // client must not consume the message into history.
         let client = match agent::client_from_config(config) {
@@ -693,6 +699,18 @@ const MAX_CHAT_NOTICE_BYTES: usize = 256;
 
 fn bound_chat_notice(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_CHAT_NOTICE_BYTES)
+}
+
+fn chat_payload_is_unsafe(text: &str) -> bool {
+    text.chars().any(|character| {
+        if matches!(character, '\n' | '\t') {
+            false
+        } else {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
 }
 
 fn bound_chat_draft(draft: impl Into<String>) -> String {
@@ -1269,6 +1287,10 @@ mod tests {
         assert!(!panel.store.active_draft().contains('\u{202e}'));
         assert!(panel.store.active_draft().contains('\u{fffd}'));
         assert!(panel.store.active_draft().starts_with("please\n"));
+        assert!(panel.submit(&ai_config()).is_none());
+        assert!(panel.store.active_draft().contains('\u{fffd}'));
+        assert!(panel.notice.contains("not sent"));
+        assert!(panel.store.active_history().is_empty());
     }
 
     #[test]
