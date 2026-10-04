@@ -1785,3 +1785,7 @@ everywhere except a resize, and an audit against ember found the rest.
 343. **AI chats library search refuses spoofing** — the AI chats library
      returns no matches when the search still contains visual spoofing or
      U+FFFD so a neutralized paste cannot open a saved chat.
+
+344. **Files-panel filter refuses spoofing** — the files-panel name filter
+     yields no matches when the query still contains visual spoofing or U+FFFD
+     so a neutralized paste cannot reveal a tree path.

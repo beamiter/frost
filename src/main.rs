@@ -24485,6 +24485,9 @@ fn filter_match_set(
     if query.is_empty() {
         return None;
     }
+    if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(&query) {
+        return Some(std::collections::BTreeSet::new());
+    }
     fn walk(
         node: &sidebar::FileTreeNode,
         query: &str,
@@ -31069,6 +31072,10 @@ mod tests {
         // Empty query is identity: no filtering at all.
         assert!(filter_match_set(&sidebar.root, "").is_none());
         assert!(filter_match_set(&sidebar.root, "  ").is_none());
+        let spoofed = filter_match_set(&sidebar.root, "deep\u{202e}").expect("unsafe query");
+        assert!(spoofed.is_empty());
+        let replacement = filter_match_set(&sidebar.root, "deep\u{fffd}").expect("fffd query");
+        assert!(replacement.is_empty());
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
