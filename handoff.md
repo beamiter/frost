@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 376 — theme setting refuses spoofing)
+
+## 2026-10-04 (upgrade round 376)
+
+- The settings theme field does not keep a name that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as the active theme identity.
+- `cargo test --offline --bin frost -- live_theme_settings_field_uses_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 375 — API key file path refuses spoofing)
 
 ## 2026-10-04 (upgrade round 375)

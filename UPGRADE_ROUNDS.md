@@ -1913,3 +1913,7 @@ everywhere except a resize, and an audit against ember found the rest.
 375. **API key file path refuses spoofing** — the settings API-key file field
      does not keep a path that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as a credential-file location.
+
+376. **Theme setting refuses spoofing** — the settings theme field does not
+     keep a name that still contains visual spoofing or U+FFFD, so a neutralized
+     paste cannot sit as the active theme identity.
