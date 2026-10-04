@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 386 — theme-editor errors omit spoofing)
+
+## 2026-10-04 (upgrade round 386)
+
+- Theme-editor error chrome drops U+FFFD leftover from neutralized spoofing, so a replacement character cannot sit next to the swatches.
+- `cargo test --offline --bin frost -- theme_editor_error_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 385 — toast chrome omits spoofing)
 
 ## 2026-10-04 (upgrade round 385)

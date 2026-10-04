@@ -1952,3 +1952,7 @@ everywhere except a resize, and an audit against ember found the rest.
 
 385. **Toast chrome omits spoofing** — toasts drop U+FFFD leftover from
      neutralized spoofing, so a replacement character cannot sit in chrome.
+
+386. **Theme-editor errors omit spoofing** — theme-editor error chrome drops
+     U+FFFD leftover from neutralized spoofing, so a replacement character
+     cannot sit next to the swatches.

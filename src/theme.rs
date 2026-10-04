@@ -82,7 +82,14 @@ pub(crate) fn bound_theme_hex_draft(hex: impl Into<String>) -> String {
 pub(crate) const MAX_THEME_EDITOR_ERROR_BYTES: usize = 256;
 
 pub(crate) fn bound_theme_editor_error(text: impl Into<String>) -> String {
-    jterm_core::review_input::safe_inline_display(&text.into(), MAX_THEME_EDITOR_ERROR_BYTES)
+    let shown =
+        jterm_core::review_input::safe_inline_display(&text.into(), MAX_THEME_EDITOR_ERROR_BYTES);
+    let shown: String = shown.chars().filter(|ch| *ch != '\u{fffd}').collect();
+    if shown.trim().is_empty() {
+        "Theme editor error".to_string()
+    } else {
+        shown
+    }
 }
 
 /// iced color views over the shared RGB theme data.
@@ -238,8 +245,9 @@ mod tests {
         ));
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_THEME_EDITOR_ERROR_BYTES);
         assert!(shown.starts_with("Save failed:"));
+        assert_eq!(bound_theme_editor_error("\u{202e}"), "Theme editor error");
     }
 }
