@@ -366,14 +366,17 @@ impl AiChatsUi {
         if items.is_empty() {
             return None;
         }
-        Some(
-            items
-                .iter()
-                .rev()
-                .map(|item| format!("$ {} (exit {})", item.command, item.exit_code))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        let lines: Vec<String> = items
+            .iter()
+            .rev()
+            .filter(|item| !crate::block_mode::command_text_is_unsafe(&item.command))
+            .map(|item| format!("$ {} (exit {})", item.command, item.exit_code))
+            .collect();
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
     }
 
     /// Begin one provider turn for the given text. Shared by the composer
@@ -1018,6 +1021,7 @@ mod tests {
         std::fs::write(
             &history,
             "{\"command\":\"cargo test\",\"exit_code\":0}\n\
+             {\"command\":\"git \\u202estatus\",\"exit_code\":0}\n\
              {\"command\":\"git status\",\"exit_code\":1}\n",
         )
         .unwrap();
@@ -1039,6 +1043,7 @@ mod tests {
             .expect("consent + history yields context");
         // Newest-first on disk comes back oldest-first, like the sources.
         assert_eq!(recent, "$ cargo test (exit 0)\n$ git status (exit 1)");
+        assert!(!recent.contains('\u{202e}'));
 
         let mut panel = panel;
         panel.set_include_recent(false);

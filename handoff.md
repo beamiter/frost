@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 331 — AI chat shell context skips spoofing)
+
+## 2026-10-04 (upgrade round 331)
+
+- Recent shell context shared with AI Chats skips commands that still contain visual spoofing or U+FFFD so they cannot leave the machine.
+- `cargo test --locked --bin frost -- ai_chats::tests::recent_shell_context_is_consent_gated_and_checkbox_scoped` passed.
+
 Updated: 2026-10-04 (upgrade round 330 — Task follow-up send refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 330)

@@ -1734,3 +1734,7 @@ everywhere except a resize, and an audit against ember found the rest.
 330. **Task follow-up send refuses U+FFFD** — native Tasks follow-up send
      refuses a composer payload that still contains U+FFFD or visual spoofing so
      a neutralized paste cannot leave the machine.
+
+331. **AI chat shell context skips spoofing** — recent shell context shared with
+     AI Chats skips commands that still contain visual spoofing or U+FFFD so they
+     cannot leave the machine.
