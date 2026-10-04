@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 359 — History picker query refuses spoofing)
+
+## 2026-10-04 (upgrade round 359)
+
+- The command-history picker does not keep a query that still contains visual spoofing or U+FFFD, so a neutralized paste cannot recall a command.
+- `cargo test --locked --bin frost -- history_picker::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 358 — Command palette query refuses spoofing)
 
 ## 2026-10-04 (upgrade round 358)

@@ -38,6 +38,30 @@ fn history_query_is_unsafe(query: &str) -> bool {
     query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
 }
 
+fn bound_history_query(query: impl Into<String>) -> String {
+    let mut query: String = query
+        .into()
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                None
+            } else if jterm_core::review_input::is_visual_spoofing_character(character) {
+                Some('\u{fffd}')
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
+    if query.len() > MAX_HISTORY_QUERY_BYTES {
+        let mut end = MAX_HISTORY_QUERY_BYTES;
+        while end > 0 && !query.is_char_boundary(end) {
+            end -= 1;
+        }
+        query.truncate(end);
+    }
+    query
+}
+
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
 /// 多行命令）——家族的 review-only 历史格式拒绝控制字符，这类文本也无法
@@ -203,25 +227,9 @@ impl HistoryPickerState {
     /// characters are dropped and the byte budget is enforced on a char
     /// boundary so iced `text_input` and the raw-key path share one contract.
     pub fn set_query(&mut self, query: impl Into<String>) {
-        let mut query: String = query
-            .into()
-            .chars()
-            .filter_map(|character| {
-                if character.is_control() {
-                    None
-                } else if jterm_core::review_input::is_visual_spoofing_character(character) {
-                    Some('\u{fffd}')
-                } else {
-                    Some(character)
-                }
-            })
-            .collect();
-        if query.len() > MAX_HISTORY_QUERY_BYTES {
-            let mut end = MAX_HISTORY_QUERY_BYTES;
-            while end > 0 && !query.is_char_boundary(end) {
-                end -= 1;
-            }
-            query.truncate(end);
+        let query = bound_history_query(query);
+        if history_query_is_unsafe(&query) {
+            return;
         }
         self.query = query;
         self.selected = 0;
@@ -477,11 +485,14 @@ mod tests {
 
         assert!(state.backspace());
         assert_eq!(state.query.len(), filled.len() - 1);
+        state.set_query("cargo");
         state.set_query("cargo\u{202e}test");
+        assert_eq!(state.query, "cargo");
         assert!(!state.query.contains('\u{202e}'));
-        assert!(state.query.contains('\u{fffd}'));
-        assert!(state.query.starts_with("cargo"));
-        assert!(state.filtered().is_empty());
-        assert_eq!(state.selected_command(), None);
+        assert!(!state.query.contains('\u{fffd}'));
+        assert!(!state.filtered().is_empty());
+        state.set_query("cargo\u{fffd}test");
+        assert_eq!(state.query, "cargo");
+        assert_eq!(state.selected_command(), Some("cargo test".into()));
     }
 }
