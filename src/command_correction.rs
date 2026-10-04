@@ -124,6 +124,12 @@ pub(crate) fn bound_correction_feedback(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_CORRECTION_FEEDBACK_BYTES)
 }
 
+fn correction_line_is_unsafe(value: &str) -> bool {
+    value.contains('\u{fffd}')
+        || value.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(value)
+}
+
 /// Accept a card draft only when it is still a persistable command. Iced may
 /// show U+FFFD after ingest; replacement characters must not be inserted or
 /// run.
@@ -192,7 +198,10 @@ impl CorrectionRegistry {
         original_command: String,
         exit_code: i32,
         deadline: Instant,
-    ) -> (u64, AiCancellationToken) {
+    ) -> Option<(u64, AiCancellationToken)> {
+        if correction_line_is_unsafe(&original_command) {
+            return None;
+        }
         self.close(session_id);
         let generation = self.generation.wrapping_add(1);
         self.generation = generation;
@@ -208,7 +217,7 @@ impl CorrectionRegistry {
                 proposal: None,
             },
         );
-        (generation, cancellation)
+        Some((generation, cancellation))
     }
 
     /// A worker result may present only for the live generation within its
@@ -224,6 +233,9 @@ impl CorrectionRegistry {
         }) else {
             return false;
         };
+        if correction_line_is_unsafe(candidate.command()) {
+            return false;
+        }
         session.proposal = Some(CorrectionProposal::new(candidate));
         true
     }
@@ -511,11 +523,14 @@ mod tests {
     fn newer_generation_cancels_and_rejects_a_late_result() {
         let mut registry = CorrectionRegistry::default();
         let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
-        let (first, first_token) = registry.begin(7, "carog check".to_string(), 127, deadline);
+        let (first, first_token) = registry
+            .begin(7, "carog check".to_string(), 127, deadline)
+            .expect("honest command");
         assert!(registry.is_resolving(7));
 
-        let (second, _second_token) =
-            registry.begin(7, SUGGESTION_COMMAND.to_string(), 1, deadline);
+        let (second, _second_token) = registry
+            .begin(7, SUGGESTION_COMMAND.to_string(), 1, deadline)
+            .expect("honest command");
         assert!(first_token.is_cancelled());
         assert_ne!(first, second);
 
@@ -536,8 +551,12 @@ mod tests {
     fn correction_sessions_are_isolated_per_pane() {
         let mut registry = CorrectionRegistry::default();
         let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
-        let (left, _) = registry.begin(1, "gti".to_string(), 127, deadline);
-        let (right, _) = registry.begin(2, "fmpg".to_string(), 100, deadline);
+        let (left, _) = registry
+            .begin(1, "gti".to_string(), 127, deadline)
+            .expect("honest command");
+        let (right, _) = registry
+            .begin(2, "fmpg".to_string(), 100, deadline)
+            .expect("honest command");
 
         assert!(registry.dismiss(1, left));
         assert!(registry.get(1).is_none());
@@ -549,7 +568,9 @@ mod tests {
     fn dismiss_only_consumes_the_exact_generation() {
         let mut registry = CorrectionRegistry::default();
         let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
-        let (generation, token) = registry.begin(3, "gti".to_string(), 127, deadline);
+        let (generation, token) = registry
+            .begin(3, "gti".to_string(), 127, deadline)
+            .expect("honest command");
 
         assert!(!registry.dismiss(3, generation.wrapping_add(1)));
         assert!(registry.get(3).is_some());
@@ -564,7 +585,9 @@ mod tests {
     fn an_expired_request_cannot_present() {
         let mut registry = CorrectionRegistry::default();
         let deadline = Instant::now() + Duration::from_millis(1);
-        let (generation, _) = registry.begin(4, "gti".to_string(), 127, deadline);
+        let (generation, _) = registry
+            .begin(4, "gti".to_string(), 127, deadline)
+            .expect("honest command");
         std::thread::sleep(Duration::from_millis(5));
         assert!(!registry.present(4, generation, candidate()));
     }
@@ -586,5 +609,18 @@ mod tests {
         assert!(!title.contains('\u{202e}'));
         assert!(title.len() <= MAX_CORRECTION_FEEDBACK_BYTES);
         assert!(title.starts_with("Fix typo"));
+    }
+
+    #[test]
+    fn spoofed_original_commands_never_open_a_correction_card() {
+        let mut registry = CorrectionRegistry::default();
+        let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
+        assert!(registry
+            .begin(7, "git \u{202e}statu".to_string(), 1, deadline)
+            .is_none());
+        assert!(registry.get(7).is_none());
+        assert!(registry
+            .begin(7, "git \u{fffd}statu".to_string(), 1, deadline)
+            .is_none());
     }
 }

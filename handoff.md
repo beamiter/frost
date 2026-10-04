@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 315 — Correction begin refuses spoofing)
+
+## 2026-10-04 (upgrade round 315)
+
+- Command-correction cards never open for a failed command that still contains visual spoofing or U+FFFD, and worker candidates with the same defect are not presented.
+- `cargo test --locked --bin frost -- command_correction::tests::spoofed_original_commands_never_open_a_correction_card` passed.
+
 Updated: 2026-10-04 (upgrade round 314 — Correction accept refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 314)

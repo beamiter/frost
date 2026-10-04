@@ -1670,3 +1670,7 @@ everywhere except a resize, and an audit against ember found the rest.
 314. **Correction accept refuses U+FFFD** — the command-correction card
      refuses a draft that still contains replacement characters so a
      neutralized edit cannot be inserted or run.
+
+315. **Correction begin refuses spoofing** — a failed command that still
+     contains visual spoofing or U+FFFD never opens a correction card, and
+     worker candidates with the same defect are not presented.

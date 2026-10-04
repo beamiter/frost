@@ -21436,7 +21436,7 @@ impl Frost {
             request.command().to_string(),
             request.exit_code(),
             deadline,
-        );
+        )?;
         // A missing credential disables only the AI fallback inside the
         // worker; the verified local resolvers run regardless.
         let client = agent::client_from_config(&self.config).ok();
