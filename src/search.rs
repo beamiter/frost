@@ -151,9 +151,17 @@ impl SearchState {
     /// characters are dropped and the byte budget is enforced on a char
     /// boundary so iced `text_input` and the raw-key path share one contract.
     pub fn set_query(&mut self, query: impl Into<String>) {
-        self.query = bound_query_text(query);
+        let query = bound_query_text(query);
+        if find_query_is_unsafe(&query) {
+            self.error_message = Some(crate::review_text::bound_query_error(
+                "Query contains control or visual-spoofing characters and was not saved",
+            ));
+            return;
+        }
+        self.query = query;
         self.history_nav_index = None;
         self.current_match_index = 0;
+        self.error_message = None;
     }
 
     /// Append typed text. Returns whether the stored query changed.
@@ -858,10 +866,21 @@ mod tests {
 
     #[test]
     fn invalid_regex_error_does_not_echo_controls() {
-        let lines = vec![SearchLine::Text("text")];
         let mut cache = None;
+        let (matches, error) = SearchEngine::search_lines(
+            vec![SearchLine::Text("text")],
+            "(\u{1b}[31m\u{202e}",
+            true,
+            true,
+            &mut cache,
+        );
+        assert!(matches.is_empty());
+        let error = error.expect("unsafe query");
+        assert!(error.contains("visual-spoofing"));
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains('\u{202e}'));
         let (matches, error) =
-            SearchEngine::search_lines(lines, "(\u{1b}[31m\u{202e}", true, true, &mut cache);
+            SearchEngine::search_lines(vec![SearchLine::Text("text")], "(", true, true, &mut cache);
         assert!(matches.is_empty());
         let error = error.expect("compile failure");
         assert!(error.contains("Invalid regex"));
@@ -913,16 +932,22 @@ mod tests {
         assert_eq!(state.query.len(), MAX_SEARCH_QUERY_BYTES);
         assert!(!state.query.contains('!'));
         assert_eq!(state.history_nav_index, Some(0));
+        state.set_query("keep");
         state.set_query("err\u{202e}or");
+        assert_eq!(state.query, "keep");
         assert!(!state.query.contains('\u{202e}'));
-        assert!(state.query.contains('\u{fffd}'));
-        assert!(state.query.starts_with("err"));
+        assert!(!state.query.contains('\u{fffd}'));
+        assert!(state
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("not saved")));
         let mut row = vec![TerminalCell::default(); 8];
         for (index, character) in "error".chars().enumerate() {
             row[index].character = character;
         }
         let mut cache = None;
-        let (matches, error) = SearchEngine::search(&[row], &state.query, false, true, &mut cache);
+        let (matches, error) =
+            SearchEngine::search(&[row], "err\u{fffd}or", false, true, &mut cache);
         assert!(matches.is_empty());
         assert!(error.is_some_and(|message| message.contains("visual-spoofing")));
     }

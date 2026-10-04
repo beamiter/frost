@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 355 — Find query field refuses spoofing)
+
+## 2026-10-04 (upgrade round 355)
+
+- Terminal find does not keep a query that still contains visual spoofing or U+FFFD, so a neutralized paste cannot scan scrollback.
+- `cargo test --locked --bin frost -- search::tests::query_drops_controls_and_truncates_on_a_char_boundary search::tests::invalid_regex_error_does_not_echo_controls` passed.
+
 Updated: 2026-10-04 (upgrade round 354 — Find & Replace fields refuse spoofing)
 
 ## 2026-10-04 (upgrade round 354)

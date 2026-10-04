@@ -1829,3 +1829,7 @@ everywhere except a resize, and an audit against ember found the rest.
 354. **Find & Replace fields refuse spoofing** — Find & Replace does not keep
      a find or replace field that still contains visual spoofing or U+FFFD, so
      a neutralized paste cannot run.
+
+355. **Find query field refuses spoofing** — terminal find does not keep a
+     query that still contains visual spoofing or U+FFFD, so a neutralized
+     paste cannot scan scrollback.
