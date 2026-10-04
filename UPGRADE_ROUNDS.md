@@ -1949,3 +1949,6 @@ everywhere except a resize, and an audit against ember found the rest.
 384. **Diagnostic overlay omits spoofing** — startup and session diagnostics
      drop visual spoofing and U+FFFD instead of drawing replacement characters,
      so a neutralized error cannot sit in the overlay.
+
+385. **Toast chrome omits spoofing** — toasts drop U+FFFD leftover from
+     neutralized spoofing, so a replacement character cannot sit in chrome.

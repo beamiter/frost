@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 385 — toast chrome omits spoofing)
+
+## 2026-10-04 (upgrade round 385)
+
+- Toasts drop U+FFFD leftover from neutralized spoofing, so a replacement character cannot sit in chrome.
+- `cargo test --offline --bin frost -- toast_text_replaces_controls_and_stays_bounded status_bar_segment_strips_cwd_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 384 — diagnostic overlay omits spoofing)
 
 ## 2026-10-04 (upgrade round 384)

@@ -202,7 +202,13 @@ pub(crate) fn bound_query_error(error: impl fmt::Display) -> String {
 pub(crate) const MAX_TOAST_BYTES: usize = 256;
 
 pub(crate) fn bound_toast_text(text: impl Into<String>) -> String {
-    jterm_core::review_input::safe_inline_display(&text.into(), MAX_TOAST_BYTES)
+    let shown = jterm_core::review_input::safe_inline_display(&text.into(), MAX_TOAST_BYTES);
+    let shown: String = shown.chars().filter(|ch| *ch != '\u{fffd}').collect();
+    if shown.trim().is_empty() {
+        "Notice".to_string()
+    } else {
+        shown
+    }
 }
 
 /// Persistent startup diagnostics overlay: keep newlines so restore/config
@@ -387,7 +393,7 @@ mod tests {
         ));
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_TOAST_BYTES);
         assert!(shown.starts_with("Remote host"));
         let phase = bound_toast_text(format!(
@@ -396,8 +402,10 @@ mod tests {
         ));
         assert!(!phase.contains('\u{1b}'));
         assert!(!phase.contains('\u{202e}'));
+        assert!(!phase.contains('\u{fffd}'));
         assert!(phase.len() <= MAX_TOAST_BYTES);
         assert!(phase.starts_with("Native session:"));
+        assert_eq!(bound_toast_text("\u{202e}"), "Notice");
     }
 
     #[test]
