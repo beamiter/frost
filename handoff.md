@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 322 — Directory listings refuse U+FFFD names)
+
+## 2026-10-04 (upgrade round 322)
+
+- Local and remote directory listings skip names that contain U+FFFD so a neutralized filename cannot appear in the Files tree.
+- `cargo test --locked --bin frost -- remote_fs::tests::parse_list_skips_unsafe_names_and_deduplicates_paths` passed.
+
 Updated: 2026-10-04 (upgrade round 321 — Visible selection copy refuses spoofing)
 
 ## 2026-10-04 (upgrade round 321)

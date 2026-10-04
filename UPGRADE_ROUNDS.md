@@ -1698,3 +1698,7 @@ everywhere except a resize, and an audit against ember found the rest.
 321. **Visible selection copy refuses spoofing** — copying a visible terminal
      text selection (including primary on mouse-up) refuses visual spoofing and
      U+FFFD so they cannot reach the host clipboard.
+
+322. **Directory listings refuse U+FFFD names** — local and remote directory
+     listings skip names that contain U+FFFD so a neutralized filename cannot
+     appear in the Files tree.

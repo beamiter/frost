@@ -1060,7 +1060,8 @@ fn listing_name_is_safe(name: &str) -> bool {
         && name != ".."
         && !name.contains('/')
         && !name.chars().any(|character| {
-            character.is_control()
+            character == '\u{fffd}'
+                || character.is_control()
                 || jterm_core::review_input::is_visual_spoofing_character(character)
         })
 }
@@ -3368,11 +3369,11 @@ mod tests {
         bytes.extend_from_slice(b"d\0");
         let entries = parse_list(&bytes, dir);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["dir one", "sym link", "�� raw"]);
+        assert_eq!(names, vec!["dir one", "sym link"]);
         assert!(entries[0].is_dir);
-        assert!(!entries[1].is_dir && !entries[2].is_dir);
-        assert_eq!(entries[2].path, dir.join("�� raw"));
+        assert!(!entries[1].is_dir);
         assert!(entries.iter().all(|entry| !entry.name.contains('\u{202e}')));
+        assert!(entries.iter().all(|entry| !entry.name.contains('\u{fffd}')));
         assert!(entries.iter().all(|entry| !entry.name.contains('\n')));
         assert_eq!(
             entries
