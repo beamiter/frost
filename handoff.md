@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 345 — OSC titles refuse U+FFFD)
+
+## 2026-10-04 (upgrade round 345)
+
+- OSC 0/1/2 window and icon titles refuse a payload that still contains U+FFFD after sanitization so a neutralized title cannot restyle app chrome.
+- `cargo test --locked --bin frost -- tests::osc_titles_are_bounded_and_safe_for_app_chrome tests::xtwinops_save_and_restore_titles tests::osc_icon_and_window_titles_are_tracked_separately tests::fragmented_osc_advances_its_scan_cursor_and_sets_the_title` passed.
+
 Updated: 2026-10-04 (upgrade round 344 — Files-panel filter refuses spoofing)
 
 ## 2026-10-04 (upgrade round 344)

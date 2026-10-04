@@ -4283,13 +4283,18 @@ impl TerminalState {
             let (command, value) = payload.split_once(';').unwrap_or((payload, ""));
             if !command.is_empty() {
                 if command == "0" {
-                    let title = Self::sanitized_title(value);
-                    self.icon_title.clone_from(&title);
-                    self.window_title = title;
+                    if let Some(title) = Self::accepted_title(value) {
+                        self.icon_title.clone_from(&title);
+                        self.window_title = title;
+                    }
                 } else if command == "1" {
-                    self.icon_title = Self::sanitized_title(value);
+                    if let Some(title) = Self::accepted_title(value) {
+                        self.icon_title = title;
+                    }
                 } else if command == "2" {
-                    self.window_title = Self::sanitized_title(value);
+                    if let Some(title) = Self::accepted_title(value) {
+                        self.window_title = title;
+                    }
                 } else if command == "7" {
                     // OSC 7 — the child reporting its cwd
                     // as `file://host/%-encoded-path`, or
@@ -6673,6 +6678,15 @@ impl TerminalState {
             })
             .take(MAX_TERMINAL_TITLE_CHARS)
             .collect()
+    }
+
+    fn accepted_title(title: &str) -> Option<String> {
+        let title = Self::sanitized_title(title);
+        if title.contains('\u{fffd}') {
+            None
+        } else {
+            Some(title)
+        }
     }
 
     fn save_titles(&mut self, target: u16) {
@@ -18063,26 +18077,31 @@ mod tests {
     #[test]
     fn osc_titles_are_bounded_and_safe_for_app_chrome() {
         let mut terminal = TerminalState::new(80, 24);
+        terminal.process_input(b"\x1b]2;kept\x1b\\");
         let hostile = format!(
             "\x1b]2;safe\n\u{202e}{}tail\x1b\\",
             "x".repeat(MAX_TERMINAL_TITLE_CHARS + 64)
         );
 
         terminal.process_input(hostile.as_bytes());
+        assert_eq!(terminal.window_title, "kept");
 
+        let oversized = format!(
+            "\x1b]2;safe{}tail\x1b\\",
+            "x".repeat(MAX_TERMINAL_TITLE_CHARS + 64)
+        );
+        terminal.process_input(oversized.as_bytes());
         assert_eq!(
             terminal.window_title.chars().count(),
             MAX_TERMINAL_TITLE_CHARS
         );
         assert!(terminal.window_title.starts_with("safe"));
         assert!(!terminal.window_title.contains('\n'));
-        assert!(!terminal.window_title.contains('\u{202e}'));
-        assert!(terminal.window_title.contains('\u{fffd}'));
         assert!(!terminal.window_title.ends_with("tail"));
         terminal.process_input("\x1b]2;ok\u{200b}title\x1b\\".as_bytes());
         assert!(!terminal.window_title.contains('\u{200b}'));
-        assert!(terminal.window_title.contains('\u{fffd}'));
-        assert!(terminal.window_title.starts_with("ok"));
+        assert!(!terminal.window_title.contains('\u{fffd}'));
+        assert!(terminal.window_title.starts_with("safe"));
     }
 
     #[test]

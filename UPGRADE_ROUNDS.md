@@ -1789,3 +1789,7 @@ everywhere except a resize, and an audit against ember found the rest.
 344. **Files-panel filter refuses spoofing** — the files-panel name filter
      yields no matches when the query still contains visual spoofing or U+FFFD
      so a neutralized paste cannot reveal a tree path.
+
+345. **OSC titles refuse U+FFFD** — OSC 0/1/2 window and icon titles refuse a
+     payload that still contains U+FFFD after sanitization so a neutralized
+     title cannot restyle app chrome.
