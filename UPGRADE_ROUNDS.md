@@ -1941,3 +1941,7 @@ everywhere except a resize, and an audit against ember found the rest.
 382. **Foreground process names omit spoofing** — a `/proc` comm that still
      contains visual spoofing or U+FFFD is omitted from the pane header, so a
      neutralized process name cannot sit in chrome.
+
+383. **Provider labels omit spoofing** — a provider display name that still
+     contains visual spoofing or U+FFFD is replaced with a generic label, so a
+     neutralized backend name cannot sit in chrome.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 383 — provider labels omit spoofing)
+
+## 2026-10-04 (upgrade round 383)
+
+- A provider display name that still contains visual spoofing or U+FFFD is replaced with a generic label, so a neutralized backend name cannot sit in chrome.
+- `cargo test --offline --bin frost -- provider_label_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 382 — foreground process names omit spoofing)
 
 ## 2026-10-04 (upgrade round 382)

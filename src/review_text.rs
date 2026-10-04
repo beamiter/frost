@@ -240,7 +240,13 @@ pub(crate) fn bound_diagnostic_text(text: impl Into<String>) -> String {
 pub(crate) const MAX_PROVIDER_LABEL_BYTES: usize = 256;
 
 pub(crate) fn bound_provider_label(text: impl Into<String>) -> String {
-    jterm_core::review_input::safe_inline_display(&text.into(), MAX_PROVIDER_LABEL_BYTES)
+    let shown =
+        jterm_core::review_input::safe_inline_display(&text.into(), MAX_PROVIDER_LABEL_BYTES);
+    if shown.is_empty() || shown.contains('\u{fffd}') {
+        "AI provider".to_string()
+    } else {
+        shown
+    }
 }
 
 /// `/proc` comm names reach the pane header. Bound and neutralize them so a
@@ -410,15 +416,14 @@ mod tests {
     #[test]
     fn provider_label_replaces_controls_and_stays_bounded() {
         let shown = bound_provider_label(format!("ollama\u{1b}[31m\u{202e}{}", "n".repeat(400)));
-        assert!(!shown.contains('\u{1b}'));
-        assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
-        assert!(shown.len() <= MAX_PROVIDER_LABEL_BYTES);
-        assert!(shown.starts_with("ollama"));
+        assert_eq!(shown, "AI provider");
+        assert!(!shown.contains('\u{fffd}'));
         let native = bound_provider_label(format!("Codex\u{202e}{}", "x".repeat(400)));
-        assert!(!native.contains('\u{202e}'));
-        assert!(native.len() <= MAX_PROVIDER_LABEL_BYTES);
-        assert!(native.starts_with("Codex"));
+        assert_eq!(native, "AI provider");
+        assert_eq!(bound_provider_label("ollama"), "ollama");
+        let filled = bound_provider_label(format!("{}y", "p".repeat(MAX_PROVIDER_LABEL_BYTES)));
+        assert_eq!(filled.len(), MAX_PROVIDER_LABEL_BYTES);
+        assert!(!filled.contains('y'));
     }
 
     #[test]
