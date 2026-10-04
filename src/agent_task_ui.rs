@@ -294,7 +294,11 @@ impl TaskPanel {
     }
 
     pub(crate) fn set_follow_up(&mut self, text: impl Into<String>) {
-        self.follow_up = bound_follow_up(text);
+        let text = bound_follow_up(text);
+        if follow_up_is_unsafe(&text) {
+            return;
+        }
+        self.follow_up = text;
     }
 }
 
@@ -359,10 +363,11 @@ mod tests {
         let mut panel = TaskPanel::new();
         panel.set_follow_up("ok\n\u{07}go");
         assert_eq!(panel.follow_up, "ok\ngo");
+        panel.set_follow_up("keep me");
         panel.set_follow_up("please\n\u{202e}adjust");
+        assert_eq!(panel.follow_up, "keep me");
         assert!(!panel.follow_up.contains('\u{202e}'));
-        assert!(panel.follow_up.contains('\u{fffd}'));
-        assert!(panel.follow_up.starts_with("please\n"));
+        assert!(!panel.follow_up.contains('\u{fffd}'));
     }
 
     #[test]

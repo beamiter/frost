@@ -1813,3 +1813,7 @@ everywhere except a resize, and an audit against ember found the rest.
 350. **Agent composer refuses spoofing** — the Agent composer does not save a
      message that still contains visual spoofing or U+FFFD, so a neutralized
      paste cannot become the next turn.
+
+351. **Tasks follow-up refuses spoofing** — the Tasks follow-up composer does
+     not save a message that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot become the next native turn.

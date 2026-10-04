@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 351 — Tasks follow-up refuses spoofing)
+
+## 2026-10-04 (upgrade round 351)
+
+- The Tasks follow-up composer does not save a message that still contains visual spoofing or U+FFFD, so a neutralized paste cannot become the next native turn.
+- `cargo test --locked --bin frost -- agent_task_ui::tests::follow_up_composer_keeps_newlines_and_truncates agent_task_ui::tests::follow_up_gate_bounds_text_and_turn_count` passed.
+
 Updated: 2026-10-04 (upgrade round 350 — Agent composer refuses spoofing)
 
 ## 2026-10-04 (upgrade round 350)
