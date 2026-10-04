@@ -1841,3 +1841,7 @@ everywhere except a resize, and an audit against ember found the rest.
 357. **Block search query field refuses spoofing** — cross-block search does
      not keep a query that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot scan command history.
+
+358. **Command palette query refuses spoofing** — the command palette does not
+     keep a query that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot select an action.
