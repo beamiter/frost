@@ -44,6 +44,15 @@ pub fn bound_api_key_draft(value: impl Into<String>) -> String {
     }
     value
 }
+
+pub fn accepted_api_key_draft(value: impl Into<String>) -> Option<String> {
+    let value = bound_api_key_draft(value);
+    if value.chars().any(api_key_char_is_unsafe) {
+        None
+    } else {
+        Some(value)
+    }
+}
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Exact content identity for optimistic concurrency checks.
@@ -1427,6 +1436,11 @@ mod tests {
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));
         assert!(spoofed.starts_with("sk-"));
+        assert!(accepted_api_key_draft("sk-\u{202e}secret").is_none());
+        assert_eq!(
+            accepted_api_key_draft("sk-secret").as_deref(),
+            Some("sk-secret")
+        );
         assert!(write_api_key_file("/tmp/unused", &spoofed).is_err());
     }
 }

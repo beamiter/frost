@@ -13385,7 +13385,9 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetAiKeyDraft(value) => {
-                self.ai_key_draft = crate::persistence::bound_api_key_draft(value);
+                if let Some(value) = crate::persistence::accepted_api_key_draft(value) {
+                    self.ai_key_draft = value;
+                }
             }
             Message::StoreAiKey => {
                 let key = self.ai_key_draft.trim().to_string();

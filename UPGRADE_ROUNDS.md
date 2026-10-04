@@ -1869,3 +1869,7 @@ everywhere except a resize, and an audit against ember found the rest.
 364. **Ask-AI request overlay refuses spoofing** — the Ask-AI overlay does not
      keep a request that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot leave as a suggestion prompt.
+
+365. **API key draft refuses spoofing** — the settings API-key field does not
+     keep a draft that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot be stored as a credential.

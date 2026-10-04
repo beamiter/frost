@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 365 — API key draft refuses spoofing)
+
+## 2026-10-04 (upgrade round 365)
+
+- The settings API-key field does not keep a draft that still contains visual spoofing or U+FFFD, so a neutralized paste cannot be stored as a credential.
+- `cargo test --locked --bin frost -- persistence::tests::api_key_draft_drops_controls_and_leaves_room_for_the_file_newline` passed.
+
 Updated: 2026-10-04 (upgrade round 364 — Ask-AI request overlay refuses spoofing)
 
 ## 2026-10-04 (upgrade round 364)
