@@ -12388,10 +12388,17 @@ impl Frost {
                 self.push_toast("Selected blocks are no longer available", ToastKind::Info);
                 Some(Task::none())
             }
+            Err(block_mode::SelectedClipboardError::Unsafe) => {
+                self.push_toast(
+                    "Selected block Markdown contains control or visual-spoofing characters; nothing was copied"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Some(Task::none())
+            }
             Err(
                 block_mode::SelectedClipboardError::TooLarge
-                | block_mode::SelectedClipboardError::OutputUnavailable
-                | block_mode::SelectedClipboardError::Unsafe,
+                | block_mode::SelectedClipboardError::OutputUnavailable,
             ) => {
                 self.push_toast(
                     "Selected block Markdown is too large to copy",
@@ -12422,6 +12429,14 @@ impl Frost {
             return Task::none();
         };
         let markdown = Self::block_markdown(&sess.terminal, zone);
+        if crate::block_mode::clipboard_multiline_is_unsafe(&markdown) {
+            self.push_toast(
+                "Block Markdown not copied: it contains control or visual-spoofing characters"
+                    .to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
         self.push_toast("Copied block as Markdown", ToastKind::Success);
         iced::clipboard::write(markdown)
     }

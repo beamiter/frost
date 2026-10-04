@@ -1702,3 +1702,7 @@ everywhere except a resize, and an audit against ember found the rest.
 322. **Directory listings refuse U+FFFD names** — local and remote directory
      listings skip names that contain U+FFFD so a neutralized filename cannot
      appear in the Files tree.
+
+323. **Block Markdown copy refuses spoofing** — copying a single block as
+     Markdown refuses visual spoofing and U+FFFD, and a selected Markdown copy
+     that fails that check reports spoofing instead of a size error.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 323 — Block Markdown copy refuses spoofing)
+
+## 2026-10-04 (upgrade round 323)
+
+- Copying a single block as Markdown refuses visual spoofing and U+FFFD, and a selected Markdown copy that fails that check reports spoofing instead of a size error.
+- `cargo test --locked --bin frost -- block_mode::tests::selected_markdown_copy_is_ordered_separated_and_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 322 — Directory listings refuse U+FFFD names)
 
 ## 2026-10-04 (upgrade round 322)
