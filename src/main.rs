@@ -24972,6 +24972,9 @@ fn tab_switcher_filtered(labels: &[String], query: &str) -> Vec<(usize, usize)> 
     if query.is_empty() {
         return labels.iter().enumerate().map(|(i, _)| (i, i)).collect();
     }
+    if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query) {
+        return Vec::new();
+    }
     let matcher = SkimMatcherV2::default();
     let mut scored: Vec<(i64, usize)> = labels
         .iter()
@@ -31457,5 +31460,6 @@ mod tests {
         assert!(!state.query.contains('\u{202e}'));
         assert!(state.query.contains('\u{fffd}'));
         assert!(state.query.starts_with("tab"));
+        assert!(tab_switcher_filtered(&["build".into(), "tab two".into()], &state.query).is_empty());
     }
 }
