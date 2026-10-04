@@ -469,6 +469,11 @@ impl AgentUi {
         if context.cmd.trim().is_empty() {
             return Err("the failed block has no command context".to_string());
         }
+        if attached_block_context_is_unsafe(&context) {
+            return Err(
+                "attached block contains control or visual-spoofing characters".to_string(),
+            );
+        }
         if self.awaiting.is_some() {
             return Err(
                 "An approved Agent command is still running; wait for its correlated completion before replacing this task"
@@ -946,7 +951,7 @@ impl AgentUi {
         ) else {
             return;
         };
-        self.last_manual_completed = Some(BlockContext {
+        let context = BlockContext {
             cmd: reported,
             output: completed.output.clone(),
             cwd: None,
@@ -954,11 +959,39 @@ impl AgentUi {
                 .exit_code
                 .expect("completion provenance and status were checked above"),
             truncated: completed.output.len() >= MANUAL_OUTPUT_TRUNCATION_HINT,
-        });
+        };
+        if attached_block_context_is_unsafe(&context) {
+            return;
+        }
+        self.last_manual_completed = Some(context);
     }
 }
 
 const MAX_AGENT_STATUS_BYTES: usize = 256;
+
+pub(crate) fn attached_block_context_is_unsafe(context: &BlockContext) -> bool {
+    attached_line_is_unsafe(&context.cmd)
+        || attached_output_is_unsafe(&context.output)
+        || context.cwd.as_deref().is_some_and(attached_line_is_unsafe)
+}
+
+fn attached_line_is_unsafe(value: &str) -> bool {
+    value.contains('\u{fffd}')
+        || value.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(value)
+}
+
+fn attached_output_is_unsafe(value: &str) -> bool {
+    value.chars().any(|character| {
+        if matches!(character, '\n' | '\t' | '\r') {
+            false
+        } else {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
+}
 
 pub(crate) fn bound_transcript_text(text: impl Into<String>) -> String {
     crate::review_text::bound_diagnostic_text(text)
@@ -1662,6 +1695,27 @@ mod tests {
         agent.handle_completed(7, &completion);
 
         assert!(agent.last_manual_completed.is_none());
+    }
+
+    #[test]
+    fn spoofed_manual_completion_is_not_attached() {
+        let mut agent = AgentUi::new();
+        agent.open(&ai_config(), 7);
+        agent.handle_completed(7, &completed("pwd", 0, "ok\u{202e}", None));
+        assert!(agent.last_manual_completed.is_none());
+        agent.handle_completed(7, &completed("pwd", 0, "ok\nthere", None));
+        assert_eq!(
+            agent
+                .last_manual_completed
+                .as_ref()
+                .map(|context| context.cmd.as_str()),
+            Some("pwd")
+        );
+        let mut spoofed = failed_block_context();
+        spoofed.cmd = "cargo test\u{202e}".to_string();
+        assert!(agent
+            .start_for_block(&ai_config(), 7, spoofed, "Fix it")
+            .is_err());
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 312 — Agent block context refuses spoofing)
+
+## 2026-10-04 (upgrade round 312)
+
+- Agent-attached block context (manual completions, Fix/Explain, Ask-AI-about-block) refuses visual spoofing and U+FFFD so it cannot become model evidence.
+- `cargo test --locked --bin frost -- agent::tests::spoofed_manual_completion_is_not_attached` passed.
+
 Updated: 2026-10-04 (upgrade round 311 — Ask-AI block context refuses spoofing)
 
 ## 2026-10-04 (upgrade round 311)

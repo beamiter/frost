@@ -1658,3 +1658,7 @@ everywhere except a resize, and an audit against ember found the rest.
 311. **Ask-AI block context refuses spoofing** — selected-block command,
      output, or cwd that still contains visual spoofing or U+FFFD cannot be
      attached as model prompt context.
+
+312. **Agent block context refuses spoofing** — manual completions, Fix/Explain,
+     and Ask-AI-about-block refuse visual spoofing and U+FFFD so they cannot
+     become model evidence.

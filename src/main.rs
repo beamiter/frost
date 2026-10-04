@@ -9063,6 +9063,13 @@ impl Frost {
             return Task::none();
         };
         let context = agent_task::context::ad_hoc_block_context(&semantic);
+        if crate::agent::attached_block_context_is_unsafe(&context) {
+            self.push_toast(
+                "Block context contains control or visual-spoofing characters".to_string(),
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
         let session_id = sess.id;
         if !self.agent.is_open || self.agent.bound_session_id != Some(session_id) {
             self.agent.open(&self.config, session_id);
