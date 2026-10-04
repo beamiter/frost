@@ -1917,3 +1917,7 @@ everywhere except a resize, and an audit against ember found the rest.
 376. **Theme setting refuses spoofing** — the settings theme field does not
      keep a name that still contains visual spoofing or U+FFFD, so a neutralized
      paste cannot sit as the active theme identity.
+
+377. **Font family setting refuses spoofing** — the settings font-family field
+     does not keep a family that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as the terminal typeface.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 377 — font family setting refuses spoofing)
+
+## 2026-10-04 (upgrade round 377)
+
+- The settings font-family field does not keep a family that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as the terminal typeface.
+- `cargo test --offline --bin frost -- live_font_family_settings_field_uses_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 376 — theme setting refuses spoofing)
 
 ## 2026-10-04 (upgrade round 376)

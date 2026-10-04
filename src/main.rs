@@ -15150,10 +15150,14 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetFontFamily(name) => {
-                self.config.font_family =
-                    crate::config::bound_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES);
-                self.config_dirty = true;
-                self.apply_config();
+                if let Some(name) = crate::config::accepted_config_text(
+                    name,
+                    crate::config::MAX_CONFIG_NAME_BYTES,
+                ) {
+                    self.config.font_family = name;
+                    self.config_dirty = true;
+                    self.apply_config();
+                }
             }
             Message::SetScrollbarAlways(always) => {
                 self.config.scrollbar_visibility = if always {
