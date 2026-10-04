@@ -228,9 +228,20 @@ impl CommandSuggestion {
         }
         match reply {
             Ok(command) => {
-                self.draft = bound_suggestion_draft(command);
-                self.phase = SuggestionPhase::Review;
-                self.feedback = None;
+                let draft = bound_suggestion_draft(command);
+                if draft.contains('\u{fffd}')
+                    || jterm_core::review_input::contains_visual_spoofing(&draft)
+                {
+                    self.draft.clear();
+                    self.phase = SuggestionPhase::Failed;
+                    self.feedback = Some(bound_suggestion_feedback(
+                        "generated command contains control or visual-spoofing characters",
+                    ));
+                } else {
+                    self.draft = draft;
+                    self.phase = SuggestionPhase::Review;
+                    self.feedback = None;
+                }
             }
             Err(error) => {
                 self.phase = SuggestionPhase::Failed;
@@ -262,6 +273,11 @@ impl CommandSuggestion {
     pub(crate) fn validated_insert_command(&self) -> Result<&str, String> {
         if self.phase != SuggestionPhase::Review {
             return Err("no generated command is ready for review".to_string());
+        }
+        if self.draft.contains('\u{fffd}') {
+            return Err(
+                "the command contains invisible or bidirectional formatting characters".to_string(),
+            );
         }
         jterm_core::review_input::validate(&self.draft).map_err(|error| error.to_string())
     }
@@ -455,6 +471,15 @@ mod tests {
     }
 
     #[test]
+    fn spoofed_generated_commands_never_enter_review() {
+        let (mut session, generation) = begin();
+        assert!(session.apply_reply(generation, Ok("rm -rf \u{202e}/".into())));
+        assert_eq!(session.phase(), SuggestionPhase::Failed);
+        assert!(session.draft.is_empty());
+        assert!(session.validated_insert_command().is_err());
+    }
+
+    #[test]
     fn stale_or_replayed_replies_never_publish() {
         let (mut session, generation) = begin();
         // A reply for an older generation is dropped while drafting.
@@ -523,6 +548,7 @@ mod tests {
             "echo one\necho two",
             "printf \u{7}",
             "echo safe\u{202e}hidden",
+            "echo ok\u{fffd}",
             "   ",
         ] {
             assert!(session.apply_reply(generation, Ok("ls".into())));

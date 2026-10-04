@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 309 — Ask-AI drafts refuse spoofing)
+
+## 2026-10-04 (upgrade round 309)
+
+- Generated Ask-AI commands that still contain U+FFFD or visual spoofing fail the card instead of entering review, and insert validation refuses replacement characters.
+- `cargo test --locked --bin frost -- ai_command::tests::spoofed_generated_commands_never_enter_review` passed.
+
 Updated: 2026-10-04 (upgrade round 308 — Ask-AI requests refuse spoofing)
 
 ## 2026-10-04 (upgrade round 308)

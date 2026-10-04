@@ -1646,3 +1646,7 @@ everywhere except a resize, and an audit against ember found the rest.
 308. **Ask-AI requests refuse spoofing** — command-suggestion sessions refuse
      natural-language requests that still contain U+FFFD, controls, or visual
      spoofing instead of sending them to the model.
+
+309. **Ask-AI drafts refuse spoofing** — a generated command that still
+     contains U+FFFD or visual spoofing fails the card instead of entering
+     review, and insert validation refuses replacement characters.
