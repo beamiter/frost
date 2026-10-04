@@ -1809,3 +1809,7 @@ everywhere except a resize, and an audit against ember found the rest.
 349. **Ask-AI review draft refuses spoofing** — the Ask-AI review card does
      not save a draft that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot become the insert command.
+
+350. **Agent composer refuses spoofing** — the Agent composer does not save a
+     message that still contains visual spoofing or U+FFFD, so a neutralized
+     paste cannot become the next turn.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 350 — Agent composer refuses spoofing)
+
+## 2026-10-04 (upgrade round 350)
+
+- The Agent composer does not save a message that still contains visual spoofing or U+FFFD, so a neutralized paste cannot become the next turn.
+- `cargo test --locked --bin frost -- agent::tests::composer_keeps_newlines_and_truncates_to_the_session_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 349 — Ask-AI review draft refuses spoofing)
 
 ## 2026-10-04 (upgrade round 349)

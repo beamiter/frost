@@ -599,7 +599,14 @@ impl AgentUi {
     }
 
     pub fn set_input(&mut self, text: impl Into<String>) {
-        self.input = bound_composer(text);
+        let text = bound_composer(text);
+        if composer_submit_is_unsafe(&text) {
+            self.set_status(
+                "message contains control or visual-spoofing characters and was not saved",
+            );
+            return;
+        }
+        self.input = text;
     }
 
     pub fn set_status(&mut self, text: impl Into<String>) {
@@ -2080,20 +2087,21 @@ mod tests {
         assert!(agent.input.len() <= MAX_AGENT_COMPOSER_BYTES);
         assert!(agent.input.is_char_boundary(agent.input.len()));
         assert!(!agent.input.contains('z'));
+        agent.set_input("keep me");
         agent.set_input("please\n\u{202e}fix");
+        assert_eq!(agent.input, "keep me");
         assert!(!agent.input.contains('\u{202e}'));
-        assert!(agent.input.contains('\u{fffd}'));
-        assert!(agent.input.starts_with("please\n"));
+        assert!(!agent.input.contains('\u{fffd}'));
+        assert!(agent.status.contains("visual-spoofing"));
         agent.session = Some(jterm_core::agent::AgentSession::new(8));
+        agent.input.clear();
         agent.submit_input();
-        assert!(agent.input.contains('\u{fffd}'));
         assert!(agent
             .session
             .as_ref()
             .expect("session")
             .transcript()
             .is_empty());
-        assert!(agent.status.contains("visual-spoofing"));
     }
 
     #[test]
