@@ -1937,3 +1937,7 @@ everywhere except a resize, and an audit against ember found the rest.
 381. **Agent edit open names unsafe commands** — refusing a spoofed Agent
      proposal reports an unsafe command instead of calling it empty, so the
      operator can tell a neutralized paste from a blank one.
+
+382. **Foreground process names omit spoofing** — a `/proc` comm that still
+     contains visual spoofing or U+FFFD is omitted from the pane header, so a
+     neutralized process name cannot sit in chrome.

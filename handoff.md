@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 382 — foreground process names omit spoofing)
+
+## 2026-10-04 (upgrade round 382)
+
+- A `/proc` comm that still contains visual spoofing or U+FFFD is omitted from the pane header, so a neutralized process name cannot sit in chrome.
+- `cargo test --offline --bin frost -- foreground_process_names_replace_spoofing_and_drop_empty` passed.
+
 Updated: 2026-10-04 (upgrade round 381 — Agent edit open names unsafe commands)
 
 ## 2026-10-04 (upgrade round 381)

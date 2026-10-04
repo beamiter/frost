@@ -253,7 +253,7 @@ pub(crate) fn bound_foreground_process_name(name: impl AsRef<str>) -> Option<Str
         MAX_FOREGROUND_PROCESS_NAME_BYTES,
     );
     let shown = shown.trim();
-    if shown.is_empty() {
+    if shown.is_empty() || shown.contains('\u{fffd}') {
         None
     } else {
         Some(shown.to_string())
@@ -501,10 +501,7 @@ mod tests {
             bound_foreground_process_name("cargo"),
             Some("cargo".to_string())
         );
-        let shown = bound_foreground_process_name("nvim\u{202e}").expect("visible name");
-        assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
-        assert!(shown.starts_with("nvim"));
+        assert!(bound_foreground_process_name("nvim\u{202e}").is_none());
         assert!(bound_foreground_process_name("").is_none());
         assert!(bound_foreground_process_name("   ").is_none());
         let overflow = bound_foreground_process_name(format!(
