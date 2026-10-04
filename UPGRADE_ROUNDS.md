@@ -1881,3 +1881,7 @@ everywhere except a resize, and an audit against ember found the rest.
 367. **Files-panel path bar refuses spoofing** — the files-panel path bar does
      not keep a path that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as a navigation target.
+
+368. **Remote host address refuses spoofing** — the remote-host address field
+     does not keep a hostname that still contains visual spoofing or U+FFFD, so
+     a neutralized paste cannot sit as a connection target.

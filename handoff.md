@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 368 — remote host address refuses spoofing)
+
+## 2026-10-04 (upgrade round 368)
+
+- The remote-host address field does not keep a hostname that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a connection target.
+- `cargo test --offline --bin frost -- live_remote_host_address_uses_the_value_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 367 — files-panel path bar refuses spoofing)
 
 ## 2026-10-04 (upgrade round 367)

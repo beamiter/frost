@@ -1007,6 +1007,19 @@ pub(crate) fn bound_config_text(value: impl Into<String>, max_bytes: usize) -> S
     bounded
 }
 
+pub(crate) fn config_text_is_unsafe(value: &str) -> bool {
+    value.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(value)
+}
+
+pub(crate) fn accepted_config_text(value: impl Into<String>, max_bytes: usize) -> Option<String> {
+    let value = bound_config_text(value, max_bytes);
+    if config_text_is_unsafe(&value) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// Live temperature field: keep the raw editing text so a half-typed "0." is
 /// not discarded, but never hold a paste larger than a numeric literal.
 pub(crate) const MAX_AI_TEMPERATURE_DRAFT_BYTES: usize = 32;
@@ -1475,6 +1488,11 @@ mod tests {
         assert!(overflow.len() <= MAX_CONFIG_VALUE_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        assert!(accepted_config_text("example.test\u{202e}", MAX_CONFIG_VALUE_BYTES).is_none());
+        assert_eq!(
+            accepted_config_text("example.test:22", MAX_CONFIG_VALUE_BYTES).as_deref(),
+            Some("example.test:22")
+        );
     }
 
     #[test]

@@ -12929,13 +12929,15 @@ impl Frost {
             }
             Message::RemoteHostHost(index, value) => {
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
-                    host.host = crate::config::bound_config_text(
+                    if let Some(value) = crate::config::accepted_config_text(
                         value,
                         crate::config::MAX_CONFIG_VALUE_BYTES,
-                    );
-                    self.config_dirty = true;
-                    if let Some(request) = self.reconcile_sidebar_remote_hosts() {
-                        return self.queue_sidebar_load(request);
+                    ) {
+                        host.host = value;
+                        self.config_dirty = true;
+                        if let Some(request) = self.reconcile_sidebar_remote_hosts() {
+                            return self.queue_sidebar_load(request);
+                        }
                     }
                 }
             }
