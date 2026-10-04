@@ -1769,3 +1769,7 @@ everywhere except a resize, and an audit against ember found the rest.
 339. **Command palette query refuses spoofing** — the command palette returns no
      matches when the query still contains visual spoofing or U+FFFD so a
      neutralized paste cannot select an action.
+
+340. **History picker query refuses spoofing** — the command-history picker
+     returns no matches when the query still contains visual spoofing or U+FFFD
+     so a neutralized paste cannot recall a command.

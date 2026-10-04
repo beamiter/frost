@@ -34,6 +34,10 @@ pub(crate) const MAX_SHARED_HISTORY_COMMAND_BYTES: usize =
 /// cannot grow the iced field and the per-entry fuzzy match without bound.
 pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
 
+fn history_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
 /// 把一条 OSC 133 重建的命令行修剪并校验为可持久化文本。返回 `None` 表示
 /// 不应写入历史：空白命令，或含换行/控制字符的重建文本（例如 heredoc 的
 /// 多行命令）——家族的 review-only 历史格式拒绝控制字符，这类文本也无法
@@ -138,6 +142,9 @@ impl HistoryPickerState {
     pub fn filtered(&self) -> Vec<&CommandHistoryRecord> {
         if self.query.is_empty() {
             return self.entries.iter().take(MAX_RESULTS).collect();
+        }
+        if history_query_is_unsafe(&self.query) {
+            return Vec::new();
         }
         let mut scored: Vec<(i64, &CommandHistoryRecord)> = self
             .entries
@@ -474,5 +481,7 @@ mod tests {
         assert!(!state.query.contains('\u{202e}'));
         assert!(state.query.contains('\u{fffd}'));
         assert!(state.query.starts_with("cargo"));
+        assert!(state.filtered().is_empty());
+        assert_eq!(state.selected_command(), None);
     }
 }
