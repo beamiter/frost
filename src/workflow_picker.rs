@@ -29,6 +29,10 @@ use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
 pub(crate) const MAX_RESULTS: usize = 15;
 const PICKER_POLICY: PickerPolicy = PickerPolicy::new(MAX_RESULTS, false);
 
+fn overlay_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
 fn bound_overlay_line(text: impl Into<String>, max_bytes: usize) -> String {
     let mut value: String = text
         .into()
@@ -137,26 +141,41 @@ impl WorkflowPickerState {
     /// 模糊匹配分数降序，同分保持加载顺序（稳定排序）。名称、描述与标签一起
     /// 参与匹配，对应 anvil 面板对 tags 的检索。
     pub(crate) fn filtered(&self) -> Vec<&Workflow> {
+        if overlay_query_is_unsafe(self.query()) {
+            return Vec::new();
+        }
         self.picker.filtered()
     }
 
     /// 高亮项下移（在过滤结果中循环）。
     pub(crate) fn select_next(&mut self) {
+        if overlay_query_is_unsafe(self.query()) {
+            return;
+        }
         self.picker.select_next();
     }
 
     /// 高亮项上移（在过滤结果中循环）。
     pub(crate) fn select_prev(&mut self) {
+        if overlay_query_is_unsafe(self.query()) {
+            return;
+        }
         self.picker.select_prev();
     }
 
     /// 当前高亮的 workflow（按过滤结果中的位置）。
     pub(crate) fn selected_workflow(&self) -> Option<&Workflow> {
+        if overlay_query_is_unsafe(self.query()) {
+            return None;
+        }
         self.picker.selected_workflow()
     }
 
     /// 过滤结果中第 `index` 条的 workflow（用于鼠标点击分发）。
     pub(crate) fn workflow_at_filtered(&self, index: usize) -> Option<&Workflow> {
+        if overlay_query_is_unsafe(self.query()) {
+            return None;
+        }
         self.picker.workflow_at_filtered(index)
     }
 }
@@ -341,6 +360,9 @@ mod tests {
         state.set_query("deploy\u{202e}");
         assert!(!state.query().contains('\u{202e}'));
         assert!(state.query().contains('\u{fffd}'));
+        assert!(state.filtered().is_empty());
+        assert!(state.selected_workflow().is_none());
+        assert!(state.workflow_at_filtered(0).is_none());
     }
 
     #[test]

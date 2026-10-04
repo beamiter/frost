@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 342 — Workflow picker query refuses spoofing)
+
+## 2026-10-04 (upgrade round 342)
+
+- The workflow picker returns no matches and cannot accept a workflow when the query still contains visual spoofing or U+FFFD.
+- `cargo test --locked --bin frost -- workflow_picker::tests::iced_query_input_crosses_the_shared_query_boundary workflow_picker::tests::fuzzy_query_matches_name_description_and_tags` passed.
+
 Updated: 2026-10-04 (upgrade round 341 — Tab switcher query refuses spoofing)
 
 ## 2026-10-04 (upgrade round 341)
