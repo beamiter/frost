@@ -1833,3 +1833,7 @@ everywhere except a resize, and an audit against ember found the rest.
 355. **Find query field refuses spoofing** — terminal find does not keep a
      query that still contains visual spoofing or U+FFFD, so a neutralized
      paste cannot scan scrollback.
+
+356. **Find history restore refuses spoofing** — terminal find does not restore
+     a history entry that still contains visual spoofing or U+FFFD, so a
+     neutralized saved query cannot scan scrollback.

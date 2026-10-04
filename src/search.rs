@@ -262,38 +262,46 @@ impl SearchState {
             return;
         }
 
-        if let Some(idx) = self.history_nav_index {
-            if idx + 1 < self.history.len() {
-                self.history_nav_index = Some(idx + 1);
-                let entry = &self.history[idx + 1];
-                self.query = bound_query_text(entry.query.clone());
-                self.use_regex = entry.is_regex;
-                self.case_sensitive = entry.case_sensitive;
-            }
-        } else {
-            self.history_nav_index = Some(0);
-            let entry = &self.history[0];
-            self.query = bound_query_text(entry.query.clone());
-            self.use_regex = entry.is_regex;
-            self.case_sensitive = entry.case_sensitive;
-        }
+        let next = match self.history_nav_index {
+            Some(idx) if idx + 1 < self.history.len() => idx + 1,
+            None => 0,
+            _ => return,
+        };
+        self.restore_history_entry(next);
     }
 
     /// 从历史中加载后一条
     pub fn history_next(&mut self) {
         if let Some(idx) = self.history_nav_index {
             if idx > 0 {
-                self.history_nav_index = Some(idx - 1);
-                let entry = &self.history[idx - 1];
-                self.query = bound_query_text(entry.query.clone());
-                self.use_regex = entry.is_regex;
-                self.case_sensitive = entry.case_sensitive;
+                self.restore_history_entry(idx - 1);
             } else {
                 // 返回输入框
                 self.history_nav_index = None;
                 self.query.clear();
             }
         }
+    }
+
+    fn restore_history_entry(&mut self, idx: usize) {
+        let Some(entry) = self.history.get(idx) else {
+            return;
+        };
+        let query = bound_query_text(entry.query.clone());
+        let use_regex = entry.is_regex;
+        let case_sensitive = entry.case_sensitive;
+        if find_query_is_unsafe(&query) {
+            self.error_message = Some(crate::review_text::bound_query_error(
+                "Query contains control or visual-spoofing characters and was not restored",
+            ));
+            return;
+        }
+        self.query = query;
+        self.use_regex = use_regex;
+        self.case_sensitive = case_sensitive;
+        self.history_nav_index = Some(idx);
+        self.current_match_index = 0;
+        self.error_message = None;
     }
 }
 
@@ -950,5 +958,24 @@ mod tests {
             SearchEngine::search(&[row], "err\u{fffd}or", false, true, &mut cache);
         assert!(matches.is_empty());
         assert!(error.is_some_and(|message| message.contains("visual-spoofing")));
+    }
+
+    #[test]
+    fn history_restore_refuses_spoofed_queries() {
+        let mut state = SearchState::new();
+        state.set_query("keep");
+        state.history.push_front(SearchHistoryEntry {
+            query: "err\u{202e}or".into(),
+            is_regex: false,
+            case_sensitive: false,
+            timestamp: "0".into(),
+        });
+        state.history_prev();
+        assert_eq!(state.query, "keep");
+        assert!(state.history_nav_index.is_none());
+        assert!(state
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("not restored")));
     }
 }

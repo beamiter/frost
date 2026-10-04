@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 356 — Find history restore refuses spoofing)
+
+## 2026-10-04 (upgrade round 356)
+
+- Terminal find does not restore a history entry that still contains visual spoofing or U+FFFD, so a neutralized saved query cannot scan scrollback.
+- `cargo test --locked --bin frost -- search::tests::history_restore_refuses_spoofed_queries search::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 355 — Find query field refuses spoofing)
 
 ## 2026-10-04 (upgrade round 355)
