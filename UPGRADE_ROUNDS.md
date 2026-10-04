@@ -1929,3 +1929,7 @@ everywhere except a resize, and an audit against ember found the rest.
 379. **Agent edit command refuses spoofing** — the Agent command-edit field
      does not keep a command that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as an approved agent command.
+
+380. **Agent edit open refuses spoofing** — Edit on an Agent proposal does not
+     open a draft that still contains visual spoofing or U+FFFD, so a
+     neutralized command cannot sit waiting for Approve.

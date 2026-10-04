@@ -101,10 +101,10 @@ pub(crate) fn accepted_agent_edit_command(value: impl Into<String>) -> Option<St
     }
 }
 
-/// Open the Agent edit field from a proposal command. Oversized or
-/// control-bearing text truncates instead of refusing the whole edit.
+/// Open the Agent edit field from a proposal command. Oversized text
+/// truncates; spoofed or empty text refuses the whole edit.
 pub(crate) fn prepared_agent_edit_command(command: impl Into<String>) -> Option<String> {
-    let command = bound_agent_edit_command(command);
+    let command = accepted_agent_edit_command(command)?;
     if command.trim_matches(' ').is_empty() {
         None
     } else {
@@ -472,6 +472,7 @@ mod tests {
         assert_eq!(opened.len(), MAX_AGENT_COMMAND_BYTES);
         assert!(!opened.contains('y'));
         assert!(prepared_agent_edit_command("\u{1b}\n").is_none());
+        assert!(prepared_agent_edit_command("git \u{202e}status").is_none());
         assert_eq!(
             prepared_agent_edit_command("ls\n\u{1b} -la").as_deref(),
             Some("ls -la")

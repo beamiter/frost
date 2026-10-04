@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 380 — Agent edit open refuses spoofing)
+
+## 2026-10-04 (upgrade round 380)
+
+- Edit on an Agent proposal does not open a draft that still contains visual spoofing or U+FFFD, so a neutralized command cannot sit waiting for Approve.
+- `cargo test --offline --bin frost -- agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls` passed.
+
 Updated: 2026-10-04 (upgrade round 379 — Agent edit command refuses spoofing)
 
 ## 2026-10-04 (upgrade round 379)
