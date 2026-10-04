@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 307 — History cwd refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 307)
+
+- Shared-history cwd restore refuses U+FFFD so a neutralized path cannot appear beside a replayed command.
+- `cargo test --locked --bin frost -- history_picker::tests::constructor_drops_unsafe_commands_and_untrusted_cwds` passed.
+
 Updated: 2026-10-04 (upgrade round 306 — Config persist refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 306)

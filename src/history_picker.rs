@@ -45,6 +45,7 @@ pub fn sanitized_command(command: &str) -> Option<&str> {
 
 pub fn sanitized_cwd(cwd: &str) -> Option<&str> {
     if cwd.len() > MAX_HISTORY_CWD_BYTES
+        || cwd.contains('\u{fffd}')
         || cwd.chars().any(char::is_control)
         || jterm_core::review_input::contains_visual_spoofing(cwd)
     {
@@ -271,6 +272,7 @@ mod tests {
         assert_eq!(sanitized_command("cat <<EOF\nhello\nEOF"), None);
         assert_eq!(sanitized_command("printf \u{7}"), None);
         assert_eq!(sanitized_command("printf safe\u{202e}txt"), None);
+        assert_eq!(sanitized_command("printf ok\u{fffd}"), None);
         assert_eq!(sanitized_command("echo\u{00a0}not-a-separator"), None);
         assert_eq!(
             sanitized_command(&"x".repeat(MAX_SHARED_HISTORY_COMMAND_BYTES + 1)),
@@ -330,6 +332,7 @@ mod tests {
         assert_eq!(state.entries[0].command, "cargo test");
         assert_eq!(state.entries[0].cwd, None);
         assert_eq!(state.selected_command().as_deref(), Some("cargo test"));
+        assert_eq!(sanitized_cwd("/tmp/\u{fffd}spoof"), None);
     }
 
     #[test]

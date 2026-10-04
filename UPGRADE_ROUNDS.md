@@ -1638,3 +1638,7 @@ everywhere except a resize, and an audit against ember found the rest.
 306. **Config persist refuses U+FFFD** — normalized settings, history paths,
      and remote-host validation refuse replacement characters so a neutralized
      draft cannot become a model name, theme, path, or ssh operand.
+
+307. **History cwd refuses U+FFFD** — shared-history working directories that
+     contain replacement characters are dropped so a neutralized path cannot
+     sit beside a replayed command.
