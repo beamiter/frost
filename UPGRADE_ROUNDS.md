@@ -1857,3 +1857,7 @@ everywhere except a resize, and an audit against ember found the rest.
 361. **Workflow picker query refuses spoofing** — the workflow picker does not
      keep a query that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot accept a workflow.
+
+362. **AI chats library search refuses spoofing** — the AI chats library search
+     does not keep a query that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot open a saved chat.

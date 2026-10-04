@@ -350,6 +350,12 @@ impl AiChatsUi {
             }
             query.truncate(end);
         }
+        if library_search_is_unsafe(&query) {
+            self.set_notice(
+                "Search contains control or visual-spoofing characters and was not saved.",
+            );
+            return;
+        }
         self.search = query;
     }
 
@@ -1259,11 +1265,14 @@ mod tests {
         assert!(panel.search.len() <= MAX_SEARCH_BYTES);
         assert!(panel.search.is_char_boundary(panel.search.len()));
         assert!(!panel.search.contains('z'));
+        panel.set_search("chat".into());
         panel.set_search("chat\u{202e}".into());
+        assert_eq!(panel.search, "chat");
         assert!(!panel.search.contains('\u{202e}'));
-        assert!(panel.search.contains('\u{fffd}'));
-        assert!(panel.search.starts_with("chat"));
-        assert!(panel.library_summaries().is_empty());
+        assert!(!panel.search.contains('\u{fffd}'));
+        assert!(panel.notice.contains("not saved"));
+        panel.set_search("chat\u{fffd}".into());
+        assert_eq!(panel.search, "chat");
     }
 
     #[test]

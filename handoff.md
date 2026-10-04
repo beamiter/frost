@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 362 — AI chats library search refuses spoofing)
+
+## 2026-10-04 (upgrade round 362)
+
+- The AI chats library search does not keep a query that still contains visual spoofing or U+FFFD, so a neutralized paste cannot open a saved chat.
+- `cargo test --locked --bin frost -- ai_chats::tests::library_search_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 361 — Workflow picker query refuses spoofing)
 
 ## 2026-10-04 (upgrade round 361)
