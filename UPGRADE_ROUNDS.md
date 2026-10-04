@@ -1956,3 +1956,7 @@ everywhere except a resize, and an audit against ember found the rest.
 386. **Theme-editor errors omit spoofing** — theme-editor error chrome drops
      U+FFFD leftover from neutralized spoofing, so a replacement character
      cannot sit next to the swatches.
+
+387. **Files-panel notices omit spoofing** — files-panel status chrome drops
+     U+FFFD leftover from neutralized spoofing, so a replacement character
+     cannot sit next to the tree.

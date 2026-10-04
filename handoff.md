@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 387 — files-panel notices omit spoofing)
+
+## 2026-10-04 (upgrade round 387)
+
+- Files-panel status chrome drops U+FFFD leftover from neutralized spoofing, so a replacement character cannot sit next to the tree.
+- `cargo test --offline --bin frost -- sidebar_notice_replaces_controls_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 386 — theme-editor errors omit spoofing)
 
 ## 2026-10-04 (upgrade round 386)

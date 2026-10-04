@@ -79,7 +79,8 @@ pub const MAX_SIDEBAR_NOTICE_BYTES: usize = 192;
 pub fn bound_sidebar_notice(text: impl AsRef<str>) -> String {
     let text =
         jterm_core::review_input::safe_inline_display(text.as_ref(), MAX_SIDEBAR_NOTICE_BYTES);
-    if text.is_empty() {
+    let text: String = text.chars().filter(|ch| *ch != '\u{fffd}').collect();
+    if text.trim().is_empty() {
         "Files panel notice".to_string()
     } else {
         text
@@ -3301,7 +3302,7 @@ mod tests {
         ));
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_SIDEBAR_NOTICE_BYTES);
         let busy = DirectoryError::busy(format!("queue full \u{1b}{}", "x".repeat(400)));
         assert!(!busy.message.contains('\u{1b}'));
@@ -3314,6 +3315,7 @@ mod tests {
         let again = bound_sidebar_notice(&shown);
         assert_eq!(again, shown);
         assert_eq!(bound_sidebar_notice(""), "Files panel notice");
+        assert_eq!(bound_sidebar_notice("\u{202e}"), "Files panel notice");
         let path_label = bound_sidebar_notice(format!("/tmp/\u{1b}[31m{}", "n".repeat(400)));
         assert!(!path_label.contains('\u{1b}'));
         assert!(path_label.len() <= MAX_SIDEBAR_NOTICE_BYTES);
@@ -3323,6 +3325,7 @@ mod tests {
             "p".repeat(400)
         )));
         assert!(!listed.contains('\u{202e}'));
+        assert!(!listed.contains('\u{fffd}'));
         assert!(listed.len() <= MAX_SIDEBAR_NOTICE_BYTES);
         assert!(listed.starts_with("/tmp/"));
     }
