@@ -205,7 +205,14 @@ impl WorkflowArgsState {
     }
 
     pub(crate) fn set_value(&mut self, index: usize, value: String) {
-        self.form.set(index, bound_arg_value(value));
+        let value = bound_arg_value(value);
+        if rendered_command_is_unsafe(&value) {
+            self.set_feedback(
+                "argument contains control or visual-spoofing characters and was not saved",
+            );
+            return;
+        }
+        self.form.set(index, value);
         self.feedback = None;
     }
 
@@ -397,11 +404,12 @@ mod tests {
         assert!(!form.missing().contains(&"env"));
         assert_eq!(form.render().unwrap(), "deploy api --env=staging");
         form.set_value(1, "staging\u{202e}".to_string());
-        let spoofed = form.render().unwrap_err();
-        assert!(
-            spoofed.contains("visual-spoofing") || spoofed.contains("control"),
-            "{spoofed}"
-        );
+        assert_eq!(form.value(1), "staging");
+        assert_eq!(form.render().unwrap(), "deploy api --env=staging");
+        assert!(form
+            .feedback
+            .as_deref()
+            .is_some_and(|text| text.contains("not saved")));
         form.set_value(1, "staging".to_string());
 
         // Reset is not the same operation as typing an empty string: the first
@@ -445,7 +453,12 @@ mod tests {
         assert!(!form.value(1).contains('!'));
         form.set_value(0, "api\u{202e}".to_string());
         assert!(!form.value(0).contains('\u{202e}'));
-        assert!(form.value(0).contains('\u{fffd}'));
+        assert!(!form.value(0).contains('\u{fffd}'));
+        assert_eq!(form.value(0), "okrm -rf /");
+        assert!(form
+            .feedback
+            .as_deref()
+            .is_some_and(|text| text.contains("not saved")));
     }
 
     #[test]

@@ -1761,3 +1761,7 @@ everywhere except a resize, and an audit against ember found the rest.
 337. **Find & Replace fields refuse spoofing** — Find & Replace refuses to run
      when the find or replace field still contains visual spoofing or U+FFFD so a
      neutralized paste cannot rewrite a selection.
+
+338. **Workflow arguments refuse spoofing** — workflow argument fields refuse
+     visual spoofing and U+FFFD so a neutralized paste is not stored or rendered
+     into the prompt.

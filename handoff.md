@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 338 — Workflow arguments refuse spoofing)
+
+## 2026-10-04 (upgrade round 338)
+
+- Workflow argument fields refuse visual spoofing and U+FFFD so a neutralized paste is not stored or rendered into the prompt.
+- `cargo test --locked --bin frost -- workflow_picker::tests::args_form_prefills_defaults_and_withholds_the_undeclared_ones` passed.
+
 Updated: 2026-10-04 (upgrade round 337 — Find & Replace fields refuse spoofing)
 
 ## 2026-10-04 (upgrade round 337)
