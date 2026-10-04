@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 369 — remote host name refuses spoofing)
+
+## 2026-10-04 (upgrade round 369)
+
+- The remote-host label field does not keep a name that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a saved host identity.
+- `cargo test --offline --bin frost -- live_remote_host_name_uses_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 368 — remote host address refuses spoofing)
 
 ## 2026-10-04 (upgrade round 368)
