@@ -44,6 +44,15 @@ pub(crate) fn bound_suggestion_request(text: impl Into<String>) -> String {
     text
 }
 
+pub(crate) fn accepted_suggestion_request(text: impl Into<String>) -> Option<String> {
+    let text = bound_suggestion_request(text);
+    if suggestion_context_is_unsafe(&text) {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Bound the review card's editable draft. Same 256 KiB review-insert budget
 /// as `jterm_core::review_input::validate`, but truncate instead of rejecting
 /// so an oversized paste or model reply remains editable.
@@ -474,6 +483,11 @@ mod tests {
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));
         assert!(spoofed.starts_with("list files "));
+        assert!(accepted_suggestion_request("list files \u{202e}secret").is_none());
+        assert_eq!(
+            accepted_suggestion_request("list files").as_deref(),
+            Some("list files")
+        );
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 364 — Ask-AI request overlay refuses spoofing)
+
+## 2026-10-04 (upgrade round 364)
+
+- The Ask-AI overlay does not keep a request that still contains visual spoofing or U+FFFD, so a neutralized paste cannot leave as a suggestion prompt.
+- `cargo test --locked --bin frost -- ai_command::tests::overlay_request_drops_controls_and_truncates` passed.
+
 Updated: 2026-10-04 (upgrade round 363 — Files-panel filter refuses spoofing)
 
 ## 2026-10-04 (upgrade round 363)

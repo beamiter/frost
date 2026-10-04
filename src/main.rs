@@ -13118,7 +13118,9 @@ impl Frost {
             }
             Message::AiAskInput(text) => {
                 if let Some(query) = self.ai_ask.as_mut() {
-                    *query = ai_command::bound_suggestion_request(text);
+                    if let Some(next) = ai_command::accepted_suggestion_request(text) {
+                        *query = next;
+                    }
                 }
             }
             Message::AiAskSubmit => return self.submit_ai_ask(),
@@ -21782,9 +21784,10 @@ impl Frost {
             _ => {
                 if !mods.control() && !mods.alt() && !mods.logo() {
                     if let Some(t) = text {
-                        let next =
-                            ai_command::bound_suggestion_request(format!("{query}{t}"));
-                        *query = next;
+                        let next = ai_command::accepted_suggestion_request(format!("{query}{t}"));
+                        if let Some(next) = next {
+                            *query = next;
+                        }
                         return Some(Task::none());
                     }
                 }

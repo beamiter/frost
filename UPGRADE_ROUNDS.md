@@ -1865,3 +1865,7 @@ everywhere except a resize, and an audit against ember found the rest.
 363. **Files-panel filter refuses spoofing** — the files-panel name filter does
      not keep a query that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot reveal a tree path.
+
+364. **Ask-AI request overlay refuses spoofing** — the Ask-AI overlay does not
+     keep a request that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot leave as a suggestion prompt.
