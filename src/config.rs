@@ -1578,6 +1578,11 @@ mod tests {
         );
         assert_eq!(filled.len(), MAX_CONFIG_NAME_BYTES);
         assert!(!filled.contains('y'));
+        assert!(accepted_config_text("off\u{202e}", MAX_CONFIG_NAME_BYTES).is_none());
+        assert_eq!(
+            accepted_config_text("persist", MAX_CONFIG_NAME_BYTES).as_deref(),
+            Some("persist")
+        );
     }
 
     #[test]

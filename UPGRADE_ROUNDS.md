@@ -1893,3 +1893,7 @@ everywhere except a resize, and an audit against ember found the rest.
 370. **Remote host user refuses spoofing** — the remote-host user field does
      not keep a login that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as an SSH identity.
+
+371. **Remote host deploy mode refuses spoofing** — the remote-host deploy
+     field does not keep a mode that still contains visual spoofing or U+FFFD,
+     so a neutralized paste cannot sit as a session-deploy policy.

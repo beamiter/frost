@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 371 — remote host deploy mode refuses spoofing)
+
+## 2026-10-04 (upgrade round 371)
+
+- The remote-host deploy field does not keep a mode that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a session-deploy policy.
+- `cargo test --offline --bin frost -- live_remote_host_deploy_uses_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 370 — remote host user refuses spoofing)
 
 ## 2026-10-04 (upgrade round 370)
