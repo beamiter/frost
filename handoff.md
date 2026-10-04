@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 357 — Block search query field refuses spoofing)
+
+## 2026-10-04 (upgrade round 357)
+
+- Cross-block search does not keep a query that still contains visual spoofing or U+FFFD, so a neutralized paste cannot scan command history.
+- `cargo test --locked --bin frost -- tests::block_search_query_input_refuses_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 356 — Find history restore refuses spoofing)
 
 ## 2026-10-04 (upgrade round 356)

@@ -1596,7 +1596,17 @@ impl BlockSearchState {
         if self.bookmark_key_claimed {
             return false;
         }
-        self.query = block_mode::bounded_block_search_query(query);
+        let query = block_mode::bounded_block_search_query(query);
+        if matches!(
+            block_mode::validated_block_search_query(&query),
+            Err(block_mode::BlockSearchQueryError::Unsafe)
+        ) {
+            self.query_error = Some(crate::review_text::bound_query_error(
+                "Query contains control or visual-spoofing characters and was not saved",
+            ));
+            return false;
+        }
+        self.query = query;
         true
     }
 
@@ -29729,6 +29739,22 @@ mod tests {
         assert!(memory.case_sensitive);
         assert_eq!(memory.scope, block_mode::BlockSearchScope::Command);
         assert_eq!(memory.filter, BlockSearchFilter::Failed);
+    }
+
+    #[test]
+    fn block_search_query_input_refuses_spoofing() {
+        let mut state = BlockSearchState {
+            query: "keep".to_string(),
+            ..BlockSearchState::default()
+        };
+        assert!(!state.apply_query_input("cargo\u{202e} test".to_string()));
+        assert_eq!(state.query, "keep");
+        assert!(state
+            .query_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not saved")));
+        assert!(state.apply_query_input("cargo test".to_string()));
+        assert_eq!(state.query, "cargo test");
     }
 
     #[test]

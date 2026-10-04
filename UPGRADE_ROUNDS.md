@@ -1837,3 +1837,7 @@ everywhere except a resize, and an audit against ember found the rest.
 356. **Find history restore refuses spoofing** — terminal find does not restore
      a history entry that still contains visual spoofing or U+FFFD, so a
      neutralized saved query cannot scan scrollback.
+
+357. **Block search query field refuses spoofing** — cross-block search does
+     not keep a query that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot scan command history.
