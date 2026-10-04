@@ -1889,3 +1889,7 @@ everywhere except a resize, and an audit against ember found the rest.
 369. **Remote host name refuses spoofing** — the remote-host label field does
      not keep a name that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as a saved host identity.
+
+370. **Remote host user refuses spoofing** — the remote-host user field does
+     not keep a login that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as an SSH identity.

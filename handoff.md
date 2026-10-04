@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 370 — remote host user refuses spoofing)
+
+## 2026-10-04 (upgrade round 370)
+
+- The remote-host user field does not keep a login that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as an SSH identity.
+- `cargo test --offline --bin frost -- live_remote_host_user_uses_the_value_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 369 — remote host name refuses spoofing)
 
 ## 2026-10-04 (upgrade round 369)

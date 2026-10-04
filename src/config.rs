@@ -1519,6 +1519,11 @@ mod tests {
         assert!(overflow.len() <= MAX_CONFIG_VALUE_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        assert!(accepted_config_text("yj\u{202e}", MAX_CONFIG_VALUE_BYTES).is_none());
+        assert_eq!(
+            accepted_config_text("yj", MAX_CONFIG_VALUE_BYTES).as_deref(),
+            Some("yj")
+        );
     }
 
     #[test]
