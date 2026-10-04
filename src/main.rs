@@ -10666,6 +10666,14 @@ impl Frost {
                     } else if let Some(text) =
                         sess.terminal.copy_selection().filter(|t| !t.is_empty())
                     {
+                        if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+                            self.push_toast(
+                                "Selection not copied: it contains control or visual-spoofing characters"
+                                    .to_string(),
+                                ToastKind::Warning,
+                            );
+                            return Task::none();
+                        }
                         return iced::clipboard::write_primary(text);
                     }
                 }
@@ -11100,6 +11108,14 @@ impl Frost {
             .and_then(|session| session.terminal.copy_selection())
             .filter(|text| !text.is_empty());
         if let Some(text) = text {
+            if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+                self.push_toast(
+                    "Selection not copied: it contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
             let count = text.chars().count();
             self.push_toast(
                 format!("Copied {} char{}", count, if count == 1 { "" } else { "s" }),

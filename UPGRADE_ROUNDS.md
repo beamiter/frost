@@ -1694,3 +1694,7 @@ everywhere except a resize, and an audit against ember found the rest.
 320. **Last/single block output copy refuses spoofing** — copying last command
      output, a single block's output, or a whole block refuses visual spoofing
      and U+FFFD so they cannot reach the host clipboard.
+
+321. **Visible selection copy refuses spoofing** — copying a visible terminal
+     text selection (including primary on mouse-up) refuses visual spoofing and
+     U+FFFD so they cannot reach the host clipboard.

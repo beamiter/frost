@@ -3215,6 +3215,7 @@ mod tests {
         assert!(clipboard_multiline_is_unsafe("ok\u{202e}"));
         assert!(clipboard_multiline_is_unsafe("ok\u{fffd}"));
         assert!(clipboard_multiline_is_unsafe("ok\u{1b}"));
+        assert!(!clipboard_multiline_is_unsafe("ok\nvisible"));
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 321 — Visible selection copy refuses spoofing)
+
+## 2026-10-04 (upgrade round 321)
+
+- Copying a visible terminal text selection (including primary on mouse-up) refuses visual spoofing and U+FFFD so they cannot reach the host clipboard.
+- `cargo test --locked --bin frost -- block_mode::tests::clipboard_multiline_is_unsafe_allows_newlines_and_rejects_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 320 — Last/single block output copy refuses spoofing)
 
 ## 2026-10-04 (upgrade round 320)
