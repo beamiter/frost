@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 319 — Block clipboard copy refuses spoofing)
+
+## 2026-10-04 (upgrade round 319)
+
+- Copying selected block commands, output, or Markdown refuses visual spoofing and U+FFFD so they cannot reach the host clipboard.
+- `cargo test --locked --bin frost -- block_mode::tests::selected_clipboard_copy_is_bounded_and_output_atomic` passed.
+
 Updated: 2026-10-04 (upgrade round 318 — Block recall refuses spoofing)
 
 ## 2026-10-04 (upgrade round 318)

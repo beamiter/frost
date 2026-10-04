@@ -417,6 +417,18 @@ pub(crate) fn command_text_is_unsafe(command: &str) -> bool {
         || jterm_core::review_input::contains_visual_spoofing(command)
 }
 
+fn clipboard_multiline_is_unsafe(text: &str) -> bool {
+    text.chars().any(|character| {
+        if matches!(character, '\n' | '\t' | '\r') {
+            false
+        } else {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
+}
+
 /// How a completed command block ended. `Unknown` is deliberately distinct
 /// from `Success`: an OSC 133 `D` without an exit code reports *nothing*, and
 /// rendering it as a green check would be a success this terminal never
@@ -882,6 +894,7 @@ pub enum SelectedClipboardError {
     Empty,
     OutputUnavailable,
     TooLarge,
+    Unsafe,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -936,6 +949,15 @@ where
         let Some(part) = part else {
             continue;
         };
+        let payload_unsafe = match mode {
+            SelectedClipboardMode::Commands => command_text_is_unsafe(&part),
+            SelectedClipboardMode::Outputs | SelectedClipboardMode::Blocks => {
+                clipboard_multiline_is_unsafe(&part)
+            }
+        };
+        if payload_unsafe {
+            return Err(SelectedClipboardError::Unsafe);
+        }
         let separator = if text.is_empty() {
             ""
         } else if mode == SelectedClipboardMode::Commands {
@@ -988,6 +1010,9 @@ where
             .ok_or(SelectedClipboardError::TooLarge)?;
         if next_len > max_bytes {
             return Err(SelectedClipboardError::TooLarge);
+        }
+        if clipboard_multiline_is_unsafe(&part) {
+            return Err(SelectedClipboardError::Unsafe);
         }
         text.push_str(separator);
         text.push_str(&part);
@@ -2522,7 +2547,7 @@ mod tests {
     #[test]
     fn selected_clipboard_copy_is_bounded_and_output_atomic() {
         use ClipboardOutput::{Available, Unavailable};
-        use SelectedClipboardError::{OutputUnavailable, TooLarge};
+        use SelectedClipboardError::{OutputUnavailable, TooLarge, Unsafe};
         use SelectedClipboardMode::{Blocks, Commands, Outputs};
 
         let mut selection = BlockSelection::default();
@@ -2552,6 +2577,24 @@ mod tests {
         assert_eq!(
             selected_clipboard_text(unavailable(), &selection, Commands, 11),
             Err(TooLarge)
+        );
+        assert_eq!(
+            selected_clipboard_text(
+                [(1, Some("git \u{202e}status"), Unavailable)],
+                &selection,
+                Commands,
+                1024
+            ),
+            Err(Unsafe)
+        );
+        assert_eq!(
+            selected_clipboard_text(
+                [(1, Some("first"), Available("ok\u{202e}".to_string()))],
+                &selection,
+                Outputs,
+                1024
+            ),
+            Err(Unsafe)
         );
     }
 

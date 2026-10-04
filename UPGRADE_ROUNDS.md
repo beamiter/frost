@@ -1686,3 +1686,7 @@ everywhere except a resize, and an audit against ember found the rest.
 318. **Block recall refuses spoofing** — recalling a selected block command
      refuses visual spoofing and U+FFFD so a neutralized OSC 133 line cannot
      be typed at the prompt.
+
+319. **Block clipboard copy refuses spoofing** — copying selected block
+     commands, output, or Markdown refuses visual spoofing and U+FFFD so they
+     cannot reach the host clipboard.
