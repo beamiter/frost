@@ -1873,3 +1873,7 @@ everywhere except a resize, and an audit against ember found the rest.
 365. **API key draft refuses spoofing** — the settings API-key field does not
      keep a draft that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot be stored as a credential.
+
+366. **Custom theme name refuses spoofing** — the theme-editor name field does
+     not keep a name that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as a filename.

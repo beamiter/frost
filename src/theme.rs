@@ -29,6 +29,19 @@ pub(crate) fn bound_custom_theme_name(name: impl Into<String>) -> String {
     bounded
 }
 
+pub(crate) fn accepted_custom_theme_name(name: impl Into<String>) -> Option<String> {
+    let name = bound_custom_theme_name(name);
+    if name.contains('\u{fffd}')
+        || name
+            .chars()
+            .any(jterm_core::review_input::is_visual_spoofing_character)
+    {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Persist-time check: iced may show U+FFFD after ingest, but a replacement
 /// character must not become a theme filename.
 pub(crate) fn validate_saved_custom_theme_name(name: &str) -> Result<(), String> {
@@ -147,9 +160,9 @@ impl ThemeExt for Theme {
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_custom_theme_name, bound_theme_editor_error, bound_theme_hex_draft,
-        validate_saved_custom_theme_name, Theme, ThemeExt as _, MAX_CUSTOM_THEME_NAME_BYTES,
-        MAX_THEME_EDITOR_ERROR_BYTES,
+        accepted_custom_theme_name, bound_custom_theme_name, bound_theme_editor_error,
+        bound_theme_hex_draft, validate_saved_custom_theme_name, Theme, ThemeExt as _,
+        MAX_CUSTOM_THEME_NAME_BYTES, MAX_THEME_EDITOR_ERROR_BYTES,
     };
     use iced::Color;
 
@@ -183,6 +196,8 @@ mod tests {
         let spoofed = bound_custom_theme_name("ok\u{202e}");
         assert_eq!(spoofed, "ok\u{fffd}");
         assert!(!spoofed.contains('\u{202e}'));
+        assert!(accepted_custom_theme_name("ok\u{202e}").is_none());
+        assert_eq!(accepted_custom_theme_name("ok").as_deref(), Some("ok"));
         let filled =
             bound_custom_theme_name(format!("{}y", "x".repeat(MAX_CUSTOM_THEME_NAME_BYTES)));
         assert_eq!(filled.len(), MAX_CUSTOM_THEME_NAME_BYTES);

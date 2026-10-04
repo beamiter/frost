@@ -15205,7 +15205,9 @@ impl Frost {
             }
             Message::ThemeEditName(name) => {
                 if let Some(ed) = &mut self.theme_editor {
-                    ed.name = crate::theme::bound_custom_theme_name(name);
+                    if let Some(name) = crate::theme::accepted_custom_theme_name(name) {
+                        ed.name = name;
+                    }
                 }
             }
             Message::ThemeEditColor(idx, hex) => {

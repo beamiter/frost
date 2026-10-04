@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 366 — custom theme name refuses spoofing)
+
+## 2026-10-04 (upgrade round 366)
+
+- The theme-editor name field does not keep a name that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a filename.
+- `cargo test --offline --bin frost -- custom_theme_name_draft_drops_path_syntax_and_stays_inside_the_filename_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 365 — API key draft refuses spoofing)
 
 ## 2026-10-04 (upgrade round 365)
