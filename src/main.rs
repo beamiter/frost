@@ -12039,6 +12039,14 @@ impl Frost {
                 );
                 return Task::none();
             }
+            Err(block_mode::SelectedCommandsError::Unsafe) => {
+                self.push_toast(
+                    "Commands not reinput: a selected command contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
         };
         let command_count = selected_commands.block_count;
         let commands = selected_commands.text;

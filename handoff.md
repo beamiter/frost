@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 317 — Block reinput refuses spoofing)
+
+## 2026-10-04 (upgrade round 317)
+
+- Reinput of selected block commands refuses the whole batch when any command still contains visual spoofing or U+FFFD.
+- `cargo test --locked --bin frost -- block_mode::tests::selected_commands_are_ordered_bounded_and_atomic` passed.
+
 Updated: 2026-10-04 (upgrade round 316 — Workflow insert refuses spoofing)
 
 ## 2026-10-04 (upgrade round 316)

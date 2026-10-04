@@ -1678,3 +1678,7 @@ everywhere except a resize, and an audit against ember found the rest.
 316. **Workflow insert refuses spoofing** — a rendered workflow command that
      still contains U+FFFD or visual spoofing is refused instead of being
      typed at the prompt for review.
+
+317. **Block reinput refuses spoofing** — reinput of selected block commands
+     refuses the whole batch when any command still contains visual spoofing
+     or U+FFFD, rather than typing it at the prompt.

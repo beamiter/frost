@@ -344,6 +344,7 @@ pub enum SelectedCommandsError {
     Empty,
     Truncated,
     TooLarge,
+    Unsafe,
 }
 
 /// Sanitization-ready selected command text plus the number of command-bearing
@@ -377,6 +378,9 @@ where
         let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
             continue;
         };
+        if selected_command_is_unsafe(command) {
+            return Err(SelectedCommandsError::Unsafe);
+        }
         if truncated {
             return Err(SelectedCommandsError::Truncated);
         }
@@ -405,6 +409,12 @@ where
             block_count,
         })
     }
+}
+
+fn selected_command_is_unsafe(command: &str) -> bool {
+    command.contains('\u{fffd}')
+        || command.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(command)
 }
 
 /// How a completed command block ended. `Unknown` is deliberately distinct
@@ -3116,6 +3126,17 @@ mod tests {
                 8
             ),
             Err(SelectedCommandsError::TooLarge)
+        );
+        assert_eq!(
+            selected_commands(
+                [
+                    (1, Some("first"), false),
+                    (3, Some("git \u{202e}status"), false)
+                ],
+                &selection,
+                256
+            ),
+            Err(SelectedCommandsError::Unsafe)
         );
 
         selection.clear();
