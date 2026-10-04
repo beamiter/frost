@@ -21503,7 +21503,7 @@ impl Frost {
             // own 16 KiB single-line budget and decides run-versus-insert from
             // that same validated string, so the button's label and what this
             // path submits cannot disagree.
-            match proposal.accept() {
+            match crate::command_correction::accept_correction(proposal) {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     proposal.set_feedback(Some(crate::command_correction::bound_correction_feedback(

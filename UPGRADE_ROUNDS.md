@@ -1666,3 +1666,7 @@ everywhere except a resize, and an audit against ember found the rest.
 313. **Agent composer refuses spoofing** — composer submit and Fix/Explain
      initial prompts refuse U+FFFD and visual spoofing so a neutralized draft
      cannot become a model user turn.
+
+314. **Correction accept refuses U+FFFD** — the command-correction card
+     refuses a draft that still contains replacement characters so a
+     neutralized edit cannot be inserted or run.

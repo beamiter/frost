@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 314 — Correction accept refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 314)
+
+- Command-correction accept refuses drafts that still contain U+FFFD so a neutralized edit cannot be inserted or run.
+- `cargo test --locked --bin frost -- command_correction::tests::accepting_runs_the_engine_gate_and_never_promotes_an_unverified_draft` passed.
+
 Updated: 2026-10-04 (upgrade round 313 — Agent composer refuse spoofing)
 
 ## 2026-10-04 (upgrade round 313)

@@ -124,6 +124,21 @@ pub(crate) fn bound_correction_feedback(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_CORRECTION_FEEDBACK_BYTES)
 }
 
+/// Accept a card draft only when it is still a persistable command. Iced may
+/// show U+FFFD after ingest; replacement characters must not be inserted or
+/// run.
+pub(crate) fn accept_correction(
+    proposal: &mut jterm_core::command_correction::CorrectionProposal,
+) -> Result<jterm_core::command_correction::AcceptedCorrection, String> {
+    let draft = proposal.draft();
+    if draft.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(draft) {
+        let error = "the command contains invisible or bidirectional formatting characters";
+        proposal.set_feedback(Some(format!("Cannot accept correction: {error}")));
+        return Err(error.to_string());
+    }
+    proposal.accept().map_err(|error| error.to_string())
+}
+
 /// One pane's live correction request, and the card it resolved into.
 pub(crate) struct CorrectionSession {
     generation: u64,
@@ -401,6 +416,8 @@ mod tests {
         assert!(proposal.accept().is_err());
         *proposal.draft_mut() = "git \u{202e}status".to_string();
         assert!(proposal.accept().is_err());
+        *proposal.draft_mut() = bound_correction_draft("git \u{202e}status");
+        assert!(accept_correction(&mut proposal).is_err());
         *proposal.draft_mut() = "x".repeat(17 * 1024);
         assert!(proposal.accept().is_err());
         assert!(!proposal.run_allowed());
