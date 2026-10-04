@@ -362,6 +362,23 @@ fn serialize_session(
     snapshot: &SessionExportSnapshot,
     format: SessionExportFormat,
 ) -> io::Result<Vec<u8>> {
+    for block in &snapshot.blocks {
+        if block
+            .command
+            .as_deref()
+            .is_some_and(crate::block_mode::command_text_is_unsafe)
+            || crate::block_mode::clipboard_multiline_is_unsafe(&block.output)
+            || block
+                .cwd
+                .as_deref()
+                .is_some_and(crate::block_mode::clipboard_multiline_is_unsafe)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session export contains control or visual-spoofing characters",
+            ));
+        }
+    }
     let mut writer = BoundedBuffer::new();
     match format {
         SessionExportFormat::Json => {
@@ -654,6 +671,22 @@ mod tests {
         assert_eq!(json["blocks"][0]["completion_observed"], true);
         assert_eq!(json["blocks"][0]["completion_provenance"], "shell_reported");
         assert_eq!(json["blocks"][0]["lifecycle_health"], "healthy");
+    }
+
+    #[test]
+    fn serialize_session_refuses_spoofed_command_or_output() {
+        for format in [SessionExportFormat::Markdown, SessionExportFormat::Json] {
+            assert!(serialize_session(
+                &snapshot(vec![block(1, "git \u{202e}status", "ok")]),
+                format
+            )
+            .is_err());
+            assert!(serialize_session(
+                &snapshot(vec![block(1, "git status", "ok\u{fffd}")]),
+                format
+            )
+            .is_err());
+        }
     }
 
     #[test]

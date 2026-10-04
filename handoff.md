@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 327 — Session export refuses spoofing)
+
+## 2026-10-04 (upgrade round 327)
+
+- Session Markdown/JSON export refuses command, output, or cwd that still contains visual spoofing or U+FFFD so it cannot be written to disk.
+- `cargo test --locked --bin frost -- block_export::tests::serialize_session_refuses_spoofed_command_or_output` passed.
+
 Updated: 2026-10-04 (upgrade round 326 — AI chat rename refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 326)

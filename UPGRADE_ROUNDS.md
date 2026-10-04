@@ -1718,3 +1718,7 @@ everywhere except a resize, and an audit against ember found the rest.
 326. **AI chat rename refuses U+FFFD** — renaming an AI chat refuses a title
      that still contains U+FFFD or visual spoofing so a neutralized name is not
      persisted.
+
+327. **Session export refuses spoofing** — session Markdown/JSON export refuses
+     command, output, or cwd that still contains visual spoofing or U+FFFD so it
+     cannot be written to disk.
