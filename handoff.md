@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 318 — Block recall refuses spoofing)
+
+## 2026-10-04 (upgrade round 318)
+
+- Recalling a selected block command refuses visual spoofing and U+FFFD so a neutralized OSC 133 line cannot be typed at the prompt.
+- `cargo test --locked --bin frost -- block_mode::tests::command_text_is_unsafe_rejects_spoofing_and_replacement` passed.
+
 Updated: 2026-10-04 (upgrade round 317 — Block reinput refuses spoofing)
 
 ## 2026-10-04 (upgrade round 317)

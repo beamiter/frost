@@ -11758,7 +11758,18 @@ impl Frost {
                 );
                 Task::none()
             }
-            Some((command, false)) => self.recall_into_active_pane(command),
+            Some((command, false)) => {
+                if crate::block_mode::command_text_is_unsafe(&command) {
+                    self.push_toast(
+                        "Command not recalled: it contains control or visual-spoofing characters"
+                            .to_string(),
+                        ToastKind::Warning,
+                    );
+                    Task::none()
+                } else {
+                    self.recall_into_active_pane(command)
+                }
+            }
             None => Task::none(),
         }
     }

@@ -1682,3 +1682,7 @@ everywhere except a resize, and an audit against ember found the rest.
 317. **Block reinput refuses spoofing** — reinput of selected block commands
      refuses the whole batch when any command still contains visual spoofing
      or U+FFFD, rather than typing it at the prompt.
+
+318. **Block recall refuses spoofing** — recalling a selected block command
+     refuses visual spoofing and U+FFFD so a neutralized OSC 133 line cannot
+     be typed at the prompt.

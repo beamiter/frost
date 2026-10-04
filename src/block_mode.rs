@@ -378,7 +378,7 @@ where
         let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
             continue;
         };
-        if selected_command_is_unsafe(command) {
+        if command_text_is_unsafe(command) {
             return Err(SelectedCommandsError::Unsafe);
         }
         if truncated {
@@ -411,7 +411,7 @@ where
     }
 }
 
-fn selected_command_is_unsafe(command: &str) -> bool {
+pub(crate) fn command_text_is_unsafe(command: &str) -> bool {
     command.contains('\u{fffd}')
         || command.chars().any(char::is_control)
         || jterm_core::review_input::contains_visual_spoofing(command)
@@ -3144,6 +3144,14 @@ mod tests {
             selected_commands(zones, &selection, 256),
             Err(SelectedCommandsError::Empty)
         );
+    }
+
+    #[test]
+    fn command_text_is_unsafe_rejects_spoofing_and_replacement() {
+        assert!(!command_text_is_unsafe("git status"));
+        assert!(command_text_is_unsafe("git \u{202e}status"));
+        assert!(command_text_is_unsafe("git \u{fffd}status"));
+        assert!(command_text_is_unsafe("git\nstatus"));
     }
 
     #[test]
