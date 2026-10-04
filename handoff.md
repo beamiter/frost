@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 384 — diagnostic overlay omits spoofing)
+
+## 2026-10-04 (upgrade round 384)
+
+- Startup and session diagnostics drop visual spoofing and U+FFFD instead of drawing replacement characters, so a neutralized error cannot sit in the overlay.
+- `cargo test --offline --bin frost -- diagnostic_text_keeps_newlines_replaces_spoofing_and_stays_bounded` passed.
+
 Updated: 2026-10-04 (upgrade round 383 — provider labels omit spoofing)
 
 ## 2026-10-04 (upgrade round 383)

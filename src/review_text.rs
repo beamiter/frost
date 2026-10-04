@@ -219,20 +219,22 @@ pub(crate) fn bound_diagnostic_text(text: impl Into<String>) -> String {
             bounded.push(ch);
             continue;
         }
-        if ch.is_control() {
+        if ch.is_control()
+            || ch == '\u{fffd}'
+            || jterm_core::review_input::is_visual_spoofing_character(ch)
+        {
             continue;
         }
-        let ch = if jterm_core::review_input::is_visual_spoofing_character(ch) {
-            '\u{fffd}'
-        } else {
-            ch
-        };
         if bounded.len().saturating_add(ch.len_utf8()) > MAX_DIAGNOSTIC_BYTES {
             break;
         }
         bounded.push(ch);
     }
-    bounded
+    if bounded.trim().is_empty() {
+        "Startup diagnostic".to_string()
+    } else {
+        bounded
+    }
 }
 
 /// Settings/chrome label for the configured AI provider. Display names are
@@ -407,10 +409,11 @@ mod tests {
         assert!(shown.contains('\n'));
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= MAX_DIAGNOSTIC_BYTES);
         assert!(shown.starts_with("Could not read"));
         assert_eq!(bound_diagnostic_text("ok\tpath"), "ok\tpath");
+        assert_eq!(bound_diagnostic_text("\u{202e}"), "Startup diagnostic");
     }
 
     #[test]

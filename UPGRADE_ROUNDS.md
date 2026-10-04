@@ -1945,3 +1945,7 @@ everywhere except a resize, and an audit against ember found the rest.
 383. **Provider labels omit spoofing** — a provider display name that still
      contains visual spoofing or U+FFFD is replaced with a generic label, so a
      neutralized backend name cannot sit in chrome.
+
+384. **Diagnostic overlay omits spoofing** — startup and session diagnostics
+     drop visual spoofing and U+FFFD instead of drawing replacement characters,
+     so a neutralized error cannot sit in the overlay.
