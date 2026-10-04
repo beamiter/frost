@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 326 — AI chat rename refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 326)
+
+- Renaming an AI chat refuses a title that still contains U+FFFD or visual spoofing so a neutralized name is not persisted.
+- `cargo test --locked --bin frost -- ai_chats::tests::rename_draft_drops_controls_and_stays_inside_the_store_title_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 325 — AI chat send refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 325)

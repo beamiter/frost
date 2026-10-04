@@ -609,6 +609,12 @@ impl AiChatsUi {
     /// envelope first so a paste cannot sit unbounded next to the store.
     pub(crate) fn rename(&mut self, title: String) {
         self.title_draft = bound_title_draft(title);
+        if chat_payload_is_unsafe(&self.title_draft) {
+            self.set_notice(
+                "Title contains control or visual-spoofing characters and was not saved.",
+            );
+            return;
+        }
         if self.store.rename_active(&self.title_draft) {
             self.dirty = true;
         }
@@ -1251,6 +1257,8 @@ mod tests {
         panel.rename("ok\u{200b}title".into());
         assert!(!panel.title_draft.contains('\u{200b}'));
         assert!(panel.title_draft.contains('\u{fffd}'));
+        assert!(!panel.store.active_title().contains('\u{fffd}'));
+        assert!(panel.notice.contains("not saved"));
         let listed = bound_title_draft(format!("chat \u{202e}{}", "t".repeat(400)));
         assert!(!listed.contains('\u{202e}'));
         assert!(listed.len() <= MAX_TITLE_DRAFT_BYTES);

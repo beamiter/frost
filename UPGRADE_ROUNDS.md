@@ -1714,3 +1714,7 @@ everywhere except a resize, and an audit against ember found the rest.
 325. **AI chat send refuses U+FFFD** — sending an AI Chats composer draft that
      still contains U+FFFD or visual spoofing is refused so a neutralized paste
      cannot leave the machine.
+
+326. **AI chat rename refuses U+FFFD** — renaming an AI chat refuses a title
+     that still contains U+FFFD or visual spoofing so a neutralized name is not
+     persisted.
