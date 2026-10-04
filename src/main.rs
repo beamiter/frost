@@ -14520,7 +14520,9 @@ impl Frost {
             Message::SidebarNavigatePath(path) => return self.navigate_sidebar_to(path),
             Message::SidebarPathEdit => return self.begin_sidebar_path_edit(),
             Message::SidebarPathInput(input) => {
-                self.sidebar_path_input = Some(crate::sidebar::bound_sidebar_path_input(input));
+                if let Some(input) = crate::sidebar::accepted_sidebar_path_input(input) {
+                    self.sidebar_path_input = Some(input);
+                }
             }
             Message::SidebarPathSubmit => return self.submit_sidebar_path(),
             Message::SidebarPathCancel => self.sidebar_path_input = None,

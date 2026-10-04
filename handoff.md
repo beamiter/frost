@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 367 — files-panel path bar refuses spoofing)
+
+## 2026-10-04 (upgrade round 367)
+
+- The files-panel path bar does not keep a path that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a navigation target.
+- `cargo test --offline --bin frost -- sidebar_path_bar_drops_controls_and_truncates_to_the_navigation_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 366 — custom theme name refuses spoofing)
 
 ## 2026-10-04 (upgrade round 366)

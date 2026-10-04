@@ -1703,6 +1703,19 @@ pub fn bound_sidebar_path_input(input: impl Into<String>) -> String {
     input
 }
 
+pub fn sidebar_path_input_is_unsafe(input: &str) -> bool {
+    input.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(input)
+}
+
+pub fn accepted_sidebar_path_input(input: impl Into<String>) -> Option<String> {
+    let input = bound_sidebar_path_input(input);
+    if sidebar_path_input_is_unsafe(&input) {
+        None
+    } else {
+        Some(input)
+    }
+}
+
 /// Validate path-bar input before it can become filesystem authority. Remote
 /// probes require absolute POSIX paths; rejecting dot/parent components keeps
 /// the displayed target identical to the directory actually requested.
@@ -3273,6 +3286,11 @@ mod tests {
         assert!(overflow.len() <= MAX_NAVIGATION_PATH_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        assert!(accepted_sidebar_path_input("/srv/project\u{202e}").is_none());
+        assert_eq!(
+            accepted_sidebar_path_input("/srv/project").as_deref(),
+            Some("/srv/project")
+        );
     }
 
     #[test]

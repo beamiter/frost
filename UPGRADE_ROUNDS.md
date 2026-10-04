@@ -1877,3 +1877,7 @@ everywhere except a resize, and an audit against ember found the rest.
 366. **Custom theme name refuses spoofing** — the theme-editor name field does
      not keep a name that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as a filename.
+
+367. **Files-panel path bar refuses spoofing** — the files-panel path bar does
+     not keep a path that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as a navigation target.
