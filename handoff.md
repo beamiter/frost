@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 316 — Workflow insert refuses spoofing)
+
+## 2026-10-04 (upgrade round 316)
+
+- Rendered workflow commands that still contain U+FFFD or visual spoofing are refused instead of being typed at the prompt.
+- `cargo test --locked --bin frost -- workflow_picker::tests::args_form_prefills_defaults_and_withholds_the_undeclared_ones` passed.
+
 Updated: 2026-10-04 (upgrade round 315 — Correction begin refuses spoofing)
 
 ## 2026-10-04 (upgrade round 315)

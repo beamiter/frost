@@ -1674,3 +1674,7 @@ everywhere except a resize, and an audit against ember found the rest.
 315. **Correction begin refuses spoofing** — a failed command that still
      contains visual spoofing or U+FFFD never opens a correction card, and
      worker candidates with the same defect are not presented.
+
+316. **Workflow insert refuses spoofing** — a rendered workflow command that
+     still contains U+FFFD or visual spoofing is refused instead of being
+     typed at the prompt for review.

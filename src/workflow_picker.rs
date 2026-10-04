@@ -224,8 +224,24 @@ impl WorkflowArgsState {
     /// 用当前值渲染模板。未填写的参数不会被当作空串提交，因此这里的
     /// `missing values:` 是真的缺值，逐字显示在表单的错误标签上。
     pub(crate) fn render(&self) -> Result<String, String> {
-        self.form.render()
+        let command = self.form.render()?;
+        insertable_rendered_command(command)
     }
+}
+
+/// Rendered workflow text is typed at the prompt. Replacement characters and
+/// visual spoofing must not leave the overlay as if they were the template.
+pub(crate) fn insertable_rendered_command(command: String) -> Result<String, String> {
+    if rendered_command_is_unsafe(&command) {
+        return Err("rendered command contains control or visual-spoofing characters".to_string());
+    }
+    Ok(command)
+}
+
+fn rendered_command_is_unsafe(command: &str) -> bool {
+    command.contains('\u{fffd}')
+        || command.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(command)
 }
 
 /// The workflows overlay is either the searchable list or one workflow's
@@ -380,6 +396,13 @@ mod tests {
         form.set_value(1, "staging".to_string());
         assert!(!form.missing().contains(&"env"));
         assert_eq!(form.render().unwrap(), "deploy api --env=staging");
+        form.set_value(1, "staging\u{202e}".to_string());
+        let spoofed = form.render().unwrap_err();
+        assert!(
+            spoofed.contains("visual-spoofing") || spoofed.contains("control"),
+            "{spoofed}"
+        );
+        form.set_value(1, "staging".to_string());
 
         // Reset is not the same operation as typing an empty string: the first
         // row returns to its declared default and the second returns to unset.

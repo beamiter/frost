@@ -10120,7 +10120,9 @@ impl Frost {
     fn accept_workflow(&mut self, workflow: workflows::Workflow) -> Task<Message> {
         if workflow.args.is_empty() {
             self.workflow_overlay = None;
-            return match workflows::render(&workflow, &std::collections::HashMap::new()) {
+            return match workflows::render(&workflow, &std::collections::HashMap::new())
+                .and_then(crate::workflow_picker::insertable_rendered_command)
+            {
                 Ok(command) => self.recall_into_active_pane(command),
                 Err(error) => {
                     log::warn!("workflow render failed: {error}");
