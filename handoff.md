@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 379 — Agent edit command refuses spoofing)
+
+## 2026-10-04 (upgrade round 379)
+
+- The Agent command-edit field does not keep a command that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as an approved agent command.
+- `cargo test --offline --bin frost -- agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls` passed.
+
 Updated: 2026-10-04 (upgrade round 378 — AI temperature draft refuses spoofing)
 
 ## 2026-10-04 (upgrade round 378)

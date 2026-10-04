@@ -13286,7 +13286,9 @@ impl Frost {
             }
             Message::AgentEditInput(value) => {
                 if let Some((_, buffer)) = self.agent.edit.as_mut() {
-                    *buffer = crate::review_text::bound_agent_edit_command(value);
+                    if let Some(value) = crate::review_text::accepted_agent_edit_command(value) {
+                        *buffer = value;
+                    }
                 }
             }
             Message::AgentEditCancel => self.agent.edit = None,

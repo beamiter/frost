@@ -88,6 +88,19 @@ pub(crate) fn bound_agent_edit_command(value: impl Into<String>) -> String {
     value
 }
 
+pub(crate) fn agent_edit_command_is_unsafe(value: &str) -> bool {
+    value.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(value)
+}
+
+pub(crate) fn accepted_agent_edit_command(value: impl Into<String>) -> Option<String> {
+    let value = bound_agent_edit_command(value);
+    if agent_edit_command_is_unsafe(&value) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// Open the Agent edit field from a proposal command. Oversized or
 /// control-bearing text truncates instead of refusing the whole edit.
 pub(crate) fn prepared_agent_edit_command(command: impl Into<String>) -> Option<String> {
@@ -440,6 +453,11 @@ mod tests {
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));
         assert!(spoofed.starts_with("git "));
+        assert!(accepted_agent_edit_command("git \u{202e}status").is_none());
+        assert_eq!(
+            accepted_agent_edit_command("git status").as_deref(),
+            Some("git status")
+        );
         let filled = bound_agent_edit_command(format!("{}y", "x".repeat(MAX_AGENT_COMMAND_BYTES)));
         assert_eq!(filled.len(), MAX_AGENT_COMMAND_BYTES);
         assert!(!filled.contains('y'));
