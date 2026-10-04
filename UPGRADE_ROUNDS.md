@@ -1654,3 +1654,7 @@ everywhere except a resize, and an audit against ember found the rest.
 310. **Ask-AI cwd/shell refuse spoofing** — suggestion sessions refuse spoofed
      working directories and shell names so they cannot be sent as model
      prompt context.
+
+311. **Ask-AI block context refuses spoofing** — selected-block command,
+     output, or cwd that still contains visual spoofing or U+FFFD cannot be
+     attached as model prompt context.

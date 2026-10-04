@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 311 — Ask-AI block context refuses spoofing)
+
+## 2026-10-04 (upgrade round 311)
+
+- Ask-AI suggestion sessions refuse selected-block context whose command, output, or cwd still contains visual spoofing or U+FFFD.
+- `cargo test --locked --bin frost -- ai_command::tests::begin_trims_and_rejects_empty_or_oversize_requests` passed.
+
 Updated: 2026-10-04 (upgrade round 310 — Ask-AI cwd/shell refuse spoofing)
 
 ## 2026-10-04 (upgrade round 310)

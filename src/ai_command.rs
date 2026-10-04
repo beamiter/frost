@@ -79,6 +79,27 @@ fn suggestion_context_is_unsafe(value: &str) -> bool {
         || jterm_core::review_input::contains_visual_spoofing(value)
 }
 
+fn suggestion_multiline_is_unsafe(value: &str) -> bool {
+    value.chars().any(|character| {
+        if matches!(character, '\n' | '\t' | '\r') {
+            false
+        } else {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
+}
+
+fn suggestion_block_is_unsafe(block: &jterm_core::ai::BlockContext) -> bool {
+    suggestion_context_is_unsafe(&block.cmd)
+        || suggestion_multiline_is_unsafe(&block.output)
+        || block
+            .cwd
+            .as_deref()
+            .is_some_and(suggestion_context_is_unsafe)
+}
+
 fn bound_suggestion_feedback(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_SUGGESTION_FEEDBACK_BYTES)
 }
@@ -168,6 +189,12 @@ impl CommandSuggestion {
             return None;
         }
         if suggestion_context_is_unsafe(&cwd) || suggestion_context_is_unsafe(&shell) {
+            return None;
+        }
+        if block_context
+            .as_ref()
+            .is_some_and(suggestion_block_is_unsafe)
+        {
             return None;
         }
         let session = Self {
@@ -377,6 +404,40 @@ mod tests {
             ".".into(),
             "sh\u{fffd}".into(),
             None
+        )
+        .is_none());
+        let honest_block = jterm_core::ai::BlockContext {
+            cmd: "ls".into(),
+            output: "a\nb".into(),
+            cwd: Some("/tmp".into()),
+            exit_code: 0,
+            truncated: false,
+        };
+        assert!(CommandSuggestion::begin(
+            1,
+            7,
+            "list files".into(),
+            "p".into(),
+            ".".into(),
+            "sh".into(),
+            Some(honest_block),
+        )
+        .is_some());
+        let spoofed_block = jterm_core::ai::BlockContext {
+            cmd: "ls\u{202e}".into(),
+            output: "ok".into(),
+            cwd: None,
+            exit_code: 0,
+            truncated: false,
+        };
+        assert!(CommandSuggestion::begin(
+            1,
+            7,
+            "list files".into(),
+            "p".into(),
+            ".".into(),
+            "sh".into(),
+            Some(spoofed_block),
         )
         .is_none());
     }
