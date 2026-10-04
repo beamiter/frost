@@ -7,6 +7,10 @@ use fuzzy_matcher::FuzzyMatcher;
 /// without bound.
 pub(crate) const MAX_PALETTE_QUERY_BYTES: usize = jterm_core::workflows::MAX_PICKER_QUERY_BYTES;
 
+fn palette_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
 /// 面板可分发的动作，每一项都 1:1 对应一个已有的 frost 操作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
@@ -712,6 +716,9 @@ impl PaletteState {
             }
             return out;
         }
+        if palette_query_is_unsafe(&self.query) {
+            return Vec::new();
+        }
         let mut scored: Vec<(i64, usize, &PaletteItem)> = self
             .all
             .iter()
@@ -974,5 +981,6 @@ mod tests {
         assert!(!palette.query.contains('\u{202e}'));
         assert!(palette.query.contains('\u{fffd}'));
         assert!(palette.query.starts_with("new"));
+        assert!(palette.filtered().is_empty());
     }
 }

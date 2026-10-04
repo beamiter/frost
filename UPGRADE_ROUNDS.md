@@ -1765,3 +1765,7 @@ everywhere except a resize, and an audit against ember found the rest.
 338. **Workflow arguments refuse spoofing** — workflow argument fields refuse
      visual spoofing and U+FFFD so a neutralized paste is not stored or rendered
      into the prompt.
+
+339. **Command palette query refuses spoofing** — the command palette returns no
+     matches when the query still contains visual spoofing or U+FFFD so a
+     neutralized paste cannot select an action.

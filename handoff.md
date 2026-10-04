@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 339 — Command palette query refuses spoofing)
+
+## 2026-10-04 (upgrade round 339)
+
+- The command palette returns no matches when the query still contains visual spoofing or U+FFFD so a neutralized paste cannot select an action.
+- `cargo test --locked --bin frost -- command_palette::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 338 — Workflow arguments refuse spoofing)
 
 ## 2026-10-04 (upgrade round 338)
