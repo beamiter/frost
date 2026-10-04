@@ -346,6 +346,13 @@ impl AiChatsUi {
         self.search = query;
     }
 
+    pub(crate) fn library_summaries(&self) -> Vec<jterm_core::ai::ChatSummary> {
+        if library_search_is_unsafe(&self.search) {
+            return Vec::new();
+        }
+        self.store.summaries_filtered(&self.search)
+    }
+
     pub(crate) fn include_recent(&self, chat_id: u64) -> bool {
         self.include_recent.get(&chat_id).copied().unwrap_or(true)
     }
@@ -705,6 +712,10 @@ impl AiChatsUi {
 }
 
 const MAX_CHAT_NOTICE_BYTES: usize = 256;
+
+fn library_search_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
 
 fn bound_chat_notice(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_CHAT_NOTICE_BYTES)
@@ -1244,6 +1255,7 @@ mod tests {
         assert!(!panel.search.contains('\u{202e}'));
         assert!(panel.search.contains('\u{fffd}'));
         assert!(panel.search.starts_with("chat"));
+        assert!(panel.library_summaries().is_empty());
     }
 
     #[test]

@@ -23798,7 +23798,7 @@ impl Frost {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        let summaries = chats.store.summaries_filtered(&chats.search);
+        let summaries = chats.library_summaries();
         let mut list = column![].spacing(2);
         if summaries.is_empty() {
             list = list.push(
