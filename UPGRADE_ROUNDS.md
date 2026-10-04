@@ -1706,3 +1706,7 @@ everywhere except a resize, and an audit against ember found the rest.
 323. **Block Markdown copy refuses spoofing** — copying a single block as
      Markdown refuses visual spoofing and U+FFFD, and a selected Markdown copy
      that fails that check reports spoofing instead of a size error.
+
+324. **Files Copy Path refuses spoofing** — Files "Copy Path" refuses visual
+     spoofing and U+FFFD so a neutralized listing path cannot reach the host
+     clipboard.

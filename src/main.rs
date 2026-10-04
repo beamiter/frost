@@ -6070,13 +6070,19 @@ impl Frost {
             SidebarMenuAction::CopyPath => {
                 // The rows' full paths as plain text, newline-joined — remote
                 // rows keep the bare remote path, no prefix.
-                let text = menu
-                    .targets
-                    .iter()
-                    .map(|(path, _)| copy_path_payload(path))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                iced::clipboard::write(text)
+                let mut parts = Vec::new();
+                for (path, _) in &menu.targets {
+                    let Some(text) = copy_path_payload(path) else {
+                        self.set_sidebar_notice(
+                            "Path not copied: it contains control or visual-spoofing characters"
+                                .to_string(),
+                            false,
+                        );
+                        return Task::none();
+                    };
+                    parts.push(text);
+                }
+                iced::clipboard::write(parts.join("\n"))
             }
             SidebarMenuAction::Paste => {
                 let live_clipboard_id = self
@@ -24624,8 +24630,15 @@ fn menu_targets(
 
 /// The text "Copy Path" puts on the host clipboard: the row's full path,
 /// lossy-decoded, exactly as the tree shows it (remote rows carry no prefix).
-fn copy_path_payload(path: &std::path::Path) -> String {
-    path.to_string_lossy().into_owned()
+/// `None` when the path still contains replacement, control, or visual-spoofing
+/// characters after decode.
+fn copy_path_payload(path: &std::path::Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    if crate::block_mode::clipboard_multiline_is_unsafe(&text) {
+        None
+    } else {
+        Some(text.into_owned())
+    }
 }
 
 /// Run one sidebar file operation off the UI thread. The location and hosts
@@ -31080,13 +31093,21 @@ mod tests {
     #[test]
     fn copy_path_payload_is_the_plain_full_path() {
         assert_eq!(
-            copy_path_payload(std::path::Path::new("/var/log/syslog")),
-            "/var/log/syslog"
+            copy_path_payload(std::path::Path::new("/var/log/syslog")).as_deref(),
+            Some("/var/log/syslog")
         );
         // Remote rows copy the bare remote path — no ssh:/docker: prefix.
         assert_eq!(
-            copy_path_payload(std::path::Path::new("/home/yj/some file.txt")),
-            "/home/yj/some file.txt"
+            copy_path_payload(std::path::Path::new("/home/yj/some file.txt")).as_deref(),
+            Some("/home/yj/some file.txt")
+        );
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/tmp/notes\u{202e}file.txt")),
+            None
+        );
+        assert_eq!(
+            copy_path_payload(std::path::Path::new("/tmp/notes\u{fffd}file.txt")),
+            None
         );
     }
 

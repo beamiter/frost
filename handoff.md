@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 324 — Files Copy Path refuses spoofing)
+
+## 2026-10-04 (upgrade round 324)
+
+- Files "Copy Path" refuses visual spoofing and U+FFFD so a neutralized listing path cannot reach the host clipboard.
+- `cargo test --locked --bin frost -- tests::copy_path_payload_is_the_plain_full_path` passed.
+
 Updated: 2026-10-04 (upgrade round 323 — Block Markdown copy refuses spoofing)
 
 ## 2026-10-04 (upgrade round 323)
