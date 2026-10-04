@@ -3710,6 +3710,7 @@ impl TerminalState {
         // rejected target into a different, valid destination.
         if uri.len() > MAX_OSC8_URI_BYTES
             || !crate::link::is_openable_url(uri)
+            || uri.contains('\u{fffd}')
             || jterm_core::review_input::contains_visual_spoofing(uri)
         {
             self.current_hyperlink = None;
@@ -3720,6 +3721,7 @@ impl TerminalState {
             .find_map(|parameter| parameter.strip_prefix("id="));
         if id.is_some_and(|id| {
             id.len() > MAX_OSC8_ID_BYTES
+                || id.contains('\u{fffd}')
                 || id.chars().any(char::is_control)
                 || jterm_core::review_input::contains_visual_spoofing(id)
         }) {
@@ -14160,6 +14162,12 @@ mod tests {
         );
         terminal.process_batch(
             "\x1b]8;id=ok\u{200b};https://example.com\x1b\\Marked\x1b]8;;\x1b\\".as_bytes(),
+        );
+        terminal.process_batch(
+            "\x1b]8;;https://example.com/\u{fffd}hidden\x1b\\Replaced\x1b]8;;\x1b\\".as_bytes(),
+        );
+        terminal.process_batch(
+            "\x1b]8;id=ok\u{fffd};https://example.com\x1b\\Marked\x1b]8;;\x1b\\".as_bytes(),
         );
         assert_eq!(terminal.osc8_interned_count(), 0);
         assert!(osc8_spans(&mut terminal).is_empty());

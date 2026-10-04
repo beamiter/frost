@@ -1722,3 +1722,7 @@ everywhere except a resize, and an audit against ember found the rest.
 327. **Session export refuses spoofing** — session Markdown/JSON export refuses
      command, output, or cwd that still contains visual spoofing or U+FFFD so it
      cannot be written to disk.
+
+328. **OSC 8 hyperlinks refuse U+FFFD** — OSC 8 hyperlinks refuse a URI or id
+     that still contains U+FFFD so a neutralized target cannot be interned or
+     clicked.

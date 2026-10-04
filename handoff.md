@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 328 — OSC 8 hyperlinks refuse U+FFFD)
+
+## 2026-10-04 (upgrade round 328)
+
+- OSC 8 hyperlinks refuse a URI or id that still contains U+FFFD so a neutralized target cannot be interned or clicked.
+- `cargo test --locked --bin frost -- terminal::tests::osc8_rejects_unsafe_or_oversized_fields_before_interning` passed.
+
 Updated: 2026-10-04 (upgrade round 327 — Session export refuses spoofing)
 
 ## 2026-10-04 (upgrade round 327)
