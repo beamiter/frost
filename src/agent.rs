@@ -508,6 +508,11 @@ impl AgentUi {
         if prompt.is_empty() {
             return Err("initial Agent prompt is empty".to_string());
         }
+        if composer_submit_is_unsafe(prompt) {
+            return Err(
+                "initial Agent prompt contains control or visual-spoofing characters".to_string(),
+            );
+        }
         let mut fresh = AgentSession::new(config.agent_max_turns);
         fresh
             .submit_user(prompt.to_string())
@@ -604,6 +609,10 @@ impl AgentUi {
     pub fn submit_input(&mut self) {
         let message = self.input.trim().to_string();
         if message.is_empty() {
+            return;
+        }
+        if composer_submit_is_unsafe(&message) {
+            self.set_status("message contains control or visual-spoofing characters");
             return;
         }
         let Some(session) = self.session.as_mut() else {
@@ -1003,6 +1012,18 @@ pub(crate) fn bound_attached_context_cmd(cmd: impl Into<String>) -> String {
 
 fn bound_agent_status(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_AGENT_STATUS_BYTES)
+}
+
+fn composer_submit_is_unsafe(value: &str) -> bool {
+    value.chars().any(|character| {
+        if matches!(character, '\n' | '\t') {
+            false
+        } else {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
 }
 
 fn bound_composer(text: impl Into<String>) -> String {
@@ -2063,6 +2084,16 @@ mod tests {
         assert!(!agent.input.contains('\u{202e}'));
         assert!(agent.input.contains('\u{fffd}'));
         assert!(agent.input.starts_with("please\n"));
+        agent.session = Some(jterm_core::agent::AgentSession::new(8));
+        agent.submit_input();
+        assert!(agent.input.contains('\u{fffd}'));
+        assert!(agent
+            .session
+            .as_ref()
+            .expect("session")
+            .transcript()
+            .is_empty());
+        assert!(agent.status.contains("visual-spoofing"));
     }
 
     #[test]

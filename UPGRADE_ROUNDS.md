@@ -1662,3 +1662,7 @@ everywhere except a resize, and an audit against ember found the rest.
 312. **Agent block context refuses spoofing** — manual completions, Fix/Explain,
      and Ask-AI-about-block refuse visual spoofing and U+FFFD so they cannot
      become model evidence.
+
+313. **Agent composer refuses spoofing** — composer submit and Fix/Explain
+     initial prompts refuse U+FFFD and visual spoofing so a neutralized draft
+     cannot become a model user turn.

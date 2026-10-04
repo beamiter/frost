@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 313 — Agent composer refuse spoofing)
+
+## 2026-10-04 (upgrade round 313)
+
+- Agent composer submit and Fix/Explain initial prompts refuse U+FFFD/visual spoofing so neutralized drafts cannot become model user turns.
+- `cargo test --locked --bin frost -- agent::tests::composer_keeps_newlines_and_truncates_to_the_session_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 312 — Agent block context refuses spoofing)
 
 ## 2026-10-04 (upgrade round 312)
