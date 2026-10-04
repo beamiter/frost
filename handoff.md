@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 329 — OSC 133 metadata refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 329)
+
+- OSC 133 command, cwd, and correlation metadata refuse U+FFFD so a neutralized shell identity cannot be retained on a block.
+- `cargo test --locked --bin frost -- terminal::tests::osc_133_metadata_refuses_terminal_invisible_characters` passed.
+
 Updated: 2026-10-04 (upgrade round 328 — OSC 8 hyperlinks refuse U+FFFD)
 
 ## 2026-10-04 (upgrade round 328)

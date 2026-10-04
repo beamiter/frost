@@ -1726,3 +1726,7 @@ everywhere except a resize, and an audit against ember found the rest.
 328. **OSC 8 hyperlinks refuse U+FFFD** — OSC 8 hyperlinks refuse a URI or id
      that still contains U+FFFD so a neutralized target cannot be interned or
      clicked.
+
+329. **OSC 133 metadata refuses U+FFFD** — OSC 133 command, cwd, and
+     correlation metadata refuse U+FFFD so a neutralized shell identity cannot
+     be retained on a block.
