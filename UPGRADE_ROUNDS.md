@@ -1738,3 +1738,7 @@ everywhere except a resize, and an audit against ember found the rest.
 331. **AI chat shell context skips spoofing** — recent shell context shared with
      AI Chats skips commands that still contain visual spoofing or U+FFFD so they
      cannot leave the machine.
+
+332. **Git diff cwd refuses spoofing** — opening a Tasks Git diff refuses a
+     worktree cwd that still contains visual spoofing or U+FFFD so Git is not
+     spawned on a neutralized path.

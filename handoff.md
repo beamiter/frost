@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 332 — Git diff cwd refuses spoofing)
+
+## 2026-10-04 (upgrade round 332)
+
+- Opening a Tasks Git diff refuses a worktree cwd that still contains visual spoofing or U+FFFD so Git is not spawned on a neutralized path.
+- `cargo test --locked --bin frost -- agent_task::diff::tests::git_diff_refuses_a_spoofed_or_replaced_cwd` passed.
+
 Updated: 2026-10-04 (upgrade round 331 — AI chat shell context skips spoofing)
 
 ## 2026-10-04 (upgrade round 331)

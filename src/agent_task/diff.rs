@@ -58,6 +58,7 @@ pub struct AgentDiffState {
 pub enum DiffRequestError {
     Busy,
     InvalidBase,
+    UnsafeCwd,
     WorkerSpawn(String),
 }
 
@@ -66,6 +67,9 @@ impl fmt::Display for DiffRequestError {
         match self {
             Self::Busy => formatter.write_str("a Git diff request is already running"),
             Self::InvalidBase => formatter.write_str("Git diff base is not a full object ID"),
+            Self::UnsafeCwd => {
+                formatter.write_str("Git diff cwd contains control or visual-spoofing characters")
+            }
             Self::WorkerSpawn(error) => {
                 write!(formatter, "could not start Git diff worker: {error}")
             }
@@ -152,6 +156,9 @@ impl AgentDiffPanel {
         self.poll();
         if self.pending.is_some() {
             return Err(DiffRequestError::Busy);
+        }
+        if diff_cwd_is_unsafe(&cwd) {
+            return Err(DiffRequestError::UnsafeCwd);
         }
 
         self.state = AgentDiffState {
@@ -859,6 +866,10 @@ pub(crate) fn visible_diff_cwd(cwd: &Path) -> String {
     crate::review_text::visible_bounded(&cwd.to_string_lossy(), MAX_DIFF_CWD_DISPLAY_BYTES)
 }
 
+fn diff_cwd_is_unsafe(cwd: &Path) -> bool {
+    crate::block_mode::clipboard_multiline_is_unsafe(&cwd.to_string_lossy())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,6 +929,22 @@ mod tests {
         assert_eq!(visible, "/tmp/repo\\nforged\\u{202E}txt");
         assert!(!visible.contains('\n'));
         assert!(!visible.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn git_diff_refuses_a_spoofed_or_replaced_cwd() {
+        let mut panel = AgentDiffPanel::new();
+        assert_eq!(
+            panel.request("/tmp/repo\u{202e}txt"),
+            Err(DiffRequestError::UnsafeCwd)
+        );
+        assert_eq!(
+            panel.request("/tmp/repo\u{fffd}txt"),
+            Err(DiffRequestError::UnsafeCwd)
+        );
+        assert!(panel.pending.is_none());
+        assert!(!panel.state.loading);
+        assert!(!panel.is_open);
     }
 
     #[test]
