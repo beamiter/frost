@@ -1849,3 +1849,7 @@ everywhere except a resize, and an audit against ember found the rest.
 359. **History picker query refuses spoofing** — the command-history picker
      does not keep a query that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot recall a command.
+
+360. **Tab switcher query refuses spoofing** — the tab switcher does not keep a
+     query that still contains visual spoofing or U+FFFD, so a neutralized
+     paste cannot jump to a tab.

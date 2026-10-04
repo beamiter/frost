@@ -1172,6 +1172,9 @@ impl TabSwitcherState {
             }
             query.truncate(end);
         }
+        if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(&query) {
+            return;
+        }
         self.query = query;
         self.selected = 0;
     }
@@ -31488,10 +31491,13 @@ mod tests {
         assert_eq!(state.query, filled);
         assert!(state.backspace());
         assert_eq!(state.query.len(), filled.len() - 1);
+        state.set_query("tab");
         state.set_query("tab\u{202e}");
+        assert_eq!(state.query, "tab");
         assert!(!state.query.contains('\u{202e}'));
-        assert!(state.query.contains('\u{fffd}'));
-        assert!(state.query.starts_with("tab"));
-        assert!(tab_switcher_filtered(&["build".into(), "tab two".into()], &state.query).is_empty());
+        assert!(!state.query.contains('\u{fffd}'));
+        assert!(!tab_switcher_filtered(&["build".into(), "tab two".into()], &state.query).is_empty());
+        state.set_query("tab\u{fffd}");
+        assert_eq!(state.query, "tab");
     }
 }

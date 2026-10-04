@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 360 — Tab switcher query refuses spoofing)
+
+## 2026-10-04 (upgrade round 360)
+
+- The tab switcher does not keep a query that still contains visual spoofing or U+FFFD, so a neutralized paste cannot jump to a tab.
+- `cargo test --locked --bin frost -- tests::tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 359 — History picker query refuses spoofing)
 
 ## 2026-10-04 (upgrade round 359)
