@@ -47,12 +47,28 @@ pub(crate) fn terminal_session_id(session_id: usize) -> String {
 
 /// A follow-up turn may be sent only when it carries visible text, stays
 /// inside the native byte budget, and the live session has turn headroom.
+/// A follow-up turn may be sent only when it carries visible text, stays
+/// inside the native byte budget, the live session has turn headroom, and the
+/// payload is not a neutralized spoofing paste.
 pub(crate) fn native_follow_up_can_send(text: &str, completed_turns: usize) -> bool {
     !text
         .trim_matches(|character| matches!(character, ' ' | '\n' | '\t'))
         .is_empty()
         && text.len() <= NATIVE_AGENT_FOLLOW_UP_MAX_BYTES
         && completed_turns < CODEX_APP_SERVER_LIVE_TURN_MAX
+        && !follow_up_is_unsafe(text)
+}
+
+pub(crate) fn follow_up_is_unsafe(text: &str) -> bool {
+    text.chars().any(|character| {
+        if matches!(character, '\n' | '\t') {
+            false
+        } else {
+            character == '\u{fffd}'
+                || character.is_control()
+                || jterm_core::review_input::is_visual_spoofing_character(character)
+        }
+    })
 }
 
 /// Bound the Tasks follow-up composer. Newlines and tabs stay (the send gate
@@ -329,6 +345,8 @@ mod tests {
             "ok",
             CODEX_APP_SERVER_LIVE_TURN_MAX
         ));
+        assert!(!native_follow_up_can_send("please\n\u{fffd}adjust", 0));
+        assert!(!native_follow_up_can_send("please\n\u{202e}adjust", 0));
     }
 
     #[test]

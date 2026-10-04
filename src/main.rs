@@ -13182,14 +13182,22 @@ impl Frost {
             }
             Message::TaskFollowUpSend(task_id) => {
                 let text = self.task_panel.follow_up.clone();
-                match self.agent_runtime.prompt_codex(
-                    &self.task_manager,
-                    task_id,
-                    &text,
-                    agent_task_ui::prompt_policy(&self.config),
-                ) {
-                    Ok(()) => self.task_panel.follow_up.clear(),
-                    Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                if agent_task_ui::follow_up_is_unsafe(&text) {
+                    self.push_toast(
+                        "Follow-up not sent: it contains control or visual-spoofing characters"
+                            .to_string(),
+                        ToastKind::Warning,
+                    );
+                } else {
+                    match self.agent_runtime.prompt_codex(
+                        &self.task_manager,
+                        task_id,
+                        &text,
+                        agent_task_ui::prompt_policy(&self.config),
+                    ) {
+                        Ok(()) => self.task_panel.follow_up.clear(),
+                        Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
+                    }
                 }
             }
             Message::TaskApprovalDeny(task_id, approval_id) => {

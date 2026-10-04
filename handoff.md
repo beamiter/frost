@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 330 — Task follow-up send refuses U+FFFD)
+
+## 2026-10-04 (upgrade round 330)
+
+- Native Tasks follow-up send refuses a composer payload that still contains U+FFFD or visual spoofing so a neutralized paste cannot leave the machine.
+- `cargo test --locked --bin frost -- agent_task_ui::tests::follow_up_gate_bounds_text_and_turn_count` passed.
+
 Updated: 2026-10-04 (upgrade round 329 — OSC 133 metadata refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 329)

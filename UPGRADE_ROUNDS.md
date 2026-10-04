@@ -1730,3 +1730,7 @@ everywhere except a resize, and an audit against ember found the rest.
 329. **OSC 133 metadata refuses U+FFFD** — OSC 133 command, cwd, and
      correlation metadata refuse U+FFFD so a neutralized shell identity cannot
      be retained on a block.
+
+330. **Task follow-up send refuses U+FFFD** — native Tasks follow-up send
+     refuses a composer payload that still contains U+FFFD or visual spoofing so
+     a neutralized paste cannot leave the machine.
