@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 308 — Ask-AI requests refuse spoofing)
+
+## 2026-10-04 (upgrade round 308)
+
+- Ask-AI command suggestion sessions refuse requests that still contain U+FFFD, controls, or visual spoofing instead of sending them to the model.
+- `cargo test --locked --bin frost -- ai_command::tests::begin_trims_and_rejects_empty_or_oversize_requests` passed.
+
 Updated: 2026-10-04 (upgrade round 307 — History cwd refuses U+FFFD)
 
 ## 2026-10-04 (upgrade round 307)

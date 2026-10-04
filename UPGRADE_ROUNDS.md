@@ -1642,3 +1642,7 @@ everywhere except a resize, and an audit against ember found the rest.
 307. **History cwd refuses U+FFFD** — shared-history working directories that
      contain replacement characters are dropped so a neutralized path cannot
      sit beside a replayed command.
+
+308. **Ask-AI requests refuse spoofing** — command-suggestion sessions refuse
+     natural-language requests that still contain U+FFFD, controls, or visual
+     spoofing instead of sending them to the model.

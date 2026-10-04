@@ -155,7 +155,12 @@ impl CommandSuggestion {
         block_context: Option<jterm_core::ai::BlockContext>,
     ) -> Option<Self> {
         let request = request.trim().to_string();
-        if request.is_empty() || request.len() > MAX_SUGGESTION_REQUEST_BYTES {
+        if request.is_empty()
+            || request.len() > MAX_SUGGESTION_REQUEST_BYTES
+            || request.contains('\u{fffd}')
+            || request.chars().any(char::is_control)
+            || jterm_core::review_input::contains_visual_spoofing(&request)
+        {
             return None;
         }
         let session = Self {
@@ -316,6 +321,8 @@ mod tests {
         let invalid = [
             "   ".to_string(),
             "x".repeat(MAX_SUGGESTION_REQUEST_BYTES + 1),
+            "list files \u{fffd}secret".to_string(),
+            "list files \u{202e}secret".to_string(),
         ];
         for request in invalid {
             assert!(CommandSuggestion::begin(
