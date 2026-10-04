@@ -120,17 +120,19 @@ impl WorkflowPickerState {
     /// Iced `text_input` and accessibility/programmatic input both cross the
     /// core's one-line and byte-budget boundary here.
     pub(crate) fn set_query(&mut self, query: impl Into<String>) {
-        self.picker.set_query(bound_overlay_line(
-            query,
-            jterm_core::workflows::MAX_PICKER_QUERY_BYTES,
-        ));
+        let query = bound_overlay_line(query, jterm_core::workflows::MAX_PICKER_QUERY_BYTES);
+        if overlay_query_is_unsafe(&query) {
+            return;
+        }
+        self.picker.set_query(query);
     }
 
     pub(crate) fn push_query_text(&mut self, text: &str) -> bool {
-        self.picker.push_query_text(&bound_overlay_line(
-            text,
-            jterm_core::workflows::MAX_PICKER_QUERY_BYTES,
-        ))
+        let text = bound_overlay_line(text, jterm_core::workflows::MAX_PICKER_QUERY_BYTES);
+        if overlay_query_is_unsafe(&text) {
+            return false;
+        }
+        self.picker.push_query_text(&text)
     }
 
     pub(crate) fn backspace(&mut self) -> bool {
@@ -357,12 +359,14 @@ mod tests {
         assert_eq!(state.selected(), 0);
         assert_eq!(state.picker.policy(), PICKER_POLICY);
         assert!(!state.picker.policy().search_command());
+        state.set_query("alpha");
         state.set_query("deploy\u{202e}");
+        assert_eq!(state.query(), "alpha");
         assert!(!state.query().contains('\u{202e}'));
-        assert!(state.query().contains('\u{fffd}'));
-        assert!(state.filtered().is_empty());
-        assert!(state.selected_workflow().is_none());
-        assert!(state.workflow_at_filtered(0).is_none());
+        assert!(!state.query().contains('\u{fffd}'));
+        assert_eq!(state.filtered().len(), 1);
+        assert!(state.selected_workflow().is_some());
+        assert!(state.workflow_at_filtered(0).is_some());
     }
 
     #[test]

@@ -1853,3 +1853,7 @@ everywhere except a resize, and an audit against ember found the rest.
 360. **Tab switcher query refuses spoofing** — the tab switcher does not keep a
      query that still contains visual spoofing or U+FFFD, so a neutralized
      paste cannot jump to a tab.
+
+361. **Workflow picker query refuses spoofing** — the workflow picker does not
+     keep a query that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot accept a workflow.
