@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 373 — AI model setting refuses spoofing)
+
+## 2026-10-04 (upgrade round 373)
+
+- The settings AI-model field does not keep a model that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a backend identifier.
+- `cargo test --offline --bin frost -- live_config_text_drops_controls_and_stays_inside_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 372 — AI provider setting refuses spoofing)
 
 ## 2026-10-04 (upgrade round 372)

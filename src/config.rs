@@ -1375,6 +1375,11 @@ mod tests {
         assert!(overflow.len() <= MAX_CONFIG_NAME_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        assert!(accepted_config_text("safe-model\u{202e}gpj", MAX_CONFIG_NAME_BYTES).is_none());
+        assert_eq!(
+            accepted_config_text("codellama:7b", MAX_CONFIG_NAME_BYTES).as_deref(),
+            Some("codellama:7b")
+        );
     }
 
     #[test]

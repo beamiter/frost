@@ -13339,9 +13339,13 @@ impl Frost {
                 }
             }
             Message::SetAiModel(model) => {
-                self.config.ai_model =
-                    crate::config::bound_config_text(model, crate::config::MAX_CONFIG_NAME_BYTES);
-                self.config_dirty = true;
+                if let Some(model) = crate::config::accepted_config_text(
+                    model,
+                    crate::config::MAX_CONFIG_NAME_BYTES,
+                ) {
+                    self.config.ai_model = model;
+                    self.config_dirty = true;
+                }
             }
             Message::SetAiBaseUrl(url) => {
                 self.config.ai_base_url =

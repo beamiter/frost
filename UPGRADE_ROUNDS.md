@@ -1901,3 +1901,7 @@ everywhere except a resize, and an audit against ember found the rest.
 372. **AI provider setting refuses spoofing** — the settings AI-provider field
      does not keep a provider that still contains visual spoofing or U+FFFD, so
      a neutralized paste cannot sit as a backend name.
+
+373. **AI model setting refuses spoofing** — the settings AI-model field does
+     not keep a model that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as a backend identifier.
