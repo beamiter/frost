@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 347 — Image drops refuse U+FFFD)
+
+## 2026-10-04 (upgrade round 347)
+
+- Dropped image paths that still contain U+FFFD are refused so a neutralized filename cannot be typed at the prompt.
+- `cargo test --locked --bin frost -- image_drop::tests::replacement_character_paths_are_rejected image_drop::tests::image_paths_are_shell_quoted_and_never_submitted` passed.
+
 Updated: 2026-10-04 (upgrade round 346 — Kitty protocol errors refuse U+FFFD)
 
 ## 2026-10-04 (upgrade round 346)

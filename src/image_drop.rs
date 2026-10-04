@@ -44,7 +44,8 @@ pub(crate) fn prompt_payload(paths: &[PathBuf]) -> Result<String, ImageDropError
         let text = path
             .to_str()
             .ok_or(ImageDropError("the image path is not valid UTF-8"))?;
-        if text.chars().any(char::is_control)
+        if text.contains('\u{fffd}')
+            || text.chars().any(char::is_control)
             || jterm_core::review_input::contains_visual_spoofing(text)
         {
             return Err(ImageDropError(
@@ -130,5 +131,15 @@ mod tests {
             ImageDropError("unsupported image type")
         );
         std::fs::remove_file(text).expect("cleanup");
+    }
+
+    #[test]
+    fn replacement_character_paths_are_rejected() {
+        let image = temporary_file("screen\u{fffd}shot.png");
+        assert_eq!(
+            prompt_payload(std::slice::from_ref(&image)).unwrap_err(),
+            ImageDropError("the image path contains hidden or control text")
+        );
+        std::fs::remove_file(image).expect("cleanup");
     }
 }

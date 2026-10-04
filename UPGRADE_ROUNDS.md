@@ -1797,3 +1797,7 @@ everywhere except a resize, and an audit against ember found the rest.
 346. **Kitty protocol errors refuse U+FFFD** — Kitty graphics protocol error
      replies omit neutralized text so U+FFFD or visual spoofing cannot leave
      through an APC-G response.
+
+347. **Image drops refuse U+FFFD** — dropped image paths that still contain
+     U+FFFD are refused so a neutralized filename cannot be typed at the
+     prompt.
