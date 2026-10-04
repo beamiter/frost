@@ -1825,3 +1825,7 @@ everywhere except a resize, and an audit against ember found the rest.
 353. **AI chat rename draft refuses spoofing** — the AI chats rename editor
      does not keep a title that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot become the saved name.
+
+354. **Find & Replace fields refuse spoofing** — Find & Replace does not keep
+     a find or replace field that still contains visual spoofing or U+FFFD, so
+     a neutralized paste cannot run.

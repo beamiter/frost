@@ -86,11 +86,25 @@ impl SearchReplacePanelState {
     }
 
     pub fn set_search_input(&mut self, text: impl Into<String>) {
-        self.search_input = bound_field(text, crate::search::MAX_SEARCH_QUERY_BYTES);
+        let text = bound_field(text, crate::search::MAX_SEARCH_QUERY_BYTES);
+        if replacement_output_is_unsafe(&text) {
+            self.status = crate::review_text::bound_query_error(
+                "find contains control or visual-spoofing characters and was not saved",
+            );
+            return;
+        }
+        self.search_input = text;
     }
 
     pub fn set_replace_input(&mut self, text: impl Into<String>) {
-        self.replace_input = bound_field(text, crate::review_text::MAX_PROMPT_INSERT_BYTES);
+        let text = bound_field(text, crate::review_text::MAX_PROMPT_INSERT_BYTES);
+        if replacement_output_is_unsafe(&text) {
+            self.status = crate::review_text::bound_query_error(
+                "replace contains control or visual-spoofing characters and was not saved",
+            );
+            return;
+        }
+        self.replace_input = text;
     }
 
     /// 对给定文本执行替换，更新状态行，返回替换后的文本（失败返回 `None`）。
@@ -265,14 +279,18 @@ mod tests {
             crate::review_text::MAX_PROMPT_INSERT_BYTES
         );
         assert!(!panel.replace_input.contains('z'));
+        panel.set_search_input("keep find");
         panel.set_search_input("err\u{202e}or");
+        assert_eq!(panel.search_input, "keep find");
         assert!(!panel.search_input.contains('\u{202e}'));
-        assert!(panel.search_input.contains('\u{fffd}'));
+        assert!(!panel.search_input.contains('\u{fffd}'));
+        assert!(panel.status.contains("not saved"));
+        panel.set_replace_input("keep replace");
         panel.set_replace_input("ok\u{202e}");
+        assert_eq!(panel.replace_input, "keep replace");
         assert!(!panel.replace_input.contains('\u{202e}'));
-        assert!(panel.replace_input.contains('\u{fffd}'));
-        assert_eq!(panel.apply("error"), None);
-        assert!(panel.status.contains("visual-spoofing"));
+        assert!(!panel.replace_input.contains('\u{fffd}'));
+        assert!(panel.status.contains("not saved"));
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 354 — Find & Replace fields refuse spoofing)
+
+## 2026-10-04 (upgrade round 354)
+
+- Find & Replace does not keep a find or replace field that still contains visual spoofing or U+FFFD, so a neutralized paste cannot run.
+- `cargo test --locked --bin frost -- search_replace_panel::tests::find_and_replace_fields_drop_controls_and_truncate search_replace_panel::tests::apply_refuses_spoofed_replacement_output` passed.
+
 Updated: 2026-10-04 (upgrade round 353 — AI chat rename draft refuses spoofing)
 
 ## 2026-10-04 (upgrade round 353)
