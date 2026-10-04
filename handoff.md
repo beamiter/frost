@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 381 — Agent edit open names unsafe commands)
+
+## 2026-10-04 (upgrade round 381)
+
+- Refusing a spoofed Agent proposal reports an unsafe command instead of calling it empty, so the operator can tell a neutralized paste from a blank one.
+- `cargo test --offline --bin frost -- agent_edit_draft_truncates_instead_of_bouncing_and_drops_controls` passed.
+
 Updated: 2026-10-04 (upgrade round 380 — Agent edit open refuses spoofing)
 
 ## 2026-10-04 (upgrade round 380)

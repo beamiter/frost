@@ -13277,9 +13277,13 @@ impl Frost {
             }
             Message::AgentEditStart(id, command) => {
                 match crate::review_text::prepared_agent_edit_command(command) {
-                    Some(command) => self.agent.edit = Some((id, command)),
-                    None => {
+                    Ok(command) => self.agent.edit = Some((id, command)),
+                    Err(crate::review_text::AgentEditPrepareError::Empty) => {
                         self.agent.set_status("Agent edit rejected: empty command");
+                        self.agent.edit = None;
+                    }
+                    Err(crate::review_text::AgentEditPrepareError::Unsafe) => {
+                        self.agent.set_status("Agent edit rejected: unsafe command");
                         self.agent.edit = None;
                     }
                 }

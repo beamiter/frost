@@ -101,14 +101,24 @@ pub(crate) fn accepted_agent_edit_command(value: impl Into<String>) -> Option<St
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentEditPrepareError {
+    Empty,
+    Unsafe,
+}
+
 /// Open the Agent edit field from a proposal command. Oversized text
 /// truncates; spoofed or empty text refuses the whole edit.
-pub(crate) fn prepared_agent_edit_command(command: impl Into<String>) -> Option<String> {
-    let command = accepted_agent_edit_command(command)?;
-    if command.trim_matches(' ').is_empty() {
-        None
+pub(crate) fn prepared_agent_edit_command(
+    command: impl Into<String>,
+) -> Result<String, AgentEditPrepareError> {
+    let command = bound_agent_edit_command(command);
+    if agent_edit_command_is_unsafe(&command) {
+        Err(AgentEditPrepareError::Unsafe)
+    } else if command.trim_matches(' ').is_empty() {
+        Err(AgentEditPrepareError::Empty)
     } else {
-        Some(command)
+        Ok(command)
     }
 }
 
@@ -471,11 +481,17 @@ mod tests {
         let opened = prepared_agent_edit_command(oversized).expect("truncate opens edit");
         assert_eq!(opened.len(), MAX_AGENT_COMMAND_BYTES);
         assert!(!opened.contains('y'));
-        assert!(prepared_agent_edit_command("\u{1b}\n").is_none());
-        assert!(prepared_agent_edit_command("git \u{202e}status").is_none());
+        assert_eq!(
+            prepared_agent_edit_command("\u{1b}\n"),
+            Err(AgentEditPrepareError::Empty)
+        );
+        assert_eq!(
+            prepared_agent_edit_command("git \u{202e}status"),
+            Err(AgentEditPrepareError::Unsafe)
+        );
         assert_eq!(
             prepared_agent_edit_command("ls\n\u{1b} -la").as_deref(),
-            Some("ls -la")
+            Ok("ls -la")
         );
     }
 

@@ -1933,3 +1933,7 @@ everywhere except a resize, and an audit against ember found the rest.
 380. **Agent edit open refuses spoofing** — Edit on an Agent proposal does not
      open a draft that still contains visual spoofing or U+FFFD, so a
      neutralized command cannot sit waiting for Approve.
+
+381. **Agent edit open names unsafe commands** — refusing a spoofed Agent
+     proposal reports an unsafe command instead of calling it empty, so the
+     operator can tell a neutralized paste from a blank one.
