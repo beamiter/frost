@@ -13348,9 +13348,13 @@ impl Frost {
                 }
             }
             Message::SetAiBaseUrl(url) => {
-                self.config.ai_base_url =
-                    crate::config::bound_config_text(url, crate::config::MAX_CONFIG_VALUE_BYTES);
-                self.config_dirty = true;
+                if let Some(url) = crate::config::accepted_config_text(
+                    url,
+                    crate::config::MAX_CONFIG_VALUE_BYTES,
+                ) {
+                    self.config.ai_base_url = url;
+                    self.config_dirty = true;
+                }
             }
             Message::SetAiMaxTokens(tokens) => {
                 self.config.ai_max_tokens = tokens.clamp(64, 32_768);

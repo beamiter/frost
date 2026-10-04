@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 374 — AI base URL setting refuses spoofing)
+
+## 2026-10-04 (upgrade round 374)
+
+- The settings AI base-URL field does not keep a URL that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as an endpoint.
+- `cargo test --offline --bin frost -- live_config_text_truncates_urls_to_the_value_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 373 — AI model setting refuses spoofing)
 
 ## 2026-10-04 (upgrade round 373)

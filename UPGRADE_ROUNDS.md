@@ -1905,3 +1905,7 @@ everywhere except a resize, and an audit against ember found the rest.
 373. **AI model setting refuses spoofing** — the settings AI-model field does
      not keep a model that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as a backend identifier.
+
+374. **AI base URL setting refuses spoofing** — the settings AI base-URL field
+     does not keep a URL that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as an endpoint.

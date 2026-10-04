@@ -1401,6 +1401,11 @@ mod tests {
         assert!(overflow.len() <= MAX_CONFIG_VALUE_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        assert!(accepted_config_text("http://127.0.0.1\u{202e}", MAX_CONFIG_VALUE_BYTES).is_none());
+        assert_eq!(
+            accepted_config_text("http://127.0.0.1:11434", MAX_CONFIG_VALUE_BYTES).as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
     }
 
     #[test]
