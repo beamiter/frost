@@ -73,6 +73,12 @@ pub(crate) fn bound_suggestion_draft(text: impl Into<String>) -> String {
 
 const MAX_SUGGESTION_FEEDBACK_BYTES: usize = 256;
 
+fn suggestion_context_is_unsafe(value: &str) -> bool {
+    value.contains('\u{fffd}')
+        || value.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(value)
+}
+
 fn bound_suggestion_feedback(text: impl Into<String>) -> String {
     jterm_core::review_input::safe_inline_display(&text.into(), MAX_SUGGESTION_FEEDBACK_BYTES)
 }
@@ -157,10 +163,11 @@ impl CommandSuggestion {
         let request = request.trim().to_string();
         if request.is_empty()
             || request.len() > MAX_SUGGESTION_REQUEST_BYTES
-            || request.contains('\u{fffd}')
-            || request.chars().any(char::is_control)
-            || jterm_core::review_input::contains_visual_spoofing(&request)
+            || suggestion_context_is_unsafe(&request)
         {
+            return None;
+        }
+        if suggestion_context_is_unsafe(&cwd) || suggestion_context_is_unsafe(&shell) {
             return None;
         }
         let session = Self {
@@ -352,6 +359,26 @@ mod tests {
             )
             .is_none());
         }
+        assert!(CommandSuggestion::begin(
+            1,
+            7,
+            "list files".into(),
+            "p".into(),
+            "/tmp/\u{202e}hidden".into(),
+            "sh".into(),
+            None
+        )
+        .is_none());
+        assert!(CommandSuggestion::begin(
+            1,
+            7,
+            "list files".into(),
+            "p".into(),
+            ".".into(),
+            "sh\u{fffd}".into(),
+            None
+        )
+        .is_none());
     }
 
     #[test]

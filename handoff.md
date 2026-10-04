@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 310 — Ask-AI cwd/shell refuse spoofing)
+
+## 2026-10-04 (upgrade round 310)
+
+- Ask-AI suggestion sessions refuse spoofed working directories and shell names so they cannot be sent as model prompt context.
+- `cargo test --locked --bin frost -- ai_command::tests::begin_trims_and_rejects_empty_or_oversize_requests` passed.
+
 Updated: 2026-10-04 (upgrade round 309 — Ask-AI drafts refuse spoofing)
 
 ## 2026-10-04 (upgrade round 309)

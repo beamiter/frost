@@ -1650,3 +1650,7 @@ everywhere except a resize, and an audit against ember found the rest.
 309. **Ask-AI drafts refuse spoofing** — a generated command that still
      contains U+FFFD or visual spoofing fails the card instead of entering
      review, and insert validation refuses replacement characters.
+
+310. **Ask-AI cwd/shell refuse spoofing** — suggestion sessions refuse spoofed
+     working directories and shell names so they cannot be sent as model
+     prompt context.
