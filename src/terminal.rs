@@ -3879,7 +3879,8 @@ impl TerminalState {
     /// family's grids.
     fn osc_metadata_is_ambiguous(text: &str) -> bool {
         text.chars().any(|character| {
-            character.is_control()
+            character == '\u{fffd}'
+                || character.is_control()
                 || jterm_core::review_input::is_terminal_visual_spoofing_character(character)
         })
     }
@@ -4506,7 +4507,7 @@ impl TerminalState {
                     // that send `cwd` unencoded with a literal `%` are the
                     // ones off-contract.
                     metadata_cwd = Self::decode_osc_metadata(raw, MAX_OSC133_CWD_BYTES)
-                        .filter(|cwd| is_valid_jsh_cwd(cwd));
+                        .filter(|cwd| is_valid_jsh_cwd(cwd) && !Self::osc_metadata_is_ambiguous(cwd));
                 }
                 "duration" | "duration_ms" => {
                     if std::mem::replace(&mut seen_duration, true) {
@@ -13576,6 +13577,22 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].id, None);
         assert!(completed[0].lifecycle.is_none());
+
+        // %EF%BF%BD is U+FFFD; a neutralized cwd or command must not be retained.
+        let mut replaced_cwd = super::TerminalState::new(40, 8);
+        replaced_cwd.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n");
+        replaced_cwd.process_input(b"\x1b]133;C;cwd_url=%2Ftmp%EF%BF%BD\x07");
+        replaced_cwd.process_input(b"\x1b]133;D;0\x07");
+        assert_eq!(replaced_cwd.command_zones[0].cwd, None);
+
+        let mut replaced_command = super::TerminalState::new(40, 8);
+        replaced_command.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n");
+        replaced_command.process_input(b"\x1b]133;C;cmdline_url=echo%EF%BF%BDhi\x07out\r\n");
+        replaced_command.process_input(b"\x1b]133;D;0\x07");
+        assert!(replaced_command.command_zones[0]
+            .command
+            .as_deref()
+            .is_none_or(|text| !text.contains('\u{fffd}')));
     }
 
     #[test]
