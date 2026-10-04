@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 372 — AI provider setting refuses spoofing)
+
+## 2026-10-04 (upgrade round 372)
+
+- The settings AI-provider field does not keep a provider that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a backend name.
+- `cargo test --offline --bin frost -- live_ai_provider_field_uses_the_name_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 371 — remote host deploy mode refuses spoofing)
 
 ## 2026-10-04 (upgrade round 371)

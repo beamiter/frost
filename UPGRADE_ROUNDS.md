@@ -1897,3 +1897,7 @@ everywhere except a resize, and an audit against ember found the rest.
 371. **Remote host deploy mode refuses spoofing** — the remote-host deploy
      field does not keep a mode that still contains visual spoofing or U+FFFD,
      so a neutralized paste cannot sit as a session-deploy policy.
+
+372. **AI provider setting refuses spoofing** — the settings AI-provider field
+     does not keep a provider that still contains visual spoofing or U+FFFD, so
+     a neutralized paste cannot sit as a backend name.

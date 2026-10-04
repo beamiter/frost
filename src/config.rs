@@ -1428,6 +1428,11 @@ mod tests {
         );
         assert_eq!(filled.len(), MAX_CONFIG_NAME_BYTES);
         assert!(!filled.contains('y'));
+        assert!(accepted_config_text("openai\u{202e}", MAX_CONFIG_NAME_BYTES).is_none());
+        assert_eq!(
+            accepted_config_text("ollama", MAX_CONFIG_NAME_BYTES).as_deref(),
+            Some("ollama")
+        );
     }
 
     #[test]
