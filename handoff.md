@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 334 — API key files refuse U+FFFD)
+
+## 2026-10-04 (upgrade round 334)
+
+- Reading or writing an API key file refuses U+FFFD so a neutralized credential cannot be stored or loaded.
+- `cargo test --locked --bin frost -- persistence::tests::api_key_io_is_private_bounded_and_rejects_links_and_fifos` passed.
+
 Updated: 2026-10-04 (upgrade round 333 — Failed-block Agent eligibility refuses spoofing)
 
 ## 2026-10-04 (upgrade round 333)

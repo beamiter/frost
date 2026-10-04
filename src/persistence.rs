@@ -373,7 +373,9 @@ pub fn read_api_key_file(raw_path: &str) -> io::Result<String> {
 }
 
 fn api_key_char_is_unsafe(character: char) -> bool {
-    character.is_control() || jterm_core::review_input::is_visual_spoofing_character(character)
+    character == '\u{fffd}'
+        || character.is_control()
+        || jterm_core::review_input::is_visual_spoofing_character(character)
 }
 
 /// Store one settings-entered key using the bounded, locked private snapshot
@@ -1225,7 +1227,11 @@ mod tests {
         );
         assert!(write_api_key_file(path.to_str().unwrap(), "sk-\u{202e}secret").is_err());
         assert!(write_api_key_file(path.to_str().unwrap(), "sk-\u{200b}secret").is_err());
+        assert!(write_api_key_file(path.to_str().unwrap(), "sk-\u{fffd}secret").is_err());
         fs::write(&path, "sk-\u{202e}secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_api_key_file(path.to_str().unwrap()).is_err());
+        fs::write(&path, "sk-\u{fffd}secret\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read_api_key_file(path.to_str().unwrap()).is_err());
         write_api_key_file(path.to_str().unwrap(), "sk-secret").unwrap();
@@ -1421,5 +1427,6 @@ mod tests {
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));
         assert!(spoofed.starts_with("sk-"));
+        assert!(write_api_key_file("/tmp/unused", &spoofed).is_err());
     }
 }

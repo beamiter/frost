@@ -1746,3 +1746,6 @@ everywhere except a resize, and an audit against ember found the rest.
 333. **Failed-block Agent eligibility refuses spoofing** — creating a Fix/Explain
      Agent or Tasks job from a failed block refuses a command or cwd that still
      contains visual spoofing or U+FFFD.
+
+334. **API key files refuse U+FFFD** — reading or writing an API key file refuses
+     U+FFFD so a neutralized credential cannot be stored or loaded.
