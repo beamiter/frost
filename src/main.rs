@@ -13126,8 +13126,7 @@ impl Frost {
             }
             Message::AiSuggestionInput(draft) => {
                 if let Some(session) = self.ai_suggestion.as_mut() {
-                    session.draft = ai_command::bound_suggestion_draft(draft);
-                    session.feedback = None;
+                    session.set_review_draft(draft);
                 }
             }
             Message::AiSuggestionInsert => return self.insert_ai_suggestion(),

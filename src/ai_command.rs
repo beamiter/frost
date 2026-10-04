@@ -301,6 +301,21 @@ impl CommandSuggestion {
         true
     }
 
+    pub(crate) fn set_review_draft(&mut self, draft: String) {
+        if self.phase != SuggestionPhase::Review {
+            return;
+        }
+        let draft = bound_suggestion_draft(draft);
+        if suggestion_context_is_unsafe(&draft) {
+            self.feedback = Some(bound_suggestion_feedback(
+                "draft contains control or visual-spoofing characters and was not saved",
+            ));
+            return;
+        }
+        self.draft = draft;
+        self.feedback = None;
+    }
+
     /// The draft validated for review-only insertion, with the sources' gate:
     /// `jterm_core::review_input::validate` at its 256 KiB budget, exactly like
     /// anvil's `CommandReviewCard::validated_command`.
@@ -477,6 +492,12 @@ mod tests {
         assert!(session.apply_reply(generation, Ok("echo one\necho two".into())));
         assert_eq!(session.draft, "echo oneecho two");
         assert_eq!(session.phase(), SuggestionPhase::Review);
+        session.set_review_draft("rm -rf \u{202e}/".into());
+        assert_eq!(session.draft, "echo oneecho two");
+        assert!(session
+            .feedback
+            .as_deref()
+            .is_some_and(|text| text.contains("not saved")));
         let spoofed = bound_suggestion_draft("rm -rf \u{202e}/");
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));

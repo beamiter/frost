@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 349 — Ask-AI review draft refuses spoofing)
+
+## 2026-10-04 (upgrade round 349)
+
+- The Ask-AI review card does not save a draft that still contains visual spoofing or U+FFFD, so a neutralized paste cannot become the insert command.
+- `cargo test --locked --bin frost -- ai_command::tests::overlay_draft_drops_controls_and_truncates` passed.
+
 Updated: 2026-10-04 (upgrade round 348 — Correction draft refuses spoofing)
 
 ## 2026-10-04 (upgrade round 348)
