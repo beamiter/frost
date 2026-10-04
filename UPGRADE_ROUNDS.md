@@ -1909,3 +1909,7 @@ everywhere except a resize, and an audit against ember found the rest.
 374. **AI base URL setting refuses spoofing** — the settings AI base-URL field
      does not keep a URL that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as an endpoint.
+
+375. **API key file path refuses spoofing** — the settings API-key file field
+     does not keep a path that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as a credential-file location.

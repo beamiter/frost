@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 375 — API key file path refuses spoofing)
+
+## 2026-10-04 (upgrade round 375)
+
+- The settings API-key file field does not keep a path that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a credential-file location.
+- `cargo test --offline --bin frost -- live_api_key_file_field_uses_the_value_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 374 — AI base URL setting refuses spoofing)
 
 ## 2026-10-04 (upgrade round 374)
