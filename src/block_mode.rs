@@ -417,7 +417,7 @@ pub(crate) fn command_text_is_unsafe(command: &str) -> bool {
         || jterm_core::review_input::contains_visual_spoofing(command)
 }
 
-fn clipboard_multiline_is_unsafe(text: &str) -> bool {
+pub(crate) fn clipboard_multiline_is_unsafe(text: &str) -> bool {
     text.chars().any(|character| {
         if matches!(character, '\n' | '\t' | '\r') {
             false
@@ -2628,6 +2628,18 @@ mod tests {
             selected_markdown_text(source(), &BlockSelection::default(), 1024),
             Err(SelectedClipboardError::Empty)
         );
+        assert_eq!(
+            selected_markdown_text(
+                [(1, "## Command Block\n\nok\u{202e}".to_string())],
+                &{
+                    let mut selection = BlockSelection::default();
+                    selection.select_all(&[1]);
+                    selection
+                },
+                1024
+            ),
+            Err(SelectedClipboardError::Unsafe)
+        );
     }
 
     #[test]
@@ -3195,6 +3207,14 @@ mod tests {
         assert!(command_text_is_unsafe("git \u{202e}status"));
         assert!(command_text_is_unsafe("git \u{fffd}status"));
         assert!(command_text_is_unsafe("git\nstatus"));
+    }
+
+    #[test]
+    fn clipboard_multiline_is_unsafe_allows_newlines_and_rejects_spoofing() {
+        assert!(!clipboard_multiline_is_unsafe("ok\nline\t2\r"));
+        assert!(clipboard_multiline_is_unsafe("ok\u{202e}"));
+        assert!(clipboard_multiline_is_unsafe("ok\u{fffd}"));
+        assert!(clipboard_multiline_is_unsafe("ok\u{1b}"));
     }
 
     #[test]

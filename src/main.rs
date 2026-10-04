@@ -11353,6 +11353,14 @@ impl Frost {
             .get(self.active)
             .and_then(|s| s.terminal.last_command_output_text());
         match text {
+            Some(text) if crate::block_mode::clipboard_multiline_is_unsafe(&text) => {
+                self.push_toast(
+                    "Last output not copied: it contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Task::none()
+            }
             Some(text) => {
                 let n = text.chars().count();
                 self.push_toast(
@@ -11733,6 +11741,14 @@ impl Frost {
             }
         };
         match text {
+            Some(text) if crate::block_mode::clipboard_multiline_is_unsafe(&text) => {
+                self.push_toast(
+                    "Output not copied: it contains control or visual-spoofing characters"
+                        .to_string(),
+                    ToastKind::Warning,
+                );
+                Task::none()
+            }
             Some(text) => {
                 let n = text.chars().count();
                 self.push_toast(
@@ -12251,6 +12267,20 @@ impl Frost {
             self.push_toast("Block is empty".to_string(), ToastKind::Info);
             return Task::none();
         };
+        if zone
+            .command
+            .as_deref()
+            .is_some_and(crate::block_mode::command_text_is_unsafe)
+            || output
+                .as_deref()
+                .is_some_and(crate::block_mode::clipboard_multiline_is_unsafe)
+        {
+            self.push_toast(
+                "Block not copied: it contains control or visual-spoofing characters".to_string(),
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
         self.push_toast("Copied block", ToastKind::Success);
         iced::clipboard::write(text)
     }

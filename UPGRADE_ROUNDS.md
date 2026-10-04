@@ -1690,3 +1690,7 @@ everywhere except a resize, and an audit against ember found the rest.
 319. **Block clipboard copy refuses spoofing** — copying selected block
      commands, output, or Markdown refuses visual spoofing and U+FFFD so they
      cannot reach the host clipboard.
+
+320. **Last/single block output copy refuses spoofing** — copying last command
+     output, a single block's output, or a whole block refuses visual spoofing
+     and U+FFFD so they cannot reach the host clipboard.
