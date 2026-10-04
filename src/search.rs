@@ -36,6 +36,10 @@ fn bound_query_text(query: impl Into<String>) -> String {
     query
 }
 
+fn find_query_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
 /// Compiled-regex cache slot. Held by `SearchState` so consecutive
 /// `recompute_search` calls with the same pattern reuse the same `Regex`
 /// instead of paying a fresh `RegexBuilder::build()` per keypress / PTY chunk.
@@ -321,6 +325,14 @@ impl SearchEngine {
     ) -> (Vec<SearchMatch>, Option<String>) {
         if query.is_empty() {
             return (Vec::new(), None);
+        }
+        if find_query_is_unsafe(query) {
+            return (
+                Vec::new(),
+                Some(crate::review_text::bound_query_error(
+                    "Query contains control or visual-spoofing characters",
+                )),
+            );
         }
 
         if use_regex {
@@ -905,5 +917,13 @@ mod tests {
         assert!(!state.query.contains('\u{202e}'));
         assert!(state.query.contains('\u{fffd}'));
         assert!(state.query.starts_with("err"));
+        let mut row = vec![TerminalCell::default(); 8];
+        for (index, character) in "error".chars().enumerate() {
+            row[index].character = character;
+        }
+        let mut cache = None;
+        let (matches, error) = SearchEngine::search(&[row], &state.query, false, true, &mut cache);
+        assert!(matches.is_empty());
+        assert!(error.is_some_and(|message| message.contains("visual-spoofing")));
     }
 }

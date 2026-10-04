@@ -1753,3 +1753,7 @@ everywhere except a resize, and an audit against ember found the rest.
 335. **Block search query refuses spoofing** — cross-block search refuses a query
      that still contains visual spoofing or U+FFFD so a neutralized paste cannot
      scan command history.
+
+336. **Find query refuses spoofing** — terminal find refuses a query that still
+     contains visual spoofing or U+FFFD so a neutralized paste cannot scan
+     scrollback.

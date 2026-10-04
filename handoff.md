@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 336 — Find query refuses spoofing)
+
+## 2026-10-04 (upgrade round 336)
+
+- Terminal find refuses a query that still contains visual spoofing or U+FFFD so a neutralized paste cannot scan scrollback.
+- `cargo test --locked --bin frost -- search::tests::query_drops_controls_and_truncates_on_a_char_boundary` passed.
+
 Updated: 2026-10-04 (upgrade round 335 — Block search query refuses spoofing)
 
 ## 2026-10-04 (upgrade round 335)
