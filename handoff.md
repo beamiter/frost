@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 363 — Files-panel filter refuses spoofing)
+
+## 2026-10-04 (upgrade round 363)
+
+- The files-panel name filter does not keep a query that still contains visual spoofing or U+FFFD, so a neutralized paste cannot reveal a tree path.
+- `cargo test --locked --bin frost -- sidebar::tests::sidebar_filter_drops_controls_and_truncates_on_a_char_boundary tests::filter_match_set_keeps_matches_and_ancestors` passed.
+
 Updated: 2026-10-04 (upgrade round 362 — AI chats library search refuses spoofing)
 
 ## 2026-10-04 (upgrade round 362)

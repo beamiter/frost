@@ -14833,7 +14833,8 @@ impl Frost {
             }
             Message::SidebarFilterInput(query) => {
                 self.invalidate_sidebar_remote_follow_intent();
-                self.sidebar_filter = Some(crate::sidebar::bound_sidebar_filter(query));
+                self.sidebar_filter = crate::sidebar::accepted_sidebar_filter(query)
+                    .or_else(|| self.sidebar_filter.clone());
             }
             Message::FileDropped(path) => {
                 // Over the files panel a drop is an import; everywhere else it

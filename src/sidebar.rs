@@ -59,6 +59,19 @@ pub fn bound_sidebar_filter(query: impl Into<String>) -> String {
     query
 }
 
+pub fn sidebar_filter_is_unsafe(query: &str) -> bool {
+    query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(query)
+}
+
+pub fn accepted_sidebar_filter(query: impl Into<String>) -> Option<String> {
+    let query = bound_sidebar_filter(query);
+    if sidebar_filter_is_unsafe(&query) {
+        None
+    } else {
+        Some(query)
+    }
+}
+
 /// Files-panel status/error chrome: interpolated names and backend errors
 /// must not restyle the tree or grow without bound.
 pub const MAX_SIDEBAR_NOTICE_BYTES: usize = 192;
@@ -3236,6 +3249,11 @@ mod tests {
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));
         assert!(spoofed.starts_with("src"));
+        assert!(accepted_sidebar_filter("src\u{202e}/lib").is_none());
+        assert_eq!(
+            accepted_sidebar_filter("src/lib").as_deref(),
+            Some("src/lib")
+        );
     }
 
     #[test]
