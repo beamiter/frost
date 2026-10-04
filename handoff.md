@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 346 — Kitty protocol errors refuse U+FFFD)
+
+## 2026-10-04 (upgrade round 346)
+
+- Kitty graphics protocol error replies omit neutralized text so U+FFFD or visual spoofing cannot leave through an APC-G response.
+- `cargo test --locked --bin frost -- kitty_graphics::tests::protocol_error_text_strips_controls_and_visual_spoofing` passed.
+
 Updated: 2026-10-04 (upgrade round 345 — OSC titles refuse U+FFFD)
 
 ## 2026-10-04 (upgrade round 345)

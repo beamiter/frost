@@ -722,7 +722,13 @@ impl KittyGraphicsState {
             Some(_) if target.quiet >= 2 => return,
             Some(failure) => {
                 let message = bound_protocol_message(&failure.message);
-                format!("{}:{message}", failure.code)
+                if message.contains('\u{fffd}')
+                    || jterm_core::review_input::contains_visual_spoofing(&message)
+                {
+                    failure.code.to_string()
+                } else {
+                    format!("{}:{message}", failure.code)
+                }
             }
         };
         let response = format!("\x1b_G{fields};{body}\x1b\\");
@@ -1362,5 +1368,12 @@ mod tests {
             bound_protocol_message(&format!("{}z", "x".repeat(MAX_RESPONSE_MESSAGE_CHARS)));
         assert_eq!(overflow.chars().count(), MAX_RESPONSE_MESSAGE_CHARS);
         assert!(!overflow.contains('z'));
+        let mut state = KittyGraphicsState::new();
+        state.reject_graphics_payload(b"Ga=q,i=7", "failed \u{202e}png");
+        let response = String::from_utf8(state.take_responses()).expect("responses are UTF-8");
+        assert!(response.contains("EINVAL"));
+        assert!(!response.contains('\u{fffd}'));
+        assert!(!response.contains('\u{202e}'));
+        assert!(!response.contains("failed"));
     }
 }
