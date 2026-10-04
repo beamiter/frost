@@ -1503,6 +1503,10 @@ pub fn bounded_block_search_query(query: String) -> String {
 pub fn validated_block_search_query(query: &str) -> Result<&str, BlockSearchQueryError> {
     if query.len() > BLOCK_SEARCH_QUERY_MAX_BYTES {
         Err(BlockSearchQueryError::TooLong)
+    } else if query.contains('\u{fffd}')
+        || jterm_core::review_input::contains_visual_spoofing(query)
+    {
+        Err(BlockSearchQueryError::Unsafe)
     } else {
         Ok(query.trim())
     }
@@ -1555,6 +1559,7 @@ impl BlockSearchScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockSearchQueryError {
     TooLong,
+    Unsafe,
     InvalidRegex(String),
 }
 
@@ -1565,6 +1570,10 @@ impl std::fmt::Display for BlockSearchQueryError {
                 formatter,
                 "Query is too long (maximum {} bytes)",
                 BLOCK_SEARCH_QUERY_MAX_BYTES
+            ),
+            Self::Unsafe => write!(
+                formatter,
+                "Query contains control or visual-spoofing characters"
             ),
             Self::InvalidRegex(error) => write!(formatter, "Invalid regular expression: {error}"),
         }
@@ -3752,10 +3761,11 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("invalid regex"),
         };
+        assert_eq!(hostile, BlockSearchQueryError::Unsafe);
         let shown = hostile.to_string();
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         let oversized = "x".repeat(BLOCK_SEARCH_QUERY_MAX_BYTES + 1);
         assert!(matches!(
             search_blocks_with_options(
@@ -3799,6 +3809,10 @@ mod tests {
         assert_eq!(spoofed, "cargo\u{fffd} test");
         assert!(!spoofed.contains('\u{202e}'));
         assert!(!spoofed.contains('\u{1b}'));
+        assert_eq!(
+            validated_block_search_query(&spoofed),
+            Err(BlockSearchQueryError::Unsafe)
+        );
     }
 
     #[test]

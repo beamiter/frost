@@ -1749,3 +1749,7 @@ everywhere except a resize, and an audit against ember found the rest.
 
 334. **API key files refuse U+FFFD** — reading or writing an API key file refuses
      U+FFFD so a neutralized credential cannot be stored or loaded.
+
+335. **Block search query refuses spoofing** — cross-block search refuses a query
+     that still contains visual spoofing or U+FFFD so a neutralized paste cannot
+     scan command history.

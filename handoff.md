@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 335 — Block search query refuses spoofing)
+
+## 2026-10-04 (upgrade round 335)
+
+- Cross-block search refuses a query that still contains visual spoofing or U+FFFD so a neutralized paste cannot scan command history.
+- `cargo test --locked --bin frost -- block_mode::tests::invalid_or_oversized_regex_is_not_a_false_empty_result` passed.
+
 Updated: 2026-10-04 (upgrade round 334 — API key files refuse U+FFFD)
 
 ## 2026-10-04 (upgrade round 334)
