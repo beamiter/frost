@@ -95,6 +95,14 @@ impl SearchReplacePanelState {
 
     /// 对给定文本执行替换，更新状态行，返回替换后的文本（失败返回 `None`）。
     pub fn apply(&mut self, text: &str) -> Option<String> {
+        if replacement_output_is_unsafe(&self.search_input)
+            || replacement_output_is_unsafe(&self.replace_input)
+        {
+            self.status = crate::review_text::bound_query_error(
+                "find or replace contains control or visual-spoofing characters",
+            );
+            return None;
+        }
         match SearchAndReplaceEngine::search_and_replace(
             text,
             &self.search_input,
@@ -263,6 +271,8 @@ mod tests {
         panel.set_replace_input("ok\u{202e}");
         assert!(!panel.replace_input.contains('\u{202e}'));
         assert!(panel.replace_input.contains('\u{fffd}'));
+        assert_eq!(panel.apply("error"), None);
+        assert!(panel.status.contains("visual-spoofing"));
     }
 
     #[test]

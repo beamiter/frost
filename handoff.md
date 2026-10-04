@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 337 — Find & Replace fields refuse spoofing)
+
+## 2026-10-04 (upgrade round 337)
+
+- Find & Replace refuses to run when the find or replace field still contains visual spoofing or U+FFFD so a neutralized paste cannot rewrite a selection.
+- `cargo test --locked --bin frost -- search_replace_panel::tests::find_and_replace_fields_drop_controls_and_truncate` passed.
+
 Updated: 2026-10-04 (upgrade round 336 — Find query refuses spoofing)
 
 ## 2026-10-04 (upgrade round 336)
