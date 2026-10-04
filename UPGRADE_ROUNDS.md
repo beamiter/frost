@@ -1801,3 +1801,7 @@ everywhere except a resize, and an audit against ember found the rest.
 347. **Image drops refuse U+FFFD** — dropped image paths that still contain
      U+FFFD are refused so a neutralized filename cannot be typed at the
      prompt.
+
+348. **Correction draft refuses spoofing** — the command-correction card does
+     not save a draft that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot become the insert/run command.

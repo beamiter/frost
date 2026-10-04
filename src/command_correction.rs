@@ -167,7 +167,15 @@ impl CorrectionSession {
         let Some(proposal) = self.proposal.as_mut() else {
             return;
         };
-        *proposal.draft_mut() = bound_correction_draft(draft);
+        let draft = bound_correction_draft(draft);
+        if correction_line_is_unsafe(&draft) {
+            proposal.set_feedback(Some(
+                "draft contains control or visual-spoofing characters and was not saved"
+                    .to_string(),
+            ));
+            return;
+        }
+        *proposal.draft_mut() = draft;
         proposal.set_feedback(None);
     }
 }
@@ -451,6 +459,24 @@ mod tests {
         assert!(!spoofed.contains('\u{202e}'));
         assert!(spoofed.contains('\u{fffd}'));
         assert!(spoofed.starts_with("git "));
+        let mut registry = CorrectionRegistry::default();
+        let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
+        let (generation, _) = registry
+            .begin(1, "git statu".to_string(), 1, deadline)
+            .expect("begin");
+        assert!(registry.present(1, generation, candidate()));
+        let session = registry.get_mut(1).expect("session");
+        session.set_draft("git \u{202e}status".into());
+        assert_eq!(
+            session.proposal.as_ref().expect("proposal").draft(),
+            "git status"
+        );
+        assert!(session
+            .proposal
+            .as_ref()
+            .expect("proposal")
+            .feedback()
+            .is_some_and(|text| text.contains("not saved")));
     }
 
     /// The verified branch — the one frost could not reach hermetically

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 348 — Correction draft refuses spoofing)
+
+## 2026-10-04 (upgrade round 348)
+
+- The command-correction card does not save a draft that still contains visual spoofing or U+FFFD, so a neutralized paste cannot become the insert/run command.
+- `cargo test --locked --bin frost -- command_correction::tests::the_card_draft_drops_controls_and_stays_inside_the_engine_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 347 — Image drops refuse U+FFFD)
 
 ## 2026-10-04 (upgrade round 347)
