@@ -1742,3 +1742,7 @@ everywhere except a resize, and an audit against ember found the rest.
 332. **Git diff cwd refuses spoofing** — opening a Tasks Git diff refuses a
      worktree cwd that still contains visual spoofing or U+FFFD so Git is not
      spawned on a neutralized path.
+
+333. **Failed-block Agent eligibility refuses spoofing** — creating a Fix/Explain
+     Agent or Tasks job from a failed block refuses a command or cwd that still
+     contains visual spoofing or U+FFFD.

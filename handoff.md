@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 333 — Failed-block Agent eligibility refuses spoofing)
+
+## 2026-10-04 (upgrade round 333)
+
+- Creating a Fix/Explain Agent or Tasks job from a failed block refuses a command or cwd that still contains visual spoofing or U+FFFD.
+- `cargo test --locked --bin frost -- block_mode::tests::agent_eligibility_rejects_truncated_blank_oversized_and_cwdless` passed.
+
 Updated: 2026-10-04 (upgrade round 332 — Git diff cwd refuses spoofing)
 
 ## 2026-10-04 (upgrade round 332)

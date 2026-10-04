@@ -1388,8 +1388,18 @@ pub fn failed_block_agent_disabled_reason(
     if command.len() > FAILED_BLOCK_COMMAND_MAX_BYTES {
         return Some("the command exceeds the Agent context limit");
     }
+    if command_text_is_unsafe(command) {
+        return Some("the command contains control or visual-spoofing characters");
+    }
     if cwd.is_none_or(|cwd| cwd.trim().is_empty()) {
         return Some("the command working directory is unavailable");
+    }
+    if cwd.is_some_and(|cwd| {
+        cwd.contains('\u{fffd}')
+            || cwd.chars().any(char::is_control)
+            || jterm_core::review_input::contains_visual_spoofing(cwd)
+    }) {
+        return Some("the command working directory contains control or visual-spoofing characters");
     }
     None
 }
@@ -4084,6 +4094,22 @@ mod tests {
         assert_eq!(
             failed_block_agent_disabled_reason(Some("cargo test"), false, Some("  ")),
             Some("the command working directory is unavailable")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo \u{202e}test"), false, Some("/work")),
+            Some("the command contains control or visual-spoofing characters")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo test\u{fffd}"), false, Some("/work")),
+            Some("the command contains control or visual-spoofing characters")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo test"), false, Some("/work\u{202e}")),
+            Some("the command working directory contains control or visual-spoofing characters")
+        );
+        assert_eq!(
+            failed_block_agent_disabled_reason(Some("cargo test"), false, Some("/work\u{fffd}")),
+            Some("the command working directory contains control or visual-spoofing characters")
         );
     }
 
