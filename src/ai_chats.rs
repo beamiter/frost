@@ -625,13 +625,14 @@ impl AiChatsUi {
     /// 80-char/256-byte bounds). The iced field is truncated to the same
     /// envelope first so a paste cannot sit unbounded next to the store.
     pub(crate) fn rename(&mut self, title: String) {
-        self.title_draft = bound_title_draft(title);
-        if chat_payload_is_unsafe(&self.title_draft) {
+        let title = bound_title_draft(title);
+        if chat_payload_is_unsafe(&title) {
             self.set_notice(
                 "Title contains control or visual-spoofing characters and was not saved.",
             );
             return;
         }
+        self.title_draft = title;
         if self.store.rename_active(&self.title_draft) {
             self.dirty = true;
         }
@@ -1278,9 +1279,11 @@ mod tests {
         assert!(panel.title_draft.chars().count() <= MAX_TITLE_DRAFT_CHARS);
         assert!(panel.title_draft.is_char_boundary(panel.title_draft.len()));
         assert!(!panel.title_draft.contains('z'));
+        panel.rename("keep me".into());
         panel.rename("ok\u{200b}title".into());
+        assert_eq!(panel.title_draft, "keep me");
         assert!(!panel.title_draft.contains('\u{200b}'));
-        assert!(panel.title_draft.contains('\u{fffd}'));
+        assert!(!panel.title_draft.contains('\u{fffd}'));
         assert!(!panel.store.active_title().contains('\u{fffd}'));
         assert!(panel.notice.contains("not saved"));
         let listed = bound_title_draft(format!("chat \u{202e}{}", "t".repeat(400)));

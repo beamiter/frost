@@ -1821,3 +1821,7 @@ everywhere except a resize, and an audit against ember found the rest.
 352. **AI chats composer refuses spoofing** — the AI chats composer does not
      save a message that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot become the next turn.
+
+353. **AI chat rename draft refuses spoofing** — the AI chats rename editor
+     does not keep a title that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot become the saved name.

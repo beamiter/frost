@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 353 — AI chat rename draft refuses spoofing)
+
+## 2026-10-04 (upgrade round 353)
+
+- The AI chats rename editor does not keep a title that still contains visual spoofing or U+FFFD, so a neutralized paste cannot become the saved name.
+- `cargo test --locked --bin frost -- ai_chats::tests::rename_draft_drops_controls_and_stays_inside_the_store_title_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 352 — AI chats composer refuses spoofing)
 
 ## 2026-10-04 (upgrade round 352)
