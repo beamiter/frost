@@ -1817,3 +1817,7 @@ everywhere except a resize, and an audit against ember found the rest.
 351. **Tasks follow-up refuses spoofing** — the Tasks follow-up composer does
      not save a message that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot become the next native turn.
+
+352. **AI chats composer refuses spoofing** — the AI chats composer does not
+     save a message that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot become the next turn.

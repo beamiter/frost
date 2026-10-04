@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 352 — AI chats composer refuses spoofing)
+
+## 2026-10-04 (upgrade round 352)
+
+- The AI chats composer does not save a message that still contains visual spoofing or U+FFFD, so a neutralized paste cannot become the next turn.
+- `cargo test --locked --bin frost -- ai_chats::tests::composer_keeps_newlines_and_matches_the_live_message_envelope` passed.
+
 Updated: 2026-10-04 (upgrade round 351 — Tasks follow-up refuses spoofing)
 
 ## 2026-10-04 (upgrade round 351)

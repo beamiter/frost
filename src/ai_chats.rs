@@ -314,7 +314,14 @@ impl AiChatsUi {
     }
 
     pub(crate) fn set_draft(&mut self, draft: String) {
-        if self.store.set_active_draft(bound_chat_draft(draft)) {
+        let draft = bound_chat_draft(draft);
+        if chat_payload_is_unsafe(&draft) {
+            self.set_notice(
+                "Message contains control or visual-spoofing characters and was not saved.",
+            );
+            return;
+        }
+        if self.store.set_active_draft(draft) {
             self.dirty = true;
         }
     }
@@ -1308,13 +1315,12 @@ mod tests {
             .active_draft()
             .is_char_boundary(panel.store.active_draft().len()));
         assert!(!panel.store.active_draft().contains('z'));
+        panel.set_draft("keep me".into());
         panel.set_draft("please\n\u{202e}fix".into());
+        assert_eq!(panel.store.active_draft(), "keep me");
         assert!(!panel.store.active_draft().contains('\u{202e}'));
-        assert!(panel.store.active_draft().contains('\u{fffd}'));
-        assert!(panel.store.active_draft().starts_with("please\n"));
-        assert!(panel.submit(&ai_config()).is_none());
-        assert!(panel.store.active_draft().contains('\u{fffd}'));
-        assert!(panel.notice.contains("not sent"));
+        assert!(!panel.store.active_draft().contains('\u{fffd}'));
+        assert!(panel.notice.contains("not saved"));
         assert!(panel.store.active_history().is_empty());
     }
 
