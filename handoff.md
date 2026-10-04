@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (upgrade round 378 — AI temperature draft refuses spoofing)
+
+## 2026-10-04 (upgrade round 378)
+
+- The settings temperature field does not keep a draft that still contains visual spoofing or U+FFFD, so a neutralized paste cannot sit as a sampling value.
+- `cargo test --offline --bin frost -- live_temperature_draft_drops_controls_and_stays_short` passed.
+
 Updated: 2026-10-04 (upgrade round 377 — font family setting refuses spoofing)
 
 ## 2026-10-04 (upgrade round 377)

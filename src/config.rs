@@ -1028,6 +1028,10 @@ pub(crate) fn bound_ai_temperature_draft(raw: impl Into<String>) -> String {
     bound_config_text(raw, MAX_AI_TEMPERATURE_DRAFT_BYTES)
 }
 
+pub(crate) fn accepted_ai_temperature_draft(raw: impl Into<String>) -> Option<String> {
+    accepted_config_text(raw, MAX_AI_TEMPERATURE_DRAFT_BYTES)
+}
+
 fn validate_remote_host_text(value: &str, field: &str, max_bytes: usize) -> Result<(), String> {
     if value.len() > max_bytes {
         return Err(format!("{field} exceeds the {max_bytes}-byte limit"));
@@ -1420,6 +1424,8 @@ mod tests {
         assert!(overflow.len() <= MAX_AI_TEMPERATURE_DRAFT_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));
+        assert!(accepted_ai_temperature_draft("0.7\u{202e}").is_none());
+        assert_eq!(accepted_ai_temperature_draft("0.7").as_deref(), Some("0.7"));
     }
 
     #[test]

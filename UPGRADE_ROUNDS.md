@@ -1921,3 +1921,7 @@ everywhere except a resize, and an audit against ember found the rest.
 377. **Font family setting refuses spoofing** — the settings font-family field
      does not keep a family that still contains visual spoofing or U+FFFD, so a
      neutralized paste cannot sit as the terminal typeface.
+
+378. **AI temperature draft refuses spoofing** — the settings temperature field
+     does not keep a draft that still contains visual spoofing or U+FFFD, so a
+     neutralized paste cannot sit as a sampling value.

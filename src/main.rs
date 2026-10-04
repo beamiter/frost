@@ -13362,14 +13362,15 @@ impl Frost {
             }
             Message::SetAiTemperature(raw) => {
                 // Keep the raw editing text; only a valid value reaches config.
-                let raw = crate::config::bound_ai_temperature_draft(raw);
-                self.config.ai_temperature = raw
-                    .trim()
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
-                self.ai_temperature_draft = raw;
-                self.config_dirty = true;
+                if let Some(raw) = crate::config::accepted_ai_temperature_draft(raw) {
+                    self.config.ai_temperature = raw
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
+                    self.ai_temperature_draft = raw;
+                    self.config_dirty = true;
+                }
             }
             Message::SetAiRedactSecrets(redact) => {
                 self.config.ai_redact_secrets = redact;
