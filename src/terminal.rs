@@ -4511,8 +4511,10 @@ impl TerminalState {
                     // ember decodes the bare key the same way, and shells
                     // that send `cwd` unencoded with a literal `%` are the
                     // ones off-contract.
-                    metadata_cwd = Self::decode_osc_metadata(raw, MAX_OSC133_CWD_BYTES)
-                        .filter(|cwd| is_valid_jsh_cwd(cwd) && !Self::osc_metadata_is_ambiguous(cwd));
+                    metadata_cwd =
+                        Self::decode_osc_metadata(raw, MAX_OSC133_CWD_BYTES).filter(|cwd| {
+                            is_valid_jsh_cwd(cwd) && !Self::osc_metadata_is_ambiguous(cwd)
+                        });
                 }
                 "duration" | "duration_ms" => {
                     if std::mem::replace(&mut seen_duration, true) {
@@ -5218,14 +5220,12 @@ impl TerminalState {
     /// (OSC 7 itself only rejects NUL — a path with, say, a newline is still
     /// openable).
     fn control_free_osc7_cwd(&self) -> Option<String> {
-        self.current_working_dir
-            .clone()
-            .filter(|cwd| {
-                !cwd.chars().any(|character| {
-                    character.is_control()
-                        || jterm_core::review_input::is_visual_spoofing_character(character)
-                })
+        self.current_working_dir.clone().filter(|cwd| {
+            !cwd.chars().any(|character| {
+                character.is_control()
+                    || jterm_core::review_input::is_visual_spoofing_character(character)
             })
+        })
     }
 
     /// Close out a lifecycle whose command really ran (`C` fired) but whose
@@ -6400,7 +6400,11 @@ impl TerminalState {
     }
 
     fn handle_osc_5522(&mut self, metadata: &str, _payload: Option<&str>) {
-        crate::debug_log!("[OSC5522] metadata={} payload={:?}", metadata, _payload);
+        crate::debug_log!(
+            "[OSC5522] metadata={} payload_bytes={}",
+            crate::debug::format_bytes(metadata.as_bytes()),
+            _payload.map_or(0, str::len)
+        );
 
         let mut message_type = None;
         let mut mime = None;
@@ -13835,15 +13839,15 @@ mod tests {
         terminal.process_input(b"\x1b]133;D;0\x07");
         assert_eq!(terminal.command_zones[3].cwd.as_deref(), Some("/srv"));
 
-        // An OSC 7 path smuggling a control character (OSC 7 itself only
-        // rejects NUL) is refused at zone finalization: every zone cwd is
-        // control-free, whatever its source.
+        // Invalid OSC 7 updates leave the last valid directory intact. Every
+        // subsequent zone inherits that safe directory, never the bad value.
         terminal.process_input(b"\x1b]7;file://localhost/tmp%0Aevil\x07");
+        assert_eq!(terminal.current_working_dir(), Some("/srv"));
         terminal.process_input(b"\x1b]133;A\x07$ ");
         terminal.process_input(b"\x1b]133;B\x07ls\r\n");
         terminal.process_input(b"\x1b]133;C\x07f\r\n");
         terminal.process_input(b"\x1b]133;D;0\x07");
-        assert_eq!(terminal.command_zones[4].cwd, None);
+        assert_eq!(terminal.command_zones[4].cwd.as_deref(), Some("/srv"));
     }
 
     #[test]
@@ -18292,11 +18296,7 @@ mod tests {
         assert!(terminal.take_clipboard_read_requests().is_empty());
 
         terminal.process_input(
-            format!(
-                "\x1b]5522;type=read:mime={}\x1b\\",
-                encode("text/plain")
-            )
-            .as_bytes(),
+            format!("\x1b]5522;type=read:mime={}\x1b\\", encode("text/plain")).as_bytes(),
         );
         let requests = terminal.take_clipboard_read_requests();
         assert_eq!(requests.len(), 1);

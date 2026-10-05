@@ -170,9 +170,9 @@ fn io_error(operation: &str, path: &Path, error: impl fmt::Display) -> AtomicWri
     AtomicWriteError::Io(format!("{operation} {}: {error}", path.display()))
 }
 
-/// Read one regular file into an exact, bounded revision. A nonblocking open
-/// keeps a malicious FIFO at a config path from freezing the UI thread.
-pub fn read_revision(path: &Path, max_bytes: u64) -> io::Result<FileRevision> {
+/// Open a private regular file without following the final symlink or blocking
+/// on a substituted FIFO. Validate ownership and mode on the opened descriptor.
+fn open_private_read(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -180,13 +180,7 @@ pub fn read_revision(path: &Path, max_bytes: u64) -> io::Result<FileRevision> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(FileRevision::Missing);
-        }
-        Err(error) => return Err(error),
-    };
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -218,6 +212,19 @@ pub fn read_revision(path: &Path, max_bytes: u64) -> io::Result<FileRevision> {
             ));
         }
     }
+    Ok(file)
+}
+
+/// Read one regular file into an exact, bounded revision.
+pub fn read_revision(path: &Path, max_bytes: u64) -> io::Result<FileRevision> {
+    let file = match open_private_read(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(FileRevision::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
     if metadata.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -234,6 +241,40 @@ pub fn read_revision(path: &Path, max_bytes: u64) -> io::Result<FileRevision> {
         ));
     }
     Ok(FileRevision::from_bytes(&bytes))
+}
+
+/// Read complete JSONL records from a bounded tail using the same descriptor
+/// checks as private snapshots. One extra boundary byte distinguishes a
+/// complete first record from a fragment; an in-flight final append is omitted.
+pub(crate) fn read_jsonl_tail(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, bool)> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = open_private_read(path)?;
+    let file_len = file.metadata()?.len();
+    let start = file_len.saturating_sub(max_bytes);
+    let read_start = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(read_start))?;
+    let mut tail = Vec::new();
+    file.take(file_len - read_start).read_to_end(&mut tail)?;
+    let content_start = usize::from(start > 0);
+    let boundary = start == 0 || tail.first() == Some(&b'\n');
+    let first_complete = if boundary {
+        content_start
+    } else {
+        tail.get(content_start..)
+            .and_then(|content| content.iter().position(|&byte| byte == b'\n'))
+            .map_or(tail.len(), |newline| content_start + newline + 1)
+    };
+    let end = tail
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if first_complete >= end {
+        tail.clear();
+    } else {
+        tail.truncate(end);
+        tail.drain(..first_complete);
+    }
+    Ok((tail, start > 0))
 }
 
 /// Read a bounded UTF-8 persistence file through the same no-follow,

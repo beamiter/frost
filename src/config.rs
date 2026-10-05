@@ -1024,10 +1024,6 @@ pub(crate) fn accepted_config_text(value: impl Into<String>, max_bytes: usize) -
 /// not discarded, but never hold a paste larger than a numeric literal.
 pub(crate) const MAX_AI_TEMPERATURE_DRAFT_BYTES: usize = 32;
 
-pub(crate) fn bound_ai_temperature_draft(raw: impl Into<String>) -> String {
-    bound_config_text(raw, MAX_AI_TEMPERATURE_DRAFT_BYTES)
-}
-
 pub(crate) fn accepted_ai_temperature_draft(raw: impl Into<String>) -> Option<String> {
     accepted_config_text(raw, MAX_AI_TEMPERATURE_DRAFT_BYTES)
 }
@@ -1414,13 +1410,22 @@ mod tests {
 
     #[test]
     fn live_temperature_draft_drops_controls_and_stays_short() {
-        assert_eq!(bound_ai_temperature_draft("0.\n\u{1b}7"), "0.7");
-        let filled =
-            bound_ai_temperature_draft(format!("{}y", "1".repeat(MAX_AI_TEMPERATURE_DRAFT_BYTES)));
+        assert_eq!(
+            accepted_ai_temperature_draft("0.\n\u{1b}7").as_deref(),
+            Some("0.7")
+        );
+        let filled = accepted_ai_temperature_draft(format!(
+            "{}y",
+            "1".repeat(MAX_AI_TEMPERATURE_DRAFT_BYTES)
+        ))
+        .unwrap();
         assert_eq!(filled.len(), MAX_AI_TEMPERATURE_DRAFT_BYTES);
         assert!(!filled.contains('y'));
-        let overflow =
-            bound_ai_temperature_draft(format!("{}z", "界".repeat(MAX_AI_TEMPERATURE_DRAFT_BYTES)));
+        let overflow = accepted_ai_temperature_draft(format!(
+            "{}z",
+            "界".repeat(MAX_AI_TEMPERATURE_DRAFT_BYTES)
+        ))
+        .unwrap();
         assert!(overflow.len() <= MAX_AI_TEMPERATURE_DRAFT_BYTES);
         assert!(overflow.is_char_boundary(overflow.len()));
         assert!(!overflow.contains('z'));

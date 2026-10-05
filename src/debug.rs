@@ -11,6 +11,7 @@ pub fn enabled() -> bool {
     })
 }
 
+#[cfg(any(debug_assertions, test))]
 pub fn format_bytes(bytes: &[u8]) -> String {
     const MAX_BYTES: usize = 96;
 

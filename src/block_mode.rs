@@ -1399,7 +1399,9 @@ pub fn failed_block_agent_disabled_reason(
             || cwd.chars().any(char::is_control)
             || jterm_core::review_input::contains_visual_spoofing(cwd)
     }) {
-        return Some("the command working directory contains control or visual-spoofing characters");
+        return Some(
+            "the command working directory contains control or visual-spoofing characters",
+        );
     }
     None
 }
@@ -4170,7 +4172,8 @@ mod tests {
             Some("/work/app"),
         );
         assert_eq!(eligible, None);
-        // A trailing newline from capture is not "multiline".
+        // Replay preserves the exact reviewed command, so even a trailing
+        // newline fails the shared control-character gate.
         assert_eq!(
             retry_replay_disabled_reason(
                 Some("cargo test\n"),
@@ -4179,7 +4182,7 @@ mod tests {
                 Some("/work/app"),
                 Some("/work/app"),
             ),
-            None
+            Some("the command contains control or visual-spoofing characters")
         );
         assert_eq!(
             retry_replay_disabled_reason(
@@ -4189,7 +4192,7 @@ mod tests {
                 Some("/work/app"),
                 Some("/work/app"),
             ),
-            Some("replay is disabled for multiline commands")
+            Some("the command contains control or visual-spoofing characters")
         );
         assert_eq!(
             retry_replay_disabled_reason(

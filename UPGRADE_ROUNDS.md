@@ -1960,3 +1960,49 @@ everywhere except a resize, and an audit against ember found the rest.
 387. **Files-panel notices omit spoofing** — files-panel status chrome drops
      U+FFFD leftover from neutralized spoofing, so a replacement character
      cannot sit next to the tree.
+
+History recall improvements continue with rounds 388–393:
+
+388. **Directory and exit-status filters** — the persisted-history picker
+     snapshots the invoking pane's cwd and combines exact-directory matching
+     with All/Success/Failed filters, before applying the visible-result cap.
+     Missing or unsafe cwd disables the directory filter. Mouse chips and
+     Ctrl+D / Ctrl+O share the same selection-resetting state transitions.
+
+389. **Review-only duplicate folding** — Unique / Ctrl+U keeps the newest
+     matching execution per command+cwd after the status filter, so later
+     success cannot hide earlier failure. Folding never mutates the history
+     snapshot or its shared JSONL file; Reset restores the unfiltered query.
+
+390. **Cached history matching** — immutable record indices are computed on
+     query/filter changes and reused for drawing, arrow navigation and Enter.
+     Rejected or unchanged queries preserve the cache and current selection.
+     Fuzzy ties retain newest-first order, and matches beyond the 15-row cap
+     remain available through a narrower query or filter.
+
+391. **Explicit result counts and empty states** — the picker shows displayed
+     rows, matching total and recent-record count; an empty filtered result
+     suggests adjusting/resetting filters rather than claiming no history.
+     A scrollable result list leaves filters and keyboard hints accessible.
+
+392. **Execution-preserving history snapshot** — the picker reads complete
+     raw JSONL records from a 4 MiB tail, up to 2,000 executions, instead of
+     the core reader's command-only deduplication. Incomplete head/tail records
+     and unsafe commands are omitted, older records outside either bound are
+     explicitly marked, and reads reuse the no-follow, nonblocking,
+     owner/single-link descriptor checks of private persistence. Disk-backed
+     regression coverage proves a newer success cannot erase an older failed
+     execution or a command's distinct cwd.
+
+393. **Restored strict quality gates** — five failures reproduced on the
+     original commit are aligned with the current safe-display, exact-replay
+     and last-good-cwd contracts. Test helpers leave production builds,
+     obsolete hardcoded color defaults are removed, and existing formatting
+     and Clippy findings are corrected. OSC 5522 debug logging now uses the
+     bounded byte preview and records only the payload length.
+
+Verification for rounds 388–393: formatting, warnings-denied Clippy and
+rustdoc, all 985 tests, and the locked release build pass. An isolated X11
+window verifies combined directory/status/unique filtering, mouse Reset,
+keyboard selection scrolling and command insertion at an OSC 133 prompt;
+the inserted sentinel command remains unexecuted.

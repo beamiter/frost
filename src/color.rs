@@ -59,7 +59,8 @@ fn named_ansi_iced(
 
 /// Resolve a foreground color using the theme palette, with VTE4-compatible
 /// bold-brightening and dim attenuation.
-pub fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> IColor {
+#[cfg(test)]
+fn resolve_fg(color: Color, theme: &Theme, bold: bool, dim: bool) -> IColor {
     resolve_fg_with_palette(color, theme, None, bold, dim)
 }
 
@@ -80,7 +81,8 @@ pub fn resolve_fg_with_palette(
 }
 
 /// Resolve a background color using the theme palette.
-pub fn resolve_bg(color: Color, theme: &Theme) -> IColor {
+#[cfg(test)]
+fn resolve_bg(color: Color, theme: &Theme) -> IColor {
     resolve_bg_with_palette(color, theme, None)
 }
 
@@ -126,17 +128,6 @@ pub fn color_256(idx: u8, theme: &Theme, palette: Option<&DynamicColorPalette>) 
             let gray = 8 + (idx - 232) * 10;
             IColor::from_rgb8(gray, gray, gray)
         }
-    }
-}
-
-pub mod defaults {
-    use iced::Color;
-
-    pub const FOREGROUND: Color = Color::from_rgb(229.0 / 255.0, 229.0 / 255.0, 229.0 / 255.0);
-    pub const BACKGROUND: Color = Color::from_rgb(29.0 / 255.0, 29.0 / 255.0, 29.0 / 255.0);
-    pub const CURSOR: Color = Color::from_rgb(127.0 / 255.0, 127.0 / 255.0, 127.0 / 255.0);
-    pub fn selection() -> Color {
-        Color::from_rgba(200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0, 100.0 / 255.0)
     }
 }
 
@@ -262,9 +253,5 @@ mod tests {
             resolve_bg(Color::Blue, &theme),
             resolve_bg_with_palette(Color::Blue, &theme, None)
         );
-        let _ = defaults::FOREGROUND;
-        let _ = defaults::BACKGROUND;
-        let _ = defaults::CURSOR;
-        let _ = defaults::selection();
     }
 }

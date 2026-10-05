@@ -226,13 +226,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_invalid_regex_does_not_echo_controls_from_the_pattern() {
+    fn unsafe_pattern_is_rejected_before_regex_compilation() {
         let mut panel = SearchReplacePanelState::new();
         panel.search_input = "(\u{1b}[31m\u{202e}".to_string();
         panel.config.use_regex = true;
 
         assert_eq!(panel.apply("text"), None);
-        assert!(panel.status.contains("Invalid regex"), "{}", panel.status);
+        assert_eq!(
+            panel.status,
+            "find or replace contains control or visual-spoofing characters"
+        );
         assert!(!panel.status.contains('\u{1b}'));
         assert!(!panel.status.contains('\u{202e}'));
         assert!(panel.status.len() <= crate::review_text::MAX_REGEX_ERROR_BYTES);

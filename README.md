@@ -71,7 +71,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
 该徽标锚定在运行卡片**当前可见的顶部行**，命令输出滚过一屏后仍然可见并继续走秒；
 完成块的徽标在行尾空白不足时会逐级缩短（依次舍去完成时刻、生命周期文字、耗时、信号名），
 而不是整条消失，任何缩短形式都保留结果字形，非健康生命周期保留 `~` 标记；支持块选择、右键动作、书签、失败/慢命令/Background 筛选、复制/回填、多块 Markdown、整会话 Markdown/JSON 导出与跨块搜索，历史修剪后已捕获的块输出仍可搜索和复制
-- 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；Enter 只把选中命令回填到提示符，不自动执行
+- 持久化命令历史与模糊选择器（`Ctrl+Shift+H`）：完成的命令连同目录、退出码写入与 anvil/forge 同格式的 JSONL 索引（从不保存输出），跨重启召回；可组合当前目录、成功/失败筛选与重复命令折叠，显示匹配总数；Enter 只把选中命令回填到提示符，不自动执行
 - 参数化 workflow（`Ctrl+Shift+M`，或命令面板的 **Workflows** 动作）：从 `~/.config/frost/workflows/`、`FROST_WORKFLOW_DIR`、XDG 数据目录与内置示例（`scripts/workflows/`）加载与 anvil/ember/forge **同一份** TOML/YAML 模板库（自 2026-08-29 起四个终端共用 `jterm_core::workflows` 这一份加载/校验/渲染实现，因此同一个文件在哪个终端里打开都是同一个意思），同名时靠前的目录优先；带参数的模板先弹出逐参数表单（声明了 `default` 的参数预填该默认值，每行的 **Reset** 可恢复该默认值），渲染结果只回填到提示符供人工审阅，绝不自动执行；**文件里没有声明 `default` 的参数不再被当作空串**——留空（或只填空白）时 Insert 会拒绝并提示 `missing values: <参数名>`，这些行在按下 Insert 之前就带 `(required)` 标记，详见下方“workflow 参数的必填约定”；命令经共享 review-only 边界校验，拒绝控制字符与视觉欺骗字符，文件大小/数量均有上限，符号链接与特殊文件直接拒绝
 - 持久化 AI Chats（`Ctrl+Shift+Alt+A`，或命令面板的 **AI Chats** 动作）跨重启保存会话；命令面板的 **Ask AI: Generate Command** 可把自然语言请求生成可编辑的命令草稿，经过提示符与输入安全门后只回填供人工审阅，绝不自动执行
 - 长命令完成桌面通知：OSC 133 计时超过阈值（默认 10 秒）且命令不在正被注视的 pane（窗口失焦或非活动 pane）时提醒
@@ -282,6 +282,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | 仅复制所选命令块的输出 | `Alt+复制快捷键`（默认 `Ctrl+Alt+Shift+C`；显式绑定优先；可见终端文本选区优先） |
 | 搜索全部回滚 | `Ctrl+Shift+F` |
+| 召回持久化命令历史 | `Ctrl+Shift+H`（浮层内 `Ctrl+D` 切换当前目录、`Ctrl+O` 循环全部/成功/失败、`Ctrl+U` 折叠重复命令；Enter 只回填） |
 | 查找替换（选中文本） | `Ctrl+Alt+R`（替换结果进剪贴板或回填提示符，从不改写 scrollback） |
 | 上/下一个命令提示符 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓`（需 shell 发送 OSC 133 集成序列） |
 | 复制上一条命令输出 | `Ctrl+Shift+G`（同样依赖 OSC 133） |
@@ -426,6 +427,22 @@ JSON 使用版本化的 `frost.block-session` v1 envelope，记录 pane session�
 块顺序和截断/淘汰汇总，后续字段演进不再依赖无版本裸数组。
 
 快捷键从 `$XDG_CONFIG_HOME/frost/keybindings.toml`（通常是 `~/.config/frost/keybindings.toml`）加载，并与默认绑定合并。chord 语法与 jterm 家族共享（来自 `jterm_core`）：修饰键顺序任意，接受 `control`、`option`、`cmd`/`command`/`win`/`meta` 等修饰键别名，以及 `enter`/`return`、`esc`/`escape`、`arrowleft`/`left`、`page_up`/`pageup` 等按键别名；`ctrl++` 表示加号本身（也可写 `ctrl+plus`），`\` 可写作 `backslash`，非 ASCII 按键按 Unicode 大小写折叠匹配。
+
+## 历史命令召回
+
+`Ctrl+Shift+H` 或命令面板的 **Command History** 打开历史选择器。输入可模糊匹配命令与目录，
+空查询按最近执行顺序排列。**This directory**（`Ctrl+D`）只保留与打开浮层时的当前目录完全
+相同的记录，不包括子目录或缺少目录信息的记录；当前目录不可用时按钮禁用。**All / Success /
+Failed**（`Ctrl+O` 循环）按退出码筛选，0 为成功，非零为失败。
+
+**Unique**（`Ctrl+U`）将同一命令、同一目录的重复记录折叠为最新的一次匹配执行；它在状态筛选
+之后生效，因此失败视图仍会保留较早的失败，即使后来同一命令成功了。默认不启用筛选或折叠，
+**Reset** 同时清空查询并恢复默认。这些操作只改变浮层展示，不修改历史文件。
+
+选择器从文件末尾最多 4 MiB 读取最近最多 2,000 条完整执行记录，一次显示最多 15 条，并显示
+筛选后的匹配总数；近期窗口里未显示的匹配可通过收窄查询或筛选召回。达到读取上限时会标记
+**older entries not loaded**，窗口之外的记录不参与此次检索。查询或筛选变化时才重新计算匹配，绘制和方向键导航复用结果。
+`↑` / `↓` 选择，Enter 或点击回填完整命令供审阅，Esc 关闭；回填不会自动执行。
 
 ## Workflow 模板
 

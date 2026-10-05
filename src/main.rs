@@ -853,6 +853,8 @@ static TAB_SWITCHER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-tab-switcher-input"));
 static HISTORY_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-input"));
+static HISTORY_PICKER_LIST_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-history-picker-list"));
 static WORKFLOW_PICKER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-workflow-picker-input"));
 /// The first argument input of the workflow form; Tab/Shift+Tab traverse the
@@ -1172,7 +1174,8 @@ impl TabSwitcherState {
             }
             query.truncate(end);
         }
-        if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(&query) {
+        if query.contains('\u{fffd}') || jterm_core::review_input::contains_visual_spoofing(&query)
+        {
             return;
         }
         self.query = query;
@@ -3457,6 +3460,8 @@ enum Message {
     TabSwitcherJump(usize),
     /// Filter text changed in the history picker.
     HistoryPickerInput(String),
+    /// Change the persisted-history filters and reset the highlighted row.
+    HistoryPickerFilter(history_picker::HistoryFilterAction),
     /// Cancel the history picker overlay.
     HistoryPickerClose,
     /// Type the clicked command into the active pane's prompt (and close).
@@ -4069,9 +4074,9 @@ impl Session {
         // Only substitute at a component boundary: `/home/user2` merely shares
         // a prefix with `/home/user` and is a different directory.
         match cwd.strip_prefix(home.as_ref()) {
-            Some(rest) if rest.starts_with('/') => {
-                Some(session_persistence::bound_tab_title_draft(format!("~{rest}")))
-            }
+            Some(rest) if rest.starts_with('/') => Some(
+                session_persistence::bound_tab_title_draft(format!("~{rest}")),
+            ),
             _ => Some(session_persistence::bound_tab_title_draft(cwd)),
         }
     }
@@ -5880,11 +5885,17 @@ impl Frost {
 
     fn begin_sidebar_path_edit(&mut self) -> Task<Message> {
         let Some(path) = self.sidebar.current_dir.to_str().map(ToOwned::to_owned) else {
-            self.set_sidebar_notice("This path is not valid UTF-8 and cannot be edited safely".to_string(), false);
+            self.set_sidebar_notice(
+                "This path is not valid UTF-8 and cannot be edited safely".to_string(),
+                false,
+            );
             return Task::none();
         };
         if sidebar::validate_absolute_navigation_path(&path).is_err() {
-            self.set_sidebar_notice("This path contains characters that cannot be edited safely".to_string(), false);
+            self.set_sidebar_notice(
+                "This path contains characters that cannot be edited safely".to_string(),
+                false,
+            );
             return Task::none();
         }
         self.sidebar_path_input = Some(path);
@@ -6005,7 +6016,10 @@ impl Frost {
     ) -> Task<Message> {
         self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(menu.generation) {
-            self.set_sidebar_notice("Files changed; reopen the menu before modifying anything".to_string(), false);
+            self.set_sidebar_notice(
+                "Files changed; reopen the menu before modifying anything".to_string(),
+                false,
+            );
             return Task::none();
         }
         let target_dir = if menu.is_dir {
@@ -6067,8 +6081,11 @@ impl Frost {
             SidebarMenuAction::Copy | SidebarMenuAction::Cut => {
                 let Some(next_id) = next_sidebar_clipboard_id(self.sidebar_next_clipboard_id)
                 else {
-                    self.set_sidebar_notice("Files clipboard identity exhausted; restart Frost before copying again"
-                            .to_string(), false);
+                    self.set_sidebar_notice(
+                        "Files clipboard identity exhausted; restart Frost before copying again"
+                            .to_string(),
+                        false,
+                    );
                     return Task::none();
                 };
                 self.sidebar_next_clipboard_id = next_id;
@@ -6103,7 +6120,10 @@ impl Frost {
                     .as_ref()
                     .map(|clipboard| clipboard.id);
                 if !sidebar_menu_clipboard_is_current(menu.clipboard_id, live_clipboard_id) {
-                    self.set_sidebar_notice("Files clipboard changed; reopen the menu before pasting".to_string(), false);
+                    self.set_sidebar_notice(
+                        "Files clipboard changed; reopen the menu before pasting".to_string(),
+                        false,
+                    );
                     return Task::none();
                 }
                 let Some(clipboard) = self.sidebar_clipboard.clone() else {
@@ -6117,8 +6137,11 @@ impl Frost {
                     }
                 };
                 let Some(context_epoch) = self.sidebar_context_epoch else {
-                    self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
-                            .to_string(), false);
+                    self.set_sidebar_notice(
+                        "Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(),
+                        false,
+                    );
                     return Task::none();
                 };
                 // Cross-location transfers can run long: give them a progress
@@ -6190,7 +6213,10 @@ impl Frost {
         self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(dialog.generation) {
             self.sidebar_dialog = None;
-            self.set_sidebar_notice("Files changed; reopen the action before modifying anything".to_string(), false);
+            self.set_sidebar_notice(
+                "Files changed; reopen the action before modifying anything".to_string(),
+                false,
+            );
             return Task::none();
         }
         if let Err(problem) = remote_fs::validate_new_name(&dialog.input) {
@@ -6200,8 +6226,11 @@ impl Frost {
             return Task::none();
         }
         let Some(context_epoch) = self.sidebar_context_epoch else {
-            self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
-                    .to_string(), false);
+            self.set_sidebar_notice(
+                "Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(),
+                false,
+            );
             return Task::none();
         };
         self.sidebar_dialog = None;
@@ -6317,7 +6346,10 @@ impl Frost {
         };
         self.invalidate_sidebar_remote_follow_intent();
         if !self.sidebar.accepts_generation(confirmation.generation) {
-            self.set_sidebar_notice("Files changed; select the items again before deleting".to_string(), false);
+            self.set_sidebar_notice(
+                "Files changed; select the items again before deleting".to_string(),
+                false,
+            );
             return Task::none();
         }
         let paths = confirmation.paths;
@@ -6328,8 +6360,11 @@ impl Frost {
             }
         }
         let Some(context_epoch) = self.sidebar_context_epoch else {
-            self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
-                    .to_string(), false);
+            self.set_sidebar_notice(
+                "Files operation identity exhausted; restart Frost before modifying files"
+                    .to_string(),
+                false,
+            );
             return Task::none();
         };
         let consumed_clipboard_id = sidebar_clipboard_id_at_location(
@@ -6671,7 +6706,8 @@ impl Frost {
             Err(error) => {
                 let message = error.to_string();
                 log::error!("[PTY] {message}");
-                self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                self.session_diagnostic =
+                    Some(crate::review_text::bound_diagnostic_text(message.clone()));
                 self.push_toast(message, ToastKind::Warning);
             }
         }
@@ -7169,7 +7205,8 @@ impl Frost {
                     Err(error) => {
                         let message = error.to_string();
                         log::error!("[PTY] {message}");
-                        self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                        self.session_diagnostic =
+                            Some(crate::review_text::bound_diagnostic_text(message.clone()));
                         self.push_toast(message, ToastKind::Warning);
                     }
                 }
@@ -7793,7 +7830,8 @@ impl Frost {
             Err(error) => {
                 let message = error.to_string();
                 log::error!("[PTY] {message}");
-                self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                self.session_diagnostic =
+                    Some(crate::review_text::bound_diagnostic_text(message.clone()));
                 self.push_toast(message, ToastKind::Warning);
             }
         }
@@ -8614,7 +8652,13 @@ impl Frost {
             );
             return Task::none();
         };
-        self.history_picker = Some(history_picker::HistoryPickerState::load(&path));
+        let cwd = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| session.cwd());
+        let mut state = history_picker::HistoryPickerState::load(&path);
+        state.set_current_directory(cwd);
+        self.history_picker = Some(state);
         iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone())
     }
 
@@ -10069,6 +10113,22 @@ impl Frost {
             return Some(Task::none());
         }
         let state = self.history_picker.as_mut()?;
+        if mods == keyboard::Modifiers::CTRL {
+            if let Key::Character(character) = key {
+                let action = match character.to_ascii_lowercase().as_str() {
+                    "d" => Some(history_picker::HistoryFilterAction::ToggleDirectory),
+                    "o" => Some(history_picker::HistoryFilterAction::SetStatus(
+                        state.status().next(),
+                    )),
+                    "u" => Some(history_picker::HistoryFilterAction::ToggleUnique),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    state.apply_filter(action);
+                    return Some(self.history_picker_snap_task());
+                }
+            }
+        }
         match key {
             Key::Named(Named::Escape) => {
                 self.history_picker = None;
@@ -10084,27 +10144,43 @@ impl Frost {
             }
             Key::Named(Named::ArrowDown) => {
                 state.select_next();
-                return Some(Task::none());
+                return Some(self.history_picker_snap_task());
             }
             Key::Named(Named::ArrowUp) => {
                 state.select_prev();
-                return Some(Task::none());
+                return Some(self.history_picker_snap_task());
             }
             Key::Named(Named::Backspace) => {
                 state.backspace();
-                return Some(Task::none());
+                return Some(self.history_picker_snap_task());
             }
             _ => {}
         }
         if !mods.control() && !mods.alt() {
             if let Some(t) = text {
                 if state.push_query_text(t) {
-                    return Some(Task::none());
+                    return Some(self.history_picker_snap_task());
                 }
             }
         }
         // Swallow all other keys while the overlay owns the keyboard.
         Some(Task::none())
+    }
+
+    fn history_picker_snap_task(&self) -> Task<Message> {
+        let Some(state) = self.history_picker.as_ref() else {
+            return Task::none();
+        };
+        let len = state.filtered().len();
+        let y = if len <= 1 {
+            0.0
+        } else {
+            state.selected.min(len - 1) as f32 / (len - 1) as f32
+        };
+        iced::widget::operation::snap_to(
+            HISTORY_PICKER_LIST_ID.clone(),
+            iced::widget::operation::RelativeOffset { x: 0.0, y },
+        )
     }
 
     /// Open the workflow picker over the current search path
@@ -12699,13 +12775,13 @@ impl Frost {
                 // above, so the pending slot is cleared either way and a
                 // refused write cannot be replayed by a later allowed one.
                 if let Some(text) = clip_set {
-                    if self.config.allow_remote_clipboard_write {
-                        if admit_osc52_clipboard_write(
+                    if self.config.allow_remote_clipboard_write
+                        && admit_osc52_clipboard_write(
                             &mut self.osc52_write_window_started,
                             &mut self.osc52_writes_in_window,
-                        ) {
-                            tasks.push(iced::clipboard::write(text));
-                        }
+                        )
+                    {
+                        tasks.push(iced::clipboard::write(text));
                     }
                 }
                 for terminator in clip_queries {
@@ -12776,9 +12852,12 @@ impl Frost {
                             let sess = &mut self.sessions[index];
                             sess.clipboard_read_in_flight = false;
                             sess.osc5522_pending_refusals = None;
-                            sess.terminal.output_buffer.extend_from_slice(
-                                &osc_5522_packet("type=read:status=EBUSY", None),
-                            );
+                            sess.terminal
+                                .output_buffer
+                                .extend_from_slice(&osc_5522_packet(
+                                    "type=read:status=EBUSY",
+                                    None,
+                                ));
                         }
                     }
                     if let Some(index) = session_index {
@@ -13345,19 +13424,17 @@ impl Frost {
                 }
             }
             Message::SetAiModel(model) => {
-                if let Some(model) = crate::config::accepted_config_text(
-                    model,
-                    crate::config::MAX_CONFIG_NAME_BYTES,
-                ) {
+                if let Some(model) =
+                    crate::config::accepted_config_text(model, crate::config::MAX_CONFIG_NAME_BYTES)
+                {
                     self.config.ai_model = model;
                     self.config_dirty = true;
                 }
             }
             Message::SetAiBaseUrl(url) => {
-                if let Some(url) = crate::config::accepted_config_text(
-                    url,
-                    crate::config::MAX_CONFIG_VALUE_BYTES,
-                ) {
+                if let Some(url) =
+                    crate::config::accepted_config_text(url, crate::config::MAX_CONFIG_VALUE_BYTES)
+                {
                     self.config.ai_base_url = url;
                     self.config_dirty = true;
                 }
@@ -13405,10 +13482,9 @@ impl Frost {
             }
             Message::SetAiKeyFile(path) => {
                 // Keep the raw editing text; only fully-blank clears the key.
-                if let Some(path) = crate::config::accepted_config_text(
-                    path,
-                    crate::config::MAX_CONFIG_VALUE_BYTES,
-                ) {
+                if let Some(path) =
+                    crate::config::accepted_config_text(path, crate::config::MAX_CONFIG_VALUE_BYTES)
+                {
                     self.config.ai_api_key_file = Some(path).filter(|p| !p.trim().is_empty());
                     self.config_dirty = true;
                 }
@@ -14629,17 +14705,23 @@ impl Frost {
                     self.sidebar_notice = None;
                 } else if outcome == SidebarLoadApply::NavigationFailed {
                     if let Some(failure) = self.sidebar.navigation_failure() {
-                        self.set_sidebar_notice(format!(
+                        self.set_sidebar_notice(
+                            format!(
                                 "Could not open folder: {}. Current files were kept.",
                                 failure.error
-                            ), false);
+                            ),
+                            false,
+                        );
                     }
                 }
                 return self.dispatch_sidebar_scans();
             }
             Message::SidebarSetLocation(hosts_epoch, location) => {
                 if hosts_epoch != self.sidebar_hosts_epoch {
-                    self.set_sidebar_notice("Remote profiles changed; choose the destination again".to_string(), false);
+                    self.set_sidebar_notice(
+                        "Remote profiles changed; choose the destination again".to_string(),
+                        false,
+                    );
                     return Task::none();
                 }
                 if location != self.sidebar.location {
@@ -14668,10 +14750,13 @@ impl Frost {
                     return self.queue_sidebar_load(request);
                 }
                 if let Some(failure) = self.sidebar.navigation_failure() {
-                    self.set_sidebar_notice(format!(
+                    self.set_sidebar_notice(
+                        format!(
                             "Could not open location: {}. Current files were kept.",
                             failure.error
-                        ), false);
+                        ),
+                        false,
+                    );
                 }
             }
             Message::SidebarRemoteFollowResolved(token, start) => {
@@ -14690,7 +14775,10 @@ impl Frost {
             Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
             Message::SidebarRowClick(generation, path, is_dir) => {
                 if !self.sidebar.accepts_generation(generation) {
-                    self.set_sidebar_notice("Files changed; select the item again".to_string(), false);
+                    self.set_sidebar_notice(
+                        "Files changed; select the item again".to_string(),
+                        false,
+                    );
                     return Task::none();
                 }
                 return self.sidebar_row_click(path, is_dir);
@@ -14945,8 +15033,11 @@ impl Frost {
                     return Task::none();
                 }
                 let Some(context_epoch) = self.sidebar_context_epoch else {
-                    self.set_sidebar_notice("Files operation identity exhausted; restart Frost before modifying files"
-                            .to_string(), false);
+                    self.set_sidebar_notice(
+                        "Files operation identity exhausted; restart Frost before modifying files"
+                            .to_string(),
+                        false,
+                    );
                     return Task::none();
                 };
                 let total_items = plan.items.len();
@@ -14989,7 +15080,7 @@ impl Frost {
                 {
                     let target = self
                         .sidebar_drop_target()
-                        .map(|dir| crate::sidebar::bound_sidebar_path_label(dir))
+                        .map(crate::sidebar::bound_sidebar_path_label)
                         .unwrap_or_else(|| {
                             crate::sidebar::bound_sidebar_path_label(&self.sidebar.current_dir)
                         });
@@ -15110,10 +15201,9 @@ impl Frost {
                 }
             }
             Message::SetTheme(name) => {
-                if let Some(name) = crate::config::accepted_config_text(
-                    name,
-                    crate::config::MAX_CONFIG_NAME_BYTES,
-                ) {
+                if let Some(name) =
+                    crate::config::accepted_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES)
+                {
                     self.config.theme = name;
                     self.config_dirty = true;
                     self.apply_config();
@@ -15157,10 +15247,9 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetFontFamily(name) => {
-                if let Some(name) = crate::config::accepted_config_text(
-                    name,
-                    crate::config::MAX_CONFIG_NAME_BYTES,
-                ) {
+                if let Some(name) =
+                    crate::config::accepted_config_text(name, crate::config::MAX_CONFIG_NAME_BYTES)
+                {
                     self.config.font_family = name;
                     self.config_dirty = true;
                     self.apply_config();
@@ -15263,12 +15352,17 @@ impl Frost {
                     if let Err(message) = crate::theme::validate_saved_custom_theme_name(&name) {
                         ed.error = Some(crate::theme::bound_theme_editor_error(message));
                     } else if Theme::is_builtin(&name) {
-                        ed.error = Some(crate::theme::bound_theme_editor_error("Name collides with a builtin theme".to_string()));
+                        ed.error = Some(crate::theme::bound_theme_editor_error(
+                            "Name collides with a builtin theme".to_string(),
+                        ));
                     } else if let Some(bad) =
                         ed.hexes.iter().position(|h| Theme::hex_to_rgb(h).is_none())
                     {
                         let labels = Theme::editable_color_labels();
-                        ed.error = Some(crate::theme::bound_theme_editor_error(format!("Invalid hex for {}", labels[bad])));
+                        ed.error = Some(crate::theme::bound_theme_editor_error(format!(
+                            "Invalid hex for {}",
+                            labels[bad]
+                        )));
                     } else {
                         let mut theme = ed.base.clone();
                         theme.name = name.clone();
@@ -15288,7 +15382,8 @@ impl Frost {
                             }
                             Err(e) => {
                                 let msg = format!("Save failed: {}", e);
-                                ed.error = Some(crate::theme::bound_theme_editor_error(msg.clone()));
+                                ed.error =
+                                    Some(crate::theme::bound_theme_editor_error(msg.clone()));
                                 save_error = Some(msg);
                             }
                         }
@@ -15724,6 +15819,16 @@ impl Frost {
                 if let Some(s) = self.history_picker.as_mut() {
                     s.set_query(q);
                 }
+                return self.history_picker_snap_task();
+            }
+            Message::HistoryPickerFilter(action) => {
+                if let Some(state) = self.history_picker.as_mut() {
+                    state.apply_filter(action);
+                }
+                return Task::batch([
+                    self.history_picker_snap_task(),
+                    iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone()),
+                ]);
             }
             Message::HistoryPickerAccept(command) => {
                 self.history_picker = None;
@@ -16610,9 +16715,9 @@ impl Frost {
             text(crate::sidebar::bound_sidebar_notice(
                 state.path.display().to_string(),
             ))
-                .size(11)
-                .wrapping(text::Wrapping::Word)
-                .style(text::secondary),
+            .size(11)
+            .wrapping(text::Wrapping::Word)
+            .style(text::secondary),
             text_input(placeholder, &state.input)
                 .id(SIDEBAR_DIALOG_INPUT_ID.clone())
                 .on_input(Message::SidebarDialogInput)
@@ -17147,11 +17252,12 @@ impl Frost {
         } else {
             for (pos, workflow) in filtered.iter().enumerate() {
                 let selected = pos == state.selected();
-                let mut info = row![
-                    text(crate::workflow_picker::bound_workflow_feedback(&workflow.name)).size(13)
-                ]
-                    .spacing(10)
-                    .align_y(iced::Alignment::Center);
+                let mut info = row![text(crate::workflow_picker::bound_workflow_feedback(
+                    &workflow.name
+                ))
+                .size(13)]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
                 if !workflow.args.is_empty() {
                     info = info.push(
                         text(format!("{} args", workflow.args.len()))
@@ -17173,8 +17279,8 @@ impl Frost {
                         text(crate::workflow_picker::bound_workflow_feedback(
                             workflow.description.clone(),
                         ))
-                            .size(11)
-                            .style(text::secondary),
+                        .size(11)
+                        .style(text::secondary),
                     );
                 }
                 let accent = self.c_accent();
@@ -17242,9 +17348,9 @@ impl Frost {
                 text(crate::workflow_picker::bound_workflow_feedback(
                     form.workflow().description.clone(),
                 ))
-                    .size(12)
-                    .wrapping(text::Wrapping::Word)
-                    .style(text::secondary),
+                .size(12)
+                .wrapping(text::Wrapping::Word)
+                .style(text::secondary),
             );
         }
         card = card.push(
@@ -17333,7 +17439,7 @@ impl Frost {
     ) -> Element<'_, Message> {
         let filtered = state.filtered();
 
-        let query: Element<'_, Message> = text_input("Recall a command…", &state.query)
+        let query: Element<'_, Message> = text_input("Recall a command…", state.query())
             .id(HISTORY_PICKER_INPUT_ID.clone())
             .on_input(Message::HistoryPickerInput)
             .size(14)
@@ -17342,22 +17448,97 @@ impl Frost {
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
+        use history_picker::{HistoryFilterAction as Filter, HistoryStatus};
+        let directory = tooltip(
+            button(text("This directory").size(11))
+                .on_press_maybe(
+                    state
+                        .current_directory()
+                        .map(|_| Message::HistoryPickerFilter(Filter::ToggleDirectory)),
+                )
+                .padding([3, 7])
+                .style(if state.directory_only() {
+                    button::primary
+                } else {
+                    button::secondary
+                }),
+            container(
+                text(match state.current_directory() {
+                    Some(cwd) => format!(
+                        "{} (Ctrl+D)",
+                        history_picker::display_cwd(&abbreviate_home(cwd))
+                    ),
+                    None => "Current directory unavailable".to_string(),
+                })
+                .size(11),
+            )
+            .padding(6)
+            .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        );
+        let status_button = |label: &str, status: HistoryStatus| {
+            button(text(label.to_string()).size(11))
+                .on_press(Message::HistoryPickerFilter(Filter::SetStatus(status)))
+                .padding([3, 7])
+                .style(if state.status() == status {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+        };
+        let unique = button(text("Unique").size(11))
+            .on_press(Message::HistoryPickerFilter(Filter::ToggleUnique))
+            .padding([3, 7])
+            .style(if state.unique() {
+                button::primary
+            } else {
+                button::secondary
+            });
+        let reset = button(text("Reset").size(11))
+            .on_press(Message::HistoryPickerFilter(Filter::Reset))
+            .padding([3, 7])
+            .style(button::secondary);
+        let filters = row![
+            directory,
+            status_button("All", HistoryStatus::All),
+            status_button("Success", HistoryStatus::Success),
+            status_button("Failed", HistoryStatus::Failed),
+            unique,
+            reset
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        let summary = text(format!(
+            "{} of {} matches · {} recent entries{}",
+            filtered.len(),
+            state.match_count(),
+            state.entry_count(),
+            if state.older_not_loaded() {
+                " · older entries not loaded"
+            } else {
+                ""
+            }
+        ))
+        .size(11)
+        .style(text::secondary);
+
         let mut list = column![].spacing(2);
         if filtered.is_empty() {
-            let hint = if state.query.is_empty() {
+            let hint = if state.entry_count() == 0 {
                 "No persisted commands yet (recorded via OSC 133 shell integration)"
             } else {
-                "No commands match"
+                "No commands match — adjust the query or reset the filters"
             };
             list = list.push(text(hint).size(13).style(text::secondary));
         } else {
             for (pos, record) in filtered.iter().enumerate() {
                 let selected = pos == state.selected;
-                let mut info =
-                    row![text(history_picker::display_command(&record.command)).size(13)]
-                        .spacing(10)
-                        .align_y(iced::Alignment::Center);
-                info = info.push(Space::new().width(Length::Fill));
+                let mut info = row![text(history_picker::display_command(&record.command))
+                    .size(13)
+                    .wrapping(text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)]
+                .spacing(10)
+                .align_y(iced::Alignment::Center);
                 if record.exit_code != 0 {
                     info = info.push(
                         text(format!("✗ {}", record.exit_code))
@@ -17365,14 +17546,26 @@ impl Frost {
                             .style(text::danger),
                     );
                 }
-                if let Some(cwd) = record.cwd.as_deref() {
-                    info = info.push(
-                        text(history_picker::display_cwd(&abbreviate_home(cwd))).size(12).style(text::secondary),
-                    );
-                }
+                let content: Element<'_, Message> = if let Some(cwd) = record.cwd.as_deref() {
+                    column![
+                        info,
+                        text(history_picker::display_cwd(&abbreviate_home(cwd)))
+                            .size(11)
+                            .width(Length::Fill)
+                            .shaping(text::Shaping::Advanced)
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                            .style(text::secondary),
+                    ]
+                    .spacing(1)
+                    .into()
+                } else {
+                    info.into()
+                };
                 let accent = self.c_accent();
-                let body = container(info).width(Length::Fill).padding([3, 8]).style(
-                    move |_t: &iced::Theme| container::Style {
+                let body = container(content)
+                    .width(Length::Fill)
+                    .padding([3, 8])
+                    .style(move |_t: &iced::Theme| container::Style {
                         background: if selected {
                             Some(iced::Background::Color(Color { a: 0.28, ..accent }))
                         } else {
@@ -17383,15 +17576,28 @@ impl Frost {
                             ..Default::default()
                         },
                         ..Default::default()
-                    },
-                );
+                    });
                 let row_btn =
                     mouse_area(body).on_press(Message::HistoryPickerAccept(record.command.clone()));
                 list = list.push(row_btn);
             }
         }
 
-        let body = column![query_line, list].spacing(8);
+        let keys =
+            text("↑/↓ select · Enter insert · Ctrl+D directory · Ctrl+O status · Ctrl+U unique")
+                .size(10)
+                .style(text::secondary);
+        let list_height = (filtered.len().max(1) as f32 * 44.0).min(300.0);
+        let body = column![
+            query_line,
+            filters,
+            summary,
+            scrollable(list)
+                .id(HISTORY_PICKER_LIST_ID.clone())
+                .height(Length::Fixed(list_height)),
+            keys
+        ]
+        .spacing(8);
         let panel = container(body)
             .width(Length::Fixed(560.0))
             .max_height(480.0)
@@ -19217,10 +19423,10 @@ impl Frost {
                         text(crate::sidebar::bound_sidebar_notice(format!(
                             "Refresh failed: {error}"
                         )))
-                            .size(11)
-                            .wrapping(text::Wrapping::Word)
-                            .width(Length::Fill)
-                            .style(text::danger),
+                        .size(11)
+                        .wrapping(text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .style(text::danger),
                         button(text("Retry").size(11))
                             .on_press(Message::SidebarRetry(
                                 self.sidebar.generation(),
@@ -19491,9 +19697,9 @@ impl Frost {
                     Some(age) => crate::sidebar::bound_sidebar_notice(format!(
                         "Refresh failed: {error} · {age}"
                     )),
-                    None => crate::sidebar::bound_sidebar_notice(format!(
-                        "Refresh failed: {error}"
-                    )),
+                    None => {
+                        crate::sidebar::bound_sidebar_notice(format!("Refresh failed: {error}"))
+                    }
                 }
             } else {
                 crate::sidebar::bound_sidebar_notice(error.to_string())
@@ -19710,9 +19916,8 @@ impl Frost {
         // cache (refreshed on the periodic tick and after command completion).
         if self.config.show_repo_strip {
             if let Some(meta) = sess.git_meta_cache.as_ref() {
-                let git = crate::review_text::bound_toast_text(
-                    jterm_core::git_meta::format_strip(meta),
-                );
+                let git =
+                    crate::review_text::bound_toast_text(jterm_core::git_meta::format_strip(meta));
                 line = line.push(text(git).size(11).color(blend(
                     self.c_text_dim(),
                     self.c_accent(),
@@ -19727,11 +19932,8 @@ impl Frost {
                     session_persistence::bound_tab_title_draft(command)
                 ))
                 .size(11)
-                .color(blend(
-                self.c_text_dim(),
-                self.c_accent(),
-                0.6,
-            )));
+                .color(blend(self.c_text_dim(), self.c_accent(), 0.6)),
+            );
         }
         // Held-open task transcript: the child exited, so the pane is
         // read-only. The chip mirrors the hint toast's wording.
@@ -20279,8 +20481,8 @@ impl Frost {
                 text(crate::review_text::bound_query_error(
                     self.search_replace.status.clone(),
                 ))
-                    .size(12)
-                    .style(text::secondary),
+                .size(12)
+                .style(text::secondary),
             );
         }
         body = body.push(
@@ -20393,7 +20595,9 @@ impl Frost {
                 .map(crate::theme::bound_custom_theme_name)
                 .filter(|name| !name.is_empty()),
         );
-        let current_theme = Some(crate::theme::bound_custom_theme_name(self.config.theme.clone()));
+        let current_theme = Some(crate::theme::bound_custom_theme_name(
+            self.config.theme.clone(),
+        ));
         let is_custom = !Theme::is_builtin(&self.config.theme);
 
         // Keep the modal inside the current window and switch to a stacked form
@@ -21099,7 +21303,11 @@ impl Frost {
         ]
         .spacing(12);
         if let Some(err) = &ed.error {
-            content = content.push(text(crate::theme::bound_theme_editor_error(err)).size(12).style(text::danger));
+            content = content.push(
+                text(crate::theme::bound_theme_editor_error(err))
+                    .size(12)
+                    .style(text::danger),
+            );
         }
         content = content.push(buttons);
 
@@ -21481,7 +21689,8 @@ impl Frost {
         let bound = self.agent.bound_session_id?;
         let Some(session_index) = self.sessions.iter().position(|session| session.id == bound)
         else {
-            self.agent.set_status("Agent session's terminal no longer exists".to_string());
+            self.agent
+                .set_status("Agent session's terminal no longer exists".to_string());
             return None;
         };
 
@@ -21489,11 +21698,13 @@ impl Frost {
         // gate therefore leaves the proposal pending and reviewable.
         let prompt_status = self.sessions[session_index].agent_prompt_status();
         if !prompt_status.is_ready() {
-            self.agent.set_status(prompt_status.blocked_message().to_string());
+            self.agent
+                .set_status(prompt_status.blocked_message().to_string());
             return None;
         }
         if !self.sessions[session_index].can_queue_user_bytes(MAX_AGENT_APPROVAL_PAYLOAD_BYTES) {
-            self.agent.set_status("Agent command not run: PTY input queue is full".to_string());
+            self.agent
+                .set_status("Agent command not run: PTY input queue is full".to_string());
             return None;
         }
 
@@ -21678,9 +21889,11 @@ impl Frost {
             match crate::command_correction::accept_correction(proposal) {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    proposal.set_feedback(Some(crate::command_correction::bound_correction_feedback(
-                        format!("Cannot accept correction: {error}"),
-                    )));
+                    proposal.set_feedback(Some(
+                        crate::command_correction::bound_correction_feedback(format!(
+                            "Cannot accept correction: {error}"
+                        )),
+                    ));
                     return Task::none();
                 }
             }
@@ -22318,7 +22531,8 @@ impl Frost {
             Err(error) => {
                 let message = error.to_string();
                 log::error!("[PTY] {message}");
-                self.session_diagnostic = Some(crate::review_text::bound_diagnostic_text(message.clone()));
+                self.session_diagnostic =
+                    Some(crate::review_text::bound_diagnostic_text(message.clone()));
                 self.push_toast(message, ToastKind::Warning);
             }
         }
@@ -22428,7 +22642,9 @@ impl Frost {
                         self.task_manager
                             .get(completion.task_id)
                             .map(|task| {
-                                crate::review_text::bound_provider_label(task.provider.display_name())
+                                crate::review_text::bound_provider_label(
+                                    task.provider.display_name(),
+                                )
                             })
                             .unwrap_or_else(|| "Agent".to_string())
                     ),
@@ -22700,9 +22916,14 @@ impl Frost {
                     button::secondary
                 };
                 providers = providers.push(
-                    button(text(crate::review_text::bound_provider_label(provider.display_name())).size(11))
-                        .style(style)
-                        .on_press(Message::TaskCreateWithProvider(provider)),
+                    button(
+                        text(crate::review_text::bound_provider_label(
+                            provider.display_name(),
+                        ))
+                        .size(11),
+                    )
+                    .style(style)
+                    .on_press(Message::TaskCreateWithProvider(provider)),
                 );
             }
             body = body.push(providers);
@@ -22819,8 +23040,8 @@ impl Frost {
                     "Native session: {:?}",
                     snapshot.phase
                 )))
-                    .size(11)
-                    .style(text::secondary),
+                .size(11)
+                .style(text::secondary),
             );
             if !snapshot.agent_text.is_empty() {
                 let truncated = if snapshot.agent_text_truncated {
@@ -22853,10 +23074,7 @@ impl Frost {
                     text(format!(
                         "$ {} · {}",
                         crate::review_text::visible_bounded(&command.command, 512),
-                        crate::review_text::visible_bounded(
-                            &command.status.to_string(),
-                            64
-                        )
+                        crate::review_text::visible_bounded(&command.status.to_string(), 64)
                     ))
                     .size(10)
                     .style(text::secondary),
@@ -23087,8 +23305,8 @@ impl Frost {
             diff_card = diff_card.push(
                 row![
                     text(self.task_panel.diff.display_requested_base())
-                    .size(10)
-                    .style(text::secondary),
+                        .size(10)
+                        .style(text::secondary),
                     Space::new().width(Length::Fill),
                     button(text("✕").size(10))
                         .style(button::secondary)
@@ -23152,34 +23370,28 @@ impl Frost {
         if let Some(session) = session {
             for (index, turn) in session.transcript().iter().enumerate() {
                 let element: Element<'_, Message> = match turn {
-                    AgentTurn::User(message) => {
-                        text(crate::agent::bound_transcript_text(format!("You: {message}")))
-                            .size(13)
-                            .into()
-                    }
-                    AgentTurn::AssistantThought(thought) => {
-                        text(crate::agent::bound_transcript_text(format!(
-                            "thought: {thought}"
-                        )))
-                        .size(12)
-                        .style(text::secondary)
-                        .into()
-                    }
-                    AgentTurn::AssistantSay(message) => {
-                        text(crate::agent::bound_transcript_text(format!(
-                            "Agent: {message}"
-                        )))
-                        .size(13)
-                        .into()
-                    }
-                    AgentTurn::ProtocolError(message) => {
-                        text(crate::agent::bound_transcript_text(format!(
-                            "protocol: {message}"
-                        )))
-                        .size(12)
-                        .style(text::danger)
-                        .into()
-                    }
+                    AgentTurn::User(message) => text(crate::agent::bound_transcript_text(format!(
+                        "You: {message}"
+                    )))
+                    .size(13)
+                    .into(),
+                    AgentTurn::AssistantThought(thought) => text(
+                        crate::agent::bound_transcript_text(format!("thought: {thought}")),
+                    )
+                    .size(12)
+                    .style(text::secondary)
+                    .into(),
+                    AgentTurn::AssistantSay(message) => text(crate::agent::bound_transcript_text(
+                        format!("Agent: {message}"),
+                    ))
+                    .size(13)
+                    .into(),
+                    AgentTurn::ProtocolError(message) => text(crate::agent::bound_transcript_text(
+                        format!("protocol: {message}"),
+                    ))
+                    .size(12)
+                    .style(text::danger)
+                    .into(),
                     AgentTurn::Observation {
                         exit_code,
                         output_sample,
@@ -23222,8 +23434,8 @@ impl Frost {
                                     "⚠ destructive: {}",
                                     crate::agent::bound_transcript_text(reason)
                                 ))
-                                    .size(12)
-                                    .style(text::danger),
+                                .size(12)
+                                .style(text::danger),
                             );
                         }
                         if let Some((edit_id, buffer)) = self
@@ -23330,8 +23542,8 @@ impl Frost {
                         text(crate::agent::bound_transcript_text(format!(
                             "thought: {thought}"
                         )))
-                            .size(12)
-                            .style(text::secondary),
+                        .size(12)
+                        .style(text::secondary),
                     );
                 }
                 if let Some(command) = &preview.command {
@@ -23339,8 +23551,8 @@ impl Frost {
                         text(crate::agent::bound_transcript_text(format!(
                             "proposing: {command}"
                         )))
-                            .size(13)
-                            .font(iced::Font::MONOSPACE),
+                        .size(13)
+                        .font(iced::Font::MONOSPACE),
                     );
                 }
                 if let Some(message) = &preview.message {
@@ -23422,8 +23634,8 @@ impl Frost {
                         "attached context: `{}` ({status})",
                         crate::agent::bound_attached_context_cmd(context.cmd.clone())
                     ))
-                        .size(10)
-                        .style(text::secondary),
+                    .size(10)
+                    .style(text::secondary),
                     button(text("✕").size(10))
                         .style(button::secondary)
                         .padding(2)
@@ -23530,8 +23742,8 @@ impl Frost {
             text(crate::command_correction::bound_correction_feedback(
                 candidate.display_badge(session.exit_code)
             ))
-                .size(11)
-                .style(text::secondary),
+            .size(11)
+            .style(text::secondary),
             button(text("✕").size(12))
                 .style(button::secondary)
                 .on_press(Message::CommandCorrectionDismiss),
@@ -23546,9 +23758,9 @@ impl Frost {
         let description = text(crate::command_correction::bound_correction_feedback(
             candidate.display_description(&session.original_command),
         ))
-            .size(12)
-            .wrapping(text::Wrapping::Word)
-            .style(text::secondary);
+        .size(12)
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
 
         let draft = text_input("corrected command", proposal.draft())
             .id(CORRECTION_INPUT_ID.clone())
@@ -23590,8 +23802,8 @@ impl Frost {
                     "⚠ destructive: {}",
                     crate::command_correction::bound_correction_feedback(reason)
                 ))
-                    .size(12)
-                    .style(text::danger),
+                .size(12)
+                .style(text::danger),
             );
         }
         card = card.push(draft).push(actions);
@@ -23600,9 +23812,11 @@ impl Frost {
         // one of the strings that lands here.
         if let Some(feedback) = proposal.feedback() {
             card = card.push(
-                text(crate::command_correction::bound_correction_feedback(feedback))
-                    .size(11)
-                    .style(text::danger),
+                text(crate::command_correction::bound_correction_feedback(
+                    feedback,
+                ))
+                .size(11)
+                .style(text::danger),
             );
         }
 
@@ -23728,9 +23942,9 @@ impl Frost {
                             .size(13)
                             .wrapping(text::Wrapping::Word),
                     )
-                        .padding(6)
-                        .style(container::bordered_box)
-                        .width(Length::Fill),
+                    .padding(6)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
                 ]
                 .spacing(2),
             );
@@ -23748,9 +23962,9 @@ impl Frost {
                             .size(13)
                             .wrapping(text::Wrapping::Word),
                     )
-                        .padding(6)
-                        .style(container::bordered_box)
-                        .width(Length::Fill),
+                    .padding(6)
+                    .style(container::bordered_box)
+                    .width(Length::Fill),
                 ]
                 .spacing(2),
             );
@@ -23933,8 +24147,8 @@ impl Frost {
                 "{} · review only",
                 crate::review_text::bound_provider_label(&session.provider)
             ))
-                .size(11)
-                .style(text::secondary),
+            .size(11)
+            .style(text::secondary),
             button(text("✕").size(12))
                 .style(button::secondary)
                 .on_press(Message::AiSuggestionDismiss),
@@ -25941,10 +26155,8 @@ mod tests {
 
     #[test]
     fn block_menu_preview_strips_command_and_cwd_spoofing() {
-        let preview = history_picker::display_command(&format!(
-            "ls \u{1b}[31m\u{202e}{}",
-            "n".repeat(400)
-        ));
+        let preview =
+            history_picker::display_command(&format!("ls \u{1b}[31m\u{202e}{}", "n".repeat(400)));
         assert!(!preview.contains('\u{1b}'));
         assert!(!preview.contains('\u{202e}'));
         assert!(preview.starts_with("ls "));
@@ -25973,14 +26185,26 @@ mod tests {
         let mut pending = None;
         let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
         assert_eq!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, false, request()),
+            service_osc5522_read(
+                &mut terminal,
+                &mut in_flight,
+                &mut pending,
+                true,
+                false,
+                request()
+            ),
             Some("text/plain".to_string())
         );
         // Permission is revoked while the host read is still outstanding.
-        assert!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, false, false, request())
-                .is_none()
-        );
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            false,
+            false,
+            request()
+        )
+        .is_none());
         assert!(
             terminal.output_buffer.is_empty(),
             "EPERM must not answer a later batch while the first read is still in flight"
@@ -25995,14 +26219,26 @@ mod tests {
         let mut pending = None;
         let request = || terminal::ClipboardReadKind::MimeData("text/plain".to_string());
         assert_eq!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, false, request()),
+            service_osc5522_read(
+                &mut terminal,
+                &mut in_flight,
+                &mut pending,
+                true,
+                false,
+                request()
+            ),
             Some("text/plain".to_string())
         );
         // A second PTY batch arrives before iced returns the first read.
-        assert!(
-            service_osc5522_read(&mut terminal, &mut in_flight, &mut pending, true, false, request())
-                .is_none()
-        );
+        assert!(service_osc5522_read(
+            &mut terminal,
+            &mut in_flight,
+            &mut pending,
+            true,
+            false,
+            request()
+        )
+        .is_none());
         assert!(
             terminal.output_buffer.is_empty(),
             "EBUSY must not overtake the first read"
@@ -26374,16 +26610,13 @@ mod tests {
     fn an_osc_52_clipboard_get_is_started_only_behind_the_read_permission() {
         let source = frost_source();
         let read = format!("iced::clipboard::{}(", "read");
-        let permitted =
-            braced_block_after(&source, "if self.config.allow_clipboard_read {");
+        let permitted = braced_block_after(&source, "if self.config.allow_clipboard_read {");
         assert!(
             permitted.contains(&read),
             "an OSC 52 GET may only start a host read when the permission is granted"
         );
-        let blocked = braced_block_after(
-            &source,
-            "if self.host_clipboard_read_blocked_for(id, fd) {",
-        );
+        let blocked =
+            braced_block_after(&source, "if self.host_clipboard_read_blocked_for(id, fd) {");
         assert!(
             !blocked.contains(&read),
             "a blocked host read must not enqueue another iced clipboard read"
@@ -26498,8 +26731,14 @@ mod tests {
             1,
             "the OSC 52 SET path writes the clipboard once, or the gate below is bypassable"
         );
-        let permitted =
-            braced_block_after(&applied, "if self.config.allow_remote_clipboard_write {");
+        let guard = "if self.config.allow_remote_clipboard_write";
+        let condition = applied
+            .split_once(guard)
+            .and_then(|(_, rest)| rest.split_once('{'))
+            .map(|(condition, _)| condition)
+            .expect("the remote clipboard permission guards a block");
+        assert!(condition.contains("&& admit_osc52_clipboard_write("));
+        let permitted = braced_block_after(&applied, &format!("{guard}{condition}{{"));
         assert!(
             permitted.contains(&write),
             "a remote clipboard SET may only be applied with the permission granted"
@@ -31316,7 +31555,10 @@ mod tests {
         .expect_err("relative");
         assert!(error.contains("absolute"));
         let hostile = plan_drop_with_caps(
-            vec![std::path::PathBuf::from(format!("rel/\u{1b}{}", "x".repeat(400)))],
+            vec![std::path::PathBuf::from(format!(
+                "rel/\u{1b}{}",
+                "x".repeat(400)
+            ))],
             root.join("target"),
             4,
             1024,
@@ -31511,8 +31753,10 @@ mod tests {
 
     #[test]
     fn tab_switcher_query_drops_controls_and_truncates_on_a_char_boundary() {
-        let mut state = TabSwitcherState::default();
-        state.selected = 3;
+        let mut state = TabSwitcherState {
+            selected: 3,
+            ..Default::default()
+        };
         assert!(state.push_query_text("ta\nb\u{1b}"));
         assert_eq!(state.query, "tab");
         assert_eq!(state.selected, 0);
@@ -31543,7 +31787,9 @@ mod tests {
         assert_eq!(state.query, "tab");
         assert!(!state.query.contains('\u{202e}'));
         assert!(!state.query.contains('\u{fffd}'));
-        assert!(!tab_switcher_filtered(&["build".into(), "tab two".into()], &state.query).is_empty());
+        assert!(
+            !tab_switcher_filtered(&["build".into(), "tab two".into()], &state.query).is_empty()
+        );
         state.set_query("tab\u{fffd}");
         assert_eq!(state.query, "tab");
     }

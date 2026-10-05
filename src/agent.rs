@@ -2118,13 +2118,13 @@ mod tests {
     #[test]
     fn agent_transcript_keeps_newlines_and_stays_bounded() {
         let shown = bound_transcript_text(format!(
-            "thought: line\n\u{1b}[31m\u{202e}{}",
+            "thought: line\n\u{1b}[31m\u{202e}\u{fffd}{}",
             "x".repeat(2000)
         ));
         assert!(shown.contains('\n'));
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= crate::review_text::MAX_DIAGNOSTIC_BYTES);
         assert!(shown.starts_with("thought:"));
     }
@@ -2132,12 +2132,12 @@ mod tests {
     #[test]
     fn attached_context_cmd_strips_spoofing_and_stays_bounded() {
         let shown = bound_attached_context_cmd(format!(
-            "cargo test \u{1b}[31m\u{202e}{}",
+            "cargo test \u{1b}[31m\u{202e}\u{fffd}{}",
             "x".repeat(2000)
         ));
         assert!(!shown.contains('\u{1b}'));
         assert!(!shown.contains('\u{202e}'));
-        assert!(shown.contains('\u{fffd}'));
+        assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= crate::review_text::MAX_DIAGNOSTIC_BYTES);
         assert!(shown.starts_with("cargo test"));
     }

@@ -128,7 +128,8 @@ impl SearchAndReplaceEngine {
     /// An empty pattern is a no-op: `str::contains("")` is true for every line
     /// and would otherwise dump the whole buffer. Context is clamped so a
     /// hostile `context_lines` cannot allocate a quadratic preview.
-    pub fn get_match_context(text: &str, pattern: &str, context_lines: usize) -> Vec<String> {
+    #[cfg(test)]
+    fn get_match_context(text: &str, pattern: &str, context_lines: usize) -> Vec<String> {
         if pattern.is_empty() {
             return Vec::new();
         }
@@ -315,14 +316,8 @@ mod tests {
             ..Default::default()
         };
         let options = ReplaceOptions { replace_all: true };
-        let (result, count) = SearchAndReplaceEngine::search_and_replace(
-            "abc",
-            "",
-            "x",
-            &config,
-            &options,
-        )
-        .unwrap();
+        let (result, count) =
+            SearchAndReplaceEngine::search_and_replace("abc", "", "x", &config, &options).unwrap();
         assert_eq!(count, 0);
         assert_eq!(result, "abc");
     }
