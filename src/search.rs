@@ -43,11 +43,12 @@ fn find_query_is_unsafe(query: &str) -> bool {
 /// Compiled-regex cache slot. Held by `SearchState` so consecutive
 /// `recompute_search` calls with the same pattern reuse the same `Regex`
 /// instead of paying a fresh `RegexBuilder::build()` per keypress / PTY chunk.
+/// Failed compilations are cached too, until the pattern or case mode changes.
 #[derive(Clone, Debug)]
 pub struct RegexCache {
     pattern: String,
     case_sensitive: bool,
-    regex: Regex,
+    compiled: Result<Regex, String>,
 }
 
 /// 单个搜索匹配项
@@ -88,8 +89,8 @@ pub struct SearchState {
     /// 历史导航位置（None 表示在输入框，Some(i) 表示在历史第 i 项）
     pub history_nav_index: Option<usize>,
 
-    /// 上次搜索词（用于检测搜索词变化）
-    last_query: String,
+    /// Draft and mode flags to restore after navigating back out of history.
+    history_draft: Option<(String, bool, bool)>,
 
     /// 搜索错误消息（正则表达式编译错误等）
     pub error_message: Option<String>,
@@ -124,7 +125,7 @@ impl SearchState {
             current_match_index: 0,
             history: VecDeque::new(),
             history_nav_index: None,
-            last_query: String::new(),
+            history_draft: None,
             error_message: None,
             regex_cache: None,
         }
@@ -141,10 +142,9 @@ impl SearchState {
     /// 关闭搜索面板
     pub fn close(&mut self) {
         self.is_open = false;
-        if !self.query.is_empty() && self.last_query != self.query {
-            self.save_to_history();
-            self.last_query = self.query.clone();
-        }
+        self.save_to_history();
+        self.history_nav_index = None;
+        self.history_draft = None;
     }
 
     /// Replace the find query; the current-match highlight resets. Control
@@ -158,7 +158,12 @@ impl SearchState {
             ));
             return;
         }
+        if self.query == query {
+            self.error_message = None;
+            return;
+        }
         self.query = query;
+        self.history_draft = None;
         self.history_nav_index = None;
         self.current_match_index = 0;
         self.error_message = None;
@@ -180,6 +185,7 @@ impl SearchState {
             return false;
         }
         self.history_nav_index = None;
+        self.history_draft = None;
         self.current_match_index = 0;
         true
     }
@@ -214,12 +220,16 @@ impl SearchState {
     /// 切换大小写敏感
     pub fn toggle_case_sensitive(&mut self) {
         self.case_sensitive = !self.case_sensitive;
+        self.history_nav_index = None;
+        self.history_draft = None;
         self.current_match_index = 0;
     }
 
     /// 切换正则表达式模式
     pub fn toggle_regex(&mut self) {
         self.use_regex = !self.use_regex;
+        self.history_nav_index = None;
+        self.history_draft = None;
         self.current_match_index = 0;
         self.error_message = None;
     }
@@ -236,7 +246,11 @@ impl SearchState {
         }
 
         // 检查重复
-        if !self.history.is_empty() && self.history[0].query == self.query {
+        if self.history.front().is_some_and(|entry| {
+            entry.query == self.query
+                && entry.is_regex == self.use_regex
+                && entry.case_sensitive == self.case_sensitive
+        }) {
             return;
         }
 
@@ -276,9 +290,16 @@ impl SearchState {
             if idx > 0 {
                 self.restore_history_entry(idx - 1);
             } else {
-                // 返回输入框
                 self.history_nav_index = None;
-                self.query.clear();
+                if let Some((query, use_regex, case_sensitive)) = self.history_draft.take() {
+                    self.query = query;
+                    self.use_regex = use_regex;
+                    self.case_sensitive = case_sensitive;
+                } else {
+                    self.query.clear();
+                }
+                self.current_match_index = 0;
+                self.error_message = None;
             }
         }
     }
@@ -295,6 +316,9 @@ impl SearchState {
                 "Query contains control or visual-spoofing characters and was not restored",
             ));
             return;
+        }
+        if self.history_nav_index.is_none() {
+            self.history_draft = Some((self.query.clone(), self.use_regex, self.case_sensitive));
         }
         self.query = query;
         self.use_regex = use_regex;
@@ -385,6 +409,19 @@ impl SearchEngine {
                     Self::identity_span,
                     &mut matches,
                 ),
+                // ASCII case folding never expands characters or changes cell
+                // positions, so no per-character column map is needed.
+                SearchLine::Text(text) if text.is_ascii() => {
+                    let folded = text.to_ascii_lowercase();
+                    Self::collect_plaintext_line(
+                        line_idx,
+                        &folded,
+                        &search_query,
+                        query_chars,
+                        Self::identity_span,
+                        &mut matches,
+                    )
+                }
                 SearchLine::Text(text) => {
                     let (folded, columns) = Self::fold_plain_text(text);
                     Self::collect_plaintext_line(
@@ -430,9 +467,12 @@ impl SearchEngine {
         matches: &mut Vec<SearchMatch>,
     ) -> bool {
         let mut start_byte = 0;
+        let mut start_char = 0;
         while let Some(rel) = search_line[start_byte..].find(search_query) {
             let match_byte = start_byte + rel;
-            let char_start = search_line[..match_byte].chars().count();
+            // Count only the new gap. Recounting the whole prefix for every
+            // match makes column mapping quadratic on densely matching rows.
+            let char_start = start_char + search_line[start_byte..match_byte].chars().count();
             let char_end = char_start + query_chars;
             if let (Some((col_start, _)), Some((_, col_end))) =
                 (span_at(char_start), span_at(char_end.saturating_sub(1)))
@@ -454,6 +494,7 @@ impl SearchEngine {
                 .map(|c| c.len_utf8())
                 .unwrap_or(1);
             start_byte = match_byte + step;
+            start_char = char_start + 1;
         }
         false
     }
@@ -479,21 +520,20 @@ impl SearchEngine {
             if !case_sensitive {
                 builder.case_insensitive(true);
             }
-            match builder.build() {
-                Ok(r) => {
-                    *cache = Some(RegexCache {
-                        pattern: pattern.to_string(),
-                        case_sensitive,
-                        regex: r,
-                    });
-                }
-                Err(e) => {
-                    *cache = None;
-                    return (Vec::new(), Some(crate::review_text::safe_regex_error(e)));
-                }
-            }
+            *cache = Some(RegexCache {
+                pattern: pattern.to_string(),
+                case_sensitive,
+                compiled: builder
+                    .build()
+                    .map_err(crate::review_text::safe_regex_error),
+            });
         }
-        let regex = &cache.as_ref().unwrap().regex;
+        // Invalid drafts are common while typing. Cache failures too so each
+        // PTY refresh does not compile the same invalid expression again.
+        let regex = match &cache.as_ref().unwrap().compiled {
+            Ok(regex) => regex,
+            Err(error) => return (Vec::new(), Some(error.clone())),
+        };
         let mut truncated = false;
 
         'lines: for (line_idx, line) in lines.into_iter().enumerate() {
@@ -535,12 +575,18 @@ impl SearchEngine {
         mut span_at: impl FnMut(usize) -> Option<(usize, usize)>,
         matches: &mut Vec<SearchMatch>,
     ) -> bool {
+        let mut previous_byte = 0;
+        let mut previous_char = 0;
         for mat in regex.find_iter(line_str) {
             if mat.is_empty() {
                 continue;
             }
-            let char_start = line_str[..mat.start()].chars().count();
-            let char_end = line_str[..mat.end()].chars().count();
+            // Regex matches do not overlap; each character in the row needs
+            // to be counted at most once, including gaps between matches.
+            let char_start = previous_char + line_str[previous_byte..mat.start()].chars().count();
+            let char_end = char_start + mat.as_str().chars().count();
+            previous_byte = mat.end();
+            previous_char = char_end;
             if let (Some((col_start, _)), Some((_, col_end))) =
                 (span_at(char_start), span_at(char_end.saturating_sub(1)))
             {
@@ -624,6 +670,292 @@ impl SearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_navigation_restores_draft_and_modes() {
+        let mut state = SearchState::new();
+        state.set_query("older");
+        state.close();
+        state.set_query("newer");
+        state.toggle_regex();
+        state.close();
+        state.set_query("unfinished");
+        state.toggle_regex();
+        state.toggle_case_sensitive();
+
+        state.history_prev();
+        assert_eq!(state.query, "newer");
+        assert!(state.use_regex);
+        assert!(!state.case_sensitive);
+        state.history_prev();
+        assert_eq!(state.query, "older");
+        state.history_next();
+        assert_eq!(state.query, "newer");
+        state.history_next();
+        assert_eq!(state.query, "unfinished");
+        assert!(!state.use_regex);
+        assert!(state.case_sensitive);
+        assert!(state.history_nav_index.is_none());
+        assert!(state.history_draft.is_none());
+    }
+
+    #[test]
+    fn edited_history_becomes_the_new_draft() {
+        let mut state = SearchState::new();
+        state.set_query("saved");
+        state.close();
+        state.set_query("original draft");
+        state.history_prev();
+        state.push_query_text(" edit");
+        state.history_prev();
+        state.history_next();
+        assert_eq!(state.query, "saved edit");
+        state.history_prev();
+        state.backspace();
+        state.history_prev();
+        state.history_next();
+        assert_eq!(state.query, "save");
+    }
+
+    #[test]
+    fn history_mode_edits_become_drafts_but_noop_input_preserves_navigation() {
+        let mut state = SearchState::new();
+        state.set_query("saved");
+        state.close();
+        state.set_query("draft");
+        state.history_prev();
+        assert!(!state.push_query_text("\n"));
+        assert_eq!(state.history_nav_index, Some(0));
+        state.history_next();
+        assert_eq!(state.query, "draft");
+
+        state.history_prev();
+        state.toggle_regex();
+        state.toggle_case_sensitive();
+        assert!(state.history_nav_index.is_none());
+        state.history_prev();
+        assert!(!state.use_regex);
+        assert!(!state.case_sensitive);
+        state.history_next();
+        assert_eq!(state.query, "saved");
+        assert!(state.use_regex);
+        assert!(state.case_sensitive);
+    }
+
+    #[test]
+    fn history_remembers_mode_changes_and_resets_navigation_on_close() {
+        let mut state = SearchState::new();
+        state.set_query("same query");
+        state.close();
+        state.close();
+        assert_eq!(state.history.len(), 1);
+        state.toggle_regex();
+        state.close();
+        state.toggle_case_sensitive();
+        state.close();
+        assert_eq!(state.history.len(), 3);
+        state.history_prev();
+        state.history_prev();
+        assert!(!state.case_sensitive);
+        state.close();
+        assert!(state.history_nav_index.is_none());
+        state.history_prev();
+        assert_eq!(state.history_nav_index, Some(0));
+        assert!(state.use_regex);
+        assert!(!state.case_sensitive);
+    }
+
+    // A deliberately simple prefix-counting oracle independent of the
+    // optimized cursors. Exercise overlapping literals, UTF-8 gaps and fold
+    // expansions in both borrowed scrollback and live-cell rows.
+    #[test]
+    fn plaintext_column_cursor_matches_reference() {
+        for text in [
+            "AAAAA",
+            "aBaBa",
+            "ééé-éaé",
+            "İB İİB",
+            "αβ ααβ",
+            "",
+            "--x--x",
+        ] {
+            let cells: Vec<_> = text
+                .chars()
+                .map(|character| TerminalCell {
+                    character,
+                    ..TerminalCell::default()
+                })
+                .collect();
+            for query in [
+                "A",
+                "aa",
+                "aba",
+                "éé",
+                "é",
+                "i",
+                "i\u{307}b",
+                "αβ",
+                "x",
+                "missing",
+            ] {
+                for case_sensitive in [true, false] {
+                    let (search_text, columns) = if case_sensitive {
+                        (
+                            text.to_string(),
+                            text.chars().enumerate().map(|(i, _)| (i, i + 1)).collect(),
+                        )
+                    } else {
+                        SearchEngine::fold_plain_text(text)
+                    };
+                    let query = if case_sensitive {
+                        query.to_string()
+                    } else {
+                        query.to_lowercase()
+                    };
+                    let query_chars = query.chars().count();
+                    let expected: Vec<_> = search_text
+                        .char_indices()
+                        .enumerate()
+                        .filter(|(_, (byte, _))| search_text[*byte..].starts_with(&query))
+                        .map(|(start, _)| SearchMatch {
+                            line: 0,
+                            col_start: columns[start].0,
+                            col_end: columns[start + query_chars - 1].1,
+                        })
+                        .collect();
+                    for line in [
+                        SearchLine::Text(text),
+                        SearchLine::Cells(Cow::Borrowed(&cells)),
+                    ] {
+                        let (actual, error) = SearchEngine::search_lines(
+                            [line],
+                            &query,
+                            false,
+                            case_sensitive,
+                            &mut None,
+                        );
+                        assert!(error.is_none());
+                        assert_eq!(
+                            actual, expected,
+                            "text={text:?}, query={query:?}, case={case_sensitive}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regex_column_cursor_matches_reference_with_empty_matches_and_utf8_gaps() {
+        for text in ["éAé B éAA", "αβ ααβ", "aaaa", "", "İB İİB"] {
+            for pattern in ["A+", "a*", "^|A|$", "é|B", ".", "αβ", r"\b", "İB"] {
+                for case_sensitive in [true, false] {
+                    let regex = RegexBuilder::new(pattern)
+                        .case_insensitive(!case_sensitive)
+                        .build()
+                        .unwrap();
+                    let expected: Vec<_> = regex
+                        .find_iter(text)
+                        .filter(|mat| !mat.is_empty())
+                        .map(|mat| SearchMatch {
+                            line: 0,
+                            col_start: text[..mat.start()].chars().count(),
+                            col_end: text[..mat.end()].chars().count(),
+                        })
+                        .collect();
+                    let (actual, error) = SearchEngine::search_lines(
+                        [SearchLine::Text(text)],
+                        pattern,
+                        true,
+                        case_sensitive,
+                        &mut None,
+                    );
+                    assert!(error.is_none());
+                    assert_eq!(actual, expected, "text={text:?}, pattern={pattern:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regex_cursor_maps_multiple_wide_cell_matches() {
+        let mut cells = vec![TerminalCell::default(); 8];
+        for start in [0, 4] {
+            cells[start].character = '界';
+            cells[start].flags.set_wide(true);
+            cells[start + 1].flags.set_wide_continuation(true);
+            cells[start + 2].character = 'é';
+        }
+        let (matches, error) = SearchEngine::search_lines(
+            [SearchLine::Cells(Cow::Borrowed(&cells))],
+            "界é",
+            true,
+            true,
+            &mut None,
+        );
+        assert!(error.is_none());
+        assert_eq!(
+            matches,
+            vec![
+                SearchMatch {
+                    line: 0,
+                    col_start: 0,
+                    col_end: 3
+                },
+                SearchMatch {
+                    line: 0,
+                    col_start: 4,
+                    col_end: 7
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn regex_cache_keeps_failures_and_invalidates_on_pattern_or_mode_changes() {
+        let mut cache = None;
+        let (_, first_error) =
+            SearchEngine::search_lines([SearchLine::Text("A")], "(", true, true, &mut cache);
+        assert!(cache.as_ref().unwrap().compiled.is_err());
+        let (_, repeated_error) =
+            SearchEngine::search_lines([SearchLine::Text("A")], "(", true, true, &mut cache);
+        assert_eq!(first_error, repeated_error);
+        let (matches, error) =
+            SearchEngine::search_lines([SearchLine::Text("A")], "a", true, true, &mut cache);
+        assert!(matches.is_empty());
+        assert!(error.is_none());
+        assert!(cache.as_ref().unwrap().compiled.is_ok());
+        let (matches, error) =
+            SearchEngine::search_lines([SearchLine::Text("A")], "a", true, false, &mut cache);
+        assert_eq!(matches.len(), 1);
+        assert!(error.is_none());
+        assert!(!cache.as_ref().unwrap().case_sensitive);
+        let (matches, error) =
+            SearchEngine::search_lines([SearchLine::Text("A")], "[", true, false, &mut cache);
+        assert!(matches.is_empty());
+        assert!(error.is_some());
+        assert!(cache.as_ref().unwrap().compiled.is_err());
+    }
+
+    #[test]
+    fn dense_unicode_matches_keep_exact_columns_and_cap() {
+        let text = "é".repeat(MAX_SEARCH_MATCHES + 1);
+        for use_regex in [false, true] {
+            let (matches, warning) = SearchEngine::search_lines(
+                [SearchLine::Text(&text)],
+                "é",
+                use_regex,
+                true,
+                &mut None,
+            );
+            assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
+            assert_eq!(warning.as_deref(), Some(MATCH_LIMIT_MESSAGE));
+            for (column, found) in matches.iter().enumerate() {
+                assert_eq!(found.col_start, column);
+                assert_eq!(found.col_end, column + 1);
+            }
+        }
+    }
 
     #[test]
     fn test_search_state_toggle() {

@@ -624,6 +624,7 @@ impl DirectoryScanCoordinator {
         self.last_timing
     }
 
+    #[cfg(test)]
     pub fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
         self.high
             .iter()

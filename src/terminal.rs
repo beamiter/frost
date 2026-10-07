@@ -159,7 +159,7 @@ impl RawRowId {
     fn fresh() -> Self {
         static NEXT_RAW_ROW_ID: AtomicU64 = AtomicU64::new(1);
         NEXT_RAW_ROW_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map(Self)
@@ -9682,9 +9682,7 @@ impl TerminalState {
                     // Mark all rows dirty after grid swap to force full re-render
                     // Increment by rows+1 to trigger grid_version_jumped in ui.rs
                     self.grid_version += self.grid.rows() as u64 + 1;
-                    for row_ver in &mut self.row_versions {
-                        *row_ver = self.grid_version;
-                    }
+                    self.row_versions.fill(self.grid_version);
                 }
             }
             2026 => {

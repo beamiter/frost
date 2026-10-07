@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="${SCRIPT_DIR}/install.sh"
 UNINSTALLER="${SCRIPT_DIR}/uninstall.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/frost-install-paths.XXXXXX")"
+EXTRA_TEST_ROOTS=()
 TEST_HOME="${TEST_ROOT}/home"
 TEST_PATH="/usr/bin:/bin"
 unset XDG_CONFIG_HOME XDG_DATA_HOME
@@ -25,7 +26,7 @@ if ((${#WORKFLOW_SOURCES[@]} != 6)); then
     exit 1
 fi
 
-trap 'rm -rf -- "${TEST_ROOT}"' EXIT
+trap 'rm -rf -- "${TEST_ROOT}" "${EXTRA_TEST_ROOTS[@]}"' EXIT
 mkdir -p "${TEST_HOME}"
 
 install_dry_run() {
@@ -1209,8 +1210,29 @@ for candidate in "${SCRIPT_DIR}/../Cargo.toml" /etc/hostname /bin/true; do
         break
     fi
 done
+if [[ -z "${cross_device_prebuilt}" ]]; then
+    # On non-container runners, the checkout, /etc and /bin can all live on
+    # the same filesystem as /tmp. Make our own source on another writable
+    # filesystem instead of depending on a container's bind-mounted files.
+    for candidate in /dev/shm "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        /tmp /var/tmp "${SCRIPT_DIR%/*}"; do
+        [[ -d "${candidate}" && -w "${candidate}" ]] || continue
+        [[ "$(stat -Lc '%d' -- "${candidate}")" != \
+            "${install_cross_device_dev}" ]] || continue
+        if cross_device_root="$(mktemp -d \
+            "${candidate}/frost-cross-device.XXXXXX" 2>/dev/null)"; then
+            EXTRA_TEST_ROOTS+=("${cross_device_root}")
+            cross_device_prebuilt="${cross_device_root}/frost"
+            cp -- "${prebuilt_binary}" "${cross_device_prebuilt}"
+            break
+        fi
+    done
+fi
 [[ -n "${cross_device_prebuilt}" ]] \
     || fail "no cross-device prebuilt fixture is available"
+[[ "$(stat -c '%d' -- "${cross_device_prebuilt}")" != \
+    "${install_cross_device_dev}" ]] \
+    || fail "cross-device prebuilt fixture shares the destination device"
 install_cross_device_tools="${TEST_ROOT}/install-cross-device-tools"
 install_cross_device_cat_marker="${TEST_ROOT}/install-cross-device-cat"
 install_cross_device_binary="${install_cross_device_stage}${install_cross_device_prefix}/bin/frost"
@@ -2042,8 +2064,36 @@ PATH="${TEST_PATH}" bash -c "${install_symlink_cleanup_foreign_command}"
 # reuses the recorded inode number, and recreate a foreign three-link set. The
 # stored no-follow text/metadata fingerprint must reject that numeric ABA and
 # retain every substitute without advertising an exact recovery command.
+# tmpfs allocates fresh inode numbers rather than promptly recycling them.
+# Find a writable filesystem that demonstrably reuses symlink inodes, keeping
+# the real numeric-ABA assertions rather than mocking stat or skipping them.
+install_symlink_cleanup_reuse_root=
+for candidate in "${SCRIPT_DIR%/*}" "${TEST_ROOT}" /tmp /var/tmp; do
+    [[ -d "${candidate}" && -w "${candidate}" ]] || continue
+    if ! reuse_root="$(mktemp -d \
+        "${candidate}/frost-inode-reuse.XXXXXX" 2>/dev/null)"; then
+        continue
+    fi
+    EXTRA_TEST_ROOTS+=("${reuse_root}")
+    reuse_probe="${reuse_root}/snapshot"
+    ln -s -- original "${reuse_probe}"
+    reuse_expected="$(stat -c '%d:%i' -- "${reuse_probe}")"
+    rm -f -- "${reuse_probe}"
+    for ((reuse_attempt = 0; reuse_attempt < 128; reuse_attempt++)); do
+        ln -s -- substitute "${reuse_probe}"
+        reuse_actual="$(stat -c '%d:%i' -- "${reuse_probe}")"
+        rm -f -- "${reuse_probe}"
+        if [[ "${reuse_actual}" == "${reuse_expected}" ]]; then
+            install_symlink_cleanup_reuse_root="${reuse_root}"
+            break
+        fi
+    done
+    [[ -z "${install_symlink_cleanup_reuse_root}" ]] || break
+done
+[[ -n "${install_symlink_cleanup_reuse_root}" ]] \
+    || fail "numeric ABA fixture needs a writable filesystem that reuses symlink inodes"
 install_symlink_cleanup_reuse_tools="${TEST_ROOT}/install-symlink-cleanup-reuse-tools"
-install_symlink_cleanup_reuse_stage="${TEST_ROOT}/install-symlink-cleanup-reuse-stage"
+install_symlink_cleanup_reuse_stage="${install_symlink_cleanup_reuse_root}/stage"
 install_symlink_cleanup_reuse_prefix="/opt/frost-install-symlink-cleanup-reuse"
 install_symlink_cleanup_reuse_workflow_dir="${install_symlink_cleanup_reuse_stage}${install_symlink_cleanup_reuse_prefix}/share/frost/workflows"
 install_symlink_cleanup_reuse_first="${install_symlink_cleanup_reuse_workflow_dir}/${WORKFLOW_SOURCES[0]##*/}"
@@ -2114,6 +2164,8 @@ env HOME="${TEST_HOME}" \
     --binary "${prebuilt_binary}" \
     --prefix "${install_symlink_cleanup_reuse_prefix}" --no-desktop \
     >"${install_symlink_cleanup_reuse_log}" 2>&1
+assert_regular_file "numeric ABA inode-reuse marker" \
+    "${install_symlink_cleanup_reuse_marker}"
 read -r install_symlink_cleanup_reuse_expected \
     install_symlink_cleanup_reuse_actual \
     <"${install_symlink_cleanup_reuse_marker}"
@@ -2129,6 +2181,10 @@ for install_symlink_cleanup_reuse_path_log in \
         && "$(readlink -- "${install_symlink_cleanup_reuse_path}")" == \
             "${install_symlink_cleanup_reuse_secret}" ]] \
         || fail "numeric ABA cleanup removed or changed a foreign substitute"
+    [[ "$(stat -c '%d:%i:%h' -- \
+        "${install_symlink_cleanup_reuse_path}")" == \
+        "${install_symlink_cleanup_reuse_expected}:3" ]] \
+        || fail "numeric ABA fixture lost its reused three-link inode"
 done
 if grep -Fq -- "${install_symlink_cleanup_reuse_secret}" \
     "${install_symlink_cleanup_reuse_log}"; then
