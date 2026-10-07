@@ -9,7 +9,7 @@
 //! [`crate::remote_fs`]'s sh probe, an ssh destination / running container —
 //! with the generation guard unchanged.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1295,6 +1295,56 @@ impl Sidebar {
         }
     }
 
+    pub fn node(&self, path: &Path) -> Option<&FileTreeNode> {
+        find_node(&self.root, path)
+    }
+
+    pub fn node_is_expanded(&self, path: &Path) -> bool {
+        self.node(path)
+            .is_some_and(|node| node.is_dir && node.expanded)
+    }
+
+    /// Expand a directory without toggling an already-open node. Unloaded or
+    /// failed directories queue the same one-level load as a first click.
+    pub fn expand_node(&mut self, path: &Path) -> Option<DirectoryRequest> {
+        let request_path = {
+            let node = find_node_mut(&mut self.root, path)?;
+            if !node.is_dir {
+                return None;
+            }
+            if node.expanded {
+                return None;
+            }
+            match node.state {
+                DirectoryState::Unloaded | DirectoryState::Error(_) => {
+                    node.expanded = true;
+                    node.state = DirectoryState::Loading;
+                    Some(node.path.clone())
+                }
+                DirectoryState::Loading
+                | DirectoryState::Refreshing
+                | DirectoryState::Loaded
+                | DirectoryState::RefreshError(_) => {
+                    node.expanded = true;
+                    None
+                }
+            }
+        };
+        request_path.map(|path| self.request_for(path, DirectoryRequestPriority::Lazy))
+    }
+
+    /// Collapse an expanded directory. Returns whether the expansion flag changed.
+    pub fn collapse_node(&mut self, path: &Path) -> bool {
+        let Some(node) = find_node_mut(&mut self.root, path) else {
+            return false;
+        };
+        if !node.is_dir || !node.expanded {
+            return false;
+        }
+        node.expanded = false;
+        true
+    }
+
     /// Toggle a directory and, when necessary, request its first one-level load.
     pub fn toggle_node(&mut self, path: &Path) -> Option<DirectoryRequest> {
         let request_path = {
@@ -1808,6 +1858,285 @@ fn reconcile_children(current: &mut Vec<FileTreeNode>, fresh: Vec<FileTreeNode>)
             previous_node
         })
         .collect();
+}
+
+/// Pixel height of one Files-tree row, matching the iced padding + 12px label.
+pub const SIDEBAR_TREE_ROW_HEIGHT: f32 = 22.0;
+/// Vertical gap between tree rows (`Column::spacing(1)`).
+pub const SIDEBAR_TREE_ROW_GAP: f32 = 1.0;
+/// Extra rows built above and below the viewport so wheel scrolling stays smooth.
+pub const SIDEBAR_TREE_OVERSCAN: usize = 8;
+
+pub fn sidebar_tree_stride() -> f32 {
+    SIDEBAR_TREE_ROW_HEIGHT + SIDEBAR_TREE_ROW_GAP
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeFocusMotion {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeFocusOutcome {
+    Move(PathBuf),
+    Collapse(PathBuf),
+    Expand(PathBuf),
+}
+
+/// One widget slot in the virtualized tree list. Error and truncation rows
+/// occupy the same stride as file rows so scroll offset stays stable.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SidebarRenderItem {
+    Node {
+        name: String,
+        path: PathBuf,
+        is_dir: bool,
+        depth: usize,
+        expanded: bool,
+        state: DirectoryState,
+        truncated: bool,
+    },
+    Error {
+        path: PathBuf,
+        depth: usize,
+        message: String,
+        refresh: bool,
+        last_loaded_at: Option<Instant>,
+    },
+    Truncated {
+        depth: usize,
+    },
+}
+
+impl SidebarRenderItem {
+    pub fn node_path(&self) -> Option<&Path> {
+        match self {
+            Self::Node { path, .. } => Some(path.as_path()),
+            _ => None,
+        }
+    }
+}
+
+/// Flatten the loaded tree in display order. A filter match set force-shows
+/// matches and ancestors without mutating expansion flags.
+pub fn collect_sidebar_render_items(
+    root: &FileTreeNode,
+    filter: Option<&BTreeSet<PathBuf>>,
+) -> Vec<SidebarRenderItem> {
+    let mut out = Vec::new();
+    collect_sidebar_render_children(&root.children, 0, filter, &mut out);
+    out
+}
+
+fn collect_sidebar_render_children(
+    children: &[FileTreeNode],
+    depth: usize,
+    filter: Option<&BTreeSet<PathBuf>>,
+    out: &mut Vec<SidebarRenderItem>,
+) {
+    for child in children {
+        if let Some(set) = filter {
+            if !set.contains(&child.path) {
+                continue;
+            }
+        }
+        out.push(SidebarRenderItem::Node {
+            name: child.name.clone(),
+            path: child.path.clone(),
+            is_dir: child.is_dir,
+            depth,
+            expanded: child.expanded,
+            state: child.state.clone(),
+            truncated: child.truncated,
+        });
+        match &child.state {
+            DirectoryState::Error(error) => out.push(SidebarRenderItem::Error {
+                path: child.path.clone(),
+                depth,
+                message: error.to_string(),
+                refresh: false,
+                last_loaded_at: child.last_loaded_at,
+            }),
+            DirectoryState::RefreshError(error) => out.push(SidebarRenderItem::Error {
+                path: child.path.clone(),
+                depth,
+                message: error.to_string(),
+                refresh: true,
+                last_loaded_at: child.last_loaded_at,
+            }),
+            _ => {}
+        }
+        if child.is_dir && (child.expanded || filter.is_some()) {
+            collect_sidebar_render_children(&child.children, depth + 1, filter, out);
+            if child.truncated {
+                out.push(SidebarRenderItem::Truncated { depth });
+            }
+        }
+    }
+}
+
+/// Visible window into a flattened tree: `(start, count, pad_top, pad_bottom)`.
+pub fn sidebar_tree_window(
+    offset_y: f32,
+    viewport_h: f32,
+    item_count: usize,
+) -> (usize, usize, f32, f32) {
+    if item_count == 0 {
+        return (0, 0, 0.0, 0.0);
+    }
+    let stride = sidebar_tree_stride();
+    let offset_y = offset_y.max(0.0);
+    let first = (offset_y / stride).floor().max(0.0) as usize;
+    let start = first.saturating_sub(SIDEBAR_TREE_OVERSCAN);
+    let visible = ((viewport_h.max(0.0) / stride).ceil() as usize).saturating_add(1);
+    let end = first
+        .saturating_add(visible)
+        .saturating_add(SIDEBAR_TREE_OVERSCAN)
+        .min(item_count);
+    let start = start.min(item_count);
+    let end = end.max(start).min(item_count);
+    let shown = end.saturating_sub(start);
+    (
+        start,
+        shown,
+        start as f32 * stride,
+        (item_count - end) as f32 * stride,
+    )
+}
+
+/// Scroll offset that keeps `index` inside the viewport.
+pub fn sidebar_tree_reveal_offset(
+    index: usize,
+    offset_y: f32,
+    viewport_h: f32,
+    item_count: usize,
+) -> f32 {
+    if item_count == 0 {
+        return 0.0;
+    }
+    let stride = sidebar_tree_stride();
+    let max_offset = ((item_count as f32 * stride) - viewport_h.max(0.0)).max(0.0);
+    let row_top = index as f32 * stride;
+    let row_bottom = row_top + SIDEBAR_TREE_ROW_HEIGHT;
+    let offset_y = offset_y.clamp(0.0, max_offset);
+    let view_bottom = offset_y + viewport_h.max(SIDEBAR_TREE_ROW_HEIGHT);
+    if row_top < offset_y {
+        row_top.min(max_offset)
+    } else if row_bottom > view_bottom {
+        (row_bottom - viewport_h.max(SIDEBAR_TREE_ROW_HEIGHT)).clamp(0.0, max_offset)
+    } else {
+        offset_y
+    }
+}
+
+fn visible_parent_path(rows: &[(PathBuf, bool)], path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.parent()?;
+    loop {
+        if rows.iter().any(|(row, _)| row == cursor) {
+            return Some(cursor.to_path_buf());
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+/// Arrow-key outcome over the visible file rows. Left collapses an expanded
+/// directory or jumps to its visible parent; Right expands a collapsed one.
+pub fn apply_tree_focus_motion(
+    rows: &[(PathBuf, bool)],
+    is_expanded: impl Fn(&Path) -> bool,
+    current: Option<&Path>,
+    motion: TreeFocusMotion,
+) -> Option<TreeFocusOutcome> {
+    if rows.is_empty() {
+        return None;
+    }
+    let Some(current) = current else {
+        return match motion {
+            TreeFocusMotion::Up => rows
+                .last()
+                .map(|(path, _)| TreeFocusOutcome::Move(path.clone())),
+            TreeFocusMotion::Down | TreeFocusMotion::Right | TreeFocusMotion::Left => rows
+                .first()
+                .map(|(path, _)| TreeFocusOutcome::Move(path.clone())),
+        };
+    };
+    let index = rows.iter().position(|(path, _)| path == current);
+    match motion {
+        TreeFocusMotion::Up => {
+            let index = index.unwrap_or(0);
+            let next = if index == 0 { 0 } else { index - 1 };
+            Some(TreeFocusOutcome::Move(rows[next].0.clone()))
+        }
+        TreeFocusMotion::Down => {
+            let index = index.unwrap_or(0);
+            let next = (index + 1).min(rows.len() - 1);
+            Some(TreeFocusOutcome::Move(rows[next].0.clone()))
+        }
+        TreeFocusMotion::Left => {
+            if rows.iter().any(|(path, is_dir)| path == current && *is_dir) && is_expanded(current)
+            {
+                Some(TreeFocusOutcome::Collapse(current.to_path_buf()))
+            } else {
+                visible_parent_path(rows, current).map(TreeFocusOutcome::Move)
+            }
+        }
+        TreeFocusMotion::Right => {
+            if rows.iter().any(|(path, is_dir)| path == current && *is_dir) && !is_expanded(current)
+            {
+                Some(TreeFocusOutcome::Expand(current.to_path_buf()))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Enabled flags for the Files context menu, in on-screen order. Disabled
+/// entries stay listed so a keyboard cursor can skip them without relayout.
+pub fn files_menu_action_enabled(
+    multi: usize,
+    is_dir: bool,
+    paste_available: bool,
+) -> Vec<(&'static str, bool, bool)> {
+    // (id, enabled, show) — id is matched by the UI layer.
+    let mut items = Vec::new();
+    if multi == 1 && is_dir {
+        items.push(("open_directory", true, true));
+    }
+    let single = multi <= 1;
+    items.push(("new_file", single, true));
+    items.push(("new_folder", single, true));
+    items.push(("rename", single, true));
+    items.push(("delete", true, true));
+    items.push(("copy", true, true));
+    items.push(("cut", true, true));
+    items.push(("copy_path", true, true));
+    items.push(("paste", paste_available, true));
+    items.push(("refresh", true, true));
+    items
+}
+
+/// Next enabled menu index in `direction` (+1 down / -1 up), wrapping.
+pub fn next_enabled_menu_index(enabled: &[bool], from: usize, direction: i32) -> usize {
+    if enabled.is_empty() {
+        return 0;
+    }
+    let len = enabled.len() as i32;
+    let mut index = from as i32;
+    for _ in 0..enabled.len() {
+        index = (index + direction).rem_euclid(len);
+        if enabled[index as usize] {
+            return index as usize;
+        }
+    }
+    from.min(enabled.len() - 1)
+}
+
+pub fn first_enabled_menu_index(enabled: &[bool]) -> usize {
+    enabled.iter().position(|on| *on).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -3352,5 +3681,132 @@ mod tests {
         assert!(!header.contains('\u{1b}'));
         assert!(!header.contains('\u{202e}'));
         assert!(header.starts_with("proj"));
+    }
+
+    #[test]
+    fn tree_window_overscans_and_pads_to_the_full_height() {
+        assert_eq!(sidebar_tree_window(0.0, 100.0, 0), (0, 0, 0.0, 0.0));
+        let stride = sidebar_tree_stride();
+        let (start, count, pad_top, pad_bottom) = sidebar_tree_window(0.0, stride * 4.0, 4);
+        assert_eq!(start, 0);
+        assert_eq!(count, 4);
+        assert_eq!(pad_top, 0.0);
+        assert_eq!(pad_bottom, 0.0);
+        let (start, count, pad_top, pad_bottom) =
+            sidebar_tree_window(stride * 20.0, stride * 5.0, 80);
+        assert_eq!(start, 20 - SIDEBAR_TREE_OVERSCAN);
+        assert!(count > 5);
+        assert_eq!(pad_top, start as f32 * stride);
+        assert_eq!(pad_bottom, (80 - start - count) as f32 * stride);
+        let (start, count, _, pad_bottom) = sidebar_tree_window(stride * 200.0, stride * 5.0, 80);
+        assert!(start + count <= 80);
+        assert_eq!(pad_bottom, 0.0);
+    }
+
+    #[test]
+    fn tree_reveal_offset_brings_the_row_into_the_viewport() {
+        let stride = sidebar_tree_stride();
+        let viewport = stride * 5.0;
+        assert_eq!(sidebar_tree_reveal_offset(0, 0.0, viewport, 20), 0.0);
+        let down = sidebar_tree_reveal_offset(10, 0.0, viewport, 20);
+        assert!(down > 0.0);
+        let up = sidebar_tree_reveal_offset(0, stride * 8.0, viewport, 20);
+        assert_eq!(up, 0.0);
+    }
+
+    #[test]
+    fn tree_focus_motion_moves_collapses_and_expands() {
+        let rows = vec![
+            (PathBuf::from("/a"), true),
+            (PathBuf::from("/a/b"), false),
+            (PathBuf::from("/c"), true),
+        ];
+        let expanded = |path: &Path| path == Path::new("/a");
+        assert_eq!(
+            apply_tree_focus_motion(&rows, expanded, None, TreeFocusMotion::Down),
+            Some(TreeFocusOutcome::Move(PathBuf::from("/a")))
+        );
+        assert_eq!(
+            apply_tree_focus_motion(
+                &rows,
+                expanded,
+                Some(Path::new("/a")),
+                TreeFocusMotion::Down
+            ),
+            Some(TreeFocusOutcome::Move(PathBuf::from("/a/b")))
+        );
+        assert_eq!(
+            apply_tree_focus_motion(
+                &rows,
+                expanded,
+                Some(Path::new("/a")),
+                TreeFocusMotion::Left
+            ),
+            Some(TreeFocusOutcome::Collapse(PathBuf::from("/a")))
+        );
+        assert_eq!(
+            apply_tree_focus_motion(
+                &rows,
+                expanded,
+                Some(Path::new("/a/b")),
+                TreeFocusMotion::Left
+            ),
+            Some(TreeFocusOutcome::Move(PathBuf::from("/a")))
+        );
+        assert_eq!(
+            apply_tree_focus_motion(
+                &rows,
+                expanded,
+                Some(Path::new("/c")),
+                TreeFocusMotion::Right
+            ),
+            Some(TreeFocusOutcome::Expand(PathBuf::from("/c")))
+        );
+        assert_eq!(
+            apply_tree_focus_motion(
+                &rows,
+                expanded,
+                Some(Path::new("/a")),
+                TreeFocusMotion::Right
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn files_menu_cursor_skips_disabled_entries() {
+        let enabled = [true, false, false, true];
+        assert_eq!(first_enabled_menu_index(&enabled), 0);
+        assert_eq!(next_enabled_menu_index(&enabled, 0, 1), 3);
+        assert_eq!(next_enabled_menu_index(&enabled, 3, 1), 0);
+        assert_eq!(next_enabled_menu_index(&enabled, 0, -1), 3);
+        assert_eq!(
+            files_menu_action_enabled(2, true, false)
+                .into_iter()
+                .filter(|(_, on, _)| !*on)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn collect_render_items_keeps_error_and_truncation_slots() {
+        let mut root = FileTreeNode::directory(PathBuf::from("/"), true);
+        let mut nested = FileTreeNode::directory(PathBuf::from("/nested"), true);
+        nested.state = DirectoryState::RefreshError(test_error("nope"));
+        nested.truncated = true;
+        nested.children.push(FileTreeNode::entry(
+            "a.txt".into(),
+            PathBuf::from("/nested/a.txt"),
+            false,
+        ));
+        root.children.push(nested);
+        let items = collect_sidebar_render_items(&root, None);
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SidebarRenderItem::Error { refresh: true, .. })));
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SidebarRenderItem::Truncated { .. })));
     }
 }

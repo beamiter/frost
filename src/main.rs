@@ -127,8 +127,9 @@ fn block_search_manual_refresh_key(
         && !modifiers.logo()
 }
 
-/// Files owns bare F5 only while the pointer is inside its visible dock. The
-/// terminal therefore keeps its ordinary F5 escape sequence everywhere else.
+/// Files owns bare F5 while the pointer is over the Files dock **or** the
+/// panel has keyboard focus. Everywhere else the terminal keeps its ordinary
+/// F5 escape sequence.
 fn sidebar_files_manual_refresh_key(
     key: &keyboard::Key,
     modifiers: keyboard::Modifiers,
@@ -147,8 +148,8 @@ enum SidebarNavigationKey {
 }
 
 /// Remote/local tree navigation owns Alt+Up and Alt+Home only while Files has
-/// the same explicit pointer scope as F5. Everywhere else the PTY receives the
-/// original key unchanged.
+/// the same shortcut scope as F5 (pointer over the dock or keyboard focus).
+/// Everywhere else the PTY receives the original key unchanged.
 fn sidebar_files_navigation_key(
     key: &keyboard::Key,
     modifiers: keyboard::Modifiers,
@@ -173,6 +174,10 @@ fn sidebar_files_navigation_key(
         keyboard::Key::Named(keyboard::key::Named::Home) => Some(SidebarNavigationKey::Home),
         _ => None,
     }
+}
+
+fn files_shortcut_scope(dock_open: bool, files_panel: bool, hovered: bool, focused: bool) -> bool {
+    dock_open && files_panel && (hovered || focused)
 }
 
 const SIDEBAR_SNAPSHOT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
@@ -879,6 +884,8 @@ static SIDEBAR_FILTER_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-filter-input"));
 static SIDEBAR_PATH_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-path-input"));
+static SIDEBAR_TREE_SCROLL_ID: once_cell::sync::Lazy<iced::widget::Id> =
+    once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-sidebar-tree-scroll"));
 static SEARCH_REPLACE_FIND_ID: once_cell::sync::Lazy<iced::widget::Id> =
     once_cell::sync::Lazy::new(|| iced::widget::Id::new("jterm-search-replace-find"));
 static CORRECTION_INPUT_ID: once_cell::sync::Lazy<iced::widget::Id> =
@@ -1937,6 +1944,30 @@ enum SidebarMenuAction {
     Refresh,
 }
 
+fn sidebar_menu_action_label(action: SidebarMenuAction, multi: usize) -> String {
+    match action {
+        SidebarMenuAction::OpenDirectory => "Open Folder".to_string(),
+        SidebarMenuAction::NewFile => "New File".to_string(),
+        SidebarMenuAction::NewFolder => "New Folder".to_string(),
+        SidebarMenuAction::Rename => "Rename".to_string(),
+        SidebarMenuAction::Delete => format!(
+            "Delete {multi} {}",
+            if multi == 1 { "item" } else { "items" }
+        ),
+        SidebarMenuAction::Copy => "Copy".to_string(),
+        SidebarMenuAction::Cut => "Cut".to_string(),
+        SidebarMenuAction::CopyPath => {
+            if multi > 1 {
+                "Copy Paths".to_string()
+            } else {
+                "Copy Path".to_string()
+            }
+        }
+        SidebarMenuAction::Paste => "Paste".to_string(),
+        SidebarMenuAction::Refresh => "Refresh".to_string(),
+    }
+}
+
 /// Open file-tree context menu: the right-clicked node, the pointer position
 /// frozen at press time, and the rows the actions apply to — the selection
 /// when the click landed inside it, otherwise just the clicked row.
@@ -1952,6 +1983,8 @@ struct SidebarMenuState {
     /// Exact Copy/Cut intent visible when the menu opened. Paste must not
     /// silently substitute a newer clipboard, even when its payload is equal.
     clipboard_id: Option<u64>,
+    /// Keyboard cursor into the enabled-skipping action list.
+    cursor: usize,
 }
 
 /// What the sidebar's modal text input is collecting a name for.
@@ -3332,6 +3365,8 @@ enum Message {
     SidebarRemoteFollowRetry,
     /// Pointer enter/exit on the dock gates the menu-anchor tracking below.
     SidebarHover(bool),
+    /// Click in the Files panel claims keyboard focus for tree walking.
+    SidebarFilesFocus,
     /// Window-space pointer position while hovering the dock; the file-ops
     /// menu anchors to the last one seen before the right-press.
     SidebarPointerMoved(iced::Point),
@@ -3342,6 +3377,8 @@ enum Message {
     SidebarFilterToggle,
     /// Live edit of the tree filter query.
     SidebarFilterInput(String),
+    /// Virtualized tree list scroll position.
+    SidebarTreeScrolled(f32, f32),
     /// Right-press on a tree row: open the file-ops menu for that node
     /// (path, is_dir).
     SidebarMenuOpen(u64, std::path::PathBuf, bool),
@@ -4724,6 +4761,13 @@ struct Frost {
     sidebar_drop_hint: bool,
     /// Pointer-over-dock flag gating the window-space pointer tracker.
     sidebar_hovered: bool,
+    /// Files panel owns arrow/Enter/Delete until the terminal is clicked or Esc.
+    sidebar_files_focused: bool,
+    /// Keyboard focus row in the Files tree (path of a visible node).
+    sidebar_tree_focus: Option<std::path::PathBuf>,
+    /// Virtualized tree scroll offset and last known viewport height.
+    sidebar_tree_offset_y: f32,
+    sidebar_tree_viewport_h: f32,
     /// Last window-space pointer position over the dock (menu anchor).
     sidebar_pointer: iced::Point,
     /// Transient status line under the files header (op failures/success);
@@ -4997,6 +5041,10 @@ impl Frost {
             sidebar_drop_debounce_generation: None,
             sidebar_drop_hint: false,
             sidebar_hovered: false,
+            sidebar_files_focused: false,
+            sidebar_tree_focus: None,
+            sidebar_tree_offset_y: 0.0,
+            sidebar_tree_viewport_h: 400.0,
             sidebar_pointer: iced::Point::ORIGIN,
             sidebar_notice: None,
             sidebar_hosts_epoch: 0,
@@ -5378,6 +5426,7 @@ impl Frost {
             && self.sidebar_menu.is_none()
             && self.sidebar_dialog.is_none()
             && self.sidebar_delete_confirm.is_none()
+            && !self.sidebar_files_focused
     }
 
     /// Search is intentionally non-modal for scrolling/selection. The remaining
@@ -5416,6 +5465,8 @@ impl Frost {
         self.sidebar_dialog = None;
         self.sidebar_delete_confirm = None;
         self.sidebar_hovered_row = None;
+        self.sidebar_tree_focus = None;
+        self.sidebar_tree_offset_y = 0.0;
         self.sidebar_drop_burst.clear();
         self.sidebar_drop_debounce_generation = None;
         self.sidebar_drop_hint = false;
@@ -5983,6 +6034,11 @@ impl Frost {
     fn toggle_sidebar(&mut self) -> Task<Message> {
         self.invalidate_sidebar_remote_follow_intent();
         self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
+            self.sidebar_files_focused = true;
+        } else {
+            self.sidebar_files_focused = false;
+        }
         // The cwd follow is local-only, exactly as in SetSidebarPanel.
         let follow_local = self.sidebar.location == remote_fs::FsLocation::Local;
         let request = if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
@@ -6309,6 +6365,8 @@ impl Frost {
     /// (dirs toggle, files type their path). Modifier clicks never toggle or
     /// insert.
     fn sidebar_row_click(&mut self, path: std::path::PathBuf, is_dir: bool) -> Task<Message> {
+        self.sidebar_files_focused = true;
+        self.sidebar_tree_focus = Some(path.clone());
         self.invalidate_sidebar_remote_follow_intent();
         if self.modifiers.control() {
             selection_toggle(&mut self.sidebar_selection, &path);
@@ -6336,6 +6394,284 @@ impl Frost {
             return Task::none();
         }
         self.update(Message::SidebarInsertPath(path))
+    }
+
+    fn files_shortcut_scope(&self) -> bool {
+        files_shortcut_scope(
+            self.dock_open(),
+            self.sidebar_panel == SidebarPanel::Files,
+            self.sidebar_hovered,
+            self.sidebar_files_focused,
+        )
+    }
+
+    fn sidebar_menu_action_list(
+        &self,
+        targets_len: usize,
+        is_dir: bool,
+    ) -> Vec<(SidebarMenuAction, bool, String)> {
+        let paste_available = self.sidebar_clipboard.is_some();
+        sidebar::files_menu_action_enabled(targets_len, is_dir, paste_available)
+            .into_iter()
+            .filter_map(|(id, enabled, _)| {
+                let action = match id {
+                    "open_directory" => SidebarMenuAction::OpenDirectory,
+                    "new_file" => SidebarMenuAction::NewFile,
+                    "new_folder" => SidebarMenuAction::NewFolder,
+                    "rename" => SidebarMenuAction::Rename,
+                    "delete" => SidebarMenuAction::Delete,
+                    "copy" => SidebarMenuAction::Copy,
+                    "cut" => SidebarMenuAction::Cut,
+                    "copy_path" => SidebarMenuAction::CopyPath,
+                    "paste" => SidebarMenuAction::Paste,
+                    "refresh" => SidebarMenuAction::Refresh,
+                    _ => return None,
+                };
+                Some((
+                    action,
+                    enabled,
+                    sidebar_menu_action_label(action, targets_len),
+                ))
+            })
+            .collect()
+    }
+
+    fn sidebar_menu_state(
+        &self,
+        path: std::path::PathBuf,
+        is_dir: bool,
+        targets: Vec<(std::path::PathBuf, bool)>,
+        generation: u64,
+    ) -> SidebarMenuState {
+        let actions = self.sidebar_menu_action_list(targets.len(), is_dir);
+        let enabled: Vec<bool> = actions.iter().map(|(_, on, _)| *on).collect();
+        SidebarMenuState {
+            path,
+            is_dir,
+            at: self.sidebar_pointer,
+            targets,
+            generation,
+            clipboard_id: self
+                .sidebar_clipboard
+                .as_ref()
+                .map(|clipboard| clipboard.id),
+            cursor: sidebar::first_enabled_menu_index(&enabled),
+        }
+    }
+
+    fn reveal_sidebar_tree_focus(&mut self) -> Task<Message> {
+        let Some(focus) = self.sidebar_tree_focus.clone() else {
+            return Task::none();
+        };
+        let items = self.sidebar_render_items();
+        let Some(index) = items
+            .iter()
+            .position(|item| item.node_path() == Some(focus.as_path()))
+        else {
+            return Task::none();
+        };
+        let offset = sidebar::sidebar_tree_reveal_offset(
+            index,
+            self.sidebar_tree_offset_y,
+            self.sidebar_tree_viewport_h,
+            items.len(),
+        );
+        self.sidebar_tree_offset_y = offset;
+        iced::widget::operation::scroll_to(
+            SIDEBAR_TREE_SCROLL_ID.clone(),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: offset },
+        )
+    }
+
+    fn sidebar_render_items(&self) -> Vec<sidebar::SidebarRenderItem> {
+        let filter = self
+            .sidebar_filter
+            .as_deref()
+            .and_then(|query| filter_match_set(&self.sidebar.root, query));
+        sidebar::collect_sidebar_render_items(&self.sidebar.root, filter.as_ref())
+    }
+
+    fn handle_sidebar_menu_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+    ) -> Task<Message> {
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+            self.sidebar_menu = None;
+            return Task::none();
+        }
+        let no_mod =
+            !modifiers.shift() && !modifiers.control() && !modifiers.alt() && !modifiers.logo();
+        let Some(menu) = self.sidebar_menu.as_ref() else {
+            return Task::none();
+        };
+        let actions = self.sidebar_menu_action_list(menu.targets.len(), menu.is_dir);
+        let enabled: Vec<bool> = actions.iter().map(|(_, on, _)| *on).collect();
+        let cursor = menu.cursor;
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if no_mod => {
+                if let Some(menu) = self.sidebar_menu.as_mut() {
+                    menu.cursor = sidebar::next_enabled_menu_index(&enabled, cursor, 1);
+                }
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if no_mod => {
+                if let Some(menu) = self.sidebar_menu.as_mut() {
+                    menu.cursor = sidebar::next_enabled_menu_index(&enabled, cursor, -1);
+                }
+            }
+            keyboard::Key::Named(keyboard::key::Named::Enter) if no_mod => {
+                if let Some((action, true, _)) = actions.get(cursor) {
+                    let action = *action;
+                    if let Some(menu) = self.sidebar_menu.take() {
+                        return self.execute_sidebar_menu_action(menu, action);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn handle_sidebar_files_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        repeat: bool,
+    ) -> Option<Task<Message>> {
+        if !self.sidebar_files_focused
+            || !self.dock_open()
+            || self.sidebar_panel != SidebarPanel::Files
+        {
+            return None;
+        }
+        let no_mod =
+            !modifiers.shift() && !modifiers.control() && !modifiers.alt() && !modifiers.logo();
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) && no_mod {
+            self.sidebar_files_focused = false;
+            return Some(Task::none());
+        }
+        if modifiers.control()
+            && !modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && matches!(key, keyboard::Key::Character(ch) if ch.eq_ignore_ascii_case("f"))
+            && !repeat
+        {
+            return Some(self.update(Message::SidebarFilterToggle));
+        }
+        let filter_typing = self.sidebar_filter.is_some();
+        if filter_typing
+            && !matches!(
+                key,
+                keyboard::Key::Named(
+                    keyboard::key::Named::ArrowUp
+                        | keyboard::key::Named::ArrowDown
+                        | keyboard::key::Named::ArrowLeft
+                        | keyboard::key::Named::ArrowRight
+                        | keyboard::key::Named::Enter
+                        | keyboard::key::Named::Delete
+                        | keyboard::key::Named::ContextMenu
+                        | keyboard::key::Named::F10
+                )
+            )
+        {
+            // Printable keys belong to the filter field while it is open.
+            return None;
+        }
+        let motion = match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if no_mod => {
+                Some(sidebar::TreeFocusMotion::Up)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if no_mod => {
+                Some(sidebar::TreeFocusMotion::Down)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if no_mod && !repeat => {
+                Some(sidebar::TreeFocusMotion::Left)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if no_mod && !repeat => {
+                Some(sidebar::TreeFocusMotion::Right)
+            }
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            let rows = self.sidebar_visible_rows();
+            let current = self.sidebar_tree_focus.clone();
+            let outcome = sidebar::apply_tree_focus_motion(
+                &rows,
+                |path| self.sidebar.node_is_expanded(path),
+                current.as_deref(),
+                motion,
+            );
+            return Some(match outcome {
+                Some(sidebar::TreeFocusOutcome::Move(path)) => {
+                    self.sidebar_tree_focus = Some(path);
+                    self.reveal_sidebar_tree_focus()
+                }
+                Some(sidebar::TreeFocusOutcome::Collapse(path)) => {
+                    self.sidebar.collapse_node(&path);
+                    self.sidebar_tree_focus = Some(path);
+                    self.reveal_sidebar_tree_focus()
+                }
+                Some(sidebar::TreeFocusOutcome::Expand(path)) => {
+                    self.sidebar_tree_focus = Some(path.clone());
+                    let task = if let Some(request) = self.sidebar.expand_node(&path) {
+                        self.queue_sidebar_load(request)
+                    } else {
+                        Task::none()
+                    };
+                    Task::batch([task, self.reveal_sidebar_tree_focus()])
+                }
+                None => Task::none(),
+            });
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) && no_mod && !repeat {
+            let Some(path) = self.sidebar_tree_focus.clone() else {
+                return Some(Task::none());
+            };
+            let is_dir = self.sidebar.node(&path).is_some_and(|node| node.is_dir);
+            return Some(self.sidebar_row_click(path, is_dir));
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Space)) && no_mod && !repeat {
+            if let Some(path) = self.sidebar_tree_focus.clone() {
+                selection_toggle(&mut self.sidebar_selection, &path);
+                self.sidebar_selection_anchor = Some(path);
+            }
+            return Some(Task::none());
+        }
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Delete)) && no_mod && !repeat {
+            let Some(path) = self.sidebar_tree_focus.clone() else {
+                return Some(Task::none());
+            };
+            let is_dir = self.sidebar.node(&path).is_some_and(|node| node.is_dir);
+            let rows = self.sidebar_visible_rows();
+            let targets = match menu_targets(&self.sidebar_selection, &rows, &path) {
+                Some(targets) => targets,
+                None => vec![(path.clone(), is_dir)],
+            };
+            let menu = self.sidebar_menu_state(path, is_dir, targets, self.sidebar.generation());
+            return Some(self.execute_sidebar_menu_action(menu, SidebarMenuAction::Delete));
+        }
+        let open_menu = matches!(key, keyboard::Key::Named(keyboard::key::Named::ContextMenu))
+            && no_mod
+            && !repeat
+            || (matches!(key, keyboard::Key::Named(keyboard::key::Named::F10))
+                && modifiers.shift()
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+                && !repeat);
+        if open_menu {
+            let Some(path) = self.sidebar_tree_focus.clone() else {
+                return Some(Task::none());
+            };
+            let is_dir = self.sidebar.node(&path).is_some_and(|node| node.is_dir);
+            return Some(self.update(Message::SidebarMenuOpen(
+                self.sidebar.generation(),
+                path,
+                is_dir,
+            )));
+        }
+        None
     }
 
     /// Run the confirmed deletion. The one absolute rule (never `/`) is
@@ -8677,6 +9013,7 @@ impl Frost {
             || self.sidebar_dialog.is_some()
             || self.sidebar_delete_confirm.is_some()
             || self.sidebar_menu.is_some()
+            || self.sidebar_files_focused
             || self.sidebar_filter.is_some()
             || self.tab_menu.is_some()
             || self.tab_switcher.is_some()
@@ -13718,10 +14055,7 @@ impl Frost {
                     // The sidebar file menu is pointer-driven; keep every
                     // keypress out of the PTY while it is visible.
                     if self.sidebar_menu.is_some() {
-                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                            self.sidebar_menu = None;
-                        }
-                        return Task::none();
+                        return self.handle_sidebar_menu_key(&key, modifiers);
                     }
                     // The tree filter is non-modal: while its input is
                     // focused the input captures typing; only Esc belongs to
@@ -13871,9 +14205,7 @@ impl Frost {
                     if self.handle_search_key(&key, modifiers, text.as_deref()) {
                         return Task::none();
                     }
-                    let files_scope = self.dock_open()
-                        && self.sidebar_panel == SidebarPanel::Files
-                        && self.sidebar_hovered;
+                    let files_scope = self.files_shortcut_scope();
                     if let Some(navigation) =
                         sidebar_files_navigation_key(&key, modifiers, repeat, files_scope)
                     {
@@ -13888,6 +14220,9 @@ impl Frost {
                         self.invalidate_sidebar_remote_follow_intent();
                         let request = self.sidebar.refresh();
                         return self.queue_sidebar_load(request);
+                    }
+                    if let Some(task) = self.handle_sidebar_files_key(&key, modifiers, repeat) {
+                        return task;
                     }
                     // Escape dismisses a visible block selection locally. It
                     // must not also reach the PTY: that would both clear the
@@ -14044,6 +14379,12 @@ impl Frost {
                     if self.handle_scroll_shortcut(&key, modifiers) {
                         return Task::none();
                     }
+                    if self.sidebar_files_focused
+                        && self.dock_open()
+                        && self.sidebar_panel == SidebarPanel::Files
+                    {
+                        return Task::none();
+                    }
                     let mut dead_input = false;
                     let Some(sess) = self.sessions.get_mut(self.active) else {
                         return Task::none();
@@ -14131,6 +14472,9 @@ impl Frost {
                 return self.handle_summary_activation(session_id, activation);
             }
             Message::MousePane(session_id, input) => {
+                if matches!(input, MouseInput::Press { .. }) {
+                    self.sidebar_files_focused = false;
+                }
                 if !self.terminal_mouse_active() {
                     // Only an app-owned release may cross modal ownership, and
                     // it still goes to its stable origin pane below. A local or
@@ -14566,6 +14910,7 @@ impl Frost {
                     self.invalidate_sidebar_remote_follow_intent();
                 }
                 self.sidebar_panel = panel;
+                self.sidebar_files_focused = panel == SidebarPanel::Files && self.sidebar_open;
                 // Opening the file tree should reflect the active tab's cwd.
                 // That follow is a local-filesystem notion only: with a remote
                 // location active, keep its root and just reload it.
@@ -14772,6 +15117,17 @@ impl Frost {
                 return self.poll_sidebar_remote_follow();
             }
             Message::SidebarHover(hovered) => self.sidebar_hovered = hovered,
+            Message::SidebarFilesFocus => {
+                if self.dock_open() && self.sidebar_panel == SidebarPanel::Files {
+                    self.sidebar_files_focused = true;
+                }
+            }
+            Message::SidebarTreeScrolled(offset_y, viewport_h) => {
+                self.sidebar_tree_offset_y = offset_y.max(0.0);
+                if viewport_h > 1.0 {
+                    self.sidebar_tree_viewport_h = viewport_h;
+                }
+            }
             Message::SidebarPointerMoved(position) => self.sidebar_pointer = position,
             Message::SidebarRowClick(generation, path, is_dir) => {
                 if !self.sidebar.accepts_generation(generation) {
@@ -14803,36 +15159,20 @@ impl Frost {
                         vec![(path.clone(), is_dir)]
                     }
                 };
-                self.sidebar_menu = Some(SidebarMenuState {
-                    path,
-                    is_dir,
-                    // Freeze the anchor now; the pointer moves on toward the
-                    // panel as soon as it appears.
-                    at: self.sidebar_pointer,
-                    targets,
-                    generation,
-                    clipboard_id: self
-                        .sidebar_clipboard
-                        .as_ref()
-                        .map(|clipboard| clipboard.id),
-                });
+                self.sidebar_menu =
+                    Some(self.sidebar_menu_state(path, is_dir, targets, generation));
             }
             Message::SidebarMenuOpenRoot(generation) => {
                 if !self.sidebar.accepts_generation(generation) {
                     return Task::none();
                 }
                 self.invalidate_sidebar_remote_follow_intent();
-                self.sidebar_menu = Some(SidebarMenuState {
-                    path: self.sidebar.current_dir.clone(),
-                    is_dir: true,
-                    at: self.sidebar_pointer,
-                    targets: vec![(self.sidebar.current_dir.clone(), true)],
+                self.sidebar_menu = Some(self.sidebar_menu_state(
+                    self.sidebar.current_dir.clone(),
+                    true,
+                    vec![(self.sidebar.current_dir.clone(), true)],
                     generation,
-                    clipboard_id: self
-                        .sidebar_clipboard
-                        .as_ref()
-                        .map(|clipboard| clipboard.id),
-                });
+                ));
             }
             Message::SidebarMenuClose => self.sidebar_menu = None,
             Message::SidebarMenuAction(action) => {
@@ -16034,12 +16374,25 @@ impl Frost {
     }
 
     /// Sidebar dock background, matching the theme's panel color.
-    fn panel_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+    fn panel_style_with_focus(
+        &self,
+        files_focused: bool,
+    ) -> impl Fn(&iced::Theme) -> container::Style {
         let bg = self.with_window_opacity(self.c_panel());
         let text = self.c_text();
+        let accent = self.c_accent();
         move |_| container::Style {
             text_color: Some(text),
             background: Some(bg.into()),
+            border: iced::Border {
+                color: if files_focused {
+                    accent
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: if files_focused { 1.0 } else { 0.0 },
+                radius: 0.0.into(),
+            },
             ..Default::default()
         }
     }
@@ -16131,40 +16484,55 @@ impl Frost {
     }
 
     /// File-tree row: the ghost button look, with an accent wash for selected
-    /// rows (kept on hover, slightly deeper).
+    /// rows (kept on hover, slightly deeper). A keyboard-focus row gets a left
+    /// accent bar; a drop target gets a stronger wash and outline.
     fn sidebar_row_style(
         &self,
         selected: bool,
+        keyboard_focus: bool,
+        drop_target: bool,
     ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
         let base = self.c_panel();
         let accent = self.c_accent();
         let text = self.c_text();
         move |_t, status| {
-            let bg = if selected {
-                Some(
-                    blend(
-                        base,
-                        accent,
-                        if status == button::Status::Hovered {
-                            0.34
-                        } else {
-                            0.24
-                        },
-                    )
-                    .into(),
-                )
+            let mut mix: f32 = if selected {
+                if status == button::Status::Hovered {
+                    0.34
+                } else {
+                    0.24
+                }
             } else {
                 match status {
-                    button::Status::Hovered => Some(blend(base, accent, 0.16).into()),
-                    _ => None,
+                    button::Status::Hovered => 0.16,
+                    _ => 0.0,
                 }
+            };
+            if drop_target {
+                mix = mix.max(0.40);
+            }
+            let bg = if mix > 0.0 {
+                Some(blend(base, accent, mix).into())
+            } else {
+                None
+            };
+            let border_w = if keyboard_focus {
+                2.0
+            } else if drop_target {
+                1.0
+            } else {
+                0.0
             };
             button::Style {
                 background: bg,
                 text_color: text,
                 border: iced::Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
+                    color: if border_w > 0.0 {
+                        accent
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: border_w,
                     radius: 4.0.into(),
                 },
                 ..Default::default()
@@ -16588,19 +16956,6 @@ impl Frost {
     /// multi-row selection the node-scoped actions apply to all targets and
     /// Rename/New are disabled (they only make sense for one row).
     fn sidebar_menu_view(&self, state: &SidebarMenuState) -> Element<'_, Message> {
-        let row_btn = |label: &str, action: SidebarMenuAction| {
-            button(text(label.to_string()).size(13))
-                .on_press(Message::SidebarMenuAction(action))
-                .padding([4, 10])
-                .width(Length::Fill)
-                .style(self.ghost_btn_style())
-        };
-        let disabled_btn = |label: &str| {
-            button(text(label.to_string()).size(13).style(text::secondary))
-                .padding([4, 10])
-                .width(Length::Fill)
-                .style(self.ghost_btn_style())
-        };
         let multi = state.targets.len();
         let header = if multi > 1 {
             format!("{multi} items selected")
@@ -16608,34 +16963,6 @@ impl Frost {
             crate::sidebar::bound_sidebar_path_label(&state.path)
         };
         let mut menu = column![text(header).size(12).style(text::secondary)].spacing(2);
-        if multi == 1 && state.is_dir {
-            menu = menu.push(row_btn("Open Folder", SidebarMenuAction::OpenDirectory));
-        }
-        if multi > 1 {
-            menu = menu.push(disabled_btn("New File"));
-            menu = menu.push(disabled_btn("New Folder"));
-            menu = menu.push(disabled_btn("Rename"));
-        } else {
-            menu = menu.push(row_btn("New File", SidebarMenuAction::NewFile));
-            menu = menu.push(row_btn("New Folder", SidebarMenuAction::NewFolder));
-            menu = menu.push(row_btn("Rename", SidebarMenuAction::Rename));
-        }
-        menu = menu.push(row_btn(
-            &format!(
-                "Delete {multi} {}",
-                if multi == 1 { "item" } else { "items" }
-            ),
-            SidebarMenuAction::Delete,
-        ));
-        menu = menu.push(row_btn("Copy", SidebarMenuAction::Copy));
-        menu = menu.push(row_btn("Cut", SidebarMenuAction::Cut));
-        menu = menu.push(row_btn(
-            if multi > 1 { "Copy Paths" } else { "Copy Path" },
-            SidebarMenuAction::CopyPath,
-        ));
-        // Paste is offered for any clipboard; within one location it copies
-        // or moves, across locations it downloads/uploads (remote→remote via
-        // a local relay). The label previews what the click would do.
         let paste_clip = self.sidebar_clipboard.as_ref();
         let paste_label = match paste_clip {
             Some(clip) => {
@@ -16659,16 +16986,34 @@ impl Frost {
             }
             None => "Paste".to_string(),
         };
-        let paste = button(text(paste_label).size(13))
-            .padding([4, 10])
-            .width(Length::Fill)
-            .style(self.ghost_btn_style());
-        menu = menu.push(if paste_clip.is_some() {
-            paste.on_press(Message::SidebarMenuAction(SidebarMenuAction::Paste))
-        } else {
-            paste
-        });
-        menu = menu.push(row_btn("Refresh", SidebarMenuAction::Refresh));
+        let actions = self.sidebar_menu_action_list(multi, state.is_dir);
+        for (index, (action, enabled, label)) in actions.into_iter().enumerate() {
+            let label = if action == SidebarMenuAction::Paste {
+                paste_label.clone()
+            } else {
+                label
+            };
+            let focused = index == state.cursor;
+            let row: Element<'_, Message> = if enabled {
+                let mut btn = button(text(label).size(13))
+                    .on_press(Message::SidebarMenuAction(action))
+                    .padding([4, 10])
+                    .width(Length::Fill);
+                btn = if focused {
+                    btn.style(self.tab_btn_style(true))
+                } else {
+                    btn.style(self.ghost_btn_style())
+                };
+                btn.into()
+            } else {
+                button(text(label).size(13).style(text::secondary))
+                    .padding([4, 10])
+                    .width(Length::Fill)
+                    .style(self.ghost_btn_style())
+                    .into()
+            };
+            menu = menu.push(row);
+        }
 
         const PANEL_W: f32 = 220.0;
         const ROW_H: f32 = 27.0;
@@ -18922,7 +19267,9 @@ impl Frost {
         container(column![header, panel].spacing(2))
             .width(Length::Fixed(self.dock_width))
             .height(Length::Fill)
-            .style(self.panel_style())
+            .style(self.panel_style_with_focus(
+                self.sidebar_files_focused && self.sidebar_panel == SidebarPanel::Files,
+            ))
             .into()
     }
 
@@ -19058,7 +19405,7 @@ impl Frost {
         }
         let back = tooltip(
             back_button,
-            container(text("Back (Alt+Left while over Files)").size(11))
+            container(text("Back (Alt+Left over Files or while Files focused)").size(11))
                 .padding(6)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
@@ -19071,7 +19418,7 @@ impl Frost {
         }
         let forward = tooltip(
             forward_button,
-            container(text("Forward (Alt+Right while over Files)").size(11))
+            container(text("Forward (Alt+Right over Files or while Files focused)").size(11))
                 .padding(6)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
@@ -19084,7 +19431,7 @@ impl Frost {
         }
         let up = tooltip(
             up_button,
-            container(text("Parent directory (Alt+Up while over Files)").size(11))
+            container(text("Parent directory (Alt+Up over Files or while Files focused)").size(11))
                 .padding(6)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
@@ -19101,7 +19448,7 @@ impl Frost {
         }
         let home = tooltip(
             home_button,
-            container(text("Location home (Alt+Home while over Files)").size(11))
+            container(text("Location home (Alt+Home over Files or while Files focused)").size(11))
                 .padding(6)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
@@ -19122,17 +19469,30 @@ impl Frost {
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
+        let refresh_help = {
+            let mut lines =
+                vec!["Refresh files (F5 while over Files or while Files focused)".to_string()];
+            if let Some(timing) = self.sidebar_scans.last_timing() {
+                lines.push(format!(
+                    "Last scan: queued {} · ran {}",
+                    compact_scan_duration(timing.queued_for),
+                    compact_scan_duration(timing.ran_for)
+                ));
+            }
+            lines.join("\n")
+        };
         let refresh_btn = tooltip(
             button(text("↻").size(12))
                 .on_press(Message::SidebarRefresh)
                 .padding([2, 6])
                 .style(self.ghost_btn_style()),
-            container(text("Refresh files (F5 while pointer is over Files)").size(11))
+            container(text(refresh_help).size(11).wrapping(text::Wrapping::Word))
                 .padding(6)
+                .max_width(360)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
-        let header = row![
+        let nav_row = row![
             back,
             forward,
             up,
@@ -19145,12 +19505,13 @@ impl Frost {
             .padding([2, 4])
             .width(Length::Fill)
             .style(self.ghost_btn_style()),
-            filter_btn,
-            hidden_btn,
-            refresh_btn,
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center);
+        let action_row = row![filter_btn, hidden_btn, refresh_btn]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
+        let header = column![nav_row, action_row].spacing(2);
         let (terminal_label, terminal_help) = sidebar_terminal_entry_copy(&self.sidebar.location);
         let terminal_entry = tooltip(
             button(text(terminal_label).size(11))
@@ -19235,39 +19596,6 @@ impl Frost {
         }
         let queued_scans = self.sidebar_scans.queued_len();
         let running_scans = self.sidebar_scans.running_len();
-        if queued_scans + running_scans > 0 {
-            let oldest = self
-                .sidebar_scans
-                .oldest_queued_age(std::time::Instant::now())
-                .map(|age| format!(" · oldest {}", compact_scan_duration(age)))
-                .unwrap_or_default();
-            rows.push(
-                container(
-                    text(format!(
-                        "Directory scans: {running_scans} running · {queued_scans} queued{oldest}"
-                    ))
-                    .size(10)
-                    .style(text::secondary),
-                )
-                .padding([1, 8])
-                .into(),
-            );
-        }
-        if let Some(timing) = self.sidebar_scans.last_timing() {
-            rows.push(
-                container(
-                    text(format!(
-                        "Last scan: queued {} · ran {}",
-                        compact_scan_duration(timing.queued_for),
-                        compact_scan_duration(timing.ran_for)
-                    ))
-                    .size(10)
-                    .style(text::secondary),
-                )
-                .padding([1, 8])
-                .into(),
-            );
-        }
         // The inline filter row: substring match over the loaded tree,
         // local and remote alike; Esc or the toggle closes and clears it.
         if let Some(query) = &self.sidebar_filter {
@@ -19448,30 +19776,35 @@ impl Frost {
             ),
             _ => {}
         }
+        let mut status_bits = Vec::new();
+        let mut status_stale = false;
+        if queued_scans + running_scans > 0 {
+            status_bits.push(format!("{running_scans} running · {queued_scans} queued"));
+        }
         if let Some(loaded_at) = self.sidebar.root.last_loaded_at {
             let age = std::time::Instant::now().saturating_duration_since(loaded_at);
             let (copy, stale) = sidebar_snapshot_age_copy(age);
-            rows.push(
-                container(text(format!("Snapshot: {copy}")).size(10).style(if stale {
-                    text::warning
-                } else {
-                    text::secondary
-                }))
-                .padding([1, 8])
-                .into(),
-            );
+            status_stale = stale;
+            status_bits.push(copy);
         }
         if self.sidebar.root.truncated {
+            status_bits.push(format!(
+                "first {} entries",
+                remote_fs::MAX_DIRECTORY_ENTRIES
+            ));
+        }
+        if !status_bits.is_empty() {
             rows.push(
                 container(
-                    text(format!(
-                        "Showing first {} entries",
-                        remote_fs::MAX_DIRECTORY_ENTRIES
-                    ))
-                    .size(10)
-                    .style(text::secondary),
+                    text(status_bits.join(" · "))
+                        .size(10)
+                        .style(if status_stale {
+                            text::warning
+                        } else {
+                            text::secondary
+                        }),
                 )
-                .padding([2, 8])
+                .padding([1, 8])
                 .into(),
             );
         }
@@ -19489,20 +19822,42 @@ impl Frost {
                     .into(),
             );
         }
-        for child in &self.sidebar.root.children {
-            if let Some(set) = &filter {
-                if !set.contains(&child.path) {
-                    continue;
-                }
-            }
-            self.collect_sidebar_nodes(child, 0, filter.as_ref(), &mut rows);
+        let chrome = mouse_area(iced::widget::Column::with_children(rows).spacing(1))
+            .on_press(Message::SidebarFilesFocus);
+        let items = sidebar::collect_sidebar_render_items(&self.sidebar.root, filter.as_ref());
+        let (start, count, pad_top, pad_bottom) = sidebar::sidebar_tree_window(
+            self.sidebar_tree_offset_y,
+            self.sidebar_tree_viewport_h,
+            items.len(),
+        );
+        let mut tree_rows: Vec<Element<'_, Message>> = Vec::new();
+        if pad_top > 0.0 {
+            tree_rows.push(Space::new().height(Length::Fixed(pad_top)).into());
         }
-        let list = iced::widget::Column::with_children(rows).spacing(1);
-        let list: Element<'_, Message> = scrollable(list).height(Length::Fill).into();
-        // Right-press on the empty area below the tree targets the root dir;
-        // row menus are captured by the rows' own mouse areas first.
-        mouse_area(list)
+        let drop_target = if self.sidebar_drop_hint {
+            self.sidebar_drop_target()
+        } else {
+            None
+        };
+        for item in items.iter().skip(start).take(count) {
+            tree_rows.push(self.sidebar_render_item(item, drop_target.as_deref()));
+        }
+        if pad_bottom > 0.0 {
+            tree_rows.push(Space::new().height(Length::Fixed(pad_bottom)).into());
+        }
+        let tree = iced::widget::Column::with_children(tree_rows).spacing(0);
+        let tree: Element<'_, Message> = scrollable(tree)
+            .id(SIDEBAR_TREE_SCROLL_ID.clone())
+            .height(Length::Fill)
+            .on_scroll(|viewport| {
+                Message::SidebarTreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
+            })
+            .into();
+        let tree = mouse_area(tree)
             .on_right_press(Message::SidebarMenuOpenRoot(self.sidebar.generation()))
+            .on_press(Message::SidebarFilesFocus);
+        column![chrome, container(tree).height(Length::Fill)]
+            .height(Length::Fill)
             .into()
     }
 
@@ -19594,117 +19949,116 @@ impl Frost {
             .into()
     }
 
-    /// Recursively flatten a file-tree node and its expanded descendants into
-    /// rows. With a filter match set, only matches and their (force-expanded)
-    /// ancestors render; expansion flags are never mutated, so clearing the
-    /// filter restores the pre-filter tree exactly.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_sidebar_nodes<'a>(
+    /// Paint one virtualized Files-tree slot (file row, inline error, or cap).
+    fn sidebar_render_item(
         &self,
-        node: &'a sidebar::FileTreeNode,
-        depth: usize,
-        filter: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
-        out: &mut Vec<Element<'a, Message>>,
-    ) {
-        let filtering = filter.is_some();
-        let indent = 6.0 + depth as f32 * 12.0;
-        let icon = if !node.is_dir {
-            "·"
-        } else {
-            match &node.state {
-                sidebar::DirectoryState::Loading | sidebar::DirectoryState::Refreshing => "◌",
-                sidebar::DirectoryState::Error(_) | sidebar::DirectoryState::RefreshError(_) => "!",
-                sidebar::DirectoryState::Unloaded | sidebar::DirectoryState::Loaded => {
-                    if node.expanded || filtering {
-                        "▾"
-                    } else {
-                        "▸"
-                    }
-                }
-            }
-        };
-        let mut label = row![
-            Space::new().width(Length::Fixed(indent)),
-            text(icon).size(12).width(Length::Fixed(14.0)),
-            text(crate::sidebar::bound_sidebar_filename(node.name.clone())).size(12),
-        ]
-        .spacing(2)
-        .align_y(iced::Alignment::Center);
-        match &node.state {
-            sidebar::DirectoryState::Loading => {
-                let copy = if self.sidebar.request_phase(&node.path)
-                    == Some(sidebar::DirectoryRequestPhase::Queued)
-                {
-                    "Queued…"
-                } else {
-                    "Loading…"
-                };
-                label = label.push(text(copy).size(10).style(text::secondary));
-            }
-            sidebar::DirectoryState::Refreshing => {
-                let copy = if self.sidebar.request_phase(&node.path)
-                    == Some(sidebar::DirectoryRequestPhase::Queued)
-                {
-                    "Refresh queued…"
-                } else {
-                    "Refreshing…"
-                };
-                label = label.push(text(copy).size(10).style(text::secondary));
-            }
-            _ => {}
-        }
-        let selected = self.sidebar_selection.contains(&node.path);
+        item: &sidebar::SidebarRenderItem,
+        drop_target: Option<&std::path::Path>,
+    ) -> Element<'_, Message> {
         let generation = self.sidebar.generation();
-        let row_button = button(label)
-            .on_press(Message::SidebarRowClick(
-                generation,
-                node.path.clone(),
-                node.is_dir,
-            ))
-            .width(Length::Fill)
-            .padding([1, 2])
-            .style(self.sidebar_row_style(selected));
-        // Left-click is modifier-aware (selection / toggle / insert);
-        // right-click opens the file-ops menu for this node. Enter/exit track
-        // the row under the pointer so a file drop can be hit-tested without
-        // layout geometry — row rects aren't knowable at view-build time, but
-        // the widget tree knows exactly which row the pointer is over.
-        out.push(
-            mouse_area(row_button)
-                .on_right_press(Message::SidebarMenuOpen(
-                    generation,
-                    node.path.clone(),
-                    node.is_dir,
-                ))
-                .on_enter(Message::SidebarRowHover(
-                    generation,
-                    Some((node.path.clone(), node.is_dir)),
-                ))
-                .on_exit(Message::SidebarRowHover(generation, None))
-                .into(),
-        );
-        if let sidebar::DirectoryState::Error(error)
-        | sidebar::DirectoryState::RefreshError(error) = &node.state
-        {
-            let error = if matches!(&node.state, sidebar::DirectoryState::RefreshError(_)) {
-                let age = node.last_loaded_at.map(|loaded_at| {
-                    sidebar_snapshot_age_copy(
-                        std::time::Instant::now().saturating_duration_since(loaded_at),
-                    )
-                    .0
-                });
-                match age {
-                    Some(age) => crate::sidebar::bound_sidebar_notice(format!(
-                        "Refresh failed: {error} · {age}"
-                    )),
-                    None => {
-                        crate::sidebar::bound_sidebar_notice(format!("Refresh failed: {error}"))
+        match item {
+            sidebar::SidebarRenderItem::Node {
+                name,
+                path,
+                is_dir,
+                depth,
+                expanded,
+                state,
+                ..
+            } => {
+                let indent = 6.0 + *depth as f32 * 12.0;
+                let filtering = self.sidebar_filter.is_some();
+                let icon = if !is_dir {
+                    "·"
+                } else {
+                    match state {
+                        sidebar::DirectoryState::Loading | sidebar::DirectoryState::Refreshing => {
+                            "◌"
+                        }
+                        sidebar::DirectoryState::Error(_)
+                        | sidebar::DirectoryState::RefreshError(_) => "!",
+                        sidebar::DirectoryState::Unloaded | sidebar::DirectoryState::Loaded => {
+                            if *expanded || filtering {
+                                "▾"
+                            } else {
+                                "▸"
+                            }
+                        }
                     }
+                };
+                let mut label = row![
+                    Space::new().width(Length::Fixed(indent)),
+                    text(icon).size(12).width(Length::Fixed(14.0)),
+                    text(crate::sidebar::bound_sidebar_filename(name.clone())).size(12),
+                ]
+                .spacing(2)
+                .align_y(iced::Alignment::Center);
+                match state {
+                    sidebar::DirectoryState::Loading => {
+                        let copy = if self.sidebar.request_phase(path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Queued…"
+                        } else {
+                            "Loading…"
+                        };
+                        label = label.push(text(copy).size(10).style(text::secondary));
+                    }
+                    sidebar::DirectoryState::Refreshing => {
+                        let copy = if self.sidebar.request_phase(path)
+                            == Some(sidebar::DirectoryRequestPhase::Queued)
+                        {
+                            "Refresh queued…"
+                        } else {
+                            "Refreshing…"
+                        };
+                        label = label.push(text(copy).size(10).style(text::secondary));
+                    }
+                    _ => {}
                 }
-            } else {
-                crate::sidebar::bound_sidebar_notice(error.to_string())
-            };
-            out.push(
+                let selected = self.sidebar_selection.contains(path);
+                let keyboard_focus = self.sidebar_tree_focus.as_deref() == Some(path.as_path());
+                let is_drop = drop_target.is_some_and(|target| target == path.as_path() && *is_dir);
+                let row_button = button(label)
+                    .on_press(Message::SidebarRowClick(generation, path.clone(), *is_dir))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(sidebar::SIDEBAR_TREE_ROW_HEIGHT))
+                    .padding([1, 2])
+                    .style(self.sidebar_row_style(selected, keyboard_focus, is_drop));
+                mouse_area(row_button)
+                    .on_right_press(Message::SidebarMenuOpen(generation, path.clone(), *is_dir))
+                    .on_enter(Message::SidebarRowHover(
+                        generation,
+                        Some((path.clone(), *is_dir)),
+                    ))
+                    .on_exit(Message::SidebarRowHover(generation, None))
+                    .into()
+            }
+            sidebar::SidebarRenderItem::Error {
+                path,
+                depth,
+                message,
+                refresh,
+                last_loaded_at,
+            } => {
+                let error = if *refresh {
+                    let age = last_loaded_at.map(|loaded_at| {
+                        sidebar_snapshot_age_copy(
+                            std::time::Instant::now().saturating_duration_since(loaded_at),
+                        )
+                        .0
+                    });
+                    match age {
+                        Some(age) => crate::sidebar::bound_sidebar_notice(format!(
+                            "Refresh failed: {message} · {age}"
+                        )),
+                        None => crate::sidebar::bound_sidebar_notice(format!(
+                            "Refresh failed: {message}"
+                        )),
+                    }
+                } else {
+                    crate::sidebar::bound_sidebar_notice(message)
+                };
                 container(
                     row![
                         text(error)
@@ -19713,40 +20067,28 @@ impl Frost {
                             .width(Length::Fill)
                             .style(text::danger),
                         button(text("Retry").size(10))
-                            .on_press(Message::SidebarRetry(generation, node.path.clone()))
+                            .on_press(Message::SidebarRetry(generation, path.clone()))
                             .padding([1, 6])
                             .style(self.ghost_btn_style()),
                     ]
                     .spacing(6)
                     .align_y(iced::Alignment::Center),
                 )
-                .padding([2, (20.0 + depth as f32 * 12.0) as u16])
-                .into(),
-            );
-        }
-        if node.is_dir && (node.expanded || filtering) {
-            for child in &node.children {
-                if let Some(set) = filter {
-                    if !set.contains(&child.path) {
-                        continue;
-                    }
-                }
-                self.collect_sidebar_nodes(child, depth + 1, filter, out);
+                .height(Length::Fixed(sidebar::SIDEBAR_TREE_ROW_HEIGHT))
+                .padding([2, (20.0 + *depth as f32 * 12.0) as u16])
+                .into()
             }
-            if node.truncated {
-                out.push(
-                    container(
-                        text(format!(
-                            "Showing first {} entries",
-                            remote_fs::MAX_DIRECTORY_ENTRIES
-                        ))
-                        .size(10)
-                        .style(text::secondary),
-                    )
-                    .padding([2, (20.0 + depth as f32 * 12.0) as u16])
-                    .into(),
-                );
-            }
+            sidebar::SidebarRenderItem::Truncated { depth } => container(
+                text(format!(
+                    "Showing first {} entries",
+                    remote_fs::MAX_DIRECTORY_ENTRIES
+                ))
+                .size(10)
+                .style(text::secondary),
+            )
+            .height(Length::Fixed(sidebar::SIDEBAR_TREE_ROW_HEIGHT))
+            .padding([2, (20.0 + *depth as f32 * 12.0) as u16])
+            .into(),
         }
     }
 
@@ -21488,11 +21830,20 @@ impl Frost {
             ),
             section("Panels"),
             bound("sidebar:toggle", "Toggle tabs / files sidebar"),
-            kb("F5 over Files", "Refresh the current file-tree root"),
             kb(
-                "Alt+Left/Right/Up/Home over Files",
+                "F5 over Files or while focused",
+                "Refresh the current file-tree root",
+            ),
+            kb(
+                "Alt+Left/Right/Up/Home over Files or while focused",
                 "Back / Forward / Parent / location home",
             ),
+            kb(
+                "Arrows / Enter / Space / Delete in focused Files",
+                "Walk the tree, open, multi-select, delete",
+            ),
+            kb("Ctrl+F in focused Files", "Filter loaded names"),
+            kb("Shift+F10 in focused Files", "File operations menu"),
             kb("Right-click folder → Open Folder", "Enter that directory"),
             kb("Ctrl+Shift+P", "Command palette"),
             bound("config:toggle", "Settings"),
@@ -27038,6 +27389,7 @@ mod tests {
             targets: vec![(removed.clone(), true)],
             generation: refresh.generation,
             clipboard_id: None,
+            cursor: 0,
         });
         let mut dialog = Some(SidebarDialogState {
             kind: SidebarDialogKind::Rename,
@@ -30269,7 +30621,7 @@ mod tests {
         ));
         assert!(
             !sidebar_files_manual_refresh_key(&f5, keyboard::Modifiers::NONE, false, false,),
-            "F5 outside the hovered Files dock must continue to the PTY",
+            "F5 outside the Files dock (and without Files focus) must continue to the PTY",
         );
         assert!(!sidebar_files_manual_refresh_key(
             &f5,
@@ -30333,6 +30685,15 @@ mod tests {
             sidebar_files_navigation_key(&keyboard::Key::Named(Named::Home), alt, true, true,),
             None
         );
+    }
+
+    #[test]
+    fn files_shortcut_scope_is_hover_or_keyboard_focus() {
+        assert!(files_shortcut_scope(true, true, true, false));
+        assert!(files_shortcut_scope(true, true, false, true));
+        assert!(!files_shortcut_scope(true, true, false, false));
+        assert!(!files_shortcut_scope(false, true, true, true));
+        assert!(!files_shortcut_scope(true, false, true, true));
     }
 
     #[test]

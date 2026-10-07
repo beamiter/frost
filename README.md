@@ -25,8 +25,13 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   切换都以新 generation 刷新当前根，旧可见性策略下的慢响应无法回写新树。刷新尤其针对慢远端采用
   stale-while-refresh：现有行、已加载子树与展开状态继续可见；成功结果按路径与类型增量对账，失败则
   保留最后一次成功内容并内联显示错误；初次加载错误和任意目录的刷新错误都提供可聚焦的 **Retry**，
-  并明确区分 Loading 与 Refreshing。Files 面板在鼠标位于其范围内时支持裸 `F5` 刷新，终端区域仍会
-  收到标准 F5 输入。每个目录请求另有同 generation 的 request id 与取消令牌；同路径新请求、根代次或
+  并明确区分 Loading 与 Refreshing。导航条、面包屑、过滤框与状态行固定在树上方，不随文件列表滚动。
+  树按视口虚拟化绘制（大目录只构建可见行）。点击 Files 面板、打开 Files 或 `Ctrl+\` 切到 Files 会
+  获得键盘焦点（dock 出现 accent 描边）：方向键走树，Left 折叠或跳到父行，Right 展开，Enter 与
+  单击同义，Space 多选，Delete 打开既有删除确认，Shift+F10 / 菜单键打开右键菜单（菜单内可用
+  方向键和 Enter），Ctrl+F 打开已加载树的名称过滤。Esc（无菜单/过滤时）或点击终端会把键盘交还 PTY。
+  Files 在指针位于其范围内 **或** 拥有键盘焦点时支持裸 `F5` 与 `Alt+Left/Right/Up/Home`；无焦点且
+  指针在终端时，这些键仍进 PTY。每个目录请求另有同 generation 的 request id 与取消令牌；同路径新请求、根代次或
   位置变化会主动退役排队与在途 list，排队任务在启动 SSH/Docker 前失败关闭，在途任务复用进程组
   watchdog 终止并回收。目录扫描由有界 coordinator 调度：最多 2 个并发、64 个排队，且每个远端
   authority 最多排队 16 个；根刷新与 Retry 优先，同时每 3 个高优先任务后给懒加载一次机会，高优先
@@ -42,8 +47,8 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   本次目录子树清理已消失路径的选择、悬停、拖放和延迟操作，跨父目录移动不会被先返回的扫描误删。
   Remote 路径导航先扫描候选目录，成功才原子换根；失败或乱序响应保留原树、选择和展开状态。
   标题栏提供 Back/Forward/Parent/Home、≤32 项成功历史、可点击面包屑与安全绝对路径栏；路径栏拒绝
-  超长、相对、`.`/`..`、控制与 Bidi 输入。鼠标位于 Files 时可用 `Alt+Left` / `Alt+Right` /
-  `Alt+Up` / `Alt+Home`，目录右键的 **Open Folder** 可把该目录设为当前根。成功离开的根进入按
+  超长、相对、`.`/`..`、控制与 Bidi 输入。指针在 Files 上或 Files 拥有键盘焦点时可用 `Alt+Left` /
+  `Alt+Right` / `Alt+Up` / `Alt+Home`，目录右键的 **Open Folder** 可把该目录设为当前根。成功离开的根进入按
   authority + path + Hidden 策略隔离的 8 项缓存，返回时仅在候选扫描成功后复用幸存子树；文件操作
   精确失效受影响父目录的缓存。Remote Home 复用切换位置时已验证的绝对 UTF-8 home，不重复启动探针。
   Remote list v4 由客户端下发 `4096 + 1` 硬上限与隐藏策略，远端到限即停，第 4097 项可靠标记
@@ -52,7 +57,7 @@ frost 是一个面向 Linux 的现代终端模拟器，使用 Rust、iced 和 wg
   同一主机的保存 profile 与临时 live socket 直接复制/移动），
   文件按流式传输、目录经 tar 转发（目录上传在解包前原子拒绝同名目标），实时显示传输进度
   （可随时取消，取消不会留下半截文件），全程有 512 MiB 上限与超时保护，远端失败会在面板内联显示。
-  从系统文件管理器把文件/目录拖放到文件树即可导入：落在目录行上导入该目录、其余位置导入当前根目录，
+  从系统文件管理器把文件/目录拖放到文件树即可导入：落在目录行上导入该目录（该行会高亮为放置目标）、其余位置导入当前根目录，
   远程位置走同一条上传通道；一次拖放最多 256 项、总量不超过传输上限，同名目标逐项拒绝。
   Files 标题区的 **Terminal here** 会从当前本地树根新建标签；远端时入口明确显示
   **Remote terminal (default dir)**，复用同一 profile 连接并进入其默认目录。远端 profile 列表
@@ -306,7 +311,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | Pane 缩放（临时全屏） | `Ctrl+Shift+Z` |
 | 交换相邻 Pane | `Ctrl+Shift+X` |
 | 关闭聚焦 Pane / 当前标签 | `Ctrl+Shift+W`（分屏时其余 pane 保持） |
-| 文件/标签侧栏 | `Ctrl+\` |
+| 文件/标签侧栏 | `Ctrl+\`（打开 Files 时侧栏获得键盘焦点；Esc 交还终端） |
 | Shell Agent | `Ctrl+Alt+G` |
 | 设置 | `Ctrl+Shift+O` |
 | 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
