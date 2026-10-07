@@ -6034,11 +6034,7 @@ impl Frost {
     fn toggle_sidebar(&mut self) -> Task<Message> {
         self.invalidate_sidebar_remote_follow_intent();
         self.sidebar_open = !self.sidebar_open;
-        if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
-            self.sidebar_files_focused = true;
-        } else {
-            self.sidebar_files_focused = false;
-        }
+        self.sidebar_files_focused = self.sidebar_open && self.sidebar_panel == SidebarPanel::Files;
         // The cwd follow is local-only, exactly as in SetSidebarPanel.
         let follow_local = self.sidebar.location == remote_fs::FsLocation::Local;
         let request = if self.sidebar_open && self.sidebar_panel == SidebarPanel::Files {
@@ -13003,7 +12999,7 @@ impl Frost {
                         .into_iter()
                         .map(|r| r.kind)
                         .collect();
-                    notifications = sess.terminal.pending_notifications.drain(..).collect();
+                    notifications = std::mem::take(&mut sess.terminal.pending_notifications);
                     completed_commands = sess.terminal.take_completed_commands();
                     // Retain the newest completion for the bottom bar; the
                     // drain above is the only place finished commands surface.
