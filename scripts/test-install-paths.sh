@@ -946,6 +946,9 @@ assert_contains "install backup cleanup success summary" \
 # before it can be reused. Inject a symlink after rm returns successfully: the
 # installer must abort, mark that name unowned, and leave the substitute for an
 # operator rather than overwrite it with ln/cp or delete it from the exit trap.
+# Pin the unlinked reservation until the substitute exists so filesystems that
+# immediately recycle inode numbers cannot turn this into a numeric-ABA test.
+# The separate symlink-snapshot numeric-ABA fixture below still exercises reuse.
 install_reservation_aba_tools="${TEST_ROOT}/install-reservation-aba-tools"
 install_reservation_aba_stage="${TEST_ROOT}/install-reservation-aba-stage"
 install_reservation_aba_prefix="/opt/frost-install-reservation-aba"
@@ -968,10 +971,12 @@ printf '%s\n' \
     'for argument do last=${argument}; done' \
     'case "${last}" in' \
     '    /proc/self/fd/*/.frost.rollback.*)' \
+    '        exec 9<"${last}"' \
     '        /usr/bin/rm "$@"' \
     '        parent=$(/usr/bin/readlink -- "${last%/*}")' \
     '        printf "%s/%s\n" "${parent}" "${last##*/}" >"${FROST_TEST_INSTALL_RESERVATION_ABA_PATH_LOG:?}"' \
     '        /usr/bin/ln -s -- "${FROST_TEST_INSTALL_RESERVATION_ABA_VICTIM:?}" "${last}"' \
+    '        exec 9<&-' \
     '        exit 0' \
     '        ;;' \
     'esac' \
@@ -1005,6 +1010,135 @@ assert_contains "rollback reservation ABA diagnostic" \
 [[ "$(<"${install_reservation_aba_binary}")" == \
     'old binary before reservation ABA' ]] \
     || fail "rollback reservation ABA changed the original binary"
+
+# A removed regular reservation can immediately donate its inode number to a
+# foreign symlink. Reproduce real numeric reuse, inject only once, and let any
+# second rm run normally so exit cleanup cannot hide an unauthorized unlink by
+# recreating the substitute. Find a suitable filesystem even with TMPDIR on
+# tmpfs; this case must exercise actual regular-to-symlink reuse, not skip it.
+install_reservation_reuse_root=
+for candidate in "${SCRIPT_DIR%/*}" "${TEST_ROOT}" /tmp /var/tmp; do
+    [[ -d "${candidate}" && -w "${candidate}" ]] || continue
+    if ! reuse_root="$(mktemp -d \
+        "${candidate}/frost-reservation-reuse.XXXXXX" 2>/dev/null)"; then
+        continue
+    fi
+    EXTRA_TEST_ROOTS+=("${reuse_root}")
+    reuse_probe="${reuse_root}/reservation"
+    : >"${reuse_probe}"
+    reuse_expected="$(stat -c '%d:%i' -- "${reuse_probe}")"
+    rm -f -- "${reuse_probe}"
+    for ((reuse_attempt = 0; reuse_attempt < 128; reuse_attempt++)); do
+        ln -s -- substitute "${reuse_probe}"
+        reuse_actual="$(stat -c '%d:%i' -- "${reuse_probe}")"
+        rm -f -- "${reuse_probe}"
+        if [[ "${reuse_actual}" == "${reuse_expected}" ]]; then
+            install_reservation_reuse_root="${reuse_root}"
+            break
+        fi
+    done
+    [[ -z "${install_reservation_reuse_root}" ]] || break
+done
+[[ -n "${install_reservation_reuse_root}" ]] \
+    || fail "numeric reservation ABA fixture needs a writable filesystem that reuses regular inodes for symlinks"
+install_reservation_reuse_tools="${TEST_ROOT}/install-reservation-reuse-tools"
+install_reservation_reuse_stage="${install_reservation_reuse_root}/stage"
+install_reservation_reuse_prefix="/opt/frost-install-reservation-reuse"
+install_reservation_reuse_binary="${install_reservation_reuse_stage}${install_reservation_reuse_prefix}/bin/frost"
+install_reservation_reuse_victim="${TEST_ROOT}/install-reservation-reuse-victim"
+install_reservation_reuse_path_log="${TEST_ROOT}/install-reservation-reuse-path"
+install_reservation_reuse_expected_log="${TEST_ROOT}/install-reservation-reuse-expected"
+install_reservation_reuse_actual_log="${TEST_ROOT}/install-reservation-reuse-actual"
+install_reservation_reuse_rm_state="${TEST_ROOT}/install-reservation-reuse-rm-count"
+mkdir -p "${install_reservation_reuse_tools}" \
+    "${install_reservation_reuse_binary%/*}"
+printf 'old binary before numeric reservation ABA\n' \
+    >"${install_reservation_reuse_binary}"
+printf 'numeric reservation ABA victim sentinel\n' \
+    >"${install_reservation_reuse_victim}"
+install_reservation_reuse_identity="$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_reservation_reuse_binary}")"
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'last=' \
+    'for argument do last=${argument}; done' \
+    'case "${last}" in' \
+    '    /proc/self/fd/*/.frost.rollback.*)' \
+    '        state=${FROST_TEST_INSTALL_RESERVATION_REUSE_RM_STATE:?}' \
+    '        count=0' \
+    '        [ ! -f "${state}" ] || read -r count <"${state}"' \
+    '        count=$((count + 1))' \
+    '        printf "%s\n" "${count}" >"${state}"' \
+    '        [ "${count}" -eq 1 ] || exec /usr/bin/rm "$@"' \
+    '        parent=$(/usr/bin/readlink -- "${last%/*}")' \
+    '        printf "%s/%s\n" "${parent}" "${last##*/}" >"${FROST_TEST_INSTALL_RESERVATION_REUSE_PATH_LOG:?}"' \
+    '        expected=$(/usr/bin/stat -c "%d:%i" -- "${last}")' \
+    '        printf "%s\n" "${expected}" >"${FROST_TEST_INSTALL_RESERVATION_REUSE_EXPECTED_LOG:?}"' \
+    '        /usr/bin/rm "$@"' \
+    '        actual=' \
+    '        attempt=0' \
+    '        while [ "${attempt}" -lt 20000 ]; do' \
+    '            /usr/bin/ln -s -- "${FROST_TEST_INSTALL_RESERVATION_REUSE_VICTIM:?}" "${last}"' \
+    '            actual=$(/usr/bin/stat -c "%d:%i" -- "${last}")' \
+    '            [ "${actual}" != "${expected}" ] || break' \
+    '            /usr/bin/rm -f -- "${last}"' \
+    '            attempt=$((attempt + 1))' \
+    '        done' \
+    '        [ "${actual}" = "${expected}" ] || exit 97' \
+    '        printf "%s\n" "${actual}" >"${FROST_TEST_INSTALL_RESERVATION_REUSE_ACTUAL_LOG:?}"' \
+    '        exit 0' \
+    '        ;;' \
+    'esac' \
+    'exec /usr/bin/rm "$@"' \
+    >"${install_reservation_reuse_tools}/rm"
+chmod 0755 "${install_reservation_reuse_tools}/rm"
+if env HOME="${TEST_HOME}" PATH="${install_reservation_reuse_tools}:${TEST_PATH}" \
+    FROST_TEST_INSTALL_RESERVATION_REUSE_RM_STATE="${install_reservation_reuse_rm_state}" \
+    FROST_TEST_INSTALL_RESERVATION_REUSE_PATH_LOG="${install_reservation_reuse_path_log}" \
+    FROST_TEST_INSTALL_RESERVATION_REUSE_EXPECTED_LOG="${install_reservation_reuse_expected_log}" \
+    FROST_TEST_INSTALL_RESERVATION_REUSE_ACTUAL_LOG="${install_reservation_reuse_actual_log}" \
+    FROST_TEST_INSTALL_RESERVATION_REUSE_VICTIM="${install_reservation_reuse_victim}" \
+    DESTDIR="${install_reservation_reuse_stage}" "${INSTALLER}" \
+    --binary "${prebuilt_binary}" --prefix "${install_reservation_reuse_prefix}" \
+    --no-desktop >"${TEST_ROOT}/install-reservation-reuse.log" 2>&1; then
+    fail "installer accepted a numerically reused rollback reservation name"
+fi
+assert_regular_file "numeric reservation ABA inode-reuse marker" \
+    "${install_reservation_reuse_actual_log}"
+install_reservation_reuse_expected="$(<"${install_reservation_reuse_expected_log}")"
+install_reservation_reuse_actual="$(<"${install_reservation_reuse_actual_log}")"
+[[ "${install_reservation_reuse_actual}" == \
+    "${install_reservation_reuse_expected}" ]] \
+    || fail "numeric reservation ABA fixture did not reuse the regular reservation inode"
+install_reservation_reuse_path="$(<"${install_reservation_reuse_path_log}")"
+[[ -L "${install_reservation_reuse_path}" ]] \
+    || fail "numeric reservation ABA cleanup deleted the foreign substitute"
+[[ "$(<"${install_reservation_reuse_rm_state}")" == 1 ]] \
+    || fail "numeric reservation ABA cleanup retried the reservation unlink"
+[[ "$(readlink -- "${install_reservation_reuse_path}")" == \
+    "${install_reservation_reuse_victim}" ]] \
+    || fail "numeric reservation ABA cleanup changed the substitute target"
+[[ "$(stat -c '%d:%i' -- "${install_reservation_reuse_path}")" == \
+    "${install_reservation_reuse_expected}" ]] \
+    || fail "numeric reservation ABA cleanup changed the substitute inode"
+[[ "$(<"${install_reservation_reuse_victim}")" == \
+    'numeric reservation ABA victim sentinel' ]] \
+    || fail "numeric reservation ABA followed the substitute"
+[[ "$(stat -c '%d:%i:%u:%g:%a' -- \
+    "${install_reservation_reuse_binary}")" == \
+    "${install_reservation_reuse_identity}" ]] \
+    || fail "numeric reservation ABA changed the original binary inode"
+[[ "$(<"${install_reservation_reuse_binary}")" == \
+    'old binary before numeric reservation ABA' ]] \
+    || fail "numeric reservation ABA changed the original binary"
+assert_contains "numeric reservation ABA fail-closed diagnostic" \
+    "$(<"${TEST_ROOT}/install-reservation-reuse.log")" \
+    "cannot prepare rollback backup beside ${install_reservation_reuse_binary}"
+assert_contains "numeric reservation ABA cleanup refusal" \
+    "$(<"${TEST_ROOT}/install-reservation-reuse.log")" \
+    "refusing to remove changed rollback backup ${install_reservation_reuse_path}"
 
 # A successful hardlink has a known identity: it must be the original target's
 # inode. Replace that link before ln returns zero and prove the unexpected name

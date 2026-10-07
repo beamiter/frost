@@ -1415,6 +1415,12 @@ prepare_install_backups() {
                 || die "install destination directory changed while reserving backup: ${directory}"
             path_matches_identity "${dest_path}" "${original_identity}" \
                 || die "install target changed while reserving backup: ${dest}"
+            # Once removal starts, a surviving name may be a foreign inode
+            # even when its numeric device/inode pair was immediately reused.
+            # Relinquish cleanup ownership before rm, including failure or
+            # signal paths; retain an ambiguous placeholder rather than risk
+            # unlinking a replacement a second time from the exit trap.
+            INSTALL_BACKUP_IDENTITIES[index]=""
             rm -f -- "${INSTALL_BACKUPS[index]}" || :
             if [[ -e "${INSTALL_BACKUPS[index]}" \
                 || -L "${INSTALL_BACKUPS[index]}" ]]; then
