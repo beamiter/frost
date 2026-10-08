@@ -19,17 +19,25 @@ impl ReadingHistory {
         self.cursor = self.visits.len() - 1;
     }
 
-    pub fn navigate(&mut self, live: &[u64], older: bool) -> Option<u64> {
+    pub fn can_navigate(&self, live: &[u64], older: bool) -> bool {
+        self.next_index(live, older).is_some()
+    }
+
+    fn next_index(&self, live: &[u64], older: bool) -> Option<usize> {
         // Keep visit positions (including repeated IDs) while skipping evicted
         // targets. Pruning first would move the cursor or skip its nearest neighbor.
-        let next = if older {
+        if older {
             (0..self.cursor)
                 .rev()
                 .find(|index| live.contains(&self.visits[*index]))
         } else {
             (self.cursor.saturating_add(1)..self.visits.len())
                 .find(|index| live.contains(&self.visits[*index]))
-        }?;
+        }
+    }
+
+    pub fn navigate(&mut self, live: &[u64], older: bool) -> Option<u64> {
+        let next = self.next_index(live, older)?;
         self.cursor = next;
         Some(self.visits[next])
     }
@@ -99,6 +107,23 @@ mod tests {
         h.seen_through = Some(3);
         assert_eq!(h.unseen([2, 3, 4, 5].into_iter()), 2);
     }
+    #[test]
+    fn navigation_availability_tracks_boundaries_without_moving_cursor() {
+        let mut h = ReadingHistory::default();
+        assert!(!h.can_navigate(&[], true));
+        assert!(!h.can_navigate(&[], false));
+        h.visit(10);
+        h.visit(20);
+        h.visit(30);
+        assert!(h.can_navigate(&[10, 30], true));
+        assert!(!h.can_navigate(&[10, 30], false));
+        assert_eq!(h.navigate(&[10, 30], true), Some(10));
+        assert!(!h.can_navigate(&[10, 30], true));
+        assert!(h.can_navigate(&[10, 30], false));
+        assert_eq!(h.navigate(&[10, 30], false), Some(30));
+        assert!(!h.can_navigate(&[30], true));
+    }
+
     #[test]
     fn unicode_preview_is_bounded_and_explicit() {
         let s = preview("你好世界", 7);

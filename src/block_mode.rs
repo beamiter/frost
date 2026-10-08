@@ -371,18 +371,22 @@ where
 {
     let mut output = String::new();
     let mut block_count = 0usize;
+    let mut retained_count = 0usize;
     for (id, command, truncated) in zones {
         if !selection.contains(id) {
             continue;
+        }
+        retained_count += 1;
+        // Missing text is background only when metadata says it is complete.
+        // Reject an incomplete selected member before skipping empty text.
+        if truncated {
+            return Err(SelectedCommandsError::Truncated);
         }
         let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
             continue;
         };
         if command_text_is_unsafe(command) {
             return Err(SelectedCommandsError::Unsafe);
-        }
-        if truncated {
-            return Err(SelectedCommandsError::Truncated);
         }
         let separator = usize::from(!output.is_empty());
         let Some(next_len) = output
@@ -401,7 +405,9 @@ where
         output.push_str(command);
         block_count += 1;
     }
-    if output.is_empty() {
+    if retained_count != selection.len() {
+        Err(SelectedCommandsError::Truncated)
+    } else if output.is_empty() {
         Err(SelectedCommandsError::Empty)
     } else {
         Ok(SelectedCommands {
@@ -3219,6 +3225,70 @@ mod tests {
         assert_eq!(
             selected_commands(zones, &selection, 256),
             Err(SelectedCommandsError::Empty)
+        );
+    }
+
+    #[test]
+    fn selected_commands_reject_missing_or_blank_truncated_members_atomically() {
+        let mut selection = BlockSelection::default();
+        selection.select_all(&[1, 2]);
+        for missing in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                selected_commands(
+                    [(1, Some("safe"), false), (2, missing, true)],
+                    &selection,
+                    256
+                ),
+                Err(SelectedCommandsError::Truncated),
+                "incomplete selected member {missing:?} must not disappear"
+            );
+        }
+        selection.select_all(&[1]);
+        assert!(
+            selected_commands([(1, Some("safe"), false), (2, None, true)], &selection, 256).is_ok()
+        );
+    }
+
+    #[test]
+    fn selected_commands_reject_missing_retained_identity() {
+        let mut selection = BlockSelection::default();
+        selection.select_all(&[1, 2]);
+        assert_eq!(
+            selected_commands([(1, Some("safe"), false)], &selection, 256),
+            Err(SelectedCommandsError::Truncated)
+        );
+    }
+
+    #[test]
+    fn selected_commands_preserve_terminal_truncation_metadata() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07safe\r\n\x1b]133;C;cmdline_url=safe\x07ok\r\n\x1b]133;D;0\x07");
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;C;cmd_truncated=1\x07lost command\r\n\x1b]133;D;0\x07");
+        let incomplete = terminal.command_zones.back().unwrap();
+        assert!(incomplete.command_truncated);
+        assert!(incomplete
+            .command
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty()));
+        let mut selection = BlockSelection::default();
+        selection.select_all(
+            &terminal
+                .command_zones
+                .iter()
+                .map(|z| z.id)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            selected_commands(
+                terminal.command_zones.iter().map(|z| (
+                    z.id,
+                    z.command.as_deref(),
+                    z.command_truncated
+                )),
+                &selection,
+                256
+            ),
+            Err(SelectedCommandsError::Truncated)
         );
     }
 

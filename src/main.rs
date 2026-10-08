@@ -1810,6 +1810,7 @@ struct BlockReview {
     title: String,
     body: String,
     commands: Option<String>,
+    command_error: Option<String>,
     bracketed: bool,
 }
 
@@ -1821,9 +1822,12 @@ impl BlockReview {
         commands: &str,
         bracketed: bool,
     ) -> bool {
+        self.matches_commands(session_id, ids, commands) && self.bracketed == bracketed
+    }
+
+    fn matches_commands(&self, session_id: usize, ids: &[u64], commands: &str) -> bool {
         self.session_id == session_id
             && self.ids == ids
-            && self.bracketed == bracketed
             && self.commands.as_deref() == Some(commands)
     }
 }
@@ -3553,6 +3557,7 @@ enum Message {
     BlockReviewClose,
     BlockReviewKeepOpen,
     BlockReviewInsert,
+    BlockReviewCopy,
     BlockReadingNavigate(bool),
     BlockGoLive,
     BlockSearchInput(String),
@@ -6785,7 +6790,7 @@ impl Frost {
             0.0
         } else if self.term_width() < 220.0 {
             116.0
-        } else if self.term_width() < 340.0 {
+        } else if self.term_width() < 430.0 {
             90.0
         } else {
             64.0
@@ -16226,6 +16231,7 @@ impl Frost {
             Message::BlockReviewClose => self.block_review = None,
             Message::BlockReviewKeepOpen => {}
             Message::BlockReviewInsert => return self.confirm_block_review(),
+            Message::BlockReviewCopy => return self.copy_block_review(),
             Message::BlockReadingNavigate(older) => {
                 if self.ensure_block_action_available("Reading history") {
                     let target = self.sessions.get_mut(self.active).and_then(|sess| {
@@ -18422,18 +18428,38 @@ impl Frost {
         } else {
             format!("Live · {} blocks", sess.terminal.command_zones.len())
         };
-        let control = |label: &'static str, message| {
+        let control = |label: &'static str, message, enabled: bool| {
+            let ghost = self.ghost_btn_style();
             button(text(label).size(11))
-                .on_press(message)
+                .on_press_maybe(enabled.then_some(message))
                 .padding([4, 7])
-                .style(self.ghost_btn_style())
+                .style(move |theme, status| {
+                    let mut style = ghost(theme, status);
+                    if status == button::Status::Disabled {
+                        style.text_color.a *= 0.4;
+                    }
+                    style
+                })
         };
+        let live_ids: Vec<_> = sess.terminal.command_zones.iter().map(|z| z.id).collect();
         let navigation = row![
-            control("←", Message::BlockReadingNavigate(true)),
-            control("→", Message::BlockReadingNavigate(false)),
-            control("Browse", Message::BlockBrowse),
-            control("Details", Message::BlockReviewOpen),
-            control("Review selection", Message::BlockReviewSelected),
+            control(
+                "Back",
+                Message::BlockReadingNavigate(true),
+                sess.block_reading.can_navigate(&live_ids, true)
+            ),
+            control(
+                "Forward",
+                Message::BlockReadingNavigate(false),
+                sess.block_reading.can_navigate(&live_ids, false)
+            ),
+            control("Browse", Message::BlockBrowse, !live_ids.is_empty()),
+            control("Details", Message::BlockReviewOpen, !live_ids.is_empty()),
+            control(
+                "Review selection",
+                Message::BlockReviewSelected,
+                !sess.block_selection.is_empty()
+            ),
         ]
         .spacing(3)
         .wrap();
@@ -18449,7 +18475,7 @@ impl Frost {
                 row![
                     text(status).size(11),
                     Space::new().width(Length::Fill),
-                    control("Go live", Message::BlockGoLive)
+                    control("Go live", Message::BlockGoLive, reading)
                 ]
                 .align_y(iced::Alignment::Center),
                 navigation
@@ -18487,9 +18513,19 @@ impl Frost {
             zone.completion_provenance,
         )
         .unwrap_or_else(|| "Background output".into());
+        let status = if zone.command_truncated
+            && zone
+                .command
+                .as_deref()
+                .is_none_or(|command| command.trim().is_empty())
+        {
+            "Command unavailable; completion metadata retained".to_string()
+        } else {
+            status
+        };
         let body = format!(
             "Command\n{}\n\nWorking directory\n{}\n\nResult\n{}\nDuration: {}\nFinished (Unix ms): {}\n\nProvenance\n{}\nCommand: {}{}\nRows: {}\nOutput source: {}\n\nOutput (text preview; images remain in the terminal)\n{}",
-            block_review::preview(zone.command.as_deref().unwrap_or("No command: background output"), 65536),
+            block_review::preview(zone.command.as_deref().unwrap_or(if zone.command_truncated { "Command unavailable" } else { "No command: background output" }), 65536),
             block_review::preview(zone.cwd.as_deref().unwrap_or("Not reported"), 8192), status,
             zone.duration_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "Not reported".into()),
             zone.finished_at_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "Not reported".into()),
@@ -18514,6 +18550,7 @@ impl Frost {
             title: format!("Block #{id} · details"),
             body,
             commands: None,
+            command_error: None,
             bracketed: false,
         });
         Task::none()
@@ -18534,20 +18571,23 @@ impl Frost {
             &sess.block_selection,
             crate::review_text::MAX_PROMPT_INSERT_BYTES,
         );
-        let commands = match commands {
-            Ok(commands) => commands,
-            Err(error) => {
-                self.push_toast(
-                    match error {
-                        block_mode::SelectedCommandsError::Empty => "Select at least one command block to review".to_string(),
-                        block_mode::SelectedCommandsError::Truncated => "A selected command is truncated or unavailable; it cannot be inserted".to_string(),
-                        block_mode::SelectedCommandsError::TooLarge => "Selected commands exceed the safe prompt-insertion budget".to_string(),
-                        block_mode::SelectedCommandsError::Unsafe => "A selected command contains unsafe control or visual-spoofing characters".to_string(),
-                    },
-                    ToastKind::Warning,
-                );
-                return Task::none();
-            }
+        if sess.block_selection.is_empty() {
+            self.push_toast(
+                "Select at least one retained block to review",
+                ToastKind::Info,
+            );
+            return Task::none();
+        }
+        // Inspection is independent of whether any command can safely leave
+        // this surface. Never make an incomplete batch look like a partial success.
+        let (commands, command_error) = match commands {
+            Ok(commands) if sess.block_selection.len() <= 128 => (Some(commands), None),
+            result => (None, Some(match result {
+                Err(block_mode::SelectedCommandsError::Empty) => "No command text in this selection; background output can still be inspected.",
+                Err(block_mode::SelectedCommandsError::Truncated) => "A selected command is truncated or unavailable. Copy and Insert refuse the entire selection.",
+                Err(block_mode::SelectedCommandsError::Unsafe) => "A selected command contains unsafe controls or visual-spoofing characters. Copy and Insert refuse the entire selection.",
+                _ => "Selection exceeds the safe review budget. Copy and Insert refuse the entire selection; select fewer blocks.",
+            }.to_string())),
         };
         let bracketed = sess.terminal.is_bracketed_paste_enabled();
         let ids = sess
@@ -18555,6 +18595,7 @@ impl Frost {
             .command_zones
             .iter()
             .filter(|z| sess.block_selection.contains(z.id))
+            .take(128)
             .map(|z| z.id)
             .collect::<Vec<_>>();
         let mut sources = String::new();
@@ -18579,30 +18620,58 @@ impl Frost {
                 block_review::preview(zone.cwd.as_deref().unwrap_or("not reported"), 256)
             ));
         }
-        let body = format!("{} command(s), in terminal order. Review the exact retained command text below.\n{}\n\nSources\n{}\nCommands\n{}",
-            commands.block_count,
-            if bracketed { "Insert places these commands in the editable prompt. It does not run them." }
+        let mut preview = String::new();
+        for zone in sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|z| ids.contains(&z.id))
+        {
+            if preview.len() >= 65536 {
+                preview.push_str("\n[Selection preview clipped]");
+                break;
+            }
+            preview.push_str(&format!(
+                "#{}{}\n{}\n\n",
+                zone.id,
+                if zone.command_truncated {
+                    " · TRUNCATED / unavailable"
+                } else {
+                    ""
+                },
+                block_review::preview(
+                    zone.command
+                        .as_deref()
+                        .unwrap_or("No retained command text"),
+                    65536usize.saturating_sub(preview.len())
+                )
+            ));
+        }
+        let body = format!("{} selected block(s), in terminal order.{}\n{}\nInsertion uses the current prompt folder; it does not change to the original folders shown below.\n\nSources\n{}\nCommands (safe display)\n{}",
+            sess.block_selection.len(), if sess.block_selection.len() > 128 { " Only the first 128 are shown." } else { "" },
+            if bracketed { "Insert places commands in the editable prompt. It does not run them." }
             else { "Bracketed paste is disabled: ONLY THE FIRST LOGICAL LINE will be inserted. Nothing is run." },
-            sources,
-            block_review::preview(&commands.text, crate::review_text::MAX_PROMPT_INSERT_BYTES * 2));
+            sources, preview);
         self.block_review = Some(BlockReview {
             session_id: sess.id,
             ids,
             title: "Review selected commands".into(),
             body,
-            commands: Some(commands.text),
+            commands: commands.map(|commands| commands.text),
+            command_error,
             bracketed,
         });
         Task::none()
     }
 
-    fn confirm_block_review(&mut self) -> Task<Message> {
-        let Some(review) = self.block_review.take() else {
-            return Task::none();
-        };
-        let valid = self.sessions.get(self.active).is_some_and(|sess| {
-            if sess.id != review.session_id
-                || sess.terminal.is_bracketed_paste_enabled() != review.bracketed
+    /// Clipboard and prompt admission resolve current retained IDs and raw text,
+    /// not the escaped review display. Copy deliberately ignores prompt state.
+    fn block_review_is_current(&self, review: &BlockReview, insertion: bool) -> bool {
+        self.sessions.get(self.active).is_some_and(|sess| {
+            if !self.config.block_mode
+                || sess.terminal.is_alt_buffer_active()
+                || sess.id != review.session_id
+                || (insertion && sess.terminal.is_bracketed_paste_enabled() != review.bracketed)
             {
                 return false;
             }
@@ -18622,15 +18691,44 @@ impl Frost {
                 crate::review_text::MAX_PROMPT_INSERT_BYTES,
             );
             commands.ok().is_some_and(|commands| {
-                review.matches_selection(
-                    sess.id,
-                    &ids,
-                    &commands.text,
-                    sess.terminal.is_bracketed_paste_enabled(),
-                )
+                if insertion {
+                    review.matches_selection(
+                        sess.id,
+                        &ids,
+                        &commands.text,
+                        sess.terminal.is_bracketed_paste_enabled(),
+                    )
+                } else {
+                    review.matches_commands(sess.id, &ids, &commands.text)
+                }
             })
-        });
-        if !valid {
+        })
+    }
+
+    fn copy_block_review(&mut self) -> Task<Message> {
+        let Some(review) = self.block_review.as_ref() else {
+            return Task::none();
+        };
+        if !self.block_review_is_current(review, false) {
+            self.push_toast(
+                "Selection changed or cannot be copied safely. Review it again.",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        let commands = review.commands.clone().expect("validated command payload");
+        self.push_toast(
+            "Selected commands copied. Nothing was sent to the terminal.",
+            ToastKind::Info,
+        );
+        iced::clipboard::write(commands)
+    }
+
+    fn confirm_block_review(&mut self) -> Task<Message> {
+        let Some(review) = self.block_review.take() else {
+            return Task::none();
+        };
+        if !self.block_review_is_current(&review, true) {
             self.push_toast(
                 "Review changed or expired. Review the selection again before inserting.",
                 ToastKind::Warning,
@@ -18654,19 +18752,30 @@ impl Frost {
             .on_press(Message::BlockReviewClose)
             .style(self.ghost_btn_style())]
         .spacing(8);
-        if review.commands.is_some() {
+        if review.commands.is_some() || review.command_error.is_some() {
+            let valid_commands = self.block_review_is_current(review, false);
+            actions = actions.push(
+                button(text("Copy commands").size(12))
+                    .on_press_maybe(valid_commands.then_some(Message::BlockReviewCopy)),
+            );
             let blocker = self
                 .sessions
                 .get(self.active)
                 .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()));
             let mut insert = button(text("Insert into prompt · not run").size(12));
-            if live && blocker.is_none() {
+            if live && self.block_review_is_current(review, true) && blocker.is_none() {
                 insert = insert.on_press(Message::BlockReviewInsert);
             }
             actions = actions.push(insert);
         }
-        let status = if !live {
+        let status = if let Some(reason) = review.command_error.as_deref() {
+            reason
+        } else if !live {
             "Source changed or was evicted. Close and reopen to review the current pane."
+        } else if review.commands.is_some() && !self.block_review_is_current(review, false) {
+            "Source text or selection changed. Close and review again before copying or inserting."
+        } else if review.commands.is_some() && !self.block_review_is_current(review, true) {
+            "Paste mode changed. Copy is available; close and review again before inserting."
         } else if review.commands.is_some() {
             self.sessions
                 .get(self.active)
@@ -18687,7 +18796,7 @@ impl Frost {
                         .width(Length::Fill)
                 )
                 .height(Length::Fill),
-                actions,
+                actions.wrap(),
             ]
             .spacing(12),
         )
@@ -18733,7 +18842,14 @@ impl Frost {
 
         let mut body = column![].spacing(7);
         if let Some((sess, zone)) = target {
-            let command = zone.command.as_deref().unwrap_or("Background output");
+            let command = zone
+                .command
+                .as_deref()
+                .unwrap_or(if zone.command_truncated {
+                    "Command unavailable"
+                } else {
+                    "Background output"
+                });
             let preview = history_picker::display_command(command);
             let outcome = block_mode::classify(zone.command.as_deref(), zone.exit_code);
             let status = block_mode::badge_text_with_lifecycle(
@@ -19422,13 +19538,27 @@ impl Frost {
                 .iter()
                 .map(Self::block_badge_cell_char)
                 .collect();
-            for badge in block_mode::badge_ladder(
-                outcome,
-                zone.duration_ms,
-                zone.start_mark_seen,
-                zone.completion_provenance,
-                clock,
-            ) {
+            let unavailable = zone.command_truncated
+                && zone
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| command.trim().is_empty());
+            let badges: Box<dyn Iterator<Item = String>> = if unavailable {
+                Box::new(
+                    ["Command unavailable", "Incomplete", "?"]
+                        .into_iter()
+                        .map(str::to_string),
+                )
+            } else {
+                Box::new(block_mode::badge_ladder(
+                    outcome,
+                    zone.duration_ms,
+                    zone.start_mark_seen,
+                    zone.completion_provenance,
+                    clock,
+                ))
+            };
+            for badge in badges {
                 let needed = badge.chars().count() + inset;
                 if block_mode::badge_fits(&chars, needed) {
                     row.badge = Some((badge, color));
@@ -26913,6 +27043,7 @@ mod tests {
             title: String::new(),
             body: String::new(),
             commands: Some("echo one\necho two".into()),
+            command_error: None,
             bracketed: true,
         };
         assert!(review.matches_selection(7, &[4, 9], "echo one\necho two", true));
@@ -26921,6 +27052,12 @@ mod tests {
         assert!(!review.matches_selection(7, &[9], "echo two", true));
         assert!(!review.matches_selection(7, &[4, 9], "changed", true));
         assert!(!review.matches_selection(7, &[4, 9], "echo one\necho two", false));
+        // Clipboard identity is independent of the paste mode and prompt;
+        // selection, pane and original bytes are still mandatory.
+        assert!(review.matches_commands(7, &[4, 9], "echo one\necho two"));
+        assert!(!review.matches_commands(8, &[4, 9], "echo one\necho two"));
+        assert!(!review.matches_commands(7, &[4], "echo one"));
+        assert!(!review.matches_commands(7, &[4, 9], "changed"));
         let details = BlockReview {
             commands: None,
             ..review
