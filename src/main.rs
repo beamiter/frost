@@ -122,30 +122,53 @@ fn captured_key_is_overlay_escape(event: &keyboard::Event) -> bool {
     )
 }
 
-/// A history-confirming Enter remains UI-owned until its physical release,
-/// even after the picker closes. Track locations independently so releasing
-/// numpad Enter cannot release a held main Enter (or vice versa).
+/// Physical Enter state is tracked before a review surface opens. Ownership
+/// can then follow the same held key through a palette, picker and mouse click
+/// without letting its repeat become an implicit shell submission.
 #[derive(Debug, Default)]
-struct HistoryEnterLatch(u8);
+struct PromptRecallEnterLatch {
+    pressed: u8,
+    owned: u8,
+}
 
-impl HistoryEnterLatch {
-    fn consume(&mut self, event: &keyboard::Event, picker_open: bool) -> bool {
-        use keyboard::{key::Named, Event, Key, Location};
-        let bit = |location| match location {
-            Location::Standard => 1,
-            Location::Left => 2,
-            Location::Right => 4,
-            Location::Numpad => 8,
-        };
+impl PromptRecallEnterLatch {
+    fn mask(location: keyboard::Location) -> u8 {
+        match location {
+            keyboard::Location::Standard => 1,
+            keyboard::Location::Left => 2,
+            keyboard::Location::Right => 4,
+            keyboard::Location::Numpad => 8,
+        }
+    }
+
+    /// Called when an explicit recall operation begins, including mouse
+    /// acceptance. A normal click with no held Enter does not block a later
+    /// fresh Enter. Failed recalls keep the same key ownership as successful
+    /// ones, so a refusal cannot accidentally submit an existing prompt.
+    fn begin_recall(&mut self) {
+        self.owned |= self.pressed;
+    }
+
+    /// A widget already consumed this press. Observe it without redispatching
+    /// its action, even if that action closed the widget before this message.
+    fn captured_press(&mut self, location: keyboard::Location) {
+        let mask = Self::mask(location);
+        self.pressed |= mask;
+        self.owned |= mask;
+    }
+
+    fn consume(&mut self, event: &keyboard::Event, recall_surface_open: bool) -> bool {
+        use keyboard::{key::Named, Event, Key};
         match event {
             Event::KeyReleased {
                 key: Key::Named(Named::Enter),
                 location,
                 ..
             } => {
-                let mask = bit(*location);
-                let owned = self.0 & mask != 0;
-                self.0 &= !mask;
+                let mask = Self::mask(*location);
+                let owned = self.owned & mask != 0;
+                self.pressed &= !mask;
+                self.owned &= !mask;
                 owned
             }
             Event::KeyPressed {
@@ -154,13 +177,14 @@ impl HistoryEnterLatch {
                 repeat,
                 ..
             } => {
-                if self.0 != 0 {
-                    self.0 |= bit(*location);
+                let mask = Self::mask(*location);
+                self.pressed |= mask;
+                if self.owned != 0 {
+                    self.owned |= mask;
                     true
-                } else if picker_open {
-                    self.0 |= bit(*location);
-                    // An Enter already repeating when a picker opens is not a
-                    // fresh confirmation. A new press continues to its handler.
+                } else if recall_surface_open {
+                    self.owned |= mask;
+                    // An already-repeating key cannot newly confirm a surface.
                     *repeat
                 } else {
                     false
@@ -3240,6 +3264,8 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    /// Observe an Enter already consumed by a widget, without repeating its action.
+    CapturedEnterPress(keyboard::Location),
     // AI agent panel (per-command approval agent over jterm_core).
     AgentInput(String),
     AgentSubmit,
@@ -4989,7 +5015,7 @@ struct Frost {
     /// Never reset on focus loss: Iced drops synthetic focus-change key events.
     /// If the real release is missed off-window, one extra press/release cycle
     /// may be consumed, rather than letting an ambiguous repeat execute input.
-    history_enter_latch: HistoryEnterLatch,
+    prompt_recall_enter_latch: PromptRecallEnterLatch,
     /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
     /// files, then a per-argument form before the rendered command is typed
     /// into the active pane for review (never executed).
@@ -5213,7 +5239,7 @@ impl Frost {
             tab_switcher: None,
             remote_picker: None,
             history_picker: None,
-            history_enter_latch: HistoryEnterLatch::default(),
+            prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
             workflow_overlay: None,
             block_search: None,
             block_search_memory: BlockSearchMemory::default(),
@@ -10498,6 +10524,9 @@ impl Frost {
     /// History recall: replace the prompt's pending line with `command`. Still
     /// never appends Enter — the user submits explicitly.
     fn recall_into_active_pane(&mut self, command: String) -> Task<Message> {
+        // Claim any held Enter before asynchronous prompt revalidation, not
+        // only after a successful write or a keyboard-based confirmation.
+        self.prompt_recall_enter_latch.begin_recall();
         let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
             return Task::none();
         };
@@ -10542,6 +10571,9 @@ impl Frost {
         policy: PastePolicy,
         clear_line_first: bool,
     ) -> bool {
+        if clear_line_first {
+            self.prompt_recall_enter_latch.begin_recall();
+        }
         let mut rejected = false;
         let mut written = false;
         let mut dead_input = false;
@@ -14136,10 +14168,20 @@ impl Frost {
                     return self.update(Message::Key(event));
                 }
             }
+            Message::CapturedEnterPress(location) => {
+                self.prompt_recall_enter_latch.captured_press(location);
+            }
             Message::Key(event) => {
+                // These surfaces confirm/open reviewed commands. Search-only
+                // Enter navigation remains unchanged; all physical presses are
+                // still tracked for a later explicit recall transaction.
+                let recall_surface_open = self.history_picker.is_some()
+                    || self.palette.is_open
+                    || self.workflow_overlay.is_some()
+                    || self.block_review.is_some();
                 if self
-                    .history_enter_latch
-                    .consume(&event, self.history_picker.is_some())
+                    .prompt_recall_enter_latch
+                    .consume(&event, recall_surface_open)
                 {
                     return Task::none();
                 }
@@ -18824,6 +18866,7 @@ impl Frost {
         let Some(review) = self.block_review.take() else {
             return Task::none();
         };
+        self.prompt_recall_enter_latch.begin_recall();
         if !self.block_review_is_current(&review, true) {
             self.push_toast(
                 "Review changed or expired. Review the selection again before inserting.",
@@ -25345,6 +25388,13 @@ impl Frost {
             iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
                 if captured_key_is_overlay_escape(&event) {
                     Some(Message::OverlayEscape(event))
+                } else if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    location,
+                    ..
+                } = &event
+                {
+                    Some(Message::CapturedEnterPress(*location))
                 } else if captured_key_is_enter_release(&event)
                     || matches!(
                         &event,
@@ -31829,7 +31879,7 @@ mod tests {
 
     #[test]
     fn history_enter_confirmation_owns_repeats_until_release() {
-        let mut latch = HistoryEnterLatch::default();
+        let mut latch = PromptRecallEnterLatch::default();
         let press = history_enter_event(true, false, keyboard::Location::Standard);
         let repeat = history_enter_event(true, true, keyboard::Location::Standard);
         let release = history_enter_event(false, false, keyboard::Location::Standard);
@@ -31906,7 +31956,7 @@ mod tests {
         drop(input);
         assert_eq!(messages, ["probe-ab"]);
         picker.set_query(messages.pop().unwrap());
-        let mut latch = HistoryEnterLatch::default();
+        let mut latch = PromptRecallEnterLatch::default();
         assert!(!latch.consume(
             &history_enter_event(true, false, keyboard::Location::Standard),
             true
@@ -31919,8 +31969,62 @@ mod tests {
     }
 
     #[test]
+    fn recall_adopts_enter_pressed_before_picker_or_mouse_acceptance() {
+        let mut latch = PromptRecallEnterLatch::default();
+        let press = history_enter_event(true, false, keyboard::Location::Standard);
+        let repeat = history_enter_event(true, true, keyboard::Location::Standard);
+        let release = history_enter_event(false, false, keyboard::Location::Standard);
+        assert!(!latch.consume(&press, false));
+        assert!(
+            !latch.consume(&repeat, false),
+            "ordinary terminal repeats are unchanged"
+        );
+        latch.begin_recall();
+        assert!(
+            latch.consume(&repeat, false),
+            "mouse acceptance adopts pre-held Enter"
+        );
+        assert!(
+            latch.consume(&press, false),
+            "refocus repeat flags cannot release ownership"
+        );
+        assert!(latch.consume(&release, false));
+        assert!(!latch.consume(&press, false));
+    }
+
+    #[test]
+    fn fresh_enter_after_mouse_recall_is_not_swallowed() {
+        let mut latch = PromptRecallEnterLatch::default();
+        latch.begin_recall();
+        assert!(!latch.consume(
+            &history_enter_event(true, false, keyboard::Location::Standard),
+            false
+        ));
+        assert!(!latch.consume(
+            &history_enter_event(false, false, keyboard::Location::Standard),
+            false
+        ));
+    }
+
+    #[test]
+    fn captured_widget_enter_and_multiple_preheld_locations_stay_owned() {
+        let mut latch = PromptRecallEnterLatch::default();
+        let main = keyboard::Location::Standard;
+        let pad = keyboard::Location::Numpad;
+        assert!(!latch.consume(&history_enter_event(true, false, main), false));
+        assert!(!latch.consume(&history_enter_event(true, false, pad), false));
+        latch.begin_recall();
+        assert!(latch.consume(&history_enter_event(false, false, main), false));
+        assert!(latch.consume(&history_enter_event(true, true, pad), false));
+        assert!(latch.consume(&history_enter_event(false, false, pad), false));
+        latch.captured_press(main);
+        assert!(latch.consume(&history_enter_event(true, true, main), false));
+        assert!(latch.consume(&history_enter_event(false, false, main), false));
+    }
+
+    #[test]
     fn inherited_history_enter_repeat_cannot_confirm_a_picker() {
-        let mut latch = HistoryEnterLatch::default();
+        let mut latch = PromptRecallEnterLatch::default();
         assert!(latch.consume(
             &history_enter_event(true, true, keyboard::Location::Standard),
             true
@@ -31937,7 +32041,7 @@ mod tests {
 
     #[test]
     fn history_enter_locations_release_independently() {
-        let mut latch = HistoryEnterLatch::default();
+        let mut latch = PromptRecallEnterLatch::default();
         let main = keyboard::Location::Standard;
         let pad = keyboard::Location::Numpad;
         assert!(!latch.consume(&history_enter_event(true, false, main), true));
