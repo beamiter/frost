@@ -70,6 +70,28 @@ fn history_picker_panel_size(window: Size, visible_results: usize) -> Size {
     )
 }
 
+/// One real workflow argument input, shared with keyboard-routing regressions.
+fn workflow_argument_input<'a, Renderer>(
+    index: usize,
+    name: &str,
+    value: &str,
+) -> iced::widget::TextInput<'a, Message, iced::Theme, Renderer>
+where
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
+{
+    let input = iced::widget::TextInput::new(name, value)
+        .on_input(move |value| Message::WorkflowArgInput(index, value))
+        // Enter must remain uncaptured so the shared physical-key latch can
+        // reject an opener's repeats before the argument-stage handler runs.
+        .size(13)
+        .font(iced::Font::MONOSPACE);
+    if index == 0 {
+        input.id(WORKFLOW_ARG_INPUT_ID.clone())
+    } else {
+        input
+    }
+}
+
 /// Must stay equal to the installed entry's basename
 /// (`data/io.github.beamiter.frost.desktop`): the desktop shell pairs a window
 /// with its launcher entry through this id.
@@ -10782,8 +10804,8 @@ impl Frost {
     /// Workflow overlay key handling. The picker stage mirrors
     /// `handle_history_picker_key` (typed text filters, arrows move, Enter
     /// accepts, Esc/Ctrl+Shift+M dismisses). The argument stage is driven by
-    /// real text inputs: they capture typing, Enter submits through
-    /// `on_submit`, Tab/Shift+Tab move focus between fields, and Escape closes.
+    /// real text inputs: they capture edits while Enter stays on the shared
+    /// physical-key ownership path. Tab/Shift+Tab move focus and Escape closes.
     fn handle_workflow_overlay_key(
         &mut self,
         key: &keyboard::Key,
@@ -17938,18 +17960,8 @@ impl Frost {
         let missing = form.missing();
         for (index, arg) in form.workflow().args.iter().enumerate() {
             let name = crate::workflow_picker::bound_workflow_feedback(&arg.name);
-            let input = text_input(&name, form.value(index))
-                .on_input(move |value| Message::WorkflowArgInput(index, value))
-                .on_submit(Message::WorkflowArgSubmit)
-                .size(13)
-                .font(iced::Font::MONOSPACE);
-            // The stable id sits on the first field so opening the form can
-            // focus it; Tab/Shift+Tab traverse the rest.
-            let input = if index == 0 {
-                input.id(WORKFLOW_ARG_INPUT_ID.clone())
-            } else {
-                input
-            };
+            // The first field has a stable focus id; Tab traverses the rest.
+            let input = workflow_argument_input(index, &name, form.value(index));
             let label = crate::workflow_picker::bound_workflow_arg_label(
                 &arg.name,
                 &arg.description,
@@ -31895,6 +31907,102 @@ mod tests {
         assert!(!latch.consume(&release, false));
         assert!(captured_key_is_enter_release(&release));
         assert!(!captured_key_is_enter_release(&press));
+    }
+
+    #[test]
+    fn workflow_argument_widget_cannot_bypass_owned_enter() {
+        use iced::advanced::{layout, widget::Tree, Layout, Shell, Widget};
+        for location in [keyboard::Location::Standard, keyboard::Location::Numpad] {
+            let mut latch = PromptRecallEnterLatch::default();
+            assert!(!latch.consume(&history_enter_event(true, false, location), true));
+            let mut input = workflow_argument_input::<()>(0, "value", "A");
+            let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, ()>);
+            tree.state
+                .downcast_mut::<iced::widget::text_input::State<()>>()
+                .focus();
+            let node = input.layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0)),
+                None,
+            );
+            let repeat = history_enter_event(true, true, location);
+            let mut messages = Vec::new();
+            let mut clipboard = iced::advanced::clipboard::Null;
+            let mut shell = Shell::new(&mut messages);
+            input.update(
+                &mut tree,
+                &iced::Event::Keyboard(repeat.clone()),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &(),
+                &mut clipboard,
+                &mut shell,
+                &iced::Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 40.0)),
+            );
+            assert!(
+                !shell.is_event_captured(),
+                "Enter must reach the physical-key ownership gate"
+            );
+            drop(shell);
+            assert!(
+                messages.is_empty(),
+                "the input must not publish a direct submit"
+            );
+            assert!(latch.consume(&repeat, true));
+            assert!(latch.consume(&history_enter_event(false, false, location), true));
+            assert!(
+                !latch.consume(&history_enter_event(true, false, location), true),
+                "a released and freshly pressed Enter can confirm the form"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_argument_ime_edit_precedes_routed_confirmation() {
+        use iced::advanced::input_method::Event as Ime;
+        use iced::advanced::{layout, widget::Tree, Layout, Shell, Widget};
+        let mut input = workflow_argument_input::<()>(0, "value", "A");
+        let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, ()>);
+        tree.state
+            .downcast_mut::<iced::widget::text_input::State<()>>()
+            .focus();
+        let node = input.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0)),
+            None,
+        );
+        let mut messages = Vec::new();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let enter = history_enter_event(true, false, keyboard::Location::Standard);
+        for (event, captured) in [
+            (iced::Event::InputMethod(Ime::Commit("B".into())), true),
+            (iced::Event::Keyboard(enter.clone()), false),
+        ] {
+            let mut shell = Shell::new(&mut messages);
+            input.update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &(),
+                &mut clipboard,
+                &mut shell,
+                &iced::Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 40.0)),
+            );
+            assert_eq!(shell.is_event_captured(), captured);
+        }
+        assert_eq!(messages.len(), 1);
+        match messages.pop().unwrap() {
+            Message::WorkflowArgInput(0, value) => assert_eq!(value, "AB"),
+            unexpected => panic!("unexpected direct action: {unexpected:?}"),
+        }
+        let mut latch = PromptRecallEnterLatch::default();
+        assert!(
+            !latch.consume(&enter, true),
+            "fresh confirmation follows the edit message"
+        );
     }
 
     #[test]
