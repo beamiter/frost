@@ -286,7 +286,7 @@ impl PlacementRequest {
         buffer_row: usize,
     ) -> Result<Self, Failure> {
         Ok(Self {
-            placement_id: command.placement,
+            placement_id: command.placement.filter(|id| *id != 0),
             // 屏幕位置来自光标，不是 x=/y=。
             col: cursor_col,
             row: cursor_row,
@@ -315,7 +315,6 @@ pub struct KittyGraphicsState {
     pending_placements: HashMap<u32, PlacementRequest>,
     /// 在途分块传输的收件人。续块只带 `m=`/`q=`，没有它就无法回复最后一块。
     chunked_target: Option<ResponseTarget>,
-    next_placement_id: u32,
     next_generation: u64,
     total_decoded: u32,
     total_bytes_processed: u64,
@@ -332,7 +331,6 @@ impl KittyGraphicsState {
             responses: Vec::new(),
             pending_placements: HashMap::new(),
             chunked_target: None,
-            next_placement_id: 1,
             next_generation: 1,
             total_decoded: 0,
             total_bytes_processed: 0,
@@ -534,6 +532,11 @@ impl KittyGraphicsState {
                 .saturating_sub(old.data.len() as u64);
             self.access_order.retain(|&id| id != image_id);
         }
+        // A successful retransmission starts a new image lifecycle. Old
+        // placements must not silently display unrelated replacement pixels.
+        // Decode completed above, so a failed transfer preserves the old image.
+        self.placements
+            .retain(|placement| placement.image_id != image_id);
         self.total_image_memory += data_size;
         self.access_order.push_back(image_id);
 
@@ -616,11 +619,17 @@ impl KittyGraphicsState {
     }
 
     fn add_placement(&mut self, image_id: u32, placement: PlacementRequest) {
-        let placement_id = placement.placement_id.or_else(|| {
-            let id = self.next_placement_id;
-            self.next_placement_id += 1;
-            Some(id)
-        });
+        // The protocol identity is (image id, nonzero placement id). Reusing
+        // that pair moves/replaces it. Anonymous placements remain anonymous:
+        // inventing ids for them collides with later client-supplied ids.
+        let placement_id = placement
+            .placement_id
+            .filter(|id| *id != 0 && image_id != 0);
+        if let Some(id) = placement_id {
+            self.placements.retain(|existing| {
+                existing.image_id != image_id || existing.placement_id != Some(id)
+            });
+        }
 
         self.placements.push(KittyPlacement {
             image_id,
@@ -660,6 +669,31 @@ impl KittyGraphicsState {
 
     /// 处理删除操作 (a=d)
     fn handle_delete(&mut self, command: &Command<'_>) -> Result<(), Failure> {
+        if let Some(selector) = command.get("d") {
+            // Explicit image deletion follows the Kitty lowercase/uppercase
+            // distinction and never expands a placement-specific request to
+            // every placement of that image.
+            if !matches!(selector, "i" | "I") {
+                return Err(Failure::new(
+                    "ENOTSUP",
+                    "unsupported kitty deletion selector",
+                ));
+            }
+            let image_id = command.id.filter(|id| *id != 0).ok_or_else(|| {
+                Failure::invalid("kitty image deletion requires a nonzero image id (i=)")
+            })?;
+            let placement_id = command.placement.filter(|id| *id != 0);
+            self.placements.retain(|placement| {
+                placement.image_id != image_id
+                    || placement_id.is_some_and(|id| placement.placement_id != Some(id))
+            });
+            if selector == "I" {
+                self.prune_unreferenced_images(&std::collections::HashSet::from([image_id]));
+            }
+            return Ok(());
+        }
+        // Preserve Frost's original selector-less, explicitly addressed delete
+        // shorthand. New callers should use d=i or d=I for protocol semantics.
         if let Some(image_id) = command.id {
             if let Some(img) = self.images.remove(&image_id) {
                 self.total_image_memory = self
@@ -1034,6 +1068,213 @@ mod tests {
         }
         assert_eq!(state.render_crops(4), vec![(1, (0, 0, 1, 1))]);
         assert!(state.render_crops(3).is_empty());
+    }
+
+    #[test]
+    fn explicit_placement_delete_keeps_other_placements_and_image_data() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=1;AQIDBA==")
+            .unwrap();
+        state.parse_graphics_payload(b"Ga=p,i=10,p=2;").unwrap();
+        state.parse_graphics_payload(b"Ga=d,d=i,i=10,p=1;").unwrap();
+        assert_eq!(state.get_placements().len(), 1);
+        assert_eq!(state.get_placements()[0].placement_id, Some(2));
+        assert!(state.get_image(10).is_some());
+    }
+
+    #[test]
+    fn lowercase_image_delete_allows_redisplay_without_retransmission() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=1;AQIDBA==")
+            .unwrap();
+        state.parse_graphics_payload(b"Ga=d,d=i,i=10;").unwrap();
+        assert!(state.get_placements().is_empty());
+        assert!(state.get_image(10).is_some());
+        state.parse_graphics_payload(b"Ga=p,i=10,p=2;").unwrap();
+        assert_eq!(state.get_placements().len(), 1);
+    }
+
+    #[test]
+    fn repeated_named_placement_moves_instead_of_duplicating() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=t,i=10;AQIDBA==")
+            .unwrap();
+        state
+            .parse_graphics_payload_at(b"Ga=p,i=10,p=7;", 2, 3)
+            .unwrap();
+        state
+            .parse_graphics_payload_at(b"Ga=p,i=10,p=7;", 8, 9)
+            .unwrap();
+        assert_eq!(state.get_placements().len(), 1);
+        assert_eq!(
+            (state.get_placements()[0].col, state.get_placements()[0].row),
+            (8, 9)
+        );
+    }
+
+    #[test]
+    fn anonymous_placements_do_not_claim_named_placement_ids() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=t,i=10;AQIDBA==")
+            .unwrap();
+        for command in [
+            b"Ga=p,i=10;".as_slice(),
+            b"Ga=p,i=10,p=0;",
+            b"Ga=p,i=10,p=1;",
+        ] {
+            state.parse_graphics_payload(command).unwrap();
+        }
+        assert_eq!(state.get_placements().len(), 3);
+        assert_eq!(
+            state
+                .get_placements()
+                .iter()
+                .filter(|p| p.placement_id.is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn successful_image_retransmission_drops_previous_placements() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=7;AQIDBA==")
+            .unwrap();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=t,i=10;BQYHCA==")
+            .unwrap();
+        assert!(state.get_placements().is_empty());
+        assert_eq!(state.get_image(10).unwrap().data, [5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn uppercase_scoped_delete_frees_data_only_after_last_placement() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=1;AQIDBA==")
+            .unwrap();
+        state.parse_graphics_payload(b"Ga=p,i=10,p=2;").unwrap();
+        state.parse_graphics_payload(b"Ga=d,d=I,i=10,p=1;").unwrap();
+        assert_eq!(state.get_placements().len(), 1);
+        assert_eq!(state.total_image_memory, 4);
+        state.parse_graphics_payload(b"Ga=d,d=I,i=10,p=2;").unwrap();
+        assert!(state.get_image(10).is_none());
+        assert_eq!(state.total_image_memory, 0);
+        assert!(!state.access_order.contains(&10));
+    }
+
+    #[test]
+    fn unknown_or_unaddressed_explicit_delete_is_non_destructive() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=1;AQIDBA==")
+            .unwrap();
+        for command in [
+            b"Ga=d,d=x,i=10,x=1;".as_slice(),
+            b"Ga=d,d=i;",
+            b"Ga=d,d=i,i=0;",
+        ] {
+            assert!(state.parse_graphics_payload(command).is_err());
+            assert_eq!(state.get_placements().len(), 1);
+            assert_eq!(state.get_image(10).unwrap().data, [1, 2, 3, 4]);
+        }
+        state.parse_graphics_payload(b"Ga=d,i=10;").unwrap();
+        assert!(
+            state.get_image(10).is_none(),
+            "legacy addressed delete still works"
+        );
+    }
+
+    #[test]
+    fn placement_identity_is_scoped_to_the_image_and_zero_is_anonymous() {
+        let mut state = KittyGraphicsState::new();
+        for id in [10, 20] {
+            state
+                .parse_graphics_payload(format!("Gf=32,s=1,v=1,a=T,i={id},p=7;AQIDBA==").as_bytes())
+                .unwrap();
+        }
+        state
+            .parse_graphics_payload_at(b"Ga=p,i=10,p=7;", 8, 9)
+            .unwrap();
+        assert_eq!(state.get_placements().len(), 2);
+        assert_eq!(
+            state
+                .get_placements()
+                .iter()
+                .find(|p| p.image_id == 20)
+                .unwrap()
+                .col,
+            0
+        );
+        state.parse_graphics_payload(b"Ga=p,i=10,p=0;").unwrap();
+        state.parse_graphics_payload(b"Ga=p,i=10,p=0;").unwrap();
+        assert_eq!(state.get_placements().len(), 4);
+        state.parse_graphics_payload(b"Ga=d,d=i,i=10,p=0;").unwrap();
+        assert_eq!(state.get_placements().len(), 1);
+        assert_eq!(state.get_placements()[0].image_id, 20);
+        assert!(state.get_image(10).is_some());
+    }
+
+    #[test]
+    fn failed_retransmission_keeps_previous_placements_and_pixels() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=7;AQIDBA==")
+            .unwrap();
+        let generation = state.get_image(10).unwrap().generation;
+        assert!(state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=t,i=10;%%%invalid%%%")
+            .is_err());
+        assert_eq!(state.get_placements().len(), 1);
+        assert_eq!(state.get_image(10).unwrap().generation, generation);
+        assert_eq!(state.get_image(10).unwrap().data, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn explicit_delete_aborts_pending_upload_even_when_selector_is_unsupported() {
+        for selector in ["i", "unsupported"] {
+            let mut state = KittyGraphicsState::new();
+            state
+                .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=7;AQIDBA==")
+                .unwrap();
+            state
+                .parse_graphics_payload(
+                    format!("Gf=32,s=1,v=1,a=T,i=20,p=8,m=1;{CHUNK_HEAD}").as_bytes(),
+                )
+                .unwrap();
+            let deleted =
+                state.parse_graphics_payload(format!("Ga=d,d={selector},i=10;").as_bytes());
+            assert_eq!(deleted.is_ok(), selector == "i");
+            assert!(state.pending_placements.is_empty());
+            assert!(state.chunked_target.is_none());
+            assert!(state
+                .parse_graphics_payload(format!("Gm=0;{CHUNK_TAIL}").as_bytes())
+                .is_err());
+            assert!(state.get_image(20).is_none());
+            assert_eq!(state.get_image(10).unwrap().data, [1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn failed_png_decode_preserves_existing_image_lifecycle() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=T,i=10,p=7;AQIDBA==")
+            .unwrap();
+        let generation = state.get_image(10).unwrap().generation;
+        let mut truncated = png_bytes(1, 1);
+        truncated.truncate(33); // Complete IHDR, missing compressed pixel data.
+        assert!(state
+            .parse_graphics_payload(format!("Gf=100,a=t,i=10;{}", encode(&truncated)).as_bytes())
+            .is_err());
+        assert_eq!(state.get_placements().len(), 1);
+        assert_eq!(state.get_image(10).unwrap().generation, generation);
+        assert_eq!(state.get_image(10).unwrap().data, [1, 2, 3, 4]);
     }
 
     #[test]
