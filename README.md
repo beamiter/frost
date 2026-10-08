@@ -983,6 +983,8 @@ selection, command text, paste mode and prompt safety are checked again before
 insertion. A changed or evicted selection fails closed. Without bracketed paste,
 only the first logical line is inserted, and the review says so. Escape closes the
 review without writing to the PTY. Review controls pause in alternate-screen apps.
+In short or narrow windows, the heading and status scroll with the preview while
+Close, Copy and Insert stay outside that scroll area and remain reachable.
 
 Clear Blocks retains the existing single-level undo, subject to scrollback and
 capture budgets. Undo does not restore cleared bookmarks or block selection.

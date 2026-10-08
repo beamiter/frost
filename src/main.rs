@@ -92,6 +92,19 @@ where
     }
 }
 
+/// Keep block review inside the available window; compact layouts scroll the
+/// heading and status together with the preview so explicit actions stay visible.
+fn block_review_panel_size(window: Size) -> Size {
+    Size::new(
+        (window.width - 32.0).clamp(1.0, 880.0),
+        (window.height - 48.0).max(1.0),
+    )
+}
+
+fn block_review_scrolls_heading(panel: Size) -> bool {
+    panel.width < 360.0 || panel.height < 300.0
+}
+
 /// Must stay equal to the installed entry's basename
 /// (`data/io.github.beamiter.frost.desktop`): the desktop shell pairs a window
 /// with its launcher entry through this id.
@@ -18935,28 +18948,33 @@ impl Frost {
         } else {
             "Read-only snapshot. Copy/export actions remain available from the block menu."
         };
-        let panel = container(
-            column![
-                text(&review.title).size(18),
-                text(status).size(12).wrapping(text::Wrapping::Word),
-                scrollable(
-                    text(&review.body)
-                        .size(13)
-                        .font(iced::Font::MONOSPACE)
-                        .wrapping(text::Wrapping::Word)
-                        .width(Length::Fill)
-                )
-                .height(Length::Fill),
-                actions.wrap(),
-            ]
-            .spacing(12),
-        )
-        .padding(18)
-        .width(Length::Fixed(
-            (self.win_size.width - 32.0).clamp(180.0, 880.0),
-        ))
-        .height(Length::Fixed((self.win_size.height - 48.0).max(120.0)))
-        .style(container::dark);
+        let panel_size = block_review_panel_size(self.win_size);
+        let title = text(&review.title).size(18);
+        let status = text(status).size(12).wrapping(text::Wrapping::Word);
+        let preview = text(&review.body)
+            .size(13)
+            .font(iced::Font::MONOSPACE)
+            .wrapping(text::Wrapping::Word)
+            .width(Length::Fill);
+        // A short/narrow window cannot reserve a wrapped heading, status and
+        // actions as well as a useful preview. Let the heading scroll in that
+        // case; the action row still owns its measured height outside the
+        // single reading scroll area, so no controls overlap or disappear.
+        let reading: Element<'_, Message> = if block_review_scrolls_heading(panel_size) {
+            scrollable(column![title, status, preview].spacing(12))
+                .height(Length::Fill)
+                .into()
+        } else {
+            column![title, status, scrollable(preview).height(Length::Fill)]
+                .spacing(12)
+                .height(Length::Fill)
+                .into()
+        };
+        let panel = container(column![reading, actions.wrap()].spacing(12))
+            .padding(18)
+            .width(Length::Fixed(panel_size.width))
+            .height(Length::Fixed(panel_size.height))
+            .style(container::dark);
         let backdrop = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -27181,6 +27199,29 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_review_layout_is_bounded_and_scrolls_wrapped_chrome_when_compact() {
+        for window in [
+            Size::new(280.0, 200.0),
+            Size::new(360.0, 300.0),
+            Size::new(1000.0, 680.0),
+            Size::new(20.0, 20.0),
+        ] {
+            let panel = block_review_panel_size(window);
+            assert!(panel.width > 0.0 && panel.width <= window.width);
+            assert!(panel.height > 0.0 && panel.height <= window.height);
+        }
+        assert!(block_review_scrolls_heading(block_review_panel_size(
+            Size::new(280.0, 200.0)
+        )));
+        assert!(block_review_scrolls_heading(block_review_panel_size(
+            Size::new(360.0, 300.0)
+        )));
+        assert!(!block_review_scrolls_heading(block_review_panel_size(
+            Size::new(1000.0, 680.0)
+        )));
+    }
+
     #[test]
     fn history_picker_panel_reserves_window_margins_and_shrinks_for_few_results() {
         use super::history_picker_panel_size;
