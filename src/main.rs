@@ -122,6 +122,65 @@ fn captured_key_is_overlay_escape(event: &keyboard::Event) -> bool {
     )
 }
 
+/// A history-confirming Enter remains UI-owned until its physical release,
+/// even after the picker closes. Track locations independently so releasing
+/// numpad Enter cannot release a held main Enter (or vice versa).
+#[derive(Debug, Default)]
+struct HistoryEnterLatch(u8);
+
+impl HistoryEnterLatch {
+    fn consume(&mut self, event: &keyboard::Event, picker_open: bool) -> bool {
+        use keyboard::{key::Named, Event, Key, Location};
+        let bit = |location| match location {
+            Location::Standard => 1,
+            Location::Left => 2,
+            Location::Right => 4,
+            Location::Numpad => 8,
+        };
+        match event {
+            Event::KeyReleased {
+                key: Key::Named(Named::Enter),
+                location,
+                ..
+            } => {
+                let mask = bit(*location);
+                let owned = self.0 & mask != 0;
+                self.0 &= !mask;
+                owned
+            }
+            Event::KeyPressed {
+                key: Key::Named(Named::Enter),
+                location,
+                repeat,
+                ..
+            } => {
+                if self.0 != 0 {
+                    self.0 |= bit(*location);
+                    true
+                } else if picker_open {
+                    self.0 |= bit(*location);
+                    // An Enter already repeating when a picker opens is not a
+                    // fresh confirmation. A new press continues to its handler.
+                    *repeat
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+fn captured_key_is_enter_release(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            ..
+        }
+    )
+}
+
 /// The Block Search refresh shortcut is deliberately the unmodified F5 key.
 /// Modified or auto-repeated function-key events remain ordinary overlay-owned
 /// no-ops instead of silently forcing a potentially expensive index rebuild.
@@ -4927,6 +4986,10 @@ struct Frost {
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
+    /// Never reset on focus loss: Iced drops synthetic focus-change key events.
+    /// If the real release is missed off-window, one extra press/release cycle
+    /// may be consumed, rather than letting an ambiguous repeat execute input.
+    history_enter_latch: HistoryEnterLatch,
     /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
     /// files, then a per-argument form before the rendered command is typed
     /// into the active pane for review (never executed).
@@ -5150,6 +5213,7 @@ impl Frost {
             tab_switcher: None,
             remote_picker: None,
             history_picker: None,
+            history_enter_latch: HistoryEnterLatch::default(),
             workflow_overlay: None,
             block_search: None,
             block_search_memory: BlockSearchMemory::default(),
@@ -14073,6 +14137,12 @@ impl Frost {
                 }
             }
             Message::Key(event) => {
+                if self
+                    .history_enter_latch
+                    .consume(&event, self.history_picker.is_some())
+                {
+                    return Task::none();
+                }
                 if let keyboard::Event::KeyReleased { key, .. } = &event {
                     if self.block_search.as_mut().is_some_and(|state| {
                         block_search_bookmark_key_release(
@@ -25275,14 +25345,16 @@ impl Frost {
             iced::Event::Keyboard(event) if status == iced::event::Status::Captured => {
                 if captured_key_is_overlay_escape(&event) {
                     Some(Message::OverlayEscape(event))
-                } else if matches!(
-                    &event,
-                    keyboard::Event::KeyReleased { key, .. }
-                        if block_search_is_bookmark_key(key)
-                ) {
-                    // The focused query can capture B's release. Always
-                    // forward it; Message::Key only consumes it when the
-                    // block-search latch actually exists.
+                } else if captured_key_is_enter_release(&event)
+                    || matches!(
+                        &event,
+                        keyboard::Event::KeyReleased { key, .. }
+                            if block_search_is_bookmark_key(key)
+                    )
+                {
+                    // A focused widget may capture a release owned by history
+                    // confirmation or block search. Let the corresponding latch
+                    // see it; this does not redispatch captured key presses.
                     Some(Message::Key(event))
                 } else {
                     None
@@ -31724,6 +31796,157 @@ mod tests {
             block_search_activation(false, true),
             BlockSearchActivation::RejectStale
         );
+    }
+
+    fn history_enter_event(
+        pressed: bool,
+        repeat: bool,
+        location: keyboard::Location,
+    ) -> keyboard::Event {
+        let key = keyboard::Key::Named(Named::Enter);
+        let physical_key =
+            keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
+        if pressed {
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location,
+                modifiers: keyboard::Modifiers::default(),
+                text: None,
+                repeat,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location,
+                modifiers: keyboard::Modifiers::default(),
+            }
+        }
+    }
+
+    #[test]
+    fn history_enter_confirmation_owns_repeats_until_release() {
+        let mut latch = HistoryEnterLatch::default();
+        let press = history_enter_event(true, false, keyboard::Location::Standard);
+        let repeat = history_enter_event(true, true, keyboard::Location::Standard);
+        let release = history_enter_event(false, false, keyboard::Location::Standard);
+        assert!(
+            !latch.consume(&press, false),
+            "ordinary prompt Enter passes"
+        );
+        assert!(
+            !latch.consume(&press, true),
+            "first picker Enter reaches confirmation"
+        );
+        for open in [true, false] {
+            assert!(latch.consume(&repeat, open));
+            assert!(
+                latch.consume(&press, open),
+                "non-repeat flags cannot prove release after refocus"
+            );
+        }
+        assert!(latch.consume(&release, false));
+        assert!(
+            !latch.consume(&press, false),
+            "fresh Enter after release remains available"
+        );
+        assert!(!latch.consume(&release, false));
+        assert!(captured_key_is_enter_release(&release));
+        assert!(!captured_key_is_enter_release(&press));
+    }
+
+    #[test]
+    fn history_ime_commit_updates_the_real_input_before_enter_confirmation() {
+        use iced::advanced::input_method::Event as Ime;
+        use iced::advanced::{layout, widget::Tree, Clipboard, Layout, Shell, Widget};
+        let mut picker = history_picker::HistoryPickerState::new(
+            ["echo probe-a", "echo probe-ab"]
+                .into_iter()
+                .map(
+                    |command| jterm_core::command_history::CommandHistoryRecord {
+                        command: command.into(),
+                        cwd: None,
+                        exit_code: 0,
+                        end_time_ms: None,
+                    },
+                )
+                .collect(),
+        );
+        picker.set_query("probe-a");
+        let mut input: iced::widget::TextInput<'_, String, iced::Theme, ()> =
+            iced::widget::TextInput::new("Recall", picker.query()).on_input(|query| query);
+        let mut tree = Tree::new(&input as &dyn Widget<String, iced::Theme, ()>);
+        tree.state
+            .downcast_mut::<iced::widget::text_input::State<()>>()
+            .focus();
+        let renderer = ();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 40.0));
+        let node = input.layout(&mut tree, &renderer, &limits, None);
+        let mut messages = Vec::new();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut shell = Shell::new(&mut messages);
+        input.update(
+            &mut tree,
+            &iced::Event::InputMethod(Ime::Commit("b".into())),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard as &mut dyn Clipboard,
+            &mut shell,
+            &iced::Rectangle::new(iced::Point::ORIGIN, Size::new(400.0, 40.0)),
+        );
+        assert!(
+            shell.is_event_captured(),
+            "IME commit cannot also reach the PTY subscription"
+        );
+        drop(shell);
+        drop(input);
+        assert_eq!(messages, ["probe-ab"]);
+        picker.set_query(messages.pop().unwrap());
+        let mut latch = HistoryEnterLatch::default();
+        assert!(!latch.consume(
+            &history_enter_event(true, false, keyboard::Location::Standard),
+            true
+        ));
+        assert_eq!(picker.selected_command().as_deref(), Some("echo probe-ab"));
+        assert!(latch.consume(
+            &history_enter_event(true, true, keyboard::Location::Standard),
+            false
+        ));
+    }
+
+    #[test]
+    fn inherited_history_enter_repeat_cannot_confirm_a_picker() {
+        let mut latch = HistoryEnterLatch::default();
+        assert!(latch.consume(
+            &history_enter_event(true, true, keyboard::Location::Standard),
+            true
+        ));
+        assert!(latch.consume(
+            &history_enter_event(false, false, keyboard::Location::Standard),
+            true
+        ));
+        assert!(!latch.consume(
+            &history_enter_event(true, false, keyboard::Location::Standard),
+            true
+        ));
+    }
+
+    #[test]
+    fn history_enter_locations_release_independently() {
+        let mut latch = HistoryEnterLatch::default();
+        let main = keyboard::Location::Standard;
+        let pad = keyboard::Location::Numpad;
+        assert!(!latch.consume(&history_enter_event(true, false, main), true));
+        assert!(!latch.consume(&history_enter_event(false, false, pad), false));
+        assert!(latch.consume(&history_enter_event(true, false, pad), false));
+        assert!(latch.consume(&history_enter_event(false, false, main), false));
+        assert!(latch.consume(&history_enter_event(true, true, pad), false));
+        assert!(latch.consume(&history_enter_event(false, false, pad), false));
+        assert!(!latch.consume(&history_enter_event(true, false, main), false));
     }
 
     #[test]
