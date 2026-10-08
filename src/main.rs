@@ -18912,12 +18912,21 @@ impl Frost {
                     .iter()
                     .all(|id| sess.terminal.zone_by_id(*id).is_some())
         });
+        // View construction is an immutable snapshot. Rebuild/validate the
+        // full selected payload once, then derive the paste-mode distinction.
+        // Copy/Insert still revalidate again when their messages are handled.
+        let valid_commands =
+            review.commands.is_some() && self.block_review_is_current(review, false);
+        let valid_insertion = valid_commands
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|sess| sess.terminal.is_bracketed_paste_enabled() == review.bracketed);
         let mut actions = row![button(text("Close · Esc").size(12))
             .on_press(Message::BlockReviewClose)
             .style(self.ghost_btn_style())]
         .spacing(8);
         if review.commands.is_some() || review.command_error.is_some() {
-            let valid_commands = self.block_review_is_current(review, false);
             actions = actions.push(
                 button(text("Copy commands").size(12))
                     .on_press_maybe(valid_commands.then_some(Message::BlockReviewCopy)),
@@ -18927,7 +18936,7 @@ impl Frost {
                 .get(self.active)
                 .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()));
             let mut insert = button(text("Insert into prompt · not run").size(12));
-            if live && self.block_review_is_current(review, true) && blocker.is_none() {
+            if live && valid_insertion && blocker.is_none() {
                 insert = insert.on_press(Message::BlockReviewInsert);
             }
             actions = actions.push(insert);
@@ -18936,9 +18945,9 @@ impl Frost {
             reason
         } else if !live {
             "Source changed or was evicted. Close and reopen to review the current pane."
-        } else if review.commands.is_some() && !self.block_review_is_current(review, false) {
+        } else if review.commands.is_some() && !valid_commands {
             "Source text or selection changed. Close and review again before copying or inserting."
-        } else if review.commands.is_some() && !self.block_review_is_current(review, true) {
+        } else if review.commands.is_some() && !valid_insertion {
             "Paste mode changed. Copy is available; close and review again before inserting."
         } else if review.commands.is_some() {
             self.sessions
@@ -27199,6 +27208,35 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_insertion_can_reuse_current_command_validation_without_weakening_snapshot_checks() {
+        let review = BlockReview {
+            session_id: 7,
+            ids: vec![1, 2],
+            title: String::new(),
+            body: String::new(),
+            commands: Some("echo one\necho two".into()),
+            command_error: None,
+            bracketed: true,
+        };
+        for session_id in [7, 8] {
+            for ids in [&[1, 2][..], &[2, 1][..], &[1][..], &[][..]] {
+                for commands in ["echo one\necho two", "echo changed", ""] {
+                    for bracketed in [true, false] {
+                        let commands_current = review.matches_commands(session_id, ids, commands);
+                        let reused = commands_current && review.bracketed == bracketed;
+                        assert_eq!(
+                            reused,
+                            review.matches_selection(session_id, ids, commands, bracketed)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(review.matches_commands(7, &[1, 2], "echo one\necho two"));
+        assert!(!review.matches_selection(7, &[1, 2], "echo one\necho two", false));
+    }
+
     #[test]
     fn block_review_layout_is_bounded_and_scrolls_wrapped_chrome_when_compact() {
         for window in [
