@@ -60,6 +60,16 @@ use terminal_view::{
 };
 use theme::Theme;
 
+/// Keep history controls inside the window while avoiding an oversized empty
+/// modal for a short result set. The list receives only the remaining height.
+fn history_picker_panel_size(window: Size, visible_results: usize) -> Size {
+    let list_height = (visible_results.max(1) as f32 * 44.0).min(300.0);
+    Size::new(
+        (window.width - 24.0).clamp(1.0, 560.0),
+        (window.height - 24.0).clamp(1.0, list_height + 160.0),
+    )
+}
+
 /// Must stay equal to the installed entry's basename
 /// (`data/io.github.beamiter.frost.desktop`): the desktop shell pairs a window
 /// with its launcher entry through this id.
@@ -3535,7 +3545,7 @@ enum Message {
     /// Cancel the history picker overlay.
     HistoryPickerClose,
     /// Type the clicked command into the active pane's prompt (and close).
-    HistoryPickerAccept(String),
+    HistoryPickerAccept(Arc<jterm_core::command_history::CommandHistoryRecord>),
     /// Filter text changed in the workflow picker.
     WorkflowPickerInput(String),
     /// Cancel the workflow overlay (picker or argument form).
@@ -16289,9 +16299,9 @@ impl Frost {
                     iced::widget::operation::focus(HISTORY_PICKER_INPUT_ID.clone()),
                 ]);
             }
-            Message::HistoryPickerAccept(command) => {
+            Message::HistoryPickerAccept(record) => {
                 self.history_picker = None;
-                return self.recall_into_active_pane(command);
+                return self.recall_into_active_pane(record.command.clone());
             }
             Message::WorkflowPickerInput(q) => {
                 if let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
@@ -16333,56 +16343,42 @@ impl Frost {
         Task::none()
     }
 
-    /// Build/refresh cached image handles for the active session's Kitty
-    /// placements. New, content-changed or differently-cropped placements get a
-    /// fresh handle; handles no longer referenced by any placement are dropped.
+    /// Cache crops in the active pane with an aggregate pixel
+    /// budget independent of the protocol's decoded-image budget. Otherwise a
+    /// thousand distinct crops can amplify one retained image into GiB of copies.
     fn refresh_kitty_handles(&mut self) {
-        type PendingHandle = (KittyHandleKey, u64, u32, u32, Vec<u8>);
-        // Collect, under an immutable borrow, which images need a (re)build and
-        // which ids are still live, then release the borrow before mutating.
-        let mut needed: Vec<PendingHandle> = Vec::new();
-        let mut live_keys = std::collections::HashSet::new();
-        {
-            let Some(sess) = self.sessions.get(self.active) else {
-                self.kitty_handles.clear();
-                return;
-            };
-            let kg = &sess.terminal.kitty_graphics;
-            for p in kg.get_placements() {
-                let Some(img) = kg.get_image(p.image_id) else {
-                    continue;
-                };
-                // `x=`/`y=`/`w=`/`h=` select a sub-rectangle of the image, so the
-                // uploaded texture is the crop, not the whole image.
-                let Some(crop) = kitty_graphics::placement_crop(img, p) else {
-                    continue;
-                };
-                let key = (sess.id, p.image_id, crop);
-                // Many placements may reference one image. Schedule/cache each
-                // texture once so placement fan-out cannot clone and upload the
-                // same (potentially large) pixel buffer hundreds of times.
-                if !live_keys.insert(key) {
-                    continue;
-                }
-                let stale = self
-                    .kitty_handles
-                    .get(&key)
-                    .map(|(_, generation)| *generation != img.generation)
-                    .unwrap_or(true);
-                if stale {
-                    needed.push((
-                        key,
-                        img.generation,
-                        crop.2,
-                        crop.3,
-                        kitty_graphics::crop_rgba(img, crop),
-                    ));
-                }
+        const MAX_KITTY_HANDLE_BYTES: usize = 256 * 1024 * 1024;
+        let Some(sess) = self.sessions.get(self.active) else {
+            self.kitty_handles.clear();
+            return;
+        };
+        let kg = &sess.terminal.kitty_graphics;
+        let crops = kg.render_crops(MAX_KITTY_HANDLE_BYTES);
+        let live: std::collections::HashMap<KittyHandleKey, u64> = crops
+            .into_iter()
+            .filter_map(|(image_id, crop)| {
+                kg.get_image(image_id)
+                    .map(|image| ((sess.id, image_id, crop), image.generation))
+            })
+            .collect();
+        // Drop stale/over-budget handles before copying replacements. Never hold
+        // a second, unbounded batch of pending RGBA buffers beside the cache.
+        self.kitty_handles.retain(|key, (_, generation)| {
+            live.get(key).is_some_and(|current| current == generation)
+        });
+        for (key, generation) in live {
+            if self.kitty_handles.contains_key(&key) {
+                continue;
             }
-        }
-        self.kitty_handles.retain(|key, _| live_keys.contains(key));
-        for (key, generation, w, h, data) in needed {
-            let handle = iced::advanced::image::Handle::from_rgba(w, h, data);
+            let (_, image_id, crop) = key;
+            let Some(image) = kg.get_image(image_id) else {
+                continue;
+            };
+            let handle = iced::advanced::image::Handle::from_rgba(
+                crop.2,
+                crop.3,
+                kitty_graphics::crop_rgba(image, crop),
+            );
             self.kitty_handles.insert(key, (handle, generation));
         }
     }
@@ -17901,7 +17897,12 @@ impl Frost {
         &self,
         state: &history_picker::HistoryPickerState,
     ) -> Element<'_, Message> {
-        let filtered = state.filtered();
+        let filtered = state.shared_filtered();
+        let panel_size = history_picker_panel_size(self.win_size, filtered.len());
+        let panel_width = panel_size.width;
+        let panel_height = panel_size.height;
+        let compact = panel_width < 440.0;
+        let scroll_panel = self.win_size.height < 244.0;
 
         let query: Element<'_, Message> = text_input("Recall a command…", state.query())
             .id(HISTORY_PICKER_INPUT_ID.clone())
@@ -17914,18 +17915,25 @@ impl Frost {
 
         use history_picker::{HistoryFilterAction as Filter, HistoryStatus};
         let directory = tooltip(
-            button(text("This directory").size(11))
-                .on_press_maybe(
-                    state
-                        .current_directory()
-                        .map(|_| Message::HistoryPickerFilter(Filter::ToggleDirectory)),
-                )
-                .padding([3, 7])
-                .style(if state.directory_only() {
-                    button::primary
+            button(
+                text(if compact {
+                    "Directory"
                 } else {
-                    button::secondary
-                }),
+                    "This directory"
+                })
+                .size(11),
+            )
+            .on_press_maybe(
+                state
+                    .current_directory()
+                    .map(|_| Message::HistoryPickerFilter(Filter::ToggleDirectory)),
+            )
+            .padding([3, 7])
+            .style(if state.directory_only() {
+                button::primary
+            } else {
+                button::secondary
+            }),
             container(
                 text(match state.current_directory() {
                     Some(cwd) => format!(
@@ -17971,7 +17979,8 @@ impl Frost {
             reset
         ]
         .spacing(4)
-        .align_y(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center)
+        .wrap();
         let summary = text(format!(
             "{} of {} matches · {} recent entries{}",
             filtered.len(),
@@ -18042,15 +18051,20 @@ impl Frost {
                         ..Default::default()
                     });
                 let row_btn =
-                    mouse_area(body).on_press(Message::HistoryPickerAccept(record.command.clone()));
+                    mouse_area(body).on_press(Message::HistoryPickerAccept(Arc::clone(record)));
                 list = list.push(row_btn);
             }
         }
 
-        let keys =
-            text("↑/↓ select · Enter insert · Ctrl+D directory · Ctrl+O status · Ctrl+U unique")
-                .size(10)
-                .style(text::secondary);
+        let keys = text(if compact {
+            "↑/↓ select · Enter insert · Esc close"
+        } else {
+            "↑/↓ select · Enter insert · Esc close · Ctrl+D directory · Ctrl+O status · Ctrl+U unique"
+        })
+        .size(10)
+        .width(Length::Fill)
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
         let list_height = (filtered.len().max(1) as f32 * 44.0).min(300.0);
         let body = column![
             query_line,
@@ -18058,13 +18072,25 @@ impl Frost {
             summary,
             scrollable(list)
                 .id(HISTORY_PICKER_LIST_ID.clone())
-                .height(Length::Fixed(list_height)),
+                .height(if scroll_panel {
+                    Length::Fixed(list_height.min(120.0))
+                } else {
+                    Length::Fill
+                }),
             keys
         ]
         .spacing(8);
+        // Reserve the query, filters and footer before giving the result list
+        // the remaining height. Very short windows scroll the whole panel so
+        // no control is clipped offscreen.
+        let body: Element<'_, Message> = if scroll_panel {
+            scrollable(body).height(Length::Fill).into()
+        } else {
+            body.into()
+        };
         let panel = container(body)
-            .width(Length::Fixed(560.0))
-            .max_height(480.0)
+            .width(Length::Fixed(panel_width))
+            .height(Length::Fixed(panel_height))
             .padding(12)
             .style(container::dark);
         let dismiss = mouse_area(
@@ -27032,6 +27058,32 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_picker_panel_reserves_window_margins_and_shrinks_for_few_results() {
+        use super::history_picker_panel_size;
+        use iced::Size;
+        assert_eq!(
+            history_picker_panel_size(Size::new(1100.0, 680.0), 15),
+            Size::new(560.0, 460.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(360.0, 300.0), 15),
+            Size::new(336.0, 276.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(280.0, 200.0), 15),
+            Size::new(256.0, 176.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(1100.0, 680.0), 0),
+            Size::new(560.0, 204.0)
+        );
+        assert_eq!(
+            history_picker_panel_size(Size::new(8.0, 8.0), 1),
+            Size::new(1.0, 1.0)
+        );
+    }
+
     use super::*;
     use iced::keyboard::key::Named;
 

@@ -757,6 +757,40 @@ impl KittyGraphicsState {
         &self.placements
     }
 
+    /// Select unique crop textures before allocating pixel copies.
+    /// The decoded-image budget does not bound this cache: many placements can
+    /// crop the same image differently. Highest-z/latest placements win when
+    /// the byte budget fills; source images and placements remain untouched.
+    pub fn render_crops(&self, max_bytes: usize) -> Vec<(u32, Crop)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut crops = Vec::new();
+        let mut remaining = max_bytes;
+        for placement in self.placements.iter().rev() {
+            let Some(image) = self.get_image(placement.image_id) else {
+                continue;
+            };
+            let Some(crop) = placement_crop(image, placement) else {
+                continue;
+            };
+            let key = (placement.image_id, crop);
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(bytes) = (crop.2 as usize)
+                .checked_mul(crop.3 as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+            else {
+                continue;
+            };
+            if bytes > remaining {
+                continue;
+            }
+            remaining -= bytes;
+            crops.push(key);
+        }
+        crops
+    }
+
     fn prune_unreferenced_images(&mut self, candidates: &std::collections::HashSet<u32>) {
         for &image_id in candidates {
             if self
@@ -950,6 +984,56 @@ mod tests {
 
     fn responses(state: &mut KittyGraphicsState) -> String {
         String::from_utf8(state.take_responses()).expect("responses are UTF-8")
+    }
+
+    #[test]
+    fn crop_texture_budget_bounds_fanout_without_mutating_protocol_state() {
+        let mut state = KittyGraphicsState::new();
+        let data = vec![255; 64 * 64 * 4];
+        state
+            .parse_graphics_payload(format!("Gf=32,s=64,v=64,a=t,i=1;{}", encode(&data)).as_bytes())
+            .unwrap();
+        for x in 0..64 {
+            state
+                .parse_graphics_payload(format!("Ga=p,i=1,p={},x={x};", x + 1).as_bytes())
+                .unwrap();
+        }
+        let old_bytes: usize = state
+            .get_placements()
+            .iter()
+            .map(|placement| {
+                let crop = placement_crop(state.get_image(1).unwrap(), placement).unwrap();
+                crop.2 as usize * crop.3 as usize * 4
+            })
+            .sum();
+        assert_eq!(old_bytes, 532_480, "one 16 KiB source amplified 32.5 times");
+        let budget = 32 * 1024;
+        let crops = state.render_crops(budget);
+        let bytes: usize = crops
+            .iter()
+            .map(|(_, crop)| crop.2 as usize * crop.3 as usize * 4)
+            .sum();
+        assert!(bytes <= budget);
+        assert!(crops.len() < 64);
+        assert_eq!(crops.first().unwrap().1 .0, 63, "latest topmost crop wins");
+        assert_eq!(state.get_placements().len(), 64);
+        assert_eq!(state.get_image(1).unwrap().data, data);
+        assert!(state.render_crops(0).is_empty());
+    }
+
+    #[test]
+    fn crop_texture_budget_deduplicates_before_accounting() {
+        let mut state = KittyGraphicsState::new();
+        state
+            .parse_graphics_payload(b"Gf=32,s=1,v=1,a=t,i=1;AQIDBA==")
+            .unwrap();
+        for id in 1..=3 {
+            state
+                .parse_graphics_payload_at(format!("Ga=p,i=1,p={id};").as_bytes(), 0, id)
+                .unwrap();
+        }
+        assert_eq!(state.render_crops(4), vec![(1, (0, 0, 1, 1))]);
+        assert!(state.render_crops(3).is_empty());
     }
 
     #[test]

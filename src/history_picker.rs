@@ -6,13 +6,27 @@
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use jterm_core::command_history::CommandHistoryRecord;
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// 打开选择器时加载的最大条数。与 forge 的历史面板一致：交互检索只需要
 /// 一个近期工作集，读取同样限制在有界的文件尾部。
 pub const PICKER_MAX_ENTRIES: usize = 2_000;
 const PICKER_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HISTORY_RECORD_BYTES: usize = 1024 * 1024;
+
+/// Dynamic-programming fuzzy scoring costs command length times query length,
+/// even though Skim compresses its score matrix to two rows. Bound work, not
+/// just the input byte limits: a valid pasted query against long history rows
+/// otherwise blocks the UI thread for seconds. Above this budget Skim's linear
+/// subsequence scorer still searches the complete command and cwd; only ranking
+/// changes. UTF-8 byte lengths conservatively bound the character work.
+const MAX_HISTORY_FUZZY_WORK: usize = 64 * 1024;
+
+fn use_linear_history_match(haystack: &str, query: &str) -> bool {
+    haystack.len().saturating_mul(query.len()) > MAX_HISTORY_FUZZY_WORK
+}
 
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更早的命令通过输入查询来召回。
@@ -159,8 +173,9 @@ pub struct HistoryPickerState {
     query: String,
     /// 当前过滤结果中的高亮位置。
     pub selected: usize,
-    entries: Vec<CommandHistoryRecord>,
+    entries: Vec<Arc<CommandHistoryRecord>>,
     matcher: SkimMatcherV2,
+    linear_matcher: SkimMatcherV2,
     current_directory: Option<String>,
     directory_only: bool,
     status: HistoryStatus,
@@ -195,8 +210,11 @@ impl HistoryPickerState {
         let mut state = Self {
             query: String::new(),
             selected: 0,
-            entries,
+            entries: entries.into_iter().map(Arc::new).collect(),
             matcher: SkimMatcherV2::default(),
+            // A nonempty match always exceeds one matrix element, selecting
+            // Skim's linear fallback without truncating either input.
+            linear_matcher: SkimMatcherV2::default().element_limit(1),
             current_directory: None,
             directory_only: false,
             status: HistoryStatus::All,
@@ -254,7 +272,18 @@ impl HistoryPickerState {
     pub fn filtered(&self) -> Vec<&CommandHistoryRecord> {
         self.results
             .iter()
-            .map(|&index| &self.entries[index])
+            .map(|&index| self.entries[index].as_ref())
+            .collect()
+    }
+
+    /// Immutable click payloads share the loaded snapshot. Rebuilding the iced
+    /// view must not clone up to fifteen 256 KiB commands on every keypress.
+    /// A queued click still owns exactly the original row even if the query or
+    /// picker changes before dispatch; only acceptance copies the raw command.
+    pub fn shared_filtered(&self) -> Vec<Arc<CommandHistoryRecord>> {
+        self.results
+            .iter()
+            .map(|&index| Arc::clone(&self.entries[index]))
             .collect()
     }
 
@@ -357,10 +386,15 @@ impl HistoryPickerState {
                 0
             } else {
                 let haystack = match record.cwd.as_deref() {
-                    Some(cwd) => format!("{} {cwd}", record.command),
-                    None => record.command.clone(),
+                    Some(cwd) => Cow::Owned(format!("{} {cwd}", record.command)),
+                    None => Cow::Borrowed(record.command.as_str()),
                 };
-                let Some(score) = self.matcher.fuzzy_match(&haystack, &self.query) else {
+                let matcher = if use_linear_history_match(&haystack, &self.query) {
+                    &self.linear_matcher
+                } else {
+                    &self.matcher
+                };
+                let Some(score) = matcher.fuzzy_match(&haystack, &self.query) else {
                     continue;
                 };
                 score
@@ -567,6 +601,148 @@ mod tests {
         // newer record first.
         assert_eq!(filtered[0].exit_code, 0);
         assert_eq!(filtered[1].exit_code, 1);
+    }
+
+    #[test]
+    fn shared_click_payload_preserves_full_snapshot_without_copying_command_bytes() {
+        let command = format!(
+            "printf {}",
+            "x".repeat(MAX_SHARED_HISTORY_COMMAND_BYTES - 7)
+        );
+        let mut state = HistoryPickerState::new(vec![record(&command, Some("/work/frost"), 0)]);
+        let first = state.shared_filtered().remove(0);
+        let second = state.shared_filtered().remove(0);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.command.as_ptr(), state.entries[0].command.as_ptr());
+        assert_eq!(first.command, command);
+        assert!(display_command(&first.command).len() < first.command.len());
+        state.set_query("unmatched");
+        assert!(state.shared_filtered().is_empty());
+        drop(state);
+        assert_eq!(
+            first.command, command,
+            "a queued click cannot retarget another row"
+        );
+        assert_eq!(first.cwd.as_deref(), Some("/work/frost"));
+    }
+
+    #[test]
+    fn fuzzy_work_budget_preserves_ordinary_scoring() {
+        assert!(!use_linear_history_match(
+            &"a".repeat(256),
+            &"a".repeat(256)
+        ));
+        assert!(use_linear_history_match(&"a".repeat(257), &"a".repeat(256)));
+        let mut state = HistoryPickerState::new(vec![
+            record("cargo test", Some("/work/frost"), 0),
+            record("cat config", None, 0),
+            record("git status", None, 0),
+        ]);
+        state.set_query("ct");
+        let matcher = SkimMatcherV2::default();
+        let mut reference: Vec<_> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let text = match entry.cwd.as_deref() {
+                    Some(cwd) => format!("{} {cwd}", entry.command),
+                    None => entry.command.clone(),
+                };
+                matcher.fuzzy_match(&text, "ct").map(|score| (score, index))
+            })
+            .collect();
+        reference.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        assert_eq!(
+            state.results,
+            reference
+                .into_iter()
+                .map(|(_, index)| index)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linear_fallback_changes_ranking_not_match_membership() {
+        let exact = SkimMatcherV2::default();
+        let linear = SkimMatcherV2::default().element_limit(1);
+        let choices = [
+            "",
+            "cargo test",
+            "CARGO test",
+            "a___b__c",
+            "aaabaaaab",
+            "目录/项目",
+            "İstanbul Straße",
+            "编译🙂终端",
+            "foo/bar.rs",
+            "foo BAR baz",
+            " /é/É/ ",
+        ];
+        let patterns = [
+            "",
+            "ct",
+            "CT",
+            "ab",
+            "aaaa",
+            "目录",
+            "目项",
+            "🙂端",
+            "İS",
+            "st",
+            "ß",
+            "fb",
+            "fB",
+            " ",
+            "éÉ",
+            "unmatched",
+        ];
+        for choice in choices {
+            for pattern in patterns {
+                assert_eq!(
+                    exact.fuzzy_match(choice, pattern).is_some(),
+                    linear.fuzzy_match(choice, pattern).is_some(),
+                    "choice {choice:?}, pattern {pattern:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_history_queries_search_full_commands_and_cwd_without_truncation() {
+        let command = format!(
+            "{} target",
+            "a".repeat(MAX_SHARED_HISTORY_COMMAND_BYTES - 7)
+        );
+        let cwd = format!("/{}目录", "d".repeat(MAX_HISTORY_CWD_BYTES - 7));
+        let mut state = HistoryPickerState::new(vec![
+            record(&command, Some(&cwd), 0),
+            record(&command, Some(&cwd), 1),
+            record("unrelated", None, 0),
+        ]);
+        state.set_query(format!("{} target", "a".repeat(512)));
+        assert_eq!(state.match_count(), 2);
+        assert_eq!(
+            state.filtered()[0].exit_code,
+            0,
+            "ties retain newest-first order"
+        );
+        assert_eq!(state.selected_command().as_deref(), Some(command.as_str()));
+        state.set_query("target 目录");
+        assert_eq!(
+            state.match_count(),
+            2,
+            "a match can cross from command to cwd"
+        );
+        state.apply_filter(HistoryFilterAction::SetStatus(HistoryStatus::Failed));
+        assert_eq!(state.match_count(), 1);
+        assert_eq!(state.filtered()[0].exit_code, 1);
+        state.set_query("TARGET");
+        assert_eq!(
+            state.match_count(),
+            0,
+            "smart-case semantics survive fallback"
+        );
     }
 
     #[test]
