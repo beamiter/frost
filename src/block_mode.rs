@@ -2277,11 +2277,11 @@ pub fn marker_fractions(rows: &[usize], total_rows: usize) -> Vec<f32> {
 
 /// True when the last `needed` cells of a row are blank, so the right-aligned
 /// badge can be painted there without covering any text.
-pub fn badge_fits(row: &[char], needed: usize) -> bool {
-    needed <= row.len()
-        && row[row.len() - needed..]
-            .iter()
-            .all(|&ch| ch == ' ' || ch == '\0')
+pub fn badge_fits(
+    row: impl ExactSizeIterator<Item = char> + DoubleEndedIterator,
+    needed: usize,
+) -> bool {
+    needed <= row.len() && row.rev().take(needed).all(|ch| ch == ' ' || ch == '\0')
 }
 
 /// How far down a running card the live badge may be anchored when the card's
@@ -2291,15 +2291,16 @@ pub fn badge_fits(row: &[char], needed: usize) -> bool {
 /// while output streams.
 pub const BADGE_ANCHOR_WINDOW: usize = 3;
 
-/// Index of the first row in `rows` whose blank tail can hold a right-aligned
-/// badge of `needed` cells, searching at most [`BADGE_ANCHOR_WINDOW`] rows.
-///
-/// `rows` is the visible part of one card in top-to-bottom order, so index 0
-/// is the card's own top row whenever that row is on screen.
-pub fn first_fitting_badge_row(rows: &[&[char]], needed: usize) -> Option<usize> {
-    rows.iter()
+/// Identity of the first eligible row whose blank tail fits, searching at
+/// most [`BADGE_ANCHOR_WINDOW`] rows in top-to-bottom order. Callers borrow
+/// their existing cells; fitting never requires a copied character grid.
+pub fn first_fitting_badge_row(
+    rows: impl IntoIterator<Item = usize>,
+    mut fits: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    rows.into_iter()
         .take(BADGE_ANCHOR_WINDOW)
-        .position(|row| badge_fits(row, needed))
+        .find(|&row| fits(row))
 }
 
 #[cfg(test)]
@@ -3900,11 +3901,11 @@ mod tests {
     #[test]
     fn badge_only_fits_over_blank_trailing_cells() {
         let blank_tail: Vec<char> = "ls -la      ".chars().collect();
-        assert!(badge_fits(&blank_tail, 5));
-        assert!(!badge_fits(&blank_tail, 8)); // would cover the "a"
-        assert!(!badge_fits(&blank_tail, 13)); // wider than the row
+        assert!(badge_fits(blank_tail.iter().copied(), 5));
+        assert!(!badge_fits(blank_tail.iter().copied(), 8)); // would cover the "a"
+        assert!(!badge_fits(blank_tail.iter().copied(), 13)); // wider than the row
         let nul_tail: Vec<char> = vec!['x', '\0', '\0'];
-        assert!(badge_fits(&nul_tail, 2));
+        assert!(badge_fits(nul_tail.iter().copied(), 2));
     }
 
     #[test]
@@ -4105,26 +4106,90 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_badge_tail_matches_materialized_rows_and_only_visits_tail() {
+        let alphabet = [' ', '\0', 'x', '界', '\u{fffd}'];
+        let mut seed = 7u64;
+        for len in 0..128 {
+            let row: Vec<char> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    alphabet[(seed >> 32) as usize % alphabet.len()]
+                })
+                .collect();
+            for needed in 0..=len + 2 {
+                let expected = needed <= row.len()
+                    && row[row.len() - needed..]
+                        .iter()
+                        .all(|&ch| ch == ' ' || ch == '\0');
+                assert_eq!(badge_fits(row.iter().copied(), needed), expected);
+            }
+        }
+        let row = [' '; 1000];
+        let visits = std::cell::Cell::new(0);
+        assert!(badge_fits(
+            row.iter().map(|&ch| {
+                visits.set(visits.get() + 1);
+                ch
+            }),
+            12
+        ));
+        assert_eq!(visits.get(), 12, "only the badge tail needs inspection");
+        visits.set(0);
+        assert!(!badge_fits(
+            row.iter().map(|&ch| {
+                visits.set(visits.get() + 1);
+                ch
+            }),
+            1001
+        ));
+        assert_eq!(visits.get(), 0, "oversized badges need no cell reads");
+    }
+
+    #[test]
+    fn borrowed_badge_anchor_preserves_view_identity_and_eligible_row_budget() {
+        let mut visited = Vec::new();
+        assert_eq!(
+            first_fitting_badge_row([4, 9, 20, 30], |row| {
+                visited.push(row);
+                row == 20
+            }),
+            Some(20)
+        );
+        assert_eq!(visited, [4, 9, 20]);
+        visited.clear();
+        assert_eq!(
+            first_fitting_badge_row([4, 9, 20, 30], |row| {
+                visited.push(row);
+                row == 30
+            }),
+            None
+        );
+        assert_eq!(visited, [4, 9, 20], "never inspect the fourth eligible row");
+    }
+
+    #[test]
     fn running_badge_anchors_to_the_first_fitting_row_within_a_short_window() {
         let full: Vec<char> = "xxxxxxxxxxxx".chars().collect();
         let free: Vec<char> = "ls -la      ".chars().collect();
-        fn rows<'a>(set: &[&'a Vec<char>]) -> Vec<&'a [char]> {
-            set.iter().map(|row| row.as_slice()).collect()
+        fn fit(rows: &[&Vec<char>], needed: usize) -> Option<usize> {
+            first_fitting_badge_row(0..rows.len(), |index| {
+                badge_fits(rows[index].iter().copied(), needed)
+            })
         }
 
         // The card's own top row wins whenever it can hold the badge.
-        assert_eq!(first_fitting_badge_row(&rows(&[&free, &free]), 5), Some(0));
+        assert_eq!(fit(&[&free, &free], 5), Some(0));
         // A full top row (long command, or an output line under it) hands the
         // badge to the next visible card row instead of dropping it, which is
         // what used to happen once the header scrolled off.
-        assert_eq!(first_fitting_badge_row(&rows(&[&full, &free]), 5), Some(1));
+        assert_eq!(fit(&[&full, &free], 5), Some(1));
         // The search is bounded, so the chip cannot wander down the screen.
         let mut deep: Vec<&Vec<char>> = vec![&full; BADGE_ANCHOR_WINDOW];
         deep.push(&free);
-        assert_eq!(first_fitting_badge_row(&rows(&deep), 5), None);
+        assert_eq!(fit(&deep, 5), None);
         // No visible card rows, or none wide enough, paints nothing.
-        assert_eq!(first_fitting_badge_row(&[], 5), None);
-        assert_eq!(first_fitting_badge_row(&rows(&[&free, &free]), 13), None);
+        assert_eq!(fit(&[], 5), None);
+        assert_eq!(fit(&[&free, &free], 13), None);
     }
 
     #[test]

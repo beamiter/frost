@@ -19398,26 +19398,18 @@ impl Frost {
         let badge = block_mode::running_badge_text(elapsed_ms);
         let needed = badge.chars().count() + self.block_badge_inset();
         let cells = sess.projection.cells();
-        let candidates: Vec<usize> = (0..cells.len())
-            .filter(|&view_row| {
-                sess.projection
-                    .view_row_absolute(view_row)
-                    .is_some_and(|row| row >= active_start && row < active_end)
-            })
-            .take(block_mode::BADGE_ANCHOR_WINDOW)
-            .collect();
-        let rows: Vec<Vec<char>> = candidates
-            .iter()
-            .map(|&view_row| {
-                cells[view_row]
-                    .iter()
-                    .map(Self::block_badge_cell_char)
-                    .collect()
-            })
-            .collect();
-        let borrowed: Vec<&[char]> = rows.iter().map(Vec::as_slice).collect();
-        let index = block_mode::first_fitting_badge_row(&borrowed, needed)?;
-        Some((candidates[index], badge, elapsed_ms))
+        let candidates = (0..cells.len()).filter(|&view_row| {
+            sess.projection
+                .view_row_absolute(view_row)
+                .is_some_and(|row| row >= active_start && row < active_end)
+        });
+        let view_row = block_mode::first_fitting_badge_row(candidates, |view_row| {
+            block_mode::badge_fits(
+                cells[view_row].iter().map(Self::block_badge_cell_char),
+                needed,
+            )
+        })?;
+        Some((view_row, badge, elapsed_ms))
     }
 
     /// Block chrome for `sess`'s visible rows, cached per session: the
@@ -19673,10 +19665,7 @@ impl Frost {
                 block_mode::clock_at_offset(ms, offset)
             });
             let inset = self.block_badge_inset();
-            let chars: Vec<char> = sess.projection.cells()[top_view]
-                .iter()
-                .map(Self::block_badge_cell_char)
-                .collect();
+            let cells = &sess.projection.cells()[top_view];
             let unavailable = zone.command_truncated
                 && zone
                     .command
@@ -19699,7 +19688,7 @@ impl Frost {
             };
             for badge in badges {
                 let needed = badge.chars().count() + inset;
-                if block_mode::badge_fits(&chars, needed) {
+                if block_mode::badge_fits(cells.iter().map(Self::block_badge_cell_char), needed) {
                     row.badge = Some((badge, color));
                     break;
                 }
@@ -28755,11 +28744,11 @@ mod tests {
         };
         continuation.flags.set_wide_continuation(true);
         let chars = [' ', Frost::block_badge_cell_char(&continuation)];
-        assert!(!block_mode::badge_fits(&chars, 1));
+        assert!(!block_mode::badge_fits(chars.into_iter(), 1));
 
         continuation.flags.set_wide_continuation(false);
         let chars = [' ', Frost::block_badge_cell_char(&continuation)];
-        assert!(block_mode::badge_fits(&chars, 1));
+        assert!(block_mode::badge_fits(chars.into_iter(), 1));
     }
 
     #[test]
