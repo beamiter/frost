@@ -2251,6 +2251,8 @@ enum ProjectedTopAnchor {
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Session wiring lands in the next slice.
 pub struct ProjectionViewState {
+    reading_hold: bool,
+    held_history_revision: u64,
     offset_from_bottom: usize,
     follow_bottom: bool,
     top_anchor: Option<ProjectedTopAnchor>,
@@ -2260,6 +2262,8 @@ pub struct ProjectionViewState {
 impl Default for ProjectionViewState {
     fn default() -> Self {
         Self {
+            reading_hold: false,
+            held_history_revision: 0,
             offset_from_bottom: 0,
             follow_bottom: true,
             top_anchor: None,
@@ -2272,6 +2276,21 @@ impl Default for ProjectionViewState {
 impl ProjectionViewState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin even an offset-zero viewport while a completed block is being read.
+    /// Raw/synthetic anchors are the same ones used for folded scrollback.
+    pub fn hold_reading_position(&mut self, viewport: &ProjectedViewport) {
+        if !self.reading_hold {
+            self.top_anchor = TerminalState::projected_top_anchor(viewport);
+            self.reading_hold = true;
+            self.held_history_revision = viewport.source_revision.history;
+            self.follow_bottom = false;
+        }
+    }
+
+    pub fn release_reading_position(&mut self) {
+        self.reading_hold = false;
     }
 
     pub fn offset_from_bottom(&self) -> usize {
@@ -2293,6 +2312,7 @@ impl ProjectionViewState {
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.reading_hold = false;
         self.offset_from_bottom = 0;
         self.follow_bottom = true;
         self.top_anchor = None;
@@ -11058,7 +11078,20 @@ impl TerminalState {
                 self.restore_identity_scroll_from_projection(state);
                 state.last_plan_key = None;
             }
-            return self.get_projected_viewport(true);
+            // At a positive offset terminal ingestion already preserves the raw
+            // viewport. Only the zero-offset transition needs explicit pinning.
+            if state.reading_hold
+                && self.scroll_offset == 0
+                && state.held_history_revision != self.history_revision
+            {
+                self.restore_identity_scroll_from_projection(state);
+            }
+            let viewport = self.get_projected_viewport(true);
+            if state.reading_hold {
+                state.top_anchor = Self::projected_top_anchor(&viewport);
+                state.held_history_revision = self.history_revision;
+            }
+            return viewport;
         }
 
         let cols = self.grid.row_len().max(1);
@@ -11094,7 +11127,7 @@ impl TerminalState {
         let viewport =
             self.get_projected_viewport_with_policy(true, policy, state.offset_from_bottom);
         state.offset_from_bottom = viewport.scroll_offset();
-        state.follow_bottom = state.offset_from_bottom == 0;
+        state.follow_bottom = state.offset_from_bottom == 0 && !state.reading_hold;
         state.top_anchor = (!state.follow_bottom)
             .then(|| Self::projected_top_anchor(&viewport))
             .flatten();
@@ -17174,6 +17207,49 @@ mod tests {
         assert!(visible.iter().all(|row| row.len() == 5));
         assert_eq!(visible[0][0].character, 'A');
         assert_eq!(visible[0][4].character, ' ');
+    }
+
+    #[test]
+    fn reading_hold_pins_folded_live_edge_through_new_output() {
+        let mut terminal = TerminalState::new(20, 4);
+        for i in 0..5 {
+            terminal.process_input(format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd{i}\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07").as_bytes());
+        }
+        let mut policy = super::ProjectionPolicy::new();
+        policy.collapse(terminal.command_zones.front().unwrap().id);
+        let mut state = super::ProjectionViewState::new();
+        let before = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(before.mode(), super::ProjectionMode::Transformed);
+        assert_eq!(before.scroll_offset(), 0);
+        let anchor = TerminalState::projected_top_anchor(&before);
+        state.hold_reading_position(&before);
+        terminal.process_input(b"new\r\nnew\r\nnew\r\nnew\r\n");
+        let after = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(after.scroll_offset() > 0);
+        assert_eq!(TerminalState::projected_top_anchor(&after), anchor);
+    }
+
+    #[test]
+    fn reading_hold_pins_live_edge_until_explicit_go_live() {
+        let mut terminal = TerminalState::new(20, 4);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\n");
+        let policy = super::ProjectionPolicy::new();
+        let mut state = super::ProjectionViewState::new();
+        let before = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(before.scroll_offset(), 0);
+        let anchor = TerminalState::projected_top_anchor(&before);
+        state.hold_reading_position(&before);
+        terminal.process_input(b"four\r\nfive\r\nsix\r\n");
+        let after = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(after.scroll_offset() > 0);
+        assert_eq!(TerminalState::projected_top_anchor(&after), anchor);
+        terminal.process_input(b"seven\r\neight\r\n");
+        let again = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(TerminalState::projected_top_anchor(&again), anchor);
+        state.scroll_to_bottom();
+        terminal.scroll_to_bottom();
+        let live = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(live.scroll_offset(), 0);
     }
 
     #[test]

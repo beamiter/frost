@@ -15,6 +15,7 @@ mod ai_command;
 mod ansi;
 mod block_export;
 mod block_mode;
+mod block_review;
 mod color;
 mod command_correction;
 mod command_palette;
@@ -1800,6 +1801,33 @@ struct BlockMenuState {
     anchor: iced::Point,
 }
 
+/// Review snapshots never own executable actions. Insert revalidates the live pane,
+/// exact selection and safe payload; ordinary Enter only stays in review.
+#[derive(Clone, Debug)]
+struct BlockReview {
+    session_id: usize,
+    ids: Vec<u64>,
+    title: String,
+    body: String,
+    commands: Option<String>,
+    bracketed: bool,
+}
+
+impl BlockReview {
+    fn matches_selection(
+        &self,
+        session_id: usize,
+        ids: &[u64],
+        commands: &str,
+        bracketed: bool,
+    ) -> bool {
+        self.session_id == session_id
+            && self.ids == ids
+            && self.bracketed == bracketed
+            && self.commands.as_deref() == Some(commands)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BlockMenuSelectionSummary {
     selected_count: usize,
@@ -1831,6 +1859,7 @@ where
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockMenuAction {
+    Details,
     CopyCommand,
     AskAi,
     CopyOutput,
@@ -3518,6 +3547,14 @@ enum Message {
     /// Render the workflow form's current values and insert for review.
     WorkflowArgSubmit,
     /// Query text changed in the block search picker.
+    BlockReviewSelected,
+    BlockBrowse,
+    BlockReviewOpen,
+    BlockReviewClose,
+    BlockReviewKeepOpen,
+    BlockReviewInsert,
+    BlockReadingNavigate(bool),
+    BlockGoLive,
     BlockSearchInput(String),
     /// Reset query, matching controls, scope, and metadata filter to defaults.
     BlockSearchReset,
@@ -3671,6 +3708,7 @@ struct Session {
     /// reconciled before actions. Native text/prompt presses or PTY-bound input
     /// clears the whole selection.
     block_selection: block_mode::BlockSelection,
+    block_reading: block_review::ReadingHistory,
     /// Pane-local bookmarks for important finalized blocks. Reconciled against
     /// the bounded zone deque before paint/navigation and cleared with blocks.
     block_bookmarks: block_mode::BlockBookmarks,
@@ -4043,6 +4081,7 @@ impl Session {
             hold_after_exit: false,
             last_duration_ms: None,
             block_selection: block_mode::BlockSelection::default(),
+            block_reading: block_review::ReadingHistory::default(),
             block_bookmarks: block_mode::BlockBookmarks::default(),
             block_chrome_cache: std::cell::RefCell::new(None),
             write_queue: std::collections::VecDeque::new(),
@@ -4185,6 +4224,9 @@ impl Session {
     }
 
     fn refresh(&mut self) {
+        if self.block_selection.is_empty() {
+            self.projection_view_state.release_reading_position();
+        }
         // The identity/P0 hot path must not allocate or scan every retained
         // zone on each PTY batch. Reconcile only after a transform exists.
         if !self.projection_policy.is_identity() {
@@ -4212,6 +4254,19 @@ impl Session {
                 self.terminal.scroll_offset == 0
             );
         }
+        if let Some(id) = self.block_selection.active() {
+            if self.projection_block_mode && !self.terminal.is_alt_buffer_active() {
+                self.projection_view_state
+                    .hold_reading_position(&self.projection);
+            }
+            self.block_reading.visit(id);
+        }
+        if self.projection.scroll_offset() == 0
+            && self.block_selection.is_empty()
+            && !self.terminal.is_alt_buffer_active()
+        {
+            self.block_reading.seen_through = self.terminal.command_zones.back().map(|z| z.id);
+        }
         let raw_cursor = self.terminal.get_cursor_pos();
         if self.projection.mode() == terminal::ProjectionMode::Transformed {
             let absolute_row = self.terminal.scrollback_len().saturating_add(raw_cursor.0);
@@ -4230,6 +4285,7 @@ impl Session {
     }
 
     fn scroll(&mut self, lines: isize) {
+        self.projection_view_state.release_reading_position();
         if self.projection.mode() == terminal::ProjectionMode::Transformed {
             self.projection_view_state.scroll(lines, &self.projection);
         } else {
@@ -4239,6 +4295,7 @@ impl Session {
     }
 
     fn set_scroll_offset(&mut self, offset: usize) {
+        self.projection_view_state.release_reading_position();
         if self.projection.mode() == terminal::ProjectionMode::Transformed {
             self.projection_view_state
                 .set_offset(offset, &self.projection);
@@ -4330,6 +4387,7 @@ impl Session {
     }
 
     fn reveal_absolute_cell(&mut self, absolute_row: usize, col: usize) -> bool {
+        self.projection_view_state.release_reading_position();
         let Some(origin) = self.terminal.raw_cell_origin_at_absolute(absolute_row, col) else {
             return false;
         };
@@ -4868,6 +4926,7 @@ struct Frost {
     next_block_search_epoch: u64,
     /// Context actions for the finalized block right-clicked anywhere in its card.
     block_menu: Option<BlockMenuState>,
+    block_review: Option<BlockReview>,
     /// Counted destructive confirmation for clearing one stable pane's block
     /// history. Revalidated before deletion in case PTY output changed it.
     block_clear_confirm: Option<BlockClearConfirmation>,
@@ -5081,6 +5140,7 @@ impl Frost {
             block_search_memory: BlockSearchMemory::default(),
             next_block_search_epoch: 0,
             block_menu: None,
+            block_review: None,
             block_clear_confirm: None,
             tab_close_confirm: None,
             last_notification_at: None,
@@ -5173,6 +5233,7 @@ impl Frost {
         if !self.config.block_mode {
             self.close_block_search();
             self.block_menu = None;
+            self.block_review = None;
             self.block_clear_confirm = None;
             for sess in &mut self.sessions {
                 sess.block_selection.clear();
@@ -5420,6 +5481,7 @@ impl Frost {
             && self.workflow_overlay.is_none()
             && self.block_search.is_none()
             && self.block_menu.is_none()
+            && self.block_review.is_none()
             && self.block_clear_confirm.is_none()
             && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
@@ -5443,6 +5505,7 @@ impl Frost {
             && self.workflow_overlay.is_none()
             && self.block_search.is_none()
             && self.block_menu.is_none()
+            && self.block_review.is_none()
             && self.block_clear_confirm.is_none()
             && self.remote_picker.is_none()
             && self.tab_close_confirm.is_none()
@@ -6717,8 +6780,23 @@ impl Frost {
     /// status bar. The top bar is always reserved (even in side-tab mode, where
     /// it hosts the dock toggle) so floating chrome never overlaps terminal
     /// content.
+    fn block_reading_bar_height(&self) -> f32 {
+        if !self.config.block_mode {
+            0.0
+        } else if self.term_width() < 220.0 {
+            116.0
+        } else if self.term_width() < 340.0 {
+            90.0
+        } else {
+            64.0
+        }
+    }
+
     fn term_height(&self) -> f32 {
-        (self.win_size.height - chrome_height(self.config.bottom_bar)).max(0.0)
+        (self.win_size.height
+            - chrome_height(self.config.bottom_bar)
+            - self.block_reading_bar_height())
+        .max(0.0)
     }
 
     /// Terminal area width: window minus the sidebar (when shown).
@@ -9006,6 +9084,7 @@ impl Frost {
         self.block_clear_confirm.is_some()
             || self.tab_close_confirm.is_some()
             || self.block_menu.is_some()
+            || self.block_review.is_some()
             || self.sidebar_dialog.is_some()
             || self.sidebar_delete_confirm.is_some()
             || self.sidebar_menu.is_some()
@@ -9383,6 +9462,7 @@ impl Frost {
             return Task::none();
         }
         match action {
+            BlockMenuAction::Details => self.open_block_review(Some(menu.zone_id)),
             BlockMenuAction::CopyCommand => self.block_copy_command_task(),
             BlockMenuAction::AskAi => self.block_ask_ai_task(menu.zone_id),
             BlockMenuAction::CopyOutput => self.block_copy_output_task(),
@@ -11845,7 +11925,9 @@ impl Frost {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(self.active) {
+            sess.projection_view_state.release_reading_position();
             sess.block_selection.replace(Some(id));
+            sess.block_reading.visit(id);
             if !rows_evicted {
                 sess.reveal_absolute_cell(prompt_row, 0);
             }
@@ -12460,7 +12542,7 @@ impl Frost {
     /// it. A multi-command selection is one editable bracketed-paste buffer;
     /// without DECSET 2004 the shared safe policy keeps only the first logical
     /// line, so later selected commands cannot execute as embedded newlines.
-    fn block_reinput_selected_commands_task(&mut self) -> Task<Message> {
+    fn insert_reviewed_block_commands(&mut self) -> Task<Message> {
         if !self.ensure_block_action_available("Block command reinput") {
             return Task::none();
         }
@@ -14017,6 +14099,12 @@ impl Frost {
                         } else if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
                         {
                             self.tab_close_confirm = None;
+                        }
+                        return Task::none();
+                    }
+                    if self.block_review.is_some() {
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.block_review = None;
                         }
                         return Task::none();
                     }
@@ -16132,6 +16220,35 @@ impl Frost {
             Message::BlockSearchToggleBookmark(hit) => {
                 return self.toggle_block_search_hit_bookmark(Some(hit));
             }
+            Message::BlockReviewSelected => return self.block_reinput_selected_commands_task(),
+            Message::BlockBrowse => return self.toggle_block_search(),
+            Message::BlockReviewOpen => return self.open_block_review(None),
+            Message::BlockReviewClose => self.block_review = None,
+            Message::BlockReviewKeepOpen => {}
+            Message::BlockReviewInsert => return self.confirm_block_review(),
+            Message::BlockReadingNavigate(older) => {
+                if self.ensure_block_action_available("Reading history") {
+                    let target = self.sessions.get_mut(self.active).and_then(|sess| {
+                        let ids = sess
+                            .terminal
+                            .command_zones
+                            .iter()
+                            .map(|z| z.id)
+                            .collect::<Vec<_>>();
+                        sess.block_reading.navigate(&ids, older)
+                    });
+                    if let Some(id) = target {
+                        self.select_and_reveal_block(id);
+                    }
+                }
+            }
+            Message::BlockGoLive => {
+                self.block_review = None;
+                if let Some(sess) = self.sessions.get_mut(self.active) {
+                    sess.block_selection.clear();
+                    sess.scroll_to_bottom();
+                }
+            }
             Message::BlockMenuClose => self.block_menu = None,
             Message::BlockMenuAction(action) => {
                 return self.execute_block_menu_action(action);
@@ -17222,12 +17339,12 @@ impl Frost {
         let body = column![
             text(format!("Clear {count} command {noun}?")).size(14),
             text(format!(
-                "This permanently removes {count} completed command {noun}, their bookmarks, and captured output from this pane."
+                "This clears {count} completed command {noun}, their bookmarks, and captured output from this pane."
             ))
             .size(12)
             .wrapping(text::Wrapping::Word)
             .style(text::secondary),
-            text("This cannot be undone.").size(12).style(text::danger),
+            text("Undo Clear Blocks can restore the latest clear, within history limits. Bookmarks and selection are not restored.").size(12).wrapping(text::Wrapping::Word).style(text::warning),
             row![
                 button(text("Cancel").size(13))
                     .on_press(Message::BlockClearConfirmNo)
@@ -18290,9 +18407,312 @@ impl Frost {
         stack![Element::from(dismiss), Element::from(centered)].into()
     }
 
-    /// Pointer-anchored actions opened by right-clicking any row of a finalized
-    /// card. Existing copy/recall/export paths remain the single implementation
-    /// of each action; this panel is only a stable-target UI.
+    /// Persistent navigation for the active pane, outside the projected grid.
+    fn block_reading_bar(&self) -> Element<'_, Message> {
+        let sess = &self.sessions[self.active];
+        let reading = sess.projection.scroll_offset() > 0 || !sess.block_selection.is_empty();
+        let unseen = sess
+            .block_reading
+            .unseen(sess.terminal.command_zones.iter().map(|z| z.id));
+        let status = if reading {
+            format!(
+                "Reading · {} selected · {unseen} new",
+                sess.block_selection.len()
+            )
+        } else {
+            format!("Live · {} blocks", sess.terminal.command_zones.len())
+        };
+        let control = |label: &'static str, message| {
+            button(text(label).size(11))
+                .on_press(message)
+                .padding([4, 7])
+                .style(self.ghost_btn_style())
+        };
+        let navigation = row![
+            control("←", Message::BlockReadingNavigate(true)),
+            control("→", Message::BlockReadingNavigate(false)),
+            control("Browse", Message::BlockBrowse),
+            control("Details", Message::BlockReviewOpen),
+            control("Review selection", Message::BlockReviewSelected),
+        ]
+        .spacing(3)
+        .wrap();
+        let content: Element<'_, Message> = if sess.terminal.is_alt_buffer_active() {
+            column![
+                text("Block review paused · alternate screen").size(12),
+                text("Return to the shell to review retained blocks.").size(11)
+            ]
+            .spacing(4)
+            .into()
+        } else {
+            column![
+                row![
+                    text(status).size(11),
+                    Space::new().width(Length::Fill),
+                    control("Go live", Message::BlockGoLive)
+                ]
+                .align_y(iced::Alignment::Center),
+                navigation
+            ]
+            .spacing(3)
+            .into()
+        };
+        container(content)
+            .padding([4, 10])
+            .width(Length::Fill)
+            .height(Length::Fixed(self.block_reading_bar_height()))
+            .style(container::dark)
+            .into()
+    }
+
+    fn open_block_review(&mut self, target: Option<u64>) -> Task<Message> {
+        if !self.ensure_block_action_available("Block details") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        let id = target
+            .or(sess.block_selection.active())
+            .or_else(|| sess.terminal.command_zones.back().map(|z| z.id));
+        let Some(zone) = id.and_then(|id| sess.terminal.zone_by_id(id)) else {
+            self.push_toast("No retained block to review", ToastKind::Info);
+            return Task::none();
+        };
+        let id = zone.id;
+        let status = block_mode::badge_text_with_lifecycle(
+            block_mode::classify(zone.command.as_deref(), zone.exit_code),
+            zone.duration_ms,
+            zone.start_mark_seen,
+            zone.completion_provenance,
+        )
+        .unwrap_or_else(|| "Background output".into());
+        let body = format!(
+            "Command\n{}\n\nWorking directory\n{}\n\nResult\n{}\nDuration: {}\nFinished (Unix ms): {}\n\nProvenance\n{}\nCommand: {}{}\nRows: {}\nOutput source: {}\n\nOutput (text preview; images remain in the terminal)\n{}",
+            block_review::preview(zone.command.as_deref().unwrap_or("No command: background output"), 65536),
+            block_review::preview(zone.cwd.as_deref().unwrap_or("Not reported"), 8192), status,
+            zone.duration_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "Not reported".into()),
+            zone.finished_at_ms.map(|ms| ms.to_string()).unwrap_or_else(|| "Not reported".into()),
+            block_mode::lifecycle_detail(zone.start_mark_seen, zone.completion_provenance),
+            if zone.command_exact { "Exact shell metadata" } else { "Reconstructed / not exact" },
+            if zone.command_truncated { "; TRUNCATED or unavailable, cannot recall" } else { "" },
+            if zone.rows_evicted { "Evicted; retained snapshot may still be available" } else { "Retained" },
+            if zone.captured_output.is_some() { "Finalization snapshot" } else if zone.captured_output_evicted { "Snapshot evicted; live rows used only if retained" } else { "Live retained rows / no text capture" },
+            match sess.terminal.zone_output_export_capped(id) {
+                Some(terminal::ZoneOutputExport::Available { text, truncated }) => format!("Capture: {}\nPreview: {}\n\n{}", if truncated { "TRUNCATED by terminal budget" } else { "Available retained text" }, if text.len() > 65536 { "Clipped to 64 KiB; copy/export retains the available capture" } else { "Retained text shown below" }, block_review::preview(&text, 65536)),
+                Some(terminal::ZoneOutputExport::Unavailable) => "Unavailable: captured output was evicted".into(),
+                _ => "No non-blank text output captured".into(),
+            }
+        );
+        sess.block_selection.replace(Some(id));
+        sess.projection_view_state
+            .hold_reading_position(&sess.projection);
+        sess.block_reading.visit(id);
+        self.block_review = Some(BlockReview {
+            session_id: sess.id,
+            ids: vec![id],
+            title: format!("Block #{id} · details"),
+            body,
+            commands: None,
+            bracketed: false,
+        });
+        Task::none()
+    }
+
+    fn block_reinput_selected_commands_task(&mut self) -> Task<Message> {
+        if !self.ensure_block_action_available("Review commands") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let commands = block_mode::selected_commands(
+            sess.terminal
+                .command_zones
+                .iter()
+                .map(|z| (z.id, z.command.as_deref(), z.command_truncated)),
+            &sess.block_selection,
+            crate::review_text::MAX_PROMPT_INSERT_BYTES,
+        );
+        let commands = match commands {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.push_toast(
+                    match error {
+                        block_mode::SelectedCommandsError::Empty => "Select at least one command block to review".to_string(),
+                        block_mode::SelectedCommandsError::Truncated => "A selected command is truncated or unavailable; it cannot be inserted".to_string(),
+                        block_mode::SelectedCommandsError::TooLarge => "Selected commands exceed the safe prompt-insertion budget".to_string(),
+                        block_mode::SelectedCommandsError::Unsafe => "A selected command contains unsafe control or visual-spoofing characters".to_string(),
+                    },
+                    ToastKind::Warning,
+                );
+                return Task::none();
+            }
+        };
+        let bracketed = sess.terminal.is_bracketed_paste_enabled();
+        let ids = sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|z| sess.block_selection.contains(z.id))
+            .map(|z| z.id)
+            .collect::<Vec<_>>();
+        let mut sources = String::new();
+        for zone in sess
+            .terminal
+            .command_zones
+            .iter()
+            .filter(|z| sess.block_selection.contains(z.id))
+        {
+            if sources.len() >= 8192 {
+                sources.push_str(
+                    "\n[Further source metadata omitted; all safe commands remain below]",
+                );
+                break;
+            }
+            sources.push_str(&format!(
+                "#{} · exit {} · cwd {}\n",
+                zone.id,
+                zone.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                block_review::preview(zone.cwd.as_deref().unwrap_or("not reported"), 256)
+            ));
+        }
+        let body = format!("{} command(s), in terminal order. Review the exact retained command text below.\n{}\n\nSources\n{}\nCommands\n{}",
+            commands.block_count,
+            if bracketed { "Insert places these commands in the editable prompt. It does not run them." }
+            else { "Bracketed paste is disabled: ONLY THE FIRST LOGICAL LINE will be inserted. Nothing is run." },
+            sources,
+            block_review::preview(&commands.text, crate::review_text::MAX_PROMPT_INSERT_BYTES * 2));
+        self.block_review = Some(BlockReview {
+            session_id: sess.id,
+            ids,
+            title: "Review selected commands".into(),
+            body,
+            commands: Some(commands.text),
+            bracketed,
+        });
+        Task::none()
+    }
+
+    fn confirm_block_review(&mut self) -> Task<Message> {
+        let Some(review) = self.block_review.take() else {
+            return Task::none();
+        };
+        let valid = self.sessions.get(self.active).is_some_and(|sess| {
+            if sess.id != review.session_id
+                || sess.terminal.is_bracketed_paste_enabled() != review.bracketed
+            {
+                return false;
+            }
+            let ids = sess
+                .terminal
+                .command_zones
+                .iter()
+                .filter(|z| sess.block_selection.contains(z.id))
+                .map(|z| z.id)
+                .collect::<Vec<_>>();
+            let commands = block_mode::selected_commands(
+                sess.terminal
+                    .command_zones
+                    .iter()
+                    .map(|z| (z.id, z.command.as_deref(), z.command_truncated)),
+                &sess.block_selection,
+                crate::review_text::MAX_PROMPT_INSERT_BYTES,
+            );
+            commands.ok().is_some_and(|commands| {
+                review.matches_selection(
+                    sess.id,
+                    &ids,
+                    &commands.text,
+                    sess.terminal.is_bracketed_paste_enabled(),
+                )
+            })
+        });
+        if !valid {
+            self.push_toast(
+                "Review changed or expired. Review the selection again before inserting.",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
+        self.insert_reviewed_block_commands()
+    }
+
+    fn block_review_view<'a>(&'a self, review: &'a BlockReview) -> Element<'a, Message> {
+        let live = self.sessions.get(self.active).is_some_and(|sess| {
+            sess.id == review.session_id
+                && !sess.terminal.is_alt_buffer_active()
+                && self.config.block_mode
+                && review
+                    .ids
+                    .iter()
+                    .all(|id| sess.terminal.zone_by_id(*id).is_some())
+        });
+        let mut actions = row![button(text("Close · Esc").size(12))
+            .on_press(Message::BlockReviewClose)
+            .style(self.ghost_btn_style())]
+        .spacing(8);
+        if review.commands.is_some() {
+            let blocker = self
+                .sessions
+                .get(self.active)
+                .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()));
+            let mut insert = button(text("Insert into prompt · not run").size(12));
+            if live && blocker.is_none() {
+                insert = insert.on_press(Message::BlockReviewInsert);
+            }
+            actions = actions.push(insert);
+        }
+        let status = if !live {
+            "Source changed or was evicted. Close and reopen to review the current pane."
+        } else if review.commands.is_some() {
+            self.sessions
+                .get(self.active)
+                .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()))
+                .unwrap_or("Enter does not insert. Use the explicit button after review.")
+        } else {
+            "Read-only snapshot. Copy/export actions remain available from the block menu."
+        };
+        let panel = container(
+            column![
+                text(&review.title).size(18),
+                text(status).size(12).wrapping(text::Wrapping::Word),
+                scrollable(
+                    text(&review.body)
+                        .size(13)
+                        .font(iced::Font::MONOSPACE)
+                        .wrapping(text::Wrapping::Word)
+                        .width(Length::Fill)
+                )
+                .height(Length::Fill),
+                actions,
+            ]
+            .spacing(12),
+        )
+        .padding(18)
+        .width(Length::Fixed(
+            (self.win_size.width - 32.0).clamp(180.0, 880.0),
+        ))
+        .height(Length::Fixed((self.win_size.height - 48.0).max(120.0)))
+        .style(container::dark);
+        let backdrop = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::BlockReviewClose);
+        stack![
+            Element::from(backdrop),
+            Element::from(
+                container(mouse_area(panel).on_press(Message::BlockReviewKeepOpen))
+                    .center(Length::Fill)
+            )
+        ]
+        .into()
+    }
+
     fn block_menu_view(&self, state: BlockMenuState) -> Element<'_, Message> {
         let target = self
             .sessions
@@ -18352,6 +18772,7 @@ impl Frost {
             };
 
             body = body
+                .push(row_btn("Open block details", BlockMenuAction::Details))
                 .push(
                     row![
                         text(format!("Command Block #{}", zone.id)).size(16),
@@ -20515,6 +20936,13 @@ impl Frost {
         } else {
             panes_body
         };
+        let panes_body: Element<'_, Message> = if self.config.block_mode {
+            column![self.block_reading_bar(), panes_body]
+                .height(Length::Fill)
+                .into()
+        } else {
+            panes_body
+        };
         let body = container(panes_body)
             .width(Length::Fill)
             .height(Length::Fill);
@@ -20636,6 +21064,11 @@ impl Frost {
         };
         let root: Element<'_, Message> = if let Some(s) = &self.block_search {
             stack![root, self.block_search_view(s)].into()
+        } else {
+            root
+        };
+        let root: Element<'_, Message> = if let Some(review) = &self.block_review {
+            stack![root, self.block_review_view(review)].into()
         } else {
             root
         };
@@ -26471,6 +26904,29 @@ fn xterm_modify_other_keys_encode(
 mod tests {
     use super::*;
     use iced::keyboard::key::Named;
+
+    #[test]
+    fn block_review_identity_and_payload_fail_closed() {
+        let review = BlockReview {
+            session_id: 7,
+            ids: vec![4, 9],
+            title: String::new(),
+            body: String::new(),
+            commands: Some("echo one\necho two".into()),
+            bracketed: true,
+        };
+        assert!(review.matches_selection(7, &[4, 9], "echo one\necho two", true));
+        assert!(!review.matches_selection(8, &[4, 9], "echo one\necho two", true));
+        assert!(!review.matches_selection(7, &[9, 4], "echo one\necho two", true));
+        assert!(!review.matches_selection(7, &[9], "echo two", true));
+        assert!(!review.matches_selection(7, &[4, 9], "changed", true));
+        assert!(!review.matches_selection(7, &[4, 9], "echo one\necho two", false));
+        let details = BlockReview {
+            commands: None,
+            ..review
+        };
+        assert!(!details.matches_selection(7, &[4, 9], "", true));
+    }
 
     #[test]
     fn desktop_notification_pair_strips_osc_payload_controls() {

@@ -942,3 +942,28 @@ feedback. Delayed file actions carry the tree generation and are rejected
 after any root/location change. If the initial remote-home probe fails, the
 panel returns to a usable Local tree, shows the bounded error inline, and lets
 the profile be selected again for a retry.
+
+### Block reading workspace
+
+Block Mode now keeps a compact reading strip above the terminal. **Browse** opens
+cross-block search; **Details** opens a bounded, read-only snapshot of the selected
+(or newest) retained block. Details show command and working-directory capture,
+exit/duration, lifecycle evidence, row retention, and text-output provenance.
+Large previews are explicitly clipped; images remain in the terminal grid.
+
+**← / →** retrace up to 64 block visits in this pane. They use stable block IDs and
+skip evicted records. Reading a selected block pins the viewport even if it began
+at the live edge. New retained completions are counted without pulling the reader
+to the bottom. **Go live** explicitly clears block selection and resumes following.
+Scrolling and normal terminal input retain their established behavior.
+
+**Review selection** (also Ctrl+Shift+I or Enter on a selected block) opens a
+nonexecuting review before inserting selected commands in terminal order. Enter
+inside the review does not insert; use **Insert into prompt · not run**. The pane,
+selection, command text, paste mode and prompt safety are checked again before
+insertion. A changed or evicted selection fails closed. Without bracketed paste,
+only the first logical line is inserted, and the review says so. Escape closes the
+review without writing to the PTY. Review controls pause in alternate-screen apps.
+
+Clear Blocks retains the existing single-level undo, subject to scrollback and
+capture budgets. Undo does not restore cleared bookmarks or block selection.
