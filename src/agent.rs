@@ -342,6 +342,13 @@ struct InFlightModelRequest {
     token: AiCancellationToken,
 }
 
+fn restored_history_notice(session: &jterm_core::agent::AgentSession) -> Option<&'static str> {
+    session
+        .snapshot()
+        .is_some_and(|snapshot| snapshot.transcript_truncated())
+        .then_some("Earlier activity was omitted to keep the saved session within its size limit")
+}
+
 pub struct AgentUi {
     pub is_open: bool,
     pub session: Option<AgentSession>,
@@ -359,6 +366,7 @@ pub struct AgentUi {
     pub edit: Option<(ProposalRef, String)>,
     pub loading: bool,
     pub status: String,
+    pub restored_history_notice: Option<&'static str>,
     pub provider_label: String,
     /// Checked monotonic half of an in-flight model request identity. The
     /// other half is the task epoch stored in [`InFlightModelRequest`].
@@ -386,6 +394,7 @@ impl AgentUi {
             edit: None,
             loading: false,
             status: String::new(),
+            restored_history_notice: None,
             provider_label: String::new(),
             generation: 0,
             execution_generation: 0,
@@ -403,10 +412,7 @@ impl AgentUi {
         self.status.clear();
         let restored = snapshot_path().and_then(|path| claim_snapshot_session(&path));
         match restored {
-            Some(session) => {
-                self.session = Some(session);
-                self.set_status("restored the previous agent session".to_string());
-            }
+            Some(session) => self.install_restored_session(session),
             None => self.session = Some(AgentSession::new(config.agent_max_turns)),
         }
         match client_from_config(config) {
@@ -419,6 +425,12 @@ impl AgentUi {
                 self.set_status(error);
             }
         }
+    }
+
+    fn install_restored_session(&mut self, session: AgentSession) {
+        self.restored_history_notice = restored_history_notice(&session);
+        self.session = Some(session);
+        self.set_status("restored the previous agent session".to_string());
     }
 
     /// Start a fresh Agent task from one failed block's captured context
@@ -535,6 +547,7 @@ impl AgentUi {
             session.cancel();
         }
         self.session = None;
+        self.restored_history_notice = None;
         self.bound_session_id = None;
         self.awaiting = None;
         self.last_manual_completed = None;
@@ -951,6 +964,7 @@ impl AgentUi {
         if let Some(session) = self.session.as_mut() {
             match session.start_new_task() {
                 Ok(()) => {
+                    self.restored_history_notice = None;
                     self.edit = None;
                     self.awaiting = None;
                     self.status.clear();
@@ -1130,6 +1144,66 @@ fn bound_composer(text: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_omitted_history_session() -> jterm_core::agent::AgentSession {
+        use jterm_core::agent::{AgentSession, AgentSessionSnapshot};
+        let mut session = AgentSession::new(10);
+        session.submit_user("retained task").unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap();
+        snapshot["transcript_truncated"] = serde_json::json!(true);
+        AgentSession::restore(AgentSessionSnapshot::from_json(&snapshot.to_string()).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn restored_history_notice_survives_status_until_history_is_replaced() {
+        let mut panel = AgentUi::new();
+        panel.install_restored_session(legacy_omitted_history_session());
+        let notice = panel
+            .restored_history_notice
+            .expect("old omitted snapshots must disclose history loss");
+        assert!(notice.contains("Earlier activity was omitted"));
+        panel.set_status("provider failed");
+        panel.status.clear();
+        assert_eq!(panel.restored_history_notice, Some(notice));
+        panel.new_task(); // AwaitingModel cannot be replaced by this transition.
+        assert_eq!(panel.restored_history_notice, Some(notice));
+        panel
+            .session
+            .as_mut()
+            .unwrap()
+            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
+            .unwrap();
+        panel.continue_task();
+        assert_eq!(panel.restored_history_notice, Some(notice));
+        panel
+            .session
+            .as_mut()
+            .unwrap()
+            .submit_user("follow up")
+            .unwrap();
+        panel
+            .session
+            .as_mut()
+            .unwrap()
+            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
+            .unwrap();
+        panel.new_task();
+        assert!(panel.restored_history_notice.is_none());
+        panel.install_restored_session(legacy_omitted_history_session());
+        panel.close();
+        assert!(panel.restored_history_notice.is_none());
+    }
+
+    #[test]
+    fn complete_restored_history_has_no_omission_notice() {
+        let mut session = AgentSession::new(10);
+        session.submit_user("complete task").unwrap();
+        let mut panel = AgentUi::new();
+        panel.install_restored_session(session);
+        assert!(panel.restored_history_notice.is_none());
+    }
 
     #[test]
     fn client_configuration_keeps_provider_credentials_bound() {

@@ -25,6 +25,15 @@ pub(crate) const MAX_TASK_TITLE_DISPLAY_BYTES: usize = 112;
 /// Display bound for branch names, status details, and validation details.
 pub(crate) const MAX_TASK_DETAIL_DISPLAY_BYTES: usize = 256;
 
+/// Visible before starting a print-mode provider; a worktree is not containment.
+pub(crate) fn native_start_notice(provider: AgentProvider) -> Option<&'static str> {
+    match provider {
+        AgentProvider::Claude => Some("Claude skips its own permission prompts and can automatically run tools with your user account's file access. This worktree is not a sandbox."),
+        AgentProvider::Kimi => Some("Kimi uses automatic tool permission and can run tools with your user account's file access. This worktree is not a sandbox."),
+        AgentProvider::Codex | AgentProvider::OpenCode => None,
+    }
+}
+
 /// Consent projection for any native provider prompt. `share_command_context`
 /// requires both the AI master switch and the explicit command-context
 /// sharing opt-in, mirroring the Settings copy; secret redaction follows the
@@ -304,6 +313,20 @@ impl TaskPanel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn print_provider_notice_discloses_permissions_without_promising_a_sandbox() {
+        use super::{native_start_notice, AgentProvider};
+        let claude = native_start_notice(AgentProvider::Claude).unwrap();
+        assert!(claude.contains("skips its own permission prompts"));
+        let kimi = native_start_notice(AgentProvider::Kimi).unwrap();
+        assert!(kimi.contains("automatic tool permission"));
+        for notice in [claude, kimi] {
+            assert!(notice.contains("user account's file access"));
+            assert!(notice.contains("not a sandbox"));
+        }
+        assert_eq!(native_start_notice(AgentProvider::Codex), None);
+        assert_eq!(native_start_notice(AgentProvider::OpenCode), None);
+    }
     use super::*;
 
     #[test]

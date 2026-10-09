@@ -2643,6 +2643,7 @@ struct SidebarLocationChoice {
 
 #[derive(Clone, Debug)]
 struct SidebarRemoteFollow {
+    cancellation: std::sync::Arc<remote_fs::CancellationToken>,
     token: u64,
     intent_epoch: u64,
     session_id: usize,
@@ -2658,6 +2659,49 @@ struct SidebarRemoteFollow {
     tree_root: std::path::PathBuf,
     sidebar_open: bool,
     sidebar_panel: SidebarPanel,
+}
+
+/// The first listing remains part of the original automatic follow request.
+/// `None` is only for a same-namespace execution-overlay rebind.
+#[derive(Clone, Debug)]
+struct SidebarRemoteFollowResult {
+    root: std::path::PathBuf,
+    listing: Option<remote_fs::DirectoryListing>,
+}
+
+fn probe_sidebar_remote_follow(
+    location: &remote_fs::FsLocation,
+    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+    show_hidden: bool,
+    preserve_loaded_tree: bool,
+    cancellation: &remote_fs::CancellationToken,
+) -> std::io::Result<SidebarRemoteFollowResult> {
+    let check_cancelled = || {
+        if cancellation.is_cancelled() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "SSH Files follow cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
+    let root = remote_fs::start_dir_cancellable(location, hosts, cancellation)?;
+    check_cancelled()?;
+    let listing = if preserve_loaded_tree {
+        None
+    } else {
+        Some(remote_fs::list_dir_listing_with_hidden_cancellable(
+            location,
+            hosts,
+            &root,
+            show_hidden,
+            Some(cancellation),
+        )?)
+    };
+    check_cancelled()?;
+    Ok(SidebarRemoteFollowResult { root, listing })
 }
 
 fn sidebar_remote_follow_tree_is_current(
@@ -2682,7 +2726,8 @@ fn sidebar_remote_follow_context_is_current(
     intent_epoch: Option<u64>,
     files_busy: bool,
 ) -> bool {
-    sidebar_remote_follow_tree_is_current(pending, sidebar, sidebar_open, sidebar_panel)
+    !pending.cancellation.is_cancelled()
+        && sidebar_remote_follow_tree_is_current(pending, sidebar, sidebar_open, sidebar_panel)
         && hosts_epoch == pending.hosts_epoch
         && intent_epoch == Some(pending.intent_epoch)
         && !files_busy
@@ -3538,7 +3583,7 @@ enum Message {
     ),
     /// Staged home probe for an SSH process observed through `/proc`. The
     /// existing tree remains visible until this succeeds and is revalidated.
-    SidebarRemoteFollowResolved(u64, Result<std::path::PathBuf, String>),
+    SidebarRemoteFollowResolved(u64, Result<SidebarRemoteFollowResult, String>),
     /// Explicitly re-probe the exact still-running SSH command named by the
     /// current Files failure notice.
     SidebarRemoteFollowRetry,
@@ -5734,7 +5779,9 @@ impl Frost {
     }
 
     fn cancel_sidebar_remote_follow(&mut self) {
-        self.sidebar_follow_pending = None;
+        if let Some(pending) = self.sidebar_follow_pending.take() {
+            pending.cancellation.cancel();
+        }
     }
 
     fn invalidate_sidebar_remote_follow_intent(&mut self) {
@@ -5906,7 +5953,9 @@ impl Frost {
             return Task::none();
         };
         self.sidebar_follow_next_token = token;
+        let cancellation = remote_fs::CancellationToken::new();
         self.sidebar_follow_pending = Some(SidebarRemoteFollow {
+            cancellation: cancellation.clone(),
             token,
             intent_epoch,
             session_id,
@@ -5929,9 +5978,17 @@ impl Frost {
         });
 
         let hosts = self.sidebar.hosts_snapshot().to_vec();
+        let show_hidden = self.sidebar.show_hidden();
         Task::perform(
             async move {
-                remote_fs::start_dir(&target_location, &hosts).map_err(|error| error.to_string())
+                probe_sidebar_remote_follow(
+                    &target_location,
+                    &hosts,
+                    show_hidden,
+                    preserve_loaded_tree,
+                    &cancellation,
+                )
+                .map_err(|error| error.to_string())
             },
             move |result| Message::SidebarRemoteFollowResolved(token, result),
         )
@@ -5940,7 +5997,7 @@ impl Frost {
     fn resolve_sidebar_remote_follow(
         &mut self,
         token: u64,
-        start: Result<std::path::PathBuf, String>,
+        start: Result<SidebarRemoteFollowResult, String>,
     ) -> Task<Message> {
         if self
             .sidebar_follow_pending
@@ -6027,13 +6084,22 @@ impl Frost {
             return Task::none();
         }
 
-        let generation = self.sidebar.begin_location_change(pending.target_location);
-        let Some(request) = self.sidebar.resolve_location(generation, Ok(start)) else {
+        let Some(listing) = start.listing else {
             return Task::none();
         };
-        self.set_sidebar_notice(format!("Following {label}"), true);
-        self.apply_config();
-        self.queue_sidebar_load(request)
+        if self
+            .sidebar
+            .commit_probed_location_listing(pending.target_location, start.root, listing)
+        {
+            self.invalidate_sidebar_pending_work();
+            self.sidebar_selection.clear();
+            self.sidebar_selection_anchor = None;
+            self.sidebar_filter = None;
+            self.sidebar_path_input = None;
+            self.set_sidebar_notice(format!("Following {label}"), true);
+            self.apply_config();
+        }
+        Task::none()
     }
 
     /// Reconcile the file tree's immutable host snapshot after a config
@@ -23707,7 +23773,7 @@ impl Frost {
         match start {
             Ok(()) => self.push_toast(
                 format!(
-                    "Preparing an isolated {} session…",
+                    "Preparing a native {} session…",
                     crate::review_text::bound_provider_label(provider.display_name())
                 ),
                 ToastKind::Info,
@@ -24378,6 +24444,9 @@ impl Frost {
 
         // Action rows.
         let provider_name = crate::review_text::bound_provider_label(task.provider.display_name());
+        if let Some(notice) = agent_task_ui::native_start_notice(task.provider) {
+            card = card.push(text(notice).size(11).style(text::danger));
+        }
         let share_context = agent_task_ui::prompt_policy(&self.config).share_command_context;
         let mut actions = row![].spacing(6);
         if preparing {
@@ -24607,6 +24676,9 @@ impl Frost {
         use jterm_core::agent::{AgentState, ProposalStatus, Turn as AgentTurn};
 
         let mut transcript = column![].spacing(8);
+        if let Some(notice) = self.agent.restored_history_notice {
+            transcript = transcript.push(text(notice).size(12).style(text::secondary));
+        }
         let session = self.agent.session.as_ref();
         if let Some(session) = session {
             for (index, turn) in session.transcript().iter().enumerate() {
@@ -28765,10 +28837,52 @@ mod tests {
     }
 
     #[test]
+    fn combined_ssh_listing_has_no_second_navigation_completion() {
+        let mut sidebar = sidebar::Sidebar::new();
+        let location = remote_fs::FsLocation::Transient(sidebar_remote_profile(
+            "observed",
+            "observed.example",
+        ));
+        let result = SidebarRemoteFollowResult {
+            root: "/remote/home".into(),
+            listing: Some(remote_fs::DirectoryListing {
+                entries: vec![],
+                truncated: false,
+            }),
+        };
+        assert!(sidebar.commit_probed_location_listing(
+            location.clone(),
+            result.root.clone(),
+            result.listing.unwrap()
+        ));
+        assert_eq!(sidebar.location, location);
+        assert_eq!(sidebar.current_dir, result.root);
+        assert!(
+            sidebar.navigation_pending_target().is_none() && !sidebar.location_change_pending(),
+            "publication must finish before source authority is released"
+        );
+    }
+
+    #[test]
+    fn cancelled_ssh_follow_never_starts_home_or_listing() {
+        let cancellation = remote_fs::CancellationToken::new();
+        cancellation.cancel();
+        let result = probe_sidebar_remote_follow(
+            &remote_fs::FsLocation::Remote(usize::MAX),
+            &[],
+            false,
+            false,
+            &cancellation,
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
     fn staged_ssh_follow_never_overrides_newer_file_tree_or_chrome_intent() {
         let profile = sidebar_remote_profile("observed", "observed.example");
         let mut sidebar = sidebar::Sidebar::new();
         let pending = SidebarRemoteFollow {
+            cancellation: remote_fs::CancellationToken::new(),
             token: 1,
             intent_epoch: 0,
             session_id: 3,
@@ -28836,6 +28950,19 @@ mod tests {
             false,
             SidebarPanel::Files,
         ));
+        pending.cancellation.cancel();
+        assert!(
+            !sidebar_remote_follow_context_is_current(
+                &pending,
+                &sidebar,
+                false,
+                SidebarPanel::Tabs,
+                0,
+                Some(0),
+                false,
+            ),
+            "completed listing still belongs to the cancelled automatic request"
+        );
         let _newer = sidebar.refresh();
         assert!(!sidebar_remote_follow_tree_is_current(
             &pending,

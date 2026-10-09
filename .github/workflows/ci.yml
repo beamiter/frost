@@ -57,6 +57,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Check Files follow callback races
+        run: python3 scripts/test-files-follow.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

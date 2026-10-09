@@ -690,6 +690,11 @@ Git worktree（位于 `~/.local/share/frost/agent-tasks/`）并登记任务卡�
   失败时可 **Open Kimi** 回退到 PTY。
 - **OpenCode**：**Start …** 与 **Open …** 都走 PATH 上的 CLI（PTY 兼容路径）。
 
+**Start Claude 会跳过 Claude 自身的权限审批；Start Kimi 使用自动工具权限模式。**
+二者都可自动运行工具，并访问当前用户账户有权访问的文件。独立 Git worktree 不是安全沙箱，
+不能限制它们只能读写该目录。Tasks 卡片在启动按钮旁持续显示此边界。**Open …** 由 CLI 自己
+处理交互提示，也不代表额外的文件系统隔离。
+
 也可随时从命令面板（`Ctrl+Shift+P`）用 **Open Codex/Claude/OpenCode/Kimi in new tab**
 在当前 pane 的工作目录新开对应 CLI（不依赖 Tasks 实验开关；命令 id 为
 `agent:launch:codex|claude|opencode|kimi`，默认不绑快捷键）。

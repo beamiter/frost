@@ -1219,6 +1219,32 @@ impl Sidebar {
         }
     }
 
+    /// Publish a complete automatic-follow snapshot synchronously. Its caller
+    /// has just revalidated the source pane/process after both home and list
+    /// finished; no second asynchronous request may outlive that authority.
+    pub fn commit_probed_location_listing(
+        &mut self,
+        location: FsLocation,
+        root: PathBuf,
+        listing: remote_fs::DirectoryListing,
+    ) -> bool {
+        let generation = self.begin_location_change(location);
+        let Some(request) = self.resolve_location(generation, Ok(root)) else {
+            return false;
+        };
+        self.apply_load(DirectoryResult {
+            generation: request.generation,
+            request_id: request.request_id,
+            path: request.path,
+            entries: Ok(listing
+                .entries
+                .into_iter()
+                .map(|entry| FileTreeNode::entry(entry.name, entry.path, entry.is_dir))
+                .collect()),
+            truncated: listing.truncated,
+        })
+    }
+
     /// Point the tree at a new root and return the one-level load request.
     pub fn set_current_dir(&mut self, path: PathBuf) -> DirectoryRequest {
         self.advance_generation();
