@@ -8546,19 +8546,6 @@ impl Frost {
         self.refresh_active_context();
     }
 
-    /// Activate `sessions[index]` through the single tab/session switching path:
-    /// switch to the tab that owns it and focus its pane there. A session is
-    /// never moved into another pane — pane ownership is fixed, so split
-    /// topology and ratios are untouched.
-    fn activate_session(&mut self, index: usize) {
-        if index >= self.sessions.len() || !self.focus_session(index) {
-            return;
-        }
-        self.session_dirty = true;
-        self.relayout();
-        self.refresh_active_context();
-    }
-
     /// Current index of the session with this stable id, if it is still open.
     /// Anything held across UI events must go through here: indices shift when
     /// a session is closed or the tabs are reordered.
