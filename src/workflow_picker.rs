@@ -81,14 +81,25 @@ pub(crate) fn bound_workflow_arg_label(name: &str, description: &str, required: 
 /// 选择器状态。`entries` 保持 `workflows::load_all` 的目录优先级顺序（与
 /// anvil 一致：更早的目录胜出同名项，目录内按文件名排序）；期间磁盘上的
 /// 变更在下一次打开时生效。
+static NEXT_PICKER_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A rendered row's immutable entry identity, independent of later filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkflowChoice {
+    snapshot: u64,
+    entry: usize,
+}
+
 pub(crate) struct WorkflowPickerState {
     picker: WorkflowPicker,
+    snapshot: u64,
 }
 
 impl WorkflowPickerState {
     pub(crate) fn new(entries: Vec<Workflow>) -> Self {
         Self {
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
+            snapshot: NEXT_PICKER_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -173,12 +184,26 @@ impl WorkflowPickerState {
         self.picker.selected_workflow()
     }
 
-    /// 过滤结果中第 `index` 条的 workflow（用于鼠标点击分发）。
-    pub(crate) fn workflow_at_filtered(&self, index: usize) -> Option<&Workflow> {
-        if overlay_query_is_unsafe(self.query()) {
+    /// Resolve the entry already borrowed by this rendered row. This copies
+    /// only two integers, never its potentially large template or arguments.
+    pub(crate) fn choice_for(&self, workflow: &Workflow) -> Option<WorkflowChoice> {
+        let entry = self
+            .picker
+            .entries()
+            .iter()
+            .position(|entry| std::ptr::eq(entry, workflow))?;
+        Some(WorkflowChoice {
+            snapshot: self.snapshot,
+            entry,
+        })
+    }
+
+    /// A queued row action may survive a query edit, but not picker replacement.
+    pub(crate) fn resolve_choice(&self, choice: WorkflowChoice) -> Option<&Workflow> {
+        if choice.snapshot != self.snapshot || overlay_query_is_unsafe(self.query()) {
             return None;
         }
-        self.picker.workflow_at_filtered(index)
+        self.picker.entries().get(choice.entry)
     }
 }
 
@@ -300,6 +325,45 @@ mod tests {
     }
 
     #[test]
+    fn queued_choice_preserves_the_original_raw_workflow_across_query_changes() {
+        let mut first = workflow("alpha", "original", &["one"]);
+        first.command = "printf '%s' 'raw \"A\"'".into();
+        first.args = vec![WorkflowArg {
+            name: "value".into(),
+            description: "original argument".into(),
+            default: Some("A".into()),
+        }];
+        first.source_path = Some(PathBuf::from("/original/alpha.yaml"));
+        let mut state =
+            WorkflowPickerState::new(vec![first.clone(), workflow("beta", "other", &[])]);
+        state.set_query("alpha");
+        let choice = state.choice_for(state.filtered()[0]).unwrap();
+        state.set_query("beta");
+        assert_eq!(state.filtered()[0].name, "beta");
+        let resolved = state.resolve_choice(choice).unwrap();
+        assert_eq!(resolved.command, first.command);
+        assert_eq!(resolved.source_path, first.source_path);
+        assert_eq!(resolved.args[0].default, first.args[0].default);
+        assert_eq!(resolved.name, "alpha");
+    }
+
+    #[test]
+    fn queued_choice_cannot_retarget_a_reopened_picker_or_foreign_entry() {
+        let entry = workflow("same name", "", &[]);
+        let first = WorkflowPickerState::new(vec![entry.clone()]);
+        let choice = first.choice_for(first.filtered()[0]).unwrap();
+        let second = WorkflowPickerState::new(vec![entry.clone()]);
+        assert!(second.resolve_choice(choice).is_none());
+        assert!(first.choice_for(&entry).is_none());
+        assert!(first
+            .resolve_choice(WorkflowChoice {
+                snapshot: choice.snapshot,
+                entry: usize::MAX
+            })
+            .is_none());
+    }
+
+    #[test]
     fn empty_query_keeps_load_order_and_caps_results() {
         let entries = (0..MAX_RESULTS + 5)
             .map(|i| workflow(&format!("wf-{i:02}"), "", &[]))
@@ -339,12 +403,12 @@ mod tests {
         state.select_prev();
         assert_eq!(state.selected(), 1);
         assert_eq!(
-            state.workflow_at_filtered(1).map(|wf| wf.name.as_str()),
+            state.filtered().get(1).map(|wf| wf.name.as_str()),
             Some("two")
         );
         state.select_next();
         assert_eq!(state.selected(), 0);
-        assert!(state.workflow_at_filtered(2).is_none());
+        assert!(state.filtered().get(2).is_none());
     }
 
     #[test]
@@ -366,7 +430,7 @@ mod tests {
         assert!(!state.query().contains('\u{fffd}'));
         assert_eq!(state.filtered().len(), 1);
         assert!(state.selected_workflow().is_some());
-        assert!(state.workflow_at_filtered(0).is_some());
+        assert!(!state.filtered().is_empty());
     }
 
     #[test]

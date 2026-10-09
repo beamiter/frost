@@ -1858,7 +1858,8 @@ pub struct BlockSearchResults {
 
 /// Clip `text` to `max_chars` characters, marking the cut with an ellipsis.
 fn clipped(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+    // Only the prefix and one overflow scalar determine whether to clip.
+    if text.chars().nth(max_chars).is_none() {
         text.to_string()
     } else {
         let mut short: String = text.chars().take(max_chars.saturating_sub(1)).collect();
@@ -2306,6 +2307,23 @@ pub fn first_fitting_badge_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_preview_preserves_scalar_boundaries_and_exact_limits() {
+        assert_eq!(clipped("", 0), "");
+        assert_eq!(clipped("a", 0), "…");
+        assert_eq!(clipped("界", 1), "界");
+        assert_eq!(clipped("界🙂", 1), "…");
+        assert_eq!(clipped("界🙂a", 2), "界…");
+        assert_eq!(clipped("界🙂a", 3), "界🙂a");
+        assert_eq!(clipped("界🙂a", usize::MAX), "界🙂a");
+        let long = "界".repeat(BLOCK_SEARCH_SOURCE_MAX_BYTES / 3);
+        let preview = clipped(&long, BLOCK_SEARCH_LINE_CHARS);
+        assert_eq!(
+            preview,
+            format!("{}…", "界".repeat(BLOCK_SEARCH_LINE_CHARS - 1))
+        );
+    }
 
     #[test]
     fn lifecycle_api_reexports_core_semantics_and_keeps_stable_schema_names() {

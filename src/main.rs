@@ -16,6 +16,7 @@ mod ansi;
 mod block_export;
 mod block_mode;
 mod block_review;
+mod block_search_layout;
 mod color;
 mod command_correction;
 mod command_palette;
@@ -26,6 +27,7 @@ mod image_drop;
 mod keybindings;
 mod kitty_graphics;
 mod link;
+mod native_enter;
 mod persistence;
 mod pty;
 mod remote_fs;
@@ -38,6 +40,7 @@ mod sidebar;
 mod terminal;
 mod terminal_view;
 mod theme;
+mod workflow_focus;
 mod workflow_picker;
 mod workflows;
 
@@ -67,6 +70,16 @@ fn history_picker_panel_size(window: Size, visible_results: usize) -> Size {
     Size::new(
         (window.width - 24.0).clamp(1.0, 560.0),
         (window.height - 24.0).clamp(1.0, list_height + 160.0),
+    )
+}
+
+/// Bound workflow panels to the window while letting their contents scroll.
+fn workflow_panel_size(window: Size, requested_height: f32) -> Size {
+    Size::new(
+        (window.width - 32.0).clamp(1.0, 560.0),
+        (window.height - 32.0)
+            .max(1.0)
+            .min(requested_height.clamp(1.0, 480.0)),
     )
 }
 
@@ -3272,12 +3285,14 @@ fn main() -> iced::Result {
         decorations: false,
         ..Default::default()
     };
+    let native_enter_ownership = native_enter::install();
     iced::application(
         move || {
             Frost::new(
                 config.clone(),
                 config_diagnostic.clone(),
                 config_revision.clone(),
+                Arc::clone(&native_enter_ownership),
             )
         },
         Frost::update,
@@ -3300,7 +3315,8 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone)]
 enum Message {
     /// Observe an Enter already consumed by a widget, without repeating its action.
-    CapturedEnterPress(keyboard::Location),
+    CapturedEnterPress(iced::window::Id, keyboard::Event),
+    WindowKey(iced::window::Id, keyboard::Event),
     // AI agent panel (per-command approval agent over jterm_core).
     AgentInput(String),
     AgentSubmit,
@@ -3670,10 +3686,9 @@ enum Message {
     WorkflowPickerInput(String),
     /// Cancel the workflow overlay (picker or argument form).
     WorkflowOverlayClose,
-    /// Accept the workflow at this position in the current filtered list:
-    /// render+insert it when it takes no arguments, otherwise open its
-    /// argument form.
-    WorkflowPickerAccept(usize),
+    /// Accept the immutable entry represented by a rendered picker row:
+    /// render+insert it when it takes no arguments, otherwise open its form.
+    WorkflowPickerAccept(workflow_picker::WorkflowChoice),
     /// Edit of one argument value in the workflow form (args index, new text).
     WorkflowArgInput(usize, String),
     /// Restore an argument to its declared default, or to genuinely unset.
@@ -5051,6 +5066,7 @@ struct Frost {
     /// If the real release is missed off-window, one extra press/release cycle
     /// may be consumed, rather than letting an ambiguous repeat execute input.
     prompt_recall_enter_latch: PromptRecallEnterLatch,
+    native_enter_ownership: native_enter::SharedOwnership,
     /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
     /// files, then a per-argument form before the rendered command is typed
     /// into the active pane for review (never executed).
@@ -5096,6 +5112,7 @@ impl Frost {
         config: Config,
         config_diagnostic: Option<String>,
         config_revision: Option<persistence::FileRevision>,
+        native_enter_ownership: native_enter::SharedOwnership,
     ) -> (Self, Task<Message>) {
         let ai_temperature_draft = config
             .ai_temperature
@@ -5275,6 +5292,7 @@ impl Frost {
             remote_picker: None,
             history_picker: None,
             prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
+            native_enter_ownership,
             workflow_overlay: None,
             block_search: None,
             block_search_memory: BlockSearchMemory::default(),
@@ -10218,6 +10236,9 @@ impl Frost {
         let Some(state) = self.block_search.as_ref() else {
             return Task::none();
         };
+        if block_search_layout::compact(block_search_layout::panel_size(self.win_size)) {
+            return block_search_layout::reveal();
+        }
         // The list widget holds only the windowed rows, so the fraction must
         // be computed inside that window — against the full hit count it would
         // scroll to the wrong row and lose the highlight.
@@ -10561,6 +10582,7 @@ impl Frost {
     fn recall_into_active_pane(&mut self, command: String) -> Task<Message> {
         // Claim any held Enter before asynchronous prompt revalidation, not
         // only after a successful write or a keyboard-based confirmation.
+        self.native_enter_ownership.lock().claim_pressed();
         self.prompt_recall_enter_latch.begin_recall();
         let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
             return Task::none();
@@ -10607,6 +10629,7 @@ impl Frost {
         clear_line_first: bool,
     ) -> bool {
         if clear_line_first {
+            self.native_enter_ownership.lock().claim_pressed();
             self.prompt_recall_enter_latch.begin_recall();
         }
         let mut rejected = false;
@@ -10754,13 +10777,12 @@ impl Frost {
         iced::widget::operation::focus(WORKFLOW_PICKER_INPUT_ID.clone())
     }
 
-    /// Picker-stage acceptance, shared by Enter and mouse click. A workflow
-    /// without arguments renders and inserts immediately; one with arguments
-    /// moves the overlay to its per-argument form (anvil's parameter dialog).
-    fn accept_workflow_at(&mut self, index: usize) -> Task<Message> {
+    /// Resolve a click against the picker snapshot that rendered its row.
+    /// Keyboard confirmation still uses the latest filtered selection.
+    fn accept_workflow_choice(&mut self, choice: workflow_picker::WorkflowChoice) -> Task<Message> {
         let workflow = match self.workflow_overlay.as_ref() {
             Some(workflow_picker::WorkflowOverlay::Picker(state)) => {
-                state.workflow_at_filtered(index).cloned()
+                state.resolve_choice(choice).cloned()
             }
             _ => None,
         };
@@ -10792,6 +10814,7 @@ impl Frost {
             workflow_picker::WorkflowArgsState::new(workflow),
         )));
         iced::widget::operation::focus(WORKFLOW_ARG_INPUT_ID.clone())
+            .chain(workflow_focus::reveal())
     }
 
     /// The argument form's primary action ("Insert command" / Enter in any
@@ -10805,7 +10828,7 @@ impl Frost {
                 Err(error) => {
                     log::warn!("workflow render failed: {error}");
                     form.set_feedback(format!("Workflow could not be rendered: {error}"));
-                    return Task::none();
+                    return workflow_focus::reveal_error();
                 }
             },
             _ => return Task::none(),
@@ -10837,10 +10860,8 @@ impl Frost {
                     self.workflow_overlay = None;
                     Some(Task::none())
                 }
-                Key::Named(Named::Tab) if mods.shift() => {
-                    Some(iced::widget::operation::focus_previous())
-                }
-                Key::Named(Named::Tab) => Some(iced::widget::operation::focus_next()),
+                Key::Named(Named::Tab) if mods.shift() => Some(workflow_focus::navigate(true)),
+                Key::Named(Named::Tab) => Some(workflow_focus::navigate(false)),
                 Key::Named(Named::Enter) => Some(self.submit_workflow_args()),
                 // Everything else belongs to the focused argument input (or is
                 // a harmless no-op); none of it may reach the terminal.
@@ -10861,22 +10882,22 @@ impl Frost {
                     }
                     Key::Named(Named::ArrowDown) => {
                         state.select_next();
-                        return Some(Task::none());
+                        return Some(workflow_focus::reveal_picker());
                     }
                     Key::Named(Named::ArrowUp) => {
                         state.select_prev();
-                        return Some(Task::none());
+                        return Some(workflow_focus::reveal_picker());
                     }
                     Key::Named(Named::Backspace) => {
                         state.backspace();
-                        return Some(Task::none());
+                        return Some(workflow_focus::reveal_picker());
                     }
                     _ => {}
                 }
                 if !mods.control() && !mods.alt() {
                     if let Some(t) = text {
                         if state.push_query_text(t) {
-                            return Some(Task::none());
+                            return Some(workflow_focus::reveal_picker());
                         }
                     }
                 }
@@ -14203,8 +14224,20 @@ impl Frost {
                     return self.update(Message::Key(event));
                 }
             }
-            Message::CapturedEnterPress(location) => {
-                self.prompt_recall_enter_latch.captured_press(location);
+            Message::CapturedEnterPress(id, event) => {
+                let mut native = self.native_enter_ownership.lock();
+                if native.acknowledge_captured(id, &event) {
+                    return Task::none();
+                }
+                if let keyboard::Event::KeyPressed { location, .. } = event {
+                    self.prompt_recall_enter_latch.captured_press(location);
+                }
+            }
+            Message::WindowKey(id, event) => {
+                if self.native_enter_ownership.lock().acknowledge(id, &event) {
+                    return Task::none();
+                }
+                return self.update(Message::Key(event));
             }
             Message::Key(event) => {
                 // These surfaces confirm/open reviewed commands. Search-only
@@ -14214,6 +14247,9 @@ impl Frost {
                     || self.palette.is_open
                     || self.workflow_overlay.is_some()
                     || self.block_review.is_some();
+                if recall_surface_open {
+                    self.native_enter_ownership.lock().claim_held();
+                }
                 if self
                     .prompt_recall_enter_latch
                     .consume(&event, recall_surface_open)
@@ -14854,6 +14890,8 @@ impl Frost {
                 }
             }
             Message::Resized(size) => {
+                let search_was_compact =
+                    block_search_layout::compact(block_search_layout::panel_size(self.win_size));
                 self.win_size = size;
                 let term_h = self.term_height();
                 let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
@@ -14864,6 +14902,14 @@ impl Frost {
                     // Apply either full-tab or pane dimensions exactly once.
                     self.relayout();
                     self.refresh_active_context();
+                }
+                if self.block_search.is_some()
+                    && (search_was_compact
+                        || block_search_layout::compact(block_search_layout::panel_size(size)))
+                {
+                    self.recompute_links();
+                    self.refresh_kitty_handles();
+                    return self.block_search_snap_task();
                 }
             }
             Message::Focus(f) => {
@@ -16456,14 +16502,20 @@ impl Frost {
                 {
                     state.set_query(q);
                 }
+                return workflow_focus::reveal_picker();
             }
             Message::WorkflowOverlayClose => self.workflow_overlay = None,
-            Message::WorkflowPickerAccept(index) => return self.accept_workflow_at(index),
+            Message::WorkflowPickerAccept(choice) => return self.accept_workflow_choice(choice),
             Message::WorkflowArgInput(index, value) => {
                 if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
                     self.workflow_overlay.as_mut()
                 {
                     form.set_value(index, value);
+                    return if form.feedback.is_some() {
+                        workflow_focus::reveal_error()
+                    } else {
+                        workflow_focus::reveal()
+                    };
                 }
             }
             Message::WorkflowArgReset(index) => {
@@ -17905,15 +17957,33 @@ impl Frost {
                         ..Default::default()
                     },
                 );
-                let row_btn = mouse_area(body).on_press(Message::WorkflowPickerAccept(pos));
+                let body = if selected {
+                    body.id(workflow_focus::PICKER_SELECTED_ID)
+                } else {
+                    body
+                };
+                let mut row_btn = mouse_area(body);
+                if let Some(choice) = state.choice_for(workflow) {
+                    row_btn = row_btn.on_press(Message::WorkflowPickerAccept(choice));
+                }
                 list = list.push(row_btn);
             }
         }
 
-        let body = column![query_line, list].spacing(8);
+        let panel_size =
+            workflow_panel_size(self.win_size, 64.0 + filtered.len().max(1) as f32 * 72.0);
+        let body = column![
+            query_line,
+            scrollable(list)
+                .id(workflow_focus::PICKER_SCROLL_ID)
+                .spacing(6)
+                .height(Length::Fill)
+        ]
+        .spacing(8);
         let panel = container(body)
-            .width(Length::Fixed(560.0))
-            .max_height(480.0)
+            .id(workflow_focus::PICKER_ID)
+            .width(Length::Fixed(panel_size.width))
+            .height(Length::Fixed(panel_size.height))
             .padding(12)
             .style(container::dark);
         let dismiss = mouse_area(
@@ -17988,15 +18058,20 @@ impl Frost {
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            card =
-                card.push(column![text(label).size(11).style(text::secondary), field,].spacing(2));
+            card = card.push(
+                container(column![text(label).size(11).style(text::secondary), field].spacing(2))
+                    .id(workflow_focus::row_id(index)),
+            );
         }
 
         if let Some(feedback) = form.feedback.as_deref() {
             card = card.push(
-                text(crate::workflow_picker::bound_workflow_feedback(feedback))
-                    .size(11)
-                    .style(text::danger),
+                container(
+                    text(crate::workflow_picker::bound_workflow_feedback(feedback))
+                        .size(11)
+                        .style(text::danger),
+                )
+                .id(workflow_focus::ERROR_ID),
             );
         }
 
@@ -18009,11 +18084,24 @@ impl Frost {
                 .on_press(Message::WorkflowOverlayClose),
         ]
         .spacing(6);
-        card = card.push(actions);
-
-        let panel = container(card)
-            .width(Length::Fixed(560.0))
-            .max_height(480.0)
+        let panel_size = workflow_panel_size(
+            self.win_size,
+            160.0 + form.workflow().args.len() as f32 * 64.0,
+        );
+        // The legal 64-argument form must never squeeze its fields and actions
+        // into zero-height rows. Reading content scrolls; actions stay visible.
+        let body = column![
+            scrollable(card)
+                .id(workflow_focus::SCROLL_ID)
+                .spacing(6)
+                .height(Length::Fill),
+            actions
+        ]
+        .spacing(8);
+        let panel = container(body)
+            .id(workflow_focus::FORM_ID)
+            .width(Length::Fixed(panel_size.width))
+            .height(Length::Fixed(panel_size.height))
             .padding(12)
             .style(container::dark);
         let dismiss = mouse_area(
@@ -18245,11 +18333,8 @@ impl Frost {
     /// Ctrl+Alt+F cross-block search picker overlay (palette-style). Enter or
     /// a click selects the hit's zone and reveals it; nothing executes.
     fn block_search_view(&self, state: &BlockSearchState) -> Element<'_, Message> {
-        let query: Element<'_, Message> = text_input("Search command blocks…", &state.query)
-            .id(BLOCK_SEARCH_INPUT_ID.clone())
-            .on_input(Message::BlockSearchInput)
-            .size(14)
-            .into();
+        let panel_size = block_search_layout::panel_size(self.win_size);
+        let compact = block_search_layout::compact(panel_size);
         let case_toggle = button(text("Aa").size(11))
             .on_press(Message::BlockSearchSetCaseSensitive(!state.case_sensitive))
             .padding([3, 7])
@@ -18288,16 +18373,24 @@ impl Frost {
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
-        // Keep the input useful at the 280 px panel minimum. The panel has
-        // 24 px horizontal padding, leaving roughly 256 px for content; the
-        // compact matching/actions row fits that width without squeezing the
-        // query down to a token-sized field.
-        let query_line = row![text("⌕").size(16), query]
+        // The query stays fixed even when a short window scrolls the controls,
+        // results and help together. Wrapping keeps the controls reachable
+        // below the former 280 px panel minimum, without shrinking the input.
+        let query_line = || {
+            row![
+                text("⌕").size(16),
+                text_input("Search command blocks…", &state.query)
+                    .id(BLOCK_SEARCH_INPUT_ID.clone())
+                    .on_input(Message::BlockSearchInput)
+                    .size(14)
+            ]
             .spacing(8)
-            .align_y(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center)
+        };
         let matching_actions = row![case_toggle, regex_toggle, whole_word_toggle, refresh, reset]
             .spacing(4)
-            .align_y(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center)
+            .wrap();
         let scope_btn = |label: &str, scope: block_mode::BlockSearchScope| {
             button(text(label.to_string()).size(11))
                 .on_press(Message::BlockSearchSetScope(scope))
@@ -18381,29 +18474,44 @@ impl Frost {
         // the query for that sends the user off tweaking a working filter.
         let pane_has_blocks = !zone_badges.is_empty();
 
-        // The count line stays outside the scrollable so it is always
-        // visible; EVERY hit is drawn inside it (ember renders the full hit
-        // list in a scroll area) and keyboard navigation wraps across all of
-        // them, `block_search_snap_task` keeping the highlight in view.
-        let mut body = column![query_line, matching_actions, filters].spacing(8);
+        // Normal panels keep the count and controls outside the windowed hit
+        // list. Short panels have one bounded scroll area below the query, so
+        // these controls cannot consume the space needed for results or help.
+        let mut body = if compact {
+            column![]
+        } else {
+            column![query_line()]
+        }
+        .push(matching_actions)
+        .push(filters)
+        .spacing(8);
         if state.loading && state.hits.is_empty() {
-            body = body.push(text("Indexing blocks…").size(13).style(text::secondary));
+            body = body.push(
+                container(text("Indexing blocks…").size(13).style(text::secondary))
+                    .id(block_search_layout::FEEDBACK_ID),
+            );
         } else if let Some(error) = &state.query_error {
             body = body.push(
-                text(crate::review_text::bound_query_error(error))
-                    .size(12)
-                    .style(text::danger),
+                container(
+                    text(crate::review_text::bound_query_error(error))
+                        .size(12)
+                        .style(text::danger),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
             );
         } else if !pane_has_blocks {
             body = body.push(
-                text(
-                    "This pane has no command blocks yet — block capture needs a shell that \
+                container(
+                    text(
+                        "This pane has no command blocks yet — block capture needs a shell that \
                      reports commands (OSC 133); run \"Install or update jsh\" from the \
                      command palette",
+                    )
+                    .size(13)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::secondary),
                 )
-                .size(13)
-                .wrapping(text::Wrapping::Word)
-                .style(text::secondary),
+                .id(block_search_layout::FEEDBACK_ID),
             );
         } else if state.query.trim().is_empty() && state.filter == BlockSearchFilter::All {
             let hint = if state.older_not_indexed {
@@ -18411,7 +18519,10 @@ impl Frost {
             } else {
                 "Type to search, or choose a filter to browse blocks"
             };
-            body = body.push(text(hint).size(13).style(text::secondary));
+            body = body.push(
+                container(text(hint).size(13).style(text::secondary))
+                    .id(block_search_layout::FEEDBACK_ID),
+            );
         } else if state.hits.is_empty() {
             let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
                 &state.cache,
@@ -18426,7 +18537,10 @@ impl Frost {
                 has_bookmarked_indexed_text,
                 state.older_not_indexed,
             );
-            body = body.push(text(empty).size(13).style(text::secondary));
+            body = body.push(
+                container(text(empty).size(13).style(text::secondary))
+                    .id(block_search_layout::FEEDBACK_ID),
+            );
         } else {
             // A rebuild in flight leaves the previous hits on screen so the
             // picker does not blank out, but they must be unmistakably stale:
@@ -18510,7 +18624,12 @@ impl Frost {
                     tooltip::Position::Left,
                 );
                 let accent = self.c_accent();
-                let jump_target = mouse_area(container(info).width(Length::Fill).padding([3, 8]));
+                let jump_target = mouse_area(
+                    container(info)
+                        .width(Length::Fill)
+                        .padding([3, 8])
+                        .clip(true),
+                );
                 let jump_target = if stale {
                     jump_target
                 } else {
@@ -18534,13 +18653,21 @@ impl Frost {
                     },
                     ..Default::default()
                 });
-                list = list.push(row_body);
+                list = list.push(if selected {
+                    row_body.id(block_search_layout::SELECTED_ID)
+                } else {
+                    row_body
+                });
             }
-            body = body.push(
-                scrollable(list)
-                    .id(BLOCK_SEARCH_LIST_ID.clone())
-                    .height(Length::Shrink),
-            );
+            body = if compact {
+                body.push(list)
+            } else {
+                body.push(
+                    scrollable(list)
+                        .id(BLOCK_SEARCH_LIST_ID.clone())
+                        .height(Length::Shrink),
+                )
+            };
         }
         // The overlay owns every key while it is open, so the chips and
         // toggles above are otherwise reachable only with the mouse.
@@ -18557,13 +18684,29 @@ impl Frost {
                 .style(text::secondary),
         );
 
-        let panel_width = (self.win_size.width - 32.0).clamp(280.0, 720.0);
-        let panel_height = (self.win_size.height - 32.0).clamp(180.0, 560.0);
+        let body = if compact {
+            column![
+                query_line(),
+                scrollable(body)
+                    .id(block_search_layout::SCROLL_ID)
+                    .spacing(4)
+                    .height(Length::Fill)
+            ]
+            .spacing(8)
+        } else {
+            body
+        };
         let panel = container(body)
-            .width(Length::Fixed(panel_width))
-            .max_height(panel_height)
+            .id(block_search_layout::PANEL_ID)
+            .width(Length::Fixed(panel_size.width))
+            .max_height(panel_size.height)
             .padding(12)
             .style(container::dark);
+        let panel = if compact {
+            panel.height(Length::Fixed(panel_size.height))
+        } else {
+            panel
+        };
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -18891,6 +19034,7 @@ impl Frost {
         let Some(review) = self.block_review.take() else {
             return Task::none();
         };
+        self.native_enter_ownership.lock().claim_pressed();
         self.prompt_recall_enter_latch.begin_recall();
         if !self.block_review_is_current(&review, true) {
             self.push_toast(
@@ -25387,6 +25531,16 @@ impl Frost {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        // An already-held key belongs to the currently visible recall surface,
+        // including a positive focus snapshot that produced no Iced key event.
+        if self.history_picker.is_some()
+            || self.palette.is_open
+            || self.workflow_overlay.is_some()
+            || self.block_review.is_some()
+        {
+            self.native_enter_ownership.lock().claim_held();
+        }
+
         let mut subs: Vec<Subscription<Message>> = self
             .sessions
             .iter()
@@ -25399,7 +25553,7 @@ impl Frost {
                 })
             })
             .collect();
-        let events = iced::event::listen_with(|event, status, _id| match event {
+        let events = iced::event::listen_with(|event, status, id| match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))
             }
@@ -25418,11 +25572,10 @@ impl Frost {
                     Some(Message::OverlayEscape(event))
                 } else if let keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    location,
                     ..
                 } = &event
                 {
-                    Some(Message::CapturedEnterPress(*location))
+                    Some(Message::CapturedEnterPress(id, event))
                 } else if captured_key_is_enter_release(&event)
                     || matches!(
                         &event,
@@ -25433,12 +25586,12 @@ impl Frost {
                     // A focused widget may capture a release owned by history
                     // confirmation or block search. Let the corresponding latch
                     // see it; this does not redispatch captured key presses.
-                    Some(Message::Key(event))
+                    Some(Message::WindowKey(id, event))
                 } else {
                     None
                 }
             }
-            iced::Event::Keyboard(k) => Some(Message::Key(k)),
+            iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k)),
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
