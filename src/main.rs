@@ -2361,6 +2361,22 @@ struct SidebarTransferUi {
     total: Option<u64>,
 }
 
+/// Retire only the worker that owns the live progress/cancel handle. A
+/// same-location operation has no owner; an obsolete completion cannot retire
+/// a newer transfer even when both reports share a Files context.
+fn retire_sidebar_transfer_owner(
+    transfer: &mut Option<SidebarTransferUi>,
+    completed: Option<&std::sync::Arc<remote_fs::TransferProgress>>,
+) -> bool {
+    let owns_current = transfer.as_ref().is_some_and(|current| {
+        completed.is_some_and(|owner| std::sync::Arc::ptr_eq(&current.progress, owner))
+    });
+    if owns_current {
+        *transfer = None;
+    }
+    owns_current
+}
+
 impl SidebarTransferUi {
     /// "download name… 12.4 MiB" / "upload name… 2.0 KiB / 12.4 MiB".
     fn status_text(&self) -> String {
@@ -2447,10 +2463,12 @@ fn drop_item_size(path: &std::path::Path, depth: usize, max_bytes: u64) -> std::
 fn plan_drop(
     paths: Vec<std::path::PathBuf>,
     target_dir: std::path::PathBuf,
+    target_is_local: bool,
 ) -> Result<DropPlan, String> {
     plan_drop_with_caps(
         paths,
         target_dir,
+        target_is_local,
         MAX_DROP_ITEMS,
         remote_fs::MAX_TRANSFER_BYTES,
     )
@@ -2460,6 +2478,7 @@ fn plan_drop(
 fn plan_drop_with_caps(
     paths: Vec<std::path::PathBuf>,
     target_dir: std::path::PathBuf,
+    target_is_local: bool,
     max_items: usize,
     max_bytes: u64,
 ) -> Result<DropPlan, String> {
@@ -2496,7 +2515,10 @@ fn plan_drop_with_caps(
             }
             Ok(metadata) => {
                 is_dir = metadata.is_dir();
-                if std::fs::symlink_metadata(&dst).is_ok() {
+                // Remote destinations belong to a different namespace. Only
+                // their backend may check collisions; its no-clobber commit
+                // remains authoritative for every destination.
+                if target_is_local && std::fs::symlink_metadata(&dst).is_ok() {
                     error = Some(crate::sidebar::bound_sidebar_notice(format!(
                         "{} already exists",
                         crate::sidebar::bound_sidebar_path_label(&dst)
@@ -2570,6 +2592,8 @@ enum SidebarOp {
 #[derive(Clone, Debug)]
 struct SidebarOpReport {
     context_epoch: u64,
+    /// Identity of this worker's progress UI, independent of Files navigation.
+    transfer_owner: Option<std::sync::Arc<remote_fs::TransferProgress>>,
     location: remote_fs::FsLocation,
     location_profile: Option<jterm_core::jsh_remote::RemoteHostConfig>,
     consumed_clipboard_id: Option<u64>,
@@ -2584,7 +2608,6 @@ struct SidebarOpReport {
     /// Backend-confirmed same-location moves. Selection and its anchor follow
     /// these exact path-prefix rewrites before reconciliation prunes rows.
     path_remaps: Vec<SidebarPathRemap>,
-    op: SidebarOp,
     warning: Option<(String, bool)>,
     cancelled: bool,
     result: Result<(), String>,
@@ -3720,7 +3743,7 @@ enum Message {
     TabSwitcherInput(String),
     /// Cancel the tab switcher overlay.
     TabSwitcherClose,
-    /// Jump to the given stable session id from the tab switcher (and close it).
+    /// Jump to the given stable tab id from the tab switcher (and close it).
     TabSwitcherJump(usize),
     /// Filter text changed in the history picker.
     HistoryPickerInput(String),
@@ -4824,6 +4847,21 @@ struct TerminalMouseGesture {
     consumed: bool,
 }
 
+/// Only the pane that started a gesture may retire it. Every visible widget
+/// can report the same global release, so a sibling's event must be a no-op.
+fn take_terminal_mouse_gesture(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    source_session_id: usize,
+    button: MouseButton,
+) -> Option<TerminalMouseGesture> {
+    let slot = gestures.get_mut(button.slot())?;
+    let gesture = (*slot)?;
+    if gesture.button != button || gesture.session_id != source_session_id {
+        return None;
+    }
+    slot.take()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverlayReleaseDisposition {
     Reject,
@@ -5678,6 +5716,8 @@ impl Frost {
         !self.search.is_open
             && !self.search_replace.is_open
             && !self.palette.is_open
+            && !self.ai_chats.is_open
+            && self.ai_ask.is_none()
             && !self.config_panel_open
             && !self.help_open
             && !self.debug_open
@@ -5702,6 +5742,8 @@ impl Frost {
     fn terminal_mouse_active(&self) -> bool {
         !self.search_replace.is_open
             && !self.palette.is_open
+            && !self.ai_chats.is_open
+            && self.ai_ask.is_none()
             && !self.config_panel_open
             && !self.help_open
             && !self.debug_open
@@ -8132,8 +8174,11 @@ impl Frost {
             self.close_block_search_on_session_change();
             self.active_session_changed_for_remote_follow();
         }
-        self.active = session;
         let idx = self.active_tab.min(self.tabs.len() - 1);
+        if self.active != session || self.tabs[idx].focus != session {
+            self.session_dirty = true;
+        }
+        self.active = session;
         self.tabs[idx].focus = session;
     }
 
@@ -8590,6 +8635,7 @@ impl Frost {
             };
             let first = ratios[gap] + step;
             if set_divider_share(ratios, gap, first, false) {
+                self.session_dirty = true;
                 self.relayout();
                 self.refresh_active_context();
             }
@@ -8626,6 +8672,7 @@ impl Frost {
     /// flow rather than saving here.
     fn equalize_panes(&mut self) {
         if equalize_pane_tree(self.layout_mut()) {
+            self.session_dirty = true;
             self.relayout();
             self.refresh_active_context();
             self.push_toast(
@@ -9241,14 +9288,12 @@ impl Frost {
                 return Some(Task::none());
             }
             Key::Named(Named::Enter) => {
-                let target = filtered.get(state.selected).map(|&(_, i)| i);
+                let target = tab_switcher_target_id(&self.tabs, &filtered, state.selected);
                 self.tab_switcher = None;
-                if let Some(i) = target {
-                    if i < self.sessions.len() && i != self.active {
-                        self.activate_session(i);
-                    }
-                }
-                return Some(Task::none());
+                return Some(match target {
+                    Some(id) => self.update(Message::TabSwitcherJump(id)),
+                    None => Task::none(),
+                });
             }
             Key::Named(Named::ArrowDown) => {
                 if !filtered.is_empty() {
@@ -11222,12 +11267,13 @@ impl Frost {
                 (gesture.report_to_app, gesture.session_id)
             }
             MouseInput::Release { button, .. } => {
-                let Some(gesture) = self.terminal_mouse_gestures[button.slot()].take() else {
+                let Some(gesture) = take_terminal_mouse_gesture(
+                    &mut self.terminal_mouse_gestures,
+                    source_session_id,
+                    button,
+                ) else {
                     return Task::none();
                 };
-                if gesture.button != button || gesture.session_id != source_session_id {
-                    return Task::none();
-                }
                 if gesture.consumed {
                     return Task::none();
                 }
@@ -11906,7 +11952,7 @@ impl Frost {
             PaletteAction::LaunchKimi => {
                 Task::done(Message::AgentLaunch(agent_task::AgentProvider::Kimi))
             }
-            PaletteAction::CloseTab => self.request_close_session(self.active),
+            PaletteAction::CloseTab => self.request_close_tab(self.active_tab),
             PaletteAction::NextTab => {
                 self.next_session();
                 Task::none()
@@ -15162,7 +15208,11 @@ impl Frost {
                     if let Some(PaneTree::Split { ratios, .. }) =
                         self.layout_mut().node_at_path_mut(&divider.path)
                     {
+                        let previous = ratios.clone();
                         equalize_shares(ratios);
+                        if *ratios != previous {
+                            self.session_dirty = true;
+                        }
                         self.relayout();
                         self.refresh_active_context();
                     }
@@ -15193,6 +15243,7 @@ impl Frost {
                             let before: f32 = ratios[..divider.gap].iter().sum();
                             let first = local - before;
                             if set_divider_share(ratios, divider.gap, first, true) {
+                                self.session_dirty = true;
                                 self.relayout();
                                 self.refresh_active_context();
                             }
@@ -15559,6 +15610,12 @@ impl Frost {
             Message::SidebarDeleteCancel => self.sidebar_delete_confirm = None,
             Message::SidebarOpFinished(report) => {
                 let report = *report;
+                // Completion releases only its own handle, even if navigation
+                // makes the report's UI feedback stale.
+                retire_sidebar_transfer_owner(
+                    &mut self.sidebar_transfer,
+                    report.transfer_owner.as_ref(),
+                );
                 // Clipboard settlement is backend state, not UI feedback. Do
                 // it first so a safe profile reorder/location switch cannot
                 // resurrect already-moved cut sources. Exact-token matching
@@ -15577,10 +15634,6 @@ impl Frost {
                     self.sidebar.hosts_snapshot(),
                 ) {
                     return Task::none();
-                }
-                // Any transfer report retires the progress UI, success or not.
-                if matches!(report.op, SidebarOp::BatchTransfer { .. }) {
-                    self.sidebar_transfer = None;
                 }
                 remap_sidebar_selection(
                     &mut self.sidebar_selection,
@@ -15719,9 +15772,11 @@ impl Frost {
                     return Task::none();
                 };
                 let generation = self.sidebar.generation();
-                return Task::perform(async move { plan_drop(paths, target_dir) }, move |plan| {
-                    Message::SidebarDropPlanned(generation, plan)
-                });
+                let target_is_local = self.sidebar.location == remote_fs::FsLocation::Local;
+                return Task::perform(
+                    async move { plan_drop(paths, target_dir, target_is_local) },
+                    move |plan| Message::SidebarDropPlanned(generation, plan),
+                );
             }
             Message::SidebarDropPlanned(generation, plan) => {
                 if !self.sidebar.accepts_generation(generation) {
@@ -16338,9 +16393,9 @@ impl Frost {
             }
             Message::TabSwitcherJump(id) => {
                 self.tab_switcher = None;
-                if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
-                    if index != self.active {
-                        self.activate_session(index);
+                if let Some(tab) = self.tab_index_by_id(id) {
+                    if tab != self.active_tab {
+                        self.activate_tab(tab);
                     }
                 }
             }
@@ -17774,11 +17829,11 @@ impl Frost {
         } else {
             for &(pos, idx) in filtered.iter() {
                 let selected = pos == state.selected;
-                let Some(session) = self.sessions.get(idx) else {
+                let Some(tab) = self.tabs.get(idx) else {
                     continue;
                 };
-                let label = session.label();
-                let id = session.id;
+                let label = self.tab_label(idx);
+                let id = tab.id;
                 let info = row![
                     text(format!("{:>2}", idx + 1))
                         .size(12)
@@ -23568,6 +23623,18 @@ impl Frost {
 
     // ===== Experimental Tasks dashboard (agent_task) =====
 
+    /// Keep Tasks dock geometry and keyboard ownership in sync for every
+    /// entry point, including opening it while the ordinary sidebar is hidden.
+    fn set_task_panel_open(&mut self, open: bool) {
+        self.invalidate_sidebar_remote_follow_intent();
+        self.sidebar_open = open;
+        if open {
+            self.sidebar_panel = SidebarPanel::Tasks;
+        }
+        self.sidebar_files_focused = false;
+        self.apply_config();
+    }
+
     /// Show or hide the Tasks dock panel. With the feature flag off the
     /// toggle only explains how to enable it.
     fn toggle_task_panel(&mut self) {
@@ -23579,13 +23646,7 @@ impl Frost {
             return;
         }
         let showing = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
-        self.invalidate_sidebar_remote_follow_intent();
-        if showing {
-            self.sidebar_open = false;
-        } else {
-            self.sidebar_open = true;
-            self.sidebar_panel = SidebarPanel::Tasks;
-        }
+        self.set_task_panel_open(!showing);
     }
 
     /// Create an isolated-worktree task from one failed command block. The
@@ -23685,9 +23746,7 @@ impl Frost {
             }
         };
         self.task_panel.provider_picker = Some(context);
-        self.invalidate_sidebar_remote_follow_intent();
-        self.sidebar_open = true;
-        self.sidebar_panel = SidebarPanel::Tasks;
+        self.set_task_panel_open(true);
         self.push_toast(
             "Choose Codex, Claude, OpenCode, or Kimi for the new task",
             ToastKind::Info,
@@ -23724,9 +23783,7 @@ impl Frost {
         match agent_task_ui::begin_worktree_creation(context, provider) {
             Ok(pending) => {
                 self.task_panel.pending_creation = Some(pending);
-                self.invalidate_sidebar_remote_follow_intent();
-                self.sidebar_open = true;
-                self.sidebar_panel = SidebarPanel::Tasks;
+                self.set_task_panel_open(true);
                 self.push_toast(
                     format!("Creating an isolated Git worktree for {provider_name}…"),
                     ToastKind::Info,
@@ -26299,13 +26356,13 @@ fn sidebar_op_task(
             let outcome = run_sidebar_op(&location, &hosts, &op, progress.as_ref());
             SidebarOpReport {
                 context_epoch,
+                transfer_owner: progress,
                 location: outcome.location,
                 location_profile,
                 consumed_clipboard_id,
                 consumed_paths: outcome.consumed_paths,
                 affected_parents: outcome.affected_parents,
                 path_remaps: outcome.path_remaps,
-                op,
                 warning: outcome.warning.map(|(warning, neutral)| {
                     (
                         jterm_core::review_input::safe_inline_display(&warning, 512),
@@ -26575,6 +26632,17 @@ fn run_sidebar_op(
 /// key handler so navigation matches the visible list.
 ///
 /// `labels` holds one entry per tab, taken from that tab's selected pane.
+/// Picker positions belong to the filtered tab order, never the sessions
+/// vector: split panes and pinned/reordered tabs make those indices diverge.
+fn tab_switcher_target_id(
+    tabs: &[Tab],
+    filtered: &[(usize, usize)],
+    selected: usize,
+) -> Option<usize> {
+    let (_, tab_index) = filtered.get(selected)?;
+    tabs.get(*tab_index).map(|tab| tab.id)
+}
+
 fn tab_switcher_filtered(labels: &[String], query: &str) -> Vec<(usize, usize)> {
     use fuzzy_matcher::skim::SkimMatcherV2;
     use fuzzy_matcher::FuzzyMatcher;
@@ -27166,16 +27234,18 @@ fn encode_key(
             let c = s.chars().next()?;
             if ctrl {
                 // Map Ctrl+key to the corresponding control byte.
-                let b = c.to_ascii_lowercase() as u8;
+                // Match Unicode scalars before narrowing: casting a non-ASCII
+                // key to u8 can alias an ASCII control (for example ţ → Ctrl+C).
+                let b = c.to_ascii_lowercase();
                 let ctrl_byte = match b {
-                    b'a'..=b'z' => b & 0x1f,
-                    b'@' => 0,
-                    b'[' => 0x1b,
-                    b'\\' => 0x1c,
-                    b']' => 0x1d,
-                    b'^' => 0x1e,
-                    b'_' => 0x1f,
-                    b' ' => 0,
+                    'a'..='z' => (b as u8) & 0x1f,
+                    '@' => 0,
+                    '[' => 0x1b,
+                    '\\' => 0x1c,
+                    ']' => 0x1d,
+                    '^' => 0x1e,
+                    '_' => 0x1f,
+                    ' ' => 0,
                     _ => return text.map(|t| t.as_bytes().to_vec()),
                 };
                 let mut v = Vec::new();
@@ -33362,6 +33432,7 @@ mod tests {
                 root.join("target").join("taken.txt"),
             ],
             root.join("target"),
+            true,
         )
         .expect("plan");
         assert_eq!(plan.items.len(), 3);
@@ -33380,13 +33451,14 @@ mod tests {
         let root = drop_fixture();
         // Empty, over the item cap, and relative paths are all refused before
         // anything is planned.
-        assert!(plan_drop_with_caps(vec![], root.join("target"), 4, 1024).is_err());
+        assert!(plan_drop_with_caps(vec![], root.join("target"), true, 4, 1024).is_err());
         let many: Vec<std::path::PathBuf> = (0..5).map(|i| root.join(format!("f{i}"))).collect();
-        let error = plan_drop_with_caps(many, root.join("target"), 4, 1024).expect_err("cap");
+        let error = plan_drop_with_caps(many, root.join("target"), true, 4, 1024).expect_err("cap");
         assert!(error.contains("limited to 4"));
         let error = plan_drop_with_caps(
             vec![std::path::PathBuf::from("relative/file.txt")],
             root.join("target"),
+            true,
             4,
             1024,
         )
@@ -33398,6 +33470,7 @@ mod tests {
                 "x".repeat(400)
             ))],
             root.join("target"),
+            true,
             4,
             1024,
         )
@@ -33405,7 +33478,7 @@ mod tests {
         assert!(!hostile.contains('\u{1b}'));
         assert!(hostile.contains("absolute"));
         // Total size over the byte cap refuses the whole burst.
-        let error = plan_drop_with_caps(vec![root.join("a.txt")], root.join("target"), 4, 2)
+        let error = plan_drop_with_caps(vec![root.join("a.txt")], root.join("target"), true, 4, 2)
             .expect_err("oversize");
         assert!(error.contains("limit"));
         std::fs::remove_dir_all(root).expect("remove test tree");
@@ -33448,6 +33521,7 @@ mod tests {
                 root.join("target").join("taken.txt"),
             ],
             root.join("target"),
+            true,
         )
         .expect("plan");
         let op = SidebarOp::BatchTransfer {
@@ -33475,7 +33549,7 @@ mod tests {
 
         // A pre-cancelled burst imports nothing and reports cancelled.
         let root2 = drop_fixture();
-        let plan = plan_drop(vec![root2.join("a.txt")], root2.join("target")).expect("plan");
+        let plan = plan_drop(vec![root2.join("a.txt")], root2.join("target"), true).expect("plan");
         let progress = remote_fs::TransferProgress::new();
         progress.cancel();
         let op = SidebarOp::BatchTransfer {
@@ -33630,5 +33704,460 @@ mod tests {
         );
         state.set_query("tab\u{fffd}");
         assert_eq!(state.query, "tab");
+    }
+    #[test]
+    fn ctrl_non_ascii_keys_never_alias_ascii_control_bytes() {
+        for character in ['ţ', 'Ť', 'š', '☃', '中', 'é'] {
+            let text = character.to_string();
+            let key = keyboard::Key::Character(text.clone().into());
+            for modifiers in [
+                keyboard::Modifiers::CTRL,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            ] {
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        modifiers,
+                        Some(&text),
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    Some(text.as_bytes().to_vec()),
+                    "Ctrl Unicode key {character:?} must not become an ASCII control"
+                );
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        modifiers,
+                        None,
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    None,
+                    "A non-ASCII key without committed text must not invent a control byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_ascii_keys_keep_their_legacy_control_mapping() {
+        for character in 'a'..='z' {
+            for case in [character, character.to_ascii_uppercase()] {
+                let key = keyboard::Key::Character(case.to_string().into());
+                let control = (character as u8) & 0x1f;
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        keyboard::Modifiers::CTRL,
+                        None,
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    Some(vec![control])
+                );
+                assert_eq!(
+                    encode_key(
+                        &key,
+                        keyboard::Location::Standard,
+                        keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+                        None,
+                        false,
+                        KeyboardEnhancements::default()
+                    ),
+                    Some(vec![0x1b, control])
+                );
+            }
+        }
+        for (character, control) in [
+            ('@', 0),
+            ('[', 27),
+            ('\\', 28),
+            (']', 29),
+            ('^', 30),
+            ('_', 31),
+            (' ', 0),
+        ] {
+            assert_eq!(
+                encode_key(
+                    &keyboard::Key::Character(character.to_string().into()),
+                    keyboard::Location::Standard,
+                    keyboard::Modifiers::CTRL,
+                    None,
+                    false,
+                    KeyboardEnhancements::default()
+                ),
+                Some(vec![control])
+            );
+        }
+    }
+
+    #[test]
+    fn modal_ai_surfaces_gate_terminal_input_and_mouse_ownership() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        for (start, end) in [
+            (
+                "    fn terminal_input_active(",
+                "    fn terminal_mouse_active(",
+            ),
+            (
+                "    fn terminal_mouse_active(",
+                "    fn local_sidebar_fallback_root(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(body.contains("&& !self.ai_chats.is_open"));
+            assert!(body.contains("&& self.ai_ask.is_none()"));
+        }
+        for (start, end) in [
+            (
+                "            Message::Ime(event) => {",
+                "            Message::ModifiersChanged(",
+            ),
+            (
+                "            Message::ImageDropped(path) => {",
+                "            Message::Pasted(id, Some(text))",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(body.contains("if !self.terminal_input_active()"));
+        }
+        let pane = source
+            .split_once("    fn pane_view(")
+            .unwrap()
+            .1
+            .split_once("    fn sidebar_view(")
+            .unwrap()
+            .0;
+        assert!(pane.contains("self.focused && is_active && self.terminal_input_active()"));
+    }
+
+    #[test]
+    fn pane_focus_and_ratio_changes_dirty_periodic_session_snapshots() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        for (start, end) in [
+            ("    fn set_focus(", "    /// The tab owning"),
+            (
+                "    fn resize_pane_direction(",
+                "    /// Toggle tmux-style zoom",
+            ),
+            ("    fn equalize_panes(", "    /// Close the focused pane"),
+            (
+                "            Message::DividerDragStart(",
+                "            Message::DividerDragEnd",
+            ),
+            (
+                "            Message::DividerDragMove(",
+                "            Message::PaneDragStart(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(
+                body.contains("self.session_dirty = true;"),
+                "snapshot mutation was not marked dirty: {start}"
+            );
+        }
+        let tick = source
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::TabMenuOpen(")
+            .unwrap()
+            .0;
+        assert!(tick.contains("if self.session_dirty {"));
+        assert!(tick.contains("self.save_session_snapshot();"));
+    }
+
+    #[test]
+    fn all_tasks_dock_entry_points_relayout_and_release_files_focus() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let setter = source
+            .split_once("    fn set_task_panel_open(")
+            .unwrap()
+            .1
+            .split_once("    /// Show or hide the Tasks dock panel")
+            .unwrap()
+            .0;
+        assert!(setter.contains("self.sidebar_files_focused = false;"));
+        assert!(setter.contains("self.apply_config();"));
+        for (start, end) in [
+            (
+                "    fn toggle_task_panel(",
+                "    /// Create an isolated-worktree task",
+            ),
+            (
+                "    fn task_create_from_block(",
+                "    /// Finish Create task",
+            ),
+            (
+                "    fn task_create_with_provider(",
+                "    /// Enter the bounded, cancellable",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(
+                body.contains("self.set_task_panel_open("),
+                "Tasks entry point bypassed layout ownership: {start}"
+            );
+            assert!(!body.contains("self.sidebar_open ="));
+        }
+    }
+    #[test]
+    fn terminal_mouse_release_retires_only_the_matching_owner() {
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let gesture = TerminalMouseGesture {
+                session_id: 42,
+                button,
+                report_to_app: true,
+                consumed: false,
+            };
+            let mut slots = [None; 3];
+            slots[button.slot()] = Some(gesture);
+            assert_eq!(take_terminal_mouse_gesture(&mut slots, 7, button), None);
+            assert_eq!(slots[button.slot()], Some(gesture));
+            assert_eq!(
+                take_terminal_mouse_gesture(&mut slots, 42, button),
+                Some(gesture)
+            );
+            assert_eq!(take_terminal_mouse_gesture(&mut slots, 42, button), None);
+        }
+        let consumed = TerminalMouseGesture {
+            session_id: 42,
+            button: MouseButton::Left,
+            report_to_app: false,
+            consumed: true,
+        };
+        let mut slots = [Some(consumed), None, None];
+        assert_eq!(
+            take_terminal_mouse_gesture(&mut slots, 42, MouseButton::Right),
+            None
+        );
+        assert_eq!(
+            take_terminal_mouse_gesture(&mut slots, 7, MouseButton::Left),
+            None
+        );
+        assert_eq!(
+            take_terminal_mouse_gesture(&mut slots, 42, MouseButton::Left),
+            Some(consumed)
+        );
+    }
+
+    #[test]
+    fn tab_switcher_targets_tab_ids_when_split_and_strip_order_diverge() {
+        let mut split = Tab::new(8, 3);
+        split.tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(2), PaneTree::Leaf(3)],
+            ratios: vec![0.5, 0.5],
+        };
+        split.pinned = true;
+        split.title = Some("work".to_string());
+        let mut tabs = vec![split, Tab::new(4, 0)];
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 0), (1, 1)], 0), Some(8));
+        tabs.reverse();
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 1)], 0), Some(8));
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 9)], 0), None);
+        assert_eq!(tab_switcher_target_id(&tabs, &[(0, 1)], 2), None);
+    }
+
+    #[test]
+    fn tab_switcher_render_and_close_actions_keep_tab_semantics() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let view = source
+            .split_once("    fn tab_switcher_view(")
+            .unwrap()
+            .1
+            .split_once("    fn remote_picker_view(")
+            .unwrap()
+            .0;
+        assert!(view.contains("self.tabs.get(idx)"));
+        assert!(view.contains("let label = self.tab_label(idx);"));
+        assert!(view.contains("let id = tab.id;"));
+        assert!(!view.contains("self.sessions.get(idx)"));
+        let handler = source
+            .split_once("    fn handle_tab_switcher_key(")
+            .unwrap()
+            .1
+            .split_once("    fn open_history_picker(")
+            .unwrap()
+            .0;
+        assert!(handler.contains("tab_switcher_target_id(&self.tabs, &filtered, state.selected)"));
+        let jump = source
+            .split_once("            Message::TabSwitcherJump(id) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::HistoryPickerClose")
+            .unwrap()
+            .0;
+        assert!(jump.contains("self.tab_index_by_id(id)"));
+        assert!(!jump.contains("self.sessions.iter()"));
+        let palette = source
+            .split_once("    fn execute_palette_action(")
+            .unwrap()
+            .1
+            .split_once("    fn copy_last_output_task(")
+            .unwrap()
+            .0;
+        assert!(
+            palette.contains("PaletteAction::CloseTab => self.request_close_tab(self.active_tab)")
+        );
+        assert!(palette.contains("PaletteAction::ClosePane => self.close_focused_pane()"));
+        let mouse = source
+            .split_once("    fn handle_mouse(")
+            .unwrap()
+            .1
+            .split_once("    fn handle_scroll_shortcut(")
+            .unwrap()
+            .0;
+        assert!(mouse.contains("let Some(gesture) = take_terminal_mouse_gesture("));
+        assert!(!mouse.contains("self.terminal_mouse_gestures[button.slot()].take()"));
+    }
+
+    fn audit_transfer_ui(
+        progress: std::sync::Arc<remote_fs::TransferProgress>,
+    ) -> Option<SidebarTransferUi> {
+        Some(SidebarTransferUi {
+            progress,
+            verb: "copy".into(),
+            name: "fixture".into(),
+            total: None,
+        })
+    }
+
+    #[test]
+    fn sidebar_old_completion_preserves_new_cancel_owner() {
+        let old = remote_fs::TransferProgress::new();
+        let new = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(new.clone());
+        assert!(!retire_sidebar_transfer_owner(&mut transfer, Some(&old)));
+        transfer.as_ref().unwrap().progress.cancel();
+        assert!(new.is_cancelled());
+        assert!(!old.is_cancelled());
+    }
+
+    #[test]
+    fn sidebar_owner_completion_does_not_depend_on_navigation_context() {
+        let own = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(own.clone());
+        // The pure ownership check has no location/epoch dependency. Reducer
+        // wiring below verifies it runs even when UI feedback will be stale.
+        assert!(retire_sidebar_transfer_owner(&mut transfer, Some(&own)));
+        assert!(transfer.is_none());
+        assert!(!own.is_cancelled());
+    }
+
+    #[test]
+    fn sidebar_no_owner_completion_preserves_live_transfer() {
+        let own = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(own.clone());
+        assert!(!retire_sidebar_transfer_owner(&mut transfer, None));
+        assert!(std::sync::Arc::ptr_eq(&transfer.unwrap().progress, &own));
+    }
+
+    #[test]
+    fn sidebar_normal_owner_completion_retires_once() {
+        let own = remote_fs::TransferProgress::new();
+        let mut transfer = audit_transfer_ui(own.clone());
+        assert!(retire_sidebar_transfer_owner(&mut transfer, Some(&own)));
+        assert!(!retire_sidebar_transfer_owner(&mut transfer, Some(&own)));
+        assert!(transfer.is_none());
+    }
+
+    #[test]
+    fn sidebar_transfer_completion_and_drop_planner_keep_owner_wiring() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let completion = source
+            .split_once("            Message::SidebarOpFinished(report) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarTransferTick => {")
+            .unwrap()
+            .0;
+        assert!(
+            completion.find("retire_sidebar_transfer_owner(").unwrap()
+                < completion
+                    .find("if !sidebar_op_report_matches_context(")
+                    .unwrap()
+        );
+        assert!(completion.contains("report.transfer_owner.as_ref()"));
+        assert!(!completion.contains("self.sidebar_transfer = None"));
+        let worker = source
+            .split_once("fn sidebar_op_task(")
+            .unwrap()
+            .1
+            .split_once("fn run_sidebar_op(")
+            .unwrap()
+            .0;
+        assert!(worker.contains("run_sidebar_op(&location, &hosts, &op, progress.as_ref())"));
+        assert!(worker.contains("transfer_owner: progress,"));
+        let drop = source
+            .split_once("            Message::SidebarDropFlush(generation) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarDropPlanned(")
+            .unwrap()
+            .0;
+        assert!(drop.contains(
+            "let target_is_local = self.sidebar.location == remote_fs::FsLocation::Local;"
+        ));
+        assert!(drop.contains("plan_drop(paths, target_dir, target_is_local)"));
+    }
+
+    #[test]
+    fn remote_drop_does_not_probe_the_local_destination_namespace() {
+        let root =
+            std::env::temp_dir().join(format!("frost-drop-namespace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("source")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let source = root.join("source/item.txt");
+        let destination = root.join("target/item.txt");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"unrelated local file").unwrap();
+        let local = plan_drop(vec![source.clone()], root.join("target"), true).unwrap();
+        assert!(local.items[0].error.is_some());
+        let remote = plan_drop(vec![source.clone()], root.join("target"), false).unwrap();
+        assert!(remote.items[0].error.is_none());
+        assert_eq!(remote.total_bytes, 6);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"unrelated local file"
+        );
+        let missing = plan_drop(vec![root.join("missing")], root.join("target"), false).unwrap();
+        assert!(missing.items[0].error.is_some());
+        assert!(plan_drop_with_caps(vec![source], root.join("target"), false, 1, 2).is_err());
     }
 }
