@@ -60,6 +60,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Files cancellation ownership
+        run: python3 scripts/test-sidebar-cancellation.py
+
   shell:
     name: Installer scripts
     runs-on: ubuntu-24.04

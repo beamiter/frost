@@ -22,7 +22,7 @@ use jterm_core::agent::{
     AgentSession, AgentSessionEpoch, AgentSessionSnapshot, AgentSnapshotError, AgentState,
     ModelOutcome, ProposalId, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
-use jterm_core::ai::{AiCancellationToken, AiClient, BlockContext, Provider};
+use jterm_core::ai::{AiCancellationToken, AiClient, BlockContext};
 use std::path::Path;
 
 const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
@@ -153,45 +153,19 @@ fn write_snapshot_file(
 }
 
 pub fn client_from_config(config: &Config) -> Result<AiClient, String> {
-    if !config.ai_enabled {
-        return Err("AI features are disabled by configuration".to_string());
-    }
-    let provider = config
-        .ai_provider
-        .parse::<Provider>()
-        .map_err(|error| error.to_string())?;
-    let app_key_name = format!(
-        "{}_AI_API_KEY",
-        jterm_core::identity::get().app_name.to_ascii_uppercase()
-    );
-    let provider_key_name = match provider {
-        Provider::Anthropic => "ANTHROPIC_API_KEY",
-        Provider::OpenAiCompatible => "OPENAI_API_KEY",
-        Provider::Ollama => "OLLAMA_API_KEY",
-    };
-    let nonempty_env = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    let api_key = match nonempty_env(&app_key_name).or_else(|| nonempty_env(provider_key_name)) {
-        Some(key) => Some(key),
-        None => jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref())
-            .as_deref()
-            .map(crate::persistence::read_api_key_file)
-            .transpose()
-            .map_err(|error| format!("AI API key file: {error}"))?,
-    };
-    AiClient::new(
-        provider,
-        api_key,
-        config.ai_model.clone(),
-        config.ai_base_url.clone(),
-        config.ai_max_tokens,
-        config.ai_temperature,
-        config.ai_redact_secrets,
-    )
+    // Keep endpoint-aware key selection and credential-file safety identical
+    // to the shared transport. A local resolver must not send an OpenAI key
+    // to a Moonshot/Kimi endpoint or normalize malformed credential bytes.
+    AiClient::from_settings(&jterm_core::ai::AiSettings {
+        enabled: config.ai_enabled,
+        provider: config.ai_provider.clone(),
+        api_key_file: jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref()),
+        model: config.ai_model.clone(),
+        base_url: config.ai_base_url.clone(),
+        max_tokens: config.ai_max_tokens,
+        temperature: config.ai_temperature,
+        redact_secrets: config.ai_redact_secrets,
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -201,6 +175,14 @@ pub fn client_from_config(config: &Config) -> Result<AiClient, String> {
 pub struct ModelRequestIdentity {
     pub epoch: AgentSessionEpoch,
     pub generation: u64,
+}
+
+/// Identity captured when a proposal action is rendered. Proposal IDs restart
+/// on task replacement, so a queued action must also name its original epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalRef {
+    pub epoch: AgentSessionEpoch,
+    pub id: ProposalId,
 }
 
 pub struct ModelRequest {
@@ -373,8 +355,8 @@ pub struct AgentUi {
     /// context.
     pub last_manual_completed: Option<BlockContext>,
     pub input: String,
-    /// Proposal being edited inline: (proposal id, buffer).
-    pub edit: Option<(ProposalId, String)>,
+    /// Proposal being edited inline: (task-bound proposal reference, buffer).
+    pub edit: Option<(ProposalRef, String)>,
     pub loading: bool,
     pub status: String,
     pub provider_label: String,
@@ -778,14 +760,93 @@ impl AgentUi {
         }
     }
 
+    #[cfg(test)]
+    pub fn proposal_ref(&self, id: ProposalId) -> Option<ProposalRef> {
+        let session = self.session.as_ref()?;
+        let reference = ProposalRef {
+            epoch: session.epoch(),
+            id,
+        };
+        self.proposal_is_current(reference).then_some(reference)
+    }
+
+    pub fn proposal_is_current(&self, reference: ProposalRef) -> bool {
+        self.is_open
+            && self.session.as_ref().is_some_and(|session| {
+                session.is_current_epoch(reference.epoch)
+                    && matches!(session.state(), AgentState::AwaitingApproval { proposal_id }
+                    if proposal_id == reference.id)
+            })
+    }
+
+    pub fn start_edit(&mut self, reference: ProposalRef, command: String) {
+        if !self.proposal_is_current(reference) {
+            return;
+        }
+        match crate::review_text::prepared_agent_edit_command(command) {
+            Ok(command) => self.edit = Some((reference, command)),
+            Err(crate::review_text::AgentEditPrepareError::Empty) => {
+                self.set_status("Agent edit rejected: empty command");
+                self.edit = None;
+            }
+            Err(crate::review_text::AgentEditPrepareError::Unsafe) => {
+                self.set_status("Agent edit rejected: unsafe command");
+                self.edit = None;
+            }
+        }
+    }
+
+    pub fn update_edit(&mut self, reference: ProposalRef, value: String) {
+        if !self.proposal_is_current(reference) {
+            return;
+        }
+        if let Some((_, buffer)) = self
+            .edit
+            .as_mut()
+            .filter(|(edited, _)| *edited == reference)
+        {
+            if let Some(value) = crate::review_text::accepted_agent_edit_command(value) {
+                *buffer = value;
+            }
+        }
+    }
+
+    pub fn cancel_edit(&mut self, reference: ProposalRef) {
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|(edited, _)| *edited == reference)
+        {
+            self.edit = None;
+        }
+    }
+
+    /// A canceled or stale edit never falls back to approving the original
+    /// command, and cannot consume an edit belonging to a newer proposal.
+    pub fn take_edited_command(&mut self, reference: ProposalRef) -> Option<String> {
+        if !self.proposal_is_current(reference)
+            || !self
+                .edit
+                .as_ref()
+                .is_some_and(|(edited, _)| *edited == reference)
+        {
+            return None;
+        }
+        self.edit.take().map(|(_, command)| command)
+    }
+
     /// Approve a proposal (optionally with an edited command). The returned
     /// generation must be armed in the terminal before any bytes are written;
     /// only a completion carrying that internal generation may be observed.
     pub fn approve(
         &mut self,
-        id: ProposalId,
+        reference: ProposalRef,
         edited: Option<String>,
     ) -> Option<ApprovedAgentExecution> {
+        if !self.proposal_is_current(reference) {
+            return None;
+        }
+        let id = reference.id;
         let session = self.session.as_mut()?;
         let candidate = edited.as_deref().or_else(|| proposal_command(session, id));
         let Some(candidate) = candidate else {
@@ -860,9 +921,12 @@ impl AgentUi {
         }
     }
 
-    pub fn reject(&mut self, id: ProposalId) {
+    pub fn reject(&mut self, reference: ProposalRef) {
+        if !self.proposal_is_current(reference) {
+            return;
+        }
         if let Some(session) = self.session.as_mut() {
-            if let Err(error) = session.reject(id) {
+            if let Err(error) = session.reject(reference.id) {
                 self.set_status(error.to_string());
             }
         }
@@ -870,11 +934,13 @@ impl AgentUi {
 
     /// Follow up on a completed task in the same transcript (budget allowing).
     pub fn continue_task(&mut self) {
-        self.edit = None;
-        self.awaiting = None;
         if let Some(session) = self.session.as_mut() {
             match session.continue_after_completion() {
-                Ok(()) => self.status.clear(),
+                Ok(()) => {
+                    self.edit = None;
+                    self.awaiting = None;
+                    self.status.clear();
+                }
                 Err(error) => self.set_status(error.to_string()),
             }
         }
@@ -882,11 +948,13 @@ impl AgentUi {
 
     /// Drop the finished transcript and start fresh in the same binding.
     pub fn new_task(&mut self) {
-        self.edit = None;
-        self.awaiting = None;
         if let Some(session) = self.session.as_mut() {
             match session.start_new_task() {
-                Ok(()) => self.status.clear(),
+                Ok(()) => {
+                    self.edit = None;
+                    self.awaiting = None;
+                    self.status.clear();
+                }
                 Err(error) => self.set_status(error.to_string()),
             }
         }
@@ -1062,6 +1130,164 @@ fn bound_composer(text: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_configuration_keeps_provider_credentials_bound() {
+        // Run each credential scenario in a separate process. Mutating the
+        // main test process's provider environment would race unrelated tests.
+        const PROBE: &str = "JTERM_HOST_AI_CREDENTIAL_PROBE";
+        if let Ok(case) = std::env::var(PROBE) {
+            let mut config = Config {
+                ai_enabled: true,
+                ai_provider: "openai-compatible".into(),
+                ai_model: "fixture-model".into(),
+                ai_base_url: match case.as_str() {
+                    "moonshot-cn" => "https://api.moonshot.cn/v1",
+                    "kimi" | "kimi-fallback" => "https://api.kimi.com/coding/v1",
+                    "moonshot-ai" | "app-override" => "https://api.moonshot.ai/v1",
+                    _ => "https://api.openai.com/v1",
+                }
+                .into(),
+                ai_max_tokens: 512,
+                ai_api_key_file: None,
+                ..Config::default()
+            };
+            if case.starts_with("file-") {
+                let directory = std::env::temp_dir().join(format!(
+                    "host-ai-credential-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir(&directory).unwrap();
+                let path = directory.join("provider.key");
+                std::fs::write(
+                    &path,
+                    if case == "file-malformed" {
+                        "file-fixture-key\n\n"
+                    } else {
+                        "file-fixture-key\n"
+                    },
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    if case == "file-symlink" {
+                        let link = directory.join("link.key");
+                        std::os::unix::fs::symlink(&path, &link).unwrap();
+                        config.ai_api_key_file = Some(link.to_str().unwrap().into());
+                    }
+                    if case == "file-public" {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                    }
+                }
+                config
+                    .ai_api_key_file
+                    .get_or_insert_with(|| path.to_str().unwrap().into());
+                let result = client_from_config(&config);
+                std::fs::remove_dir_all(directory).unwrap();
+                if case == "file-private" {
+                    assert_eq!(result.unwrap().api_key.as_deref(), Some("file-fixture-key"));
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "unsafe file credential was accepted: {case}"
+                    );
+                }
+                return;
+            }
+            let result = client_from_config(&config);
+            if case == "padded-env" {
+                assert!(
+                    result.is_err(),
+                    "credential whitespace must not be silently trimmed"
+                );
+            } else {
+                let expected = match case.as_str() {
+                    "openai" => "openai-fixture-key",
+                    "app-override" => "app-fixture-key",
+                    "kimi-fallback" => "kimi-fixture-key",
+                    _ => "moonshot-fixture-key",
+                };
+                assert_eq!(result.unwrap().api_key.as_deref(), Some(expected), "{case}");
+            }
+            return;
+        }
+        let test_name = format!(
+            "{}::client_configuration_keeps_provider_credentials_bound",
+            module_path!().split_once("::").unwrap().1
+        );
+        let app_key = format!(
+            "{}_AI_API_KEY",
+            jterm_core::identity::get().app_name.to_ascii_uppercase()
+        );
+        let app_file = format!(
+            "{}_AI_API_KEY_FILE",
+            jterm_core::identity::get().app_name.to_ascii_uppercase()
+        );
+        for case in [
+            "moonshot-ai",
+            "moonshot-cn",
+            "kimi",
+            "kimi-fallback",
+            "openai",
+            "app-override",
+            "padded-env",
+            "file-private",
+            "file-malformed",
+            "file-symlink",
+            "file-public",
+        ] {
+            if !cfg!(unix) && matches!(case, "file-symlink" | "file-public") {
+                continue;
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(PROBE, case)
+                .env_remove(&app_key)
+                .env_remove(&app_file);
+            for name in [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "MOONSHOT_API_KEY",
+                "KIMI_API_KEY",
+                "OLLAMA_API_KEY",
+            ] {
+                command.env_remove(name);
+            }
+            if !case.starts_with("file-") {
+                command
+                    .env(
+                        "OPENAI_API_KEY",
+                        if case == "padded-env" {
+                            " padded-key "
+                        } else {
+                            "openai-fixture-key"
+                        },
+                    )
+                    .env("KIMI_API_KEY", "kimi-fixture-key");
+                if case != "kimi-fallback" {
+                    command.env("MOONSHOT_API_KEY", "moonshot-fixture-key");
+                }
+            }
+            if case == "app-override" {
+                command.env(&app_key, "app-fixture-key");
+            }
+            let output = command.output().expect("run isolated credential probe");
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {
         std::fs::write(path, contents).unwrap();
@@ -1410,6 +1636,7 @@ mod tests {
         // An approved command still executing (both the local one-shot
         // execution slot and the protocol state) refuses a new task.
         let mut agent = AgentUi::new();
+        agent.is_open = true;
         let mut session = AgentSession::new(8);
         session.submit_user("look").unwrap();
         let ModelOutcome::Proposal { id, .. } = session
@@ -1419,7 +1646,9 @@ mod tests {
             panic!("expected proposal");
         };
         agent.session = Some(session);
-        assert!(agent.approve(id, None).is_some());
+        assert!(agent
+            .approve(agent.proposal_ref(id).unwrap(), None)
+            .is_some());
         let error = agent
             .start_for_block(&config, 3, failed_block_context(), "Fix it")
             .unwrap_err();
@@ -1532,9 +1761,13 @@ mod tests {
             panic!("expected proposal");
         };
         let mut agent = AgentUi::new();
+        agent.is_open = true;
         agent.session = Some(session);
         assert!(agent
-            .approve(id, Some("printf safe\u{2066}hidden".into()))
+            .approve(
+                agent.proposal_ref(id).unwrap(),
+                Some("printf safe\u{2066}hidden".into())
+            )
             .is_none());
         assert!(agent.status.contains("rejected"));
         assert!(matches!(
@@ -1596,7 +1829,9 @@ mod tests {
         let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
             panic!("expected proposal");
         };
-        let approved = agent.approve(id, None).expect("proposal approves");
+        let approved = agent
+            .approve(agent.proposal_ref(id).unwrap(), None)
+            .expect("proposal approves");
         assert_eq!(approved.command, "ls -la");
 
         // Wrong session id: ignored entirely.
@@ -1670,7 +1905,9 @@ mod tests {
         let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
             panic!("expected proposal");
         };
-        let approved = agent.approve(id, None).expect("proposal approves");
+        let approved = agent
+            .approve(agent.proposal_ref(id).unwrap(), None)
+            .expect("proposal approves");
         let mut completion = completed("ls -la", 0, "total 0", Some(approved.generation));
         completion.exit_code = None;
 
@@ -1696,7 +1933,9 @@ mod tests {
         let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
             panic!("expected proposal");
         };
-        let approved = agent.approve(id, None).expect("proposal approves");
+        let approved = agent
+            .approve(agent.proposal_ref(id).unwrap(), None)
+            .expect("proposal approves");
         let mut completion = completed("ls -la", 0, "partial", Some(approved.generation));
         completion.exit_code = None;
         completion.completion_provenance =
@@ -1758,7 +1997,9 @@ mod tests {
         let jterm_core::agent::ModelOutcome::Proposal { id, .. } = outcome else {
             panic!("expected proposal");
         };
-        let approved = agent.approve(id, None).expect("proposal approves");
+        let approved = agent
+            .approve(agent.proposal_ref(id).unwrap(), None)
+            .expect("proposal approves");
 
         agent.handle_completed(7, &completed("echo prefix; ls -la", 0, "spoof", None));
 
@@ -2140,5 +2381,126 @@ mod tests {
         assert!(!shown.contains('\u{fffd}'));
         assert!(shown.len() <= crate::review_text::MAX_DIAGNOSTIC_BYTES);
         assert!(shown.starts_with("cargo test"));
+    }
+
+    #[test]
+    fn rejected_task_controls_preserve_execution_correlation() {
+        for continue_task in [false, true] {
+            let mut agent = AgentUi::new();
+            agent.is_open = true;
+            agent.bound_session_id = Some(7);
+            let mut session = AgentSession::new(4);
+            session.submit_user("inspect").unwrap();
+            let ModelOutcome::Proposal { id, .. } = session
+                .accept_model_reply(r#"{"action":"run","command":"printf safe"}"#)
+                .unwrap()
+            else {
+                panic!("expected proposal")
+            };
+            agent.session = Some(session);
+            let approved = agent
+                .approve(agent.proposal_ref(id).unwrap(), None)
+                .unwrap();
+            if continue_task {
+                agent.continue_task();
+            } else {
+                agent.new_task();
+            }
+            assert!(
+                agent.awaiting.is_some(),
+                "a rejected task control lost the running command"
+            );
+            agent.handle_completed(
+                7,
+                &completed("printf safe", 0, "safe", Some(approved.generation)),
+            );
+            assert_eq!(
+                agent.session.as_ref().unwrap().state(),
+                AgentState::AwaitingModel
+            );
+        }
+    }
+
+    #[test]
+    fn stale_proposal_id_must_not_approve_a_replacement_task() {
+        let mut agent = AgentUi::new();
+        agent.is_open = true;
+        agent.bound_session_id = Some(7);
+        let mut original = AgentSession::new(4);
+        original.submit_user("inspect original").unwrap();
+        let ModelOutcome::Proposal { id: old_id, .. } = original
+            .accept_model_reply(r#"{"action":"run","command":"printf reviewed"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        agent.session = Some(original);
+        let old_reference = agent.proposal_ref(old_id).unwrap();
+        // A queued UI message still holds old_id after closing/replacing its task.
+        let mut replacement = AgentSession::new(4);
+        replacement.submit_user("inspect replacement").unwrap();
+        let ModelOutcome::Proposal { id: new_id, .. } = replacement
+            .accept_model_reply(r#"{"action":"run","command":"printf never-reviewed"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        assert_eq!(
+            old_id, new_id,
+            "proposal IDs restart in replacement sessions"
+        );
+        agent.session = Some(replacement);
+        assert!(
+            agent.approve(old_reference, None).is_none(),
+            "stale approval executed a replacement proposal"
+        );
+        agent.reject(old_reference);
+        assert_eq!(
+            agent.session.as_ref().unwrap().state(),
+            AgentState::AwaitingApproval {
+                proposal_id: new_id
+            }
+        );
+        let current = agent.proposal_ref(new_id).unwrap();
+        agent.start_edit(current, "printf current-edit".into());
+        agent.start_edit(old_reference, "printf stale".into());
+        agent.update_edit(old_reference, "printf stale-update".into());
+        agent.cancel_edit(old_reference);
+        assert!(agent.take_edited_command(old_reference).is_none());
+        assert_eq!(agent.edit.as_ref().unwrap().1, "printf current-edit");
+        let edited = agent.take_edited_command(current).unwrap();
+        assert_eq!(
+            agent.approve(current, Some(edited)).unwrap().command,
+            "printf current-edit"
+        );
+        assert!(
+            agent.approve(current, None).is_none(),
+            "approval must remain one-shot"
+        );
+    }
+
+    #[test]
+    fn canceled_edit_does_not_approve_the_unedited_command() {
+        let mut agent = AgentUi::new();
+        agent.is_open = true;
+        agent.bound_session_id = Some(7);
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf original"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        agent.session = Some(session);
+        let reference = agent.proposal_ref(id).unwrap();
+        agent.start_edit(reference, "printf edited".into());
+        agent.cancel_edit(reference);
+        assert!(agent.take_edited_command(reference).is_none());
+        assert!(agent.awaiting.is_none());
+        assert_eq!(
+            agent.session.as_ref().unwrap().state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
     }
 }

@@ -896,6 +896,12 @@ impl KittyGraphicsState {
         // arrival paint order for equal z-indexes under the stable re-sort.
         let mut combined = placements;
         combined.append(&mut self.placements);
+        // New output can fill the normal placement budget while this history
+        // is stashed. Undo must not accumulate another full budget on every
+        // clear/restore cycle; evict the oldest restored prefix first.
+        if combined.len() > MAX_KITTY_PLACEMENTS {
+            combined.drain(..combined.len() - MAX_KITTY_PLACEMENTS);
+        }
         self.placements = combined;
         self.placements.sort_by_key(|placement| placement.z_index);
         self.enforce_image_limits();

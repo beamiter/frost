@@ -394,11 +394,13 @@ mod unix_pty {
     /// The probe owns the whole process group it starts, not just the direct
     /// child: a shell that forks a daemon inherits this pipe, and reading to
     /// EOF would then wait for *that* descendant rather than for the program we
-    /// asked to identify itself. The banner is read concurrently under a byte
-    /// ceiling so the child cannot block on a full pipe either, and the group
-    /// is signalled and reaped at one deadline.
+    /// asked to identify itself. Drain a nonblocking pipe under a byte ceiling
+    /// while observing the leader without reaping it. Group cleanup precedes
+    /// the final wait, and a descendant that escaped the group cannot extend
+    /// the deadline merely by retaining stdout.
     fn jsh_version_banner(path: &Path) -> Option<String> {
         use std::io::Read;
+        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
@@ -425,38 +427,52 @@ mod unix_pty {
         let group = child.id() as libc::pid_t;
         let mut stdout = child.stdout.take()?;
 
-        // Drain concurrently: a child that fills the pipe while we wait for it
-        // to exit would deadlock against a reader that only runs afterwards.
-        let reader = std::thread::spawn(move || {
-            let mut banner = Vec::new();
-            let _ = stdout
-                .by_ref()
-                .take(MAX_BANNER_BYTES)
-                .read_to_end(&mut banner);
-            banner
-        });
-
+        // A descendant may leave our process group but retain the pipe. A
+        // blocking reader/join would then outlive the nominal probe deadline.
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            // The direct child has not been waited on, so the group is still
+            // ours even if the leader already exited.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let mut banner = Vec::new();
+        let mut drain_available = || -> std::io::Result<()> {
+            let remaining = MAX_BANNER_BYTES.saturating_sub(banner.len() as u64);
+            match stdout.by_ref().take(remaining).read_to_end(&mut banner) {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                Err(error) => Err(error),
+            }
+        };
         let deadline = Instant::now() + JSH_PROBE_TIMEOUT;
         let exited_cleanly = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status.success(),
+            if drain_available().is_err() {
+                break false;
+            }
+            match Pty::observe_child_exit(group) {
+                Ok(Some(code)) => break code == 0,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                _ => break false,
+                Ok(None) => break false,
+                // An external reaper may have released the PID. Do not send
+                // any further signals through its now-unowned numeric group.
+                Err(_) => return None,
             }
         };
-        // Signal the group whether or not the direct child exited: a daemonised
-        // descendant still holds the pipe, and the reader below must be able to
-        // reach EOF.
-        // SAFETY: killpg only signals the group this probe created.
-        unsafe {
-            libc::killpg(group, libc::SIGKILL);
-        }
+        // WNOWAIT retained the leader's PID/PGID through this last signal,
+        // including when it exited before its same-group descendants.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
         let _ = child.kill();
         let _ = child.wait();
-        let banner = reader.join().ok()?;
-        if !exited_cleanly {
+        // The leader may have written between the last drain and observation.
+        // This read never waits for EOF from escaped descendants.
+        let output_ok = drain_available().is_ok();
+        if !exited_cleanly || !output_ok {
             return None;
         }
         String::from_utf8(banner).ok()
@@ -623,6 +639,11 @@ mod unix_pty {
             command_argv: Option<&[String]>,
             extra_env: &[(&str, &str)],
         ) -> Result<Self> {
+            // Reject malformed explicit commands before openpty: returning
+            // from the later argv builder would otherwise leak both raw fds.
+            if command_argv.is_some_and(|argv| argv.is_empty()) {
+                return Err(anyhow!("command argv must not be empty"));
+            }
             // Reject stale session-history paths before allocating a PTY or
             // forking. The child still reports chdir failures through the setup
             // pipe below, closing the validation-to-fork race.
@@ -1242,9 +1263,9 @@ mod unix_pty {
                     }
                 },
                 Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
-                    // Already reaped elsewhere. Treat as dead so callers stop
-                    // polling.
-                    self.exit_code_cached = Some(0);
+                    // Already reaped elsewhere. The status is unknown, so
+                    // stop polling without reporting a successful task exit.
+                    self.exit_code_cached = Some(-1);
                     self.lifecycle = ChildLifecycle::Reaped;
                     false
                 }
@@ -1289,25 +1310,26 @@ mod unix_pty {
             let child_pid = self.child_pid;
             std::thread::spawn(move || unsafe {
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                // Observe without reaping. Even if TERM already ended the
+                // leader, its zombie must pin the PID/PGID until we have killed
+                // same-group descendants that ignored HUP/TERM. Reaping first
+                // would both leak those jobs and permit numeric PID reuse.
+                if let Err(error) = Self::observe_child_exit(child_pid) {
+                    // ECHILD means ownership has already been lost; never send
+                    // a signal to a potentially recycled PID or process group.
+                    if error.raw_os_error() != Some(libc::ECHILD) {
+                        log::warn!("could not observe terminating PTY child: {error}");
+                    }
+                    return;
+                }
+                let _ = libc::kill(-child_pid, libc::SIGKILL);
+                let _ = libc::kill(child_pid, libc::SIGKILL);
                 let mut status = 0;
-                let observed = loop {
-                    let result = libc::waitpid(child_pid, &mut status, libc::WNOHANG);
-                    if result >= 0
+                loop {
+                    if libc::waitpid(child_pid, &mut status, 0) >= 0
                         || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
                     {
-                        break result;
-                    }
-                };
-                if observed == 0 {
-                    // Still alive after the grace period: force kill, then reap.
-                    let _ = libc::kill(-child_pid, libc::SIGKILL);
-                    let _ = libc::kill(child_pid, libc::SIGKILL);
-                    loop {
-                        if libc::waitpid(child_pid, &mut status, 0) >= 0
-                            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                        {
-                            break;
-                        }
+                        break;
                     }
                 }
             });
@@ -1448,6 +1470,157 @@ mod unix_pty {
             );
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn empty_command_argv_does_not_leak_pty_fds() {
+            const HELPER: &str = "FROST_TEST_EMPTY_ARGV_FDS";
+            if std::env::var_os(HELPER).is_none() {
+                // Isolate the fd count from other concurrently running tests.
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "empty_command_argv_does_not_leak_pty_fds",
+                        "--test-threads=1",
+                    ])
+                    .env(HELPER, "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "isolated fd test failed: {}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                return;
+            }
+            let count_fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+            let before = count_fds();
+            for _ in 0..8 {
+                let error = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"), Some(&[]))
+                    .err()
+                    .expect("empty command argv must fail");
+                assert!(error.to_string().contains("command argv must not be empty"));
+            }
+            assert_eq!(count_fds(), before, "invalid argv leaked PTY descriptors");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn version_probe_does_not_wait_for_an_escaped_stdout_holder() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = std::env::temp_dir().join(format!(
+                "frost-probe-escaped-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let script = root.join("jsh");
+            // setsid deliberately escapes the owned group while keeping the
+            // output pipe open. This tests a bounded probe, not containment of
+            // escaped sessions. The fixture exits on its own after 1.2 seconds.
+            std::fs::write(
+                &script,
+                concat!(
+                    "#!/bin/sh\n",
+                    "setsid /bin/sh -c 'printf ready > \"$1\"; sleep 1.2' ",
+                    "probe-child \"$0.ready\" &\n",
+                    "while [ ! -e \"$0.ready\" ]; do sleep 0.01; done\n",
+                    "printf 'jsh 0.1.0\\n'\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let started = Instant::now();
+            let banner = jsh_version_banner(&script);
+            let elapsed = started.elapsed();
+            let fixture_started = script.with_extension("ready").exists();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(fixture_started, "setsid fixture did not start");
+            assert!(banner.is_some_and(|banner| banner.starts_with("jsh ")));
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "version probe exceeded its deadline waiting for an escaped stdout holder: {elapsed:?}"
+            );
+        }
+
+        #[test]
+        fn terminate_cleans_descendants_after_leader_exits_during_grace_period() {
+            let root = std::env::temp_dir().join(format!(
+                "frost-pty-terminate-descendants-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let ready = root.join("ready");
+            let leader_exited = root.join("leader-exited");
+            let escaped = root.join("descendant-escaped");
+            let argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                // Non-interactive sh leaves the background job in the leader's
+                // group. Synchronize after its traps are installed, then make
+                // the leader exit immediately on TERM while its child ignores
+                // both graceful signals. The child is deliberately bounded so
+                // a failing regression cannot leave a long-running orphan.
+                concat!(
+                    "trap '' HUP; trap 'printf exited > \"$2\"; exit 0' TERM; ",
+                    "(trap '' HUP TERM; printf ready > \"$1\"; ",
+                    "sleep 0.6; printf escaped > \"$3\") & ",
+                    "while :; do :; done"
+                )
+                .to_string(),
+                "frost-terminate-descendant-test".to_string(),
+                ready.to_string_lossy().into_owned(),
+                leader_exited.to_string_lossy().into_owned(),
+                escaped.to_string_lossy().into_owned(),
+            ];
+            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+                .expect("spawn termination test shell");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant did not install its traps"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            pty.terminate().expect("terminate the leader");
+            pty.terminate().expect("repeated terminate is harmless");
+            assert_eq!(pty.lifecycle, ChildLifecycle::TerminationStarted);
+            // Do not reap here: the detached thread is the sole wait owner.
+            std::thread::sleep(Duration::from_millis(850));
+            let leader_handled_term = leader_exited.exists();
+            let descendant_survived = escaped.exists();
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pty.child_pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            let wait_error = std::io::Error::last_os_error();
+            let _ = std::fs::remove_dir_all(root);
+            assert_eq!(observed, -1, "detached reaper did not reap the leader");
+            assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+            assert!(
+                leader_handled_term,
+                "leader did not handle TERM before SIGKILL"
+            );
+            assert!(
+                !descendant_survived,
+                "same-group descendant survived after the leader exited during termination"
+            );
+        }
+
         #[test]
         fn terminate_is_idempotent_at_the_lifecycle_boundary() {
             let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, Some("/bin/sh"), None)
@@ -1500,6 +1673,33 @@ mod unix_pty {
             std::thread::sleep(Duration::from_millis(850));
             assert!(!escaped_marker.exists());
             let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn an_externally_reaped_child_has_unknown_not_successful_status() {
+            let argv = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 7".to_string(),
+            ];
+            let mut pty = Pty::new_with_cwd(80, 24, Some("/"), None, None, Some(&argv))
+                .expect("spawn externally reaped test child");
+            // Model a competing reaper consuming the status. ECHILD cannot
+            // establish success, and task terminals must not report it as 0.
+            let mut status = 0;
+            loop {
+                let result = unsafe { libc::waitpid(pty.child_pid, &mut status, 0) };
+                if result == pty.child_pid {
+                    break;
+                }
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINTR)
+                );
+            }
+            assert!(!pty.is_alive());
+            assert_eq!(pty.exited_code(), Some(-1));
+            assert_eq!(pty.lifecycle, ChildLifecycle::Reaped);
         }
 
         #[test]

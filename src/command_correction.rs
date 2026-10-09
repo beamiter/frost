@@ -145,6 +145,15 @@ pub(crate) fn accept_correction(
     proposal.accept().map_err(|error| error.to_string())
 }
 
+/// Identity captured by the card's UI actions. Both the target pane and its
+/// generation are required: neither active focus nor a newer card grants an
+/// old click authority to insert or run a different command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CorrectionRef {
+    pub(crate) session_id: usize,
+    pub(crate) generation: u64,
+}
+
 /// One pane's live correction request, and the card it resolved into.
 pub(crate) struct CorrectionSession {
     generation: u64,
@@ -211,7 +220,7 @@ impl CorrectionRegistry {
             return None;
         }
         self.close(session_id);
-        let generation = self.generation.wrapping_add(1);
+        let generation = self.generation.checked_add(1)?;
         self.generation = generation;
         let cancellation = AiCancellationToken::new();
         self.sessions.insert(
@@ -254,6 +263,15 @@ impl CorrectionRegistry {
 
     pub(crate) fn get_mut(&mut self, session_id: usize) -> Option<&mut CorrectionSession> {
         self.sessions.get_mut(&session_id)
+    }
+
+    pub(crate) fn get_current_mut(
+        &mut self,
+        reference: CorrectionRef,
+    ) -> Option<&mut CorrectionSession> {
+        self.sessions
+            .get_mut(&reference.session_id)
+            .filter(|session| session.generation == reference.generation)
     }
 
     /// Dismiss exactly this generation; a stale dismissal cannot cancel a
@@ -648,5 +666,62 @@ mod tests {
         assert!(registry
             .begin(7, "git \u{fffd}statu".to_string(), 1, deadline)
             .is_none());
+    }
+
+    #[test]
+    fn exhausted_card_identities_fail_closed_without_reuse() {
+        let mut registry = CorrectionRegistry::default();
+        registry.generation = u64::MAX;
+        let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
+        assert!(registry
+            .begin(1, SUGGESTION_COMMAND.into(), 1, deadline)
+            .is_none());
+        assert!(registry.get(1).is_none());
+        assert_eq!(registry.generation, u64::MAX);
+    }
+
+    #[test]
+    fn card_actions_require_the_original_pane_and_generation() {
+        let mut registry = CorrectionRegistry::default();
+        let deadline = Instant::now() + CORRECTION_REQUEST_TIMEOUT;
+        let (old_generation, _) = registry
+            .begin(1, SUGGESTION_COMMAND.into(), 1, deadline)
+            .unwrap();
+        assert!(registry.present(1, old_generation, candidate()));
+        let old = CorrectionRef {
+            session_id: 1,
+            generation: old_generation,
+        };
+        let (other_generation, _) = registry
+            .begin(2, SUGGESTION_COMMAND.into(), 1, deadline)
+            .unwrap();
+        assert!(registry.present(2, other_generation, candidate()));
+        let wrong_pane = CorrectionRef {
+            session_id: 2,
+            ..old
+        };
+        assert!(registry.get_current_mut(wrong_pane).is_none());
+        // A fresh completion on the same pane invalidates every action its old
+        // card already queued, including an edit, approval, or dismissal.
+        let (new_generation, _) = registry
+            .begin(1, SUGGESTION_COMMAND.into(), 1, deadline)
+            .unwrap();
+        assert!(registry.present(1, new_generation, candidate()));
+        assert!(registry.get_current_mut(old).is_none());
+        assert!(!registry.dismiss(old.session_id, old.generation));
+        let current = CorrectionRef {
+            session_id: 1,
+            generation: new_generation,
+        };
+        let session = registry.get_current_mut(current).unwrap();
+        session.set_draft("git status --short".into());
+        assert_eq!(
+            session.proposal.as_ref().unwrap().draft(),
+            "git status --short"
+        );
+        assert_eq!(
+            registry.get(2).unwrap().proposal.as_ref().unwrap().draft(),
+            "git status"
+        );
     }
 }

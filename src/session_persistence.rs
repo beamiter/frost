@@ -1603,13 +1603,13 @@ impl SessionsSnapshot {
 
     /// 从文件加载。文件不存在与文件读不动是两种结果，见 [`SnapshotLoad`]。
     pub fn load(path: &Path) -> SnapshotLoad {
-        if !path.exists() {
-            return SnapshotLoad::Missing;
-        }
+        // Let the no-follow reader distinguish a missing entry from an
+        // unreadable one. Path::exists follows symlinks and hides I/O errors,
+        // bypassing quarantine for dangling links and symlink loops.
         let content = match crate::persistence::read_text_bounded(path, MAX_SNAPSHOT_BYTES) {
             Ok(content) => content,
-            // 和 exists() 之间存在竞争：文件刚被删掉就当成没有快照，否则调用方
-            // 会去隔离一个已经不在那里的文件。
+            // A genuinely absent entry (including one just removed by another
+            // process) has nothing to quarantine.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return SnapshotLoad::Missing
             }
@@ -2037,6 +2037,35 @@ mod tests {
         let (mut snapshot, mut warnings) = decode_bounded_snapshot(contents).unwrap();
         warnings.extend(snapshot.sanitize());
         (snapshot, warnings)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_snapshot_symlinks_are_unreadable_and_preserved_for_quarantine() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch("unresolved-symlinks");
+        for (name, target) in [
+            ("dangling.json", "missing.json"),
+            ("loop.json", "loop.json"),
+        ] {
+            let path = root.join(name);
+            symlink(target, &path).unwrap();
+            assert!(
+                matches!(SessionsSnapshot::load(&path), SnapshotLoad::Unreadable(_)),
+                "an existing unresolved symlink must not be mistaken for missing state"
+            );
+            assert_eq!(
+                std::fs::read_link(&path).unwrap(),
+                std::path::Path::new(target)
+            );
+            let backup = snapshot_file::quarantine_corrupt(&path).unwrap();
+            assert_eq!(
+                std::fs::read_link(&backup).unwrap(),
+                std::path::Path::new(target)
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

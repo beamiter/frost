@@ -1,3 +1,28 @@
+/// Locate cancellation before the first real string terminator. A fresh ESC
+/// abandons the string and is parsed again; CAN/SUB are consumed. The bool says
+/// that ESC was the final byte of the previous read and must be restored.
+fn control_string_abort(input: &[u8], previous_escape: bool, osc: bool) -> Option<(usize, bool)> {
+    if previous_escape {
+        match input.first().copied()? {
+            b'\\' => return None,
+            0x18 | 0x1a => return Some((1, false)),
+            _ => return Some((0, true)),
+        }
+    }
+    for (index, byte) in input.iter().copied().enumerate() {
+        match byte {
+            0x18 | 0x1a => return Some((index + 1, false)),
+            0x07 if osc => return None,
+            0x1b => match input.get(index + 1) {
+                Some(b'\\') | None => return None,
+                Some(_) => return Some((index, false)),
+            },
+            _ => {}
+        }
+    }
+    None
+}
+
 use crate::kitty_graphics::{KittyGraphicsState, KittyImage, KittyPlacement};
 use base64::Engine;
 use jterm_core::click_cursor;
@@ -7661,6 +7686,45 @@ impl TerminalState {
     /// Begin buffering an unterminated APC (`ESC _` through the end of the
     /// current read). A first fragment that already exceeds the cap is
     /// rejected without being retained; the parser then discards through ST.
+    /// Abort a fragmented control string before its ordinary resume scanner
+    /// can consume a replacement escape or the visible text after CAN/SUB.
+    fn abort_pending_control_string(&mut self, input: &[u8]) -> bool {
+        let (previous_escape, osc) = if self.discarding_oversized_apc {
+            (self.discarding_apc_prev_escape, false)
+        } else if !self.pending_apc.is_empty() {
+            (self.pending_apc.last() == Some(&0x1b), false)
+        } else if !self.pending_osc.is_empty() {
+            (self.pending_osc.last() == Some(&0x1b), true)
+        } else if !self.pending_dcs.is_empty() {
+            (self.pending_dcs.last() == Some(&0x1b), false)
+        } else {
+            return false;
+        };
+        let Some((resume, restore_escape)) = control_string_abort(input, previous_escape, osc)
+        else {
+            return false;
+        };
+        if !self.pending_apc.is_empty() {
+            self.reject_buffered_kitty_apc_with_suffix(
+                &input[..resume],
+                "Kitty graphics APC was cancelled",
+            );
+        }
+        self.pending_apc.clear();
+        self.pending_apc_scan_from = 0;
+        self.pending_osc.clear();
+        self.pending_osc_scan_from = 0;
+        self.pending_dcs.clear();
+        self.pending_dcs_scan_from = 0;
+        self.discarding_oversized_apc = false;
+        self.discarding_apc_prev_escape = false;
+        if restore_escape {
+            self.pending_escape.push(0x1b);
+        }
+        self.process_input(&input[resume..]);
+        true
+    }
+
     fn begin_pending_apc(&mut self, tail: &[u8]) {
         if tail.len() > MAX_PENDING_ESCAPE {
             if let Some(payload) = tail.strip_prefix(b"\x1b_") {
@@ -8040,6 +8104,9 @@ impl TerminalState {
     }
 
     fn process_input_inner(&mut self, input: &[u8]) {
+        if self.abort_pending_control_string(input) {
+            return;
+        }
         // A fragmented kitty APC streams against its own bounded buffer; this
         // must run before the pending_escape merge so the APC never pays the
         // O(n^2) re-scan and its tail is never parsed as ordinary input.
@@ -8151,6 +8218,10 @@ impl TerminalState {
                     }
 
                     match data_slice[i + 1] {
+                        // A repeated ESC abandons the unfinished prefix.
+                        0x1b => {
+                            i += 1;
+                        }
                         b'7' => {
                             // DECSC - Save cursor (position + SGR + charset + origin)
                             self.save_cursor();
@@ -8195,6 +8266,12 @@ impl TerminalState {
                             i += 2;
 
                             let payload_start = i;
+                            if let Some((resume, _)) =
+                                control_string_abort(&data_slice[i..], false, true)
+                            {
+                                i += resume;
+                                continue;
+                            }
 
                             let mut terminated = false;
                             while i < data_slice.len() {
@@ -8242,6 +8319,20 @@ impl TerminalState {
                             let is_apc = data_slice[i + 1] == b'_';
                             i += 2;
 
+                            if let Some((resume, _)) =
+                                control_string_abort(&data_slice[i..], false, false)
+                            {
+                                if is_apc {
+                                    self.kitty_graphics.reject_graphics_payload(
+                                        &data_slice[i..i + resume],
+                                        "Kitty graphics APC was cancelled",
+                                    );
+                                    let responses = self.kitty_graphics.take_responses();
+                                    self.output_buffer.extend_from_slice(&responses);
+                                }
+                                i += resume;
+                                continue;
+                            }
                             let mut terminated = false;
                             let dcs_start = i;
                             while i < data_slice.len() {
@@ -17923,11 +18014,12 @@ mod tests {
         assert_eq!(terminal.window_title, "win");
         assert_eq!(terminal.grid[0][0].character, 'Y');
 
-        // An ESC not followed by `\` stays payload, even across reads.
+        // A non-ST ESC abandons OSC and starts SOS here, even across reads.
         let mut terminal = TerminalState::new(16, 2);
         terminal.process_input(b"\x1b]0;a\x1b");
         terminal.process_input(b"Xb\x07");
-        assert_eq!(terminal.window_title, "aXb");
+        assert!(terminal.window_title.is_empty());
+        assert!(!terminal.pending_dcs.is_empty());
         assert_eq!(terminal.grid[0][0].character, ' ');
     }
 
@@ -20657,5 +20749,105 @@ mod tests {
         assert_eq!(full.get_cursor_pos(), (11, 2));
         assert_eq!(row(&full, 11), "$");
         assert_eq!(row(&full, 0), "row 8");
+    }
+    #[test]
+    fn cancelled_control_strings_resume_visible_text_at_every_split() {
+        for prefix in [
+            b"\x1b]0;unfinished".as_slice(),
+            b"\x1b_Gi=1",
+            b"\x1bP$qm",
+            b"\x1b^ignored",
+            b"\x1bXignored",
+        ] {
+            for cancel in [0x18, 0x1a] {
+                let mut bytes = prefix.to_vec();
+                bytes.push(cancel);
+                bytes.extend_from_slice(b"ok");
+                for split in 0..=bytes.len() {
+                    let mut terminal = TerminalState::new(16, 2);
+                    terminal.process_input(&bytes[..split]);
+                    terminal.process_input(&bytes[split..]);
+                    assert_eq!(
+                        terminal.grid[0][0].character, 'o',
+                        "prefix={prefix:?}, cancel={cancel}, split={split}"
+                    );
+                    assert_eq!(terminal.grid[0][1].character, 'k');
+                    assert!(terminal.window_title.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_reset_interrupts_control_strings_at_every_split() {
+        for prefix in [
+            b"\x1b]0;unfinished".as_slice(),
+            b"\x1b_Gi=1",
+            b"\x1bP$qm",
+            b"\x1b^ignored",
+            b"\x1bXignored",
+            b"\x1b",
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(b"\x1bcok");
+            for split in 0..=bytes.len() {
+                let mut terminal = TerminalState::new(16, 2);
+                terminal.process_input(b"old\x1b[?2004h");
+                terminal.process_input(&bytes[..split]);
+                terminal.process_input(&bytes[split..]);
+                assert_eq!(
+                    terminal.grid[0][0].character, 'o',
+                    "prefix={prefix:?}, split={split}"
+                );
+                assert_eq!(
+                    terminal.grid[0][1].character, 'k',
+                    "prefix={prefix:?}, split={split}"
+                );
+                assert!(!terminal.modes.contains(&2004));
+                assert!(terminal.window_title.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn discarded_oversized_apc_still_obeys_cancellation_and_reset() {
+        for suffix in [b"\x18ok".as_slice(), b"\x1aok", b"\x1bcok"] {
+            let mut terminal = TerminalState::new(16, 2);
+            let mut oversized = b"\x1b_Gi=1;".to_vec();
+            oversized.resize(MAX_PENDING_ESCAPE + 1, b'A');
+            terminal.process_input(&oversized);
+            assert!(terminal.discarding_oversized_apc);
+            for byte in suffix {
+                terminal.process_input(&[*byte]);
+            }
+            assert!(!terminal.discarding_oversized_apc);
+            assert_eq!(terminal.grid[0][0].character, 'o');
+            assert_eq!(terminal.grid[0][1].character, 'k');
+        }
+    }
+
+    #[test]
+    fn undo_clear_graphics_reapplies_the_placement_budget_after_new_output() {
+        let mut terminal = TerminalState::new(30, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07old\r\n\x1b]133;C\x07\x1b_Gf=32,s=1,v=1,a=t,i=51,q=2;AQIDBA==\x1b\\");
+        for placement in 1..=1024 {
+            terminal.process_input(format!("\x1b_Ga=p,i=51,p={placement},q=2\x1b\\").as_bytes());
+        }
+        terminal.process_input(
+            b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07new\r\n\x1b]133;C\x07",
+        );
+        assert_eq!(terminal.kitty_graphics.get_placements().len(), 1024);
+        assert_eq!(terminal.clear_completed_blocks(), 1);
+        terminal.process_input(b"\x1b_Gf=32,s=1,v=1,a=t,i=52,q=2;BQYHCA==\x1b\\");
+        for placement in 1..=1024 {
+            terminal.process_input(format!("\x1b_Ga=p,i=52,p={placement},q=2\x1b\\").as_bytes());
+        }
+        assert_eq!(terminal.undo_clear_completed_blocks(), 1);
+        assert_eq!(terminal.kitty_graphics.get_placements().len(), 1024);
+        assert!(terminal
+            .kitty_graphics
+            .get_placements()
+            .iter()
+            .all(|placement| placement.image_id == 52));
     }
 }

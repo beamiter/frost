@@ -243,6 +243,12 @@ impl CommandSuggestion {
         self.generation
     }
 
+    /// UI actions carry the generation rendered on their card, just like
+    /// worker replies. A queued click must never act on a replacement draft.
+    pub(crate) fn is_generation(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
     pub(crate) fn cancellation(&self) -> AiCancellationToken {
         self.cancellation.clone()
     }
@@ -261,7 +267,7 @@ impl CommandSuggestion {
     /// request — anvil's `suggestion_reply_is_current`: a stopped or
     /// superseded request's late reply is dropped, never presented.
     fn reply_is_current(&self, generation: u64) -> bool {
-        self.phase == SuggestionPhase::Drafting && self.generation == generation
+        self.phase == SuggestionPhase::Drafting && self.is_generation(generation)
     }
 
     /// Apply a worker reply. Returns whether the card changed.
@@ -694,5 +700,21 @@ mod tests {
             session.feedback.as_deref(),
             Some("Cannot insert: the prompt already contains input")
         );
+    }
+
+    #[test]
+    fn ui_action_identity_changes_on_replacement_and_regeneration() {
+        let mut counter = 0;
+        let (mut first, original) = begin_at(&mut counter);
+        assert!(first.apply_reply(original, Ok("printf reviewed".into())));
+        assert!(first.is_generation(original));
+        let (mut replacement, fresh) = begin_at(&mut counter);
+        assert!(replacement.apply_reply(fresh, Ok("printf replacement".into())));
+        assert!(!replacement.is_generation(original));
+        assert!(replacement.is_generation(fresh));
+        let regenerated = next_generation(&mut counter).unwrap();
+        assert!(replacement.regenerate(regenerated));
+        assert!(!replacement.is_generation(fresh));
+        assert!(replacement.is_generation(regenerated));
     }
 }

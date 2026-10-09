@@ -3320,12 +3320,12 @@ enum Message {
     // AI agent panel (per-command approval agent over jterm_core).
     AgentInput(String),
     AgentSubmit,
-    AgentApprove(jterm_core::agent::ProposalId),
-    AgentEditStart(jterm_core::agent::ProposalId, String),
-    AgentEditInput(String),
-    AgentEditApprove(jterm_core::agent::ProposalId),
-    AgentEditCancel,
-    AgentReject(jterm_core::agent::ProposalId),
+    AgentApprove(agent::ProposalRef),
+    AgentEditStart(agent::ProposalRef, String),
+    AgentEditInput(agent::ProposalRef, String),
+    AgentEditApprove(agent::ProposalRef),
+    AgentEditCancel(agent::ProposalRef),
+    AgentReject(agent::ProposalRef),
     /// One streamed fragment of the in-flight model reply for the given
     /// request task epoch/generation (stale ones dropped).
     AgentModelDelta(agent::ModelRequestIdentity, String),
@@ -3343,10 +3343,10 @@ enum Message {
         Result<Option<command_correction::CorrectionCandidate>, String>,
     ),
     /// Edit of the correction card's command draft.
-    CommandCorrectionInput(String),
+    CommandCorrectionInput(command_correction::CorrectionRef, String),
     /// The card's primary action: run when verified and unchanged, else insert.
-    CommandCorrectionAccept,
-    CommandCorrectionDismiss,
+    CommandCorrectionAccept(command_correction::CorrectionRef),
+    CommandCorrectionDismiss(command_correction::CorrectionRef),
     /// Settings toggle for review-first command correction.
     SetCommandCorrectionEnabled(bool),
     // Persistent AI chats library (ported from anvil's AI panel) and inline
@@ -3379,12 +3379,12 @@ enum Message {
     /// The suggestion worker resolved (stale generations dropped).
     AiSuggestionResolved(u64, Result<String, String>),
     /// Edit of the suggestion card's command draft.
-    AiSuggestionInput(String),
+    AiSuggestionInput(u64, String),
     /// The card's primary action: insert the validated draft at the prompt
     /// for review. Never submits.
-    AiSuggestionInsert,
-    AiSuggestionRegenerate,
-    AiSuggestionDismiss,
+    AiSuggestionInsert(u64),
+    AiSuggestionRegenerate(u64),
+    AiSuggestionDismiss(u64),
     // Experimental Tasks dashboard (native Codex/Claude runtime + isolated worktrees).
     TaskPanelToggle,
     TaskSelect(agent_task::TaskId),
@@ -13725,15 +13725,18 @@ impl Frost {
                     }
                 }
             }
-            Message::CommandCorrectionInput(draft) => {
-                if let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) {
-                    if let Some(session) = self.command_corrections.get_mut(session_id) {
-                        session.set_draft(draft);
-                    }
+            Message::CommandCorrectionInput(reference, draft) => {
+                if let Some(session) = self.command_corrections.get_current_mut(reference) {
+                    session.set_draft(draft);
                 }
             }
-            Message::CommandCorrectionAccept => return self.accept_command_correction(),
-            Message::CommandCorrectionDismiss => self.dismiss_active_correction(),
+            Message::CommandCorrectionAccept(reference) => {
+                return self.accept_command_correction(reference);
+            }
+            Message::CommandCorrectionDismiss(reference) => {
+                self.command_corrections
+                    .dismiss(reference.session_id, reference.generation);
+            }
             Message::SetCommandCorrectionEnabled(enabled) => {
                 self.config.command_correction_enabled = enabled;
                 self.config_dirty = true;
@@ -13809,14 +13812,30 @@ impl Frost {
                     }
                 }
             }
-            Message::AiSuggestionInput(draft) => {
-                if let Some(session) = self.ai_suggestion.as_mut() {
+            Message::AiSuggestionInput(generation, draft) => {
+                if let Some(session) = self
+                    .ai_suggestion
+                    .as_mut()
+                    .filter(|session| session.is_generation(generation))
+                {
                     session.set_review_draft(draft);
                 }
             }
-            Message::AiSuggestionInsert => return self.insert_ai_suggestion(),
-            Message::AiSuggestionRegenerate => return self.regenerate_ai_suggestion(),
-            Message::AiSuggestionDismiss => self.ai_suggestion = None,
+            Message::AiSuggestionInsert(generation) => {
+                return self.insert_ai_suggestion(generation)
+            }
+            Message::AiSuggestionRegenerate(generation) => {
+                return self.regenerate_ai_suggestion(generation)
+            }
+            Message::AiSuggestionDismiss(generation) => {
+                if self
+                    .ai_suggestion
+                    .as_ref()
+                    .is_some_and(|session| session.is_generation(generation))
+                {
+                    self.ai_suggestion = None;
+                }
+            }
             Message::TaskPanelToggle => {
                 self.toggle_task_panel();
             }
@@ -13936,36 +13955,18 @@ impl Frost {
                     return task;
                 }
             }
-            Message::AgentEditStart(id, command) => {
-                match crate::review_text::prepared_agent_edit_command(command) {
-                    Ok(command) => self.agent.edit = Some((id, command)),
-                    Err(crate::review_text::AgentEditPrepareError::Empty) => {
-                        self.agent.set_status("Agent edit rejected: empty command");
-                        self.agent.edit = None;
-                    }
-                    Err(crate::review_text::AgentEditPrepareError::Unsafe) => {
-                        self.agent.set_status("Agent edit rejected: unsafe command");
-                        self.agent.edit = None;
-                    }
-                }
+            Message::AgentEditStart(reference, command) => {
+                self.agent.start_edit(reference, command);
             }
-            Message::AgentEditInput(value) => {
-                if let Some((_, buffer)) = self.agent.edit.as_mut() {
-                    if let Some(value) = crate::review_text::accepted_agent_edit_command(value) {
-                        *buffer = value;
-                    }
-                }
+            Message::AgentEditInput(reference, value) => {
+                self.agent.update_edit(reference, value);
             }
-            Message::AgentEditCancel => self.agent.edit = None,
-            Message::AgentEditApprove(id) => {
-                let edited = self
-                    .agent
-                    .edit
-                    .take()
-                    .filter(|(edit_id, _)| *edit_id == id)
-                    .map(|(_, buffer)| buffer);
-                if let Some(task) = self.agent_run_approved(id, edited) {
-                    return task;
+            Message::AgentEditCancel(reference) => self.agent.cancel_edit(reference),
+            Message::AgentEditApprove(reference) => {
+                if let Some(edited) = self.agent.take_edited_command(reference) {
+                    if let Some(task) = self.agent_run_approved(reference, Some(edited)) {
+                        return task;
+                    }
                 }
             }
             Message::AgentReject(id) => {
@@ -22904,9 +22905,12 @@ impl Frost {
     /// pending line, submit it, then continue driving the protocol.
     fn agent_run_approved(
         &mut self,
-        id: jterm_core::agent::ProposalId,
+        reference: agent::ProposalRef,
         edited: Option<String>,
     ) -> Option<Task<Message>> {
+        if !self.agent.proposal_is_current(reference) {
+            return None;
+        }
         let bound = self.agent.bound_session_id?;
         let Some(session_index) = self.sessions.iter().position(|session| session.id == bound)
         else {
@@ -22929,7 +22933,7 @@ impl Frost {
             return None;
         }
 
-        let approved = self.agent.approve(id, edited)?;
+        let approved = self.agent.approve(reference, edited)?;
         let sess = &mut self.sessions[session_index];
         let paste = match agent_command_payload(
             &approved.command,
@@ -23092,12 +23096,13 @@ impl Frost {
     /// (and that is not dangerous) runs after this one explicit action; an
     /// unverified or edited draft is inserted at the prompt for review and the
     /// user still presses Enter.
-    fn accept_command_correction(&mut self) -> Task<Message> {
-        let Some(session_id) = self.sessions.get(self.active).map(|sess| sess.id) else {
-            return Task::none();
-        };
+    fn accept_command_correction(
+        &mut self,
+        reference: command_correction::CorrectionRef,
+    ) -> Task<Message> {
+        let session_id = reference.session_id;
         let accepted = {
-            let Some(session) = self.command_corrections.get_mut(session_id) else {
+            let Some(session) = self.command_corrections.get_current_mut(reference) else {
                 return Task::none();
             };
             let Some(proposal) = session.proposal.as_mut() else {
@@ -23141,8 +23146,9 @@ impl Frost {
         };
         let written = self.write_paste_to_session(session_id, &accepted.command, policy, true);
         if written {
-            self.dismiss_active_correction();
-        } else if let Some(session) = self.command_corrections.get_mut(session_id) {
+            self.command_corrections
+                .dismiss(session_id, reference.generation);
+        } else if let Some(session) = self.command_corrections.get_current_mut(reference) {
             if let Some(proposal) = session.proposal.as_mut() {
                 proposal.set_feedback(Some(crate::command_correction::bound_correction_feedback(
                     "The target prompt changed before the command could be queued.",
@@ -23406,7 +23412,14 @@ impl Frost {
     }
 
     /// Re-draft after a failure with the same request and captured context.
-    fn regenerate_ai_suggestion(&mut self) -> Task<Message> {
+    fn regenerate_ai_suggestion(&mut self, expected_generation: u64) -> Task<Message> {
+        if !self
+            .ai_suggestion
+            .as_ref()
+            .is_some_and(|session| session.is_generation(expected_generation))
+        {
+            return Task::none();
+        }
         let Some(generation) = self.next_ai_suggestion_generation() else {
             return Task::none();
         };
@@ -23437,7 +23450,14 @@ impl Frost {
     /// boundary, and type the command into the prompt through the
     /// non-submitting insert policy. Generated commands never run
     /// automatically — the user reviews and presses Enter.
-    fn insert_ai_suggestion(&mut self) -> Task<Message> {
+    fn insert_ai_suggestion(&mut self, generation: u64) -> Task<Message> {
+        if !self
+            .ai_suggestion
+            .as_ref()
+            .is_some_and(|session| session.is_generation(generation))
+        {
+            return Task::none();
+        }
         // The insert types into the *bound* pane. If the user has moved on to
         // another pane, refuse rather than clearing and rewriting a prompt
         // that is off screen (ember refuses the same way).
@@ -24642,6 +24662,10 @@ impl Frost {
                         command,
                         status,
                     } => {
+                        let reference = agent::ProposalRef {
+                            epoch: session.epoch(),
+                            id: *id,
+                        };
                         let danger = jterm_core::agent::is_dangerous(command);
                         let is_current = matches!(
                             session.state(),
@@ -24659,11 +24683,11 @@ impl Frost {
                                 .style(text::danger),
                             );
                         }
-                        if let Some((edit_id, buffer)) = self
+                        if let Some((edit_reference, buffer)) = self
                             .agent
                             .edit
                             .as_ref()
-                            .filter(|(edit_id, _)| edit_id == id)
+                            .filter(|(edited, _)| *edited == reference)
                         {
                             let visible_buffer = crate::review_text::visible_bounded(
                                 buffer,
@@ -24672,18 +24696,20 @@ impl Frost {
                             card = card.push(
                                 text_input("command", &visible_buffer)
                                     .id(AGENT_EDIT_INPUT_ID.clone())
-                                    .on_input(Message::AgentEditInput)
-                                    .on_submit(Message::AgentEditApprove(*edit_id))
+                                    .on_input(move |value| {
+                                        Message::AgentEditInput(reference, value)
+                                    })
+                                    .on_submit(Message::AgentEditApprove(*edit_reference))
                                     .size(13)
                                     .font(iced::Font::MONOSPACE),
                             );
                             card = card.push(
                                 row![
                                     button(text("Approve edited").size(12))
-                                        .on_press(Message::AgentEditApprove(*edit_id)),
+                                        .on_press(Message::AgentEditApprove(*edit_reference)),
                                     button(text("Cancel").size(12))
                                         .style(button::secondary)
-                                        .on_press(Message::AgentEditCancel),
+                                        .on_press(Message::AgentEditCancel(*edit_reference)),
                                 ]
                                 .spacing(6),
                             );
@@ -24709,18 +24735,18 @@ impl Frost {
                                         } else {
                                             button::primary
                                         })
-                                        .on_press(Message::AgentApprove(*id));
+                                        .on_press(Message::AgentApprove(reference));
                                     row![
                                         approve,
                                         button(text("Edit").size(12))
                                             .style(button::secondary)
                                             .on_press(Message::AgentEditStart(
-                                                *id,
+                                                reference,
                                                 command.clone()
                                             )),
                                         button(text("Reject").size(12))
                                             .style(button::secondary)
-                                            .on_press(Message::AgentReject(*id)),
+                                            .on_press(Message::AgentReject(reference)),
                                     ]
                                     .spacing(6)
                                     .into()
@@ -24947,6 +24973,10 @@ impl Frost {
     fn correction_card(&self) -> Option<Element<'_, Message>> {
         let session_id = self.sessions.get(self.active).map(|sess| sess.id)?;
         let session = self.command_corrections.get(session_id)?;
+        let reference = command_correction::CorrectionRef {
+            session_id,
+            generation: session.generation(),
+        };
         let proposal = session.proposal.as_ref()?;
         let candidate = proposal.candidate();
         // Recomputed against the live draft on every keystroke: any edit
@@ -24967,7 +24997,7 @@ impl Frost {
             .style(text::secondary),
             button(text("✕").size(12))
                 .style(button::secondary)
-                .on_press(Message::CommandCorrectionDismiss),
+                .on_press(Message::CommandCorrectionDismiss(reference)),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -24985,8 +25015,8 @@ impl Frost {
 
         let draft = text_input("corrected command", proposal.draft())
             .id(CORRECTION_INPUT_ID.clone())
-            .on_input(Message::CommandCorrectionInput)
-            .on_submit(Message::CommandCorrectionAccept)
+            .on_input(move |draft| Message::CommandCorrectionInput(reference, draft))
+            .on_submit(Message::CommandCorrectionAccept(reference))
             .size(13)
             .font(iced::Font::MONOSPACE);
 
@@ -25004,10 +25034,10 @@ impl Frost {
             } else {
                 button::secondary
             })
-            .on_press(Message::CommandCorrectionAccept),
+            .on_press(Message::CommandCorrectionAccept(reference)),
             button(text("Dismiss").size(12))
                 .style(button::secondary)
-                .on_press(Message::CommandCorrectionDismiss),
+                .on_press(Message::CommandCorrectionDismiss(reference)),
         ]
         .spacing(6);
 
@@ -25360,6 +25390,7 @@ impl Frost {
         // Scoped to the bound pane, like the correction card above: the card
         // describes work for one pane's prompt and inserts into it.
         let session = self.ai_suggestion_bound_session()?;
+        let generation = session.generation();
 
         let header = row![
             text("AI command suggestion").size(14),
@@ -25372,7 +25403,7 @@ impl Frost {
             .style(text::secondary),
             button(text("✕").size(12))
                 .style(button::secondary)
-                .on_press(Message::AiSuggestionDismiss),
+                .on_press(Message::AiSuggestionDismiss(generation)),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -25418,7 +25449,7 @@ impl Frost {
                 card = card.push(
                     row![button(text("Stop").size(12))
                         .style(button::danger)
-                        .on_press(Message::AiSuggestionDismiss)]
+                        .on_press(Message::AiSuggestionDismiss(generation))]
                     .spacing(6),
                 );
             }
@@ -25426,8 +25457,8 @@ impl Frost {
                 card = card.push(
                     text_input("generated command", &session.draft)
                         .id(AI_SUGGESTION_INPUT_ID.clone())
-                        .on_input(Message::AiSuggestionInput)
-                        .on_submit(Message::AiSuggestionInsert)
+                        .on_input(move |draft| Message::AiSuggestionInput(generation, draft))
+                        .on_submit(Message::AiSuggestionInsert(generation))
                         .size(13)
                         .font(iced::Font::MONOSPACE),
                 );
@@ -25435,13 +25466,13 @@ impl Frost {
                     row![
                         button(text("Insert for review").size(12))
                             .style(button::primary)
-                            .on_press(Message::AiSuggestionInsert),
+                            .on_press(Message::AiSuggestionInsert(generation)),
                         button(text("Regenerate").size(12))
                             .style(button::secondary)
-                            .on_press(Message::AiSuggestionRegenerate),
+                            .on_press(Message::AiSuggestionRegenerate(generation)),
                         button(text("Dismiss").size(12))
                             .style(button::secondary)
-                            .on_press(Message::AiSuggestionDismiss),
+                            .on_press(Message::AiSuggestionDismiss(generation)),
                     ]
                     .spacing(6),
                 );
@@ -25451,10 +25482,10 @@ impl Frost {
                     row![
                         button(text("Retry").size(12))
                             .style(button::secondary)
-                            .on_press(Message::AiSuggestionRegenerate),
+                            .on_press(Message::AiSuggestionRegenerate(generation)),
                         button(text("Dismiss").size(12))
                             .style(button::secondary)
-                            .on_press(Message::AiSuggestionDismiss),
+                            .on_press(Message::AiSuggestionDismiss(generation)),
                     ]
                     .spacing(6),
                 );
@@ -26413,9 +26444,9 @@ fn run_sidebar_op(
                     }
                     Err(error) => {
                         if progress.is_some_and(|progress| progress.is_cancelled()) {
-                            // The watchdog killed this item's stream; tidy a
-                            // partial remote extraction if there is one.
-                            cleanup_after_cancel(location, hosts, &item.dst, item.is_dir);
+                            // The transport owns only its private staging.
+                            // A raced destination may belong to another actor;
+                            // cancellation never authorizes deleting that path.
                             return SidebarWorkerOutcome {
                                 location: location.clone(),
                                 warning: Some((
@@ -26455,23 +26486,6 @@ fn run_sidebar_op(
                 path_remaps,
             }
         }
-    }
-}
-
-/// Best-effort tidy-up after a cancelled transfer: local staging temps are
-/// already unlinked by the streaming paths and the probe's own trap/size
-/// re-check keeps a cancelled file upload from landing, but a cancelled
-/// directory upload may have partially extracted on the remote — remove what
-/// the transfer itself created. Failure here is silent by design: the next
-/// listing shows whatever remains.
-fn cleanup_after_cancel(
-    dst_loc: &remote_fs::FsLocation,
-    hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
-    dst: &std::path::Path,
-    is_dir: bool,
-) {
-    if is_dir && dst_loc.is_remote() {
-        let _ = remote_fs::delete(dst_loc, hosts, dst);
     }
 }
 
