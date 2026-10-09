@@ -1002,6 +1002,11 @@ impl Sidebar {
         action: NavigationHistoryAction,
     ) -> Option<DirectoryRequest> {
         if target == self.current_dir {
+            // Choosing the accepted root is still a newer navigation intent:
+            // an older candidate must not commit after this no-op selection.
+            self.pending_location_change = None;
+            self.cancel_pending_navigation();
+            self.navigation_failure = None;
             return None;
         }
         self.pending_location_change = None;
@@ -1123,6 +1128,7 @@ impl Sidebar {
             return None;
         }
         self.show_hidden = show_hidden;
+        invalidate_hidden_policy(&mut self.root, show_hidden);
         Some(self.refresh())
     }
 
@@ -1738,15 +1744,16 @@ fn collect_stale_visible_directories(
     if !visible || !node.is_dir {
         return;
     }
-    if node.state == DirectoryState::Loaded
+    // A retained snapshot with no timestamp was invalidated by a visibility
+    // policy change. An expanded unloaded node can likewise be the remnant of
+    // a cancelled old-generation scan. Both need bounded replacement work.
+    if (node.state == DirectoryState::Loaded
         && node
             .last_loaded_at
-            .is_some_and(|loaded_at| now.saturating_duration_since(loaded_at) >= stale_after)
+            .is_none_or(|loaded_at| now.saturating_duration_since(loaded_at) >= stale_after))
+        || (node.state == DirectoryState::Unloaded && node.expanded)
     {
-        candidates.push((
-            node.path.clone(),
-            node.last_loaded_at.expect("checked snapshot time"),
-        ));
+        candidates.push((node.path.clone(), node.last_loaded_at.unwrap_or(now)));
     }
     if node.expanded {
         for child in &node.children {
@@ -1842,6 +1849,34 @@ fn find_node_mut<'a>(node: &'a mut FileTreeNode, path: &Path) -> Option<&'a mut 
     node.children
         .iter_mut()
         .find_map(|child| find_node_mut(child, path))
+}
+
+/// Retain visible row identities and expansion while making every previously
+/// loaded level eligible for a new-policy scan. Hiding immediately removes
+/// dotfile rows, so a retained snapshot cannot expose an old-policy target.
+/// The normal refresh queue supplies replacement listings without recursive
+/// filesystem work on the UI thread.
+fn invalidate_hidden_policy(node: &mut FileTreeNode, show_hidden: bool) {
+    if !show_hidden {
+        node.children.retain(|child| {
+            !child
+                .path
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().first() == Some(&b'.'))
+        });
+    }
+    if matches!(
+        node.state,
+        DirectoryState::Loaded | DirectoryState::Refreshing | DirectoryState::RefreshError(_)
+    ) {
+        node.state = DirectoryState::Loaded;
+        node.last_loaded_at = None;
+    }
+    for child in &mut node.children {
+        if child.is_dir {
+            invalidate_hidden_policy(child, show_hidden);
+        }
+    }
 }
 
 /// Retire work stamped with an older tree generation without throwing away a
@@ -3835,5 +3870,213 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| matches!(item, SidebarRenderItem::Truncated { .. })));
+    }
+}
+
+#[cfg(test)]
+mod ui_policy_tests {
+    use super::*;
+    fn file(path: &str) -> FileTreeNode {
+        FileTreeNode::entry(path.rsplit('/').next().unwrap().into(), path.into(), false)
+    }
+    fn loaded(path: &str, children: Vec<FileTreeNode>) -> FileTreeNode {
+        let mut node = FileTreeNode::directory(path.into(), true);
+        node.state = DirectoryState::Loaded;
+        node.children = children;
+        node.last_loaded_at = Some(Instant::now());
+        node
+    }
+    fn panel(show_hidden: bool) -> Sidebar {
+        let deep = loaded(
+            "/fixture/nested/deep",
+            if show_hidden {
+                vec![file("/fixture/nested/deep/.deep")]
+            } else {
+                Vec::new()
+            },
+        );
+        let mut children = vec![file("/fixture/nested/visible"), deep];
+        if show_hidden {
+            children.push(file("/fixture/nested/.secret"));
+        }
+        let nested = loaded("/fixture/nested", children);
+        Sidebar {
+            current_dir: "/fixture".into(),
+            root: loaded(
+                "/fixture",
+                vec![
+                    nested,
+                    FileTreeNode::directory("/fixture/unloaded".into(), false),
+                ],
+            ),
+            home_dir: Some("/fixture".into()),
+            location: FsLocation::Local,
+            hosts: Vec::new(),
+            generation: 0,
+            next_request_id: 0,
+            active_requests: HashMap::new(),
+            show_hidden,
+            pending_navigation: None,
+            pending_location_change: None,
+            navigation_failure: None,
+            back_history: VecDeque::new(),
+            forward_history: VecDeque::new(),
+            cached_roots: VecDeque::new(),
+        }
+    }
+    fn root_result(request: DirectoryRequest) -> DirectoryResult {
+        DirectoryResult {
+            generation: request.generation,
+            request_id: request.request_id,
+            path: request.path,
+            truncated: false,
+            entries: Ok(vec![
+                FileTreeNode::directory("/fixture/nested".into(), false),
+                FileTreeNode::directory("/fixture/unloaded".into(), false),
+            ]),
+        }
+    }
+    #[test]
+    fn hiding_removes_nested_dotfiles_before_and_after_root_reply() {
+        let mut sidebar = panel(true);
+        let request = sidebar.set_show_hidden(false).unwrap();
+        assert!(
+            !sidebar.contains_path(Path::new("/fixture/nested/.secret")),
+            "old hidden descendants must not remain actionable under the new policy"
+        );
+        assert!(!sidebar.contains_path(Path::new("/fixture/nested/deep/.deep")));
+        assert!(sidebar.apply_load(root_result(request)));
+        assert!(!collect_sidebar_render_items(&sidebar.root, None)
+            .iter()
+            .any(|row| row.node_path() == Some(Path::new("/fixture/nested/.secret"))));
+        assert!(sidebar.contains_path(Path::new("/fixture/nested/visible")));
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/nested")));
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/nested/deep")));
+    }
+    #[test]
+    fn enabling_reloads_loaded_descendants_preserving_expansion_and_paths() {
+        let mut sidebar = panel(false);
+        let request = sidebar.set_show_hidden(true).unwrap();
+        assert!(sidebar.apply_load(root_result(request)));
+        let requests = sidebar.refresh_stale_visible(Instant::now(), Duration::from_secs(60), 8);
+        let paths: BTreeSet<_> = requests.iter().map(|r| r.path.clone()).collect();
+        assert!(
+            paths.contains(Path::new("/fixture/nested")),
+            "cached descendants need a new-policy listing without waiting 60 seconds"
+        );
+        assert!(paths.contains(Path::new("/fixture/nested/deep")));
+        assert!(!paths.contains(Path::new("/fixture/unloaded")));
+        assert!(requests.iter().all(|r| r.show_hidden));
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/nested")));
+        assert!(sidebar.contains_path(Path::new("/fixture/nested/visible")));
+    }
+    #[test]
+    fn cancelled_expanded_unloaded_directory_is_requeued_under_new_policy() {
+        let mut sidebar = panel(false);
+        let request = sidebar.expand_node(Path::new("/fixture/unloaded")).unwrap();
+        let root = sidebar.set_show_hidden(true).unwrap();
+        assert!(request.cancellation.is_cancelled());
+        assert!(sidebar.apply_load(root_result(root)));
+        let requests = sidebar.refresh_stale_visible(Instant::now(), Duration::from_secs(60), 8);
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.path == Path::new("/fixture/unloaded")),
+            "expanded directory whose old-policy scan was retired must be reloadable"
+        );
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/unloaded")));
+    }
+    #[test]
+    fn old_policy_root_and_nested_results_cannot_repopulate_new_policy() {
+        let mut sidebar = panel(true);
+        let old_root = sidebar.refresh();
+        let old_nested = sidebar
+            .refresh_directory(Path::new("/fixture/nested"))
+            .unwrap();
+        let new_root = sidebar.set_show_hidden(false).unwrap();
+        assert!(old_root.cancellation.is_cancelled());
+        assert!(old_nested.cancellation.is_cancelled());
+        assert!(!sidebar.apply_load(root_result(old_root)));
+        assert!(!sidebar.apply_load(DirectoryResult {
+            generation: old_nested.generation,
+            request_id: old_nested.request_id,
+            path: old_nested.path,
+            entries: Ok(vec![file("/fixture/nested/.late")]),
+            truncated: false
+        }));
+        assert!(sidebar.apply_load(root_result(new_root)));
+        assert!(!sidebar.contains_path(Path::new("/fixture/nested/.late")));
+    }
+    #[test]
+    fn root_only_policy_change_and_same_policy_noop_remain_bounded() {
+        let mut sidebar = panel(false);
+        sidebar.root.children.clear();
+        assert!(sidebar.set_show_hidden(false).is_none());
+        let request = sidebar.set_show_hidden(true).unwrap();
+        assert_eq!(sidebar.active_requests.len(), 1);
+        assert!(sidebar.apply_load(DirectoryResult {
+            generation: request.generation,
+            request_id: request.request_id,
+            path: request.path,
+            entries: Ok(vec![file("/fixture/.root")]),
+            truncated: false
+        }));
+        assert!(sidebar.contains_path(Path::new("/fixture/.root")));
+        assert!(sidebar
+            .refresh_stale_visible(Instant::now(), Duration::from_secs(60), 8)
+            .is_empty());
+    }
+    #[test]
+    fn selecting_current_root_cancels_the_older_pending_navigation() {
+        let mut sidebar = panel(false);
+        let old = sidebar.begin_navigation("/elsewhere".into()).unwrap();
+        assert!(sidebar.begin_navigation("/fixture".into()).is_none());
+        assert!(
+            old.cancellation.is_cancelled(),
+            "newer accepted-root intent must retire the older candidate"
+        );
+        assert!(sidebar.navigation_pending_target().is_none());
+        assert!(!sidebar.apply_load(root_result(old)));
+        assert_eq!(sidebar.current_dir, Path::new("/fixture"));
+    }
+    #[test]
+    fn new_policy_nested_listing_reconciles_preserved_directory_identities() {
+        let mut sidebar = panel(false);
+        let root = sidebar.set_show_hidden(true).unwrap();
+        assert!(sidebar.apply_load(root_result(root)));
+        let requests = sidebar.refresh_stale_visible(Instant::now(), Duration::from_secs(60), 8);
+        let nested = requests
+            .into_iter()
+            .find(|r| r.path == Path::new("/fixture/nested"))
+            .expect("new-policy nested request");
+        assert!(sidebar.apply_load(DirectoryResult {
+            generation: nested.generation,
+            request_id: nested.request_id,
+            path: nested.path,
+            entries: Ok(vec![
+                file("/fixture/nested/.secret"),
+                file("/fixture/nested/visible"),
+                FileTreeNode::directory("/fixture/nested/deep".into(), false)
+            ]),
+            truncated: false,
+        }));
+        assert!(sidebar.contains_path(Path::new("/fixture/nested/.secret")));
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/nested/deep")));
+        let root = sidebar.set_show_hidden(false).unwrap();
+        assert!(!sidebar.contains_path(Path::new("/fixture/nested/.secret")));
+        assert!(sidebar.apply_load(root_result(root)));
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/nested/deep")));
+    }
+    #[test]
+    fn same_current_root_cancels_pending_location_probe_without_replacing_tree() {
+        let mut sidebar = panel(false);
+        let generation = sidebar.begin_location_change(FsLocation::Remote(0));
+        assert!(sidebar.begin_navigation("/fixture".into()).is_none());
+        assert!(!sidebar.location_change_pending());
+        assert!(sidebar
+            .resolve_location(generation, Ok("/remote".into()))
+            .is_none());
+        assert_eq!(sidebar.current_dir, Path::new("/fixture"));
+        assert!(sidebar.node_is_expanded(Path::new("/fixture/nested")));
     }
 }

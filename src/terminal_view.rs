@@ -611,6 +611,18 @@ impl Default for State {
     }
 }
 
+impl State {
+    /// Focus loss can swallow the release that ends a gesture. Retire every
+    /// widget-local owner before handling later mouse events in a surviving tree.
+    fn reset_on_unfocused(&mut self, event: &Event) -> bool {
+        if !matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+            return false;
+        }
+        *self = Self::default();
+        true
+    }
+}
+
 fn owns_mouse_release(
     published_presses: &[bool; 3],
     dragging: bool,
@@ -1970,6 +1982,11 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        // Do not capture focus changes: sibling widgets also need to retire
+        // their gestures. This precedes IME and absent-callback early exits.
+        if tree.state.downcast_mut::<State>().reset_on_unfocused(event) {
+            return;
+        }
         let bounds = layout.bounds();
 
         // Keep the input method enabled and positioned at the text cursor while
@@ -3216,5 +3233,66 @@ where
 {
     fn from(w: TermWidget<'a, Message>) -> Self {
         Element::new(w)
+    }
+}
+
+#[cfg(test)]
+mod focus_state_tests {
+    use super::*;
+
+    #[test]
+    fn unfocused_resets_all_widget_local_input_ownership() {
+        let mut state = State {
+            dragging: true,
+            scrollbar_dragging: true,
+            published_presses: [true; 3],
+            consumed_presses: [true; 3],
+            last_click: Some((Instant::now(), 3, 2)),
+            click_count: 3,
+            scroll_accum: 0.75,
+            summary_press: None,
+        };
+        assert!(state.reset_on_unfocused(&Event::Window(iced::window::Event::Unfocused)));
+        assert!(!state.dragging);
+        assert!(!state.scrollbar_dragging);
+        assert_eq!(state.published_presses, [false; 3]);
+        assert_eq!(state.consumed_presses, [false; 3]);
+        assert!(state.last_click.is_none());
+        assert_eq!(state.click_count, 0);
+        assert_eq!(state.scroll_accum, 0.0);
+        assert!(state.summary_press.is_none());
+        assert!(state.reset_on_unfocused(&Event::Window(iced::window::Event::Unfocused)));
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            assert!(!owns_mouse_release(
+                &state.published_presses,
+                state.dragging,
+                state.scrollbar_dragging,
+                button
+            ));
+        }
+    }
+
+    #[test]
+    fn other_window_and_mouse_events_do_not_reset_a_continuous_gesture() {
+        let mut state = State {
+            dragging: true,
+            published_presses: [true, false, false],
+            click_count: 2,
+            scroll_accum: 0.5,
+            ..State::default()
+        };
+        for event in [
+            Event::Window(iced::window::Event::Focused),
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(20.0, 30.0),
+            }),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ] {
+            assert!(!state.reset_on_unfocused(&event));
+            assert!(state.dragging);
+            assert!(state.published_presses[MouseButton::Left.slot()]);
+            assert_eq!(state.click_count, 2);
+            assert_eq!(state.scroll_accum, 0.5);
+        }
     }
 }

@@ -2809,6 +2809,42 @@ fn chrome_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Optio
     }
 }
 
+/// The visible list and its selection belong to one opening of the picker.
+/// A callback retains the allocation, so an older opening's identity cannot be
+/// reused while that callback still exists.
+struct RemotePickerState {
+    identity: std::sync::Arc<()>,
+    hosts: Vec<jterm_core::jsh_remote::RemoteHostConfig>,
+    selected: usize,
+}
+
+impl RemotePickerState {
+    fn new(hosts: &[jterm_core::jsh_remote::RemoteHostConfig]) -> Self {
+        Self {
+            identity: std::sync::Arc::new(()),
+            hosts: hosts.to_vec(),
+            selected: first_runnable_remote_index(hosts).unwrap_or(0),
+        }
+    }
+}
+
+/// A selection must still belong to this opening and identify one validated
+/// profile in both the displayed snapshot and current config. Reordering is
+/// safe; removal, edits, duplicates, and inactive entries fail closed.
+fn remote_picker_target_index(
+    picker: Option<&RemotePickerState>,
+    identity: &std::sync::Arc<()>,
+    profile: &jterm_core::jsh_remote::RemoteHostConfig,
+    current_hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
+) -> Option<usize> {
+    let picker = picker?;
+    if !std::sync::Arc::ptr_eq(&picker.identity, identity) {
+        return None;
+    }
+    unique_active_remote_profile_index(&picker.hosts, profile)?;
+    unique_active_remote_profile_index(current_hosts, profile)
+}
+
 fn first_runnable_remote_index(
     hosts: &[jterm_core::jsh_remote::RemoteHostConfig],
 ) -> Option<usize> {
@@ -3486,7 +3522,10 @@ enum Message {
     /// Close the remote host picker overlay.
     RemotePickerClose,
     /// Open the picked `[[remote_hosts]]` entry in a new session.
-    RemotePickerConnect(usize),
+    RemotePickerConnect(
+        std::sync::Arc<()>,
+        Box<jterm_core::jsh_remote::RemoteHostConfig>,
+    ),
     /// Per-field edits of the indexed `[[remote_hosts]]` entry from Settings.
     RemoteHostName(usize, String),
     RemoteHostHost(usize, String),
@@ -5143,8 +5182,8 @@ struct Frost {
     /// tab labels lets the user jump by typing. Field holds the typed query
     /// and current selection index.
     tab_switcher: Option<TabSwitcherState>,
-    /// Remote host picker overlay: `Some(selected index)` while open.
-    remote_picker: Option<usize>,
+    /// Remote host picker: one opening identity, profile snapshot and selection.
+    remote_picker: Option<RemotePickerState>,
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
@@ -6228,9 +6267,6 @@ impl Frost {
     }
 
     fn navigate_sidebar_to(&mut self, path: std::path::PathBuf) -> Task<Message> {
-        if path == self.sidebar.current_dir {
-            return Task::none();
-        }
         self.invalidate_sidebar_remote_follow_intent();
         self.sidebar
             .begin_navigation(path)
@@ -9099,8 +9135,7 @@ impl Frost {
                 if self.remote_picker.is_some() {
                     self.remote_picker = None;
                 } else {
-                    self.remote_picker =
-                        Some(first_runnable_remote_index(&self.config.remote_hosts).unwrap_or(0));
+                    self.remote_picker = Some(RemotePickerState::new(&self.config.remote_hosts));
                 }
                 Some(Task::none())
             }
@@ -9131,38 +9166,36 @@ impl Frost {
             self.remote_picker = None;
             return Some(Task::none());
         }
-        let count = self
-            .config
-            .remote_hosts
-            .len()
-            .min(config::MAX_REMOTE_HOST_UI_ROWS);
-        let selected = self.remote_picker.as_mut()?;
+        let state = self.remote_picker.as_mut()?;
+        let count = state.hosts.len().min(config::MAX_REMOTE_HOST_UI_ROWS);
         match key {
             Key::Named(Named::Escape) => {
                 self.remote_picker = None;
                 Some(Task::none())
             }
             Key::Named(Named::Enter) => {
-                let index = *selected;
-                self.remote_picker = None;
-                if index < count {
-                    self.connect_remote_host(index);
-                }
-                Some(Task::none())
+                let profile = state.hosts.get(state.selected).cloned();
+                let identity = state.identity.clone();
+                Some(match profile {
+                    Some(profile) => {
+                        self.update(Message::RemotePickerConnect(identity, Box::new(profile)))
+                    }
+                    None => {
+                        self.remote_picker = None;
+                        Task::none()
+                    }
+                })
             }
             Key::Named(Named::ArrowDown) if count > 0 => {
-                if let Some(next) =
-                    next_runnable_remote_index(&self.config.remote_hosts, *selected, true)
-                {
-                    *selected = next;
+                if let Some(next) = next_runnable_remote_index(&state.hosts, state.selected, true) {
+                    state.selected = next;
                 }
                 Some(Task::none())
             }
             Key::Named(Named::ArrowUp) if count > 0 => {
-                if let Some(next) =
-                    next_runnable_remote_index(&self.config.remote_hosts, *selected, false)
+                if let Some(next) = next_runnable_remote_index(&state.hosts, state.selected, false)
                 {
-                    *selected = next;
+                    state.selected = next;
                 }
                 Some(Task::none())
             }
@@ -13681,7 +13714,15 @@ impl Frost {
             }
             Message::JshInstall => self.install_or_update_jsh(),
             Message::RemotePickerClose => self.remote_picker = None,
-            Message::RemotePickerConnect(index) => {
+            Message::RemotePickerConnect(identity, profile) => {
+                let Some(index) = remote_picker_target_index(
+                    self.remote_picker.as_ref(),
+                    &identity,
+                    &profile,
+                    &self.config.remote_hosts,
+                ) else {
+                    return Task::none();
+                };
                 self.remote_picker = None;
                 self.connect_remote_host(index);
             }
@@ -17872,9 +17913,9 @@ impl Frost {
     /// in a new session; a host that fails validation is shown with its
     /// reason rather than hidden, so a config typo is discovered here and not
     /// by its absence.
-    fn remote_picker_view(&self, selected: usize) -> Element<'_, Message> {
+    fn remote_picker_view(&self, state: &RemotePickerState) -> Element<'_, Message> {
         let mut list = column![].spacing(2);
-        if self.config.remote_hosts.is_empty() {
+        if state.hosts.is_empty() {
             list = list.push(
                 text(
                     "No [[remote_hosts]] configured. Add one in Settings (Ctrl+Shift+O, Remote hosts) or in config.toml:\n\n[[remote_hosts]]  # ssh\nname = \"dev\"\nhost = \"dev.example.com\"\nuser = \"yj\"\ndeploy = \"persist\"\nssh_args = [\"-p\", \"22\"]\n\n[[remote_hosts]]  # running container\nname = \"myubuntu\"\nhost = \"myubuntu\"\ndocker = true\ndeploy = \"persist\"",
@@ -17883,14 +17924,13 @@ impl Frost {
                 .style(text::secondary),
             );
         }
-        for (index, host) in self
-            .config
-            .remote_hosts
+        for (index, host) in state
+            .hosts
             .iter()
             .take(config::MAX_REMOTE_HOST_UI_ROWS)
             .enumerate()
         {
-            let validation = config::validate_remote_host_at(&self.config.remote_hosts, index);
+            let validation = config::validate_remote_host_at(&state.hosts, index);
             let transport = if host.docker { "docker" } else { "ssh" };
             let deploy = if host.deploy.is_empty() {
                 "off"
@@ -17914,7 +17954,7 @@ impl Frost {
                     .spacing(10)
                     .align_y(iced::Alignment::Center);
                     let accent = self.c_accent();
-                    let highlighted = index == selected;
+                    let highlighted = index == state.selected;
                     let body = container(info).width(Length::Fill).padding([3, 8]).style(
                         move |_t: &iced::Theme| container::Style {
                             background: if highlighted {
@@ -17929,8 +17969,10 @@ impl Frost {
                             ..Default::default()
                         },
                     );
-                    list =
-                        list.push(mouse_area(body).on_press(Message::RemotePickerConnect(index)));
+                    list = list.push(mouse_area(body).on_press(Message::RemotePickerConnect(
+                        state.identity.clone(),
+                        Box::new(host.clone()),
+                    )));
                 }
                 Err(problem) => {
                     list = list.push(
@@ -17945,11 +17987,11 @@ impl Frost {
                 }
             }
         }
-        if self.config.remote_hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
+        if state.hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
             list = list.push(
                 text(format!(
                     "{} additional drafts remain saved but are omitted from this bounded view.",
-                    self.config.remote_hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS
+                    state.hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS
                 ))
                 .size(11)
                 .style(text::secondary),
@@ -21635,8 +21677,8 @@ impl Frost {
         } else {
             root
         };
-        let root: Element<'_, Message> = if let Some(selected) = self.remote_picker {
-            stack![root, self.remote_picker_view(selected)].into()
+        let root: Element<'_, Message> = if let Some(state) = self.remote_picker.as_ref() {
+            stack![root, self.remote_picker_view(state)].into()
         } else {
             root
         };
@@ -34146,5 +34188,125 @@ mod tests {
         let missing = plan_drop(vec![root.join("missing")], root.join("target"), false).unwrap();
         assert!(missing.items[0].error.is_some());
         assert!(plan_drop_with_caps(vec![source], root.join("target"), false, 1, 2).is_err());
+    }
+    #[test]
+    fn remote_picker_snapshot_rebinds_only_a_unique_unchanged_profile() {
+        let a = sidebar_remote_profile("A", "a.example.test");
+        let b = sidebar_remote_profile("B", "b.example.test");
+        let picker = RemotePickerState::new(&[a.clone(), b.clone()]);
+        let reordered = vec![b.clone(), a.clone()];
+        assert_eq!(
+            remote_picker_target_index(Some(&picker), &picker.identity, &a, &reordered),
+            Some(1)
+        );
+        assert_eq!(
+            picker.hosts[picker.selected], a,
+            "the displayed selection stays on A"
+        );
+        let mut changed = a.clone();
+        changed.host = "changed.example.test".into();
+        for current in [
+            vec![changed, b.clone()],
+            vec![b.clone()],
+            vec![a.clone(), b, a.clone()],
+        ] {
+            assert_eq!(
+                remote_picker_target_index(Some(&picker), &picker.identity, &a, &current),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn remote_picker_dismissal_and_reopening_retire_callback_identity() {
+        let a = sidebar_remote_profile("A", "a.example.test");
+        let hosts = vec![a.clone()];
+        let old = RemotePickerState::new(&hosts);
+        let identity = old.identity.clone();
+        drop(old);
+        assert_eq!(
+            remote_picker_target_index(None, &identity, &a, &hosts),
+            None
+        );
+        let new = RemotePickerState::new(&hosts);
+        assert_eq!(
+            remote_picker_target_index(Some(&new), &identity, &a, &hosts),
+            None
+        );
+        assert_eq!(
+            remote_picker_target_index(Some(&new), &new.identity, &a, &hosts),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn remote_picker_snapshot_and_current_active_limits_both_apply() {
+        let a = sidebar_remote_profile("A", "a.example.test");
+        let b = sidebar_remote_profile("B", "b.example.test");
+        let picker = RemotePickerState::new(std::slice::from_ref(&a));
+        let mut inactive = vec![b.clone(); config::MAX_REMOTE_HOSTS];
+        inactive.push(a.clone());
+        assert_eq!(
+            remote_picker_target_index(Some(&picker), &picker.identity, &a, &inactive),
+            None
+        );
+        assert_eq!(
+            remote_picker_target_index(
+                Some(&picker),
+                &picker.identity,
+                &b,
+                std::slice::from_ref(&b)
+            ),
+            None
+        );
+        let duplicate = RemotePickerState::new(&[a.clone(), a.clone()]);
+        assert_eq!(
+            remote_picker_target_index(
+                Some(&duplicate),
+                &duplicate.identity,
+                &a,
+                std::slice::from_ref(&a)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_picker_keyboard_rows_and_dispatch_share_snapshot_identity() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let key = source
+            .split_once("    fn handle_remote_picker_key(")
+            .unwrap()
+            .1
+            .split_once("    /// Open a `[[remote_hosts]]` destination")
+            .unwrap()
+            .0;
+        assert!(key.contains("state.hosts.get(state.selected).cloned()"));
+        assert!(key.contains("let identity = state.identity.clone();"));
+        assert!(key.contains("self.update(Message::RemotePickerConnect("));
+        assert!(!key.contains("self.config.remote_hosts"));
+        let view = source
+            .split_once("    fn remote_picker_view(")
+            .unwrap()
+            .1
+            .split_once("\n    fn ")
+            .unwrap()
+            .0;
+        assert!(view.contains("state.identity.clone()"));
+        assert!(view.contains("Box::new(host.clone())"));
+        assert!(view.contains("config::validate_remote_host_at(&state.hosts, index)"));
+        assert!(!view.contains("self.config.remote_hosts"));
+        let callback = source
+            .split_once("            Message::RemotePickerConnect(identity, profile) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::RemoteHostName(")
+            .unwrap()
+            .0;
+        assert!(
+            callback.find("remote_picker_target_index(").unwrap()
+                < callback.find("self.connect_remote_host(index)").unwrap()
+        );
+        assert!(callback.contains("return Task::none();"));
     }
 }
