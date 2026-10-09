@@ -5500,6 +5500,7 @@ impl TerminalState {
         if count == 0 {
             return;
         }
+        self.rebase_raw_selection_after_prefix_trim(count);
         // Rows the cap (or any other trim) already dropped are rows a deferred
         // ED 3 must no longer count, or settling it would eat live content.
         self.pending_saved_line_purge = self.pending_saved_line_purge.saturating_sub(count);
@@ -5570,6 +5571,10 @@ impl TerminalState {
     fn on_scrollback_rows_inserted(&mut self, count: usize) {
         if count == 0 {
             return;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            selection.anchor.0 = selection.anchor.0.saturating_add(count);
+            selection.active.0 = selection.active.0.saturating_add(count);
         }
         // Rows coming back must not be netted against a trim the zones have
         // not been rebased for yet; the two shifts are over different anchors.
@@ -7356,11 +7361,25 @@ impl TerminalState {
         }
 
         let before = self.scrollback_pushes;
+        let old_grid_base = self.scrollback.len();
+        // Snapshot rows are copies, so live-grid endpoints must not inherit
+        // the prefix-eviction shift used when real rows move into history.
+        let selection = self.selection.take();
         for row in first..=last {
             let line = ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
             self.push_scrollback_compressed_with_options(line, allow_alt_buffer);
         }
-        self.scrollback_pushes.wrapping_sub(before) as usize
+        let appended = self.scrollback_pushes.wrapping_sub(before) as usize;
+        self.selection = selection;
+        let removed_prefix = old_grid_base
+            .saturating_add(appended)
+            .saturating_sub(self.scrollback.len());
+        self.rebase_raw_selection_for_grid_base_change(
+            old_grid_base,
+            self.scrollback.len(),
+            removed_prefix,
+        );
+        appended
     }
 
     /// One synchronized frame of a full-screen app, kept scrollable.
@@ -7389,12 +7408,10 @@ impl TerminalState {
         if snapshot == self.last_archived_screen_snapshot {
             return;
         }
-        let old_grid_base = self.scrollback.len();
         self.retire_provisional_alt_snapshot();
         let appended = self.archive_visible_screen_to_scrollback_with_options(true, true);
         self.provisional_alt_snapshot =
             (appended > 0).then_some((appended, self.scrollback_pushes));
-        self.rebase_raw_selection_for_grid_base_change(old_grid_base, self.scrollback.len());
     }
 
     /// Synchronized alternate-screen frames are copied into (and superseded
@@ -7402,19 +7419,52 @@ impl TerminalState {
     /// absolute `scrollback + grid` coordinates, so a changing snapshot height
     /// must move live-grid anchors with the grid base. Codex does this on every
     /// repaint.
-    fn rebase_raw_selection_for_grid_base_change(&mut self, old_base: usize, new_base: usize) {
-        let Some(selection) = self.selection.as_mut() else {
+    fn rebase_raw_selection_for_grid_base_change(
+        &mut self,
+        old_base: usize,
+        new_base: usize,
+        removed_prefix: usize,
+    ) {
+        let Some(mut selection) = self.selection else {
             return;
         };
         for point in [&mut selection.anchor, &mut selection.active] {
             if point.0 < old_base {
-                continue;
-            }
-            point.0 = if new_base >= old_base {
-                point.0.saturating_add(new_base - old_base)
+                // A copied screen can evict old history; a retired snapshot
+                // can remove its tail. Neither may retarget a lost endpoint.
+                let Some(row) = point
+                    .0
+                    .checked_sub(removed_prefix)
+                    .filter(|row| *row < new_base)
+                else {
+                    self.selection = None;
+                    return;
+                };
+                point.0 = row;
             } else {
-                point.0.saturating_sub(old_base - new_base)
-            };
+                point.0 = new_base.saturating_add(point.0 - old_base);
+            }
+        }
+        self.selection = Some(selection);
+    }
+
+    fn rebase_raw_selection_after_prefix_trim(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some(mut selection) = self.selection else {
+            return;
+        };
+        match (
+            selection.anchor.0.checked_sub(count),
+            selection.active.0.checked_sub(count),
+        ) {
+            (Some(anchor), Some(active)) => {
+                selection.anchor.0 = anchor;
+                selection.active.0 = active;
+                self.selection = Some(selection);
+            }
+            _ => self.selection = None,
         }
     }
 
@@ -7432,7 +7482,9 @@ impl TerminalState {
         if rows == 0 {
             return;
         }
-        self.scrollback.truncate(self.scrollback.len() - rows);
+        let old_grid_base = self.scrollback.len();
+        self.scrollback.truncate(old_grid_base - rows);
+        self.rebase_raw_selection_for_grid_base_change(old_grid_base, self.scrollback.len(), 0);
         self.bump_history_revision();
     }
 
@@ -20849,5 +20901,168 @@ mod tests {
             .get_placements()
             .iter()
             .all(|placement| placement.image_id == 52));
+    }
+
+    #[test]
+    fn raw_selection_tracks_prefix_eviction_and_limit_shrink() {
+        for shrink in [false, true] {
+            let mut terminal = TerminalState::new(8, 2);
+            terminal.set_max_scrollback(2);
+            terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+            terminal.select_word_at(0, 1);
+            assert_eq!(terminal.copy_selection().as_deref(), Some("three"));
+            if shrink {
+                terminal.set_max_scrollback(1);
+            } else {
+                terminal.process_input(b"\r\nfive");
+            }
+            assert_eq!(terminal.copy_selection().as_deref(), Some("three"));
+        }
+    }
+
+    #[test]
+    fn raw_history_selection_is_rebased_or_cleared_when_its_endpoint_is_evicted() {
+        for (viewport_row, expected) in [(0, None), (1, Some("two"))] {
+            let mut terminal = TerminalState::new(8, 2);
+            terminal.set_max_scrollback(2);
+            terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+            terminal.scroll(2);
+            terminal.select_word_at(viewport_row, 1);
+            terminal.process_input(b"\r\nfive");
+            assert_eq!(terminal.copy_selection().as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn raw_selection_keeps_reverse_rectangle_coordinates_during_prefix_trim() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_max_scrollback(2);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.start_selection_with_mode((1, 2), super::SelectionMode::Block);
+        terminal.update_selection((0, 0));
+        let before = terminal.copy_selection();
+        assert_eq!(before.as_deref(), Some("thr\nfou"));
+        terminal.process_input(b"\r\nfive");
+        assert_eq!(terminal.copy_selection(), before);
+    }
+
+    #[test]
+    fn raw_snapshot_copy_rebases_history_and_keeps_the_live_grid_selected() {
+        for history in [false, true] {
+            let mut terminal = TerminalState::new(8, 2);
+            terminal.set_max_scrollback(3);
+            terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+            if history {
+                terminal.scroll(2);
+                terminal.select_word_at(1, 1);
+                assert_eq!(terminal.copy_selection().as_deref(), Some("two"));
+            } else {
+                terminal.select_word_at(0, 1);
+                assert_eq!(terminal.copy_selection().as_deref(), Some("three"));
+            }
+            let before = terminal.copy_selection();
+            terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+            assert_eq!(terminal.copy_selection(), before);
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_copy_clears_an_evicted_history_endpoint() {
+        let mut terminal = TerminalState::new(8, 2);
+        terminal.set_max_scrollback(2);
+        terminal.process_input(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.scroll(2);
+        terminal.select_word_at(1, 1);
+        assert_eq!(terminal.copy_selection().as_deref(), Some("two"));
+        terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+        assert_eq!(terminal.copy_selection(), None);
+    }
+
+    #[test]
+    fn raw_selection_after_clear_tracks_rows_prepended_by_undo() {
+        for cap in [2, 100] {
+            let mut terminal = TerminalState::new(16, 4);
+            terminal.set_max_scrollback(cap);
+            emit_zone(&mut terminal, 0);
+            assert_eq!(terminal.clear_completed_blocks(), 1);
+            terminal.process_input(b"newword");
+            terminal.select_word_at(terminal.cursor_row, 1);
+            assert_eq!(terminal.copy_selection().as_deref(), Some("newword"));
+            assert_eq!(terminal.undo_clear_completed_blocks(), 1);
+            assert_eq!(terminal.copy_selection().as_deref(), Some("newword"));
+        }
+    }
+
+    #[test]
+    fn retiring_a_snapshot_clears_endpoints_in_its_removed_history_tail() {
+        let mut terminal = TerminalState::new(12, 3);
+        terminal.process_input(b"\x1b[?1049h\x1b[?2026hfirst\r\nsecond\x1b[?2026l");
+        assert!(terminal.provisional_alt_snapshot.is_some());
+        terminal.select_text((0, 0), (0, 4));
+        assert_eq!(terminal.copy_selection().as_deref(), Some("first"));
+        terminal.retire_provisional_alt_snapshot();
+        assert_eq!(terminal.copy_selection(), None);
+    }
+
+    #[test]
+    fn raw_selection_retention_matrix_covers_small_caps_and_both_directions() {
+        for cap in [0, 1, 2] {
+            for reverse in [false, true] {
+                for rectangular in [false, true] {
+                    for change in ["scroll", "copy", "shrink"] {
+                        let mut terminal = TerminalState::new(8, 3);
+                        terminal.set_max_scrollback(cap);
+                        terminal.process_input(b"aaa\r\nbbb\r\nccc\r\nddd\r\neee\r\nfff");
+                        let (anchor, active) = if reverse {
+                            ((1, 2), (0, 0))
+                        } else {
+                            ((0, 0), (1, 2))
+                        };
+                        let mode = if rectangular {
+                            super::SelectionMode::Block
+                        } else {
+                            super::SelectionMode::Normal
+                        };
+                        terminal.start_selection_with_mode(anchor, mode);
+                        terminal.update_selection(active);
+                        let before = terminal.copy_selection();
+                        assert!(before
+                            .as_ref()
+                            .is_some_and(|text| text.contains("ddd") && text.contains("eee")));
+                        match change {
+                            "scroll" => terminal.process_input(b"\r\nggg"),
+                            "copy" => {
+                                terminal.archive_visible_screen_to_scrollback_with_options(
+                                    false, false,
+                                );
+                            }
+                            "shrink" => terminal.set_max_scrollback(0),
+                            _ => unreachable!(),
+                        }
+                        assert_eq!(
+                            terminal.copy_selection(),
+                            before,
+                            "cap={cap} reverse={reverse} rectangular={rectangular} change={change}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_copy_refuses_alt_buffer_without_rebasing_selection() {
+        let mut terminal = TerminalState::new(8, 3);
+        terminal.set_max_scrollback(0);
+        terminal.process_input(b"\x1b[?1049haaa\r\nbbb");
+        terminal.start_selection_with_mode((0, 0), super::SelectionMode::Normal);
+        terminal.update_selection((1, 2));
+        let before = terminal.copy_selection();
+        let selection = terminal.selection;
+        let history = terminal.scrollback_len();
+        terminal.archive_visible_screen_to_scrollback_with_options(false, false);
+        assert_eq!(terminal.scrollback_len(), history);
+        assert_eq!(terminal.selection, selection);
+        assert_eq!(terminal.copy_selection(), before);
     }
 }

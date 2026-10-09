@@ -665,21 +665,55 @@ impl KeyBindings {
 
     /// Merge user TOML over defaults while retaining every valid entry. Invalid
     /// bindings are diagnosed individually instead of discarding the entire
-    /// custom table.
+    /// custom table. Shared unbind tokens remove a chord. Conflicting aliases
+    /// of one chord retain its default (or leave it unbound when no default
+    /// exists), rather than choosing a command in random HashMap order.
     pub fn from_toml_with_diagnostics(content: &str) -> Result<KeyBindingsLoad, toml::de::Error> {
         let mut bindings = Self::default_bindings();
         let mut diagnostics = Vec::new();
         let user_bindings: KeyBindings = toml::from_str(content)?;
-        for (key, value) in user_bindings.bindings {
+        let mut entries: Vec<_> = user_bindings.bindings.into_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut parsed: HashMap<String, (String, Option<String>, bool)> = HashMap::new();
+        for (key, value) in entries {
             let Some(canonical) = KeyBinding::canonical(&key) else {
                 diagnostics.push(format!("Invalid shortcut \"{key}\""));
                 continue;
             };
-            if let Err(error) = value.parse::<Command>() {
-                diagnostics.push(format!("Invalid command for \"{key}\": {error}"));
+            let command = if jterm_core::keybindings::is_unbind_token(&value) {
+                None
+            } else {
+                match value.parse::<Command>() {
+                    Ok(command) => Some(command.to_string()),
+                    Err(error) => {
+                        diagnostics.push(format!("Invalid command for \"{key}\": {error}"));
+                        continue;
+                    }
+                }
+            };
+            if let Some((previous_key, previous_command, conflicted)) = parsed.get_mut(&canonical) {
+                if *previous_command != command {
+                    *conflicted = true;
+                    diagnostics.push(format!(
+                        "Conflicting shortcuts \"{previous_key}\" and \"{key}\" normalize to \"{canonical}\"; keeping its default binding"
+                    ));
+                }
+            } else {
+                parsed.insert(canonical, (key, command, false));
+            }
+        }
+        for (canonical, (_, command, conflicted)) in parsed {
+            if conflicted {
                 continue;
             }
-            bindings.bindings.insert(canonical, value);
+            match command {
+                Some(command) => {
+                    bindings.bindings.insert(canonical, command);
+                }
+                None => {
+                    bindings.bindings.remove(&canonical);
+                }
+            }
         }
         Ok(KeyBindingsLoad {
             bindings,
@@ -1127,6 +1161,113 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("Invalid shortcut")));
+    }
+
+    #[test]
+    fn conflicting_normalized_aliases_are_deterministic_and_keep_defaults() {
+        let content = r#"
+"ctrl+shift+t" = "session:close"
+"Shift+Control+T" = "edit:copy"
+"Ctrl+F8" = "edit:paste"
+"control+f8" = "session:new"
+"f9" = "edit:copy"
+"#;
+        let expected_diagnostics = KeyBindings::from_toml_with_diagnostics(content)
+            .unwrap()
+            .diagnostics;
+        assert_eq!(expected_diagnostics.len(), 2);
+        assert!(expected_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.contains("Conflicting shortcuts")));
+        for _ in 0..256 {
+            let loaded = KeyBindings::from_toml_with_diagnostics(content).unwrap();
+            assert!(loaded.usable);
+            assert_eq!(loaded.diagnostics, expected_diagnostics);
+            assert_eq!(
+                loaded.bindings.get_command("ctrl+shift+t"),
+                Some(Command::SessionNew)
+            );
+            assert_eq!(loaded.bindings.get_command("ctrl+f8"), None);
+            assert_eq!(loaded.bindings.get_command("f9"), Some(Command::EditCopy));
+        }
+    }
+
+    #[test]
+    fn shared_unbind_tokens_remove_defaults_and_reload_can_restore_them() {
+        for token in ["", "false", "none", "disabled", "unbind", " UnBiNd "] {
+            let content = format!("\"Shift+Control+T\" = {token:?}\n");
+            let loaded = KeyBindings::from_toml_with_diagnostics(&content).unwrap();
+            assert!(loaded.usable);
+            assert!(loaded.diagnostics.is_empty(), "{token:?}");
+            assert_eq!(loaded.bindings.get_command("ctrl+shift+t"), None);
+            assert_eq!(loaded.bindings.shortcut_label("session:new"), None);
+        }
+        let restored = KeyBindings::from_toml_with_diagnostics("").unwrap();
+        assert_eq!(
+            restored.bindings.get_command("ctrl+shift+t"),
+            Some(Command::SessionNew)
+        );
+    }
+
+    #[test]
+    fn equivalent_aliases_merge_and_invalid_aliases_do_not_shadow_valid_entries() {
+        let loaded = KeyBindings::from_toml_with_diagnostics(
+            r#"
+"Ctrl+F8" = "edit:copy"
+"control+f8" = "edit:copy"
+"Ctrl+Shift+T" = "none"
+"control+shift+t" = "disabled"
+"Ctrl+F9" = "not:a:command"
+"control+f9" = "edit:paste"
+"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(loaded.diagnostics[0].contains("Invalid command"));
+        assert_eq!(
+            loaded.bindings.get_command("ctrl+f8"),
+            Some(Command::EditCopy)
+        );
+        assert_eq!(loaded.bindings.get_command("ctrl+shift+t"), None);
+        assert_eq!(
+            loaded.bindings.get_command("ctrl+f9"),
+            Some(Command::EditPaste)
+        );
+    }
+
+    #[test]
+    fn bind_and_unbind_alias_conflict_does_not_pick_an_arbitrary_winner() {
+        let loaded = KeyBindings::from_toml_with_diagnostics(
+            "\"ctrl+shift+t\" = \"none\"\n\"Shift+Control+T\" = \"session:close\"\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(loaded.diagnostics[0].contains("Conflicting shortcuts"));
+        assert_eq!(
+            loaded.bindings.get_command("ctrl+shift+t"),
+            Some(Command::SessionNew)
+        );
+    }
+
+    #[test]
+    fn numeric_command_aliases_share_one_action_and_reverse_label() {
+        let loaded = KeyBindings::from_toml_with_diagnostics(
+            "\"F8\" = \"session:jump:01\"\n\"f8\" = \"session:jump:+1\"\n",
+        )
+        .unwrap();
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(
+            loaded.bindings.get_command("f8"),
+            Some(Command::SessionJump(1))
+        );
+        assert_eq!(
+            loaded.bindings.bindings.get("f8").map(String::as_str),
+            Some("session:jump:1")
+        );
+        assert_eq!(
+            loaded.bindings.chords_for("session:jump:1"),
+            ["Ctrl+2", "F8"]
+        );
     }
 
     #[test]

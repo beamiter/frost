@@ -22,7 +22,7 @@ cosmic-text = "0.15"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "eb4b5db17acb1591c87cd5489d595952b2f55c42" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "7c43e5116d4e85bfcdc3f0fbd9cf1317db3ee3a7" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"

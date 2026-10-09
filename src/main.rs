@@ -2966,7 +2966,8 @@ fn build_restored_tabs(
     let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut tabs: Vec<Tab> = Vec::new();
     let mut next_id = 0usize;
-    for restored in trees {
+    let mut restored_active_tab = None;
+    for (saved_index, restored) in trees.into_iter().enumerate() {
         let RestoredTab {
             tree,
             focus: saved_focus,
@@ -2989,6 +2990,9 @@ fn build_restored_tabs(
             .filter(|session| tree.contains_session(*session))
             .or_else(|| leaves.first().copied());
         let Some(focus) = focus else { continue };
+        if saved_active_tab == Some(saved_index) {
+            restored_active_tab = Some(tabs.len());
+        }
         tabs.push(Tab {
             id: next_id,
             tree,
@@ -3012,8 +3016,7 @@ fn build_restored_tabs(
         next_id += 1;
     }
 
-    let active_tab = saved_active_tab
-        .filter(|index| *index < tabs.len())
+    let active_tab = restored_active_tab
         // No recorded tab (or it did not survive): follow the active session.
         .or_else(|| tabs.iter().position(|tab| tab.contains(active_session)))
         .unwrap_or(0);
@@ -7117,7 +7120,7 @@ impl Frost {
         let Ok(path) = config.session_history_path() else {
             return default(0);
         };
-        let snapshot = match session_persistence::SessionsSnapshot::load(&path) {
+        let mut snapshot = match session_persistence::SessionsSnapshot::load(&path) {
             session_persistence::SnapshotLoad::Loaded(s) if !s.sessions.is_empty() => s,
             session_persistence::SnapshotLoad::Loaded(_)
             | session_persistence::SnapshotLoad::Missing => return default(0),
@@ -7170,14 +7173,17 @@ impl Frost {
                 session_persistence::MAX_RESTORED_SESSIONS
             );
         }
-        for snap in snapshot
+        let mut restored = vec![false; snapshot.sessions.len()];
+        for (snapshot_index, snap) in snapshot
             .sessions
             .iter()
             .take(session_persistence::MAX_RESTORED_SESSIONS)
+            .enumerate()
         {
             match Session::spawn(config, next_id, cols, rows, snap.cwd.as_deref()) {
                 Ok(session) => {
                     sessions.push(session);
+                    restored[snapshot_index] = true;
                     next_id += 1;
                 }
                 Err(error) if snap.cwd.is_some() => {
@@ -7191,6 +7197,7 @@ impl Frost {
                                 "Restored missing cwd {cwd:?} in the default folder"
                             ));
                             sessions.push(session);
+                            restored[snapshot_index] = true;
                             next_id += 1;
                         }
                         Err(fallback_error) => restore_warnings
@@ -7205,6 +7212,7 @@ impl Frost {
         if sessions.is_empty() {
             return default(0);
         }
+        snapshot.retain_restored_sessions(&restored);
         let active = snapshot.active_index.unwrap_or(0).min(sessions.len() - 1);
         eprintln!(
             "[SessionPersistence] Restored {} session(s) from {}",
@@ -30657,6 +30665,37 @@ mod tests {
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs[0].sessions(), vec![0]);
         assert_eq!(tabs[1].sessions(), vec![1]);
+    }
+
+    #[test]
+    fn discarded_restored_tabs_preserve_the_selected_tab_identity() {
+        let (tabs, active, _) = build_restored_tabs(
+            vec![
+                RestoredTab::plain(PaneTree::Leaf(9), None),
+                RestoredTab::plain(PaneTree::Leaf(0), None),
+                RestoredTab::plain(PaneTree::Leaf(1), None),
+            ],
+            2,
+            0,
+            Some(1),
+        );
+        assert_eq!(tabs[active].focus, 0);
+    }
+
+    #[test]
+    fn a_discarded_active_tab_cannot_activate_an_adopted_orphan_by_index() {
+        let (tabs, active, _) = build_restored_tabs(
+            vec![
+                RestoredTab::plain(PaneTree::Leaf(0), None),
+                RestoredTab::plain(PaneTree::Leaf(0), None),
+            ],
+            2,
+            0,
+            Some(1),
+        );
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1].sessions(), vec![1]);
+        assert_eq!(tabs[active].focus, 0);
     }
 
     #[test]

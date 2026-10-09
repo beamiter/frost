@@ -1644,6 +1644,62 @@ impl SessionsSnapshot {
         Ok((json, warnings))
     }
 
+    /// Reconcile persisted indices with the shells that actually spawned.
+    /// Both saved-cwd and default-cwd attempts can fail, so compacting the
+    /// runtime session vector must also compact every saved pane reference.
+    pub fn retain_restored_sessions(&mut self, keep: &[bool]) {
+        let mut next = 0;
+        let remap: Vec<Option<usize>> = (0..self.sessions.len())
+            .map(|old| {
+                keep.get(old).copied().unwrap_or(false).then(|| {
+                    let new = next;
+                    next += 1;
+                    new
+                })
+            })
+            .collect();
+        let active_tab_survives = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| prune_tree(&tab.tree, &remap).is_some());
+        let pruned = prune_sessions(
+            std::mem::take(&mut self.sessions),
+            std::mem::take(&mut self.tabs),
+            self.active_index,
+            self.active_tab,
+            keep,
+        );
+        self.sessions = pruned.sessions;
+        self.tabs = pruned.tabs;
+        self.active_index = pruned.active_index;
+        // Without a surviving selected tab, the controller must follow the
+        // surviving active session rather than an unrelated compacted index.
+        self.active_tab = active_tab_survives.then_some(pruned.active_tab).flatten();
+        self.tree = self.tree.as_ref().and_then(|tree| prune_tree(tree, &remap));
+        self.split = self.split.take().and_then(|split| {
+            let focused_session = split.panes.get(split.focused).copied();
+            let aligned = split.ratios.len() == split.panes.len();
+            let mut panes = Vec::new();
+            let mut ratios = Vec::new();
+            let mut focused = 0;
+            for (index, old) in split.panes.into_iter().enumerate() {
+                if let Some(new) = remap.get(old).copied().flatten() {
+                    if focused_session == Some(old) {
+                        focused = panes.len();
+                    }
+                    panes.push(new);
+                    ratios.push(if aligned { split.ratios[index] } else { 1.0 });
+                }
+            }
+            (panes.len() >= 2).then_some(SplitSnapshot {
+                mode: split.mode,
+                ratios,
+                panes,
+                focused,
+            })
+        });
+    }
+
     fn sanitize(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
         if self.sessions.len() > MAX_RESTORED_SESSIONS {
@@ -2958,6 +3014,111 @@ mod tests {
                 children.iter().flat_map(tree_sessions).collect()
             }
         }
+    }
+
+    #[test]
+    fn failed_restores_remap_all_snapshot_formats_and_active_identity() {
+        let mut snapshot = SessionsSnapshot::new(
+            (0..4)
+                .map(|index| SessionSnapshot {
+                    cwd: Some(format!("/session-{index}")),
+                })
+                .collect(),
+            Some(2),
+            (0..4)
+                .map(|index| {
+                    let mut tab = tab(leaf(index), Some(index));
+                    tab.title = Some(format!("tab-{index}"));
+                    tab
+                })
+                .collect(),
+            Some(2),
+        );
+        snapshot.tree = Some(PaneTreeSnapshot::Split {
+            axis: "vertical".into(),
+            ratios: vec![0.1, 0.2, 0.3, 0.4],
+            children: (0..4).map(leaf).collect(),
+        });
+        snapshot.split = Some(SplitSnapshot {
+            mode: "vertical".into(),
+            ratios: vec![0.1, 0.2, 0.3, 0.4],
+            panes: vec![0, 1, 2, 3],
+            focused: 2,
+        });
+        snapshot.retain_restored_sessions(&[false, true, true, false]);
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(snapshot.sessions[0].cwd.as_deref(), Some("/session-1"));
+        assert_eq!(snapshot.active_index, Some(1));
+        assert_eq!(snapshot.active_tab, Some(1));
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(snapshot.tabs[1].title.as_deref(), Some("tab-2"));
+        assert_eq!(snapshot.tabs[1].focus, Some(1));
+        assert!(matches!(
+            snapshot.tabs[1].tree,
+            PaneTreeSnapshot::Leaf { session: 1 }
+        ));
+        let PaneTreeSnapshot::Split {
+            children, ratios, ..
+        } = snapshot.tree.unwrap()
+        else {
+            panic!("surviving split")
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(ratios, vec![0.2, 0.3]);
+        assert!(matches!(children[0], PaneTreeSnapshot::Leaf { session: 0 }));
+        assert!(matches!(children[1], PaneTreeSnapshot::Leaf { session: 1 }));
+        let split = snapshot.split.unwrap();
+        assert_eq!(split.panes, vec![0, 1]);
+        assert_eq!(split.ratios, vec![0.2, 0.3]);
+        assert_eq!(split.focused, 1);
+    }
+
+    #[test]
+    fn missing_restored_active_tab_follows_the_session_including_orphans() {
+        let mut snapshot = SessionsSnapshot::new(
+            (0..3).map(|_| SessionSnapshot { cwd: None }).collect(),
+            Some(2),
+            vec![tab(leaf(0), Some(0))],
+            Some(0),
+        );
+        snapshot.retain_restored_sessions(&[false, true, true]);
+        assert_eq!(snapshot.active_index, Some(1));
+        assert_eq!(snapshot.active_tab, None);
+        assert!(snapshot.tabs.is_empty());
+        assert!(snapshot.tree.is_none());
+
+        let mut snapshot = SessionsSnapshot::new(
+            (0..3).map(|_| SessionSnapshot { cwd: None }).collect(),
+            Some(2),
+            vec![tab(leaf(0), Some(0)), tab(leaf(2), Some(2))],
+            None,
+        );
+        snapshot.retain_restored_sessions(&[true, true, true]);
+        assert_eq!(snapshot.active_tab, None);
+        assert_eq!(snapshot.active_index, Some(2));
+    }
+
+    #[test]
+    fn all_failed_restores_clear_every_saved_reference() {
+        let mut snapshot = SessionsSnapshot::new(
+            vec![SessionSnapshot { cwd: None }],
+            Some(0),
+            vec![tab(leaf(0), Some(0))],
+            Some(0),
+        );
+        snapshot.split = Some(SplitSnapshot {
+            mode: "vertical".into(),
+            ratios: vec![],
+            panes: vec![0, 1],
+            focused: 0,
+        });
+        snapshot.retain_restored_sessions(&[]);
+        assert!(snapshot.sessions.is_empty());
+        assert!(snapshot.tabs.is_empty());
+        assert!(snapshot.tree.is_none());
+        assert!(snapshot.split.is_none());
+        assert_eq!(snapshot.active_index, None);
+        assert_eq!(snapshot.active_tab, None);
     }
 
     #[test]
