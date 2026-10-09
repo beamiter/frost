@@ -379,9 +379,9 @@ fn open_private_key_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
     Ok((file, metadata))
 }
 
-/// Read one configured API key without following links or blocking on a FIFO.
-/// The pinned core revision predates these descriptor-level credential checks,
-/// so frontends keep this local guard until they can pin a published fix.
+/// Legacy local reader retained for private-file regression fixtures.
+/// Production credential loading now uses the shared AiClient settings path.
+#[cfg(test)]
 pub fn read_api_key_file(raw_path: &str) -> io::Result<String> {
     let path = expand_private_path(raw_path)?;
     let (file, metadata) = open_private_key_file(&path)?;
