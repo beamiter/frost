@@ -551,6 +551,51 @@ mod tests {
     }
 
     #[test]
+    fn input_overlay_pauses_clock_without_resume_catchup() {
+        let mut life = WindowLife::new_at(Duration::ZERO);
+        life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned);
+        life.note_input(Duration::ZERO);
+        life.advance(
+            Duration::from_millis(100),
+            true,
+            false,
+            CircadianPhase::Unlearned,
+        );
+        let before_overlay = values(life.state());
+        for second in [1, 2, 60, 3600] {
+            assert_eq!(
+                life.advance(
+                    Duration::from_secs(second),
+                    false,
+                    true,
+                    CircadianPhase::Unlearned
+                ),
+                0.0
+            );
+            assert_eq!(values(life.state()), before_overlay);
+        }
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(3601),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            0.0
+        );
+        assert_eq!(values(life.state()), before_overlay);
+        assert_eq!(
+            life.advance(
+                Duration::from_millis(3_601_100),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            0.1
+        );
+    }
+
+    #[test]
     fn quiet_rest_and_recent_input_use_content_free_activity() {
         let mut life = WindowLife::new_at(Duration::ZERO);
         life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned);

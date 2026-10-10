@@ -20025,7 +20025,7 @@ impl Frost {
         if !self.config.ascii_organism_enabled
             || !self.config.bottom_bar
             || !self.focused
-            || self.config_panel_open
+            || !self.terminal_input_active()
             || self.win_size.width < 640.0
         {
             return None;
@@ -34448,6 +34448,36 @@ mod tests {
                 Some(vec![control])
             );
         }
+    }
+
+    #[test]
+    fn organism_observation_reuses_terminal_input_ownership() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("|| !self.terminal_input_active()"));
+        let display_owner = source
+            .split_once("    fn organism_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .0;
+        assert!(display_owner.contains("self.organism_observation_owner()"));
+        let tick = source
+            .split_once("            Message::OrganismTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetBottomBar(")
+            .unwrap()
+            .0;
+        assert!(tick.contains("let owner = self.organism_observation_owner();"));
+        assert!(tick.contains("self.organism.tick(owner, running, any_running);"));
     }
 
     #[test]
