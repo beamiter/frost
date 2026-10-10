@@ -1,4 +1,5 @@
-//! Reset only the remote editor's retained widget state at its identity boundary.
+//! Reset an explicitly scoped form's retained widget state at its identity boundary.
+//! Used by the remote editor and workflow Args form; unrelated widgets stay intact.
 //! Message tokens reject queued callbacks; this scope also retires pressed/input
 //! state before a newly rendered callback can inherit it.
 use iced::advanced::widget::{tree, Tree};

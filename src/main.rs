@@ -34,7 +34,6 @@ mod organism_preview;
 mod organism_watch;
 mod persistence;
 mod pty;
-mod remote_editor_scope;
 mod remote_fs;
 mod remote_host_editor;
 mod review_text;
@@ -46,6 +45,7 @@ mod sidebar;
 mod terminal;
 mod terminal_view;
 mod theme;
+mod widget_identity_scope;
 mod workflow_focus;
 mod workflow_picker;
 mod workflows;
@@ -91,6 +91,7 @@ fn workflow_panel_size(window: Size, requested_height: f32) -> Size {
 
 /// One real workflow argument input, shared with keyboard-routing regressions.
 fn workflow_argument_input<'a, Renderer>(
+    identity: workflow_picker::WorkflowArgsIdentity,
     index: usize,
     name: &str,
     value: &str,
@@ -99,7 +100,7 @@ where
     Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
 {
     let input = iced::widget::TextInput::new(name, value)
-        .on_input(move |value| Message::WorkflowArgInput(index, value))
+        .on_input(move |value| Message::WorkflowArgInput(identity.clone(), index, value))
         // Enter must remain uncaptured so the shared physical-key latch can
         // reject an opener's repeats before the argument-stage handler runs.
         .size(13)
@@ -3938,17 +3939,18 @@ enum Message {
     HistoryPickerAccept(Arc<jterm_core::command_history::CommandHistoryRecord>),
     /// Filter text changed in the workflow picker.
     WorkflowPickerInput(String),
-    /// Cancel the workflow overlay (picker or argument form).
-    WorkflowOverlayClose,
+    /// Dismiss only the picker opening that produced this backdrop callback.
+    WorkflowPickerClose(u64),
     /// Accept the immutable entry represented by a rendered picker row:
     /// render+insert it when it takes no arguments, otherwise open its form.
     WorkflowPickerAccept(workflow_picker::WorkflowChoice),
     /// Edit of one argument value in the workflow form (args index, new text).
-    WorkflowArgInput(usize, String),
+    WorkflowArgInput(workflow_picker::WorkflowArgsIdentity, usize, String),
     /// Restore an argument to its declared default, or to genuinely unset.
-    WorkflowArgReset(usize),
+    WorkflowArgReset(workflow_picker::WorkflowArgsIdentity, usize),
     /// Render the workflow form's current values and insert for review.
-    WorkflowArgSubmit,
+    WorkflowArgSubmit(workflow_picker::WorkflowArgsIdentity),
+    WorkflowArgClose(workflow_picker::WorkflowArgsIdentity),
     /// Query text changed in the block search picker.
     BlockReviewSelected,
     BlockBrowse,
@@ -17281,12 +17283,23 @@ impl Frost {
                 }
                 return workflow_focus::reveal_picker();
             }
-            Message::WorkflowOverlayClose => self.workflow_overlay = None,
+            Message::WorkflowPickerClose(snapshot) => {
+                if self
+                    .workflow_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.accepts_picker_close(snapshot))
+                {
+                    self.workflow_overlay = None;
+                }
+            }
             Message::WorkflowPickerAccept(choice) => return self.accept_workflow_choice(choice),
-            Message::WorkflowArgInput(index, value) => {
+            Message::WorkflowArgInput(identity, index, value) => {
                 if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
                     self.workflow_overlay.as_mut()
                 {
+                    if !form.accepts(&identity) {
+                        return Task::none();
+                    }
                     form.set_value(index, value);
                     return if form.feedback.is_some() {
                         workflow_focus::reveal_error()
@@ -17295,14 +17308,28 @@ impl Frost {
                     };
                 }
             }
-            Message::WorkflowArgReset(index) => {
+            Message::WorkflowArgReset(identity, index) => {
                 if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
                     self.workflow_overlay.as_mut()
                 {
+                    if !form.accepts(&identity) {
+                        return Task::none();
+                    }
                     form.reset_value(index);
                 }
             }
-            Message::WorkflowArgSubmit => return self.submit_workflow_args(),
+            Message::WorkflowArgSubmit(identity) => {
+                if matches!(self.workflow_overlay.as_ref(), Some(workflow_picker::WorkflowOverlay::Args(form)) if form.accepts(&identity))
+                {
+                    return self.submit_workflow_args();
+                }
+            }
+            Message::WorkflowArgClose(identity) => {
+                if matches!(self.workflow_overlay.as_ref(), Some(workflow_picker::WorkflowOverlay::Args(form)) if form.accepts(&identity))
+                {
+                    self.workflow_overlay = None;
+                }
+            }
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
             }
@@ -18769,7 +18796,7 @@ impl Frost {
                 .width(Length::Fill)
                 .height(Length::Fill),
         )
-        .on_press(Message::WorkflowOverlayClose);
+        .on_press(Message::WorkflowPickerClose(state.snapshot_identity()));
         let centered = container(panel)
             .center_x(Length::Fill)
             .center_y(Length::Fill);
@@ -18792,7 +18819,7 @@ impl Frost {
             Space::new().width(Length::Fill),
             button(text("✕").size(12))
                 .style(button::secondary)
-                .on_press(Message::WorkflowOverlayClose),
+                .on_press(Message::WorkflowArgClose(form.identity())),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -18822,7 +18849,7 @@ impl Frost {
         for (index, arg) in form.workflow().args.iter().enumerate() {
             let name = crate::workflow_picker::bound_workflow_feedback(&arg.name);
             // The first field has a stable focus id; Tab traverses the rest.
-            let input = workflow_argument_input(index, &name, form.value(index));
+            let input = workflow_argument_input(form.identity(), index, &name, form.value(index));
             let label = crate::workflow_picker::bound_workflow_arg_label(
                 &arg.name,
                 &arg.description,
@@ -18832,7 +18859,7 @@ impl Frost {
                 input,
                 button(text("Reset").size(11))
                     .style(button::secondary)
-                    .on_press(Message::WorkflowArgReset(index)),
+                    .on_press(Message::WorkflowArgReset(form.identity(), index)),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
@@ -18856,10 +18883,10 @@ impl Frost {
         let actions = row![
             button(text("Insert command").size(12))
                 .style(button::primary)
-                .on_press(Message::WorkflowArgSubmit),
+                .on_press(Message::WorkflowArgSubmit(form.identity())),
             button(text("Cancel").size(12))
                 .style(button::secondary)
-                .on_press(Message::WorkflowOverlayClose),
+                .on_press(Message::WorkflowArgClose(form.identity())),
         ]
         .spacing(6);
         let panel_size = workflow_panel_size(
@@ -18887,11 +18914,14 @@ impl Frost {
                 .width(Length::Fill)
                 .height(Length::Fill),
         )
-        .on_press(Message::WorkflowOverlayClose);
+        .on_press(Message::WorkflowArgClose(form.identity()));
         let centered = container(panel)
             .center_x(Length::Fill)
             .center_y(Length::Fill);
-        stack![Element::from(dismiss), Element::from(centered)].into()
+        widget_identity_scope::scope(
+            form.identity().widget_identity(),
+            stack![Element::from(dismiss), Element::from(centered)],
+        )
     }
 
     /// Ctrl+Shift+H persisted-command history picker overlay (palette-style).
@@ -23441,7 +23471,7 @@ impl Frost {
             task_sidebar_row,
             preferred_agent_row,
             agent_turns_row,
-            remote_editor_scope::scope(self.remote_host_editor.identity(), remote_hosts_section),
+            widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section),
             buttons,
             footer,
         ]
@@ -28524,12 +28554,80 @@ fn xterm_modify_other_keys_encode(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn picker_backdrop_callback_validates_snapshot_before_dismissing() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        let handler = production
+            .split_once("            Message::WorkflowPickerClose(snapshot) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::WorkflowPickerAccept(choice)")
+            .unwrap()
+            .0;
+        assert!(
+            handler
+                .find("overlay.accepts_picker_close(snapshot)")
+                .unwrap()
+                < handler.find("self.workflow_overlay = None").unwrap()
+        );
+        let view = production
+            .split_once("    fn workflow_picker_view(")
+            .unwrap()
+            .1
+            .split_once("    fn workflow_args_view(")
+            .unwrap()
+            .0;
+        assert!(view.contains("Message::WorkflowPickerClose(state.snapshot_identity())"));
+        assert!(!production.contains("WorkflowOverlayClose"));
+    }
+
+    #[test]
+    fn workflow_args_callbacks_and_widget_tree_share_opening_identity() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        let handlers = production
+            .split_once("            Message::WorkflowArgInput(identity, index, value) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::TabCloseConfirmNo => {")
+            .unwrap()
+            .0;
+        assert_eq!(handlers.matches("form.accepts(&identity)").count(), 4);
+        assert!(
+            handlers.find("form.accepts(&identity)").unwrap()
+                < handlers.find("form.set_value(index, value)").unwrap()
+        );
+        let view = production
+            .split_once("    fn workflow_args_view(")
+            .unwrap()
+            .1
+            .split_once("    /// Ctrl+Shift+H")
+            .unwrap()
+            .0;
+        assert!(!view.contains("Message::WorkflowOverlayClose"));
+        assert_eq!(
+            view.matches("Message::WorkflowArgClose(form.identity())")
+                .count(),
+            3
+        );
+        assert!(view.contains("Message::WorkflowArgSubmit(form.identity())"));
+        assert!(view.contains("Message::WorkflowArgReset(form.identity(), index)"));
+        assert!(view.contains("workflow_argument_input(form.identity(), index"));
+        assert!(view.contains(
+            "widget_identity_scope::scope(\n            form.identity().widget_identity(),"
+        ));
+    }
+
+    #[test]
     fn only_remote_settings_widgets_share_the_editor_retirement_identity() {
         let source = include_str!("main.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
-        assert_eq!(production.matches("remote_editor_scope::scope(").count(), 1);
+        assert_eq!(
+            production.matches("widget_identity_scope::scope(").count(),
+            2
+        );
         assert!(production.contains(
-            "remote_editor_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
+            "widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
         ));
         // Add and every row live inside the same subtree reset boundary.
         let settings = production
@@ -28540,7 +28638,7 @@ mod tests {
             settings
                 .find("Message::RemoteHostAdd(self.remote_host_editor.identity())")
                 .unwrap()
-                < settings.find("remote_editor_scope::scope(").unwrap()
+                < settings.find("widget_identity_scope::scope(").unwrap()
         );
     }
 
@@ -33962,7 +34060,12 @@ mod tests {
         for location in [keyboard::Location::Standard, keyboard::Location::Numpad] {
             let mut latch = PromptRecallEnterLatch::default();
             assert!(!latch.consume(&history_enter_event(true, false, location), true));
-            let mut input = workflow_argument_input::<()>(0, "value", "A");
+            let mut input = workflow_argument_input::<()>(
+                workflow_picker::WorkflowArgsIdentity::default(),
+                0,
+                "value",
+                "A",
+            );
             let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, ()>);
             tree.state
                 .downcast_mut::<iced::widget::text_input::State<()>>()
@@ -34009,7 +34112,12 @@ mod tests {
     fn workflow_argument_ime_edit_precedes_routed_confirmation() {
         use iced::advanced::input_method::Event as Ime;
         use iced::advanced::{layout, widget::Tree, Layout, Shell, Widget};
-        let mut input = workflow_argument_input::<()>(0, "value", "A");
+        let mut input = workflow_argument_input::<()>(
+            workflow_picker::WorkflowArgsIdentity::default(),
+            0,
+            "value",
+            "A",
+        );
         let mut tree = Tree::new(&input as &dyn Widget<Message, iced::Theme, ()>);
         tree.state
             .downcast_mut::<iced::widget::text_input::State<()>>()
@@ -34042,7 +34150,7 @@ mod tests {
         }
         assert_eq!(messages.len(), 1);
         match messages.pop().unwrap() {
-            Message::WorkflowArgInput(0, value) => assert_eq!(value, "AB"),
+            Message::WorkflowArgInput(_, 0, value) => assert_eq!(value, "AB"),
             unexpected => panic!("unexpected direct action: {unexpected:?}"),
         }
         let mut latch = PromptRecallEnterLatch::default();

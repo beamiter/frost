@@ -23,6 +23,7 @@
 
 use crate::workflows::{self, ArgsForm, Workflow};
 use jterm_core::workflows::{PickerPolicy, WorkflowPicker};
+use std::sync::Arc;
 
 /// 一次渲染/导航的最大结果数。键盘选择与绘制共用 `filtered()`，因此上限
 /// 同时约束两者——更多的 workflow 通过输入查询来召回（与历史选择器一致）。
@@ -116,6 +117,10 @@ impl WorkflowPickerState {
         Self::new(workflows::load_library_from(dirs))
     }
 
+    pub(crate) fn snapshot_identity(&self) -> u64 {
+        self.snapshot
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.picker.is_empty()
     }
@@ -207,6 +212,16 @@ impl WorkflowPickerState {
     }
 }
 
+/// Opaque opening identity; Debug contains no workflow or argument content.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkflowArgsIdentity(Arc<()>);
+
+impl WorkflowArgsIdentity {
+    pub(crate) fn widget_identity(&self) -> Arc<()> {
+        self.0.clone()
+    }
+}
+
 /// 参数填写表单状态，对应 anvil 的 workflow 对话框：每个声明的参数一行输入，
 /// 以声明的默认值预填。值的记账交给 [`ArgsForm`]——它在类型里保留了"未填写
 /// 且文件未声明默认值"与"用户显式清空"的区别，而这正是四份拷贝共有的缺陷所
@@ -219,6 +234,7 @@ impl WorkflowPickerState {
 /// 是"未填写"，渲染时报 `missing values:`，[`Self::missing`] 让视图在按下
 /// Insert 之前就把这些行标出来。
 pub(crate) struct WorkflowArgsState {
+    identity: WorkflowArgsIdentity,
     form: ArgsForm,
     /// 最近一次渲染错误，内联显示在表单上（correction 卡片的 feedback 惯例）。
     pub feedback: Option<String>,
@@ -227,9 +243,20 @@ pub(crate) struct WorkflowArgsState {
 impl WorkflowArgsState {
     pub(crate) fn new(workflow: Workflow) -> Self {
         Self {
+            identity: WorkflowArgsIdentity::default(),
             form: ArgsForm::new(workflow),
             feedback: None,
         }
+    }
+
+    /// Each opening owns its immutable parameter shape. Edits and resets keep
+    /// this identity, while even an identical reopened workflow gets a new one.
+    pub(crate) fn identity(&self) -> WorkflowArgsIdentity {
+        self.identity.clone()
+    }
+
+    pub(crate) fn accepts(&self, identity: &WorkflowArgsIdentity) -> bool {
+        Arc::ptr_eq(&self.identity.0, &identity.0)
     }
 
     /// 表单正在填写的 workflow（视图取名称、描述与命令模板）。
@@ -306,11 +333,91 @@ pub(crate) enum WorkflowOverlay {
     Args(Box<WorkflowArgsState>),
 }
 
+impl WorkflowOverlay {
+    /// A retained picker backdrop cannot dismiss a later picker or Args form.
+    pub(crate) fn accepts_picker_close(&self, snapshot: u64) -> bool {
+        matches!(self, Self::Picker(state) if state.snapshot_identity() == snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workflows::WorkflowArg;
     use std::path::PathBuf;
+
+    fn argument_form(name: &str) -> WorkflowArgsState {
+        let mut definition = workflow(name, "", &[]);
+        definition.command = "echo {value}".into();
+        definition.args = vec![WorkflowArg {
+            name: "value".into(),
+            description: String::new(),
+            default: Some("default".into()),
+        }];
+        WorkflowArgsState::new(definition)
+    }
+
+    #[test]
+    fn picker_backdrop_close_only_accepts_its_current_opening() {
+        let picker = WorkflowPickerState::new(vec![workflow("A", "", &[])]);
+        let snapshot = picker.snapshot_identity();
+        let current = WorkflowOverlay::Picker(Box::new(picker));
+        assert!(current.accepts_picker_close(snapshot));
+        let args = WorkflowOverlay::Args(Box::new(argument_form("A")));
+        assert!(!args.accepts_picker_close(snapshot));
+        let reopened = WorkflowOverlay::Picker(Box::new(WorkflowPickerState::new(vec![workflow(
+            "A",
+            "",
+            &[],
+        )])));
+        assert!(!reopened.accepts_picker_close(snapshot));
+    }
+
+    #[test]
+    fn args_old_opening_cannot_edit_reset_submit_or_close_replacement() {
+        let old = argument_form("A").identity();
+        let mut current = Some(argument_form("B"));
+        current.as_mut().unwrap().set_value(0, "B value".into());
+        // The host uses this same admission check before each action.
+        for action in 0..4 {
+            let form = current.as_mut().unwrap();
+            if form.accepts(&old) {
+                match action {
+                    0 => form.set_value(0, "stale".into()),
+                    1 => form.reset_value(0),
+                    2 => panic!("stale submit would recall {}", form.render().unwrap()),
+                    _ => current = None,
+                }
+            }
+            assert_eq!(current.as_ref().unwrap().value(0), "B value");
+        }
+    }
+
+    #[test]
+    fn args_same_opening_keeps_consecutive_edits_and_reset() {
+        let mut form = argument_form("A");
+        let identity = form.identity();
+        for value in ["one", "two"] {
+            assert!(form.accepts(&identity));
+            form.set_value(0, value.into());
+            assert_eq!(form.value(0), value);
+        }
+        form.reset_value(0);
+        assert!(form.accepts(&identity));
+        assert_eq!(form.render().unwrap(), "echo default");
+    }
+
+    #[test]
+    fn args_identical_reopening_never_revives_old_callbacks_or_widget_state() {
+        let old = argument_form("A").identity();
+        let reopened = argument_form("A");
+        assert!(!reopened.accepts(&old));
+        assert!(!Arc::ptr_eq(
+            &old.widget_identity(),
+            &reopened.identity().widget_identity()
+        ));
+        assert!(reopened.accepts(&reopened.identity()));
+    }
 
     fn workflow(name: &str, description: &str, tags: &[&str]) -> Workflow {
         Workflow {
