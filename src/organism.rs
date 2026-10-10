@@ -5,6 +5,7 @@
 //! Stable live Start identities are not public in Frost's terminal boundary,
 //! so watching is display-only: no synthetic `command_started` is generated.
 use crate::organism_hover::LiveGreeting;
+use crate::organism_preview::PreviewSequence;
 use crate::organism_watch::WatchObservation;
 use std::collections::HashMap;
 use std::fmt;
@@ -91,6 +92,14 @@ impl fmt::Display for MotionChoice {
             Self::Calm => "Calm",
             Self::Static => "Static",
         })
+    }
+}
+
+pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
+    if bottom_bar {
+        "Reserves a fixed-height strip above the bottom bar. It stays blank while hidden; hover the status-bar glyph to greet."
+    } else {
+        "Turn on Bottom status bar (cwd, git, last command) to show the live companion."
     }
 }
 
@@ -227,6 +236,7 @@ impl SessionLife {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelloAvailability {
+    Demonstrating,
     Busy,
     CoolingDown,
     Available,
@@ -266,6 +276,13 @@ pub struct LivePresentation {
     pub explanation: &'static str,
 }
 
+pub struct PreviewPresentation {
+    pub sprite: String,
+    pub pose: PreviewPose,
+    pub demo_step: Option<usize>,
+    pub hello: HelloAvailability,
+}
+
 pub struct Organism {
     enabled: bool,
     sessions: HashMap<usize, SessionLife>,
@@ -275,6 +292,7 @@ pub struct Organism {
     pub pose: Pose,
     hello: GentleInteraction,
     preview_deadlines: PreviewDeadlines,
+    preview_sequence: PreviewSequence,
     live_greeting: LiveGreeting,
     watch: WatchObservation,
 }
@@ -291,6 +309,7 @@ impl Default for Organism {
             pose: Pose(PreviewPose::Calm),
             hello: GentleInteraction::default(),
             preview_deadlines: PreviewDeadlines::default(),
+            preview_sequence: PreviewSequence::default(),
             live_greeting: LiveGreeting::default(),
             watch: WatchObservation::default(),
         }
@@ -470,6 +489,7 @@ impl Organism {
     }
 
     pub fn close_preview(&mut self) {
+        self.preview_sequence.stop();
         self.hello.cancel();
         self.preview_deadlines.cancel();
     }
@@ -479,11 +499,25 @@ impl Organism {
         self.pose = pose;
     }
 
-    pub fn hello_availability(&self) -> HelloAvailability {
-        self.hello_availability_at(self.born.elapsed())
+    pub fn start_demo(&mut self) {
+        self.start_demo_at(self.born.elapsed());
+    }
+
+    fn start_demo_at(&mut self, now: Duration) {
+        if self.preview_sequence.start(now) {
+            self.hello.cancel();
+            self.preview_deadlines.cancel();
+        }
+    }
+
+    pub fn stop_demo(&mut self) {
+        self.preview_sequence.stop();
     }
 
     fn hello_availability_at(&self, now: Duration) -> HelloAvailability {
+        if self.preview_sequence.sample(now).is_some() {
+            return HelloAvailability::Demonstrating;
+        }
         let context = self.pose.0.context();
         if !GentleInteraction::default().request(now, context) {
             HelloAvailability::Busy
@@ -499,17 +533,25 @@ impl Organism {
     }
 
     fn say_hello_at(&mut self, now: Duration) {
+        if self.preview_sequence.sample(now).is_some() {
+            return;
+        }
         if self.hello.request(now, self.pose.0.context()) {
             self.preview_deadlines.accepted(now);
         }
     }
 
     pub fn preview_deadline(&self) -> Option<Instant> {
-        let now = self.born.elapsed();
-        let eligible = GentleInteraction::default().request(now, self.pose.0.context());
-        self.preview_deadlines
-            .next(now, eligible)
+        self.preview_deadline_at(self.born.elapsed())
             .map(|deadline| self.born + deadline)
+    }
+
+    fn preview_deadline_at(&self, now: Duration) -> Option<Duration> {
+        if self.preview_sequence.sample(now).is_some() {
+            return self.preview_sequence.next_wake(now);
+        }
+        let eligible = GentleInteraction::default().request(now, self.pose.0.context());
+        self.preview_deadlines.next(now, eligible)
     }
 
     pub fn retreat_deadline(&self) -> Option<Instant> {
@@ -610,10 +652,6 @@ impl Organism {
             .map(|deadline| self.born + deadline)
     }
 
-    fn frame(&self, motion: Option<Motion>) -> u64 {
-        Self::frame_at(motion, self.born.elapsed())
-    }
-
     fn frame_at(motion: Option<Motion>, now: Duration) -> u64 {
         if motion == Some(Motion::Full) {
             now.as_millis() as u64 / 100
@@ -677,10 +715,28 @@ impl Organism {
         }
     }
 
-    pub fn preview(&self, motion: Option<Motion>) -> String {
-        let mut hello = self.hello.clone();
-        let context = hello.apply(self.born.elapsed(), self.pose.0.context());
-        sprite_frame_with_context(context, self.frame(motion)).into_owned()
+    pub fn preview_presentation(&self, motion: Option<Motion>) -> PreviewPresentation {
+        self.preview_presentation_at(motion, self.born.elapsed())
+    }
+
+    fn preview_presentation_at(
+        &self,
+        motion: Option<Motion>,
+        now: Duration,
+    ) -> PreviewPresentation {
+        let demo = self.preview_sequence.sample(now);
+        let pose = demo.map_or(self.pose.0, |step| step.pose);
+        let context = if demo.is_some() {
+            pose.context()
+        } else {
+            self.hello.clone().apply(now, pose.context())
+        };
+        PreviewPresentation {
+            sprite: sprite_frame_with_context(context, Self::frame_at(motion, now)).into_owned(),
+            pose,
+            demo_step: demo.map(|step| step.number),
+            hello: self.hello_availability_at(now),
+        }
     }
 }
 
@@ -714,6 +770,107 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn expanded_hint_names_the_actual_bottom_bar_control_when_needed() {
+        assert!(
+            expanded_companion_hint(false).contains("Bottom status bar (cwd, git, last command)")
+        );
+        assert!(expanded_companion_hint(true).contains("stays blank while hidden"));
+    }
+
+    #[test]
+    fn demo_preserves_manual_pose_life_and_both_greeting_clocks() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.select_pose(Pose(PreviewPose::Curious));
+        organism.say_hello_at(Duration::ZERO);
+        let context = organism.sessions[&1].context;
+        let epoch = organism.live_greeting.epoch();
+        organism
+            .live_greeting
+            .enter(1, epoch, Duration::ZERO, context, true);
+        organism
+            .live_greeting
+            .advance(Some(1), Duration::from_millis(600), context, true);
+        let live_deadline = organism.live_greeting.deadline(Duration::from_secs(1));
+        assert_eq!(live_deadline, Some(Duration::from_millis(2600)));
+        let before = values(organism.life.state());
+        organism.start_demo_at(Duration::from_secs(1));
+        organism.say_hello_at(Duration::from_secs(2));
+        assert_eq!(organism.preview_deadlines.ready_at, Duration::from_secs(8));
+        assert_eq!(organism.preview_deadlines.greeting_until, Duration::ZERO);
+        assert_eq!(
+            organism.live_greeting.deadline(Duration::from_secs(1)),
+            live_deadline
+        );
+        for (time, pose, step) in [
+            (1, PreviewPose::Calm, 1),
+            (3, PreviewPose::Working, 2),
+            (5, PreviewPose::Concerned, 3),
+            (7, PreviewPose::Success, 4),
+            (9, PreviewPose::Sleeping, 5),
+        ] {
+            let preview =
+                organism.preview_presentation_at(Some(Motion::Static), Duration::from_secs(time));
+            assert_eq!(preview.pose, pose);
+            assert_eq!(preview.demo_step, Some(step));
+            assert_eq!(preview.hello, HelloAvailability::Demonstrating);
+            assert_eq!(preview.sprite, sprite_frame_with_context(pose.context(), 0));
+        }
+        assert_eq!(
+            organism.preview_deadline_at(Duration::from_millis(10999)),
+            Some(Duration::from_secs(11))
+        );
+        let restored =
+            organism.preview_presentation_at(Some(Motion::Static), Duration::from_secs(11));
+        assert_eq!(restored.pose, PreviewPose::Curious);
+        assert_eq!(restored.demo_step, None);
+        assert_eq!(organism.preview_deadline_at(Duration::from_secs(11)), None);
+        assert_eq!(organism.pose, Pose(PreviewPose::Curious));
+        assert_eq!(values(organism.life.state()), before);
+        assert_eq!(organism.sessions.len(), 1);
+    }
+
+    #[test]
+    fn demo_cancellation_and_hello_entry_guard_are_explicit() {
+        for cancel in [0, 1, 2] {
+            let mut organism = Organism::default();
+            organism.start_demo_at(Duration::ZERO);
+            organism.say_hello_at(Duration::from_secs(1));
+            assert_eq!(organism.preview_deadlines.ready_at, Duration::ZERO);
+            match cancel {
+                0 => organism.stop_demo(),
+                1 => organism.close_preview(),
+                _ => organism.select_pose(Pose(PreviewPose::Curious)),
+            }
+            for time in [1, 9, 100] {
+                let preview = organism.preview_presentation_at(None, Duration::from_secs(time));
+                assert_eq!(preview.demo_step, None);
+                assert_eq!(preview.pose, organism.pose.0);
+                assert_eq!(
+                    organism.preview_deadline_at(Duration::from_secs(time)),
+                    None
+                );
+            }
+            organism.say_hello_at(Duration::from_secs(1));
+            assert_eq!(organism.preview_deadlines.ready_at, Duration::from_secs(9));
+        }
+        let mut cooling = Organism::default();
+        cooling.say_hello_at(Duration::ZERO);
+        cooling.start_demo_at(Duration::from_secs(1));
+        cooling.stop_demo();
+        assert_eq!(
+            cooling.hello_availability_at(Duration::from_secs(2)),
+            HelloAvailability::CoolingDown
+        );
+        assert_eq!(
+            cooling.preview_deadline_at(Duration::from_secs(2)),
+            Some(Duration::from_secs(8))
+        );
     }
 
     #[test]
@@ -1275,7 +1432,7 @@ mod tests {
         let mut organism = Organism::default();
         let before = values(organism.life.state());
         organism.say_hello();
-        organism.preview(Some(Motion::Full));
+        organism.preview_presentation(Some(Motion::Full));
         organism.tick(None, false, false);
         assert_eq!(values(organism.life.state()), before);
         organism.set_enabled(true);
@@ -1345,12 +1502,18 @@ mod tests {
         let mut organism = Organism::default();
         for pose in PreviewPose::ALL {
             organism.select_pose(Pose(pose));
-            assert!(!organism.preview(None).is_empty());
+            assert!(!organism.preview_presentation(None).sprite.is_empty());
         }
         organism.say_hello();
         assert!(organism.sessions.is_empty());
-        assert_eq!(organism.frame(None), 0);
-        assert_eq!(organism.frame(Some(Motion::Calm)), 0);
-        assert_eq!(organism.frame(Some(Motion::Static)), 0);
+        assert_eq!(Organism::frame_at(None, Duration::from_secs(1)), 0);
+        assert_eq!(
+            Organism::frame_at(Some(Motion::Calm), Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(
+            Organism::frame_at(Some(Motion::Static), Duration::from_secs(1)),
+            0
+        );
     }
 }

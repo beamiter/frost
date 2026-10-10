@@ -30,6 +30,7 @@ mod link;
 mod native_enter;
 mod organism;
 mod organism_hover;
+mod organism_preview;
 mod organism_watch;
 mod persistence;
 mod pty;
@@ -3857,6 +3858,8 @@ enum Message {
     SetOrganismMotion(organism::MotionChoice),
     SetOrganismPose(organism::Pose),
     OrganismHello,
+    OrganismDemoPlay,
+    OrganismDemoStop,
     OrganismTick,
     OrganismHoverEnter(usize, u64),
     OrganismHoverExit(usize, u64),
@@ -13550,7 +13553,7 @@ impl Frost {
             self.organism.pause_clock();
             self.organism_pointer_buttons.clear();
         }
-        if !self.config_panel_open || self.theme_editor.is_some() {
+        if !self.organism_preview_visible() {
             self.organism.close_preview();
         }
         self.sync_organism_watch();
@@ -16537,10 +16540,16 @@ impl Frost {
             }
             Message::SetOrganismPose(pose) => self.organism.select_pose(pose),
             Message::OrganismHello => {
-                if self.config_panel_open && self.theme_editor.is_none() {
+                if self.organism_preview_visible() {
                     self.organism.say_hello();
                 }
             }
+            Message::OrganismDemoPlay => {
+                if self.organism_preview_visible() {
+                    self.organism.start_demo();
+                }
+            }
+            Message::OrganismDemoStop => self.organism.stop_demo(),
             Message::OrganismHoverEnter(id, epoch) => {
                 if self.organism_owner() == Some(id) {
                     let eligible = self.organism_hover_eligible();
@@ -22602,6 +22611,15 @@ impl Frost {
             .into()
     }
 
+    /// The same gate admits preview actions and their timer subscription.
+    fn organism_preview_visible(&self) -> bool {
+        organism_preview::preview_visible(
+            self.focused,
+            self.config_panel_open,
+            self.theme_editor.is_some(),
+        )
+    }
+
     /// Centered settings overlay (Ctrl+Shift+O). Controls live-apply on change;
     /// Save persists to disk, Reset restores defaults.
     fn organism_settings(&self) -> Element<'_, Message> {
@@ -22610,13 +22628,33 @@ impl Frost {
             .map(organism::Pose)
             .collect();
         let motion = organism::MotionChoice::from_config(self.config.ascii_organism_motion);
-        let availability = self.organism.hello_availability();
+        let preview = self
+            .organism
+            .preview_presentation(self.config.ascii_organism_motion);
+        let availability = preview.hello;
+        let (demo_button, demo_caption) = if let Some(step) = preview.demo_step {
+            (
+                button(text("Stop demo")).on_press(Message::OrganismDemoStop),
+                format!(
+                    "Demo {step}/5: {} (example). No command runs.",
+                    preview.pose.label()
+                ),
+            )
+        } else {
+            (
+                button(text("Play demo")).on_press(Message::OrganismDemoPlay),
+                "A 10-second example sequence. No command runs.".to_string(),
+            )
+        };
         let mut hello_button = button(text("Say hello"));
         if availability == organism::HelloAvailability::Available {
             hello_button = hello_button.on_press(Message::OrganismHello);
         }
         let mut hello_controls = column![hello_button].spacing(4);
         match availability {
+            organism::HelloAvailability::Demonstrating => {
+                hello_controls = hello_controls.push(text("Unavailable during demo").size(11));
+            }
             organism::HelloAvailability::Busy => {
                 hello_controls = hello_controls.push(text("Unavailable for this pose").size(11));
             }
@@ -22632,7 +22670,7 @@ impl Frost {
             text("Local bottom-bar companion. Memory is volatile; it resets when disabled or closed.").size(11),
             checkbox(self.config.ascii_organism_expanded).label("Show expanded companion")
                 .on_toggle(Message::SetOrganismExpanded),
-            text("Reserves a fixed-height strip above the bottom bar. It stays blank while hidden; hover the status-bar glyph to greet.").size(11),
+            text(organism::expanded_companion_hint(self.config.bottom_bar)).size(11),
             text("Organism Motion").size(13),
             pick_list(organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
@@ -22644,9 +22682,12 @@ impl Frost {
             text("Organism Preview").size(13),
             text("Pose").size(12),
             pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose),
-            container(text(self.organism.preview(self.config.ascii_organism_motion))
+            container(text(preview.sprite)
                 .font(self.mono).size(13))
                 .width(Length::Fixed(200.0)).height(Length::Fixed(72.0)),
+            text(preview.pose.explanation()).size(11),
+            demo_button,
+            text(demo_caption).size(11),
             hello_controls,
             text("Preview is isolated: no command, terminal input, life change, or saved memory.").size(11),
         ].spacing(8).into()
@@ -26563,7 +26604,7 @@ impl Frost {
             _ => None,
         });
         subs.push(events);
-        let preview_visible = self.focused && self.config_panel_open && self.theme_editor.is_none();
+        let preview_visible = self.organism_preview_visible();
         let live_visible = self.focused
             && self.config.ascii_organism_enabled
             && self.config.bottom_bar
@@ -28373,6 +28414,49 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn demo_and_hello_requests_share_the_preview_visibility_guard() {
+        let source = include_str!("main.rs");
+        let gate = source
+            .split_once("    fn organism_preview_visible(&self)")
+            .unwrap()
+            .1;
+        let gate = gate
+            .split_once("    fn organism_settings(&self)")
+            .unwrap()
+            .0;
+        for field in [
+            "self.focused",
+            "self.config_panel_open",
+            "self.theme_editor.is_some()",
+        ] {
+            assert!(gate.contains(field));
+        }
+        for marker in ["Message::OrganismHello =>", "Message::OrganismDemoPlay =>"] {
+            let handler = source
+                .split_once(marker)
+                .unwrap()
+                .1
+                .split_once("            Message::")
+                .unwrap()
+                .0;
+            assert!(handler.contains("if self.organism_preview_visible()"));
+            assert!(!handler.contains("write_pty"));
+        }
+        assert!(source.contains("Message::OrganismDemoStop => self.organism.stop_demo()"));
+        assert!(source.contains("let preview_visible = self.organism_preview_visible();"));
+        let update = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1;
+        let update = update.split_once("        match message {").unwrap().0;
+        assert!(update.contains("if !self.organism_preview_visible()"));
+        assert!(update.contains("self.organism.close_preview()"));
+        let blur = source.split_once("Message::Focus(f) => {").unwrap().1;
+        let blur = blur.split_once("Message::NewSession =>").unwrap().0;
+        assert!(blur.contains("self.organism.close_preview()"));
+    }
+
     #[test]
     fn expanded_companion_reserves_height_only_for_explicit_config() {
         for enabled in [false, true] {
