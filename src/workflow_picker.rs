@@ -237,6 +237,13 @@ impl WorkflowArgsIdentity {
     }
 }
 
+/// One deferred submission, distinct even when the same form is retried.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkflowArgsAttempt {
+    opening: WorkflowArgsIdentity,
+    identity: Arc<()>,
+}
+
 /// 参数填写表单状态，对应 anvil 的 workflow 对话框：每个声明的参数一行输入，
 /// 以声明的默认值预填。值的记账交给 [`ArgsForm`]——它在类型里保留了"未填写
 /// 且文件未声明默认值"与"用户显式清空"的区别，而这正是四份拷贝共有的缺陷所
@@ -250,6 +257,7 @@ impl WorkflowArgsIdentity {
 /// Insert 之前就把这些行标出来。
 pub(crate) struct WorkflowArgsState {
     identity: WorkflowArgsIdentity,
+    pending: Option<Arc<()>>,
     form: ArgsForm,
     /// 最近一次渲染错误，内联显示在表单上（correction 卡片的 feedback 惯例）。
     pub feedback: Option<String>,
@@ -259,6 +267,7 @@ impl WorkflowArgsState {
     pub(crate) fn new(workflow: Workflow) -> Self {
         Self {
             identity: WorkflowArgsIdentity::default(),
+            pending: None,
             form: ArgsForm::new(workflow),
             feedback: None,
         }
@@ -272,6 +281,45 @@ impl WorkflowArgsState {
 
     pub(crate) fn accepts(&self, identity: &WorkflowArgsIdentity) -> bool {
         Arc::ptr_eq(&self.identity.0, &identity.0)
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub(crate) fn begin_delivery(&mut self) -> Option<WorkflowArgsAttempt> {
+        if self.is_pending() {
+            return None;
+        }
+        let identity = Arc::new(());
+        self.pending = Some(identity.clone());
+        self.feedback = None;
+        Some(WorkflowArgsAttempt {
+            opening: self.identity(),
+            identity,
+        })
+    }
+
+    pub(crate) fn accepts_delivery(&self, attempt: &WorkflowArgsAttempt) -> bool {
+        self.accepts(&attempt.opening)
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &attempt.identity))
+    }
+
+    /// Only definite refusal before this payload's admission is retryable.
+    pub(crate) fn reject_delivery(
+        &mut self,
+        attempt: &WorkflowArgsAttempt,
+        reason: String,
+    ) -> bool {
+        if !self.accepts_delivery(attempt) {
+            return false;
+        }
+        self.pending = None;
+        self.set_feedback(reason);
+        true
     }
 
     /// 表单正在填写的 workflow（视图取名称、描述与命令模板）。
@@ -293,6 +341,7 @@ impl WorkflowArgsState {
     }
 
     pub(crate) fn set_value(&mut self, index: usize, value: String) {
+        self.pending = None;
         let value = bound_arg_value(value);
         if rendered_command_is_unsafe(&value) {
             self.set_feedback(
@@ -312,6 +361,7 @@ impl WorkflowArgsState {
     /// without a default this restores the genuinely-unset state; assigning an
     /// empty string cannot express that distinction.
     pub(crate) fn reset_value(&mut self, index: usize) {
+        self.pending = None;
         self.form.clear(index);
         self.feedback = None;
     }
@@ -370,6 +420,51 @@ mod tests {
             default: Some("default".into()),
         }];
         WorkflowArgsState::new(definition)
+    }
+
+    #[test]
+    fn args_delivery_rejection_preserves_draft_and_allows_a_new_attempt() {
+        let mut form = argument_form("A");
+        form.set_value(0, "reviewed value".into());
+        let attempt = form.begin_delivery().unwrap();
+        assert!(form.is_pending());
+        assert!(form.begin_delivery().is_none());
+        assert!(form.reject_delivery(&attempt, "prompt busy".into()));
+        assert!(!form.is_pending());
+        assert_eq!(form.value(0), "reviewed value");
+        assert_eq!(form.feedback.as_deref(), Some("prompt busy"));
+        let retry = form.begin_delivery().unwrap();
+        assert!(!form.accepts_delivery(&attempt));
+        assert!(form.accepts_delivery(&retry));
+        assert!(!form.reject_delivery(&attempt, "stale failure".into()));
+        assert!(form.accepts_delivery(&retry));
+    }
+
+    #[test]
+    fn args_edit_or_reset_invalidates_deferred_delivery_before_new_text_is_used() {
+        let mut form = argument_form("A");
+        let old = form.begin_delivery().unwrap();
+        form.set_value(0, "new text".into());
+        assert!(!form.accepts_delivery(&old));
+        assert!(!form.is_pending());
+        let newer = form.begin_delivery().unwrap();
+        form.reset_value(0);
+        assert!(!form.accepts_delivery(&newer));
+        assert_eq!(form.render().unwrap(), "echo default");
+        assert!(form.begin_delivery().is_some());
+    }
+
+    #[test]
+    fn args_delivery_from_closed_or_replaced_opening_cannot_affect_reopened_form() {
+        let mut old = argument_form("A");
+        let attempt = old.begin_delivery().unwrap();
+        drop(old);
+        let mut reopened = argument_form("A");
+        let current = reopened.begin_delivery().unwrap();
+        assert!(!reopened.accepts_delivery(&attempt));
+        assert!(!reopened.reject_delivery(&attempt, "stale".into()));
+        assert!(reopened.accepts_delivery(&current));
+        assert_eq!(reopened.value(0), "default");
     }
 
     #[test]

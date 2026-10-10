@@ -3951,6 +3951,7 @@ enum Message {
     /// Render the workflow form's current values and insert for review.
     WorkflowArgSubmit(workflow_picker::WorkflowArgsIdentity),
     WorkflowArgClose(workflow_picker::WorkflowArgsIdentity),
+    WorkflowArgDeliver(workflow_picker::WorkflowArgsAttempt, usize, String),
     /// Query text changed in the block search picker.
     BlockReviewSelected,
     BlockBrowse,
@@ -11217,18 +11218,114 @@ impl Frost {
     /// inline on the form, like anvil's dialog error label.
     fn submit_workflow_args(&mut self) -> Task<Message> {
         let rendered = match self.workflow_overlay.as_mut() {
-            Some(workflow_picker::WorkflowOverlay::Args(form)) => match form.render() {
-                Ok(command) => command,
-                Err(error) => {
-                    log::warn!("workflow render failed: {error}");
-                    form.set_feedback(format!("Workflow could not be rendered: {error}"));
-                    return workflow_focus::reveal_error();
+            Some(workflow_picker::WorkflowOverlay::Args(form)) => {
+                if form.is_pending() {
+                    return Task::none();
                 }
-            },
+                match form.render() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        log::warn!("workflow render failed: {error}");
+                        form.set_feedback(format!("Workflow could not be rendered: {error}"));
+                        return workflow_focus::reveal_error();
+                    }
+                }
+            }
             _ => return Task::none(),
         };
+        // Preserve the ordinary recall's Enter ownership before deferred checks.
+        self.native_enter_ownership.lock().claim_pressed();
+        self.prompt_recall_enter_latch.begin_recall();
+        let target = self.sessions.get(self.active).map(|session| session.id);
+        let Some(workflow_picker::WorkflowOverlay::Args(form)) = self.workflow_overlay.as_mut()
+        else {
+            return Task::none();
+        };
+        let Some(id) = target else {
+            form.set_feedback("Workflow not inserted: the terminal session is no longer available");
+            return workflow_focus::reveal_error();
+        };
+        let Some(attempt) = form.begin_delivery() else {
+            return Task::none();
+        };
+        Task::done(Message::WorkflowArgDeliver(attempt, id, rendered))
+    }
+
+    /// Preflight may drain older queued work, but never admits this workflow
+    /// payload. The actual write keeps using the existing shared paste boundary.
+    fn workflow_recall_preflight(&mut self, id: usize, command: &str) -> Result<String, String> {
+        let command = crate::review_text::sanitize_untrusted_single_line(
+            command,
+            crate::history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        self.session_prompt_replace_ready(id)
+            .map_err(str::to_owned)?;
+        let sess = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or_else(|| "the terminal session is no longer available".to_string())?;
+        if sess.transcript_read_only() {
+            return Err("the terminal transcript is read-only".into());
+        }
+        let paste = pty_input::encode_prompt_insert(
+            &command,
+            PasteModes {
+                bracketed: sess.terminal.is_bracketed_paste_enabled(),
+            },
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+            true,
+        );
+        if paste.is_empty() {
+            return Err("the command has no insertable text".into());
+        }
+        if !sess.can_queue_user_bytes(paste.bytes.len()) {
+            return Err("the terminal cannot accept this input payload".into());
+        }
+        Ok(command)
+    }
+
+    fn deliver_workflow_args(
+        &mut self,
+        attempt: workflow_picker::WorkflowArgsAttempt,
+        id: usize,
+        command: String,
+    ) -> Task<Message> {
+        if !matches!(self.workflow_overlay.as_ref(), Some(workflow_picker::WorkflowOverlay::Args(form)) if form.accepts_delivery(&attempt))
+        {
+            return Task::none();
+        }
+        let command = match self.workflow_recall_preflight(id, &command) {
+            Ok(command) => command,
+            Err(reason) => {
+                if let Some(workflow_picker::WorkflowOverlay::Args(form)) =
+                    self.workflow_overlay.as_mut()
+                {
+                    form.reject_delivery(
+                        &attempt,
+                        format!("Workflow not inserted: {reason}. Your arguments are preserved."),
+                    );
+                }
+                return workflow_focus::reveal_error();
+            }
+        };
+        let accepted = self.write_paste_to_session(
+            id,
+            &command,
+            PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+            true,
+        );
+        // A false result after attempting the shared writer can include partial
+        // PTY delivery. Retire on either result; never expose one-click retry.
         self.workflow_overlay = None;
-        self.recall_into_active_pane(rendered)
+        if !accepted {
+            self.push_toast(
+                "Workflow insertion may be incomplete. Some text may have reached the terminal; inspect the prompt before retrying.",
+                ToastKind::Warning,
+            );
+        }
+        Task::none()
     }
 
     /// Workflow overlay key handling. The picker stage mirrors
@@ -17333,6 +17430,9 @@ impl Frost {
                     self.workflow_overlay = None;
                 }
             }
+            Message::WorkflowArgDeliver(attempt, id, command) => {
+                return self.deliver_workflow_args(attempt, id, command);
+            }
             Message::TabCloseConfirmNo => {
                 self.tab_close_confirm = None;
             }
@@ -18890,7 +18990,9 @@ impl Frost {
         let actions = row![
             button(text("Insert command").size(12))
                 .style(button::primary)
-                .on_press(Message::WorkflowArgSubmit(form.identity())),
+                .on_press_maybe(
+                    (!form.is_pending()).then(|| Message::WorkflowArgSubmit(form.identity()))
+                ),
             button(text("Cancel").size(12))
                 .style(button::secondary)
                 .on_press(Message::WorkflowArgClose(form.identity())),
@@ -28560,6 +28662,76 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workflow_args_delivery_keeps_deferred_identity_and_retires_after_attempt() {
+        let source = include_str!("main.rs");
+        let submit = source
+            .split_once("    fn submit_workflow_args(")
+            .unwrap()
+            .1
+            .split_once("    /// Preflight may drain")
+            .unwrap()
+            .0;
+        assert!(submit.contains("form.is_pending()"));
+        assert!(submit.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(submit.contains("Task::done(Message::WorkflowArgDeliver(attempt, id, rendered))"));
+        assert!(!submit.contains("self.workflow_overlay = None"));
+        assert!(
+            submit.find("claim_pressed()").unwrap() < submit.find("form.begin_delivery()").unwrap()
+        );
+        let delivery = source
+            .split_once("    fn deliver_workflow_args(")
+            .unwrap()
+            .1
+            .split_once("    /// Workflow overlay key handling.")
+            .unwrap()
+            .0;
+        assert!(
+            delivery.find("form.accepts_delivery(&attempt)").unwrap()
+                < delivery
+                    .find("self.workflow_recall_preflight(id, &command)")
+                    .unwrap()
+        );
+        assert!(
+            delivery.find("form.reject_delivery(").unwrap()
+                < delivery.find("self.write_paste_to_session(").unwrap()
+        );
+        assert!(
+            delivery.find("self.write_paste_to_session(").unwrap()
+                < delivery.find("self.workflow_overlay = None").unwrap()
+        );
+        assert!(
+            delivery.find("self.workflow_overlay = None").unwrap()
+                < delivery.find("if !accepted").unwrap()
+        );
+        assert!(delivery.contains("Some text may have reached the terminal"));
+    }
+
+    #[test]
+    fn workflow_preflight_uses_recall_sanitizer_and_exact_encoded_admission_size() {
+        let source = include_str!("main.rs");
+        let preflight = source
+            .split_once("    fn workflow_recall_preflight(")
+            .unwrap()
+            .1
+            .split_once("    fn deliver_workflow_args(")
+            .unwrap()
+            .0;
+        assert!(preflight.contains("sanitize_untrusted_single_line("));
+        assert!(preflight.contains("crate::history_picker::MAX_SHARED_HISTORY_COMMAND_BYTES"));
+        assert!(preflight.contains("self.session_prompt_replace_ready(id)"));
+        assert!(preflight.contains("session.id == id"));
+        assert!(preflight.contains("sess.transcript_read_only()"));
+        assert!(preflight.contains("bracketed: sess.terminal.is_bracketed_paste_enabled()"));
+        assert!(preflight.contains(
+            "PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),\n            true,"
+        ));
+        assert!(preflight.contains("paste.is_empty()"));
+        assert!(preflight.contains("sess.can_queue_user_bytes(paste.bytes.len())"));
+        assert!(!preflight.contains("write_paste_to_session"));
+        assert!(!preflight.contains("write_pty("));
+    }
+
     #[test]
     fn workflow_picker_opening_scopes_query_state_and_queued_input() {
         let source = include_str!("main.rs");
