@@ -26380,8 +26380,8 @@ impl Frost {
             && self.config.ascii_organism_enabled
             && self.config.bottom_bar
             && self.win_size.width >= 640.0;
-        let preview_full = preview_visible
-            && self.config.ascii_organism_motion == Some(organism::Motion::Full);
+        let preview_full =
+            preview_visible && self.config.ascii_organism_motion == Some(organism::Motion::Full);
         if preview_full || live_visible {
             let full = preview_full
                 || (self.config.ascii_organism_motion == Some(organism::Motion::Full)

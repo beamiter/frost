@@ -227,10 +227,10 @@ impl PreviewDeadlines {
 
     fn next(&self, now: Duration, eligible: bool) -> Option<Duration> {
         [Some(self.greeting_until), eligible.then_some(self.ready_at)]
-        .into_iter()
-        .flatten()
-        .filter(|deadline| *deadline > now)
-        .min()
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline > now)
+            .min()
     }
 }
 
@@ -583,10 +583,7 @@ mod tests {
             organism.preview_deadlines.greeting_until,
             Duration::from_secs(10)
         );
-        assert_eq!(
-            organism.preview_deadlines.ready_at,
-            Duration::from_secs(16)
-        );
+        assert_eq!(organism.preview_deadlines.ready_at, Duration::from_secs(16));
         assert_eq!(values(organism.life.state()), state);
         assert!(organism.sessions.is_empty());
     }
