@@ -35,6 +35,7 @@ mod organism_watch;
 mod persistence;
 mod pty;
 mod remote_fs;
+mod remote_host_editor;
 mod review_text;
 mod search;
 mod search_replace;
@@ -3657,14 +3658,14 @@ enum Message {
         Box<jterm_core::jsh_remote::RemoteHostConfig>,
     ),
     /// Per-field edits of the indexed `[[remote_hosts]]` entry from Settings.
-    RemoteHostName(usize, String),
-    RemoteHostHost(usize, String),
-    RemoteHostUser(usize, String),
-    RemoteHostDocker(usize, bool),
-    RemoteHostDeploy(usize, String),
+    RemoteHostName(remote_host_editor::RowTarget, String),
+    RemoteHostHost(remote_host_editor::RowTarget, String),
+    RemoteHostUser(remote_host_editor::RowTarget, String),
+    RemoteHostDocker(remote_host_editor::RowTarget, bool),
+    RemoteHostDeploy(remote_host_editor::RowTarget, String),
     /// Append a template `[[remote_hosts]]` entry for in-place editing.
-    RemoteHostAdd,
-    RemoteHostRemove(usize),
+    RemoteHostAdd(Arc<()>),
+    RemoteHostRemove(remote_host_editor::RowTarget),
     /// Hide the jsh notice until the next launch.
     JshNoticeDismiss,
     SetAiEnabled(bool),
@@ -5329,6 +5330,7 @@ struct Frost {
     tab_switcher: Option<TabSwitcherState>,
     /// Remote host picker: one opening identity, profile snapshot and selection.
     remote_picker: Option<RemotePickerState>,
+    remote_host_editor: remote_host_editor::RemoteHostEditor,
     /// History-picker overlay (Ctrl+Shift+H): fuzzy search over the persisted
     /// command-history index; Enter types the selection into the active pane.
     history_picker: Option<history_picker::HistoryPickerState>,
@@ -5563,6 +5565,7 @@ impl Frost {
             jsh_notice_dismissed: false,
             tab_switcher: None,
             remote_picker: None,
+            remote_host_editor: remote_host_editor::RemoteHostEditor::default(),
             history_picker: None,
             prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
             native_enter_ownership,
@@ -5656,6 +5659,25 @@ impl Frost {
 
     fn effective_font_size(&self) -> f32 {
         Config::clamp_font_size(self.config.font_size)
+    }
+
+    fn set_config_panel_open(&mut self, open: bool) {
+        if self.config_panel_open != open {
+            self.remote_host_editor.retire();
+            self.config_panel_open = open;
+        }
+    }
+
+    fn remote_host_editor_visible(&self) -> bool {
+        self.focused && self.config_panel_open && self.theme_editor.is_none()
+    }
+
+    fn remote_host_row(&self, target: &remote_host_editor::RowTarget) -> Option<usize> {
+        self.remote_host_editor.resolve(
+            target,
+            self.remote_host_editor_visible(),
+            self.config.remote_hosts.len(),
+        )
     }
 
     /// Single re-apply path for live config changes (Set*, Reset, hot reload):
@@ -5886,6 +5908,7 @@ impl Frost {
                     self.config.ascii_organism_motion,
                     config.ascii_organism_motion,
                 );
+                self.remote_host_editor.retire();
                 self.config = config;
                 self.win_size =
                     logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
@@ -9250,15 +9273,15 @@ impl Frost {
                 Task::none()
             }
             C::ConfigOpen => {
-                self.config_panel_open = true;
+                self.set_config_panel_open(true);
                 Task::none()
             }
             C::ConfigClose => {
-                self.config_panel_open = false;
+                self.set_config_panel_open(false);
                 Task::none()
             }
             C::ConfigToggle => {
-                self.config_panel_open = !self.config_panel_open;
+                self.set_config_panel_open(!self.config_panel_open);
                 Task::none()
             }
             C::SidebarToggle => self.toggle_sidebar(),
@@ -12025,7 +12048,7 @@ impl Frost {
             if let Key::Character(c) = key {
                 if c.eq_ignore_ascii_case("o") {
                     self.theme_editor = None;
-                    self.config_panel_open = false;
+                    self.set_config_panel_open(false);
                     return Some(Task::none());
                 }
             }
@@ -12035,7 +12058,7 @@ impl Frost {
             if self.theme_editor.is_some() {
                 self.theme_editor = None;
             } else {
-                self.config_panel_open = false;
+                self.set_config_panel_open(false);
             }
         }
         Some(Task::none())
@@ -12306,7 +12329,7 @@ impl Frost {
             PaletteAction::ToggleAiChats => self.toggle_ai_chats(),
             PaletteAction::AskAiGenerate => self.open_ai_ask(),
             PaletteAction::OpenSettings => {
-                self.config_panel_open = true;
+                self.set_config_panel_open(true);
                 Task::none()
             }
             PaletteAction::QuickTabSwitch => {
@@ -14050,7 +14073,10 @@ impl Frost {
                 self.remote_picker = None;
                 self.connect_remote_host(index);
             }
-            Message::RemoteHostName(index, name) => {
+            Message::RemoteHostName(target, name) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     if let Some(name) = crate::config::accepted_config_text(
                         name,
@@ -14064,7 +14090,10 @@ impl Frost {
                     }
                 }
             }
-            Message::RemoteHostHost(index, value) => {
+            Message::RemoteHostHost(target, value) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     if let Some(value) = crate::config::accepted_config_text(
                         value,
@@ -14078,7 +14107,10 @@ impl Frost {
                     }
                 }
             }
-            Message::RemoteHostUser(index, user) => {
+            Message::RemoteHostUser(target, user) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     // Blank clears the login/exec user rather than storing "".
                     if let Some(user) = crate::config::accepted_config_text(
@@ -14093,7 +14125,10 @@ impl Frost {
                     }
                 }
             }
-            Message::RemoteHostDocker(index, docker) => {
+            Message::RemoteHostDocker(target, docker) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     host.docker = docker;
                     self.config_dirty = true;
@@ -14102,7 +14137,10 @@ impl Frost {
                     }
                 }
             }
-            Message::RemoteHostDeploy(index, deploy) => {
+            Message::RemoteHostDeploy(target, deploy) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
                 if let Some(host) = self.config.remote_hosts.get_mut(index) {
                     if let Some(deploy) = crate::config::accepted_config_text(
                         deploy,
@@ -14116,7 +14154,13 @@ impl Frost {
                     }
                 }
             }
-            Message::RemoteHostAdd => {
+            Message::RemoteHostAdd(identity) => {
+                if !self
+                    .remote_host_editor
+                    .accepts(&identity, self.remote_host_editor_visible())
+                {
+                    return Task::none();
+                }
                 if self.config.remote_hosts.len() >= config::MAX_REMOTE_HOSTS {
                     self.push_toast(
                         format!(
@@ -14143,14 +14187,19 @@ impl Frost {
                         deploy: "persist".to_string(),
                         deploy_artifact: None,
                     });
+                self.remote_host_editor.retire();
                 self.config_dirty = true;
                 if let Some(request) = self.reconcile_sidebar_remote_hosts() {
                     return self.queue_sidebar_load(request);
                 }
             }
-            Message::RemoteHostRemove(index) => {
+            Message::RemoteHostRemove(target) => {
+                let Some(index) = self.remote_host_row(&target) else {
+                    return Task::none();
+                };
                 if index < self.config.remote_hosts.len() {
                     self.config.remote_hosts.remove(index);
+                    self.remote_host_editor.retire();
                     self.config_dirty = true;
                     if let Some(request) = self.reconcile_sidebar_remote_hosts() {
                         return self.queue_sidebar_load(request);
@@ -15462,6 +15511,7 @@ impl Frost {
             }
             Message::Focus(f) => {
                 if !f {
+                    self.remote_host_editor.retire();
                     self.organism_pointer_buttons.clear();
                     self.cancel_layout_drags();
                     self.hovered_tab = None;
@@ -16395,7 +16445,7 @@ impl Frost {
                 }
             }
             Message::ToggleConfigPanel => {
-                self.config_panel_open = !self.config_panel_open;
+                self.set_config_panel_open(!self.config_panel_open);
             }
             Message::BlinkTick => {
                 self.blink_on = !self.blink_on;
@@ -16649,6 +16699,7 @@ impl Frost {
                 self.apply_config();
             }
             Message::ThemeEditOpen => {
+                self.remote_host_editor.retire();
                 // Seed the editor from the current theme; suggest a fresh name so
                 // saving doesn't silently overwrite a builtin.
                 let base = self.theme.clone();
@@ -16800,6 +16851,7 @@ impl Frost {
                             self.config.ascii_organism_motion,
                             reset.ascii_organism_motion,
                         );
+                        self.remote_host_editor.retire();
                         self.config = reset;
                         self.config_revision = Some(revision);
                         self.win_size = logical_viewport_after_scale(
@@ -16827,6 +16879,7 @@ impl Frost {
                                 self.config.ascii_organism_motion,
                                 reset.ascii_organism_motion,
                             );
+                            self.remote_host_editor.retire();
                             self.config = reset;
                             self.config_revision = Some(revision);
                             self.win_size = logical_viewport_after_scale(
@@ -23211,6 +23264,7 @@ impl Frost {
             .take(config::MAX_REMOTE_HOST_UI_ROWS)
             .enumerate()
         {
+            let target = self.remote_host_editor.target(i);
             let validation = config::validate_remote_host_at(&self.config.remote_hosts, i);
             let transport = if host.docker { "docker" } else { "ssh" };
             let deploy = if host.deploy.is_empty() {
@@ -23227,30 +23281,35 @@ impl Frost {
                     .size(12)
                     .style(text::secondary),
                 button(text("Delete").size(12))
-                    .on_press(Message::RemoteHostRemove(i))
+                    .on_press(Message::RemoteHostRemove(target.clone()))
                     .style(button::danger),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
+            let name_target = target.clone();
             let name_input = text_input("display name", &host.name)
-                .on_input(move |s| Message::RemoteHostName(i, s))
+                .on_input(move |s| Message::RemoteHostName(name_target.clone(), s))
                 .size(13);
             let host_placeholder = if host.docker {
                 "container name"
             } else {
                 "ssh host"
             };
+            let host_target = target.clone();
             let host_input = text_input(host_placeholder, &host.host)
-                .on_input(move |s| Message::RemoteHostHost(i, s))
+                .on_input(move |s| Message::RemoteHostHost(host_target.clone(), s))
                 .size(13);
+            let user_target = target.clone();
             let user_input = text_input("user (optional)", host.user.as_deref().unwrap_or(""))
-                .on_input(move |s| Message::RemoteHostUser(i, s))
+                .on_input(move |s| Message::RemoteHostUser(user_target.clone(), s))
                 .size(13);
+            let docker_target = target.clone();
             let docker_box = checkbox(host.docker)
                 .label("docker")
                 .text_size(13)
-                .on_toggle(move |v| Message::RemoteHostDocker(i, v));
+                .on_toggle(move |v| Message::RemoteHostDocker(docker_target.clone(), v));
+            let deploy_target = target.clone();
             let deploy_pick = pick_list(
                 vec![
                     "off".to_string(),
@@ -23258,7 +23317,7 @@ impl Frost {
                     "incognito".to_string(),
                 ],
                 Some(deploy_label),
-                move |v| Message::RemoteHostDeploy(i, v),
+                move |v| Message::RemoteHostDeploy(deploy_target.clone(), v),
             )
             .text_size(13)
             .width(Length::Fixed(110.0));
@@ -23304,7 +23363,7 @@ impl Frost {
         let add_host = if at_remote_host_capacity {
             add_host
         } else {
-            add_host.on_press(Message::RemoteHostAdd)
+            add_host.on_press(Message::RemoteHostAdd(self.remote_host_editor.identity()))
         };
         remote_hosts_section = remote_hosts_section.push(add_host);
         if at_remote_host_capacity {
@@ -28463,6 +28522,116 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_editor_callbacks_validate_retained_identity_before_index_access() {
+        let source = include_str!("main.rs");
+        let handlers = source
+            .split_once("            Message::RemoteHostName(target, name) => {")
+            .unwrap()
+            .1;
+        let handlers = handlers
+            .split_once("            Message::JshNoticeDismiss")
+            .unwrap()
+            .0;
+        assert_eq!(
+            handlers
+                .matches("let Some(index) = self.remote_host_row(&target)")
+                .count(),
+            6
+        );
+        assert!(!handlers.contains("Message::RemoteHostRemove(index)"));
+        let add = handlers
+            .split_once("            Message::RemoteHostAdd(identity) => {")
+            .unwrap()
+            .1;
+        let add = add
+            .split_once("            Message::RemoteHostRemove(target)")
+            .unwrap()
+            .0;
+        assert!(add.contains(".accepts(&identity, self.remote_host_editor_visible())"));
+        assert!(
+            add.find("config::MAX_REMOTE_HOSTS").unwrap()
+                < add.find("self.remote_host_editor.retire();").unwrap()
+        );
+        assert!(
+            add.find("self.remote_host_editor.retire();").unwrap()
+                < add.find("self.reconcile_sidebar_remote_hosts()").unwrap()
+        );
+        let remove = handlers
+            .split_once("            Message::RemoteHostRemove(target)")
+            .unwrap()
+            .1;
+        assert!(
+            remove.find("self.remote_host_editor.retire();").unwrap()
+                < remove
+                    .find("self.reconcile_sidebar_remote_hosts()")
+                    .unwrap()
+        );
+        let fields = handlers
+            .split_once("            Message::RemoteHostAdd(identity)")
+            .unwrap()
+            .0;
+        assert!(!fields.contains("self.remote_host_editor.retire()"));
+        for field in ["Name", "Host", "User", "Docker", "Deploy"] {
+            assert!(source.contains(&format!("RemoteHost{field}(remote_host_editor::RowTarget,")));
+        }
+        assert!(source.contains("Message::RemoteHostRemove(target.clone())"));
+        assert!(source.contains("Message::RemoteHostAdd(self.remote_host_editor.identity())"));
+    }
+
+    #[test]
+    fn remote_editor_opening_replacement_and_hidden_boundaries_retire_callbacks() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        assert_eq!(production.matches("self.config_panel_open =").count(), 1);
+        let open = production
+            .split_once("    fn set_config_panel_open(")
+            .unwrap()
+            .1;
+        let open = open.split_once("    fn apply_config(").unwrap().0;
+        assert!(open.contains("if self.config_panel_open != open"));
+        assert!(open.contains("self.remote_host_editor.retire();"));
+        assert!(
+            open.contains("self.focused && self.config_panel_open && self.theme_editor.is_none()")
+        );
+        let reload = production
+            .split_once("    fn reload_config_if_changed(")
+            .unwrap()
+            .1;
+        let reload = reload.split_once("self.config = config;").unwrap().0;
+        assert!(reload.contains("self.remote_host_editor.retire();"));
+        let reset = production
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .1;
+        let reset = reset
+            .split_once("            Message::ConfigTick")
+            .unwrap()
+            .0;
+        assert_eq!(
+            reset.matches("self.remote_host_editor.retire();").count(),
+            2
+        );
+        let blur = production
+            .split_once("            Message::Focus(f) => {")
+            .unwrap()
+            .1;
+        let blur = blur
+            .split_once("            Message::NewSession")
+            .unwrap()
+            .0;
+        assert!(blur.contains("self.remote_host_editor.retire();"));
+        let theme = production
+            .split_once("            Message::ThemeEditOpen => {")
+            .unwrap()
+            .1;
+        assert!(theme
+            .split_once("            Message::ThemeEditClose")
+            .unwrap()
+            .0
+            .contains("self.remote_host_editor.retire();"));
+    }
+
     #[test]
     fn config_save_feedback_prioritizes_blocked_over_pending_confirmation() {
         assert_eq!(config_save_feedback(false, false), "Changes auto-save");
