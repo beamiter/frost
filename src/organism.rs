@@ -5,6 +5,7 @@
 //! Stable live Start identities are not public in Frost's terminal boundary,
 //! so watching is display-only: no synthetic `command_started` is generated.
 use crate::organism_hover::LiveGreeting;
+use crate::organism_watch::WatchObservation;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -252,6 +253,7 @@ pub struct Organism {
     hello: GentleInteraction,
     preview_deadlines: PreviewDeadlines,
     live_greeting: LiveGreeting,
+    watch: WatchObservation,
 }
 
 impl Default for Organism {
@@ -267,6 +269,7 @@ impl Default for Organism {
             hello: GentleInteraction::default(),
             preview_deadlines: PreviewDeadlines::default(),
             live_greeting: LiveGreeting::default(),
+            watch: WatchObservation::default(),
         }
     }
 }
@@ -275,6 +278,7 @@ impl Organism {
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.enabled != enabled {
             self.sessions.clear();
+            self.watch.reset();
             self.close_preview();
             self.cancel_live_greeting();
             self.enabled = enabled;
@@ -298,6 +302,7 @@ impl Organism {
 
     pub fn set_remote(&mut self, id: usize, remote: bool) {
         if remote {
+            self.watch.reset_owner(id);
             self.live_greeting.cancel_owner(id);
         }
         if let Some(life) = self.sessions.get_mut(&id) {
@@ -311,6 +316,7 @@ impl Organism {
     }
 
     pub fn forget_session(&mut self, id: usize) {
+        self.watch.reset_owner(id);
         self.live_greeting.cancel_owner(id);
         self.sessions.remove(&id);
     }
@@ -328,6 +334,7 @@ impl Organism {
         exit: Option<i32>,
         duration: Option<u64>,
     ) {
+        self.watch.reset_owner(id);
         if !self.enabled {
             return;
         }
@@ -373,6 +380,45 @@ impl Organism {
         }
     }
 
+    pub fn watch_batch_admitted(&self, id: usize) -> bool {
+        self.enabled
+            && self
+                .sessions
+                .get(&id)
+                .is_some_and(|life| !life.remote && !life.quarantine_batch)
+    }
+
+    pub fn reset_watch(&mut self) {
+        self.watch.reset();
+    }
+
+    pub fn observe_watch(&mut self, owner: Option<usize>, running: bool) {
+        self.watch.observe(
+            owner.filter(|id| self.enabled && self.is_local(*id)),
+            running,
+            self.born.elapsed(),
+        );
+    }
+
+    pub fn watch_output(
+        &mut self,
+        id: usize,
+        owner: Option<usize>,
+        running: bool,
+        nonempty: bool,
+        admitted: bool,
+    ) {
+        let now = self.born.elapsed();
+        self.watch.observe(
+            owner.filter(|id| self.enabled && self.is_local(*id)),
+            running,
+            now,
+        );
+        if nonempty {
+            self.watch.output(id, now, admitted);
+        }
+    }
+
     pub fn note_output(&mut self, id: usize) {
         if self.enabled {
             self.life.note_output(self.born.elapsed());
@@ -391,6 +437,7 @@ impl Organism {
 
     /// Presentation-only retreat also serves blur and attempted gestures.
     pub fn retreat(&mut self) {
+        self.watch.reset();
         self.cancel_live_greeting();
         self.retreat_until = Instant::now() + Duration::from_millis(900);
     }
@@ -451,6 +498,7 @@ impl Organism {
     }
 
     pub fn pause_clock(&mut self) {
+        self.watch.reset();
         self.cancel_live_greeting();
         self.life
             .advance(self.born.elapsed(), false, false, CircadianPhase::Unlearned);
@@ -561,7 +609,13 @@ impl Organism {
             } else {
                 Behavior::WatchCommand
             };
-            RenderContext::new(behavior, BodyLanguage::from_state(self.life.state()), false)
+            let context =
+                RenderContext::new(behavior, BodyLanguage::from_state(self.life.state()), false);
+            if motion == Some(Motion::Static) {
+                context
+            } else {
+                context.with_watch_rhythm(self.watch.rhythm(id, self.born.elapsed()))
+            }
         } else {
             self.sessions
                 .get(&id)
@@ -620,6 +674,54 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn watch_rhythm_is_display_only_static_safe_and_owner_bound() {
+        use jterm_core::organism::WatchRhythm;
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, true);
+        organism.set_remote(1, false);
+        organism.born = Instant::now() - Duration::from_secs(10);
+        organism.watch.observe(Some(1), true, Duration::ZERO);
+        let before = organism.life.state();
+        for settled in [false, true] {
+            let behavior = if settled {
+                Behavior::WatchSettled
+            } else {
+                Behavior::WatchCommand
+            };
+            let context = RenderContext::new(behavior, BodyLanguage::from_state(before), false);
+            let (glyph, _) = organism.presentation(1, true, settled, Some(Motion::Calm));
+            assert_eq!(
+                glyph,
+                sticky_glyph_with_context(context.with_watch_rhythm(WatchRhythm::Waiting), 0)
+            );
+            let (glyph, _) = organism.presentation(1, true, settled, Some(Motion::Static));
+            assert_eq!(glyph, sticky_glyph_with_context(context, 0));
+        }
+        assert_eq!(values(organism.life.state()), values(before));
+        organism.completed(2, "cargo test", Some(0), Some(10));
+        assert_eq!(
+            organism.watch.rhythm(1, Duration::from_secs(10)),
+            WatchRhythm::Waiting
+        );
+        // Even a completion ignored by enable-time quarantine retires cadence.
+        organism.completed(1, "cargo test", Some(0), Some(10));
+        assert_eq!(
+            organism.watch.rhythm(1, Duration::from_secs(10)),
+            WatchRhythm::Steady
+        );
+        assert!(!organism.watch_batch_admitted(1));
+        organism.batch_finished(1, true);
+        assert!(organism.watch_batch_admitted(1));
+        organism.observe_watch(Some(1), true);
+        organism.set_remote(1, true);
+        assert_eq!(
+            organism.watch.rhythm(1, Duration::from_secs(20)),
+            WatchRhythm::Steady
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ mod link;
 mod native_enter;
 mod organism;
 mod organism_hover;
+mod organism_watch;
 mod persistence;
 mod pty;
 mod remote_fs;
@@ -7278,6 +7279,7 @@ impl Frost {
     /// Refresh every cache/state object whose coordinates belong to the active
     /// session. All tab/pane activation paths call this before accepting input.
     fn refresh_active_context(&mut self) {
+        self.organism.reset_watch();
         self.organism.cancel_live_greeting();
         self.links_cache_key = None;
         if self.search.is_open {
@@ -13522,6 +13524,7 @@ impl Frost {
         if !self.config_panel_open || self.theme_editor.is_some() {
             self.organism.close_preview();
         }
+        self.sync_organism_watch();
         match message {
             Message::PtyOutput(id, fd, data) => {
                 let t0 = std::time::Instant::now();
@@ -13554,6 +13557,10 @@ impl Frost {
                         }
                     }
                 }
+                // Snapshot admission before the batch lifts enable-time quarantine.
+                let watch_batch_identity =
+                    self.sessions.iter().any(|s| s.id == id && s.master_fd == fd);
+                let watch_batch_admitted = self.organism.watch_batch_admitted(id);
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.terminal.process_batch(&data);
                     let retained_block_ids: Vec<u64> = sess
@@ -13630,6 +13637,19 @@ impl Frost {
                 {
                     self.organism.note_output(id);
                 }
+                let watch_owner = self.organism_watch_owner();
+                let watch_running = self
+                    .sessions
+                    .iter()
+                    .find(|s| Some(s.id) == watch_owner)
+                    .is_some_and(|s| s.terminal.is_command_running());
+                self.organism.watch_output(
+                    id,
+                    watch_owner,
+                    watch_running,
+                    watch_batch_identity && !data.is_empty(),
+                    watch_batch_admitted && completed_commands.is_empty(),
+                );
                 self.last_ingest_us = t0.elapsed().as_micros();
                 self.last_ingest_bytes = data.len();
                 if is_active_output
@@ -16484,6 +16504,7 @@ impl Frost {
                 }
             }
             Message::SetOrganismMotion(choice) => {
+                self.organism.reset_watch();
                 self.organism.cancel_live_greeting();
                 self.config.ascii_organism_motion = choice.configured();
                 self.config_dirty = true;
@@ -16541,6 +16562,7 @@ impl Frost {
                         && s.terminal.is_command_running()
                         && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
                 });
+                self.sync_organism_watch();
                 self.organism.tick(owner, running, any_running);
                 let hover_owner = self.organism_owner();
                 let hover_eligible = self.organism_hover_eligible();
@@ -20076,6 +20098,20 @@ impl Frost {
                     && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
             })
             .map(|s| s.id)
+    }
+
+    fn organism_watch_owner(&self) -> Option<usize> {
+        self.organism_owner()
+            .filter(|_| self.config.ascii_organism_motion != Some(organism::Motion::Static))
+    }
+
+    fn sync_organism_watch(&mut self) {
+        let owner = self.organism_watch_owner();
+        let running = self
+            .sessions
+            .get(self.active)
+            .is_some_and(|s| s.terminal.is_command_running());
+        self.organism.observe_watch(owner, running);
     }
 
     fn organism_hover_eligible(&self) -> bool {
@@ -28262,6 +28298,42 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watch_rhythm_uses_only_visible_running_nonempty_admitted_batches() {
+        let source = include_str!("main.rs");
+        let update = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1;
+        let output = update
+            .split_once("            Message::PtyOutput(id, fd, data) => {")
+            .unwrap()
+            .1;
+        let output = output
+            .split_once("                self.last_ingest_us =")
+            .unwrap()
+            .0;
+        assert!(output.contains("s.id == id && s.master_fd == fd"));
+        assert!(
+            output.find("watch_batch_admitted(id)").unwrap()
+                < output.find("process_batch(&data)").unwrap()
+        );
+        assert!(output.contains("watch_batch_admitted && completed_commands.is_empty()"));
+        assert!(output.contains("watch_batch_identity && !data.is_empty(),"));
+        assert!(output.contains("s.terminal.is_command_running()"));
+        assert!(output.contains("self.organism_watch_owner()"));
+        let owner = source
+            .split_once("    fn organism_watch_owner(&self)")
+            .unwrap()
+            .1;
+        let owner = owner
+            .split_once("    fn sync_organism_watch(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("self.organism_owner()"));
+        assert!(owner.contains("Some(organism::Motion::Static)"));
+    }
+
     #[test]
     fn review_insertion_can_reuse_current_command_validation_without_weakening_snapshot_checks() {
         let review = BlockReview {
