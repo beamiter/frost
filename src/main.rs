@@ -16544,7 +16544,8 @@ impl Frost {
                 self.organism.tick(owner, running, any_running);
                 let hover_owner = self.organism_owner();
                 let hover_eligible = self.organism_hover_eligible();
-                self.organism.poll_live_greeting(hover_owner, hover_eligible);
+                self.organism
+                    .poll_live_greeting(hover_owner, hover_eligible);
             }
             Message::SetBottomBar(show) => {
                 self.config.bottom_bar = show;
@@ -26481,24 +26482,24 @@ impl Frost {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
-        if live_visible
-            && self.config.ascii_organism_motion != Some(organism::Motion::Static)
-        {
+        if live_visible && self.config.ascii_organism_motion != Some(organism::Motion::Static) {
             // Observe without consuming or rerouting the original mouse event.
             // Iced supplies no native snapshot of buttons pressed outside this
             // window; only observed button-down/drag state is claimed here.
-            subs.push(iced::event::listen_with(|event, _status, _id| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => {
-                    Some(Message::OrganismPointerButton(button, true))
-                }
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
-                    Some(Message::OrganismPointerButton(button, false))
-                }
-                iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
-                    Some(Message::OrganismPointerLeft)
-                }
-                _ => None,
-            }));
+            subs.push(iced::event::listen_with(
+                |event, _status, _id| match event {
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => {
+                        Some(Message::OrganismPointerButton(button, true))
+                    }
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
+                        Some(Message::OrganismPointerButton(button, false))
+                    }
+                    iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
+                        Some(Message::OrganismPointerLeft)
+                    }
+                    _ => None,
+                },
+            ));
         }
         if self.organism_hover_eligible() {
             if let Some(deadline) = self.organism.live_greeting_deadline() {
