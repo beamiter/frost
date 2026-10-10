@@ -208,6 +208,32 @@ impl SessionLife {
     }
 }
 
+/// Absolute preview deadlines stay stable across unrelated redraws.
+#[derive(Default)]
+struct PreviewDeadlines {
+    greeting_until: Duration,
+    ready_at: Duration,
+}
+
+impl PreviewDeadlines {
+    fn accepted(&mut self, now: Duration) {
+        self.greeting_until = now.saturating_add(GentleInteraction::HOLD);
+        self.ready_at = now.saturating_add(GentleInteraction::COOLDOWN);
+    }
+
+    fn cancel(&mut self) {
+        self.greeting_until = Duration::ZERO;
+    }
+
+    fn next(&self, now: Duration, eligible: bool) -> Option<Duration> {
+        [Some(self.greeting_until), eligible.then_some(self.ready_at)]
+        .into_iter()
+        .flatten()
+        .filter(|deadline| *deadline > now)
+        .min()
+    }
+}
+
 pub struct Organism {
     enabled: bool,
     sessions: HashMap<usize, SessionLife>,
@@ -216,6 +242,7 @@ pub struct Organism {
     retreat_until: Instant,
     pub pose: Pose,
     hello: GentleInteraction,
+    preview_deadlines: PreviewDeadlines,
 }
 
 impl Default for Organism {
@@ -229,6 +256,7 @@ impl Default for Organism {
             retreat_until: now,
             pose: Pose(PreviewPose::Calm),
             hello: GentleInteraction::default(),
+            preview_deadlines: PreviewDeadlines::default(),
         }
     }
 }
@@ -237,7 +265,7 @@ impl Organism {
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.enabled != enabled {
             self.sessions.clear();
-            self.hello.cancel();
+            self.close_preview();
             self.enabled = enabled;
             self.life = WindowLife::new_at(self.born.elapsed());
         }
@@ -353,10 +381,11 @@ impl Organism {
 
     pub fn close_preview(&mut self) {
         self.hello.cancel();
+        self.preview_deadlines.cancel();
     }
 
     pub fn select_pose(&mut self, pose: Pose) {
-        self.hello.cancel();
+        self.close_preview();
         self.pose = pose;
     }
 
@@ -366,9 +395,29 @@ impl Organism {
     }
 
     pub fn say_hello(&mut self) {
-        let _ = self
-            .hello
-            .request(self.born.elapsed(), self.pose.0.context());
+        self.say_hello_at(self.born.elapsed());
+    }
+
+    fn say_hello_at(&mut self, now: Duration) {
+        if self.hello.request(now, self.pose.0.context()) {
+            self.preview_deadlines.accepted(now);
+        }
+    }
+
+    pub fn preview_deadline(&self) -> Option<Instant> {
+        let now = self.born.elapsed();
+        let eligible = GentleInteraction::default().request(now, self.pose.0.context());
+        self.preview_deadlines
+            .next(now, eligible)
+            .map(|deadline| self.born + deadline)
+    }
+
+    pub fn retreat_deadline(&self) -> Option<Instant> {
+        self.retreat_deadline_at(Instant::now())
+    }
+
+    fn retreat_deadline_at(&self, now: Instant) -> Option<Instant> {
+        (now < self.retreat_until).then_some(self.retreat_until)
     }
 
     pub fn pause_clock(&mut self) {
@@ -473,6 +522,93 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn calm_preview_wakes_only_at_absolute_greeting_and_cooldown_deadlines() {
+        let mut deadlines = PreviewDeadlines::default();
+        assert_eq!(deadlines.next(Duration::ZERO, true), None);
+        deadlines.accepted(Duration::from_secs(10));
+        assert_eq!(
+            deadlines.next(Duration::from_secs(10), true),
+            Some(Duration::from_secs(12))
+        );
+        // An unrelated redraw does not restart a relative timer.
+        assert_eq!(
+            deadlines.next(Duration::from_secs(11), true),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            deadlines.next(Duration::from_secs(12), true),
+            Some(Duration::from_secs(18))
+        );
+        assert_eq!(deadlines.next(Duration::from_secs(18), true), None);
+        deadlines.cancel();
+        assert_eq!(deadlines.next(Duration::from_secs(11), false), None);
+        assert_eq!(
+            deadlines.next(Duration::from_secs(11), true),
+            Some(Duration::from_secs(18))
+        );
+    }
+
+    #[test]
+    fn rejected_hello_and_preview_changes_never_extend_or_reset_cooldown() {
+        let mut organism = Organism::default();
+        let state = values(organism.life.state());
+        organism.say_hello_at(Duration::ZERO);
+        organism.say_hello_at(Duration::from_secs(1));
+        assert_eq!(
+            organism.preview_deadlines.greeting_until,
+            GentleInteraction::HOLD
+        );
+        assert_eq!(
+            organism.preview_deadlines.ready_at,
+            GentleInteraction::COOLDOWN
+        );
+        organism.select_pose(Pose(PreviewPose::Working));
+        assert_eq!(organism.preview_deadlines.greeting_until, Duration::ZERO);
+        organism.say_hello_at(Duration::from_secs(3));
+        assert_eq!(
+            organism.preview_deadlines.ready_at,
+            GentleInteraction::COOLDOWN
+        );
+        organism.select_pose(Pose(PreviewPose::Calm));
+        organism.close_preview();
+        organism.set_enabled(true);
+        organism.set_enabled(false);
+        organism.say_hello_at(Duration::from_secs(7));
+        assert_eq!(organism.preview_deadlines.greeting_until, Duration::ZERO);
+        organism.say_hello_at(Duration::from_secs(8));
+        assert_eq!(
+            organism.preview_deadlines.greeting_until,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            organism.preview_deadlines.ready_at,
+            Duration::from_secs(16)
+        );
+        assert_eq!(values(organism.life.state()), state);
+        assert!(organism.sessions.is_empty());
+    }
+
+    #[test]
+    fn retreat_wake_is_exact_and_expires_without_a_second_heartbeat() {
+        let mut organism = Organism::default();
+        let now = organism.born;
+        organism.retreat_until = now + Duration::from_millis(900);
+        assert_eq!(
+            organism.retreat_deadline_at(now + Duration::from_millis(899)),
+            Some(now + Duration::from_millis(900))
+        );
+        assert_eq!(
+            organism.retreat_deadline_at(now + Duration::from_millis(900)),
+            None
+        );
+        organism.retreat_until = now + Duration::from_millis(1500);
+        assert_eq!(
+            organism.retreat_deadline_at(now + Duration::from_millis(900)),
+            Some(now + Duration::from_millis(1500))
+        );
     }
 
     #[test]

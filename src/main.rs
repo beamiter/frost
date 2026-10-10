@@ -26380,14 +26380,30 @@ impl Frost {
             && self.config.ascii_organism_enabled
             && self.config.bottom_bar
             && self.win_size.width >= 640.0;
-        if preview_visible || live_visible {
-            let full = self.config.ascii_organism_motion == Some(organism::Motion::Full)
-                && (preview_visible || self.organism_owner().is_some());
+        let preview_full = preview_visible
+            && self.config.ascii_organism_motion == Some(organism::Motion::Full);
+        if preview_full || live_visible {
+            let full = preview_full
+                || (self.config.ascii_organism_motion == Some(organism::Motion::Full)
+                    && self.organism_owner().is_some());
             let millis = if full { 100 } else { 900 };
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(millis))
                     .map(|_| Message::OrganismTick),
             );
+        }
+        // Calm/Static preview needs only greeting expiry and cooldown wakes.
+        // Absolute keys prevent unrelated redraws from postponing the deadline.
+        if preview_visible && !preview_full {
+            if let Some(deadline) = self.organism.preview_deadline() {
+                subs.push(organism_deadline_subscription(deadline));
+            }
+        }
+        // The dormant 900ms heartbeat must not add another phase of retreat.
+        if self.organism_observation_owner().is_some() {
+            if let Some(deadline) = self.organism.retreat_deadline() {
+                subs.push(organism_deadline_subscription(deadline));
+            }
         }
         // A right-press on a tab carries no coordinates, so the context menu
         // needs the pointer tracked separately. Track it only while a tab is
@@ -27395,6 +27411,16 @@ fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
     ));
     output.extend_from_slice(&osc_5522_packet("type=read:status=DONE", None));
     output
+}
+
+fn organism_deadline_subscription(deadline: std::time::Instant) -> Subscription<Message> {
+    Subscription::run_with(deadline, |deadline| {
+        let deadline = *deadline;
+        iced::futures::stream::once(async move {
+            tokio::time::sleep_until(deadline.into()).await;
+            Message::OrganismTick
+        })
+    })
 }
 
 fn pty_subscription(key: PtySubscriptionKey) -> Subscription<Message> {
@@ -34448,6 +34474,33 @@ mod tests {
                 Some(vec![control])
             );
         }
+    }
+
+    #[test]
+    fn organism_preview_and_retreat_use_one_shot_deadlines() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let subscription = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subscription.contains("if preview_full || live_visible"));
+        assert!(subscription.contains("if preview_visible && !preview_full"));
+        assert!(subscription.contains("self.organism.preview_deadline()"));
+        assert!(subscription.contains("self.organism_observation_owner().is_some()"));
+        assert!(subscription.contains("self.organism.retreat_deadline()"));
+        let deadline = source
+            .split_once("fn organism_deadline_subscription(")
+            .unwrap()
+            .1
+            .split_once("fn pty_subscription(")
+            .unwrap()
+            .0;
+        assert!(deadline.contains("Subscription::run_with(deadline"));
+        assert!(deadline.contains("stream::once"));
+        assert!(deadline.contains("sleep_until(deadline.into())"));
     }
 
     #[test]
