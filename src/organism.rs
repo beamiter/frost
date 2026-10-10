@@ -4,6 +4,7 @@
 //! host supplies one-shot completed commands and a content-free running flag.
 //! Stable live Start identities are not public in Frost's terminal boundary,
 //! so watching is display-only: no synthetic `command_started` is generated.
+use crate::organism_hover::LiveGreeting;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -250,6 +251,7 @@ pub struct Organism {
     pub pose: Pose,
     hello: GentleInteraction,
     preview_deadlines: PreviewDeadlines,
+    live_greeting: LiveGreeting,
 }
 
 impl Default for Organism {
@@ -264,6 +266,7 @@ impl Default for Organism {
             pose: Pose(PreviewPose::Calm),
             hello: GentleInteraction::default(),
             preview_deadlines: PreviewDeadlines::default(),
+            live_greeting: LiveGreeting::default(),
         }
     }
 }
@@ -273,6 +276,7 @@ impl Organism {
         if self.enabled != enabled {
             self.sessions.clear();
             self.close_preview();
+            self.cancel_live_greeting();
             self.enabled = enabled;
             self.life = WindowLife::new_at(self.born.elapsed());
         }
@@ -293,6 +297,9 @@ impl Organism {
     }
 
     pub fn set_remote(&mut self, id: usize, remote: bool) {
+        if remote {
+            self.live_greeting.cancel_owner(id);
+        }
         if let Some(life) = self.sessions.get_mut(&id) {
             life.remote = remote;
             life.next_remote_probe = Instant::now() + Duration::from_millis(900);
@@ -304,6 +311,7 @@ impl Organism {
     }
 
     pub fn forget_session(&mut self, id: usize) {
+        self.live_greeting.cancel_owner(id);
         self.sessions.remove(&id);
     }
 
@@ -335,6 +343,7 @@ impl Organism {
             life.accept_completion = true;
             return;
         }
+        self.live_greeting.cancel_owner(id);
         let now = Instant::now();
         life.native.sync_state(self.life.state());
         let reaction = life
@@ -351,6 +360,9 @@ impl Organism {
     }
 
     pub fn batch_finished(&mut self, id: usize, running: bool) {
+        if running {
+            self.live_greeting.cancel_owner(id);
+        }
         if let Some(life) = self.sessions.get_mut(&id) {
             if life.quarantine_batch {
                 life.quarantine_batch = false;
@@ -379,6 +391,7 @@ impl Organism {
 
     /// Presentation-only retreat also serves blur and attempted gestures.
     pub fn retreat(&mut self) {
+        self.cancel_live_greeting();
         self.retreat_until = Instant::now() + Duration::from_millis(900);
     }
 
@@ -438,6 +451,7 @@ impl Organism {
     }
 
     pub fn pause_clock(&mut self) {
+        self.cancel_live_greeting();
         self.life
             .advance(self.born.elapsed(), false, false, CircadianPhase::Unlearned);
     }
@@ -472,6 +486,59 @@ impl Organism {
         }
     }
 
+    pub fn cancel_live_greeting(&mut self) {
+        self.live_greeting.cancel();
+    }
+
+    pub fn leave_live_greeting(&mut self) {
+        self.live_greeting.leave();
+    }
+
+    pub fn live_greeting_exit_reference(&self, id: usize) -> (usize, u64) {
+        self.live_greeting
+            .exit_reference()
+            .unwrap_or((id, self.live_greeting.epoch()))
+    }
+
+    pub fn exit_live_greeting(&mut self, id: usize, epoch: u64) {
+        self.live_greeting.exit(id, epoch);
+    }
+
+    pub fn live_greeting_epoch(&self) -> u64 {
+        self.live_greeting.epoch()
+    }
+
+    pub fn enter_live_greeting(&mut self, id: usize, epoch: u64, eligible: bool) {
+        if let Some(life) = self.sessions.get(&id) {
+            self.live_greeting.enter(
+                id,
+                epoch,
+                self.born.elapsed(),
+                life.context,
+                eligible && self.enabled && !life.remote,
+            );
+        }
+    }
+
+    pub fn poll_live_greeting(&mut self, owner: Option<usize>, eligible: bool) {
+        let context = owner
+            .and_then(|id| self.sessions.get(&id))
+            .map(|life| life.context)
+            .unwrap_or_else(|| PreviewPose::Calm.context());
+        self.live_greeting.advance(
+            owner,
+            self.born.elapsed(),
+            context,
+            self.enabled && eligible,
+        );
+    }
+
+    pub fn live_greeting_deadline(&self) -> Option<Instant> {
+        self.live_greeting
+            .deadline(self.born.elapsed())
+            .map(|deadline| self.born + deadline)
+    }
+
     fn frame(&self, motion: Option<Motion>) -> u64 {
         if motion == Some(Motion::Full) {
             self.born.elapsed().as_millis() as u64 / 100
@@ -504,6 +571,11 @@ impl Organism {
         let context = RenderContext {
             body_language: BodyLanguage::from_state(self.life.state()),
             ..context
+        };
+        let context = if running || motion == Some(Motion::Static) {
+            context
+        } else {
+            self.live_greeting.apply(id, self.born.elapsed(), context)
         };
         (
             sticky_glyph_with_context(context, self.frame(motion)).into_owned(),
@@ -548,6 +620,60 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn live_greeting_has_no_physiology_or_preview_side_effects() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        let before = values(organism.life.state());
+        let preview_ready = organism.preview_deadlines.ready_at;
+        organism.live_greeting.enter(
+            1,
+            organism.live_greeting.epoch(),
+            Duration::ZERO,
+            PreviewPose::Calm.context(),
+            true,
+        );
+        organism.live_greeting.advance(
+            Some(1),
+            Duration::from_millis(600),
+            PreviewPose::Calm.context(),
+            true,
+        );
+        let _ = organism.presentation(1, false, false, Some(Motion::Calm));
+        assert_eq!(values(organism.life.state()), before);
+        assert_eq!(organism.preview_deadlines.ready_at, preview_ready);
+        assert_eq!(
+            organism.hello_availability_at(Duration::ZERO),
+            HelloAvailability::Available
+        );
+    }
+
+    #[test]
+    fn background_session_events_do_not_cancel_the_frontmost_greeting() {
+        for event in ["remote", "forget", "completed", "running"] {
+            for target in [1, 2] {
+                let mut organism = Organism::default();
+                organism.set_enabled(true);
+                for id in [1, 2] {
+                    organism.prime_session(id, false);
+                    organism.set_remote(id, false);
+                    organism.batch_finished(id, false);
+                }
+                organism.enter_live_greeting(1, organism.live_greeting_epoch(), true);
+                assert!(organism.live_greeting_deadline().is_some());
+                match event {
+                    "remote" => organism.set_remote(target, true),
+                    "forget" => organism.forget_session(target),
+                    "completed" => organism.completed(target, "cargo test", Some(0), Some(1)),
+                    _ => organism.batch_finished(target, true),
+                }
+                assert_eq!(organism.live_greeting_deadline().is_some(), target == 2);
+            }
+        }
     }
 
     #[test]

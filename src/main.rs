@@ -29,6 +29,7 @@ mod kitty_graphics;
 mod link;
 mod native_enter;
 mod organism;
+mod organism_hover;
 mod persistence;
 mod pty;
 mod remote_fs;
@@ -3837,6 +3838,10 @@ enum Message {
     SetOrganismPose(organism::Pose),
     OrganismHello,
     OrganismTick,
+    OrganismHoverEnter(usize, u64),
+    OrganismHoverExit(usize, u64),
+    OrganismPointerButton(iced::mouse::Button, bool),
+    OrganismPointerLeft,
     ThemeEditOpen,
     ThemeEditClose,
     ThemeEditName(String),
@@ -5022,6 +5027,7 @@ fn overlay_release_disposition(
 struct Frost {
     config: Config,
     organism: organism::Organism,
+    organism_pointer_buttons: Vec<iced::mouse::Button>,
     theme: Theme,
     metrics: Metrics,
     sessions: Vec<Session>,
@@ -5393,6 +5399,7 @@ impl Frost {
         let mut app = Frost {
             config,
             organism: organism::Organism::default(),
+            organism_pointer_buttons: Vec::new(),
             theme,
             metrics,
             sessions,
@@ -7271,6 +7278,7 @@ impl Frost {
     /// Refresh every cache/state object whose coordinates belong to the active
     /// session. All tab/pane activation paths call this before accepting input.
     fn refresh_active_context(&mut self) {
+        self.organism.cancel_live_greeting();
         self.links_cache_key = None;
         if self.search.is_open {
             let reflow_pending = self
@@ -13509,6 +13517,7 @@ impl Frost {
             .set_enabled(self.config.ascii_organism_enabled);
         if self.organism_observation_owner().is_none() {
             self.organism.pause_clock();
+            self.organism_pointer_buttons.clear();
         }
         if !self.config_panel_open || self.theme_editor.is_some() {
             self.organism.close_preview();
@@ -15362,6 +15371,7 @@ impl Frost {
             }
             Message::Focus(f) => {
                 if !f {
+                    self.organism_pointer_buttons.clear();
                     self.cancel_layout_drags();
                     self.hovered_tab = None;
                     self.terminal_mouse_gestures = [None; 3];
@@ -16474,6 +16484,7 @@ impl Frost {
                 }
             }
             Message::SetOrganismMotion(choice) => {
+                self.organism.cancel_live_greeting();
                 self.config.ascii_organism_motion = choice.configured();
                 self.config_dirty = true;
             }
@@ -16482,6 +16493,27 @@ impl Frost {
                 if self.config_panel_open && self.theme_editor.is_none() {
                     self.organism.say_hello();
                 }
+            }
+            Message::OrganismHoverEnter(id, epoch) => {
+                if self.organism_owner() == Some(id) {
+                    let eligible = self.organism_hover_eligible();
+                    self.organism.enter_live_greeting(id, epoch, eligible);
+                }
+            }
+            Message::OrganismHoverExit(id, epoch) => self.organism.exit_live_greeting(id, epoch),
+            Message::OrganismPointerButton(button, pressed) => {
+                organism_hover::update_pressed_button(
+                    &mut self.organism_pointer_buttons,
+                    button,
+                    pressed,
+                );
+                if pressed {
+                    self.organism.cancel_live_greeting();
+                }
+            }
+            Message::OrganismPointerLeft => {
+                self.organism_pointer_buttons.clear();
+                self.organism.leave_live_greeting();
             }
             Message::OrganismTick => {
                 if self.config.ascii_organism_enabled {
@@ -16510,6 +16542,9 @@ impl Frost {
                         && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
                 });
                 self.organism.tick(owner, running, any_running);
+                let hover_owner = self.organism_owner();
+                let hover_eligible = self.organism_hover_eligible();
+                self.organism.poll_live_greeting(hover_owner, hover_eligible);
             }
             Message::SetBottomBar(show) => {
                 self.config.bottom_bar = show;
@@ -20042,6 +20077,21 @@ impl Frost {
             .map(|s| s.id)
     }
 
+    fn organism_hover_eligible(&self) -> bool {
+        self.organism_owner().is_some()
+            && self.config.ascii_organism_motion != Some(organism::Motion::Static)
+            && self.organism_pointer_buttons.is_empty()
+            && self.dragging_tab.is_none()
+            && self.pane_drag.is_none()
+            && self.dragging_divider.is_none()
+            && !self.dragging_sidebar
+            && self.terminal_mouse_gestures.iter().all(Option::is_none)
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| !session.terminal.is_command_running())
+    }
+
     fn status_bar(&self) -> Element<'_, Message> {
         let sess = self.sessions.get(self.active);
         let cwd = sess
@@ -20105,6 +20155,18 @@ impl Frost {
                 slot.into()
             } else {
                 tooltip(slot, text(explanation).size(11), tooltip::Position::Top).into()
+            };
+            let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
+                let (exit_id, exit_epoch) = self.organism.live_greeting_exit_reference(id);
+                mouse_area(slot)
+                    .on_enter(Message::OrganismHoverEnter(
+                        id,
+                        self.organism.live_greeting_epoch(),
+                    ))
+                    .on_exit(Message::OrganismHoverExit(exit_id, exit_epoch))
+                    .into()
+            } else {
+                slot
             };
             right = right.push(slot);
         }
@@ -26416,6 +26478,30 @@ impl Frost {
         // The dormant 900ms heartbeat must not add another phase of retreat.
         if self.organism_observation_owner().is_some() {
             if let Some(deadline) = self.organism.retreat_deadline() {
+                subs.push(organism_deadline_subscription(deadline));
+            }
+        }
+        if live_visible
+            && self.config.ascii_organism_motion != Some(organism::Motion::Static)
+        {
+            // Observe without consuming or rerouting the original mouse event.
+            // Iced supplies no native snapshot of buttons pressed outside this
+            // window; only observed button-down/drag state is claimed here.
+            subs.push(iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => {
+                    Some(Message::OrganismPointerButton(button, true))
+                }
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
+                    Some(Message::OrganismPointerButton(button, false))
+                }
+                iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
+                    Some(Message::OrganismPointerLeft)
+                }
+                _ => None,
+            }));
+        }
+        if self.organism_hover_eligible() {
+            if let Some(deadline) = self.organism.live_greeting_deadline() {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
@@ -34488,6 +34574,55 @@ mod tests {
                 Some(vec![control])
             );
         }
+    }
+
+    #[test]
+    fn live_hover_is_passive_owner_bound_and_deadline_driven() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .1
+            .split_once("    fn jsh_notice(")
+            .unwrap()
+            .0;
+        assert!(bar.contains("Length::Fixed(84.0)"));
+        assert!(bar.contains(".on_enter(Message::OrganismHoverEnter("));
+        assert!(bar.contains("self.organism.live_greeting_epoch()"));
+        assert!(bar.contains(".on_exit(Message::OrganismHoverExit(exit_id, exit_epoch))"));
+        assert!(!bar.contains(".on_press("));
+        assert!(!bar.contains("write_pty"));
+        let eligible = source
+            .split_once("    fn organism_hover_eligible(")
+            .unwrap()
+            .1
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .0;
+        assert!(eligible.contains("self.organism_owner().is_some()"));
+        assert!(eligible.contains("Some(organism::Motion::Static)"));
+        assert!(eligible.contains("self.organism_pointer_buttons.is_empty()"));
+        assert!(eligible.contains("self.terminal_mouse_gestures.iter().all(Option::is_none)"));
+        assert!(eligible.contains("!session.terminal.is_command_running()"));
+        let hover = source
+            .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismTick => {")
+            .unwrap()
+            .0;
+        assert!(hover.contains("self.organism_owner() == Some(id)"));
+        assert!(!hover.contains("write_pty"));
+        assert!(!hover.contains("set_focus"));
+        let subscriptions = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subscriptions.contains("if self.organism_hover_eligible()"));
+        assert!(subscriptions.contains("self.organism.live_greeting_deadline()"));
     }
 
     #[test]
