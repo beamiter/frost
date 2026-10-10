@@ -22440,9 +22440,21 @@ impl Frost {
             .into_iter()
             .map(organism::Pose)
             .collect();
+        let availability = self.organism.hello_availability();
         let mut hello_button = button(text("Say hello"));
-        if self.organism.can_say_hello() {
+        if availability == organism::HelloAvailability::Available {
             hello_button = hello_button.on_press(Message::OrganismHello);
+        }
+        let mut hello_controls = column![hello_button].spacing(4);
+        match availability {
+            organism::HelloAvailability::Busy => {
+                hello_controls = hello_controls.push(text("Unavailable for this pose").size(11));
+            }
+            organism::HelloAvailability::CoolingDown => {
+                hello_controls =
+                    hello_controls.push(text("Wait for the greeting cooldown").size(11));
+            }
+            organism::HelloAvailability::Available => {}
         }
         column![
             checkbox(self.config.ascii_organism_enabled).label("ASCII Organism")
@@ -22459,7 +22471,7 @@ impl Frost {
             container(text(self.organism.preview(self.config.ascii_organism_motion))
                 .font(self.mono).size(13))
                 .width(Length::Fixed(200.0)).height(Length::Fixed(72.0)),
-            hello_button,
+            hello_controls,
             text("Preview is isolated: no command, terminal input, life change, or saved memory.").size(11),
         ].spacing(8).into()
     }

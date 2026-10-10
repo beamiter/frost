@@ -208,6 +208,13 @@ impl SessionLife {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloAvailability {
+    Busy,
+    CoolingDown,
+    Available,
+}
+
 /// Absolute preview deadlines stay stable across unrelated redraws.
 #[derive(Default)]
 struct PreviewDeadlines {
@@ -389,9 +396,19 @@ impl Organism {
         self.pose = pose;
     }
 
-    pub fn can_say_hello(&self) -> bool {
-        let mut hello = self.hello.clone();
-        hello.request(self.born.elapsed(), self.pose.0.context())
+    pub fn hello_availability(&self) -> HelloAvailability {
+        self.hello_availability_at(self.born.elapsed())
+    }
+
+    fn hello_availability_at(&self, now: Duration) -> HelloAvailability {
+        let context = self.pose.0.context();
+        if !GentleInteraction::default().request(now, context) {
+            HelloAvailability::Busy
+        } else if self.hello.clone().request(now, context) {
+            HelloAvailability::Available
+        } else {
+            HelloAvailability::CoolingDown
+        }
     }
 
     pub fn say_hello(&mut self) {
@@ -522,6 +539,49 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn hello_availability_is_read_only_and_explains_busy_and_cooldown() {
+        let mut organism = Organism::default();
+        for _ in 0..3 {
+            assert_eq!(
+                organism.hello_availability_at(Duration::ZERO),
+                HelloAvailability::Available
+            );
+        }
+        organism.say_hello_at(Duration::ZERO);
+        assert_eq!(
+            organism.hello_availability_at(Duration::from_secs(1)),
+            HelloAvailability::CoolingDown
+        );
+        assert_eq!(
+            organism.hello_availability_at(Duration::from_secs(8)),
+            HelloAvailability::Available
+        );
+        // Reading the future must not advance the real attention clock.
+        organism.say_hello_at(Duration::from_secs(1));
+        assert_eq!(
+            organism.preview_deadlines.ready_at,
+            GentleInteraction::COOLDOWN
+        );
+        organism.select_pose(Pose(PreviewPose::Working));
+        assert_eq!(
+            organism.hello_availability_at(Duration::from_secs(8)),
+            HelloAvailability::Busy
+        );
+        organism.select_pose(Pose(PreviewPose::Calm));
+        organism.close_preview();
+        organism.set_enabled(true);
+        organism.set_enabled(false);
+        assert_eq!(
+            organism.hello_availability_at(Duration::from_secs(7)),
+            HelloAvailability::CoolingDown
+        );
+        assert_eq!(
+            organism.hello_availability_at(Duration::from_secs(8)),
+            HelloAvailability::Available
+        );
     }
 
     #[test]
