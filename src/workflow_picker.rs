@@ -3,7 +3,7 @@
 //! parameter dialog.
 //!
 //! The picker fuzzy-searches the loaded workflow list; accepting a workflow
-//! without arguments renders and inserts it at the active prompt for review,
+//! without arguments renders and inserts it at its opening session’s prompt for review,
 //! while one with arguments opens the per-argument form. Nothing ever
 //! executes: the rendered command goes through the same `PromptRecall` review
 //! boundary as history recall.
@@ -92,14 +92,16 @@ pub(crate) struct WorkflowChoice {
 }
 
 pub(crate) struct WorkflowPickerState {
+    target_session_id: usize,
     widget_identity: Arc<()>,
     picker: WorkflowPicker,
     snapshot: u64,
 }
 
 impl WorkflowPickerState {
-    pub(crate) fn new(entries: Vec<Workflow>) -> Self {
+    pub(crate) fn new(target_session_id: usize, entries: Vec<Workflow>) -> Self {
         Self {
+            target_session_id,
             widget_identity: Arc::new(()),
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             snapshot: NEXT_PICKER_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -108,15 +110,19 @@ impl WorkflowPickerState {
 
     /// 从全部搜索路径加载。缺失/损坏的文件被 `jterm_core::workflows` 记录并
     /// 跳过，这里得到的只是更短的列表而不是错误。
-    pub(crate) fn load() -> Self {
-        Self::load_from(&workflows::workflow_dirs())
+    pub(crate) fn load(target_session_id: usize) -> Self {
+        Self::load_from(target_session_id, &workflows::workflow_dirs())
     }
 
     /// Test seam (and any future caller with an explicit search path). 顺序由
     /// `workflows::load_library_from` 钉死为目录优先级顺序——`filtered()` 的
     /// 空查询分支直接暴露它。
-    pub(crate) fn load_from(dirs: &[std::path::PathBuf]) -> Self {
-        Self::new(workflows::load_library_from(dirs))
+    pub(crate) fn load_from(target_session_id: usize, dirs: &[std::path::PathBuf]) -> Self {
+        Self::new(target_session_id, workflows::load_library_from(dirs))
+    }
+
+    pub(crate) fn target_session_id(&self) -> usize {
+        self.target_session_id
     }
 
     /// Retained widget state belongs to this opening, not a filtered row position.
@@ -256,6 +262,7 @@ pub(crate) struct WorkflowArgsAttempt {
 /// 是"未填写"，渲染时报 `missing values:`，[`Self::missing`] 让视图在按下
 /// Insert 之前就把这些行标出来。
 pub(crate) struct WorkflowArgsState {
+    target_session_id: usize,
     identity: WorkflowArgsIdentity,
     pending: Option<Arc<()>>,
     form: ArgsForm,
@@ -264,13 +271,18 @@ pub(crate) struct WorkflowArgsState {
 }
 
 impl WorkflowArgsState {
-    pub(crate) fn new(workflow: Workflow) -> Self {
+    pub(crate) fn new(target_session_id: usize, workflow: Workflow) -> Self {
         Self {
+            target_session_id,
             identity: WorkflowArgsIdentity::default(),
             pending: None,
             form: ArgsForm::new(workflow),
             feedback: None,
         }
+    }
+
+    pub(crate) fn target_session_id(&self) -> usize {
+        self.target_session_id
     }
 
     /// Each opening owns its immutable parameter shape. Edits and resets keep
@@ -419,7 +431,52 @@ mod tests {
             description: String::new(),
             default: Some("default".into()),
         }];
-        WorkflowArgsState::new(definition)
+        WorkflowArgsState::new(0, definition)
+    }
+
+    #[test]
+    fn workflow_opening_target_does_not_follow_replacement_active_session() {
+        let definition = argument_form("A").workflow().clone();
+        let picker = WorkflowPickerState::new(41, vec![definition]);
+        let mut form = WorkflowArgsState::new(
+            picker.target_session_id(),
+            picker.selected_workflow().unwrap().clone(),
+        );
+        form.set_value(0, "keep draft".into());
+        let remaining_sessions = [73_usize];
+        let replacement_active = remaining_sessions[0];
+        assert_ne!(form.target_session_id(), replacement_active);
+        assert!(!remaining_sessions.contains(&form.target_session_id()));
+        let attempt = form.begin_delivery().unwrap();
+        assert!(form.reject_delivery(
+            &attempt,
+            "the terminal session is no longer available".into()
+        ));
+        assert_eq!(form.value(0), "keep draft");
+        assert_eq!(form.target_session_id(), 41);
+    }
+
+    #[test]
+    fn workflow_query_and_background_removal_preserve_opening_target() {
+        let definition = argument_form("A").workflow().clone();
+        let mut picker = WorkflowPickerState::new(41, vec![definition]);
+        picker.set_query("A");
+        picker.select_next();
+        let mut sessions = vec![41_usize, 73];
+        sessions.retain(|&id| id != 73);
+        assert_eq!(
+            sessions
+                .iter()
+                .copied()
+                .find(|&id| id == picker.target_session_id()),
+            Some(41)
+        );
+        let form = WorkflowArgsState::new(
+            picker.target_session_id(),
+            picker.selected_workflow().unwrap().clone(),
+        );
+        assert_eq!(form.target_session_id(), 41);
+        assert_eq!(picker.target_session_id(), 41);
     }
 
     #[test]
@@ -469,8 +526,8 @@ mod tests {
 
     #[test]
     fn picker_query_callbacks_belong_to_their_opening_and_keep_typing_identity() {
-        let old = WorkflowPickerState::new(vec![workflow("A", "", &[])]);
-        let mut current = WorkflowPickerState::new(vec![workflow("A", "", &[])]);
+        let old = WorkflowPickerState::new(0, vec![workflow("A", "", &[])]);
+        let mut current = WorkflowPickerState::new(0, vec![workflow("A", "", &[])]);
         let identity = current.widget_identity();
         assert!(!current.set_query_from_snapshot(old.snapshot_identity(), "stale".into()));
         assert_eq!(current.query(), "");
@@ -487,17 +544,16 @@ mod tests {
 
     #[test]
     fn picker_backdrop_close_only_accepts_its_current_opening() {
-        let picker = WorkflowPickerState::new(vec![workflow("A", "", &[])]);
+        let picker = WorkflowPickerState::new(0, vec![workflow("A", "", &[])]);
         let snapshot = picker.snapshot_identity();
         let current = WorkflowOverlay::Picker(Box::new(picker));
         assert!(current.accepts_picker_close(snapshot));
         let args = WorkflowOverlay::Args(Box::new(argument_form("A")));
         assert!(!args.accepts_picker_close(snapshot));
-        let reopened = WorkflowOverlay::Picker(Box::new(WorkflowPickerState::new(vec![workflow(
-            "A",
-            "",
-            &[],
-        )])));
+        let reopened = WorkflowOverlay::Picker(Box::new(WorkflowPickerState::new(
+            0,
+            vec![workflow("A", "", &[])],
+        )));
         assert!(!reopened.accepts_picker_close(snapshot));
     }
 
@@ -570,7 +626,7 @@ mod tests {
         }];
         first.source_path = Some(PathBuf::from("/original/alpha.yaml"));
         let mut state =
-            WorkflowPickerState::new(vec![first.clone(), workflow("beta", "other", &[])]);
+            WorkflowPickerState::new(0, vec![first.clone(), workflow("beta", "other", &[])]);
         state.set_query("alpha");
         let choice = state.choice_for(state.filtered()[0]).unwrap();
         state.set_query("beta");
@@ -585,9 +641,9 @@ mod tests {
     #[test]
     fn queued_choice_cannot_retarget_a_reopened_picker_or_foreign_entry() {
         let entry = workflow("same name", "", &[]);
-        let first = WorkflowPickerState::new(vec![entry.clone()]);
+        let first = WorkflowPickerState::new(0, vec![entry.clone()]);
         let choice = first.choice_for(first.filtered()[0]).unwrap();
-        let second = WorkflowPickerState::new(vec![entry.clone()]);
+        let second = WorkflowPickerState::new(0, vec![entry.clone()]);
         assert!(second.resolve_choice(choice).is_none());
         assert!(first.choice_for(&entry).is_none());
         assert!(first
@@ -603,7 +659,7 @@ mod tests {
         let entries = (0..MAX_RESULTS + 5)
             .map(|i| workflow(&format!("wf-{i:02}"), "", &[]))
             .collect();
-        let state = WorkflowPickerState::new(entries);
+        let state = WorkflowPickerState::new(0, entries);
         let filtered = state.filtered();
         assert_eq!(filtered.len(), MAX_RESULTS);
         assert_eq!(filtered[0].name, "wf-00");
@@ -615,12 +671,15 @@ mod tests {
 
     #[test]
     fn fuzzy_query_matches_name_description_and_tags() {
-        let mut state = WorkflowPickerState::new(vec![
-            workflow("Deploy to staging", "", &[]),
-            workflow("Ship it", "run the deploy playbook", &[]),
-            workflow("Tunnel", "ssh forward", &["deploy", "net"]),
-            workflow("Unrelated", "nothing", &[]),
-        ]);
+        let mut state = WorkflowPickerState::new(
+            0,
+            vec![
+                workflow("Deploy to staging", "", &[]),
+                workflow("Ship it", "run the deploy playbook", &[]),
+                workflow("Tunnel", "ssh forward", &["deploy", "net"]),
+                workflow("Unrelated", "nothing", &[]),
+            ],
+        );
         state.set_query("deploy");
         let names: Vec<&str> = state.filtered().iter().map(|wf| wf.name.as_str()).collect();
         assert_eq!(
@@ -634,7 +693,7 @@ mod tests {
     #[test]
     fn selection_wraps_and_click_index_resolves() {
         let mut state =
-            WorkflowPickerState::new(vec![workflow("one", "", &[]), workflow("two", "", &[])]);
+            WorkflowPickerState::new(0, vec![workflow("one", "", &[]), workflow("two", "", &[])]);
         state.select_prev();
         assert_eq!(state.selected(), 1);
         assert_eq!(
@@ -648,7 +707,7 @@ mod tests {
 
     #[test]
     fn iced_query_input_crosses_the_shared_query_boundary() {
-        let mut state = WorkflowPickerState::new(vec![workflow("alpha", "", &[])]);
+        let mut state = WorkflowPickerState::new(0, vec![workflow("alpha", "", &[])]);
         state.set_query(format!(
             "{}\nignored",
             "x".repeat(jterm_core::workflows::MAX_PICKER_QUERY_BYTES + 16)
@@ -682,13 +741,13 @@ mod tests {
         std::fs::write(dir.join("a.yaml"), "name: A\ncommand: echo a\n").unwrap();
         std::fs::write(dir.join("broken.yaml"), "name: [not\n").unwrap();
 
-        let state = WorkflowPickerState::load_from(std::slice::from_ref(&dir));
+        let state = WorkflowPickerState::load_from(0, std::slice::from_ref(&dir));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(state.filtered().len(), 1);
         assert_eq!(state.selected_workflow().unwrap().name, "A");
 
         let missing = PathBuf::from("/nonexistent/frost/workflows/never");
-        assert!(WorkflowPickerState::load_from(std::slice::from_ref(&missing)).is_empty());
+        assert!(WorkflowPickerState::load_from(0, std::slice::from_ref(&missing)).is_empty());
     }
 
     #[test]
@@ -713,7 +772,7 @@ mod tests {
             ],
             source_path: None,
         };
-        let mut form = WorkflowArgsState::new(workflow);
+        let mut form = WorkflowArgsState::new(0, workflow);
         assert_eq!(form.value(0), "api");
         assert_eq!(form.value(1), "");
 
@@ -788,7 +847,7 @@ mod tests {
 
     #[test]
     fn workflow_feedback_replaces_controls_and_stays_bounded() {
-        let mut form = WorkflowArgsState::new(workflow("echo", "", &[]));
+        let mut form = WorkflowArgsState::new(0, workflow("echo", "", &[]));
         form.set_feedback(format!(
             "Workflow could not be rendered: \u{1b}[31m\u{202e}{}",
             "x".repeat(400)

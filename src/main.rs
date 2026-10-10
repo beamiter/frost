@@ -11166,8 +11166,11 @@ impl Frost {
     /// palette so both entry points behave identically. The load is bounded
     /// and synchronous, the same seam as `open_history_picker`.
     fn open_workflow_picker(&mut self) -> Task<Message> {
+        let Some(id) = self.sessions.get(self.active).map(|session| session.id) else {
+            return Task::none();
+        };
         self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Picker(Box::new(
-            workflow_picker::WorkflowPickerState::load(),
+            workflow_picker::WorkflowPickerState::load(id),
         )));
         iced::widget::operation::focus(WORKFLOW_PICKER_INPUT_ID.clone())
     }
@@ -11175,26 +11178,35 @@ impl Frost {
     /// Resolve a click against the picker snapshot that rendered its row.
     /// Keyboard confirmation still uses the latest filtered selection.
     fn accept_workflow_choice(&mut self, choice: workflow_picker::WorkflowChoice) -> Task<Message> {
-        let workflow = match self.workflow_overlay.as_ref() {
-            Some(workflow_picker::WorkflowOverlay::Picker(state)) => {
-                state.resolve_choice(choice).cloned()
-            }
+        let selection = match self.workflow_overlay.as_ref() {
+            Some(workflow_picker::WorkflowOverlay::Picker(state)) => state
+                .resolve_choice(choice)
+                .cloned()
+                .map(|workflow| (state.target_session_id(), workflow)),
             _ => None,
         };
-        let Some(workflow) = workflow else {
+        let Some((target_session_id, workflow)) = selection else {
             return Task::none();
         };
-        self.accept_workflow(workflow)
+        self.accept_workflow(target_session_id, workflow)
     }
 
     /// Render-and-insert or open the argument form for one chosen workflow.
-    fn accept_workflow(&mut self, workflow: workflows::Workflow) -> Task<Message> {
+    fn accept_workflow(
+        &mut self,
+        target_session_id: usize,
+        workflow: workflows::Workflow,
+    ) -> Task<Message> {
         if workflow.args.is_empty() {
             self.workflow_overlay = None;
             return match workflows::render(&workflow, &std::collections::HashMap::new())
                 .and_then(crate::workflow_picker::insertable_rendered_command)
             {
-                Ok(command) => self.recall_into_active_pane(command),
+                Ok(command) => {
+                    self.native_enter_ownership.lock().claim_pressed();
+                    self.prompt_recall_enter_latch.begin_recall();
+                    Task::done(Message::PromptRecall(target_session_id, command))
+                }
                 Err(error) => {
                     log::warn!("workflow render failed: {error}");
                     self.push_toast(
@@ -11206,7 +11218,7 @@ impl Frost {
             };
         }
         self.workflow_overlay = Some(workflow_picker::WorkflowOverlay::Args(Box::new(
-            workflow_picker::WorkflowArgsState::new(workflow),
+            workflow_picker::WorkflowArgsState::new(target_session_id, workflow),
         )));
         iced::widget::operation::focus(WORKFLOW_ARG_INPUT_ID.clone())
             .chain(workflow_focus::reveal())
@@ -11236,15 +11248,11 @@ impl Frost {
         // Preserve the ordinary recall's Enter ownership before deferred checks.
         self.native_enter_ownership.lock().claim_pressed();
         self.prompt_recall_enter_latch.begin_recall();
-        let target = self.sessions.get(self.active).map(|session| session.id);
         let Some(workflow_picker::WorkflowOverlay::Args(form)) = self.workflow_overlay.as_mut()
         else {
             return Task::none();
         };
-        let Some(id) = target else {
-            form.set_feedback("Workflow not inserted: the terminal session is no longer available");
-            return workflow_focus::reveal_error();
-        };
+        let id = form.target_session_id();
         let Some(attempt) = form.begin_delivery() else {
             return Task::none();
         };
@@ -11366,8 +11374,9 @@ impl Frost {
                     }
                     Key::Named(Named::Enter) => {
                         let workflow = state.selected_workflow().cloned();
+                        let target_session_id = state.target_session_id();
                         return Some(match workflow {
-                            Some(workflow) => self.accept_workflow(workflow),
+                            Some(workflow) => self.accept_workflow(target_session_id, workflow),
                             None => Task::none(),
                         });
                     }
@@ -28663,6 +28672,42 @@ fn xterm_modify_other_keys_encode(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workflow_target_is_captured_at_opening_and_carried_through_both_accept_routes() {
+        let source = include_str!("main.rs");
+        let opening = source
+            .split_once("    fn open_workflow_picker(")
+            .unwrap()
+            .1
+            .split_once("    /// Resolve a click")
+            .unwrap()
+            .0;
+        assert!(opening.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(opening.contains("WorkflowPickerState::load(id)"));
+        let accept = source
+            .split_once("    fn accept_workflow_choice(")
+            .unwrap()
+            .1
+            .split_once("    /// Workflow overlay key handling.")
+            .unwrap()
+            .0;
+        assert!(accept.contains("(state.target_session_id(), workflow)"));
+        assert!(accept.contains("WorkflowArgsState::new(target_session_id, workflow)"));
+        assert!(accept.contains("Message::PromptRecall(target_session_id, command)"));
+        assert!(accept.contains("let id = form.target_session_id();"));
+        assert!(!accept.contains("self.active"));
+        assert!(!accept.contains("recall_into_active_pane"));
+        let keys = source
+            .split_once("    fn handle_workflow_overlay_key(")
+            .unwrap()
+            .1
+            .split_once("    /// Stable id of the finalized block")
+            .unwrap()
+            .0;
+        assert!(keys.contains("let target_session_id = state.target_session_id();"));
+        assert!(keys.contains("self.accept_workflow(target_session_id, workflow)"));
+    }
+
+    #[test]
     fn workflow_args_delivery_keeps_deferred_identity_and_retires_after_attempt() {
         let source = include_str!("main.rs");
         let submit = source
@@ -28673,7 +28718,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(submit.contains("form.is_pending()"));
-        assert!(submit.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(submit.contains("let id = form.target_session_id();"));
         assert!(submit.contains("Task::done(Message::WorkflowArgDeliver(attempt, id, rendered))"));
         assert!(!submit.contains("self.workflow_overlay = None"));
         assert!(

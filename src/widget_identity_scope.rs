@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn picker_query_edits_retain_tree_but_same_shape_reopening_resets_it() {
-        let mut picker = crate::workflow_picker::WorkflowPickerState::new(Vec::new());
+        let mut picker = crate::workflow_picker::WorkflowPickerState::new(0, Vec::new());
         let content = || Space::new().width(20).height(20);
         let initial: Element<'_, (), iced::Theme, TestRenderer> =
             scope(picker.widget_identity(), content());
@@ -203,7 +203,7 @@ mod tests {
         tree.diff(edited.as_widget());
         assert_eq!(*tree.children[0].state.downcast_ref::<usize>(), 41);
         // The old tree is still cached when close/reopen occur in one app batch.
-        let reopened = crate::workflow_picker::WorkflowPickerState::new(Vec::new());
+        let reopened = crate::workflow_picker::WorkflowPickerState::new(0, Vec::new());
         let replacement: Element<'_, (), iced::Theme, TestRenderer> =
             scope(reopened.widget_identity(), content());
         tree.diff(replacement.as_widget());
