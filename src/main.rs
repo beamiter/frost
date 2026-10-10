@@ -28414,7 +28414,10 @@ mod tests {
     #[test]
     fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
         let source = include_str!("main.rs");
-        let height = source.split_once("    fn organism_strip_height(&self)").unwrap().1;
+        let height = source
+            .split_once("    fn organism_strip_height(&self)")
+            .unwrap()
+            .1;
         let height = height.split_once("    fn term_height(&self)").unwrap().0;
         assert!(height.contains("companion_strip_height("));
         assert!(!height.contains("organism_owner") && !height.contains("win_size"));
@@ -28430,7 +28433,8 @@ mod tests {
         assert!(bar.contains("let companion_height = self.organism_strip_height()"));
         assert!(bar.contains("column![companion, bar]"));
         assert_eq!(
-            bar.matches(".on_enter(Message::OrganismHoverEnter(").count(),
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
             1
         );
         for marker in [
