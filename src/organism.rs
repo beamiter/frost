@@ -60,7 +60,7 @@ impl MotionChoice {
     pub fn interaction_hint(self) -> &'static str {
         match self {
             Self::Static => "Hover greetings are unavailable in Static.",
-            _ => "While idle, hover over the live glyph for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
+            _ => "While idle, hover over the status-bar glyph for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
         }
     }
 

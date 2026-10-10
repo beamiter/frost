@@ -155,6 +155,24 @@ fn chrome_height(bottom_bar: bool) -> f32 {
     TAB_BAR_H + if bottom_bar { STATUS_BAR_H } else { 0.0 }
 }
 
+/// Visibility changes only clear this opt-in strip; they never change its height.
+fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
+    if enabled && expanded && bottom_bar {
+        88.0
+    } else {
+        0.0
+    }
+}
+
+fn terminal_height_after_chrome(
+    window_height: f32,
+    bottom_bar: bool,
+    reading_bar_height: f32,
+    companion_height: f32,
+) -> f32 {
+    (window_height - chrome_height(bottom_bar) - reading_bar_height - companion_height).max(0.0)
+}
+
 /// Whether an existing block selection may consume plain navigation/Enter.
 /// Running and alternate-screen applications always retain their keyboard.
 /// The single exception to dropping keyboard events a widget captured.
@@ -3835,6 +3853,7 @@ enum Message {
     SetShowRepoStrip(bool),
     SetBottomBar(bool),
     SetAsciiOrganism(bool),
+    SetOrganismExpanded(bool),
     SetOrganismMotion(organism::MotionChoice),
     SetOrganismPose(organism::Pose),
     OrganismHello,
@@ -7223,11 +7242,21 @@ impl Frost {
         }
     }
 
+    fn organism_strip_height(&self) -> f32 {
+        companion_strip_height(
+            self.config.ascii_organism_enabled,
+            self.config.ascii_organism_expanded,
+            self.config.bottom_bar,
+        )
+    }
+
     fn term_height(&self) -> f32 {
-        (self.win_size.height
-            - chrome_height(self.config.bottom_bar)
-            - self.block_reading_bar_height())
-        .max(0.0)
+        terminal_height_after_chrome(
+            self.win_size.height,
+            self.config.bottom_bar,
+            self.block_reading_bar_height(),
+            self.organism_strip_height(),
+        )
     }
 
     /// Terminal area width: window minus the sidebar (when shown).
@@ -16492,18 +16521,13 @@ impl Frost {
             }
             Message::SetAsciiOrganism(enabled) => {
                 self.config.ascii_organism_enabled = enabled;
-                self.organism.set_enabled(enabled);
                 self.config_dirty = true;
-                if enabled {
-                    for sess in &self.sessions {
-                        if !sess.managed_remote && !sess.transcript_read_only() {
-                            self.organism
-                                .prime_session(sess.id, sess.terminal.is_command_running());
-                            self.organism
-                                .set_remote(sess.id, sess.observed_ssh_command().is_some());
-                        }
-                    }
-                }
+                self.apply_config();
+            }
+            Message::SetOrganismExpanded(expanded) => {
+                self.config.ascii_organism_expanded = expanded;
+                self.config_dirty = true;
+                self.apply_config();
             }
             Message::SetOrganismMotion(choice) => {
                 self.organism.reset_watch();
@@ -18253,7 +18277,7 @@ impl Frost {
         }
         // Sit just above the bottom bar — or the window edge when it's off.
         let bottom = if self.config.bottom_bar {
-            STATUS_BAR_H + 12.0
+            STATUS_BAR_H + self.organism_strip_height() + 12.0
         } else {
             12.0
         };
@@ -20171,22 +20195,43 @@ impl Frost {
             right = right.push(segment(seg));
         }
 
+        // One snapshot feeds the status glyph, tooltip and optional full body.
+        let presentation = self.organism_owner().map(|id| {
+            let running = sess.is_some_and(|s| s.terminal.is_command_running());
+            let settled = sess
+                .and_then(|s| s.terminal.running_duration_ms())
+                .is_some_and(|ms| ms >= 60_000);
+            self.organism
+                .presentation(id, running, settled, self.config.ascii_organism_motion)
+        });
+        let presentation = presentation.unwrap_or_default();
+        let companion_height = self.organism_strip_height();
+        let companion: Element<'_, Message> = if presentation.explanation.is_empty() {
+            Space::new().width(Length::Fill).into()
+        } else {
+            row![
+                container(text(presentation.sprite.clone()).font(self.mono).size(13))
+                    .width(Length::Fixed(200.0))
+                    .height(Length::Fixed(72.0)),
+                text(presentation.explanation).size(11),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+        let companion = container(companion)
+            .width(Length::Fill)
+            .height(Length::Fixed(companion_height))
+            .padding([8, 10])
+            .style(self.chrome_bar_style());
         if self.config.ascii_organism_enabled && self.win_size.width >= 640.0 {
             // Reserve the same slot while hidden/retreating so typing, focus
             // and pane changes cannot move the ordinary status segments.
-            let presentation = self.organism_owner().map(|id| {
-                let running = sess.is_some_and(|s| s.terminal.is_command_running());
-                let settled = sess
-                    .and_then(|s| s.terminal.running_duration_ms())
-                    .is_some_and(|ms| ms >= 60_000);
-                self.organism
-                    .presentation(id, running, settled, self.config.ascii_organism_motion)
-            });
             let organism::LivePresentation {
                 glyph,
                 sprite,
                 explanation,
-            } = presentation.unwrap_or_default();
+            } = presentation;
             let slot = container(
                 text(glyph)
                     .font(self.mono)
@@ -20228,13 +20273,18 @@ impl Frost {
         let bar = row![left, Space::new().width(Length::Fill), right]
             .spacing(12)
             .align_y(iced::Alignment::Center);
-        container(bar)
+        let bar: Element<'_, Message> = container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(STATUS_BAR_H))
             .padding([0, 10])
             .align_y(iced::Alignment::Center)
             .style(self.chrome_bar_style())
-            .into()
+            .into();
+        if companion_height > 0.0 {
+            column![companion, bar].into()
+        } else {
+            bar
+        }
     }
 
     /// One-line offer to install or update jsh, shown under the tab bar only
@@ -22580,6 +22630,9 @@ impl Frost {
             checkbox(self.config.ascii_organism_enabled).label("ASCII Organism")
                 .on_toggle(Message::SetAsciiOrganism),
             text("Local bottom-bar companion. Memory is volatile; it resets when disabled or closed.").size(11),
+            checkbox(self.config.ascii_organism_expanded).label("Show expanded companion")
+                .on_toggle(Message::SetOrganismExpanded),
+            text("Reserves a fixed-height strip above the bottom bar. It stays blank while hidden; hover the status-bar glyph to greet.").size(11),
             text("Organism Motion").size(13),
             pick_list(organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
@@ -28320,6 +28373,81 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expanded_companion_reserves_height_only_for_explicit_config() {
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                for bottom_bar in [false, true] {
+                    let expected = if enabled && expanded && bottom_bar {
+                        88.0
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        companion_strip_height(enabled, expanded, bottom_bar),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_height_is_stable_and_tiny_terminal_viewports_are_nonnegative() {
+        let reserved = companion_strip_height(true, true, true);
+        for window_height in [0.0, 1.0, 40.0, 88.0, 100.0, 800.0] {
+            for reading_height in [0.0, 64.0, 116.0] {
+                let compact =
+                    terminal_height_after_chrome(window_height, true, reading_height, 0.0);
+                let expanded =
+                    terminal_height_after_chrome(window_height, true, reading_height, reserved);
+                assert_eq!(
+                    compact,
+                    (window_height - chrome_height(true) - reading_height).max(0.0)
+                );
+                assert_eq!(expanded, (compact - 88.0).max(0.0));
+                assert!(expanded >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_companion_reuses_one_snapshot_and_shared_geometry() {
+        let source = include_str!("main.rs");
+        let height = source.split_once("    fn organism_strip_height(&self)").unwrap().1;
+        let height = height.split_once("    fn term_height(&self)").unwrap().0;
+        assert!(height.contains("companion_strip_height("));
+        assert!(!height.contains("organism_owner") && !height.contains("win_size"));
+        let term = source.split_once("    fn term_height(&self)").unwrap().1;
+        let term = term.split_once("    fn term_width(&self)").unwrap().0;
+        assert!(term.contains("self.organism_strip_height()"));
+        assert!(source.contains("STATUS_BAR_H + self.organism_strip_height() + 12.0"));
+        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
+        let bar = bar.split_once("    fn jsh_notice(&self)").unwrap().0;
+        assert_eq!(bar.matches(".presentation(").count(), 1);
+        assert!(bar.contains("let presentation = self.organism_owner().map"));
+        assert!(bar.contains("if presentation.explanation.is_empty()"));
+        assert!(bar.contains("let companion_height = self.organism_strip_height()"));
+        assert!(bar.contains("column![companion, bar]"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(").count(),
+            1
+        );
+        for marker in [
+            "Message::SetAsciiOrganism(enabled)",
+            "Message::SetOrganismExpanded(expanded)",
+        ] {
+            let handler = source
+                .split_once(marker)
+                .unwrap()
+                .1
+                .split_once("            Message::")
+                .unwrap()
+                .0;
+            assert!(handler.contains("self.apply_config()"));
+        }
+    }
+
     #[test]
     fn live_sprite_detail_remains_inside_the_existing_visible_owner_gate() {
         let source = include_str!("main.rs");

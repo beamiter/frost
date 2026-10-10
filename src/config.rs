@@ -126,6 +126,9 @@ pub struct Config {
     /// Offline companion in the existing bottom status bar; opt-in.
     #[serde(default)]
     pub ascii_organism_enabled: bool,
+    /// Reserve a full-body companion strip above the status bar; compact by default.
+    #[serde(default)]
+    pub ascii_organism_expanded: bool,
     /// Missing means Automatic (currently a disclosed Calm fallback).
     #[serde(default)]
     pub ascii_organism_motion: Option<crate::organism::Motion>,
@@ -623,6 +626,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             ascii_organism_enabled: false,
+            ascii_organism_expanded: false,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
@@ -1251,6 +1255,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn expanded_organism_is_explicit_and_old_configs_stay_compact() {
+        assert!(!Config::default().ascii_organism_expanded);
+        let old = Config::from_toml("ascii_organism_enabled = true\n").unwrap();
+        assert!(old.ascii_organism_enabled);
+        assert!(!old.ascii_organism_expanded);
+        for expanded in [false, true] {
+            let config =
+                Config::from_toml(&format!("ascii_organism_expanded = {expanded}\n")).unwrap();
+            assert_eq!(config.ascii_organism_expanded, expanded);
+            assert!(!config.ascii_organism_enabled);
+            let saved = toml::to_string(&config).unwrap();
+            assert_eq!(
+                Config::from_toml(&saved).unwrap().ascii_organism_expanded,
+                expanded
+            );
+        }
+        assert!(Config::from_toml("ascii_organism_expanded = \"yes\"\n").is_err());
     }
 
     #[test]
