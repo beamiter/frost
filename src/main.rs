@@ -3227,6 +3227,18 @@ fn reindex_tabs_for_removal(tabs: &mut [Tab], removed: usize) {
     }
 }
 
+/// Pending means save confirmation is outstanding, including durability retry.
+/// The existing ConfigTick handles retries; blocked writes require the diagnostic.
+fn config_save_feedback(dirty: bool, blocked: bool) -> &'static str {
+    if blocked {
+        "Auto-save paused · See the configuration diagnostic"
+    } else if dirty {
+        "Save pending · auto-save will retry"
+    } else {
+        "Changes auto-save"
+    }
+}
+
 /// Only losing the active tab clears its zoom. IDs are captured before reindexing.
 fn pane_zoom_after_tab_close(
     zoomed: bool,
@@ -23323,11 +23335,14 @@ impl Frost {
         ]
         .spacing(8);
 
-        let footer = text("Changes auto-save · Ctrl+Shift+O toggles · Esc closes")
-            .size(10)
-            .width(Length::Fill)
-            .wrapping(text::Wrapping::Word)
-            .style(text::secondary);
+        let footer = text(format!(
+            "{} · Ctrl+Shift+O toggles · Esc closes",
+            config_save_feedback(self.config_dirty, self.config_write_blocked)
+        ))
+        .size(10)
+        .width(Length::Fill)
+        .wrapping(text::Wrapping::Word)
+        .style(text::secondary);
 
         let content = column![
             text("Settings").size(18),
@@ -28448,6 +28463,62 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_save_feedback_prioritizes_blocked_over_pending_confirmation() {
+        assert_eq!(config_save_feedback(false, false), "Changes auto-save");
+        assert_eq!(
+            config_save_feedback(true, false),
+            "Save pending · auto-save will retry"
+        );
+        for dirty in [false, true] {
+            assert_eq!(
+                config_save_feedback(dirty, true),
+                "Auto-save paused · See the configuration diagnostic"
+            );
+        }
+        // Dirty also covers normal debounce and a visible but not durable write.
+        // It must not categorically claim failure, absence, or successful saving.
+        let pending = config_save_feedback(true, false);
+        assert!(!pending.contains("failed"));
+        assert!(!pending.contains("not written"));
+        assert!(!pending.contains("saved"));
+    }
+
+    #[test]
+    fn settings_save_feedback_uses_existing_dirty_state_and_retry_tick() {
+        let source = include_str!("main.rs");
+        let settings = source
+            .split_once("        let footer = text(format!(")
+            .unwrap()
+            .1;
+        assert!(settings
+            .split_once("        let content = column![")
+            .unwrap()
+            .0
+            .contains("config_save_feedback(self.config_dirty, self.config_write_blocked)"));
+        let subscription = source.split_once("    fn subscription(&self)").unwrap().1;
+        assert!(subscription.contains("iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick)"));
+        let tick = source
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .1;
+        let tick = tick
+            .split_once("            Message::TabMenuOpen")
+            .unwrap()
+            .0;
+        assert!(
+            tick.find("self.reload_config_if_changed()").unwrap()
+                < tick.find("self.persist_live_config();").unwrap()
+        );
+        let save = source
+            .split_once("    fn persist_live_config(&mut self)")
+            .unwrap()
+            .1;
+        let save = save.split_once("    /// Observe external edits").unwrap().0;
+        assert!(save.contains("if !self.config_dirty || self.config_write_blocked"));
+        assert!(save.contains("self.save_config_checked()"));
+    }
+
     #[test]
     fn session_close_uses_stable_organism_owner_and_keeps_all_context_caches() {
         let source = include_str!("main.rs");
