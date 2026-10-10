@@ -34,6 +34,7 @@ mod organism_preview;
 mod organism_watch;
 mod persistence;
 mod pty;
+mod remote_editor_scope;
 mod remote_fs;
 mod remote_host_editor;
 mod review_text;
@@ -23440,7 +23441,7 @@ impl Frost {
             task_sidebar_row,
             preferred_agent_row,
             agent_turns_row,
-            remote_hosts_section,
+            remote_editor_scope::scope(self.remote_host_editor.identity(), remote_hosts_section),
             buttons,
             footer,
         ]
@@ -28522,6 +28523,27 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_remote_settings_widgets_share_the_editor_retirement_identity() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        assert_eq!(production.matches("remote_editor_scope::scope(").count(), 1);
+        assert!(production.contains(
+            "remote_editor_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
+        ));
+        // Add and every row live inside the same subtree reset boundary.
+        let settings = production
+            .split_once("let target = self.remote_host_editor.target(i);")
+            .unwrap()
+            .1;
+        assert!(
+            settings
+                .find("Message::RemoteHostAdd(self.remote_host_editor.identity())")
+                .unwrap()
+                < settings.find("remote_editor_scope::scope(").unwrap()
+        );
+    }
+
     #[test]
     fn remote_editor_callbacks_validate_retained_identity_before_index_access() {
         let source = include_str!("main.rs");
