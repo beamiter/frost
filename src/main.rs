@@ -28323,10 +28323,7 @@ mod tests {
     #[test]
     fn live_sprite_detail_remains_inside_the_existing_visible_owner_gate() {
         let source = include_str!("main.rs");
-        let bar = source
-            .split_once("    fn status_bar(&self)")
-            .unwrap()
-            .1;
+        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let slot = bar
             .split_once("let presentation = self.organism_owner().map")
             .unwrap()

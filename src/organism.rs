@@ -758,7 +758,9 @@ mod tests {
         assert_eq!(full.sprite, sprite_frame_with_context(final_context, 7));
         assert_eq!(values(organism.life.state()), before);
         let hidden = LivePresentation::default();
-        assert!(hidden.glyph.is_empty() && hidden.sprite.is_empty() && hidden.explanation.is_empty());
+        assert!(
+            hidden.glyph.is_empty() && hidden.sprite.is_empty() && hidden.explanation.is_empty()
+        );
     }
 
     #[test]
