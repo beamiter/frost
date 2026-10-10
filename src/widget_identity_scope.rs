@@ -1,5 +1,5 @@
 //! Reset an explicitly scoped form's retained widget state at its identity boundary.
-//! Used by the remote editor and workflow Args form; unrelated widgets stay intact.
+//! Used by the remote editor and workflow picker/Args forms; unrelated widgets stay intact.
 //! Message tokens reject queued callbacks; this scope also retires pressed/input
 //! state before a newly rendered callback can inherit it.
 use iced::advanced::widget::{tree, Tree};
@@ -187,6 +187,27 @@ mod tests {
         ) {
             callback(Err(iced::advanced::image::Error::Unsupported));
         }
+    }
+
+    #[test]
+    fn picker_query_edits_retain_tree_but_same_shape_reopening_resets_it() {
+        let mut picker = crate::workflow_picker::WorkflowPickerState::new(Vec::new());
+        let content = || Space::new().width(20).height(20);
+        let initial: Element<'_, (), iced::Theme, TestRenderer> =
+            scope(picker.widget_identity(), content());
+        let mut tree = Tree::new(initial.as_widget());
+        tree.children[0].state = tree::State::new(41_usize);
+        picker.set_query("query");
+        let edited: Element<'_, (), iced::Theme, TestRenderer> =
+            scope(picker.widget_identity(), content());
+        tree.diff(edited.as_widget());
+        assert_eq!(*tree.children[0].state.downcast_ref::<usize>(), 41);
+        // The old tree is still cached when close/reopen occur in one app batch.
+        let reopened = crate::workflow_picker::WorkflowPickerState::new(Vec::new());
+        let replacement: Element<'_, (), iced::Theme, TestRenderer> =
+            scope(reopened.widget_identity(), content());
+        tree.diff(replacement.as_widget());
+        assert!(matches!(tree.children[0].state, tree::State::None));
     }
 
     #[test]

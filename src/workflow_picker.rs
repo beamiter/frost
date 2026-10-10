@@ -92,6 +92,7 @@ pub(crate) struct WorkflowChoice {
 }
 
 pub(crate) struct WorkflowPickerState {
+    widget_identity: Arc<()>,
     picker: WorkflowPicker,
     snapshot: u64,
 }
@@ -99,6 +100,7 @@ pub(crate) struct WorkflowPickerState {
 impl WorkflowPickerState {
     pub(crate) fn new(entries: Vec<Workflow>) -> Self {
         Self {
+            widget_identity: Arc::new(()),
             picker: WorkflowPicker::new(entries, PICKER_POLICY),
             snapshot: NEXT_PICKER_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -115,6 +117,19 @@ impl WorkflowPickerState {
     /// 空查询分支直接暴露它。
     pub(crate) fn load_from(dirs: &[std::path::PathBuf]) -> Self {
         Self::new(workflows::load_library_from(dirs))
+    }
+
+    /// Retained widget state belongs to this opening, not a filtered row position.
+    pub(crate) fn widget_identity(&self) -> Arc<()> {
+        self.widget_identity.clone()
+    }
+
+    pub(crate) fn set_query_from_snapshot(&mut self, snapshot: u64, query: String) -> bool {
+        if snapshot != self.snapshot {
+            return false;
+        }
+        self.set_query(query);
+        true
     }
 
     pub(crate) fn snapshot_identity(&self) -> u64 {
@@ -355,6 +370,24 @@ mod tests {
             default: Some("default".into()),
         }];
         WorkflowArgsState::new(definition)
+    }
+
+    #[test]
+    fn picker_query_callbacks_belong_to_their_opening_and_keep_typing_identity() {
+        let old = WorkflowPickerState::new(vec![workflow("A", "", &[])]);
+        let mut current = WorkflowPickerState::new(vec![workflow("A", "", &[])]);
+        let identity = current.widget_identity();
+        assert!(!current.set_query_from_snapshot(old.snapshot_identity(), "stale".into()));
+        assert_eq!(current.query(), "");
+        for query in ["A", "Al", ""] {
+            assert!(current.set_query_from_snapshot(current.snapshot_identity(), query.into()));
+            assert_eq!(current.query(), query);
+            assert!(Arc::ptr_eq(&identity, &current.widget_identity()));
+        }
+        current.select_next();
+        current.select_prev();
+        assert!(Arc::ptr_eq(&identity, &current.widget_identity()));
+        assert!(!Arc::ptr_eq(&identity, &old.widget_identity()));
     }
 
     #[test]

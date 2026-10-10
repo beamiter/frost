@@ -3938,7 +3938,7 @@ enum Message {
     /// Type the clicked command into the active pane's prompt (and close).
     HistoryPickerAccept(Arc<jterm_core::command_history::CommandHistoryRecord>),
     /// Filter text changed in the workflow picker.
-    WorkflowPickerInput(String),
+    WorkflowPickerInput(u64, String),
     /// Dismiss only the picker opening that produced this backdrop callback.
     WorkflowPickerClose(u64),
     /// Accept the immutable entry represented by a rendered picker row:
@@ -17275,11 +17275,14 @@ impl Frost {
                     None => Task::none(),
                 };
             }
-            Message::WorkflowPickerInput(q) => {
-                if let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
+            Message::WorkflowPickerInput(snapshot, q) => {
+                let Some(workflow_picker::WorkflowOverlay::Picker(state)) =
                     self.workflow_overlay.as_mut()
-                {
-                    state.set_query(q);
+                else {
+                    return Task::none();
+                };
+                if !state.set_query_from_snapshot(snapshot, q) {
+                    return Task::none();
                 }
                 return workflow_focus::reveal_picker();
             }
@@ -18695,10 +18698,11 @@ impl Frost {
         state: &workflow_picker::WorkflowPickerState,
     ) -> Element<'_, Message> {
         let filtered = state.filtered();
+        let snapshot = state.snapshot_identity();
 
         let query: Element<'_, Message> = text_input("Run a workflow…", state.query())
             .id(WORKFLOW_PICKER_INPUT_ID.clone())
-            .on_input(Message::WorkflowPickerInput)
+            .on_input(move |query| Message::WorkflowPickerInput(snapshot, query))
             .size(14)
             .into();
         let query_line = row![text("⚙").size(16), query]
@@ -18800,7 +18804,10 @@ impl Frost {
         let centered = container(panel)
             .center_x(Length::Fill)
             .center_y(Length::Fill);
-        stack![Element::from(dismiss), Element::from(centered)].into()
+        widget_identity_scope::scope(
+            state.widget_identity(),
+            stack![Element::from(dismiss), Element::from(centered)],
+        )
     }
 
     /// One workflow's argument form (anvil's parameter dialog): description,
@@ -28554,6 +28561,34 @@ fn xterm_modify_other_keys_encode(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workflow_picker_opening_scopes_query_state_and_queued_input() {
+        let source = include_str!("main.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        let view = production
+            .split_once("    fn workflow_picker_view(")
+            .unwrap()
+            .1
+            .split_once("    fn workflow_args_view(")
+            .unwrap()
+            .0;
+        assert!(view.contains("Message::WorkflowPickerInput(snapshot, query)"));
+        assert!(
+            view.contains("widget_identity_scope::scope(\n            state.widget_identity(),")
+        );
+        let handler = production
+            .split_once("            Message::WorkflowPickerInput(snapshot, q) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::WorkflowPickerClose(snapshot)")
+            .unwrap()
+            .0;
+        assert!(handler.contains("state.set_query_from_snapshot(snapshot, q)"));
+        // Row activation is a fresh press, with no retained Button release latch.
+        assert!(view.contains("row_btn.on_press(Message::WorkflowPickerAccept(choice))"));
+        assert!(!view.contains(".on_release("));
+    }
+
+    #[test]
     fn picker_backdrop_callback_validates_snapshot_before_dismissing() {
         let source = include_str!("main.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
@@ -28624,7 +28659,7 @@ mod tests {
         let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
         assert_eq!(
             production.matches("widget_identity_scope::scope(").count(),
-            2
+            3
         );
         assert!(production.contains(
             "widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
