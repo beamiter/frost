@@ -20182,7 +20182,11 @@ impl Frost {
                 self.organism
                     .presentation(id, running, settled, self.config.ascii_organism_motion)
             });
-            let (glyph, explanation) = presentation.unwrap_or_default();
+            let organism::LivePresentation {
+                glyph,
+                sprite,
+                explanation,
+            } = presentation.unwrap_or_default();
             let slot = container(
                 text(glyph)
                     .font(self.mono)
@@ -20193,7 +20197,19 @@ impl Frost {
             let slot: Element<'_, Message> = if explanation.is_empty() {
                 slot.into()
             } else {
-                tooltip(slot, text(explanation).size(11), tooltip::Position::Top).into()
+                let detail = container(
+                    column![
+                        container(text(sprite).font(self.mono).size(13))
+                            .width(Length::Fixed(200.0))
+                            .height(Length::Fixed(72.0)),
+                        text(explanation).size(11),
+                    ]
+                    .spacing(8),
+                )
+                .padding(8)
+                .width(Length::Fixed(220.0))
+                .max_height(160.0);
+                tooltip(slot, detail, tooltip::Position::Top).into()
             };
             let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
                 let (exit_id, exit_epoch) = self.organism.live_greeting_exit_reference(id);
@@ -28304,6 +28320,30 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_sprite_detail_remains_inside_the_existing_visible_owner_gate() {
+        let source = include_str!("main.rs");
+        let bar = source
+            .split_once("    fn status_bar(&self)")
+            .unwrap()
+            .1;
+        let slot = bar
+            .split_once("let presentation = self.organism_owner().map")
+            .unwrap()
+            .1;
+        let slot = slot
+            .split_once("            let slot: Element<'_, Message> = if let Some(id)")
+            .unwrap()
+            .0;
+        assert!(slot.contains("presentation.unwrap_or_default()"));
+        assert!(slot.contains("if explanation.is_empty()"));
+        assert!(slot.contains("Length::Fixed(84.0)"));
+        assert!(slot.contains("text(sprite).font(self.mono)"));
+        assert!(slot.contains(".max_height(160.0)"));
+        assert!(slot.contains("tooltip(slot, detail, tooltip::Position::Top)"));
+        assert!(!slot.contains("on_press"));
+    }
+
     #[test]
     fn watch_rhythm_uses_only_visible_running_nonempty_admitted_batches() {
         let source = include_str!("main.rs");

@@ -258,6 +258,14 @@ impl PreviewDeadlines {
     }
 }
 
+/// One render snapshot shared by the fixed glyph and its passive detail view.
+#[derive(Default)]
+pub struct LivePresentation {
+    pub glyph: String,
+    pub sprite: String,
+    pub explanation: &'static str,
+}
+
 pub struct Organism {
     enabled: bool,
     sessions: HashMap<usize, SessionLife>,
@@ -603,8 +611,12 @@ impl Organism {
     }
 
     fn frame(&self, motion: Option<Motion>) -> u64 {
+        Self::frame_at(motion, self.born.elapsed())
+    }
+
+    fn frame_at(motion: Option<Motion>, now: Duration) -> u64 {
         if motion == Some(Motion::Full) {
-            self.born.elapsed().as_millis() as u64 / 100
+            now.as_millis() as u64 / 100
         } else {
             0
         }
@@ -616,7 +628,18 @@ impl Organism {
         running: bool,
         settled: bool,
         motion: Option<Motion>,
-    ) -> (String, &'static str) {
+    ) -> LivePresentation {
+        self.presentation_at(id, running, settled, motion, self.born.elapsed())
+    }
+
+    fn presentation_at(
+        &self,
+        id: usize,
+        running: bool,
+        settled: bool,
+        motion: Option<Motion>,
+        now: Duration,
+    ) -> LivePresentation {
         let context = if running {
             // Display only. No fabricated Start is fed into the life reducer.
             let behavior = if settled {
@@ -629,7 +652,7 @@ impl Organism {
             if motion == Some(Motion::Static) {
                 context
             } else {
-                context.with_watch_rhythm(self.watch.rhythm(id, self.born.elapsed()))
+                context.with_watch_rhythm(self.watch.rhythm(id, now))
             }
         } else {
             self.sessions
@@ -644,12 +667,14 @@ impl Organism {
         let context = if running || motion == Some(Motion::Static) {
             context
         } else {
-            self.live_greeting.apply(id, self.born.elapsed(), context)
+            self.live_greeting.apply(id, now, context)
         };
-        (
-            sticky_glyph_with_context(context, self.frame(motion)).into_owned(),
-            jterm_core::organism_daily::behavior_explanation(context.behavior),
-        )
+        let frame = Self::frame_at(motion, now);
+        LivePresentation {
+            glyph: sticky_glyph_with_context(context, frame).into_owned(),
+            sprite: sprite_frame_with_context(context, frame).into_owned(),
+            explanation: jterm_core::organism_daily::behavior_explanation(context.behavior),
+        }
     }
 
     pub fn preview(&self, motion: Option<Motion>) -> String {
@@ -689,6 +714,51 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn live_sprite_and_glyph_share_the_greeting_without_changing_life() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        let context = RenderContext {
+            body_language: BodyLanguage::from_state(organism.life.state()),
+            ..organism.sessions[&1].context
+        };
+        let epoch = organism.live_greeting.epoch();
+        organism
+            .live_greeting
+            .enter(1, epoch, Duration::ZERO, context, true);
+        organism
+            .live_greeting
+            .advance(Some(1), Duration::from_millis(600), context, true);
+        let before = values(organism.life.state());
+        let now = Duration::from_millis(700);
+        let final_context = organism.live_greeting.apply(1, now, context);
+        assert_eq!(
+            final_context.behavior,
+            PreviewPose::Greeting.context().behavior
+        );
+        let presentation = organism.presentation_at(1, false, false, Some(Motion::Calm), now);
+        assert_eq!(
+            presentation.glyph,
+            sticky_glyph_with_context(final_context, 0)
+        );
+        assert_eq!(
+            presentation.sprite,
+            sprite_frame_with_context(final_context, 0)
+        );
+        assert_eq!(
+            presentation.explanation,
+            jterm_core::organism_daily::behavior_explanation(final_context.behavior)
+        );
+        let full = organism.presentation_at(1, false, false, Some(Motion::Full), now);
+        assert_eq!(full.glyph, sticky_glyph_with_context(final_context, 7));
+        assert_eq!(full.sprite, sprite_frame_with_context(final_context, 7));
+        assert_eq!(values(organism.life.state()), before);
+        let hidden = LivePresentation::default();
+        assert!(hidden.glyph.is_empty() && hidden.sprite.is_empty() && hidden.explanation.is_empty());
     }
 
     #[test]
@@ -732,12 +802,18 @@ mod tests {
                 Behavior::WatchCommand
             };
             let context = RenderContext::new(behavior, BodyLanguage::from_state(before), false);
-            let (glyph, _) = organism.presentation(1, true, settled, Some(Motion::Calm));
+            let LivePresentation { glyph, sprite, .. } =
+                organism.presentation(1, true, settled, Some(Motion::Calm));
+            assert_eq!(
+                sprite,
+                sprite_frame_with_context(context.with_watch_rhythm(WatchRhythm::Waiting), 0)
+            );
             assert_eq!(
                 glyph,
                 sticky_glyph_with_context(context.with_watch_rhythm(WatchRhythm::Waiting), 0)
             );
-            let (glyph, _) = organism.presentation(1, true, settled, Some(Motion::Static));
+            let LivePresentation { glyph, .. } =
+                organism.presentation(1, true, settled, Some(Motion::Static));
             assert_eq!(glyph, sticky_glyph_with_context(context, 0));
         }
         assert_eq!(values(organism.life.state()), values(before));
@@ -837,8 +913,17 @@ mod tests {
                 BodyLanguage::from_state(organism.life.state()),
                 false,
             );
-            let (glyph, explanation) = organism.presentation(3, false, false, Some(Motion::Static));
+            let LivePresentation {
+                glyph,
+                sprite,
+                explanation,
+            } = organism.presentation(3, false, false, Some(Motion::Static));
             assert!(!glyph.is_empty());
+            assert_eq!(
+                sprite,
+                sprite_frame_with_context(organism.sessions[&3].context, 0)
+            );
+            assert_eq!(sprite.lines().count(), 3);
             assert_eq!(
                 explanation,
                 jterm_core::organism_daily::behavior_explanation(behavior)
@@ -848,7 +933,14 @@ mod tests {
             (false, Behavior::WatchCommand),
             (true, Behavior::WatchSettled),
         ] {
-            let (_, explanation) = organism.presentation(3, true, settled, Some(Motion::Static));
+            let presentation = organism.presentation(3, true, settled, Some(Motion::Static));
+            let context = RenderContext::new(
+                behavior,
+                BodyLanguage::from_state(organism.life.state()),
+                false,
+            );
+            assert_eq!(presentation.sprite, sprite_frame_with_context(context, 0));
+            let explanation = presentation.explanation;
             assert_eq!(
                 explanation,
                 jterm_core::organism_daily::behavior_explanation(behavior)
