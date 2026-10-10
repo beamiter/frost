@@ -20085,26 +20085,28 @@ impl Frost {
         if self.config.ascii_organism_enabled && self.win_size.width >= 640.0 {
             // Reserve the same slot while hidden/retreating so typing, focus
             // and pane changes cannot move the ordinary status segments.
-            let glyph = self
-                .organism_owner()
-                .map(|id| {
-                    let running = sess.is_some_and(|s| s.terminal.is_command_running());
-                    let settled = sess
-                        .and_then(|s| s.terminal.running_duration_ms())
-                        .is_some_and(|ms| ms >= 60_000);
-                    self.organism
-                        .glyph(id, running, settled, self.config.ascii_organism_motion)
-                })
-                .unwrap_or_default();
-            right = right.push(
-                container(
-                    text(glyph)
-                        .font(self.mono)
-                        .size(11)
-                        .color(self.c_text_dim()),
-                )
-                .width(Length::Fixed(84.0)),
-            );
+            let presentation = self.organism_owner().map(|id| {
+                let running = sess.is_some_and(|s| s.terminal.is_command_running());
+                let settled = sess
+                    .and_then(|s| s.terminal.running_duration_ms())
+                    .is_some_and(|ms| ms >= 60_000);
+                self.organism
+                    .presentation(id, running, settled, self.config.ascii_organism_motion)
+            });
+            let (glyph, explanation) = presentation.unwrap_or_default();
+            let slot = container(
+                text(glyph)
+                    .font(self.mono)
+                    .size(11)
+                    .color(self.c_text_dim()),
+            )
+            .width(Length::Fixed(84.0));
+            let slot: Element<'_, Message> = if explanation.is_empty() {
+                slot.into()
+            } else {
+                tooltip(slot, text(explanation).size(11), tooltip::Position::Top).into()
+            };
+            right = right.push(slot);
         }
         let bar = row![left, Space::new().width(Length::Fill), right]
             .spacing(12)

@@ -480,7 +480,13 @@ impl Organism {
         }
     }
 
-    pub fn glyph(&self, id: usize, running: bool, settled: bool, motion: Option<Motion>) -> String {
+    pub fn presentation(
+        &self,
+        id: usize,
+        running: bool,
+        settled: bool,
+        motion: Option<Motion>,
+    ) -> (String, &'static str) {
         let context = if running {
             // Display only. No fabricated Start is fed into the life reducer.
             let behavior = if settled {
@@ -499,7 +505,10 @@ impl Organism {
             body_language: BodyLanguage::from_state(self.life.state()),
             ..context
         };
-        sticky_glyph_with_context(context, self.frame(motion)).into_owned()
+        (
+            sticky_glyph_with_context(context, self.frame(motion)).into_owned(),
+            jterm_core::organism_daily::behavior_explanation(context.behavior),
+        )
     }
 
     pub fn preview(&self, motion: Option<Motion>) -> String {
@@ -539,6 +548,46 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn live_explanation_uses_the_same_authoritative_behavior_as_the_glyph() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(3, false);
+        let before = values(organism.life.state());
+        for behavior in [
+            Behavior::Idle,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::UnknownOutcome,
+            Behavior::RestAfterPush,
+        ] {
+            organism.sessions.get_mut(&3).unwrap().context = RenderContext::new(
+                behavior,
+                BodyLanguage::from_state(organism.life.state()),
+                false,
+            );
+            let (glyph, explanation) = organism.presentation(3, false, false, Some(Motion::Static));
+            assert!(!glyph.is_empty());
+            assert_eq!(
+                explanation,
+                jterm_core::organism_daily::behavior_explanation(behavior)
+            );
+        }
+        for (settled, behavior) in [
+            (false, Behavior::WatchCommand),
+            (true, Behavior::WatchSettled),
+        ] {
+            let (_, explanation) = organism.presentation(3, true, settled, Some(Motion::Static));
+            assert_eq!(
+                explanation,
+                jterm_core::organism_daily::behavior_explanation(behavior)
+            );
+        }
+        assert_eq!(values(organism.life.state()), before);
     }
 
     #[test]
