@@ -198,7 +198,11 @@ pub(crate) fn accept_clicked_record(
     record: &Arc<CommandHistoryRecord>,
 ) -> Option<String> {
     let state = picker.as_ref()?;
-    if !state.entries.iter().any(|current| Arc::ptr_eq(current, record)) {
+    if !state
+        .entries
+        .iter()
+        .any(|current| Arc::ptr_eq(current, record))
+    {
         return None;
     }
     let command = record.command.clone();
@@ -633,7 +637,10 @@ mod tests {
         assert!(accept_clicked_record(&mut picker, &clicked).is_none());
         assert!(picker.is_some());
         let reopened = picker.as_ref().unwrap().shared_filtered().remove(0);
-        assert_eq!(accept_clicked_record(&mut picker, &reopened).as_deref(), Some("cargo test"));
+        assert_eq!(
+            accept_clicked_record(&mut picker, &reopened).as_deref(),
+            Some("cargo test")
+        );
     }
 
     #[test]
@@ -642,7 +649,10 @@ mod tests {
         let clicked = picker.as_ref().unwrap().shared_filtered().remove(0);
         picker.as_mut().unwrap().set_query("not matching");
         assert!(picker.as_ref().unwrap().filtered().is_empty());
-        assert_eq!(accept_clicked_record(&mut picker, &clicked).as_deref(), Some("cargo test"));
+        assert_eq!(
+            accept_clicked_record(&mut picker, &clicked).as_deref(),
+            Some("cargo test")
+        );
         let state = HistoryPickerState::new(vec![record("git status", None, 0)]);
         let closed = state.shared_filtered().remove(0);
         drop(state);
@@ -652,10 +662,19 @@ mod tests {
     #[test]
     fn history_callback_closes_snapshot_before_existing_active_prompt_recall() {
         let source = include_str!("main.rs");
-        let handler = source.split_once("            Message::HistoryPickerAccept(record) => {")
-            .unwrap().1.split_once("            Message::WorkflowPickerInput(").unwrap().0;
-        assert!(handler.find("accept_clicked_record(").unwrap()
-            < handler.find("self.recall_into_active_pane(command)").unwrap());
+        let handler = source
+            .split_once("            Message::HistoryPickerAccept(record) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::WorkflowPickerInput(")
+            .unwrap()
+            .0;
+        assert!(
+            handler.find("accept_clicked_record(").unwrap()
+                < handler
+                    .find("self.recall_into_active_pane(command)")
+                    .unwrap()
+        );
         assert!(!handler.contains("record.command"));
         // Cross-session history targeting is deliberately unchanged: no
         // opening-session pin or new PTY/prompt implementation is introduced.

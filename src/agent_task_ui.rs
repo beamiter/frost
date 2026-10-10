@@ -287,7 +287,10 @@ pub(crate) struct TaskProviderPicker {
 
 impl TaskProviderPicker {
     pub(crate) fn new(context: SemanticCommandContext) -> Self {
-        Self { context, identity: Arc::new(()) }
+        Self {
+            context,
+            identity: Arc::new(()),
+        }
     }
 
     pub(crate) fn reference(&self) -> Arc<()> {
@@ -298,8 +301,14 @@ impl TaskProviderPicker {
         self.identity = Arc::new(());
     }
 
-    pub(crate) fn take_current(picker: &mut Option<Self>, reference: &Arc<()>) -> Option<SemanticCommandContext> {
-        if !picker.as_ref().is_some_and(|current| Arc::ptr_eq(&current.identity, reference)) {
+    pub(crate) fn take_current(
+        picker: &mut Option<Self>,
+        reference: &Arc<()>,
+    ) -> Option<SemanticCommandContext> {
+        if !picker
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.identity, reference))
+        {
             return None;
         }
         picker.take().map(|current| current.context)
@@ -384,7 +393,10 @@ impl TaskPanel {
         // Spawn failure has an admitted, visible error state. Busy/invalid
         // requests must not relabel the previous task's retained result.
         if result.is_ok()
-            || matches!(&result, Err(crate::agent_task::DiffRequestError::WorkerSpawn(_)))
+            || matches!(
+                &result,
+                Err(crate::agent_task::DiffRequestError::WorkerSpawn(_))
+            )
         {
             self.diff_task = Some(task_id);
             self.diff_epoch = Arc::new(());
@@ -406,17 +418,34 @@ impl TaskPanel {
         self.follow_up_epoch = Arc::new(());
     }
 
-    pub(crate) fn follow_up_reference(&self, task_id: TaskId, completed_turns: usize) -> TaskFollowUpRef {
-        TaskFollowUpRef { task_id, completed_turns, selection: self.follow_up_epoch.clone() }
+    pub(crate) fn follow_up_reference(
+        &self,
+        task_id: TaskId,
+        completed_turns: usize,
+    ) -> TaskFollowUpRef {
+        TaskFollowUpRef {
+            task_id,
+            completed_turns,
+            selection: self.follow_up_epoch.clone(),
+        }
     }
 
-    pub(crate) fn accepts_follow_up(&self, reference: &TaskFollowUpRef, completed_turns: usize) -> bool {
+    pub(crate) fn accepts_follow_up(
+        &self,
+        reference: &TaskFollowUpRef,
+        completed_turns: usize,
+    ) -> bool {
         self.selected == Some(reference.task_id)
             && reference.completed_turns == completed_turns
             && Arc::ptr_eq(&self.follow_up_epoch, &reference.selection)
     }
 
-    pub(crate) fn edit_follow_up(&mut self, reference: &TaskFollowUpRef, completed_turns: usize, text: String) -> bool {
+    pub(crate) fn edit_follow_up(
+        &mut self,
+        reference: &TaskFollowUpRef,
+        completed_turns: usize,
+        text: String,
+    ) -> bool {
         if !self.accepts_follow_up(reference, completed_turns) {
             return false;
         }
@@ -427,7 +456,11 @@ impl TaskPanel {
     /// Consume callback identity before dispatch, retaining the draft until
     /// success. Even a failed attempt cannot be repeated by a queued duplicate;
     /// the user can retry through the newly rendered composer identity.
-    pub(crate) fn begin_follow_up_send(&mut self, reference: &TaskFollowUpRef, completed_turns: usize) -> Option<String> {
+    pub(crate) fn begin_follow_up_send(
+        &mut self,
+        reference: &TaskFollowUpRef,
+        completed_turns: usize,
+    ) -> Option<String> {
         if !self.accepts_follow_up(reference, completed_turns)
             || !native_follow_up_can_send(&self.follow_up, completed_turns)
         {
@@ -521,7 +554,10 @@ mod tests {
         assert!(TaskProviderPicker::take_current(&mut picker, &old_a).is_none());
         picker = Some(TaskProviderPicker::new(picker_context("B")));
         assert!(TaskProviderPicker::take_current(&mut picker, &old_a).is_none());
-        assert_eq!(picker.as_ref().unwrap().context.command.as_deref(), Some("B"));
+        assert_eq!(
+            picker.as_ref().unwrap().context.command.as_deref(),
+            Some("B")
+        );
         let hidden_b = picker.as_ref().unwrap().reference();
         picker.as_mut().unwrap().retire_reference();
         assert!(TaskProviderPicker::take_current(&mut picker, &hidden_b).is_none());
@@ -540,22 +576,50 @@ mod tests {
     #[test]
     fn provider_choice_keeps_current_visibility_and_availability_checks() {
         let source = include_str!("main.rs");
-        let method = source.split("fn task_create_with_provider(").nth(1).unwrap()
-            .split("/// Enter the bounded").next().unwrap();
-        assert!(method.find("!self.config.experimental_task_sidebar").unwrap()
-            < method.find("TaskProviderPicker::take_current").unwrap());
-        assert!(method.find("TaskProviderPicker::take_current").unwrap()
-            < method.find("ensure_executable_available").unwrap());
-        assert!(method.find("ensure_executable_available").unwrap()
-            < method.find("begin_worktree_creation").unwrap());
+        let method = source
+            .split("fn task_create_with_provider(")
+            .nth(1)
+            .unwrap()
+            .split("/// Enter the bounded")
+            .next()
+            .unwrap();
+        assert!(
+            method
+                .find("!self.config.experimental_task_sidebar")
+                .unwrap()
+                < method.find("TaskProviderPicker::take_current").unwrap()
+        );
+        assert!(
+            method.find("TaskProviderPicker::take_current").unwrap()
+                < method.find("ensure_executable_available").unwrap()
+        );
+        assert!(
+            method.find("ensure_executable_available").unwrap()
+                < method.find("begin_worktree_creation").unwrap()
+        );
         assert!(method.contains("TaskProviderPicker::new(context)"));
         assert!(source.contains("Message::TaskCreateWithProvider(reference.clone(), provider)"));
         assert!(source.contains("Message::TaskCreateProviderCancel(reference)"));
-        let cancel = source.split("Message::TaskCreateProviderCancel(reference) => {").nth(1).unwrap()
-            .split("Message::TaskStartNative").next().unwrap();
+        let cancel = source
+            .split("Message::TaskCreateProviderCancel(reference) => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::TaskStartNative")
+            .next()
+            .unwrap();
         assert!(cancel.contains("TaskProviderPicker::take_current"));
-        for start in ["fn toggle_sidebar(", "fn sync_tab_position_ui(", "fn set_task_panel_open("] {
-            let body = source.split(start).nth(1).unwrap().split("\n    fn ").next().unwrap();
+        for start in [
+            "fn toggle_sidebar(",
+            "fn sync_tab_position_ui(",
+            "fn set_task_panel_open(",
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split("\n    fn ")
+                .next()
+                .unwrap();
             assert!(body.contains("retire_panel_callbacks()"));
         }
     }
@@ -595,24 +659,52 @@ mod tests {
     fn diff_production_display_and_request_are_bound_to_selected_task() {
         let source = include_str!("main.rs");
         assert!(source.contains("if self.task_panel.owns_visible_diff(task.id)"));
-        let open = source.split("Message::TaskDiffOpen(task_id) => {").nth(1).unwrap()
-            .split("Message::TaskDiffClose").next().unwrap();
-        assert!(open.find("self.task_panel.selected != Some(task_id)").unwrap()
-            < open.find("request_diff(task_id").unwrap());
-        let pump = source.split("// Tasks dashboard pump:").nth(1).unwrap()
-            .split("let interval =").next().unwrap();
+        let open = source
+            .split("Message::TaskDiffOpen(task_id) => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::TaskDiffClose")
+            .next()
+            .unwrap();
+        assert!(
+            open.find("self.task_panel.selected != Some(task_id)")
+                .unwrap()
+                < open.find("request_diff(").unwrap()
+        );
+        let pump = source
+            .split("// Tasks dashboard pump:")
+            .nth(1)
+            .unwrap()
+            .split("let interval =")
+            .next()
+            .unwrap();
         assert!(pump.contains("self.task_panel.diff.state().loading"));
         let ui = include_str!("agent_task_ui.rs");
-        let close = ui.split("pub(crate) fn close_diff(&mut self) {").nth(1).unwrap()
-            .split("pub(crate) fn diff_reference").next().unwrap();
+        let close = ui
+            .split("pub(crate) fn close_diff(&mut self) {")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn diff_reference")
+            .next()
+            .unwrap();
         assert!(!close.contains("self.diff ="));
         assert!(!close.contains("pending"));
         let worker = include_str!("agent_task/diff.rs");
-        let poll = worker.split("pub fn poll(&mut self) -> bool {").nth(1).unwrap()
-            .split("/// Base revision").next().unwrap();
+        let poll = worker
+            .split("pub fn poll(&mut self) -> bool {")
+            .nth(1)
+            .unwrap()
+            .split("/// Base revision")
+            .next()
+            .unwrap();
         assert!(!poll.contains("is_open = true"));
-        let apply = worker.split("fn apply_result(&mut self, result: WorkerResult) {").nth(1).unwrap()
-            .split("\n}").next().unwrap();
+        let apply = worker
+            .split("fn apply_result(&mut self, result: WorkerResult) {")
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
         assert!(!apply.contains("is_open = true"));
     }
 
@@ -629,7 +721,10 @@ mod tests {
         assert!(!panel.edit_follow_up(&old_a, 1, "late A input".into()));
         assert_eq!(panel.begin_follow_up_send(&old_a, 1), None);
         assert_eq!(panel.follow_up, "feedback for B");
-        assert_eq!(panel.begin_follow_up_send(&current_b, 1).as_deref(), Some("feedback for B"));
+        assert_eq!(
+            panel.begin_follow_up_send(&current_b, 1).as_deref(),
+            Some("feedback for B")
+        );
         // Dispatch failure keeps the draft, but a queued duplicate cannot retry.
         assert_eq!(panel.follow_up, "feedback for B");
         assert_eq!(panel.begin_follow_up_send(&current_b, 1), None);
@@ -666,16 +761,31 @@ mod tests {
     #[test]
     fn production_follow_up_admission_precedes_dispatch_and_draft_clear() {
         let source = include_str!("main.rs");
-        let send = source.split("Message::TaskFollowUpSend(reference) => {").nth(1).unwrap()
-            .split("Message::TaskApprovalDeny").next().unwrap();
+        let send = source
+            .split("Message::TaskFollowUpSend(reference) => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::TaskApprovalDeny")
+            .next()
+            .unwrap();
         let guard = send.find("task_follow_up_is_current").unwrap();
         let take = send.find("begin_follow_up_send").unwrap();
         let dispatch = send.find("prompt_codex").unwrap();
-        let clear = send.find("Ok(()) => self.task_panel.follow_up.clear()").unwrap();
+        let clear = send
+            .find("Ok(()) => self.task_panel.follow_up.clear()")
+            .unwrap();
         assert!(guard < take && take < dispatch && dispatch < clear);
-        let input = source.split("Message::TaskFollowUpInput(reference, value) => {").nth(1).unwrap()
-            .split("Message::TaskFollowUpSend").next().unwrap();
-        assert!(input.find("task_follow_up_is_current").unwrap() < input.find("edit_follow_up").unwrap());
+        let input = source
+            .split("Message::TaskFollowUpInput(reference, value) => {")
+            .nth(1)
+            .unwrap()
+            .split("Message::TaskFollowUpSend")
+            .next()
+            .unwrap();
+        assert!(
+            input.find("task_follow_up_is_current").unwrap()
+                < input.find("edit_follow_up").unwrap()
+        );
         assert!(source.contains("Message::TaskFollowUpInput(input_reference.clone(), value)"));
         assert!(source.contains("Message::TaskFollowUpSend(reference)"));
         let direct_assignment = regex::Regex::new(r"self\.task_panel\.selected\s*=[^=]").unwrap();

@@ -2453,7 +2453,9 @@ impl SidebarDropIntents {
     }
 
     fn collecting_is(&self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
-        self.collecting.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, intent))
+        self.collecting
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, intent))
     }
 
     fn start_planning(&mut self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
@@ -2466,7 +2468,11 @@ impl SidebarDropIntents {
     }
 
     fn finish_planning(&mut self, intent: &std::sync::Arc<SidebarDropIntent>) -> bool {
-        let Some(index) = self.planning.iter().position(|(current, _)| std::sync::Arc::ptr_eq(current, intent)) else {
+        let Some(index) = self
+            .planning
+            .iter()
+            .position(|(current, _)| std::sync::Arc::ptr_eq(current, intent))
+        else {
             return false;
         };
         self.planning.remove(index).1
@@ -2474,17 +2480,31 @@ impl SidebarDropIntents {
 }
 
 impl SidebarDropIntent {
-    fn capture(generation: u64, context_epoch: Option<u64>, session_id: Option<usize>,
-        target_dir: Option<std::path::PathBuf>, target_is_local: bool) -> Option<std::sync::Arc<Self>>
-    {
+    fn capture(
+        generation: u64,
+        context_epoch: Option<u64>,
+        session_id: Option<usize>,
+        target_dir: Option<std::path::PathBuf>,
+        target_is_local: bool,
+    ) -> Option<std::sync::Arc<Self>> {
         Some(std::sync::Arc::new(Self {
-            generation, context_epoch: context_epoch?, session_id: session_id?,
-            target_dir: target_dir?, target_is_local,
+            generation,
+            context_epoch: context_epoch?,
+            session_id: session_id?,
+            target_dir: target_dir?,
+            target_is_local,
         }))
     }
 
-    fn matches_context(&self, generation: u64, epoch: Option<u64>, session_id: Option<usize>) -> bool {
-        self.generation == generation && Some(self.context_epoch) == epoch && Some(self.session_id) == session_id
+    fn matches_context(
+        &self,
+        generation: u64,
+        epoch: Option<u64>,
+        session_id: Option<usize>,
+    ) -> bool {
+        self.generation == generation
+            && Some(self.context_epoch) == epoch
+            && Some(self.session_id) == session_id
     }
 }
 
@@ -5590,12 +5610,15 @@ impl Frost {
     /// Single re-apply path for live config changes (Set*, Reset, hot reload):
     /// re-resolve the theme, rebuild metrics, and regrid every session.
     fn apply_config(&mut self) {
-        self.organism.set_enabled(self.config.ascii_organism_enabled);
+        self.organism
+            .set_enabled(self.config.ascii_organism_enabled);
         if self.config.ascii_organism_enabled {
             for sess in &self.sessions {
                 if !sess.managed_remote && !sess.transcript_read_only() {
-                    self.organism.prime_session(sess.id, sess.terminal.is_command_running());
-                    self.organism.set_remote(sess.id, sess.observed_ssh_command().is_some());
+                    self.organism
+                        .prime_session(sess.id, sess.terminal.is_command_running());
+                    self.organism
+                        .set_remote(sess.id, sess.observed_ssh_command().is_some());
                 }
             }
         }
@@ -8872,8 +8895,13 @@ impl Frost {
                 sess.block_selection.clear();
                 sess.terminal.scroll_to_bottom();
                 sess.projection_view_state.scroll_to_bottom();
-                if sess.write_pty(bytes) && !sess.managed_remote && self.organism.is_local(sess.id)
-                    && !matches!(sess.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                if sess.write_pty(bytes)
+                    && !sess.managed_remote
+                    && self.organism.is_local(sess.id)
+                    && !matches!(
+                        sess.fg_proc_cache.as_deref(),
+                        Some("ssh" | "mosh" | "telnet")
+                    )
                 {
                     self.organism.accepted_input();
                 }
@@ -10921,9 +10949,13 @@ impl Frost {
             self.hint_read_only_transcript();
             return false;
         }
-        if written && self.organism.is_local(id)
-            && self.sessions.get(self.active).is_some_and(|s| s.id == id && !s.managed_remote
-                && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet")))
+        if written
+            && self.organism.is_local(id)
+            && self.sessions.get(self.active).is_some_and(|s| {
+                s.id == id
+                    && !s.managed_remote
+                    && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+            })
         {
             self.organism.accepted_input();
         }
@@ -13473,7 +13505,8 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        self.organism.set_enabled(self.config.ascii_organism_enabled);
+        self.organism
+            .set_enabled(self.config.ascii_organism_enabled);
         if self.organism_observation_owner().is_none() {
             self.organism.pause_clock();
         }
@@ -13495,11 +13528,17 @@ impl Frost {
                 // Observe only live session identities, before processing this
                 // batch so enabling during C..D cannot replay that command.
                 if self.config.ascii_organism_enabled {
-                    if let Some(sess) = self.sessions.iter().find(|s| s.id == id && s.master_fd == fd) {
+                    if let Some(sess) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id && s.master_fd == fd)
+                    {
                         if !sess.managed_remote && !sess.transcript_read_only() {
-                            self.organism.prime_session(id, sess.terminal.is_command_running());
+                            self.organism
+                                .prime_session(id, sess.terminal.is_command_running());
                             if self.organism.remote_probe_due(id) {
-                                self.organism.set_remote(id, sess.observed_ssh_command().is_some());
+                                self.organism
+                                    .set_remote(id, sess.observed_ssh_command().is_some());
                             }
                         } else {
                             self.organism.forget_session(id);
@@ -13539,24 +13578,46 @@ impl Frost {
                 // Borrow the existing one-shot drain. Do not drain again or
                 // infer successful exits for boundary-inferred completions.
                 if self.config.ascii_organism_enabled {
-                    if let Some(sess) = self.sessions.iter().find(|s| s.id == id && s.master_fd == fd) {
-                        if !sess.managed_remote && !sess.terminal.is_alt_buffer_active()
-                            && !matches!(sess.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                    if let Some(sess) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id && s.master_fd == fd)
+                    {
+                        if !sess.managed_remote
+                            && !sess.terminal.is_alt_buffer_active()
+                            && !matches!(
+                                sess.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
                         {
                             for completed in &completed_commands {
                                 let exit = (completed.completion_provenance
                                     == block_mode::CompletionProvenance::ShellReported)
                                     .then_some(completed.exit_code)
                                     .flatten();
-                                self.organism.completed(id, &completed.command, exit, completed.duration_ms);
+                                self.organism.completed(
+                                    id,
+                                    &completed.command,
+                                    exit,
+                                    completed.duration_ms,
+                                );
                             }
-                            self.organism.batch_finished(id, sess.terminal.is_command_running());
+                            self.organism
+                                .batch_finished(id, sess.terminal.is_command_running());
                         }
                     }
                 }
-                if !data.is_empty() && self.organism.is_local(id)
-                    && self.sessions.iter().any(|s| s.id == id && s.master_fd == fd && !s.managed_remote
-                        && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet")))
+                if !data.is_empty()
+                    && self.organism.is_local(id)
+                    && self.sessions.iter().any(|s| {
+                        s.id == id
+                            && s.master_fd == fd
+                            && !s.managed_remote
+                            && !matches!(
+                                s.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
+                    })
                 {
                     self.organism.note_output(id);
                 }
@@ -14165,7 +14226,8 @@ impl Frost {
             }
             Message::TaskCreateProviderCancel(reference) => {
                 agent_task_ui::TaskProviderPicker::take_current(
-                    &mut self.task_panel.provider_picker, &reference,
+                    &mut self.task_panel.provider_picker,
+                    &reference,
                 );
             }
             Message::TaskStartNative(task_id) => self.task_start_native(task_id),
@@ -14200,14 +14262,18 @@ impl Frost {
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
             Message::TaskFollowUpInput(reference, value) => {
                 if self.task_follow_up_is_current(&reference) {
-                    self.task_panel.edit_follow_up(&reference, reference.completed_turns, value);
+                    self.task_panel
+                        .edit_follow_up(&reference, reference.completed_turns, value);
                 }
             }
             Message::TaskFollowUpSend(reference) => {
                 if !self.task_follow_up_is_current(&reference) {
                     return Task::none();
                 }
-                let Some(text) = self.task_panel.begin_follow_up_send(&reference, reference.completed_turns) else {
+                let Some(text) = self
+                    .task_panel
+                    .begin_follow_up_send(&reference, reference.completed_turns)
+                else {
                     return Task::none();
                 };
                 // The task and immutable draft are admitted together before
@@ -14241,15 +14307,18 @@ impl Frost {
             }
             Message::TaskDiffOpen(task_id) => {
                 if self.task_panel.selected != Some(task_id)
-                    || !self.config.experimental_task_sidebar || !self.dock_open()
+                    || !self.config.experimental_task_sidebar
+                    || !self.dock_open()
                     || self.sidebar_panel != SidebarPanel::Tasks
                 {
                     return Task::none();
                 }
                 if let Some(task) = self.task_manager.get(task_id) {
-                    let result = self
-                        .task_panel
-                        .request_diff(task_id, task.worktree_path.clone(), task.base_commit.clone());
+                    let result = self.task_panel.request_diff(
+                        task_id,
+                        task.worktree_path.clone(),
+                        task.base_commit.clone(),
+                    );
                     if let Err(error) = result {
                         self.push_toast(error.to_string(), ToastKind::Warning);
                     }
@@ -14395,7 +14464,10 @@ impl Frost {
                     self.config.ai_api_key_file = Some(path).filter(|p| !p.is_empty());
                     self.config_dirty = true;
                 } else {
-                    self.push_toast("Key file path unchanged: unsafe characters or more than 16 KiB", ToastKind::Warning);
+                    self.push_toast(
+                        "Key file path unchanged: unsafe characters or more than 16 KiB",
+                        ToastKind::Warning,
+                    );
                 }
             }
             Message::SetAiKeyDraft(value) => {
@@ -14568,7 +14640,9 @@ impl Frost {
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
-                if self.terminal_input_active() && matches!(&event, keyboard::Event::KeyPressed { .. }) {
+                if self.terminal_input_active()
+                    && matches!(&event, keyboard::Event::KeyPressed { .. })
+                {
                     self.organism.retreat();
                 }
                 // These surfaces confirm/open reviewed commands. Search-only
@@ -15024,9 +15098,13 @@ impl Frost {
                             sess.block_selection.clear();
                             sess.terminal.scroll_to_bottom();
                             sess.projection_view_state.scroll_to_bottom();
-                            if sess.write_pty(&bytes) && !sess.managed_remote
+                            if sess.write_pty(&bytes)
+                                && !sess.managed_remote
                                 && self.organism.is_local(sess.id)
-                                && !matches!(sess.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                                && !matches!(
+                                    sess.fg_proc_cache.as_deref(),
+                                    Some("ssh" | "mosh" | "telnet")
+                                )
                             {
                                 self.organism.accepted_input();
                             }
@@ -15047,7 +15125,9 @@ impl Frost {
                 let Some(sess) = self.sessions.get_mut(self.active) else {
                     return Task::none();
                 };
-                if !sess.transcript_read_only() && matches!(&event, Ime::Preedit(..) | Ime::Commit(_)) {
+                if !sess.transcript_read_only()
+                    && matches!(&event, Ime::Preedit(..) | Ime::Commit(_))
+                {
                     self.organism.retreat();
                 }
                 match event {
@@ -15060,9 +15140,13 @@ impl Frost {
                         sess.refresh();
                     }
                     Ime::Preedit(content, selection) => {
-                        if !sess.transcript_read_only() && !sess.managed_remote
+                        if !sess.transcript_read_only()
+                            && !sess.managed_remote
                             && self.organism.is_local(sess.id)
-                            && !matches!(sess.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                            && !matches!(
+                                sess.fg_proc_cache.as_deref(),
+                                Some("ssh" | "mosh" | "telnet")
+                            )
                         {
                             self.organism.accepted_input();
                         }
@@ -15080,9 +15164,13 @@ impl Frost {
                             sess.block_selection.clear();
                             sess.terminal.scroll_to_bottom();
                             sess.projection_view_state.scroll_to_bottom();
-                            if sess.write_pty(text.as_bytes()) && !sess.managed_remote
+                            if sess.write_pty(text.as_bytes())
+                                && !sess.managed_remote
                                 && self.organism.is_local(sess.id)
-                                && !matches!(sess.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                                && !matches!(
+                                    sess.fg_proc_cache.as_deref(),
+                                    Some("ssh" | "mosh" | "telnet")
+                                )
                             {
                                 self.organism.accepted_input();
                             }
@@ -15148,11 +15236,13 @@ impl Frost {
                     self.refresh_active_context();
                 }
                 self.organism.retreat();
-                if self.sessions.get(self.active).is_some_and(|s| s.id == session_id
-                    && !s.managed_remote
-                    && !s.transcript_read_only() && self.organism.is_local(s.id)
-                    && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet")))
-                {
+                if self.sessions.get(self.active).is_some_and(|s| {
+                    s.id == session_id
+                        && !s.managed_remote
+                        && !s.transcript_read_only()
+                        && self.organism.is_local(s.id)
+                        && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                }) {
                     self.organism.accepted_input();
                 }
                 return self.handle_mouse(session_id, input);
@@ -15982,9 +16072,17 @@ impl Frost {
                 let generation = self.sidebar.generation();
                 let session_id = self.sessions.get(self.active).map(|session| session.id);
                 if self.sidebar_drop_debounce_generation != Some(generation)
-                    || !self.sidebar_drop_intents.collecting.as_ref().is_some_and(|intent| {
-                        intent.matches_context(generation, self.sidebar_context_epoch, session_id)
-                    })
+                    || !self
+                        .sidebar_drop_intents
+                        .collecting
+                        .as_ref()
+                        .is_some_and(|intent| {
+                            intent.matches_context(
+                                generation,
+                                self.sidebar_context_epoch,
+                                session_id,
+                            )
+                        })
                 {
                     self.sidebar_drop_burst.clear();
                     self.sidebar_drop_intents.collecting = None;
@@ -15992,12 +16090,18 @@ impl Frost {
                 }
                 if self.sidebar_drop_intents.collecting.is_none() {
                     if !self.sidebar_drop_intents.can_plan() {
-                        self.set_sidebar_notice("Drop planning is busy; wait and drop these files again".to_string(), false);
+                        self.set_sidebar_notice(
+                            "Drop planning is busy; wait and drop these files again".to_string(),
+                            false,
+                        );
                         return Task::none();
                     }
                     let Some(intent) = SidebarDropIntent::capture(
-                        generation, self.sidebar_context_epoch, session_id,
-                        self.sidebar_drop_target(), self.sidebar.location == remote_fs::FsLocation::Local,
+                        generation,
+                        self.sidebar_context_epoch,
+                        session_id,
+                        self.sidebar_drop_target(),
+                        self.sidebar.location == remote_fs::FsLocation::Local,
                     ) else {
                         return Task::none();
                     };
@@ -16016,8 +16120,11 @@ impl Frost {
                     return Task::none();
                 }
                 if self.sidebar_drop_debounce_generation != Some(intent.generation)
-                    || !intent.matches_context(self.sidebar.generation(), self.sidebar_context_epoch,
-                        self.sessions.get(self.active).map(|session| session.id))
+                    || !intent.matches_context(
+                        self.sidebar.generation(),
+                        self.sidebar_context_epoch,
+                        self.sessions.get(self.active).map(|session| session.id),
+                    )
                 {
                     self.sidebar_drop_intents.collecting = None;
                     self.sidebar_drop_debounce_generation = None;
@@ -16038,22 +16145,30 @@ impl Frost {
                 let target_is_local = intent.target_is_local;
                 if !self.sidebar_drop_intents.start_planning(&intent) {
                     self.sidebar_drop_intents.collecting = None;
-                    self.set_sidebar_notice("Drop planning is busy; wait and drop these files again".to_string(), false);
+                    self.set_sidebar_notice(
+                        "Drop planning is busy; wait and drop these files again".to_string(),
+                        false,
+                    );
                     return Task::none();
                 }
                 return Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || plan_drop(paths, target_dir, target_is_local))
-                            .await
-                            .unwrap_or_else(|error| Err(format!("Drop planner failed: {error}")))
+                        tokio::task::spawn_blocking(move || {
+                            plan_drop(paths, target_dir, target_is_local)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(format!("Drop planner failed: {error}")))
                     },
                     move |plan| Message::SidebarDropPlanned(intent, plan),
                 );
             }
             Message::SidebarDropPlanned(intent, plan) => {
                 if !self.sidebar_drop_intents.finish_planning(&intent)
-                    || !intent.matches_context(self.sidebar.generation(), self.sidebar_context_epoch,
-                        self.sessions.get(self.active).map(|session| session.id))
+                    || !intent.matches_context(
+                        self.sidebar.generation(),
+                        self.sidebar_context_epoch,
+                        self.sessions.get(self.active).map(|session| session.id),
+                    )
                 {
                     return Task::none();
                 }
@@ -16350,8 +16465,10 @@ impl Frost {
                 if enabled {
                     for sess in &self.sessions {
                         if !sess.managed_remote && !sess.transcript_read_only() {
-                            self.organism.prime_session(sess.id, sess.terminal.is_command_running());
-                            self.organism.set_remote(sess.id, sess.observed_ssh_command().is_some());
+                            self.organism
+                                .prime_session(sess.id, sess.terminal.is_command_running());
+                            self.organism
+                                .set_remote(sess.id, sess.observed_ssh_command().is_some());
                         }
                     }
                 }
@@ -16372,19 +16489,26 @@ impl Frost {
                     self.organism.retain_sessions(&ids);
                     if let Some(sess) = self.sessions.get(self.active) {
                         if !sess.managed_remote && !sess.transcript_read_only() {
-                            self.organism.prime_session(sess.id, sess.terminal.is_command_running());
+                            self.organism
+                                .prime_session(sess.id, sess.terminal.is_command_running());
                             if self.organism.remote_probe_due(sess.id) {
-                                self.organism.set_remote(sess.id, sess.observed_ssh_command().is_some());
+                                self.organism
+                                    .set_remote(sess.id, sess.observed_ssh_command().is_some());
                             }
                         }
                     }
                 }
                 let owner = self.organism_observation_owner();
-                let running = self.sessions.get(self.active)
+                let running = self
+                    .sessions
+                    .get(self.active)
                     .is_some_and(|s| s.terminal.is_command_running());
-                let any_running = self.sessions.iter().any(|s| !s.managed_remote
-                    && self.organism.is_local(s.id) && s.terminal.is_command_running()
-                    && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet")));
+                let any_running = self.sessions.iter().any(|s| {
+                    !s.managed_remote
+                        && self.organism.is_local(s.id)
+                        && s.terminal.is_command_running()
+                        && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+                });
                 self.organism.tick(owner, running, any_running);
             }
             Message::SetBottomBar(show) => {
@@ -16949,7 +17073,8 @@ impl Frost {
                 ]);
             }
             Message::HistoryPickerAccept(record) => {
-                let command = history_picker::accept_clicked_record(&mut self.history_picker, &record);
+                let command =
+                    history_picker::accept_clicked_record(&mut self.history_picker, &record);
                 return match command {
                     Some(command) => self.recall_into_active_pane(command),
                     None => Task::none(),
@@ -19892,21 +20017,29 @@ impl Frost {
     /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
     /// left; last-command status, grid size, and tab count on the right.
     fn organism_owner(&self) -> Option<usize> {
-        self.organism_observation_owner().filter(|_| !self.organism.is_retreating())
+        self.organism_observation_owner()
+            .filter(|_| !self.organism.is_retreating())
     }
 
     fn organism_observation_owner(&self) -> Option<usize> {
-        if !self.config.ascii_organism_enabled || !self.config.bottom_bar
-            || !self.focused || self.config_panel_open
+        if !self.config.ascii_organism_enabled
+            || !self.config.bottom_bar
+            || !self.focused
+            || self.config_panel_open
             || self.win_size.width < 640.0
         {
             return None;
         }
-        self.sessions.get(self.active).filter(|s| {
-            !s.managed_remote && !s.transcript_read_only()
-                && !s.terminal.is_alt_buffer_active() && self.organism.is_local(s.id)
-                && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
-        }).map(|s| s.id)
+        self.sessions
+            .get(self.active)
+            .filter(|s| {
+                !s.managed_remote
+                    && !s.transcript_read_only()
+                    && !s.terminal.is_alt_buffer_active()
+                    && self.organism.is_local(s.id)
+                    && !matches!(s.fg_proc_cache.as_deref(), Some("ssh" | "mosh" | "telnet"))
+            })
+            .map(|s| s.id)
     }
 
     fn status_bar(&self) -> Element<'_, Message> {
@@ -19952,15 +20085,25 @@ impl Frost {
         if self.config.ascii_organism_enabled && self.win_size.width >= 640.0 {
             // Reserve the same slot while hidden/retreating so typing, focus
             // and pane changes cannot move the ordinary status segments.
-            let glyph = self.organism_owner().map(|id| {
-                let running = sess.is_some_and(|s| s.terminal.is_command_running());
-                let settled = sess.and_then(|s| s.terminal.running_duration_ms())
-                    .is_some_and(|ms| ms >= 60_000);
-                self.organism.glyph(id, running, settled, self.config.ascii_organism_motion)
-            }).unwrap_or_default();
+            let glyph = self
+                .organism_owner()
+                .map(|id| {
+                    let running = sess.is_some_and(|s| s.terminal.is_command_running());
+                    let settled = sess
+                        .and_then(|s| s.terminal.running_duration_ms())
+                        .is_some_and(|ms| ms >= 60_000);
+                    self.organism
+                        .glyph(id, running, settled, self.config.ascii_organism_motion)
+                })
+                .unwrap_or_default();
             right = right.push(
-                container(text(glyph).font(self.mono).size(11).color(self.c_text_dim()))
-                    .width(Length::Fixed(84.0)),
+                container(
+                    text(glyph)
+                        .font(self.mono)
+                        .size(11)
+                        .color(self.c_text_dim()),
+                )
+                .width(Length::Fixed(84.0)),
             );
         }
         let bar = row![left, Space::new().width(Length::Fill), right]
@@ -22220,7 +22363,9 @@ impl Frost {
         let input_epoch = std::sync::Arc::clone(&epoch);
         let query = text_input("Type to filter…", &self.palette.query)
             .id(PALETTE_INPUT_ID.clone())
-            .on_input(move |value| Message::PaletteInput(std::sync::Arc::clone(&input_epoch), value))
+            .on_input(move |value| {
+                Message::PaletteInput(std::sync::Arc::clone(&input_epoch), value)
+            })
             .size(14);
         let query_line = row![text("›").size(16), query]
             .spacing(8)
@@ -22292,7 +22437,9 @@ impl Frost {
     /// Save persists to disk, Reset restores defaults.
     fn organism_settings(&self) -> Element<'_, Message> {
         let poses: Vec<organism::Pose> = jterm_core::organism_daily::PreviewPose::ALL
-            .into_iter().map(organism::Pose).collect();
+            .into_iter()
+            .map(organism::Pose)
+            .collect();
         let mut hello_button = button(text("Say hello"));
         if self.organism.can_say_hello() {
             hello_button = hello_button.on_press(Message::OrganismHello);
@@ -24020,14 +24167,20 @@ impl Frost {
     /// Re-check the same live task/turn conditions that render the composer.
     /// A retained UI callback must never send another selected task's draft.
     fn task_follow_up_is_current(&self, reference: &agent_task_ui::TaskFollowUpRef) -> bool {
-        if !self.config.experimental_task_sidebar || !self.dock_open()
+        if !self.config.experimental_task_sidebar
+            || !self.dock_open()
             || self.sidebar_panel != SidebarPanel::Tasks
         {
             return false;
         }
-        let Some(task) = self.task_manager.get(reference.task_id) else { return false; };
-        let Some(snapshot) = self.agent_runtime.snapshot(reference.task_id) else { return false; };
-        self.task_panel.accepts_follow_up(reference, snapshot.completed_turns)
+        let Some(task) = self.task_manager.get(reference.task_id) else {
+            return false;
+        };
+        let Some(snapshot) = self.agent_runtime.snapshot(reference.task_id) else {
+            return false;
+        };
+        self.task_panel
+            .accepts_follow_up(reference, snapshot.completed_turns)
             && self.agent_runtime.has_running(task.id)
             && self.task_manager.has_active_agent_event_stream(task.id)
             && task.status == agent_task::TaskStatus::ReadyForReview
@@ -24169,8 +24322,13 @@ impl Frost {
     }
 
     /// Finish Create task after the user picks a provider in the Tasks panel.
-    fn task_create_with_provider(&mut self, reference: std::sync::Arc<()>, provider: agent_task::AgentProvider) {
-        if !self.config.experimental_task_sidebar || !self.dock_open()
+    fn task_create_with_provider(
+        &mut self,
+        reference: std::sync::Arc<()>,
+        provider: agent_task::AgentProvider,
+    ) {
+        if !self.config.experimental_task_sidebar
+            || !self.dock_open()
             || self.sidebar_panel != SidebarPanel::Tasks
         {
             return;
@@ -24183,7 +24341,8 @@ impl Frost {
             return;
         }
         let Some(context) = agent_task_ui::TaskProviderPicker::take_current(
-            &mut self.task_panel.provider_picker, &reference,
+            &mut self.task_panel.provider_picker,
+            &reference,
         ) else {
             return;
         };
@@ -25004,7 +25163,9 @@ impl Frost {
                 .snapshot(task.id)
                 .map(|snapshot| snapshot.completed_turns)
                 .unwrap_or(0);
-            let reference = self.task_panel.follow_up_reference(task.id, completed_turns);
+            let reference = self
+                .task_panel
+                .follow_up_reference(task.id, completed_turns);
             let input_reference = reference.clone();
             let input = text_input(
                 "Review feedback for the next turn…",
@@ -26215,14 +26376,18 @@ impl Frost {
         });
         subs.push(events);
         let preview_visible = self.focused && self.config_panel_open && self.theme_editor.is_none();
-        let live_visible = self.focused && self.config.ascii_organism_enabled
-            && self.config.bottom_bar && self.win_size.width >= 640.0;
+        let live_visible = self.focused
+            && self.config.ascii_organism_enabled
+            && self.config.bottom_bar
+            && self.win_size.width >= 640.0;
         if preview_visible || live_visible {
             let full = self.config.ascii_organism_motion == Some(organism::Motion::Full)
                 && (preview_visible || self.organism_owner().is_some());
             let millis = if full { 100 } else { 900 };
-            subs.push(iced::time::every(std::time::Duration::from_millis(millis))
-                .map(|_| Message::OrganismTick));
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(millis))
+                    .map(|_| Message::OrganismTick),
+            );
         }
         // A right-press on a tab carries no coordinates, so the context menu
         // needs the pointer tracked separately. Track it only while a tab is
@@ -27129,7 +27294,8 @@ fn abbreviate_home(path: &str) -> String {
 /// Lexical component matching only: no filesystem lookup or canonicalization.
 /// Non-UTF8/empty home paths retain the original display policy.
 fn abbreviate_home_with(path: &str, home: Option<&std::path::Path>) -> String {
-    let Some(home) = home.filter(|home| !home.as_os_str().is_empty() && home.to_str().is_some()) else {
+    let Some(home) = home.filter(|home| !home.as_os_str().is_empty() && home.to_str().is_some())
+    else {
         return path.to_string();
     };
     let Ok(rest) = std::path::Path::new(path).strip_prefix(home) else {
@@ -28114,14 +28280,32 @@ mod tests {
         assert_eq!(abbreviate_home_with("/home/ann", home), "~");
         assert_eq!(abbreviate_home_with("/home/ann/", home), "~");
         assert_eq!(abbreviate_home_with("/home/ann/src", home), "~/src");
-        assert_eq!(abbreviate_home_with("/home/anna/src", home), "/home/anna/src");
+        assert_eq!(
+            abbreviate_home_with("/home/anna/src", home),
+            "/home/anna/src"
+        );
         assert_eq!(abbreviate_home_with("/home/annex", home), "/home/annex");
-        assert_eq!(abbreviate_home_with("/home/ann/雪", Some(std::path::Path::new("/home/ann/"))), "~/雪");
-        assert_eq!(abbreviate_home_with("/", Some(std::path::Path::new("/"))), "~");
-        assert_eq!(abbreviate_home_with("/tmp", Some(std::path::Path::new("/"))), "~/tmp");
+        assert_eq!(
+            abbreviate_home_with("/home/ann/雪", Some(std::path::Path::new("/home/ann/"))),
+            "~/雪"
+        );
+        assert_eq!(
+            abbreviate_home_with("/", Some(std::path::Path::new("/"))),
+            "~"
+        );
+        assert_eq!(
+            abbreviate_home_with("/tmp", Some(std::path::Path::new("/"))),
+            "~/tmp"
+        );
         assert_eq!(abbreviate_home_with("/tmp", None), "/tmp");
-        assert_eq!(abbreviate_home_with("/tmp", Some(std::path::Path::new(""))), "/tmp");
-        assert_eq!(abbreviate_home_with("/home/ann/../other", home), "~/../other");
+        assert_eq!(
+            abbreviate_home_with("/tmp", Some(std::path::Path::new(""))),
+            "/tmp"
+        );
+        assert_eq!(
+            abbreviate_home_with("/home/ann/../other", home),
+            "~/../other"
+        );
     }
 
     #[cfg(unix)]
@@ -28129,7 +28313,10 @@ mod tests {
     fn non_utf8_home_keeps_original_path_display() {
         use std::os::unix::ffi::OsStringExt;
         let home = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/home/\xff".to_vec()));
-        assert_eq!(abbreviate_home_with("/home/ann/src", Some(&home)), "/home/ann/src");
+        assert_eq!(
+            abbreviate_home_with("/home/ann/src", Some(&home)),
+            "/home/ann/src"
+        );
     }
 
     #[test]
@@ -34318,39 +34505,73 @@ mod tests {
     #[test]
     fn direct_session_save_failure_remains_eligible_for_periodic_retry() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
-        let save = source.split_once("    fn save_session_snapshot(&mut self) {")
-            .unwrap().1.split_once("    fn new_session(&mut self)").unwrap().0;
+        let save = source
+            .split_once("    fn save_session_snapshot(&mut self) {")
+            .unwrap()
+            .1
+            .split_once("    fn new_session(&mut self)")
+            .unwrap()
+            .0;
         let mark_pending = save.find("self.session_dirty = true;").unwrap();
         assert!(save.find("self.sessions.is_empty() || !self.config.restore_session || !self.is_first_instance").unwrap()
             < mark_pending);
         assert!(save.find("if self.session_writes_blocked {").unwrap() < mark_pending);
-        let inactive = save.split_once("        if self.session_writes_blocked {").unwrap().0;
+        let inactive = save
+            .split_once("        if self.session_writes_blocked {")
+            .unwrap()
+            .0;
         assert!(inactive.contains("self.session_dirty = false;"));
         assert!(!inactive.contains("snapshot.save("));
         for (start, end) in [
             ("    fn new_session_at(", "    /// Run the jsh installer"),
             ("    fn close_session(", "    /// Reconcile every tab"),
         ] {
-            let caller = source.split_once(start).unwrap().1.split_once(end).unwrap().0;
+            let caller = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
             assert!(caller.contains("self.save_session_snapshot();"));
         }
-        let tick = source.split_once("            Message::ConfigTick => {")
-            .unwrap().1.split_once("            Message::TabMenuOpen(").unwrap().0;
+        let tick = source
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::TabMenuOpen(")
+            .unwrap()
+            .0;
         assert!(tick.contains("if self.session_dirty {"));
         assert!(tick.contains("self.save_session_snapshot();"));
-        let eligible = save.split_once("        if self.session_writes_blocked {")
-            .unwrap().1;
+        let eligible = save
+            .split_once("        if self.session_writes_blocked {")
+            .unwrap()
+            .1;
         let pending = eligible.find("self.session_dirty = true;").unwrap();
-        for failure_boundary in ["snapshot.to_json()", "self.config.session_history_path()", "snapshot.save(&path)"] {
+        for failure_boundary in [
+            "snapshot.to_json()",
+            "self.config.session_history_path()",
+            "snapshot.save(&path)",
+        ] {
             assert!(pending < eligible.find(failure_boundary).unwrap());
         }
         // After admission only a cached exact match or a successful save may
         // clear pending work; all error returns retain it for ConfigTick.
         assert_eq!(eligible.matches("self.session_dirty = false;").count(), 2);
-        let write = eligible.split_once("match snapshot.save(&path) {").unwrap().1;
-        assert!(write.split_once("            Err(error) => {").unwrap().0
+        let write = eligible
+            .split_once("match snapshot.save(&path) {")
+            .unwrap()
+            .1;
+        assert!(write
+            .split_once("            Err(error) => {")
+            .unwrap()
+            .0
             .contains("self.session_dirty = false;"));
-        assert!(!write.split_once("            Err(error) => {").unwrap().1
+        assert!(!write
+            .split_once("            Err(error) => {")
+            .unwrap()
+            .1
             .contains("self.session_dirty = false;"));
     }
 
@@ -34631,28 +34852,49 @@ mod tests {
             .split_once("            Message::SidebarDropPlanned(")
             .unwrap()
             .0;
-        assert!(drop.contains(
-            "let target_is_local = intent.target_is_local;"
-        ));
+        assert!(drop.contains("let target_is_local = intent.target_is_local;"));
         assert!(drop.contains("plan_drop(paths, target_dir, target_is_local)"));
         assert!(drop.contains("tokio::task::spawn_blocking("));
         assert!(drop.contains("Drop planner failed:"));
         assert!(drop.contains("let target_dir = intent.target_dir.clone();"));
         assert!(!drop.contains("self.sidebar_drop_target()"));
-        let cancel = source.split_once("            Message::SidebarTransferCancel => {")
-            .unwrap().1.split_once("            Message::SidebarRowHover(").unwrap().0;
+        let cancel = source
+            .split_once("            Message::SidebarTransferCancel => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarRowHover(")
+            .unwrap()
+            .0;
         assert!(cancel.contains("self.sidebar_drop_intents.clear()"));
         assert!(cancel.contains("self.sidebar_drop_burst.clear()"));
         assert!(cancel.contains("transfer.progress.cancel()"));
-        let admission = source.split_once("            Message::FileDropped(path) => {")
-            .unwrap().1.split_once("            Message::SidebarDropFlush(").unwrap().0;
-        assert!(admission.find("!self.sidebar_drop_intents.can_plan()").unwrap()
-            < admission.find("return Task::perform(").unwrap());
+        let admission = source
+            .split_once("            Message::FileDropped(path) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarDropFlush(")
+            .unwrap()
+            .0;
+        assert!(
+            admission
+                .find("!self.sidebar_drop_intents.can_plan()")
+                .unwrap()
+                < admission.find("return Task::perform(").unwrap()
+        );
         assert!(admission.contains("Drop planning is busy; wait and drop these files again"));
-        let completion = source.split_once("            Message::SidebarDropPlanned(intent, plan) => {")
-            .unwrap().1.split_once("            Message::SidebarDropHover(").unwrap().0;
-        assert!(completion.find("!self.sidebar_drop_intents.finish_planning(&intent)").unwrap()
-            < completion.find("self.sidebar_transfer = Some(ui)").unwrap());
+        let completion = source
+            .split_once("            Message::SidebarDropPlanned(intent, plan) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SidebarDropHover(")
+            .unwrap()
+            .0;
+        assert!(
+            completion
+                .find("!self.sidebar_drop_intents.finish_planning(&intent)")
+                .unwrap()
+                < completion.find("self.sidebar_transfer = Some(ui)").unwrap()
+        );
     }
 
     fn test_drop_intent(target: &str) -> std::sync::Arc<SidebarDropIntent> {

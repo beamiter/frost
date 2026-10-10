@@ -1265,12 +1265,18 @@ mod tests {
             (" Full ", crate::organism::Motion::Full),
             ("CALM", crate::organism::Motion::Calm),
         ] {
-            let input = format!("ascii_organism_enabled = true\nascii_organism_motion = \"{label}\"\n");
+            let input =
+                format!("ascii_organism_enabled = true\nascii_organism_motion = \"{label}\"\n");
             let config = Config::from_toml(&input).unwrap();
             assert!(config.ascii_organism_enabled);
             assert_eq!(config.ascii_organism_motion, Some(motion));
             let serialized = toml::to_string(&config).unwrap();
-            assert_eq!(Config::from_toml(&serialized).unwrap().ascii_organism_motion, Some(motion));
+            assert_eq!(
+                Config::from_toml(&serialized)
+                    .unwrap()
+                    .ascii_organism_motion,
+                Some(motion)
+            );
         }
         assert!(Config::from_toml("ascii_organism_motion = \"unknown\"\n").is_err());
     }
@@ -1364,7 +1370,10 @@ mod tests {
         assert_eq!(normalized.ai_provider, default_ai_provider());
         assert_eq!(normalized.ai_base_url, default_ai_base_url());
         assert_eq!(normalized.ai_model, default_ai_model());
-        assert_eq!(normalized.ai_api_key_file.as_deref(), Some("/tmp/key\0suffix"));
+        assert_eq!(
+            normalized.ai_api_key_file.as_deref(),
+            Some("/tmp/key\0suffix")
+        );
         assert_eq!(normalized.font_family, default_font_family());
         assert_eq!(normalized.theme, default_theme());
         assert_eq!(normalized.shell, None);
@@ -1375,42 +1384,79 @@ mod tests {
 
     #[test]
     fn credential_path_normalization_never_retargets_a_selected_source() {
-        for raw in [" /tmp/key".to_string(), "/tmp/key ".to_string(), "   ".to_string(),
-            "/tmp/key\0suffix".to_string(), "/tmp/key\u{202e}spoof".to_string(),
-            format!("/{}", "x".repeat(16 * 1024))] {
-            let config = Config { ai_api_key_file: Some(raw.clone()), ..Config::default() }.normalized();
+        for raw in [
+            " /tmp/key".to_string(),
+            "/tmp/key ".to_string(),
+            "   ".to_string(),
+            "/tmp/key\0suffix".to_string(),
+            "/tmp/key\u{202e}spoof".to_string(),
+            format!("/{}", "x".repeat(16 * 1024)),
+        ] {
+            let config = Config {
+                ai_api_key_file: Some(raw.clone()),
+                ..Config::default()
+            }
+            .normalized();
             assert_eq!(config.ai_api_key_file.as_deref(), Some(raw.as_str()));
             let serialized = config.serialized().unwrap();
-            let restored: Config = toml::from_str(std::str::from_utf8(&serialized).unwrap()).unwrap();
-            assert_eq!(restored.normalized().ai_api_key_file.as_deref(), Some(raw.as_str()));
+            let restored: Config =
+                toml::from_str(std::str::from_utf8(&serialized).unwrap()).unwrap();
+            assert_eq!(
+                restored.normalized().ai_api_key_file.as_deref(),
+                Some(raw.as_str())
+            );
         }
-        assert_eq!(Config { ai_api_key_file: Some(String::new()), ..Config::default() }
-            .normalized().ai_api_key_file, None);
+        assert_eq!(
+            Config {
+                ai_api_key_file: Some(String::new()),
+                ..Config::default()
+            }
+            .normalized()
+            .ai_api_key_file,
+            None
+        );
     }
 
     #[test]
     fn credential_path_live_edit_rejects_instead_of_sanitizing_or_truncating() {
-        for raw in ["/tmp/key\0suffix".to_string(), "/tmp/key\nother".to_string(),
-            "/tmp/key\u{202e}spoof".to_string(), "x".repeat(16 * 1024 + 1)] {
+        for raw in [
+            "/tmp/key\0suffix".to_string(),
+            "/tmp/key\nother".to_string(),
+            "/tmp/key\u{202e}spoof".to_string(),
+            "x".repeat(16 * 1024 + 1),
+        ] {
             assert!(accepted_ai_key_path_draft(raw).is_none());
         }
         for raw in ["", "   ", " /tmp/key", "/tmp/key ", "~/key"] {
             assert_eq!(accepted_ai_key_path_draft(raw.into()).as_deref(), Some(raw));
         }
         let exact_limit = format!("/{}", "x".repeat(16 * 1024 - 1));
-        assert_eq!(accepted_ai_key_path_draft(exact_limit.clone()), Some(exact_limit));
+        assert_eq!(
+            accepted_ai_key_path_draft(exact_limit.clone()),
+            Some(exact_limit)
+        );
     }
 
     #[test]
     fn credential_path_settings_and_store_use_exact_admission() {
         let source = include_str!("main.rs");
-        let edit = source.split_once("            Message::SetAiKeyFile(path) => {")
-            .unwrap().1.split_once("            Message::SetAiKeyDraft(").unwrap().0;
+        let edit = source
+            .split_once("            Message::SetAiKeyFile(path) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetAiKeyDraft(")
+            .unwrap()
+            .0;
         assert!(edit.contains("accepted_ai_key_path_draft(path)"));
         assert!(edit.contains("Key file path unchanged:"));
         assert!(!edit.contains("trim()"));
-        let store = source.split_once("            Message::StoreAiKey => {")
-            .unwrap().1.split_once("match persistence::write_api_key_file").unwrap().0;
+        let store = source
+            .split_once("            Message::StoreAiKey => {")
+            .unwrap()
+            .1
+            .split_once("match persistence::write_api_key_file")
+            .unwrap()
+            .0;
         assert!(!store.contains("trim()"));
         assert!(store.contains(".filter(|p| !p.is_empty())"));
     }

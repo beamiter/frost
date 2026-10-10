@@ -807,9 +807,9 @@ impl PaletteState {
         if !self.accepts_epoch(epoch) {
             return None;
         }
-        self.filtered().into_iter().find_map(|(current, item)| {
-            (current == index).then_some(item.action)
-        })
+        self.filtered()
+            .into_iter()
+            .find_map(|(current, item)| (current == index).then_some(item.action))
     }
 
     /// Replace the query; the highlight returns to the first row. Control
@@ -853,8 +853,15 @@ mod tests {
         let mut palette = PaletteState::new();
         palette.open();
         let epoch = palette.epoch();
-        let index = palette.all.iter().position(|item| item.action == PaletteAction::CloseTab).unwrap();
-        assert_eq!(palette.action_at(&epoch, index), Some(PaletteAction::CloseTab));
+        let index = palette
+            .all
+            .iter()
+            .position(|item| item.action == PaletteAction::CloseTab)
+            .unwrap();
+        assert_eq!(
+            palette.action_at(&epoch, index),
+            Some(PaletteAction::CloseTab)
+        );
         palette.close();
         assert_eq!(palette.action_at(&epoch, index), None);
         assert!(!palette.accepts_epoch(&epoch));
@@ -864,7 +871,10 @@ mod tests {
         palette.set_query("no-such-command-zzzzzz");
         assert_eq!(palette.action_at(&current, index), None);
         palette.set_query("");
-        assert_eq!(palette.action_at(&current, index), Some(PaletteAction::CloseTab));
+        assert_eq!(
+            palette.action_at(&current, index),
+            Some(PaletteAction::CloseTab)
+        );
         assert_eq!(palette.action_at(&current, usize::MAX), None);
     }
 

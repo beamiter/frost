@@ -9,8 +9,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use jterm_core::organism::{
-    classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind,
-    Behavior, BodyLanguage, CircadianPhase, LifeState, NativeOrganism, Reaction, RenderContext, RepoVigil, Tone,
+    classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind, Behavior,
+    BodyLanguage, CircadianPhase, LifeState, NativeOrganism, Reaction, RenderContext, RepoVigil,
+    Tone,
 };
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
@@ -172,7 +173,8 @@ impl WindowLife {
             self.state.tick(active.as_secs_f32(), true, resting, phase);
         }
         if !inactive.is_zero() {
-            self.state.tick(inactive.as_secs_f32(), false, resting, phase);
+            self.state
+                .tick(inactive.as_secs_f32(), false, resting, phase);
         }
         elapsed.as_secs_f32()
     }
@@ -250,7 +252,9 @@ impl Organism {
     }
 
     pub fn remote_probe_due(&self, id: usize) -> bool {
-        self.sessions.get(&id).is_some_and(|life| Instant::now() >= life.next_remote_probe)
+        self.sessions
+            .get(&id)
+            .is_some_and(|life| Instant::now() >= life.next_remote_probe)
     }
 
     pub fn set_remote(&mut self, id: usize, remote: bool) {
@@ -274,7 +278,13 @@ impl Organism {
 
     /// Called only from the existing completion drain, never by frame timers.
     /// No command text is retained, logged, sent, or persisted by this adapter.
-    pub fn completed(&mut self, id: usize, command: &str, exit: Option<i32>, duration: Option<u64>) {
+    pub fn completed(
+        &mut self,
+        id: usize,
+        command: &str,
+        exit: Option<i32>,
+        duration: Option<u64>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -292,7 +302,9 @@ impl Organism {
         }
         let now = Instant::now();
         life.native.sync_state(self.life.state());
-        let reaction = life.native.command_finished(classify_command(command), exit, duration);
+        let reaction = life
+            .native
+            .command_finished(classify_command(command), exit, duration);
         self.life.replace_state(life.native.state());
         life.ambient.interrupt();
         life.context = RenderContext::new(
@@ -354,11 +366,14 @@ impl Organism {
     }
 
     pub fn say_hello(&mut self) {
-        let _ = self.hello.request(self.born.elapsed(), self.pose.0.context());
+        let _ = self
+            .hello
+            .request(self.born.elapsed(), self.pose.0.context());
     }
 
     pub fn pause_clock(&mut self) {
-        self.life.advance(self.born.elapsed(), false, false, CircadianPhase::Unlearned);
+        self.life
+            .advance(self.born.elapsed(), false, false, CircadianPhase::Unlearned);
     }
 
     pub fn tick(&mut self, owner: Option<usize>, running: bool, any_running: bool) {
@@ -402,10 +417,17 @@ impl Organism {
     pub fn glyph(&self, id: usize, running: bool, settled: bool, motion: Option<Motion>) -> String {
         let context = if running {
             // Display only. No fabricated Start is fed into the life reducer.
-            let behavior = if settled { Behavior::WatchSettled } else { Behavior::WatchCommand };
+            let behavior = if settled {
+                Behavior::WatchSettled
+            } else {
+                Behavior::WatchCommand
+            };
             RenderContext::new(behavior, BodyLanguage::from_state(self.life.state()), false)
         } else {
-            self.sessions.get(&id).map(|life| life.context).unwrap_or_else(|| PreviewPose::Calm.context())
+            self.sessions
+                .get(&id)
+                .map(|life| life.context)
+                .unwrap_or_else(|| PreviewPose::Calm.context())
         };
         let context = RenderContext {
             body_language: BodyLanguage::from_state(self.life.state()),
@@ -441,26 +463,90 @@ mod tests {
     use super::*;
 
     fn values(state: LifeState) -> [f32; 8] {
-        [state.energy, state.mood, state.curiosity, state.boredom,
-            state.stress, state.social_need, state.attachment, state.confidence]
+        [
+            state.energy,
+            state.mood,
+            state.curiosity,
+            state.boredom,
+            state.stress,
+            state.social_need,
+            state.attachment,
+            state.confidence,
+        ]
     }
 
     #[test]
     fn window_clock_is_single_bounded_and_resets_after_hidden() {
         let mut life = WindowLife::new_at(Duration::ZERO);
-        assert_eq!(life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned), 0.0);
-        assert_eq!(life.advance(Duration::from_secs(1), true, false, CircadianPhase::Unlearned), 1.0);
+        assert_eq!(
+            life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned),
+            0.0
+        );
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(1),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            1.0
+        );
         let state = values(life.state());
-        assert_eq!(life.advance(Duration::from_secs(1), true, false, CircadianPhase::Unlearned), 0.0);
-        assert_eq!(life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned), 0.0);
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(1),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            0.0
+        );
+        assert_eq!(
+            life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned),
+            0.0
+        );
         assert_eq!(values(life.state()), state);
-        assert_eq!(life.advance(Duration::from_secs(3600), true, false, CircadianPhase::Unlearned), 1.0);
-        life.advance(Duration::from_secs(3601), false, false, CircadianPhase::Unlearned);
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(3600),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            1.0
+        );
+        life.advance(
+            Duration::from_secs(3601),
+            false,
+            false,
+            CircadianPhase::Unlearned,
+        );
         let state = values(life.state());
-        assert_eq!(life.advance(Duration::from_secs(7200), true, false, CircadianPhase::Unlearned), 0.0);
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(7200),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            0.0
+        );
         assert_eq!(values(life.state()), state);
-        life.advance(Duration::from_secs(1), false, true, CircadianPhase::Unlearned);
-        assert_eq!(life.advance(Duration::from_secs(7201), true, false, CircadianPhase::Unlearned), 0.0);
+        life.advance(
+            Duration::from_secs(1),
+            false,
+            true,
+            CircadianPhase::Unlearned,
+        );
+        assert_eq!(
+            life.advance(
+                Duration::from_secs(7201),
+                true,
+                false,
+                CircadianPhase::Unlearned
+            ),
+            0.0
+        );
         assert_eq!(values(life.state()), state);
     }
 
@@ -470,22 +556,47 @@ mod tests {
         life.advance(Duration::ZERO, true, false, CircadianPhase::Unlearned);
         let before = life.state();
         life.note_input(Duration::ZERO);
-        life.advance(Duration::from_millis(900), true, false, CircadianPhase::Unlearned);
+        life.advance(
+            Duration::from_millis(900),
+            true,
+            false,
+            CircadianPhase::Unlearned,
+        );
         assert!(life.state().boredom < before.boredom);
         assert!(life.state().social_need < before.social_need);
         for second in 1..60 {
-            life.advance(Duration::from_secs(second), true, false, CircadianPhase::Unlearned);
+            life.advance(
+                Duration::from_secs(second),
+                true,
+                false,
+                CircadianPhase::Unlearned,
+            );
         }
         let before_rest = life.state();
-        life.advance(Duration::from_secs(60), true, false, CircadianPhase::Unlearned);
+        life.advance(
+            Duration::from_secs(60),
+            true,
+            false,
+            CircadianPhase::Unlearned,
+        );
         assert!(life.state().energy > before_rest.energy);
         assert!(life.state().stress < before.stress);
         life.note_output(Duration::from_secs(60));
         let before_work = life.state().energy;
-        life.advance(Duration::from_secs(61), true, false, CircadianPhase::Unlearned);
+        life.advance(
+            Duration::from_secs(61),
+            true,
+            false,
+            CircadianPhase::Unlearned,
+        );
         assert!(life.state().energy < before_work);
         let before_running = life.state().energy;
-        life.advance(Duration::from_secs(120), true, true, CircadianPhase::Unlearned);
+        life.advance(
+            Duration::from_secs(120),
+            true,
+            true,
+            CircadianPhase::Unlearned,
+        );
         assert!(life.state().energy < before_running);
         assert_eq!(life.idle_for(Duration::from_secs(120)), Duration::ZERO);
     }
@@ -498,12 +609,16 @@ mod tests {
         hostile.stress = f32::INFINITY;
         hostile.boredom = -1.0;
         life.replace_state(hostile);
-        assert!(values(life.state()).iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        assert!(values(life.state())
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
         let mut left = AmbientMind::seeded(17);
         let mut right = AmbientMind::seeded(17);
         for second in 0..120 {
-            assert_eq!(left.step(life.state(), second as f32, 1.0, RepoVigil::None),
-                right.step(life.state(), second as f32, 1.0, RepoVigil::None));
+            assert_eq!(
+                left.step(life.state(), second as f32, 1.0, RepoVigil::None),
+                right.step(life.state(), second as f32, 1.0, RepoVigil::None)
+            );
         }
     }
 
@@ -521,7 +636,10 @@ mod tests {
         organism.batch_finished(3, false);
         organism.completed(3, "cargo test", None, Some(1));
         organism.tick(Some(3), false, false);
-        assert_eq!(organism.sessions[&3].context.behavior, Behavior::UnknownOutcome);
+        assert_eq!(
+            organism.sessions[&3].context.behavior,
+            Behavior::UnknownOutcome
+        );
     }
 
     #[test]
@@ -536,7 +654,10 @@ mod tests {
         organism.completed(7, "cargo test", Some(0), Some(100));
         assert_eq!(organism.sessions[&7].context.behavior, Behavior::Idle);
         organism.completed(7, "cargo test", None, Some(100));
-        assert_eq!(organism.sessions[&7].context.behavior, Behavior::UnknownOutcome);
+        assert_eq!(
+            organism.sessions[&7].context.behavior,
+            Behavior::UnknownOutcome
+        );
         organism.set_enabled(false);
         organism.completed(7, "cargo test", Some(0), None);
         assert!(organism.sessions.is_empty());
@@ -565,7 +686,10 @@ mod tests {
         assert_eq!(organism.sessions[&9].context.behavior, Behavior::Idle);
         organism.batch_finished(9, false);
         organism.completed(9, "cargo test", None, Some(100));
-        assert_eq!(organism.sessions[&9].context.behavior, Behavior::UnknownOutcome);
+        assert_eq!(
+            organism.sessions[&9].context.behavior,
+            Behavior::UnknownOutcome
+        );
     }
 
     #[test]

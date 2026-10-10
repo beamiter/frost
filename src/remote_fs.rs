@@ -1623,8 +1623,16 @@ pub fn validate_delete_path(path: &Path) -> Result<(), String> {
     // component. Path::components already normalizes harmless interior dots.
     // Even benign parent aliases are rejected: lexical normalization would
     // change their meaning across an ancestor symlink.
-    if path.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir)) {
-        return Err("delete paths must not contain parent or leading current-directory components".to_string());
+    if path.components().any(|part| {
+        matches!(
+            part,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(
+            "delete paths must not contain parent or leading current-directory components"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -1634,8 +1642,10 @@ pub fn validate_delete_path(path: &Path) -> Result<(), String> {
 fn reject_local_root_directory(path: &Path) -> io::Result<()> {
     let canonical = path.canonicalize()?;
     if canonical.parent().is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "refusing to delete a filesystem root alias"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to delete a filesystem root alias",
+        ));
     }
     Ok(())
 }
@@ -4357,10 +4367,27 @@ mod tests {
 
     #[test]
     fn delete_validation_refuses_root_and_traversal_aliases_without_io() {
-        for path in ["", "/", "//", "/.", ".", "..", "/tmp/..", "/tmp/../", "../item", "./item", "/tmp/../safe"] {
+        for path in [
+            "",
+            "/",
+            "//",
+            "/.",
+            ".",
+            "..",
+            "/tmp/..",
+            "/tmp/../",
+            "../item",
+            "./item",
+            "/tmp/../safe",
+        ] {
             assert!(validate_delete_path(Path::new(path)).is_err(), "{path:?}");
         }
-        for path in ["/tmp", "/tmp/file", "/tmp/link-to-root", "ordinary-relative-file"] {
+        for path in [
+            "/tmp",
+            "/tmp/file",
+            "/tmp/link-to-root",
+            "ordinary-relative-file",
+        ] {
             assert!(validate_delete_path(Path::new(path)).is_ok(), "{path:?}");
         }
     }
@@ -4368,11 +4395,28 @@ mod tests {
     #[test]
     fn destructive_root_alias_guards_precede_local_and_remote_removal() {
         let source = include_str!("remote_fs.rs");
-        let delete = source.split_once("pub fn delete(").unwrap().1
-            .split_once("/// Rename `src`").unwrap().0;
-        assert!(delete.find("symlink_metadata(path)").unwrap() < delete.find("reject_local_root_directory(path)?").unwrap());
-        assert!(delete.find("reject_local_root_directory(path)?").unwrap() < delete.find("std::fs::remove_dir_all(path)").unwrap());
-        let remote = PROBE_SCRIPT.split_once("  rm)\n").unwrap().1.split_once("  mv)\n").unwrap().0;
+        let delete = source
+            .split_once("pub fn delete(")
+            .unwrap()
+            .1
+            .split_once("/// Rename `src`")
+            .unwrap()
+            .0;
+        assert!(
+            delete.find("symlink_metadata(path)").unwrap()
+                < delete.find("reject_local_root_directory(path)?").unwrap()
+        );
+        assert!(
+            delete.find("reject_local_root_directory(path)?").unwrap()
+                < delete.find("std::fs::remove_dir_all(path)").unwrap()
+        );
+        let remote = PROBE_SCRIPT
+            .split_once("  rm)\n")
+            .unwrap()
+            .1
+            .split_once("  mv)\n")
+            .unwrap()
+            .0;
         assert!(remote.find("[ ! -L \"$p\" ]").unwrap() < remote.find("cd -P").unwrap());
         assert!(remote.find("[ \"$physical\" != / ]").unwrap() < remote.find("rm -rf --").unwrap());
         assert!(remote.contains("rm -f -- \"$p\""));

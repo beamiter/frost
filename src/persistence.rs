@@ -314,7 +314,10 @@ fn expand_private_path_with_home(
         || raw_path.chars().any(char::is_control)
         || jterm_core::review_input::contains_visual_spoofing(raw_path)
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "credential path must be bounded visible text"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential path must be bounded visible text",
+        ));
     }
     if raw_path.is_empty() {
         return Err(io::Error::new(
@@ -323,10 +326,14 @@ fn expand_private_path_with_home(
         ));
     }
     if raw_path == "~" || raw_path.starts_with("~/") {
-        let home = home.and_then(std::ffi::OsStr::to_str)
-            .filter(|value| !value.is_empty() && Path::new(value).is_absolute()
-                && !value.chars().any(char::is_control)
-                && !jterm_core::review_input::contains_visual_spoofing(value))
+        let home = home
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && Path::new(value).is_absolute()
+                    && !value.chars().any(char::is_control)
+                    && !jterm_core::review_input::contains_visual_spoofing(value)
+            })
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -336,12 +343,18 @@ fn expand_private_path_with_home(
         let mut path = PathBuf::from(home);
         if let Some(rest) = raw_path.strip_prefix("~/") {
             if Path::new(rest).is_absolute() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "~/ credential paths must remain relative to HOME"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "~/ credential paths must remain relative to HOME",
+                ));
             }
             path.push(rest);
         }
         if path.as_os_str().as_encoded_bytes().len() > MAX_API_KEY_PATH_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expanded credential path is too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expanded credential path is too long",
+            ));
         }
         return Ok(path);
     }
@@ -462,7 +475,8 @@ fn api_key_char_is_unsafe(character: char) -> bool {
 pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
     let path = expand_private_path(raw_path)?;
     let key = raw_key;
-    if key.is_empty() || key.len() > MAX_API_KEY_DRAFT_BYTES
+    if key.is_empty()
+        || key.len() > MAX_API_KEY_DRAFT_BYTES
         || !key.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
     {
         return Err(io::Error::new(
@@ -933,7 +947,10 @@ fn atomic_replace_with_parent(
         io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
     })?;
     let destination = CString::new(destination.as_bytes()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination contains a NUL byte")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination contains a NUL byte",
+        )
     })?;
     for _ in 0..128 {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
@@ -1349,7 +1366,9 @@ mod tests {
         for home in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
             for path in ["~", "~/key", "~//key"] {
                 assert_eq!(
-                    expand_private_path_with_home(path, home).unwrap_err().kind(),
+                    expand_private_path_with_home(path, home)
+                        .unwrap_err()
+                        .kind(),
                     io::ErrorKind::InvalidInput
                 );
             }
@@ -1368,10 +1387,21 @@ mod tests {
             PathBuf::from("/home/example")
         );
         assert!(expand_private_path_with_home("relative/key", home).is_err());
-        for path in ["~//key", "~///key", " /key", "/key ", "/key\n", "/key\u{202e}"] {
+        for path in [
+            "~//key",
+            "~///key",
+            " /key",
+            "/key ",
+            "/key\n",
+            "/key\u{202e}",
+        ] {
             assert!(expand_private_path_with_home(path, home).is_err());
         }
-        assert!(expand_private_path_with_home(&format!("/{}", "a".repeat(MAX_API_KEY_PATH_BYTES)), home).is_err());
+        assert!(expand_private_path_with_home(
+            &format!("/{}", "a".repeat(MAX_API_KEY_PATH_BYTES)),
+            home
+        )
+        .is_err());
         for bad_home in ["relative", "/home\n", "/home\u{202e}"] {
             assert!(expand_private_path_with_home("~/key", Some(OsStr::new(bad_home))).is_err());
         }
@@ -1382,7 +1412,6 @@ mod tests {
         }
         assert!(accepted_api_key_draft("two\nlines").is_none());
         assert!(accepted_api_key_draft("x".repeat(MAX_API_KEY_DRAFT_BYTES + 1)).is_none());
-
     }
 
     #[cfg(unix)]
@@ -1391,10 +1420,10 @@ mod tests {
         use std::ffi::CString;
 
         let id = 42;
-        let primary = CString::new(format!(".frost-snapshot.tmp.{}.{id}", std::process::id()))
-            .unwrap();
-        let alternate = CString::new(format!(".frost-snapshot.alt.{}.{id}", std::process::id()))
-            .unwrap();
+        let primary =
+            CString::new(format!(".frost-snapshot.tmp.{}.{id}", std::process::id())).unwrap();
+        let alternate =
+            CString::new(format!(".frost-snapshot.alt.{}.{id}", std::process::id())).unwrap();
         let ordinary = CString::new("session.json").unwrap();
         assert_eq!(snapshot_staging_name(&primary, id), alternate);
         assert_eq!(snapshot_staging_name(&alternate, id), primary);
@@ -1423,8 +1452,7 @@ mod tests {
         fs::rename(&parent, &moved).unwrap();
         symlink(&other, &parent).unwrap();
 
-        atomic_replace_with_parent(&parent.join("snapshot"), b"private", &directory)
-            .unwrap();
+        atomic_replace_with_parent(&parent.join("snapshot"), b"private", &directory).unwrap();
 
         assert_eq!(fs::read(moved.join("snapshot")).unwrap(), b"private");
         assert_eq!(fs::read(other.join("snapshot")).unwrap(), b"unrelated");
@@ -1457,12 +1485,9 @@ mod tests {
         fs::rename(&parent, &moved).unwrap();
         symlink(&other, &parent).unwrap();
 
-        assert!(atomic_replace_with_parent(
-            &parent.join("snapshot"),
-            b"private",
-            &directory,
-        )
-        .is_err());
+        assert!(
+            atomic_replace_with_parent(&parent.join("snapshot"), b"private", &directory,).is_err()
+        );
 
         assert!(moved.join("snapshot").is_dir());
         assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
