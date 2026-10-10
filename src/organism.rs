@@ -328,6 +328,23 @@ impl Organism {
         }
     }
 
+    /// Config reloads and the settings control share the same transient boundary.
+    /// An unchanged preference must not interrupt an existing visit.
+    pub fn motion_changed(&mut self, previous: Option<Motion>, next: Option<Motion>) {
+        if previous != next {
+            self.reset_watch();
+            self.cancel_live_greeting();
+        }
+    }
+
+    /// Session indices can shift while the same foreground session stays active.
+    pub fn owner_changed(&mut self, previous: Option<usize>, next: Option<usize>) {
+        if previous != next {
+            self.reset_watch();
+            self.cancel_live_greeting();
+        }
+    }
+
     pub fn prime_session(&mut self, id: usize, running: bool) {
         if self.enabled {
             self.sessions
@@ -770,6 +787,196 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn motion_changes_cancel_transients_but_keep_cooldown_and_unchanged_visits() {
+        use jterm_core::organism::WatchRhythm;
+        for previous in [
+            None,
+            Some(Motion::Full),
+            Some(Motion::Calm),
+            Some(Motion::Static),
+        ] {
+            for next in [
+                None,
+                Some(Motion::Full),
+                Some(Motion::Calm),
+                Some(Motion::Static),
+            ] {
+                let mut organism = Organism::default();
+                let context = PreviewPose::Calm.context();
+                organism.watch.observe(Some(1), true, Duration::ZERO);
+                for millis in [0, 100, 200, 300] {
+                    organism
+                        .watch
+                        .output(1, Duration::from_millis(millis), true);
+                }
+                organism.live_greeting.enter(
+                    1,
+                    organism.live_greeting.epoch(),
+                    Duration::ZERO,
+                    context,
+                    true,
+                );
+                organism
+                    .live_greeting
+                    .advance(Some(1), Duration::from_millis(600), context, true);
+                organism.say_hello_at(Duration::ZERO);
+                let before = values(organism.life.state());
+                let now = Duration::from_millis(700);
+                assert_eq!(organism.watch.rhythm(1, now), WatchRhythm::Busy);
+                assert_eq!(
+                    organism.live_greeting.apply(1, now, context).behavior,
+                    PreviewPose::Greeting.context().behavior
+                );
+                organism.motion_changed(previous, next);
+                if previous == next {
+                    assert_eq!(organism.watch.rhythm(1, now), WatchRhythm::Busy);
+                    assert_eq!(
+                        organism.live_greeting.apply(1, now, context).behavior,
+                        PreviewPose::Greeting.context().behavior
+                    );
+                } else {
+                    assert_eq!(organism.watch.rhythm(1, now), WatchRhythm::Steady);
+                    assert_eq!(organism.live_greeting.apply(1, now, context), context);
+                    assert_eq!(organism.live_greeting.deadline(now), None);
+                    // A new visit still cannot spend the accepted greeting's cooldown.
+                    organism.live_greeting.leave();
+                    organism.live_greeting.enter(
+                        1,
+                        organism.live_greeting.epoch(),
+                        now,
+                        context,
+                        true,
+                    );
+                    organism.live_greeting.advance(
+                        Some(1),
+                        Duration::from_millis(1300),
+                        context,
+                        true,
+                    );
+                    assert_eq!(
+                        organism
+                            .live_greeting
+                            .apply(1, Duration::from_millis(1300), context),
+                        context
+                    );
+                }
+                assert_eq!(organism.preview_deadlines.ready_at, Duration::from_secs(8));
+                assert_eq!(values(organism.life.state()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn motion_change_cancels_pending_dwell_without_rearming_stationary_pointer() {
+        let mut organism = Organism::default();
+        let context = PreviewPose::Calm.context();
+        organism.live_greeting.enter(
+            1,
+            organism.live_greeting.epoch(),
+            Duration::ZERO,
+            context,
+            true,
+        );
+        organism.motion_changed(Some(Motion::Full), Some(Motion::Full));
+        assert_eq!(
+            organism.live_greeting.deadline(Duration::from_millis(200)),
+            Some(Duration::from_millis(600))
+        );
+        organism.motion_changed(Some(Motion::Full), Some(Motion::Calm));
+        assert_eq!(
+            organism.live_greeting.deadline(Duration::from_millis(300)),
+            None
+        );
+        organism.live_greeting.enter(
+            1,
+            organism.live_greeting.epoch(),
+            Duration::from_millis(300),
+            context,
+            true,
+        );
+        organism
+            .live_greeting
+            .advance(Some(1), Duration::from_secs(1), context, true);
+        assert_eq!(
+            organism
+                .live_greeting
+                .apply(1, Duration::from_secs(1), context),
+            context
+        );
+        assert_eq!(
+            organism.live_greeting.deadline(Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn background_close_preserves_stable_owner_but_owner_close_retires_transients() {
+        use jterm_core::organism::WatchRhythm;
+        for next in [Some(10), Some(20), None] {
+            let mut organism = Organism::default();
+            organism.set_enabled(true);
+            organism.prime_session(10, false);
+            organism.prime_session(20, false);
+            let context = PreviewPose::Calm.context();
+            organism.watch.observe(Some(10), true, Duration::ZERO);
+            for millis in [0, 100, 200, 300] {
+                organism
+                    .watch
+                    .output(10, Duration::from_millis(millis), true);
+            }
+            organism.live_greeting.enter(
+                10,
+                organism.live_greeting.epoch(),
+                Duration::ZERO,
+                context,
+                true,
+            );
+            organism
+                .live_greeting
+                .advance(Some(10), Duration::from_millis(600), context, true);
+            let now = Duration::from_millis(700);
+            assert_eq!(organism.watch.rhythm(10, now), WatchRhythm::Busy);
+            assert_eq!(
+                organism.live_greeting.apply(10, now, context).behavior,
+                PreviewPose::Greeting.context().behavior
+            );
+            organism.forget_session(if next == Some(10) { 20 } else { 10 });
+            organism.owner_changed(Some(10), next);
+            if next == Some(10) {
+                assert_eq!(organism.watch.rhythm(10, now), WatchRhythm::Busy);
+                assert_eq!(
+                    organism.live_greeting.apply(10, now, context).behavior,
+                    PreviewPose::Greeting.context().behavior
+                );
+            } else {
+                assert_eq!(organism.watch.rhythm(10, now), WatchRhythm::Steady);
+                assert_eq!(organism.live_greeting.apply(10, now, context), context);
+                assert_eq!(organism.live_greeting.deadline(now), None);
+                organism.live_greeting.leave();
+                organism.live_greeting.enter(
+                    20,
+                    organism.live_greeting.epoch(),
+                    now,
+                    context,
+                    true,
+                );
+                organism.live_greeting.advance(
+                    Some(20),
+                    Duration::from_millis(1300),
+                    context,
+                    true,
+                );
+                assert_eq!(
+                    organism
+                        .live_greeting
+                        .apply(20, Duration::from_millis(1300), context),
+                    context
+                );
+            }
+        }
     }
 
     #[test]

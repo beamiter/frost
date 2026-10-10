@@ -5861,6 +5861,10 @@ impl Frost {
                 if self.config.experimental_task_sidebar != config.experimental_task_sidebar {
                     self.task_panel.retire_panel_callbacks();
                 }
+                self.organism.motion_changed(
+                    self.config.ascii_organism_motion,
+                    config.ascii_organism_motion,
+                );
                 self.config = config;
                 self.win_size =
                     logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
@@ -7313,6 +7317,11 @@ impl Frost {
     fn refresh_active_context(&mut self) {
         self.organism.reset_watch();
         self.organism.cancel_live_greeting();
+        self.refresh_active_context_caches();
+    }
+
+    /// Refresh index-dependent caches without treating reindexing as a new owner.
+    fn refresh_active_context_caches(&mut self) {
         self.links_cache_key = None;
         if self.search.is_open {
             let reflow_pending = self
@@ -7757,6 +7766,7 @@ impl Frost {
             self.sidebar_drop_burst.clear();
             self.sidebar_drop_debounce_generation = None;
         }
+        let previous_owner = self.sessions.get(self.active).map(|session| session.id);
         let mut sess = self.sessions.remove(index);
         let closed_id = sess.id;
         self.organism.forget_session(closed_id);
@@ -7793,7 +7803,9 @@ impl Frost {
         // neighbor leaf when the focused pane's session is the one closing).
         let old_active = self.active;
         self.prune_closed_pane(index, old_active);
-        self.refresh_active_context();
+        let next_owner = self.sessions.get(self.active).map(|session| session.id);
+        self.organism.owner_changed(previous_owner, next_owner);
+        self.refresh_active_context_caches();
         self.save_session_snapshot();
         Task::none()
     }
@@ -16533,9 +16545,10 @@ impl Frost {
                 self.apply_config();
             }
             Message::SetOrganismMotion(choice) => {
-                self.organism.reset_watch();
-                self.organism.cancel_live_greeting();
-                self.config.ascii_organism_motion = choice.configured();
+                let next = choice.configured();
+                self.organism
+                    .motion_changed(self.config.ascii_organism_motion, next);
+                self.config.ascii_organism_motion = next;
                 self.config_dirty = true;
             }
             Message::SetOrganismPose(pose) => self.organism.select_pose(pose),
@@ -16758,6 +16771,10 @@ impl Frost {
                     Ok(revision) => {
                         let old_scale = self.scale_factor();
                         self.task_panel.retire_panel_callbacks();
+                        self.organism.motion_changed(
+                            self.config.ascii_organism_motion,
+                            reset.ascii_organism_motion,
+                        );
                         self.config = reset;
                         self.config_revision = Some(revision);
                         self.win_size = logical_viewport_after_scale(
@@ -16781,6 +16798,10 @@ impl Frost {
                             // memory and retry it as dirty on the next tick.
                             let old_scale = self.scale_factor();
                             self.task_panel.retire_panel_callbacks();
+                            self.organism.motion_changed(
+                                self.config.ascii_organism_motion,
+                                reset.ascii_organism_motion,
+                            );
                             self.config = reset;
                             self.config_revision = Some(revision);
                             self.win_size = logical_viewport_after_scale(
@@ -28414,6 +28435,86 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_close_uses_stable_organism_owner_and_keeps_all_context_caches() {
+        let source = include_str!("main.rs");
+        let close = source.split_once("    fn close_session(").unwrap().1;
+        let close = close.split_once("    /// Reconcile every tab").unwrap().0;
+        let before = close
+            .find("let previous_owner = self.sessions.get(self.active).map(|session| session.id);")
+            .unwrap();
+        let remove = close.find("self.sessions.remove(index)").unwrap();
+        let prune = close
+            .find("self.prune_closed_pane(index, old_active);")
+            .unwrap();
+        let after = close
+            .find("let next_owner = self.sessions.get(self.active).map(|session| session.id);")
+            .unwrap();
+        assert!(before < remove && remove < prune && prune < after);
+        assert!(close.contains("self.organism.forget_session(closed_id);"));
+        assert!(close.contains("self.organism.owner_changed(previous_owner, next_owner);"));
+        assert!(close.contains("self.refresh_active_context_caches();"));
+        assert!(!close.contains("self.refresh_active_context();"));
+        assert!(close.contains("let exit = self.exit_flushing_durable_state();"));
+        let full = source
+            .split_once("    fn refresh_active_context(&mut self)")
+            .unwrap()
+            .1;
+        let full = full.split_once("    /// Startup session setup").unwrap().0;
+        assert!(full.contains("self.organism.reset_watch();"));
+        assert!(full.contains("self.organism.cancel_live_greeting();"));
+        assert!(full.contains("self.refresh_active_context_caches();"));
+        for cache in [
+            "self.links_cache_key = None;",
+            "self.recompute_search();",
+            "self.reveal_current_search_match();",
+            "self.recompute_links();",
+            "self.refresh_kitty_handles();",
+        ] {
+            assert!(full.contains(cache));
+        }
+        let exit = source
+            .split_once("    fn exit_flushing_durable_state(")
+            .unwrap()
+            .1;
+        let exit = exit.split_once("const EXIT_FLUSH_TIMEOUT").unwrap().0;
+        assert!(exit.contains("self.organism.set_enabled(false);"));
+        assert!(exit.contains("self.organism.close_preview();"));
+    }
+
+    #[test]
+    fn organism_motion_reload_and_reset_share_the_settings_boundary() {
+        let source = include_str!("main.rs");
+        let reload = source
+            .split_once("    fn reload_config_if_changed(")
+            .unwrap()
+            .1;
+        let reload = reload.split_once("self.config = config;").unwrap().0;
+        assert!(reload.contains("self.organism.motion_changed("));
+        assert!(reload.contains("self.config.ascii_organism_motion"));
+        assert!(reload.contains("config.ascii_organism_motion"));
+        let reset = source
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .1;
+        let reset = reset
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .0;
+        assert_eq!(reset.matches("self.organism.motion_changed(").count(), 2);
+        assert_eq!(reset.matches("reset.ascii_organism_motion").count(), 2);
+        let control = source
+            .split_once("            Message::SetOrganismMotion(choice) => {")
+            .unwrap()
+            .1;
+        let control = control
+            .split_once("            Message::SetOrganismPose")
+            .unwrap()
+            .0;
+        assert!(control.contains(".motion_changed(self.config.ascii_organism_motion, next)"));
+        assert!(control.contains("self.config.ascii_organism_motion = next;"));
+    }
+
     #[test]
     fn demo_and_hello_requests_share_the_preview_visibility_guard() {
         let source = include_str!("main.rs");
