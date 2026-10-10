@@ -6,6 +6,7 @@
 //! silently overwriting one another while keeping failed writes off the live
 //! destination path.
 
+#[cfg(not(unix))]
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -17,10 +18,12 @@ use std::time::{Duration, Instant};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_KEY_FILE_BYTES: u64 = 16 * 1024;
+const MAX_API_KEY_PATH_BYTES: usize = 16 * 1024;
 /// Live settings-field budget: the file stores one trailing newline, so the
 /// iced draft cannot hold more than the writer will accept.
 pub const MAX_API_KEY_DRAFT_BYTES: usize = (MAX_API_KEY_FILE_BYTES - 1) as usize;
 
+#[cfg(test)]
 pub fn bound_api_key_draft(value: impl Into<String>) -> String {
     let mut value: String = value
         .into()
@@ -46,8 +49,9 @@ pub fn bound_api_key_draft(value: impl Into<String>) -> String {
 }
 
 pub fn accepted_api_key_draft(value: impl Into<String>) -> Option<String> {
-    let value = bound_api_key_draft(value);
-    if value.chars().any(api_key_char_is_unsafe) {
+    // Never sanitize/truncate credential bytes into a different secret.
+    let value: String = value.into();
+    if value.len() > MAX_API_KEY_DRAFT_BYTES || value.chars().any(api_key_char_is_unsafe) {
         None
     } else {
         Some(value)
@@ -295,7 +299,23 @@ pub fn read_text_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
 }
 
 fn expand_private_path(raw_path: &str) -> io::Result<PathBuf> {
-    let raw_path = raw_path.trim();
+    let home = std::env::var_os("HOME");
+    expand_private_path_with_home(raw_path, home.as_deref())
+}
+
+fn expand_private_path_with_home(
+    raw_path: &str,
+    home: Option<&std::ffi::OsStr>,
+) -> io::Result<PathBuf> {
+    // Match jterm_core f77e's production reader; its pure validator is private.
+    // Do not trim a path into another destination or save what cannot reload.
+    if raw_path.len() > MAX_API_KEY_PATH_BYTES
+        || raw_path.trim_matches(' ') != raw_path
+        || raw_path.chars().any(char::is_control)
+        || jterm_core::review_input::contains_visual_spoofing(raw_path)
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "credential path must be bounded visible text"));
+    }
     if raw_path.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -303,17 +323,25 @@ fn expand_private_path(raw_path: &str) -> io::Result<PathBuf> {
         ));
     }
     if raw_path == "~" || raw_path.starts_with("~/") {
-        let home = std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
+        let home = home.and_then(std::ffi::OsStr::to_str)
+            .filter(|value| !value.is_empty() && Path::new(value).is_absolute()
+                && !value.chars().any(char::is_control)
+                && !jterm_core::review_input::contains_visual_spoofing(value))
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "HOME is unavailable for ~/ credential path",
+                    "an absolute HOME is required for ~/ credential path",
                 )
             })?;
         let mut path = PathBuf::from(home);
         if let Some(rest) = raw_path.strip_prefix("~/") {
+            if Path::new(rest).is_absolute() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "~/ credential paths must remain relative to HOME"));
+            }
             path.push(rest);
+        }
+        if path.as_os_str().as_encoded_bytes().len() > MAX_API_KEY_PATH_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expanded credential path is too long"));
         }
         return Ok(path);
     }
@@ -433,23 +461,13 @@ fn api_key_char_is_unsafe(character: char) -> bool {
 /// adopted.
 pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> io::Result<()> {
     let path = expand_private_path(raw_path)?;
-    let key = raw_key.trim();
-    if key.is_empty() {
+    let key = raw_key;
+    if key.is_empty() || key.len() > MAX_API_KEY_DRAFT_BYTES
+        || !key.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "API key must not be empty",
-        ));
-    }
-    if key.chars().any(api_key_char_is_unsafe) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "API key must be one line without control or visual-spoofing characters",
-        ));
-    }
-    if key.len() as u64 + 1 > MAX_API_KEY_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::FileTooLarge,
-            format!("API key exceeds {} bytes", MAX_API_KEY_FILE_BYTES - 1),
+            "API key must be bounded non-empty visible ASCII without whitespace",
         ));
     }
     match open_private_key_file(&path) {
@@ -818,11 +836,13 @@ fn create_private_snapshot_parent(parent: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(not(unix))]
 struct TempFileGuard {
     path: PathBuf,
     committed: bool,
 }
 
+#[cfg(not(unix))]
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if !self.committed {
@@ -831,6 +851,7 @@ impl Drop for TempFileGuard {
     }
 }
 
+#[cfg(not(unix))]
 fn create_unique_temp(path: &Path) -> io::Result<(fs::File, PathBuf)> {
     let parent = path
         .parent()
@@ -866,6 +887,109 @@ fn create_unique_temp(path: &Path) -> io::Result<(fs::File, PathBuf)> {
     ))
 }
 
+#[cfg(unix)]
+fn snapshot_staging_name(destination: &std::ffi::CStr, id: u64) -> std::ffi::CString {
+    let name = format!(".frost-snapshot.tmp.{}.{id}", std::process::id());
+    // The caller may choose any basename, including our generated staging
+    // name. Never let O_CREAT publish the destination before bytes are synced.
+    let name = if name.as_bytes() == destination.to_bytes() {
+        format!(".frost-snapshot.alt.{}.{id}", std::process::id())
+    } else {
+        name
+    };
+    std::ffi::CString::new(name).expect("generated staging name has no NUL")
+}
+
+/// Keep every staging operation anchored to the directory that was validated
+/// and locked. A renamed/replaced parent pathname must not redirect private
+/// config, session, or API-key bytes to a different directory.
+#[cfg(unix)]
+fn atomic_replace_with_parent(
+    path: &Path,
+    contents: &[u8],
+    directory: &fs::File,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    struct StagingGuard<'a> {
+        directory: &'a fs::File,
+        name: CString,
+        committed: bool,
+    }
+
+    impl Drop for StagingGuard<'_> {
+        fn drop(&mut self) {
+            // SAFETY: the borrowed directory remains open and the staging
+            // name is a live NUL-terminated single path component.
+            if !self.committed {
+                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+            }
+        }
+    }
+
+    let destination = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+    })?;
+    let destination = CString::new(destination.as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination contains a NUL byte")
+    })?;
+    for _ in 0..128 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let name = snapshot_staging_name(&destination, id);
+        // SAFETY: the descriptor and name remain valid for the call; a
+        // successful open returns a fresh descriptor owned by this function.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut cleanup = StagingGuard {
+            directory,
+            name,
+            committed: false,
+        };
+        // SAFETY: `openat` returned a fresh owned descriptor; wrap it once.
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        // SAFETY: both names are live C strings and the directory remains
+        // open. Both entries are resolved under that same validated inode.
+        let result = unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                cleanup.name.as_ptr(),
+                directory.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Successful rename consumed the staging entry; never unlink a name
+        // that a concurrent writer might subsequently reuse.
+        cleanup.committed = true;
+        return directory.sync_all();
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique persistence staging file",
+    ))
+}
+
+#[cfg(not(unix))]
 fn atomic_replace_with_parent(
     path: &Path,
     contents: &[u8],
@@ -1219,6 +1343,135 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn credential_home_expansion_requires_an_absolute_home() {
+        use std::ffi::OsStr;
+
+        for home in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
+            for path in ["~", "~/key", "~//key"] {
+                assert_eq!(
+                    expand_private_path_with_home(path, home).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+            assert_eq!(
+                expand_private_path_with_home("/absolute/key", home).unwrap(),
+                PathBuf::from("/absolute/key")
+            );
+        }
+        let home = Some(OsStr::new("/home/example"));
+        assert_eq!(
+            expand_private_path_with_home("~/key", home).unwrap(),
+            PathBuf::from("/home/example/key")
+        );
+        assert_eq!(
+            expand_private_path_with_home("~", home).unwrap(),
+            PathBuf::from("/home/example")
+        );
+        assert!(expand_private_path_with_home("relative/key", home).is_err());
+        for path in ["~//key", "~///key", " /key", "/key ", "/key\n", "/key\u{202e}"] {
+            assert!(expand_private_path_with_home(path, home).is_err());
+        }
+        assert!(expand_private_path_with_home(&format!("/{}", "a".repeat(MAX_API_KEY_PATH_BYTES)), home).is_err());
+        for bad_home in ["relative", "/home\n", "/home\u{202e}"] {
+            assert!(expand_private_path_with_home("~/key", Some(OsStr::new(bad_home))).is_err());
+        }
+        let oversized_home = format!("/{}", "h".repeat(MAX_API_KEY_PATH_BYTES - 1));
+        assert!(expand_private_path_with_home("~/key", Some(OsStr::new(&oversized_home))).is_err());
+        for key in [" leading", "trailing ", "two words", "two\nlines", "clé"] {
+            assert!(write_api_key_file("/not-touched/by-invalid-key", key).is_err());
+        }
+        assert!(accepted_api_key_draft("two\nlines").is_none());
+        assert!(accepted_api_key_draft("x".repeat(MAX_API_KEY_DRAFT_BYTES + 1)).is_none());
+
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_staging_name_never_equals_the_destination() {
+        use std::ffi::CString;
+
+        let id = 42;
+        let primary = CString::new(format!(".frost-snapshot.tmp.{}.{id}", std::process::id()))
+            .unwrap();
+        let alternate = CString::new(format!(".frost-snapshot.alt.{}.{id}", std::process::id()))
+            .unwrap();
+        let ordinary = CString::new("session.json").unwrap();
+        assert_eq!(snapshot_staging_name(&primary, id), alternate);
+        assert_eq!(snapshot_staging_name(&alternate, id), primary);
+        assert_eq!(snapshot_staging_name(&ordinary, id), primary);
+        for destination in [&primary, &alternate, &ordinary] {
+            let staging = snapshot_staging_name(destination, id);
+            assert_ne!(staging.as_bytes(), destination.as_bytes());
+            assert!(!staging.as_bytes().contains(&b'/'));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_snapshot_replacement_stays_in_the_validated_parent() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = Scratch::new("snapshot-parent-replaced");
+        let parent = root.0.join("parent");
+        let moved = root.0.join("moved");
+        let other = root.0.join("other");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(parent.join("snapshot"), b"original").unwrap();
+        fs::write(other.join("snapshot"), b"unrelated").unwrap();
+        let directory = open_snapshot_parent(&parent).unwrap();
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&other, &parent).unwrap();
+
+        atomic_replace_with_parent(&parent.join("snapshot"), b"private", &directory)
+            .unwrap();
+
+        assert_eq!(fs::read(moved.join("snapshot")).unwrap(), b"private");
+        assert_eq!(fs::read(other.join("snapshot")).unwrap(), b"unrelated");
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 1);
+        assert_eq!(
+            fs::metadata(moved.join("snapshot"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_atomic_snapshot_publish_cleans_the_validated_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = Scratch::new("snapshot-parent-cleanup");
+        let parent = root.0.join("parent");
+        let moved = root.0.join("moved");
+        let other = root.0.join("other");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(parent.join("snapshot")).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("snapshot"), b"unrelated").unwrap();
+        let directory = open_snapshot_parent(&parent).unwrap();
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&other, &parent).unwrap();
+
+        assert!(atomic_replace_with_parent(
+            &parent.join("snapshot"),
+            b"private",
+            &directory,
+        )
+        .is_err());
+
+        assert!(moved.join("snapshot").is_dir());
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+        assert_eq!(fs::read(other.join("snapshot")).unwrap(), b"unrelated");
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn revisions_never_follow_symlinks_or_accept_hard_links() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -1270,7 +1523,7 @@ mod tests {
 
         let root = Scratch::new("api-key");
         let path = root.0.join("ai.key");
-        write_api_key_file(path.to_str().unwrap(), "  sk-secret  ").unwrap();
+        write_api_key_file(path.to_str().unwrap(), "sk-secret").unwrap();
         assert_eq!(
             read_api_key_file(path.to_str().unwrap()).unwrap(),
             "sk-secret"

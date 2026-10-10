@@ -189,6 +189,23 @@ pub struct HistoryPickerState {
     rebuild_count: usize,
 }
 
+/// Accept only a retained row from the currently open snapshot, then close
+/// before dispatch. New/open/load always allocates fresh record Arcs. A click
+/// retains its original row across query edits, but not close/reopen. Targeting
+/// remains the active prompt at dispatch, as for keyboard history recall.
+pub(crate) fn accept_clicked_record(
+    picker: &mut Option<HistoryPickerState>,
+    record: &Arc<CommandHistoryRecord>,
+) -> Option<String> {
+    let state = picker.as_ref()?;
+    if !state.entries.iter().any(|current| Arc::ptr_eq(current, record)) {
+        return None;
+    }
+    let command = record.command.clone();
+    *picker = None;
+    Some(command)
+}
+
 impl HistoryPickerState {
     pub fn new(mut entries: Vec<CommandHistoryRecord>) -> Self {
         entries.retain_mut(|record| {
@@ -601,6 +618,48 @@ mod tests {
         // newer record first.
         assert_eq!(filtered[0].exit_code, 0);
         assert_eq!(filtered[1].exit_code, 1);
+    }
+
+    #[test]
+    fn clicked_history_record_requires_current_open_snapshot_and_is_one_shot() {
+        let state = HistoryPickerState::new(vec![record("cargo test", None, 0)]);
+        let clicked = state.shared_filtered().remove(0);
+        let keyboard = state.selected_command();
+        let mut picker = Some(state);
+        assert_eq!(accept_clicked_record(&mut picker, &clicked), keyboard);
+        assert!(picker.is_none());
+        assert!(accept_clicked_record(&mut picker, &clicked).is_none());
+        picker = Some(HistoryPickerState::new(vec![record("cargo test", None, 0)]));
+        assert!(accept_clicked_record(&mut picker, &clicked).is_none());
+        assert!(picker.is_some());
+        let reopened = picker.as_ref().unwrap().shared_filtered().remove(0);
+        assert_eq!(accept_clicked_record(&mut picker, &reopened).as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn clicked_history_record_survives_query_edit_but_not_explicit_close() {
+        let mut picker = Some(HistoryPickerState::new(vec![record("cargo test", None, 0)]));
+        let clicked = picker.as_ref().unwrap().shared_filtered().remove(0);
+        picker.as_mut().unwrap().set_query("not matching");
+        assert!(picker.as_ref().unwrap().filtered().is_empty());
+        assert_eq!(accept_clicked_record(&mut picker, &clicked).as_deref(), Some("cargo test"));
+        let state = HistoryPickerState::new(vec![record("git status", None, 0)]);
+        let closed = state.shared_filtered().remove(0);
+        drop(state);
+        assert!(accept_clicked_record(&mut picker, &closed).is_none());
+    }
+
+    #[test]
+    fn history_callback_closes_snapshot_before_existing_active_prompt_recall() {
+        let source = include_str!("main.rs");
+        let handler = source.split_once("            Message::HistoryPickerAccept(record) => {")
+            .unwrap().1.split_once("            Message::WorkflowPickerInput(").unwrap().0;
+        assert!(handler.find("accept_clicked_record(").unwrap()
+            < handler.find("self.recall_into_active_pane(command)").unwrap());
+        assert!(!handler.contains("record.command"));
+        // Cross-session history targeting is deliberately unchanged: no
+        // opening-session pin or new PTY/prompt implementation is introduced.
+        assert!(handler.contains("None => Task::none()"));
     }
 
     #[test]

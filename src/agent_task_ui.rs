@@ -278,17 +278,57 @@ pub(crate) const VALIDATION_ENV_OVERRIDES: [(&str, &str); 3] = [
     ("ZDOTDIR", "/dev/null"),
 ];
 
+/// One immutable provider-choice opening. Retained callbacks cannot consume
+/// a later context even when the same failed command is opened again.
+pub(crate) struct TaskProviderPicker {
+    pub(crate) context: SemanticCommandContext,
+    identity: Arc<()>,
+}
+
+impl TaskProviderPicker {
+    pub(crate) fn new(context: SemanticCommandContext) -> Self {
+        Self { context, identity: Arc::new(()) }
+    }
+
+    pub(crate) fn reference(&self) -> Arc<()> {
+        self.identity.clone()
+    }
+
+    pub(crate) fn retire_reference(&mut self) {
+        self.identity = Arc::new(());
+    }
+
+    pub(crate) fn take_current(picker: &mut Option<Self>, reference: &Arc<()>) -> Option<SemanticCommandContext> {
+        if !picker.as_ref().is_some_and(|current| Arc::ptr_eq(&current.identity, reference)) {
+            return None;
+        }
+        picker.take().map(|current| current.context)
+    }
+}
+
 /// View state for the Tasks dashboard dock panel.
+/// A rendered composer belongs to one selected task and one completed turn.
+/// Retained Arc identity also distinguishes close/reopen and A→B→A selection.
+#[derive(Clone, Debug)]
+pub(crate) struct TaskFollowUpRef {
+    pub(crate) task_id: TaskId,
+    pub(crate) completed_turns: usize,
+    selection: Arc<()>,
+}
+
 pub(crate) struct TaskPanel {
     pub(crate) selected: Option<TaskId>,
     /// Draft review feedback for the selected task's next native turn.
     pub(crate) follow_up: String,
+    follow_up_epoch: Arc<()>,
     pub(crate) pending_creation: Option<PendingTaskCreation>,
     /// Failed-block context waiting for an explicit provider choice.
-    pub(crate) provider_picker: Option<SemanticCommandContext>,
+    pub(crate) provider_picker: Option<TaskProviderPicker>,
     /// Bounded read-only `git status`/`git diff` surface for the selected
     /// task's worktree (worker-owned; polled from the iced tick).
     pub(crate) diff: crate::agent_task::AgentDiffPanel,
+    diff_task: Option<TaskId>,
+    diff_epoch: Arc<()>,
 }
 
 impl TaskPanel {
@@ -296,10 +336,106 @@ impl TaskPanel {
         Self {
             selected: None,
             follow_up: String::new(),
+            follow_up_epoch: Arc::new(()),
             pending_creation: None,
             provider_picker: None,
             diff: crate::agent_task::AgentDiffPanel::new(),
+            diff_task: None,
+            diff_epoch: Arc::new(()),
         }
+    }
+
+    pub(crate) fn select(&mut self, task_id: Option<TaskId>) {
+        self.close_diff();
+        self.selected = task_id;
+        self.follow_up.clear();
+        self.retire_follow_up();
+    }
+
+    /// Hiding a diff never drops its receiver: an old worker retains the
+    /// single-flight slot until poll retires it, but cannot regain visibility.
+    pub(crate) fn close_diff(&mut self) {
+        self.diff.is_open = false;
+        self.diff_task = None;
+        self.diff_epoch = Arc::new(());
+    }
+
+    pub(crate) fn diff_reference(&self) -> Arc<()> {
+        self.diff_epoch.clone()
+    }
+
+    pub(crate) fn close_current_diff(&mut self, reference: &Arc<()>) {
+        if Arc::ptr_eq(&self.diff_epoch, reference) {
+            self.close_diff();
+        }
+    }
+
+    pub(crate) fn owns_visible_diff(&self, task_id: TaskId) -> bool {
+        self.diff.is_open && self.selected == Some(task_id) && self.diff_task == Some(task_id)
+    }
+
+    pub(crate) fn request_diff(
+        &mut self,
+        task_id: TaskId,
+        cwd: std::path::PathBuf,
+        base: String,
+    ) -> Result<(), crate::agent_task::DiffRequestError> {
+        let result = self.diff.request_from(cwd, base);
+        // Spawn failure has an admitted, visible error state. Busy/invalid
+        // requests must not relabel the previous task's retained result.
+        if result.is_ok()
+            || matches!(&result, Err(crate::agent_task::DiffRequestError::WorkerSpawn(_)))
+        {
+            self.diff_task = Some(task_id);
+            self.diff_epoch = Arc::new(());
+        }
+        result
+    }
+
+    /// Panel visibility transitions revoke both composer and picker callbacks,
+    /// preserving the current draft/context for the next visible opening.
+    pub(crate) fn retire_panel_callbacks(&mut self) {
+        self.retire_follow_up();
+        if let Some(picker) = self.provider_picker.as_mut() {
+            picker.retire_reference();
+        }
+    }
+
+    /// Hiding the composer revokes callbacks but keeps its editable draft.
+    pub(crate) fn retire_follow_up(&mut self) {
+        self.follow_up_epoch = Arc::new(());
+    }
+
+    pub(crate) fn follow_up_reference(&self, task_id: TaskId, completed_turns: usize) -> TaskFollowUpRef {
+        TaskFollowUpRef { task_id, completed_turns, selection: self.follow_up_epoch.clone() }
+    }
+
+    pub(crate) fn accepts_follow_up(&self, reference: &TaskFollowUpRef, completed_turns: usize) -> bool {
+        self.selected == Some(reference.task_id)
+            && reference.completed_turns == completed_turns
+            && Arc::ptr_eq(&self.follow_up_epoch, &reference.selection)
+    }
+
+    pub(crate) fn edit_follow_up(&mut self, reference: &TaskFollowUpRef, completed_turns: usize, text: String) -> bool {
+        if !self.accepts_follow_up(reference, completed_turns) {
+            return false;
+        }
+        self.set_follow_up(text);
+        true
+    }
+
+    /// Consume callback identity before dispatch, retaining the draft until
+    /// success. Even a failed attempt cannot be repeated by a queued duplicate;
+    /// the user can retry through the newly rendered composer identity.
+    pub(crate) fn begin_follow_up_send(&mut self, reference: &TaskFollowUpRef, completed_turns: usize) -> Option<String> {
+        if !self.accepts_follow_up(reference, completed_turns)
+            || !native_follow_up_can_send(&self.follow_up, completed_turns)
+        {
+            return None;
+        }
+        let text = self.follow_up.clone();
+        self.retire_follow_up();
+        Some(text)
     }
 
     pub(crate) fn set_follow_up(&mut self, text: impl Into<String>) {
@@ -353,6 +489,196 @@ mod tests {
             &second
         ));
         assert_ne!(first, second);
+    }
+
+    fn picker_context(command: &str) -> SemanticCommandContext {
+        SemanticCommandContext {
+            source_session_id: "test".to_string(),
+            source_execution_id: "test".to_string(),
+            source_sequence: 1,
+            source_shell: None,
+            command: Some(command.to_string()),
+            command_exact: true,
+            command_truncated: false,
+            cwd: Some("/fixture".to_string()),
+            cwd_after: None,
+            exit_code: Some(1),
+            duration_ms: None,
+            output_text: String::new(),
+            output_available: true,
+            output_truncated: false,
+            output_total_bytes: 0,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn provider_choice_and_cancel_only_consume_the_current_opening_once() {
+        let mut picker = Some(TaskProviderPicker::new(picker_context("A")));
+        let old_a = picker.as_ref().unwrap().reference();
+        assert!(TaskProviderPicker::take_current(&mut picker, &old_a).is_some());
+        assert!(TaskProviderPicker::take_current(&mut picker, &old_a).is_none());
+        picker = Some(TaskProviderPicker::new(picker_context("B")));
+        assert!(TaskProviderPicker::take_current(&mut picker, &old_a).is_none());
+        assert_eq!(picker.as_ref().unwrap().context.command.as_deref(), Some("B"));
+        let hidden_b = picker.as_ref().unwrap().reference();
+        picker.as_mut().unwrap().retire_reference();
+        assert!(TaskProviderPicker::take_current(&mut picker, &hidden_b).is_none());
+        let current_b = picker.as_ref().unwrap().reference();
+        let context = TaskProviderPicker::take_current(&mut picker, &current_b).unwrap();
+        assert_eq!(context.command.as_deref(), Some("B"));
+        // A failed availability check restores the same text as a fresh opening.
+        picker = Some(TaskProviderPicker::new(context));
+        assert!(TaskProviderPicker::take_current(&mut picker, &current_b).is_none());
+        let retry = picker.as_ref().unwrap().reference();
+        assert!(TaskProviderPicker::take_current(&mut picker, &retry).is_some());
+        picker = Some(TaskProviderPicker::new(picker_context("A")));
+        assert!(TaskProviderPicker::take_current(&mut picker, &old_a).is_none());
+    }
+
+    #[test]
+    fn provider_choice_keeps_current_visibility_and_availability_checks() {
+        let source = include_str!("main.rs");
+        let method = source.split("fn task_create_with_provider(").nth(1).unwrap()
+            .split("/// Enter the bounded").next().unwrap();
+        assert!(method.find("!self.config.experimental_task_sidebar").unwrap()
+            < method.find("TaskProviderPicker::take_current").unwrap());
+        assert!(method.find("TaskProviderPicker::take_current").unwrap()
+            < method.find("ensure_executable_available").unwrap());
+        assert!(method.find("ensure_executable_available").unwrap()
+            < method.find("begin_worktree_creation").unwrap());
+        assert!(method.contains("TaskProviderPicker::new(context)"));
+        assert!(source.contains("Message::TaskCreateWithProvider(reference.clone(), provider)"));
+        assert!(source.contains("Message::TaskCreateProviderCancel(reference)"));
+        let cancel = source.split("Message::TaskCreateProviderCancel(reference) => {").nth(1).unwrap()
+            .split("Message::TaskStartNative").next().unwrap();
+        assert!(cancel.contains("TaskProviderPicker::take_current"));
+        for start in ["fn toggle_sidebar(", "fn sync_tab_position_ui(", "fn set_task_panel_open("] {
+            let body = source.split(start).nth(1).unwrap().split("\n    fn ").next().unwrap();
+            assert!(body.contains("retire_panel_callbacks()"));
+        }
+    }
+
+    #[test]
+    fn task_diff_selection_and_close_do_not_relabel_late_results() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        panel.diff_task = Some(a);
+        panel.diff.is_open = true;
+        assert!(panel.owns_visible_diff(a));
+        assert!(!panel.owns_visible_diff(b));
+        panel.select(Some(b));
+        assert!(!panel.owns_visible_diff(b));
+        assert!(!panel.owns_visible_diff(a));
+        panel.select(Some(a));
+        assert!(!panel.owns_visible_diff(a));
+        // A fresh request can become visible; closing/deletion revokes it.
+        panel.diff_task = Some(a);
+        panel.diff.is_open = true;
+        let old_close = panel.diff_reference();
+        panel.close_diff();
+        assert!(!panel.owns_visible_diff(a));
+        panel.diff_task = Some(a);
+        panel.diff.is_open = true;
+        panel.close_current_diff(&old_close);
+        assert!(panel.owns_visible_diff(a));
+        panel.diff_task = Some(a);
+        panel.diff.is_open = true;
+        panel.select(None);
+        assert!(!panel.owns_visible_diff(a));
+    }
+
+    #[test]
+    fn diff_production_display_and_request_are_bound_to_selected_task() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("if self.task_panel.owns_visible_diff(task.id)"));
+        let open = source.split("Message::TaskDiffOpen(task_id) => {").nth(1).unwrap()
+            .split("Message::TaskDiffClose").next().unwrap();
+        assert!(open.find("self.task_panel.selected != Some(task_id)").unwrap()
+            < open.find("request_diff(task_id").unwrap());
+        let pump = source.split("// Tasks dashboard pump:").nth(1).unwrap()
+            .split("let interval =").next().unwrap();
+        assert!(pump.contains("self.task_panel.diff.state().loading"));
+        let ui = include_str!("agent_task_ui.rs");
+        let close = ui.split("pub(crate) fn close_diff(&mut self) {").nth(1).unwrap()
+            .split("pub(crate) fn diff_reference").next().unwrap();
+        assert!(!close.contains("self.diff ="));
+        assert!(!close.contains("pending"));
+        let worker = include_str!("agent_task/diff.rs");
+        let poll = worker.split("pub fn poll(&mut self) -> bool {").nth(1).unwrap()
+            .split("/// Base revision").next().unwrap();
+        assert!(!poll.contains("is_open = true"));
+        let apply = worker.split("fn apply_result(&mut self, result: WorkerResult) {").nth(1).unwrap()
+            .split("\n}").next().unwrap();
+        assert!(!apply.contains("is_open = true"));
+    }
+
+    #[test]
+    fn stale_follow_up_cannot_read_or_replace_another_tasks_draft() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        let old_a = panel.follow_up_reference(a, 1);
+        panel.select(Some(b));
+        let current_b = panel.follow_up_reference(b, 1);
+        assert!(panel.edit_follow_up(&current_b, 1, "feedback for B".into()));
+        assert!(!panel.edit_follow_up(&old_a, 1, "late A input".into()));
+        assert_eq!(panel.begin_follow_up_send(&old_a, 1), None);
+        assert_eq!(panel.follow_up, "feedback for B");
+        assert_eq!(panel.begin_follow_up_send(&current_b, 1).as_deref(), Some("feedback for B"));
+        // Dispatch failure keeps the draft, but a queued duplicate cannot retry.
+        assert_eq!(panel.follow_up, "feedback for B");
+        assert_eq!(panel.begin_follow_up_send(&current_b, 1), None);
+        assert!(!panel.edit_follow_up(&current_b, 1, "late edit".into()));
+        let retry = panel.follow_up_reference(b, 1);
+        assert!(panel.begin_follow_up_send(&retry, 1).is_some());
+        panel.follow_up.clear(); // Existing handler clears only after success.
+        assert_eq!(panel.begin_follow_up_send(&retry, 1), None);
+    }
+
+    #[test]
+    fn follow_up_selection_visibility_and_turn_changes_revoke_callbacks() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        let first = panel.follow_up_reference(a, 1);
+        panel.select(Some(b));
+        panel.select(Some(a));
+        assert!(!panel.accepts_follow_up(&first, 1));
+        let reopened = panel.follow_up_reference(a, 1);
+        assert!(panel.edit_follow_up(&reopened, 1, "keep draft".into()));
+        panel.retire_follow_up(); // Close/reopen keeps text, revokes old view.
+        assert!(!panel.accepts_follow_up(&reopened, 1));
+        assert_eq!(panel.follow_up, "keep draft");
+        let current = panel.follow_up_reference(a, 1);
+        assert!(panel.accepts_follow_up(&current, 1));
+        assert!(!panel.accepts_follow_up(&current, 2));
+        assert_eq!(panel.begin_follow_up_send(&current, 2), None);
+        panel.select(None); // Removed/hidden selection.
+        assert!(!panel.accepts_follow_up(&current, 1));
+    }
+
+    #[test]
+    fn production_follow_up_admission_precedes_dispatch_and_draft_clear() {
+        let source = include_str!("main.rs");
+        let send = source.split("Message::TaskFollowUpSend(reference) => {").nth(1).unwrap()
+            .split("Message::TaskApprovalDeny").next().unwrap();
+        let guard = send.find("task_follow_up_is_current").unwrap();
+        let take = send.find("begin_follow_up_send").unwrap();
+        let dispatch = send.find("prompt_codex").unwrap();
+        let clear = send.find("Ok(()) => self.task_panel.follow_up.clear()").unwrap();
+        assert!(guard < take && take < dispatch && dispatch < clear);
+        let input = source.split("Message::TaskFollowUpInput(reference, value) => {").nth(1).unwrap()
+            .split("Message::TaskFollowUpSend").next().unwrap();
+        assert!(input.find("task_follow_up_is_current").unwrap() < input.find("edit_follow_up").unwrap());
+        assert!(source.contains("Message::TaskFollowUpInput(input_reference.clone(), value)"));
+        assert!(source.contains("Message::TaskFollowUpSend(reference)"));
+        assert!(!source.contains("self.task_panel.selected ="));
     }
 
     #[test]

@@ -92,6 +92,24 @@ pub(crate) fn bound_theme_editor_error(text: impl Into<String>) -> String {
     }
 }
 
+/// Commit the selected-theme fallback only after deletion succeeds. Keeping
+/// this result boundary pure lets failures be tested without deleting themes.
+pub(crate) fn apply_custom_theme_deletion<E>(
+    result: Result<(), E>,
+    deleted: &str,
+    selected: &mut String,
+    dirty: &mut bool,
+) -> Result<bool, E> {
+    result?;
+    if selected.as_str() == deleted {
+        *selected = "dark".to_string();
+        *dirty = true;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// iced color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color;
@@ -249,5 +267,44 @@ mod tests {
         assert!(shown.len() <= MAX_THEME_EDITOR_ERROR_BYTES);
         assert!(shown.starts_with("Save failed:"));
         assert_eq!(bound_theme_editor_error("\u{202e}"), "Theme editor error");
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::apply_custom_theme_deletion;
+
+    #[test]
+    fn failed_deletion_preserves_selected_theme_and_dirty_state() {
+        for initial_dirty in [false, true] {
+            let mut selected = "custom".to_string();
+            let mut dirty = initial_dirty;
+            assert_eq!(apply_custom_theme_deletion(Err("injected I/O failure"), "custom", &mut selected, &mut dirty), Err("injected I/O failure"));
+            assert_eq!(selected, "custom");
+            assert_eq!(dirty, initial_dirty);
+        }
+    }
+
+    #[test]
+    fn only_successfully_deleted_selected_theme_changes_preference() {
+        let mut selected = "custom".to_string();
+        let mut dirty = false;
+        assert_eq!(apply_custom_theme_deletion(Ok::<(), ()>(()), "other", &mut selected, &mut dirty), Ok(false));
+        assert_eq!(selected, "custom");
+        assert!(!dirty);
+        assert_eq!(apply_custom_theme_deletion(Ok::<(), ()>(()), "custom", &mut selected, &mut dirty), Ok(true));
+        assert_eq!(selected, "dark");
+        assert!(dirty);
+    }
+
+    #[test]
+    fn production_delete_commits_only_after_result_admission() {
+        let source = include_str!("main.rs");
+        let handler = source.split("Message::ThemeDelete(name) => {").nth(1).unwrap()
+            .split("Message::ConfigSave").next().unwrap();
+        assert!(handler.contains("apply_custom_theme_deletion("));
+        assert!(handler.contains("Ok(changed)"));
+        assert!(!handler.contains("self.config.theme ="));
+        assert!(!handler.contains("self.config_dirty ="));
     }
 }

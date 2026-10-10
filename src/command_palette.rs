@@ -148,6 +148,7 @@ impl PaletteItem {
 
 /// 命令面板状态。
 pub struct PaletteState {
+    epoch: std::sync::Arc<()>,
     pub is_open: bool,
     pub query: String,
     /// 当前过滤结果中的高亮位置。
@@ -677,6 +678,7 @@ impl PaletteState {
             },
         ];
         Self {
+            epoch: std::sync::Arc::new(()),
             is_open: false,
             query: String::new(),
             selected: 0,
@@ -699,6 +701,7 @@ impl PaletteState {
     }
 
     pub fn open(&mut self) {
+        self.epoch = std::sync::Arc::new(());
         self.is_open = true;
         self.query.clear();
         self.selected = 0;
@@ -789,9 +792,24 @@ impl PaletteState {
             .map(|(_, item)| item.action)
     }
 
-    /// 按 `all` 中的索引取动作（用于鼠标点击分发）。
-    pub fn action_at(&self, index: usize) -> Option<PaletteAction> {
-        self.all.get(index).map(|item| item.action)
+    /// Identity of this opening, retained by rendered input/row callbacks.
+    pub fn epoch(&self) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.epoch)
+    }
+
+    pub fn accepts_epoch(&self, epoch: &std::sync::Arc<()>) -> bool {
+        self.is_open && std::sync::Arc::ptr_eq(&self.epoch, epoch)
+    }
+
+    /// A row may act only while its opening and filtered entry are current.
+    /// A duplicate event after close must not act on a newly active tab.
+    pub fn action_at(&self, epoch: &std::sync::Arc<()>, index: usize) -> Option<PaletteAction> {
+        if !self.accepts_epoch(epoch) {
+            return None;
+        }
+        self.filtered().into_iter().find_map(|(current, item)| {
+            (current == index).then_some(item.action)
+        })
     }
 
     /// Replace the query; the highlight returns to the first row. Control
@@ -829,6 +847,44 @@ impl PaletteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_actions_cannot_survive_close_reopen_or_filter_removal() {
+        let mut palette = PaletteState::new();
+        palette.open();
+        let epoch = palette.epoch();
+        let index = palette.all.iter().position(|item| item.action == PaletteAction::CloseTab).unwrap();
+        assert_eq!(palette.action_at(&epoch, index), Some(PaletteAction::CloseTab));
+        palette.close();
+        assert_eq!(palette.action_at(&epoch, index), None);
+        assert!(!palette.accepts_epoch(&epoch));
+        palette.open();
+        assert_eq!(palette.action_at(&epoch, index), None);
+        let current = palette.epoch();
+        palette.set_query("no-such-command-zzzzzz");
+        assert_eq!(palette.action_at(&current, index), None);
+        palette.set_query("");
+        assert_eq!(palette.action_at(&current, index), Some(PaletteAction::CloseTab));
+        assert_eq!(palette.action_at(&current, usize::MAX), None);
+    }
+
+    #[test]
+    fn valid_keyboard_and_mouse_selection_still_resolve_the_same_action() {
+        let mut palette = PaletteState::new();
+        palette.open();
+        let epoch = palette.epoch();
+        palette.select_next();
+        let (index, item) = palette.filtered()[palette.selected];
+        assert_eq!(palette.selected_action(), Some(item.action));
+        assert_eq!(palette.action_at(&epoch, index), Some(item.action));
+        palette.set_query("close");
+        let (index, item) = palette.filtered()[palette.selected];
+        assert_eq!(palette.selected_action(), Some(item.action));
+        assert_eq!(palette.action_at(&epoch, index), Some(item.action));
+        // Input updates retain the same opening identity; queued characters
+        // from a single text-input widget are not discarded between redraws.
+        assert!(palette.accepts_epoch(&epoch));
+    }
 
     /// The hints the palette shows are read from the binding table rather
     /// than baked into the item list, so this now pins the DEFAULT table's

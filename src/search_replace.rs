@@ -15,6 +15,59 @@ pub struct ReplaceOptions {
     pub replace_all: bool,
 }
 
+/// Shared prompt/clipboard replacement result envelope. Fail rather than
+/// truncate when expansion exceeds the same budget as prompt insertion.
+pub(crate) const MAX_REPLACEMENT_RESULT_BYTES: usize = crate::review_text::MAX_PROMPT_INSERT_BYTES;
+
+fn replacement_growth(current: usize, additional: usize, limit: usize) -> Result<usize, String> {
+    current.checked_add(additional).filter(|size| *size <= limit)
+        .ok_or_else(|| format!("replacement result exceeds the {limit}-byte limit"))
+}
+
+fn append_replacement(result: &mut String, part: &str, limit: usize) -> Result<(), String> {
+    replacement_growth(result.len(), part.len(), limit)?;
+    result.push_str(part);
+    Ok(())
+}
+
+/// Count expansion bytes without creating an expanded temporary. Mirrors the
+/// pinned regex 1.13.1 capture interpolation grammar, with differential tests
+/// below: longest ASCII unbraced name, arbitrary braced name, $$ and malformed
+/// references. Numeric parse failure (including overflow) falls back to name.
+fn capture_expansion_len(captures: &regex::Captures<'_>, mut template: &str, limit: usize) -> Result<usize, String> {
+    let mut size = 0;
+    while let Some(dollar) = template.find('$') {
+        size = replacement_growth(size, dollar, limit)?;
+        template = &template[dollar..];
+        if template.as_bytes().get(1) == Some(&b'$') {
+            size = replacement_growth(size, 1, limit)?;
+            template = &template[2..];
+            continue;
+        }
+        let reference = if template.as_bytes().get(1) == Some(&b'{') {
+            template[2..].find('}').map(|end| (&template[2..2 + end], end + 3))
+        } else {
+            let end = 1 + template.as_bytes()[1..].iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_').count();
+            (end > 1).then(|| (&template[1..end], end))
+        };
+        let Some((name, end)) = reference else {
+            size = replacement_growth(size, 1, limit)?;
+            template = &template[1..];
+            continue;
+        };
+        let capture = match name.parse::<usize>() {
+            Ok(index) => captures.get(index),
+            Err(_) => captures.name(name),
+        };
+        if let Some(value) = capture {
+            size = replacement_growth(size, value.len(), limit)?;
+        }
+        template = &template[end..];
+    }
+    replacement_growth(size, template.len(), limit)
+}
+
 /// 搜索和替换引擎
 pub struct SearchAndReplaceEngine;
 
@@ -27,14 +80,23 @@ impl SearchAndReplaceEngine {
         config: &SearchConfig,
         options: &ReplaceOptions,
     ) -> Result<(String, usize), String> {
-        // An empty Find field is a no-op in both literal and regex modes.
+        Self::search_and_replace_with_limit(text, search_pattern, replacement, config, options,
+            MAX_REPLACEMENT_RESULT_BYTES)
+    }
+
+    fn search_and_replace_with_limit(
+        text: &str, search_pattern: &str, replacement: &str,
+        config: &SearchConfig, options: &ReplaceOptions, limit: usize,
+    ) -> Result<(String, usize), String> {
+        // No-match/empty-pattern outputs must obey the same envelope too.
         if search_pattern.is_empty() {
+            replacement_growth(0, text.len(), limit)?;
             return Ok((text.to_string(), 0));
         }
         if config.use_regex {
-            Self::regex_replace(text, search_pattern, replacement, config, options)
+            Self::regex_replace(text, search_pattern, replacement, config, options, limit)
         } else {
-            Self::literal_replace(text, search_pattern, replacement, config, options)
+            Self::literal_replace(text, search_pattern, replacement, config, options, limit)
         }
     }
 
@@ -47,13 +109,15 @@ impl SearchAndReplaceEngine {
         replacement: &str,
         config: &SearchConfig,
         options: &ReplaceOptions,
+        limit: usize,
     ) -> Result<(String, usize), String> {
         // Empty pattern would match endlessly; treat as a no-op.
         if pattern.is_empty() {
+            replacement_growth(0, text.len(), limit)?;
             return Ok((text.to_string(), 0));
         }
 
-        let mut result = String::with_capacity(text.len());
+        let mut result = String::with_capacity(text.len().min(limit));
         let mut count = 0;
         let mut i = 0;
 
@@ -62,7 +126,7 @@ impl SearchAndReplaceEngine {
             if take_more {
                 if let Some(mlen) = match_len_at(text, i, pattern, config.case_sensitive) {
                     if mlen > 0 && (!config.whole_word || is_whole_word(text, i, i + mlen)) {
-                        result.push_str(replacement);
+                        append_replacement(&mut result, replacement, limit)?;
                         i += mlen;
                         count += 1;
                         continue;
@@ -76,6 +140,7 @@ impl SearchAndReplaceEngine {
                 i += 1;
                 continue;
             };
+            replacement_growth(result.len(), ch.len_utf8(), limit)?;
             result.push(ch);
             i += ch.len_utf8();
         }
@@ -90,6 +155,7 @@ impl SearchAndReplaceEngine {
         replacement: &str,
         config: &SearchConfig,
         options: &ReplaceOptions,
+        limit: usize,
     ) -> Result<(String, usize), String> {
         use regex::RegexBuilder;
 
@@ -105,19 +171,24 @@ impl SearchAndReplaceEngine {
             .build()
             .map_err(crate::review_text::safe_regex_error)?;
 
-        let result = if options.replace_all {
-            regex.replace_all(text, replacement).to_string()
-        } else {
-            regex.replace(text, replacement).to_string()
-        };
-
-        let count = if options.replace_all {
-            regex.find_iter(text).count()
-        } else if regex.is_match(text) {
-            1
-        } else {
-            0
-        };
+        let mut result = String::with_capacity(text.len().min(limit));
+        let mut count = 0;
+        let mut consumed = 0;
+        for captures in regex.captures_iter(text) {
+            let matched = captures.get(0).expect("regex captures include the full match");
+            append_replacement(&mut result, &text[consumed..matched.start()], limit)?;
+            let expansion = capture_expansion_len(&captures, replacement, limit)?;
+            replacement_growth(result.len(), expansion, limit)?;
+            // Exact preflight above covers every append made by expand;
+            // neither an oversized temporary nor a partial result escapes.
+            captures.expand(replacement, &mut result);
+            consumed = matched.end();
+            count += 1;
+            if !options.replace_all {
+                break;
+            }
+        }
+        append_replacement(&mut result, &text[consumed..], limit)?;
 
         Ok((result, count))
     }
@@ -217,6 +288,78 @@ fn match_len_at(text: &str, idx: usize, pattern: &str, case_sensitive: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_result_limits_apply_before_literal_or_capture_growth() {
+        for use_regex in [false, true] {
+            let config = SearchConfig { use_regex, ..SearchConfig::default() };
+            let all = ReplaceOptions { replace_all: true };
+            assert_eq!(SearchAndReplaceEngine::search_and_replace_with_limit(
+                "aa", "a", "界", &config, &all, 6).unwrap(), ("界界".into(), 2));
+            assert!(SearchAndReplaceEngine::search_and_replace_with_limit(
+                "aa", "a", "界", &config, &all, 5).is_err());
+            assert_eq!(SearchAndReplaceEngine::search_and_replace_with_limit(
+                "aa", "a", "界", &config, &ReplaceOptions::default(), 4).unwrap(), ("界a".into(), 1));
+            assert!(SearchAndReplaceEngine::search_and_replace_with_limit(
+                "unchanged", "z", "x", &config, &all, 8).is_err());
+            assert!(SearchAndReplaceEngine::search_and_replace_with_limit(
+                "unchanged", "", "x", &config, &all, 8).is_err());
+            assert_eq!(SearchAndReplaceEngine::search_and_replace_with_limit(
+                "aaaa", "a", "", &config, &all, 0).unwrap(), (String::new(), 4));
+        }
+        let config = SearchConfig { use_regex: true, ..SearchConfig::default() };
+        assert!(SearchAndReplaceEngine::search_and_replace_with_limit(
+            "abcdefgh", "(.*)", "$1$1", &config, &ReplaceOptions::default(), 15).is_err());
+        assert_eq!(SearchAndReplaceEngine::search_and_replace_with_limit(
+            "abcdefgh", "(.*)", "$1$1", &config, &ReplaceOptions::default(), 16).unwrap().0,
+            "abcdefghabcdefgh");
+        assert!(replacement_growth(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn exact_capture_preflight_matches_pinned_regex_interpolation() {
+        let regex = regex::Regex::new(r"(?P<word>é+)(x)?").unwrap();
+        let captures = regex.captures("éé").unwrap();
+        for template in ["", "$", "$$", "$$$1", "$0", "$1$1", "$2", "$missing",
+            "$1a", "${1}a", "${word}", "$word", "${}", "${missing name}",
+            "${word", "${word}}", "$999999999999999999999999999999", "${+1}",
+            "界$word🙂", "$é", "${é}", "${1}${2}$$"] {
+            let mut expanded = String::new();
+            captures.expand(template, &mut expanded);
+            assert_eq!(capture_expansion_len(&captures, template, expanded.len()).unwrap(), expanded.len(), "{template:?}");
+            if !expanded.is_empty() {
+                assert!(capture_expansion_len(&captures, template, expanded.len() - 1).is_err(), "{template:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_regex_preserves_zero_width_unicode_and_first_all_results() {
+        for pattern in ["^", "$", "a*", "(?P<letter>.)", "(é)?", "z"] {
+            let regex = regex::Regex::new(pattern).unwrap();
+            for text in ["", "éa🙂", "aaa"] {
+                for replacement in ["X", "$0$0", "${letter}$$", "${1}", "$unknown", "界"] {
+                    for replace_all in [false, true] {
+                        let expected = if replace_all { regex.replace_all(text, replacement) }
+                            else { regex.replace(text, replacement) }.into_owned();
+                        let actual = SearchAndReplaceEngine::search_and_replace_with_limit(text, pattern,
+                            replacement, &SearchConfig { use_regex: true, ..SearchConfig::default() },
+                            &ReplaceOptions { replace_all }, expected.len()).unwrap();
+                        assert_eq!(actual.0, expected, "{pattern:?} {text:?} {replacement:?} {replace_all}");
+                        let count = if replace_all { regex.find_iter(text).count() }
+                            else { usize::from(regex.is_match(text)) };
+                        assert_eq!(actual.1, count);
+                        if !expected.is_empty() {
+                            assert!(SearchAndReplaceEngine::search_and_replace_with_limit(text, pattern,
+                                replacement, &SearchConfig { use_regex: true, ..SearchConfig::default() },
+                                &ReplaceOptions { replace_all }, expected.len() - 1).is_err());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     #[test]
     fn whole_word_literal_uses_unicode_regex_boundaries() {

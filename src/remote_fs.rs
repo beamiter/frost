@@ -453,7 +453,13 @@ case "$op" in
   rm)
     p=${2:-}
     case "$p" in /*?*) ;; *) exit 2 ;; esac
-    if [ -d "$p" ] && [ ! -L "$p" ]; then rm -rf "$p" || exit 4; else rm -f "$p" || exit 4; fi
+    if [ -d "$p" ] && [ ! -L "$p" ]; then
+      physical=$(cd -P "$p" 2>/dev/null && pwd -P) || exit 4
+      [ "$physical" != / ] || exit 2
+      rm -rf -- "$p" || exit 4
+    else
+      rm -f -- "$p" || exit 4
+    fi
     ;;
   mv)
     s=${2:-}; n=${3:-}
@@ -1613,6 +1619,24 @@ pub fn validate_delete_path(path: &Path) -> Result<(), String> {
     if path.parent().is_none() {
         return Err("refusing to delete the filesystem root".to_string());
     }
+    // Reject parent traversal and a retained leading current-directory
+    // component. Path::components already normalizes harmless interior dots.
+    // Even benign parent aliases are rejected: lexical normalization would
+    // change their meaning across an ancestor symlink.
+    if path.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir)) {
+        return Err("delete paths must not contain parent or leading current-directory components".to_string());
+    }
+    Ok(())
+}
+
+// Call only after classifying the final entry as a directory. In particular,
+// do not canonicalize a final symlink before deciding to unlink it.
+fn reject_local_root_directory(path: &Path) -> io::Result<()> {
+    let canonical = path.canonicalize()?;
+    if canonical.parent().is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "refusing to delete a filesystem root alias"));
+    }
     Ok(())
 }
 
@@ -1627,6 +1651,12 @@ pub fn delete(loc: &FsLocation, hosts: &[RemoteHostConfig], path: &Path) -> io::
             // descended into.
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.is_dir() {
+                // Classify the final entry before canonicalizing: a final
+                // symlink to / must still be unlinked, never followed. This
+                // also rejects directory aliases such as a trailing-slash
+                // link to root. Ancestor replacement races remain outside
+                // this path-based backend's confinement guarantees.
+                reject_local_root_directory(path)?;
                 std::fs::remove_dir_all(path)
             } else {
                 std::fs::remove_file(path)
@@ -4326,9 +4356,43 @@ mod tests {
     }
 
     #[test]
-    fn delete_validation_refuses_only_the_root() {
-        assert!(validate_delete_path(Path::new("/")).is_err());
-        assert!(validate_delete_path(Path::new("/tmp")).is_ok());
+    fn delete_validation_refuses_root_and_traversal_aliases_without_io() {
+        for path in ["", "/", "//", "/.", ".", "..", "/tmp/..", "/tmp/../", "../item", "./item", "/tmp/../safe"] {
+            assert!(validate_delete_path(Path::new(path)).is_err(), "{path:?}");
+        }
+        for path in ["/tmp", "/tmp/file", "/tmp/link-to-root", "ordinary-relative-file"] {
+            assert!(validate_delete_path(Path::new(path)).is_ok(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn destructive_root_alias_guards_precede_local_and_remote_removal() {
+        let source = include_str!("remote_fs.rs");
+        let delete = source.split_once("pub fn delete(").unwrap().1
+            .split_once("/// Rename `src`").unwrap().0;
+        assert!(delete.find("symlink_metadata(path)").unwrap() < delete.find("reject_local_root_directory(path)?").unwrap());
+        assert!(delete.find("reject_local_root_directory(path)?").unwrap() < delete.find("std::fs::remove_dir_all(path)").unwrap());
+        let remote = PROBE_SCRIPT.split_once("  rm)\n").unwrap().1.split_once("  mv)\n").unwrap().0;
+        assert!(remote.find("[ ! -L \"$p\" ]").unwrap() < remote.find("cd -P").unwrap());
+        assert!(remote.find("[ \"$physical\" != / ]").unwrap() < remote.find("rm -rf --").unwrap());
+        assert!(remote.contains("rm -f -- \"$p\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_root_guard_is_read_only_and_final_root_symlink_is_unlinked() {
+        // These checks only canonicalize; never call delete on root/aliases.
+        assert!(reject_local_root_directory(Path::new("/")).is_err());
+        let root = temp_tree();
+        assert!(reject_local_root_directory(&root).is_ok());
+        assert!(reject_local_root_directory(&root.join("missing")).is_err());
+        let link = root.join("root-link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(reject_local_root_directory(&link).is_err());
+        delete(&FsLocation::Local, &[], &link).expect("unlink only the temporary symlink");
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(root.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -123,6 +123,13 @@ pub enum TabPosition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Offline companion in the existing bottom status bar; opt-in.
+    #[serde(default)]
+    pub ascii_organism_enabled: bool,
+    /// Missing means Automatic (currently a disclosed Calm fallback).
+    #[serde(default)]
+    pub ascii_organism_motion: Option<crate::organism::Motion>,
+
     /// AI features master switch. Off by default: nothing leaves the machine
     /// unless the user opts in.
     #[serde(default)]
@@ -615,6 +622,8 @@ fn default_jsh_update_check() -> String {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            ascii_organism_enabled: false,
+            ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
             remote_hosts: default_remote_hosts(),
@@ -721,8 +730,11 @@ impl Config {
         .unwrap_or(jterm_core::agent_task::AgentProvider::Codex)
         .config_value()
         .to_string();
-        self.ai_api_key_file =
-            normalized_optional_text(self.ai_api_key_file, MAX_CONFIG_VALUE_BYTES);
+        // Credential paths select a source, not a display label. Preserve
+        // malformed nonempty values so the shared reader rejects the selected
+        // file rather than silently choosing a different credential source.
+        // The whole config read/write remains bounded by MAX_CONFIG_BYTES.
+        self.ai_api_key_file = self.ai_api_key_file.filter(|path| !path.is_empty());
         self.font_family = self.font_family.trim().to_string();
         if !valid_config_text(&self.font_family, MAX_CONFIG_NAME_BYTES) {
             self.font_family = default_font_family();
@@ -1020,6 +1032,13 @@ pub(crate) fn accepted_config_text(value: impl Into<String>, max_bytes: usize) -
     }
 }
 
+/// Unlike ordinary labels, credential paths must never be sanitized or
+/// truncated into another destination. Reject unsafe live edits wholesale;
+/// loaded nonempty paths remain exact for the strict credential reader.
+pub(crate) fn accepted_ai_key_path_draft(raw: String) -> Option<String> {
+    (raw.is_empty() || valid_config_text(&raw, 16 * 1024)).then_some(raw)
+}
+
 /// Live temperature field: keep the raw editing text so a half-typed "0." is
 /// not discarded, but never hold a paste larger than a numeric literal.
 pub(crate) const MAX_AI_TEMPERATURE_DRAFT_BYTES: usize = 32;
@@ -1235,6 +1254,28 @@ mod tests {
     }
 
     #[test]
+    fn ascii_organism_is_opt_in_and_motion_round_trips() {
+        let default = Config::from_toml("").unwrap();
+        assert!(!default.ascii_organism_enabled);
+        assert_eq!(default.ascii_organism_motion, None);
+        for (label, motion) in [
+            ("full", crate::organism::Motion::Full),
+            ("calm", crate::organism::Motion::Calm),
+            ("static", crate::organism::Motion::Static),
+            (" Full ", crate::organism::Motion::Full),
+            ("CALM", crate::organism::Motion::Calm),
+        ] {
+            let input = format!("ascii_organism_enabled = true\nascii_organism_motion = \"{label}\"\n");
+            let config = Config::from_toml(&input).unwrap();
+            assert!(config.ascii_organism_enabled);
+            assert_eq!(config.ascii_organism_motion, Some(motion));
+            let serialized = toml::to_string(&config).unwrap();
+            assert_eq!(Config::from_toml(&serialized).unwrap().ascii_organism_motion, Some(motion));
+        }
+        assert!(Config::from_toml("ascii_organism_motion = \"unknown\"\n").is_err());
+    }
+
+    #[test]
     fn normalization_bounds_untrusted_numeric_values() {
         let config = Config {
             font_size: f32::NAN,
@@ -1300,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_or_control_bearing_config_strings_never_reach_consumers() {
+    fn ordinary_config_labels_are_bounded_and_credential_selection_is_preserved() {
         let config = Config {
             ai_provider: "p".repeat(MAX_CONFIG_NAME_BYTES + 1),
             ai_base_url: format!(
@@ -1323,13 +1364,55 @@ mod tests {
         assert_eq!(normalized.ai_provider, default_ai_provider());
         assert_eq!(normalized.ai_base_url, default_ai_base_url());
         assert_eq!(normalized.ai_model, default_ai_model());
-        assert_eq!(normalized.ai_api_key_file, None);
+        assert_eq!(normalized.ai_api_key_file.as_deref(), Some("/tmp/key\0suffix"));
         assert_eq!(normalized.font_family, default_font_family());
         assert_eq!(normalized.theme, default_theme());
         assert_eq!(normalized.shell, None);
         assert_eq!(normalized.session_history_file, None);
         assert_eq!(normalized.command_history_path, None);
         assert_eq!(normalized.jsh_update_check, "daily");
+    }
+
+    #[test]
+    fn credential_path_normalization_never_retargets_a_selected_source() {
+        for raw in [" /tmp/key".to_string(), "/tmp/key ".to_string(), "   ".to_string(),
+            "/tmp/key\0suffix".to_string(), "/tmp/key\u{202e}spoof".to_string(),
+            format!("/{}", "x".repeat(16 * 1024))] {
+            let config = Config { ai_api_key_file: Some(raw.clone()), ..Config::default() }.normalized();
+            assert_eq!(config.ai_api_key_file.as_deref(), Some(raw.as_str()));
+            let serialized = config.serialized().unwrap();
+            let restored: Config = toml::from_str(std::str::from_utf8(&serialized).unwrap()).unwrap();
+            assert_eq!(restored.normalized().ai_api_key_file.as_deref(), Some(raw.as_str()));
+        }
+        assert_eq!(Config { ai_api_key_file: Some(String::new()), ..Config::default() }
+            .normalized().ai_api_key_file, None);
+    }
+
+    #[test]
+    fn credential_path_live_edit_rejects_instead_of_sanitizing_or_truncating() {
+        for raw in ["/tmp/key\0suffix".to_string(), "/tmp/key\nother".to_string(),
+            "/tmp/key\u{202e}spoof".to_string(), "x".repeat(16 * 1024 + 1)] {
+            assert!(accepted_ai_key_path_draft(raw).is_none());
+        }
+        for raw in ["", "   ", " /tmp/key", "/tmp/key ", "~/key"] {
+            assert_eq!(accepted_ai_key_path_draft(raw.into()).as_deref(), Some(raw));
+        }
+        let exact_limit = format!("/{}", "x".repeat(16 * 1024 - 1));
+        assert_eq!(accepted_ai_key_path_draft(exact_limit.clone()), Some(exact_limit));
+    }
+
+    #[test]
+    fn credential_path_settings_and_store_use_exact_admission() {
+        let source = include_str!("main.rs");
+        let edit = source.split_once("            Message::SetAiKeyFile(path) => {")
+            .unwrap().1.split_once("            Message::SetAiKeyDraft(").unwrap().0;
+        assert!(edit.contains("accepted_ai_key_path_draft(path)"));
+        assert!(edit.contains("Key file path unchanged:"));
+        assert!(!edit.contains("trim()"));
+        let store = source.split_once("            Message::StoreAiKey => {")
+            .unwrap().1.split_once("match persistence::write_api_key_file").unwrap().0;
+        assert!(!store.contains("trim()"));
+        assert!(store.contains(".filter(|p| !p.is_empty())"));
     }
 
     #[test]
