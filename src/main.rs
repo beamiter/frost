@@ -3227,6 +3227,15 @@ fn reindex_tabs_for_removal(tabs: &mut [Tab], removed: usize) {
     }
 }
 
+/// Only losing the active tab clears its zoom. IDs are captured before reindexing.
+fn pane_zoom_after_tab_close(
+    zoomed: bool,
+    active_tab_id: Option<usize>,
+    emptied_tab_id: Option<usize>,
+) -> bool {
+    zoomed && !(emptied_tab_id.is_some() && emptied_tab_id == active_tab_id)
+}
+
 /// Validate a candidate restored layout: every leaf session must be in range and
 /// appear at most once, and the pane count must stay within `MAX_PANES`.
 ///
@@ -7842,6 +7851,11 @@ impl Frost {
 
         // A tab whose only pane just closed has nothing left to show.
         let emptied = owner.filter(|&tab| self.tabs[tab].tree.leaf_count() <= 1);
+        self.pane_zoomed = pane_zoom_after_tab_close(
+            self.pane_zoomed,
+            self.tabs.get(self.active_tab).map(|tab| tab.id),
+            emptied.and_then(|tab| self.tabs.get(tab).map(|tab| tab.id)),
+        );
         if let Some(tab) = emptied {
             if self.tabs.len() > 1 {
                 self.tabs.remove(tab);
@@ -7863,7 +7877,6 @@ impl Frost {
             .map(|tab| tab.focus)
             .unwrap_or(fallback);
         if emptied.is_some() {
-            self.pane_zoomed = false;
             self.hovered_divider = None;
             self.dragging_divider = None;
         }
@@ -31857,6 +31870,85 @@ mod tests {
             None
         );
         assert_eq!(next_id, 3);
+    }
+
+    #[test]
+    fn background_empty_tab_close_preserves_zoom_and_stable_foreground_owner() {
+        for background_first in [true, false] {
+            let mut tabs = if background_first {
+                vec![Tab::new(7, 0), split_tab(42, &[1, 2])]
+            } else {
+                vec![split_tab(42, &[0, 1]), Tab::new(7, 2)]
+            };
+            let mut ids = if background_first {
+                vec![70, 420, 421]
+            } else {
+                vec![420, 421, 70]
+            };
+            let active_tab = usize::from(background_first);
+            tabs[active_tab].focus = if background_first { 2 } else { 1 };
+            let before_owner = ids[tabs[active_tab].focus];
+            let background_tab = 1 - active_tab;
+            let removed = tabs[background_tab].focus;
+            let zoomed = pane_zoom_after_tab_close(
+                true,
+                Some(tabs[active_tab].id),
+                Some(tabs[background_tab].id),
+            );
+            tabs.remove(background_tab);
+            ids.remove(removed);
+            reindex_tabs_for_removal(&mut tabs, removed);
+            assert!(zoomed);
+            assert_eq!(tabs[0].id, 42);
+            assert_eq!(tabs[0].tree.leaf_count(), 2);
+            assert_eq!(ids[tabs[0].focus], before_owner);
+        }
+    }
+
+    #[test]
+    fn zoom_close_policy_preserves_existing_active_pane_and_final_tab_semantics() {
+        // Closing the active tab clears zoom, including the last-tab model state.
+        assert!(!pane_zoom_after_tab_close(true, Some(42), Some(42)));
+        assert!(!pane_zoom_after_tab_close(false, Some(42), Some(7)));
+        // An active or background pane close that leaves its tab nonempty
+        // retains the existing zoom preference, even if only one pane remains.
+        assert!(pane_zoom_after_tab_close(true, Some(42), None));
+        let mut tabs = vec![split_tab(42, &[0, 1]), split_tab(7, &[2, 3])];
+        tabs[0].focus = 1;
+        reindex_tabs_for_removal(&mut tabs, 2);
+        assert_eq!(tabs[0].focus, 1);
+        assert_eq!(tabs[0].tree.leaf_count(), 2);
+        assert_eq!(tabs[1].tree.leaf_count(), 1);
+        reindex_tabs_for_removal(&mut tabs, 1);
+        assert_eq!(tabs[0].tree.leaf_count(), 1);
+        assert!(pane_zoom_after_tab_close(true, Some(42), None));
+    }
+
+    #[test]
+    fn close_zoom_policy_uses_pre_removal_tab_ids_and_retains_divider_cleanup() {
+        let source = include_str!("main.rs");
+        let prune = source.split_once("    fn prune_closed_pane(").unwrap().1;
+        let prune = prune.split_once("    fn busy_session_name(").unwrap().0;
+        assert!(
+            prune
+                .find("self.pane_zoomed = pane_zoom_after_tab_close(")
+                .unwrap()
+                < prune.find("self.tabs.remove(tab);").unwrap()
+        );
+        assert!(prune.contains("self.tabs.get(self.active_tab).map(|tab| tab.id)"));
+        assert!(prune.contains("emptied.and_then(|tab| self.tabs.get(tab).map(|tab| tab.id))"));
+        assert!(!prune.contains("self.pane_zoomed = false;"));
+        assert!(prune.contains("self.hovered_divider = None;"));
+        assert!(prune.contains("self.dragging_divider = None;"));
+        assert!(prune.contains("self.relayout();"));
+        let close = source.split_once("    fn close_session(").unwrap().1;
+        let close = close.split_once("    /// Reconcile every tab").unwrap().0;
+        assert!(
+            close.find("if self.sessions.len() == 1").unwrap()
+                < close.find("self.sessions.remove(index)").unwrap()
+        );
+        assert!(close.contains("let exit = self.exit_flushing_durable_state();"));
+        assert!(close.contains("self.organism.owner_changed(previous_owner, next_owner);"));
     }
 
     /// The headline rule: a tab owns its panes, so closing it takes every
