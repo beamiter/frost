@@ -49,6 +49,21 @@ pub enum MotionChoice {
 impl MotionChoice {
     pub const ALL: [Self; 4] = [Self::Automatic, Self::Full, Self::Calm, Self::Static];
 
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Automatic | Self::Calm => "Still poses that respond to work.",
+            Self::Full => "Animated poses that respond to work.",
+            Self::Static => "Still poses that respond to work; no output rhythm.",
+        }
+    }
+
+    pub fn interaction_hint(self) -> &'static str {
+        match self {
+            Self::Static => "Hover greetings are unavailable in Static.",
+            _ => "While idle, hover over the live glyph for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
+        }
+    }
+
     pub fn configured(self) -> Option<Motion> {
         match self {
             Self::Automatic => None,
@@ -674,6 +689,30 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn motion_help_matches_the_live_capabilities() {
+        assert_eq!(
+            MotionChoice::Automatic.description(),
+            MotionChoice::Calm.description()
+        );
+        assert!(MotionChoice::Full.description().contains("Animated"));
+        assert!(MotionChoice::Calm.description().contains("Still"));
+        assert!(MotionChoice::Static
+            .description()
+            .contains("no output rhythm"));
+        for choice in [
+            MotionChoice::Automatic,
+            MotionChoice::Full,
+            MotionChoice::Calm,
+        ] {
+            assert!(choice.interaction_hint().contains("600 ms"));
+            assert!(choice.interaction_hint().contains("8-second cooldown"));
+        }
+        assert!(MotionChoice::Static
+            .interaction_hint()
+            .contains("unavailable"));
     }
 
     #[test]

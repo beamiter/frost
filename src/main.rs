@@ -22543,6 +22543,7 @@ impl Frost {
             .into_iter()
             .map(organism::Pose)
             .collect();
+        let motion = organism::MotionChoice::from_config(self.config.ascii_organism_motion);
         let availability = self.organism.hello_availability();
         let mut hello_button = button(text("Say hello"));
         if availability == organism::HelloAvailability::Available {
@@ -22568,6 +22569,9 @@ impl Frost {
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
                 Message::SetOrganismMotion),
             text("Automatic currently uses Calm; desktop animation preferences are not available.").size(11),
+            text(motion.description()).size(11),
+            text(motion.interaction_hint()).size(11),
+            text("Output rhythm reflects observed activity, not command progress.").size(11),
             text("Organism Preview").size(13),
             text("Pose").size(12),
             pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose),
