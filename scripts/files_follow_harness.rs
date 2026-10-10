@@ -292,6 +292,19 @@ impl Session {
 }
 // @files-follow:types
 // @files-follow:helpers
+// The Files-follow fixture observes this unrelated invalidation boundary.
+// Drop planner ownership/capacity is tested by the production drop tests;
+// this stub deliberately does not pretend to model those worker lifetimes.
+#[derive(Default)]
+struct DropIntentInvalidation {
+    invalidations: usize,
+}
+impl DropIntentInvalidation {
+    fn clear(&mut self) {
+        self.invalidations += 1;
+    }
+}
+
 struct TerminalApp {
     sidebar: sidebar::Sidebar,
     sidebar_follow_pending: Option<SidebarRemoteFollow>,
@@ -306,6 +319,8 @@ struct TerminalApp {
     sidebar_dialog: Option<()>,
     sidebar_delete_confirm: Option<()>,
     sidebar_drop_burst: Vec<()>,
+    sidebar_drop_intents: DropIntentInvalidation,
+    sidebar_drop_debounce_generation: Option<u64>,
     sidebar_open: bool,
     sidebar_panel: SidebarPanel,
     sidebar_hosts_epoch: u64,
@@ -402,6 +417,8 @@ fn setup() -> Rc<RefCell<TerminalApp>> {
         sidebar_dialog: None,
         sidebar_delete_confirm: None,
         sidebar_drop_burst: vec![],
+        sidebar_drop_intents: DropIntentInvalidation::default(),
+        sidebar_drop_debounce_generation: None,
         sidebar_open: false,
         sidebar_panel: SidebarPanel::Tabs,
         sidebar_hosts_epoch: 0,

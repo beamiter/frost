@@ -678,7 +678,10 @@ mod tests {
         assert!(input.find("task_follow_up_is_current").unwrap() < input.find("edit_follow_up").unwrap());
         assert!(source.contains("Message::TaskFollowUpInput(input_reference.clone(), value)"));
         assert!(source.contains("Message::TaskFollowUpSend(reference)"));
-        assert!(!source.contains("self.task_panel.selected ="));
+        let direct_assignment = regex::Regex::new(r"self\.task_panel\.selected\s*=[^=]").unwrap();
+        assert!(direct_assignment.is_match("self.task_panel.selected = Some(id);"));
+        assert!(!direct_assignment.is_match("self.task_panel.selected == Some(id)"));
+        assert!(!direct_assignment.is_match(source));
     }
 
     #[test]

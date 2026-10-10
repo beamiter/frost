@@ -34662,8 +34662,10 @@ mod tests {
     #[test]
     fn drop_keeps_first_destination_when_pointer_moves_during_debounce() {
         let first = test_drop_intent("/first");
-        let mut state = SidebarDropIntents::default();
-        state.collecting = Some(first.clone());
+        let mut state = SidebarDropIntents {
+            collecting: Some(first.clone()),
+            ..SidebarDropIntents::default()
+        };
         let later_hover = test_drop_intent("/other");
         assert!(!state.start_planning(&later_hover));
         assert!(state.start_planning(&first));
@@ -34675,8 +34677,10 @@ mod tests {
     #[test]
     fn cancelled_drop_callbacks_cannot_consume_a_new_same_context_burst() {
         let old = test_drop_intent("/first");
-        let mut state = SidebarDropIntents::default();
-        state.collecting = Some(old.clone());
+        let mut state = SidebarDropIntents {
+            collecting: Some(old.clone()),
+            ..SidebarDropIntents::default()
+        };
         assert!(state.start_planning(&old));
         state.clear();
         let new = test_drop_intent("/first");
@@ -34692,8 +34696,10 @@ mod tests {
     fn consecutive_drop_bursts_keep_independent_planning_and_destinations() {
         let a = test_drop_intent("/a");
         let b = test_drop_intent("/b");
-        let mut state = SidebarDropIntents::default();
-        state.collecting = Some(a.clone());
+        let mut state = SidebarDropIntents {
+            collecting: Some(a.clone()),
+            ..SidebarDropIntents::default()
+        };
         assert!(state.start_planning(&a));
         state.collecting = Some(b.clone());
         assert!(!state.start_planning(&a));
