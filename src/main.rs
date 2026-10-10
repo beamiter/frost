@@ -13558,8 +13558,10 @@ impl Frost {
                     }
                 }
                 // Snapshot admission before the batch lifts enable-time quarantine.
-                let watch_batch_identity =
-                    self.sessions.iter().any(|s| s.id == id && s.master_fd == fd);
+                let watch_batch_identity = self
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == id && s.master_fd == fd);
                 let watch_batch_admitted = self.organism.watch_batch_admitted(id);
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.terminal.process_batch(&data);
@@ -28326,10 +28328,7 @@ mod tests {
             .split_once("    fn organism_watch_owner(&self)")
             .unwrap()
             .1;
-        let owner = owner
-            .split_once("    fn sync_organism_watch(")
-            .unwrap()
-            .0;
+        let owner = owner.split_once("    fn sync_organism_watch(").unwrap().0;
         assert!(owner.contains("self.organism_owner()"));
         assert!(owner.contains("Some(organism::Motion::Static)"));
     }
