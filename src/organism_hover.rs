@@ -107,6 +107,13 @@ impl LiveGreeting {
             .or(self.active_until.filter(|deadline| *deadline > now))
     }
 
+    /// A passive cue for an admitted dwell, never a greeting or a new request.
+    pub fn candidate_visible(&self, id: usize, now: Duration, context: RenderContext) -> bool {
+        self.owner == Some(id)
+            && self.candidate.is_some_and(|deadline| now < deadline)
+            && self.interaction.clone().request(now, context)
+    }
+
     pub fn apply(&self, id: usize, now: Duration, context: RenderContext) -> RenderContext {
         if self.owner == Some(id) && self.active_until.is_some_and(|deadline| now < deadline) {
             self.interaction.clone().apply(now, context)
@@ -135,6 +142,56 @@ mod tests {
 
     fn idle() -> RenderContext {
         PreviewPose::Calm.context()
+    }
+
+    #[test]
+    fn candidate_cue_is_read_only_owner_bound_and_strictly_before_dwell() {
+        let mut hello = LiveGreeting::default();
+        hello.enter(1, hello.epoch(), Duration::ZERO, idle(), true);
+        for _ in 0..3 {
+            assert!(hello.candidate_visible(1, Duration::ZERO, idle()));
+            assert!(hello.candidate_visible(1, DWELL - Duration::from_millis(1), idle()));
+            assert!(!hello.candidate_visible(2, Duration::ZERO, idle()));
+            assert!(!hello.candidate_visible(1, DWELL, idle()));
+            assert!(!hello.candidate_visible(1, Duration::from_secs(9), idle()));
+            assert_eq!(hello.apply(1, Duration::ZERO, idle()), idle());
+            assert_eq!(hello.deadline(Duration::ZERO), Some(DWELL));
+        }
+        // Future or repeated reads must not consume the accepted interaction.
+        hello.advance(Some(1), DWELL, idle(), true);
+        assert!(!hello.candidate_visible(1, DWELL, idle()));
+        assert_eq!(hello.apply(1, DWELL, idle()).behavior, Behavior::Approach);
+        hello.leave();
+        hello.enter(1, hello.epoch(), Duration::from_secs(1), idle(), true);
+        assert!(!hello.candidate_visible(1, Duration::from_secs(1), idle()));
+        assert_eq!(hello.deadline(Duration::from_secs(1)), None);
+        hello.leave();
+        let ready = DWELL + GentleInteraction::COOLDOWN;
+        hello.enter(1, hello.epoch(), ready, idle(), true);
+        assert!(hello.candidate_visible(1, ready, idle()));
+    }
+
+    #[test]
+    fn candidate_cue_rechecks_busy_and_cancellation_without_stationary_rearm() {
+        let mut hello = LiveGreeting::default();
+        hello.enter(1, hello.epoch(), Duration::ZERO, idle(), true);
+        let busy = RenderContext {
+            behavior: Behavior::WatchCommand,
+            ..idle()
+        };
+        assert!(!hello.candidate_visible(1, Duration::ZERO, busy));
+        hello.cancel();
+        assert!(!hello.candidate_visible(1, Duration::ZERO, idle()));
+        hello.enter(1, hello.epoch(), Duration::ZERO, idle(), true);
+        assert!(!hello.candidate_visible(1, Duration::ZERO, idle()));
+        hello.leave();
+        hello.enter(1, hello.epoch(), Duration::ZERO, idle(), false);
+        assert!(!hello.candidate_visible(1, Duration::ZERO, idle()));
+        hello.leave();
+        hello.enter(1, hello.epoch(), Duration::ZERO, idle(), true);
+        assert!(hello.candidate_visible(1, Duration::ZERO, idle()));
+        hello.leave();
+        assert!(!hello.candidate_visible(1, Duration::ZERO, idle()));
     }
 
     #[test]

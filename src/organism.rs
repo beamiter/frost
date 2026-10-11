@@ -663,6 +663,16 @@ impl Organism {
         );
     }
 
+    pub fn live_greeting_candidate_visible(&self, id: usize) -> bool {
+        self.enabled
+            && self.sessions.get(&id).is_some_and(|life| {
+                !life.remote
+                    && self
+                        .live_greeting
+                        .candidate_visible(id, self.born.elapsed(), life.context)
+            })
+    }
+
     pub fn live_greeting_deadline(&self) -> Option<Instant> {
         self.live_greeting
             .deadline(self.born.elapsed())

@@ -20587,11 +20587,30 @@ impl Frost {
                 sprite,
                 explanation,
             } = presentation;
+            let candidate_visible = self.organism_hover_eligible()
+                && self
+                    .organism_owner()
+                    .is_some_and(|id| self.organism.live_greeting_candidate_visible(id));
+            // Always reserve this tiny mark inside the existing slot. It is
+            // a passive dwell cue, not a focus ring or a behavior change.
+            let cue_color = self.c_text_dim();
+            let cue = container(Space::new())
+                .width(Length::Fixed(2.0))
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: candidate_visible.then_some(cue_color.into()),
+                    ..Default::default()
+                });
             let slot = container(
-                text(glyph)
-                    .font(self.mono)
-                    .size(11)
-                    .color(self.c_text_dim()),
+                row![
+                    text(glyph)
+                        .font(self.mono)
+                        .size(11)
+                        .color(self.c_text_dim()),
+                    Space::new().width(Length::Fill),
+                    cue,
+                ]
+                .align_y(iced::Alignment::Center),
             )
             .width(Length::Fixed(84.0));
             let slot: Element<'_, Message> = if explanation.is_empty() {
@@ -36053,6 +36072,32 @@ mod tests {
                 Some(vec![control])
             );
         }
+    }
+
+    #[test]
+    fn hover_candidate_cue_stays_inside_glyph_slot_and_uses_existing_admission() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .1
+            .split_once("    fn jsh_notice(")
+            .unwrap()
+            .0;
+        let glyph = bar.split_once("        if layout.glyph {").unwrap().1;
+        assert!(glyph.contains("let candidate_visible = self.organism_hover_eligible()"));
+        assert!(glyph.contains("self.organism.live_greeting_candidate_visible(id)"));
+        assert!(glyph.contains("background: candidate_visible.then_some(cue_color.into())"));
+        assert!(glyph.contains(".width(Length::Fixed(2.0))"));
+        assert!(glyph.contains(".height(Length::Fixed(2.0))"));
+        assert!(glyph.contains(".width(Length::Fixed(84.0))"));
+        assert!(!bar.contains("time::"));
+        assert!(!bar.contains("Behavior::"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
     }
 
     #[test]
