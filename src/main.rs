@@ -20614,10 +20614,13 @@ impl Frost {
                 .width(Length::Fixed(COMPANION_BODY_WIDTH))
                 .height(Length::Fixed(72.0));
             if layout.explanation {
-                row![body, text(presentation.explanation).size(11)]
-                    .spacing(12)
-                    .align_y(iced::Alignment::Center)
-                    .into()
+                row![
+                    body,
+                    text(presentation.explanation.clone().into_owned()).size(11)
+                ]
+                .spacing(12)
+                .align_y(iced::Alignment::Center)
+                .into()
             } else {
                 // Passive body only: do not create a second hover target.
                 body.into()
@@ -20670,7 +20673,7 @@ impl Frost {
                         container(text(sprite).font(self.mono).size(13))
                             .width(Length::Fixed(200.0))
                             .height(Length::Fixed(72.0)),
-                        text(explanation).size(11),
+                        text(explanation.into_owned()).size(11),
                     ]
                     .spacing(8),
                 )
@@ -29374,6 +29377,20 @@ mod tests {
             .0;
         assert!(control.contains(".motion_changed(self.config.ascii_organism_motion, next)"));
         assert!(control.contains("self.config.ascii_organism_motion = next;"));
+    }
+
+    #[test]
+    fn live_rhythm_explanation_is_shared_by_body_and_tooltip() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
+        let bar = bar.split_once("    fn ").unwrap().0;
+        assert_eq!(
+            bar.matches(".presentation(id, running, settled,").count(),
+            1
+        );
+        assert!(bar.contains("text(presentation.explanation.clone().into_owned())"));
+        assert!(bar.contains("text(explanation.into_owned())"));
+        assert!(!bar.contains("behavior_explanation("));
     }
 
     #[test]

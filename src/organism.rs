@@ -7,6 +7,7 @@
 use crate::organism_hover::LiveGreeting;
 use crate::organism_preview::{PreviewAction, PreviewRequest, PreviewSequence};
 use crate::organism_watch::WatchObservation;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use jterm_core::organism::{
     classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind, Behavior,
     BodyLanguage, CircadianPhase, LifeState, NativeOrganism, Reaction, RenderContext, RepoVigil,
-    Tone,
+    Tone, WatchRhythm,
 };
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
@@ -273,7 +274,26 @@ impl PreviewDeadlines {
 pub struct LivePresentation {
     pub glyph: String,
     pub sprite: String,
-    pub explanation: &'static str,
+    pub explanation: Cow<'static, str>,
+}
+
+/// Describe only the output rhythm already selected for this render snapshot.
+/// These observations do not infer command progress, intent, or stalled work.
+fn live_explanation(context: RenderContext) -> Cow<'static, str> {
+    let base = jterm_core::organism_daily::behavior_explanation(context.behavior);
+    if !matches!(
+        context.behavior,
+        Behavior::WatchCommand | Behavior::WatchSettled
+    ) {
+        return Cow::Borrowed(base);
+    }
+    let observation = match context.watch_rhythm {
+        WatchRhythm::Steady => return Cow::Borrowed(base),
+        WatchRhythm::Busy => "Recent output activity.",
+        WatchRhythm::Waiting => "No new output observed recently.",
+        WatchRhythm::Resumed => "Output activity resumed.",
+    };
+    Cow::Owned(format!("{base} {observation}"))
 }
 
 pub struct PreviewPresentation {
@@ -815,7 +835,7 @@ impl Organism {
         LivePresentation {
             glyph: sticky_glyph_with_context(context, frame).into_owned(),
             sprite: sprite_frame_with_context(context, frame).into_owned(),
-            explanation: jterm_core::organism_daily::behavior_explanation(context.behavior),
+            explanation: live_explanation(context),
         }
     }
 
@@ -1513,6 +1533,113 @@ mod tests {
         assert!(MotionChoice::Static
             .interaction_hint()
             .contains("unavailable"));
+    }
+
+    #[test]
+    fn live_watch_explanation_preserves_behavior_and_names_only_observed_rhythm() {
+        for behavior in [Behavior::WatchCommand, Behavior::WatchSettled] {
+            let context = RenderContext::new(
+                behavior,
+                BodyLanguage::from_state(LifeState::default()),
+                false,
+            );
+            let base = jterm_core::organism_daily::behavior_explanation(behavior);
+            assert!(matches!(live_explanation(context), Cow::Borrowed(_)));
+            for (rhythm, observation) in [
+                (WatchRhythm::Busy, "Recent output activity."),
+                (WatchRhythm::Waiting, "No new output observed recently."),
+                (WatchRhythm::Resumed, "Output activity resumed."),
+            ] {
+                assert_eq!(
+                    live_explanation(context.with_watch_rhythm(rhythm)),
+                    format!("{base} {observation}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_watch_explanations_ignore_any_stale_rhythm() {
+        for behavior in [
+            Behavior::Idle,
+            Behavior::Approach,
+            Behavior::InspectError,
+            Behavior::Celebrate,
+            Behavior::UnknownOutcome,
+            Behavior::WatchAgent,
+        ] {
+            for rhythm in [
+                WatchRhythm::Steady,
+                WatchRhythm::Busy,
+                WatchRhythm::Waiting,
+                WatchRhythm::Resumed,
+            ] {
+                let context = RenderContext::new(
+                    behavior,
+                    BodyLanguage::from_state(LifeState::default()),
+                    false,
+                )
+                .with_watch_rhythm(rhythm);
+                assert_eq!(
+                    live_explanation(context),
+                    jterm_core::organism_daily::behavior_explanation(behavior)
+                );
+                assert!(matches!(live_explanation(context), Cow::Borrowed(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn live_explanation_uses_final_motion_context_without_frame_chatter() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, true);
+        organism.set_remote(1, false);
+        organism.watch.observe(Some(1), true, Duration::ZERO);
+        let before = values(organism.life.state());
+        for settled in [false, true] {
+            let behavior = if settled {
+                Behavior::WatchSettled
+            } else {
+                Behavior::WatchCommand
+            };
+            let base = jterm_core::organism_daily::behavior_explanation(behavior);
+            for motion in [None, Some(Motion::Calm), Some(Motion::Full)] {
+                let first =
+                    organism.presentation_at(1, true, settled, motion, Duration::from_secs(4));
+                let next =
+                    organism.presentation_at(1, true, settled, motion, Duration::from_millis(4100));
+                assert_eq!(
+                    first.explanation,
+                    format!("{base} No new output observed recently.")
+                );
+                assert_eq!(first.explanation, next.explanation);
+            }
+            let still = organism.presentation_at(
+                1,
+                true,
+                settled,
+                Some(Motion::Static),
+                Duration::from_secs(4),
+            );
+            assert_eq!(still.explanation, base);
+            let other_owner = organism.presentation_at(
+                2,
+                true,
+                settled,
+                Some(Motion::Full),
+                Duration::from_secs(4),
+            );
+            assert_eq!(other_owner.explanation, base);
+        }
+        organism.reset_watch();
+        let reset =
+            organism.presentation_at(1, true, false, Some(Motion::Full), Duration::from_secs(4));
+        assert_eq!(
+            reset.explanation,
+            jterm_core::organism_daily::behavior_explanation(Behavior::WatchCommand)
+        );
+        assert_eq!(values(organism.life.state()), before);
     }
 
     #[test]
