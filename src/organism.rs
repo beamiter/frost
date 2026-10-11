@@ -97,7 +97,7 @@ impl fmt::Display for MotionChoice {
 
 pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
     if bottom_bar {
-        "Reserves a fixed-height strip above the bottom bar. It stays blank while hidden; hover the status-bar glyph to greet."
+        "Reserves a fixed-height strip above the bottom bar. When space allows, narrow windows show only the body. It stays blank while hidden; hover the status-bar glyph in a wider window to greet."
     } else {
         "Turn on Bottom status bar (cwd, git, last command) to show the live companion."
     }

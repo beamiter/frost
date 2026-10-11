@@ -159,6 +159,42 @@ fn chrome_height(bottom_bar: bool) -> f32 {
     TAB_BAR_H + if bottom_bar { STATUS_BAR_H } else { 0.0 }
 }
 
+const COMPANION_BODY_WIDTH: f32 = 200.0;
+const COMPANION_HORIZONTAL_PADDING: f32 = 10.0;
+const ORGANISM_STATUS_MIN_WIDTH: f32 = 640.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrganismLayout {
+    glyph: bool,
+    body: bool,
+    explanation: bool,
+}
+
+impl OrganismLayout {
+    fn presentable(self) -> bool {
+        self.glyph || self.body
+    }
+
+    fn maintenance_eligible(self, focused: bool) -> bool {
+        focused && self.presentable()
+    }
+}
+
+/// The expanded strip has no border. Body-only needs its existing 200-unit
+/// container plus 10 units of padding on each side; the crowded status row
+/// keeps its original threshold. All values are Iced logical layout units.
+fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> OrganismLayout {
+    let enabled = enabled && bottom_bar && width.is_finite();
+    let glyph = enabled && width >= ORGANISM_STATUS_MIN_WIDTH;
+    let body =
+        enabled && expanded && width >= COMPANION_BODY_WIDTH + 2.0 * COMPANION_HORIZONTAL_PADDING;
+    OrganismLayout {
+        glyph,
+        body,
+        explanation: body && glyph,
+    }
+}
+
 /// Visibility changes only clear this opt-in strip; they never change its height.
 fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
     if enabled && expanded && bottom_bar {
@@ -5741,6 +5777,7 @@ impl Frost {
                 sess.refresh();
             }
         }
+        self.sync_organism_geometry();
         self.relayout();
         if resized {
             self.refresh_active_context();
@@ -15599,6 +15636,7 @@ impl Frost {
                 let search_was_compact =
                     block_search_layout::compact(block_search_layout::panel_size(self.win_size));
                 self.win_size = size;
+                self.sync_organism_geometry();
                 let term_h = self.term_height();
                 let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
                 let (cols, rows) = self.metrics.grid_size(term_w, term_h);
@@ -20357,6 +20395,27 @@ impl Frost {
 
     /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
     /// left; last-command status, grid size, and tab count on the right.
+    fn organism_layout(&self) -> OrganismLayout {
+        organism_layout(
+            self.win_size.width,
+            self.config.ascii_organism_enabled,
+            self.config.ascii_organism_expanded,
+            self.config.bottom_bar,
+        )
+    }
+
+    fn sync_organism_geometry(&mut self) {
+        let layout = self.organism_layout();
+        if !layout.glyph {
+            self.organism.cancel_live_greeting();
+            self.organism_pointer_buttons.clear();
+        }
+        if !layout.presentable() {
+            self.organism.pause_clock();
+        }
+        self.sync_organism_watch();
+    }
+
     fn organism_owner(&self) -> Option<usize> {
         self.organism_observation_owner()
             .filter(|_| !self.organism.is_retreating())
@@ -20367,7 +20426,7 @@ impl Frost {
             || !self.config.bottom_bar
             || !self.focused
             || !self.terminal_input_active()
-            || self.win_size.width < 640.0
+            || !self.organism_layout().presentable()
         {
             return None;
         }
@@ -20398,7 +20457,8 @@ impl Frost {
     }
 
     fn organism_hover_eligible(&self) -> bool {
-        self.organism_owner().is_some()
+        self.organism_layout().glyph
+            && self.organism_owner().is_some()
             && self.config.ascii_organism_motion != Some(organism::Motion::Static)
             && self.organism_pointer_buttons.is_empty()
             && self.dragging_tab.is_none()
@@ -20413,6 +20473,7 @@ impl Frost {
     }
 
     fn status_bar(&self) -> Element<'_, Message> {
+        let layout = self.organism_layout();
         let sess = self.sessions.get(self.active);
         let cwd = sess
             .and_then(|s| s.cwd_cache.as_deref())
@@ -20463,25 +20524,29 @@ impl Frost {
         });
         let presentation = presentation.unwrap_or_default();
         let companion_height = self.organism_strip_height();
-        let companion: Element<'_, Message> = if presentation.explanation.is_empty() {
+        let companion: Element<'_, Message> = if !layout.body || presentation.explanation.is_empty()
+        {
             Space::new().width(Length::Fill).into()
         } else {
-            row![
-                container(text(presentation.sprite.clone()).font(self.mono).size(13))
-                    .width(Length::Fixed(200.0))
-                    .height(Length::Fixed(72.0)),
-                text(presentation.explanation).size(11),
-            ]
-            .spacing(12)
-            .align_y(iced::Alignment::Center)
-            .into()
+            let body = container(text(presentation.sprite.clone()).font(self.mono).size(13))
+                .width(Length::Fixed(COMPANION_BODY_WIDTH))
+                .height(Length::Fixed(72.0));
+            if layout.explanation {
+                row![body, text(presentation.explanation).size(11)]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center)
+                    .into()
+            } else {
+                // Passive body only: do not create a second hover target.
+                body.into()
+            }
         };
         let companion = container(companion)
             .width(Length::Fill)
             .height(Length::Fixed(companion_height))
-            .padding([8, 10])
+            .padding([8.0, COMPANION_HORIZONTAL_PADDING])
             .style(self.chrome_bar_style());
-        if self.config.ascii_organism_enabled && self.win_size.width >= 640.0 {
+        if layout.glyph {
             // Reserve the same slot while hidden/retreating so typing, focus
             // and pane changes cannot move the ordinary status segments.
             let organism::LivePresentation {
@@ -26862,10 +26927,10 @@ impl Frost {
         });
         subs.push(events);
         let preview_visible = self.organism_preview_visible();
-        let live_visible = self.focused
-            && self.config.ascii_organism_enabled
-            && self.config.bottom_bar
-            && self.win_size.width >= 640.0;
+        let live_layout = self.organism_layout();
+        // Reuse the one maintenance timer across every presentable layout,
+        // including a temporarily remote/alt/overlay-suppressed narrow body.
+        let live_visible = live_layout.maintenance_eligible(self.focused);
         let preview_full =
             preview_visible && self.config.ascii_organism_motion == Some(organism::Motion::Full);
         if preview_full || live_visible {
@@ -26891,7 +26956,10 @@ impl Frost {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
-        if live_visible && self.config.ascii_organism_motion != Some(organism::Motion::Static) {
+        if live_visible
+            && live_layout.glyph
+            && self.config.ascii_organism_motion != Some(organism::Motion::Static)
+        {
             // Observe without consuming or rerouting the original mouse event.
             // Iced supplies no native snapshot of buttons pressed outside this
             // window; only observed button-down/drag state is claimed here.
@@ -29184,6 +29252,158 @@ mod tests {
     }
 
     #[test]
+    fn organism_layout_uses_existing_body_width_and_preserves_compact_threshold() {
+        let minimum = COMPANION_BODY_WIDTH + 2.0 * COMPANION_HORIZONTAL_PADDING;
+        assert_eq!(minimum, 220.0);
+        for width in [0.0, 219.99, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!organism_layout(width, true, true, true).presentable());
+        }
+        for width in [minimum, 400.0, 639.99] {
+            let expanded = organism_layout(width, true, true, true);
+            assert!(expanded.body);
+            assert!(!expanded.glyph);
+            assert!(!expanded.explanation);
+            assert!(!organism_layout(width, true, false, true).presentable());
+        }
+        assert_eq!(
+            organism_layout(640.0, true, true, true),
+            OrganismLayout {
+                glyph: true,
+                body: true,
+                explanation: true,
+            }
+        );
+        assert_eq!(
+            organism_layout(640.0, true, false, true),
+            OrganismLayout {
+                glyph: true,
+                body: false,
+                explanation: false,
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_companion_preserves_height_and_stops_maintenance_without_presentable_geometry() {
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                for bottom_bar in [false, true] {
+                    let height = companion_strip_height(enabled, expanded, bottom_bar);
+                    for width in [700.0, 500.0, 219.0, 500.0, 700.0] {
+                        let layout = organism_layout(width, enabled, expanded, bottom_bar);
+                        assert!(!layout.maintenance_eligible(false));
+                        assert_eq!(layout.maintenance_eligible(true), layout.presentable());
+                        assert_eq!(
+                            companion_strip_height(enabled, expanded, bottom_bar),
+                            height
+                        );
+                        if !enabled || !bottom_bar {
+                            assert!(!layout.presentable());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shrinking_away_the_glyph_cancels_visit_without_rearming_on_width_restore() {
+        use std::time::Duration;
+        let context = jterm_core::organism_daily::PreviewPose::Calm.context();
+        let mut greeting = organism_hover::LiveGreeting::default();
+        greeting.enter(1, greeting.epoch(), Duration::ZERO, context, true);
+        greeting.advance(Some(1), Duration::from_millis(600), context, true);
+        assert_ne!(
+            greeting.apply(1, Duration::from_millis(700), context),
+            context
+        );
+        for width in [500.0, 219.0, 700.0] {
+            if !organism_layout(width, true, true, true).glyph {
+                greeting.cancel();
+            }
+        }
+        // Same physical visit stays consumed even when the old target returns.
+        greeting.enter(
+            1,
+            greeting.epoch(),
+            Duration::from_millis(800),
+            context,
+            true,
+        );
+        assert!(greeting.deadline(Duration::from_millis(800)).is_none());
+        assert_eq!(
+            greeting.apply(1, Duration::from_millis(800), context),
+            context
+        );
+    }
+
+    #[test]
+    fn narrow_companion_owner_view_and_subscription_share_geometry_without_second_target() {
+        let source = include_str!("main.rs");
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("!self.organism_layout().presentable()"));
+        assert!(owner.contains("!self.terminal_input_active()"));
+        assert!(owner.contains("!s.terminal.is_alt_buffer_active()"));
+        let bar = source
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .1
+            .split_once("    /// One-line offer")
+            .unwrap()
+            .0;
+        assert!(bar.contains("let layout = self.organism_layout()"));
+        assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
+        assert!(bar.contains("if layout.explanation"));
+        assert!(bar.contains("if layout.glyph"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
+        let subs = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subs.contains("let live_layout = self.organism_layout()"));
+        assert!(subs.contains("live_layout.maintenance_eligible(self.focused)"));
+        assert!(subs.contains("&& live_layout.glyph"));
+        assert!(subs.contains("let millis = if full { 100 } else { 900 }"));
+        assert_eq!(subs.matches("iced::time::every(").count(), 1);
+        let resize = source
+            .split_once("            Message::Resized(size) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Focus(f)")
+            .unwrap()
+            .0;
+        assert!(
+            resize.find("self.sync_organism_geometry()").unwrap()
+                < resize.find("self.metrics.grid_size").unwrap()
+        );
+        let sync = source
+            .split_once("    fn sync_organism_geometry(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_owner(")
+            .unwrap()
+            .0;
+        assert!(sync.contains("self.organism.cancel_live_greeting()"));
+        assert!(sync.contains("self.organism.pause_clock()"));
+        assert!(!sync.contains("enter_live_greeting"));
+        assert!(!sync.contains("preview"));
+        assert!(!sync.contains("demo"));
+    }
+
+    #[test]
     fn expanded_companion_reserves_height_only_for_explicit_config() {
         for enabled in [false, true] {
             for expanded in [false, true] {
@@ -29239,7 +29459,7 @@ mod tests {
         let bar = bar.split_once("    fn jsh_notice(&self)").unwrap().0;
         assert_eq!(bar.matches(".presentation(").count(), 1);
         assert!(bar.contains("let presentation = self.organism_owner().map"));
-        assert!(bar.contains("if presentation.explanation.is_empty()"));
+        assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
         assert!(bar.contains("let companion_height = self.organism_strip_height()"));
         assert!(bar.contains("column![companion, bar]"));
         assert_eq!(
