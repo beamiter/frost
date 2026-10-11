@@ -195,6 +195,39 @@ fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) 
     }
 }
 
+/// Explain stable layout capabilities, not transient live-owner eligibility.
+fn organism_settings_hint(
+    width: f32,
+    enabled: bool,
+    expanded: bool,
+    bottom_bar: bool,
+) -> &'static str {
+    if !enabled {
+        return "Enable ASCII Organism to allow the live companion.";
+    }
+    if !bottom_bar {
+        return organism::expanded_companion_hint(false);
+    }
+    let layout = organism_layout(width, enabled, expanded, bottom_bar);
+    if layout.body && !layout.glyph {
+        return "This width has room for the body, but not the status glyph. Body-only has no live hover target; Preview Say hello is separate.";
+    }
+    if !layout.presentable() {
+        return if organism_layout(width, enabled, true, bottom_bar).body {
+            "This width has no room for the status glyph. Enable Show expanded companion to allow a body-only layout, or widen the window."
+        } else if expanded {
+            "Resize the window to make room for the live body. The expanded strip keeps its reserved height."
+        } else {
+            "Resize the window to make room for the live companion; even the expanded body needs more width."
+        };
+    }
+    if expanded {
+        organism::expanded_companion_hint(true)
+    } else {
+        "This width has room for the compact status glyph. Enable Show expanded companion for a full-body layout."
+    }
+}
+
 /// Visibility changes only clear this opt-in strip; they never change its height.
 fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
     if enabled && expanded && bottom_bar {
@@ -22983,7 +23016,12 @@ impl Frost {
             text("Local bottom-bar companion. Memory is volatile; it resets when disabled or closed.").size(11),
             checkbox(self.config.ascii_organism_expanded).label("Show expanded companion")
                 .on_toggle(Message::SetOrganismExpanded),
-            text(organism::expanded_companion_hint(self.config.bottom_bar)).size(11),
+            text(organism_settings_hint(
+                self.win_size.width,
+                self.config.ascii_organism_enabled,
+                self.config.ascii_organism_expanded,
+                self.config.bottom_bar,
+            )).size(11),
             text("Organism Motion").size(13),
             pick_list(organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
@@ -29249,6 +29287,83 @@ mod tests {
         let blur = source.split_once("Message::Focus(f) => {").unwrap().1;
         let blur = blur.split_once("Message::NewSession =>").unwrap().0;
         assert!(blur.contains("self.organism.close_preview()"));
+    }
+
+    #[test]
+    fn organism_settings_hint_prioritizes_enabled_and_bottom_bar_before_geometry() {
+        for width in [0.0, 220.0, 640.0, f32::NAN] {
+            for expanded in [false, true] {
+                for bottom_bar in [false, true] {
+                    assert_eq!(
+                        organism_settings_hint(width, false, expanded, bottom_bar),
+                        "Enable ASCII Organism to allow the live companion."
+                    );
+                }
+                assert_eq!(
+                    organism_settings_hint(width, true, expanded, false),
+                    organism::expanded_companion_hint(false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn organism_settings_hint_tracks_shared_width_capabilities_and_preview_distinction() {
+        for width in [0.0, 219.99, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(organism_settings_hint(width, true, true, true).contains("Resize the window"));
+            assert!(!organism_settings_hint(width, true, false, true)
+                .contains("Enable Show expanded companion"));
+        }
+        for width in [220.0, 639.99] {
+            assert!(organism_settings_hint(width, true, false, true)
+                .contains("Enable Show expanded companion"));
+            let body_only = organism_settings_hint(width, true, true, true);
+            assert!(body_only.contains("no live hover target"));
+            assert!(body_only.contains("Preview Say hello is separate"));
+        }
+        assert!(organism_settings_hint(640.0, true, false, true).contains("compact status glyph"));
+        assert_eq!(
+            organism_settings_hint(640.0, true, true, true),
+            organism::expanded_companion_hint(true)
+        );
+    }
+
+    #[test]
+    fn organism_settings_guidance_reads_current_config_without_transient_owner_or_wakes() {
+        let source = include_str!("main.rs");
+        let helper = source
+            .split_once("fn organism_settings_hint(")
+            .unwrap()
+            .1
+            .split_once("/// Visibility changes only clear")
+            .unwrap()
+            .0;
+        assert!(helper.contains("organism_layout(width, enabled, expanded, bottom_bar)"));
+        for forbidden in [
+            "organism_owner",
+            "focused",
+            "remote",
+            "Subscription",
+            "Instant",
+            "Task",
+        ] {
+            assert!(!helper.contains(forbidden));
+        }
+        let settings = source
+            .split_once("            text(organism_settings_hint(")
+            .unwrap()
+            .1
+            .split_once("            text(\"Organism Motion\")")
+            .unwrap()
+            .0;
+        for current in [
+            "self.win_size.width",
+            "self.config.ascii_organism_enabled",
+            "self.config.ascii_organism_expanded",
+            "self.config.bottom_bar",
+        ] {
+            assert!(settings.contains(current));
+        }
     }
 
     #[test]
