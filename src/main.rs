@@ -20525,17 +20525,16 @@ impl Frost {
             || !self.organism_interaction_eligible()
         {
             Some("The companion is unavailable for the original pane right now.")
-        } else {
-            match self
-                .organism
-                .greet_live(target.expect("checked original owner"))
-            {
+        } else if let Some(id) = target {
+            match self.organism.greet_live(id) {
                 organism_hover::ExplicitGreeting::Accepted => None,
                 organism_hover::ExplicitGreeting::Busy => Some("The companion is busy right now."),
                 organism_hover::ExplicitGreeting::Cooldown => {
                     Some("The companion is cooling down. Try again later.")
                 }
             }
+        } else {
+            Some("The companion is unavailable for the original pane right now.")
         };
         if let Some(message) = refusal {
             self.push_toast(message.to_string(), ToastKind::Info);
