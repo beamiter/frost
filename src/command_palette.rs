@@ -156,6 +156,8 @@ pub struct PaletteState {
     /// 当前过滤结果中的高亮位置。
     pub selected: usize,
     all: Vec<PaletteItem>,
+    // Stable semantic row identities; filtering/navigation never rotates them.
+    row_identities: Vec<std::sync::Arc<()>>,
     matcher: SkimMatcherV2,
     /// Most-recent-first list of actions the user has executed. Drives the
     /// empty-query order so frequent commands surface first. Capped to 16.
@@ -686,6 +688,7 @@ impl PaletteState {
                 action: PaletteAction::GreetCompanion,
             },
         ];
+        let row_identities = all.iter().map(|_| std::sync::Arc::new(())).collect();
         Self {
             epoch: std::sync::Arc::new(()),
             greeting_target: None,
@@ -693,6 +696,7 @@ impl PaletteState {
             query: String::new(),
             selected: 0,
             all,
+            row_identities,
             matcher: SkimMatcherV2::default(),
             mru: Vec::new(),
         }
@@ -819,6 +823,10 @@ impl PaletteState {
         std::sync::Arc::clone(&self.epoch)
     }
 
+    pub fn row_identity(&self, index: usize) -> Option<std::sync::Arc<()>> {
+        self.row_identities.get(index).cloned()
+    }
+
     pub fn accepts_epoch(&self, epoch: &std::sync::Arc<()>) -> bool {
         self.is_open && std::sync::Arc::ptr_eq(&self.epoch, epoch)
     }
@@ -869,6 +877,40 @@ impl PaletteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_identities_follow_all_items_while_query_and_navigation_preserve_opening() {
+        let mut palette = PaletteState::new();
+        palette.open();
+        let opening = palette.epoch();
+        let identities: Vec<_> = (0..palette.all.len())
+            .map(|index| palette.row_identity(index).unwrap())
+            .collect();
+        for (left, identity) in identities.iter().enumerate() {
+            for earlier in &identities[..left] {
+                assert!(!std::sync::Arc::ptr_eq(identity, earlier));
+            }
+        }
+        for query in ["", "close", "hello", "split", ""] {
+            palette.set_query(query);
+            palette.select_next();
+            assert!(palette.accepts_epoch(&opening));
+            for (index, _) in palette.filtered() {
+                assert!(std::sync::Arc::ptr_eq(
+                    &identities[index],
+                    &palette.row_identity(index).unwrap()
+                ));
+            }
+        }
+        assert!(palette.row_identity(usize::MAX).is_none());
+        palette.close();
+        palette.open();
+        assert!(!palette.accepts_epoch(&opening));
+        assert!(std::sync::Arc::ptr_eq(
+            &identities[0],
+            &palette.row_identity(0).unwrap()
+        ));
+    }
 
     #[test]
     fn companion_action_is_palette_only_and_target_survives_query_until_close() {

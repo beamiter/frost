@@ -1,5 +1,5 @@
-//! Reset an explicitly scoped form's retained widget state at its identity boundary.
-//! Used by the remote editor and workflow picker/Args forms; unrelated widgets stay intact.
+//! Reset an explicitly scoped form or row's retained state at its identity boundary.
+//! Remote editor, workflow forms and palette items use it; unrelated widgets stay intact.
 //! Message tokens reject queued callbacks; this scope also retires pressed/input
 //! state before a newly rendered callback can inherit it.
 use iced::advanced::widget::{tree, Tree};
@@ -187,6 +187,114 @@ mod tests {
         ) {
             callback(Err(iced::advanced::image::Error::Unsupported));
         }
+    }
+
+    fn first_palette_button(
+        palette: &crate::command_palette::PaletteState,
+    ) -> Element<'static, u8, iced::Theme, TestRenderer> {
+        let (index, _) = palette.filtered()[0];
+        scope(
+            palette.row_identity(index).unwrap(),
+            button(Space::new().width(40).height(30)).on_press(index as u8),
+        )
+    }
+
+    #[test]
+    fn palette_filter_replacement_cannot_inherit_another_actions_pressed_button() {
+        let mut palette = crate::command_palette::PaletteState::new();
+        palette.open();
+        let old_index = palette.filtered()[0].0;
+        let mut old = first_palette_button(&palette);
+        let mut tree = Tree::new(old.as_widget());
+        assert!(send(
+            &mut old,
+            &mut tree,
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+        )
+        .is_empty());
+        palette.set_query("hello");
+        let new_index = palette.filtered()[0].0;
+        assert_ne!(old_index, new_index);
+        let mut replacement = first_palette_button(&palette);
+        tree.diff(replacement.as_widget());
+        assert!(send(
+            &mut replacement,
+            &mut tree,
+            mouse::Event::ButtonReleased(mouse::Button::Left)
+        )
+        .is_empty());
+        assert!(send(
+            &mut replacement,
+            &mut tree,
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+        )
+        .is_empty());
+        assert_eq!(
+            send(
+                &mut replacement,
+                &mut tree,
+                mouse::Event::ButtonReleased(mouse::Button::Left)
+            ),
+            [new_index as u8]
+        );
+    }
+
+    #[test]
+    fn palette_same_item_retains_an_ordinary_press_across_query_redraw() {
+        let mut palette = crate::command_palette::PaletteState::new();
+        palette.open();
+        palette.set_query("Greet companion");
+        let index = palette.filtered()[0].0;
+        let mut old = first_palette_button(&palette);
+        let mut tree = Tree::new(old.as_widget());
+        assert!(send(
+            &mut old,
+            &mut tree,
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+        )
+        .is_empty());
+        palette.set_query("hello");
+        assert_eq!(palette.filtered()[0].0, index);
+        let mut redraw = first_palette_button(&palette);
+        tree.diff(redraw.as_widget());
+        assert_eq!(
+            send(
+                &mut redraw,
+                &mut tree,
+                mouse::Event::ButtonReleased(mouse::Button::Left)
+            ),
+            [index as u8]
+        );
+    }
+
+    #[test]
+    fn palette_query_preserves_outer_state_but_new_opening_resets_cached_subtree() {
+        let mut palette = crate::command_palette::PaletteState::new();
+        palette.open();
+        let build = |palette: &crate::command_palette::PaletteState| -> Element<'static, u8, iced::Theme, TestRenderer> {
+            scope(palette.epoch(), iced::widget::column![
+                Space::new().width(20).height(20),
+                first_palette_button(palette),
+            ])
+        };
+        let old = build(&palette);
+        let mut tree = Tree::new(old.as_widget());
+        tree.children[0].children[0].state = tree::State::new(73_usize);
+        palette.set_query("hello");
+        let edited = build(&palette);
+        tree.diff(edited.as_widget());
+        assert_eq!(
+            *tree.children[0].children[0].state.downcast_ref::<usize>(),
+            73
+        );
+        palette.close();
+        palette.open();
+        let reopened = build(&palette);
+        tree.diff(reopened.as_widget());
+        assert!(matches!(
+            tree.children[0].children[0].state,
+            tree::State::None
+        ));
     }
 
     #[test]

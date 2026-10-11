@@ -23003,7 +23003,9 @@ impl Frost {
                     } else {
                         button::text
                     });
-                list = list.push(row_btn);
+                if let Some(identity) = self.palette.row_identity(*idx) {
+                    list = list.push(widget_identity_scope::scope(identity, row_btn));
+                }
             }
         }
 
@@ -23026,10 +23028,12 @@ impl Frost {
         .max_height(panel_height)
         .padding(12)
         .style(container::dark);
-        container(inner)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into()
+        widget_identity_scope::scope(
+            epoch,
+            container(inner)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
     }
 
     /// The same gate admits preview actions and their timer subscription.
@@ -29058,12 +29062,30 @@ mod tests {
     }
 
     #[test]
+    fn palette_widgets_bind_row_state_to_items_and_outer_state_to_opening() {
+        let source = include_str!("main.rs");
+        let palette = source
+            .split_once("    fn command_palette(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn organism_preview_visible(")
+            .unwrap()
+            .0;
+        assert!(palette.contains("let epoch = self.palette.epoch()"));
+        assert!(palette.contains("self.palette.row_identity(*idx)"));
+        assert!(palette.contains("widget_identity_scope::scope(identity, row_btn)"));
+        assert!(palette.contains("widget_identity_scope::scope(\n            epoch,"));
+        assert!(!palette.contains("Arc::new"));
+        assert_eq!(palette.matches("widget_identity_scope::scope(").count(), 2);
+    }
+
+    #[test]
     fn only_remote_settings_widgets_share_the_editor_retirement_identity() {
         let source = include_str!("main.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
         assert_eq!(
             production.matches("widget_identity_scope::scope(").count(),
-            3
+            5
         );
         assert!(production.contains(
             "widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
