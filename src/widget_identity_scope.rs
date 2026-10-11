@@ -189,6 +189,97 @@ mod tests {
         }
     }
 
+    fn preview_button(
+        sequence: &crate::organism_preview::PreviewSequence,
+        action: crate::organism_preview::PreviewAction,
+        message: u8,
+    ) -> Element<'static, u8, iced::Theme, TestRenderer> {
+        scope(
+            sequence.control_epoch(),
+            scope(
+                sequence.action_identity(action),
+                button(Space::new().width(40).height(30)).on_press(message),
+            ),
+        )
+    }
+
+    #[test]
+    fn preview_pause_and_hello_press_cannot_transfer_across_control_revisions() {
+        use crate::organism_preview::{PreviewAction, PreviewSequence};
+        use std::time::Duration;
+        for old_action in [PreviewAction::Pause, PreviewAction::Hello] {
+            let mut sequence = PreviewSequence::default();
+            if old_action == PreviewAction::Pause {
+                sequence.start(Duration::ZERO);
+            }
+            let mut old = preview_button(&sequence, old_action, 1);
+            let mut tree = Tree::new(old.as_widget());
+            assert!(send(
+                &mut old,
+                &mut tree,
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+            )
+            .is_empty());
+            let next_action = if old_action == PreviewAction::Pause {
+                sequence.pause(Duration::from_millis(500));
+                PreviewAction::Resume
+            } else {
+                sequence.start(Duration::ZERO);
+                sequence.stop();
+                PreviewAction::Hello
+            };
+            let mut next = preview_button(&sequence, next_action, 2);
+            tree.diff(next.as_widget());
+            assert!(send(
+                &mut next,
+                &mut tree,
+                mouse::Event::ButtonReleased(mouse::Button::Left)
+            )
+            .is_empty());
+            assert!(send(
+                &mut next,
+                &mut tree,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            )
+            .is_empty());
+            assert_eq!(
+                send(
+                    &mut next,
+                    &mut tree,
+                    mouse::Event::ButtonReleased(mouse::Button::Left)
+                ),
+                [2]
+            );
+        }
+    }
+
+    #[test]
+    fn naturally_finished_demo_stop_press_cannot_become_play_without_epoch_mutation() {
+        use crate::organism_preview::{PreviewAction, PreviewSequence};
+        use std::time::Duration;
+        let mut sequence = PreviewSequence::default();
+        sequence.start(Duration::ZERO);
+        let epoch = sequence.control_epoch();
+        let mut old = preview_button(&sequence, PreviewAction::Stop, 1);
+        let mut tree = Tree::new(old.as_widget());
+        assert!(send(
+            &mut old,
+            &mut tree,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        )
+        .is_empty());
+        assert_eq!(sequence.sample(Duration::from_secs(10)), None);
+        assert!(Arc::ptr_eq(&epoch, &sequence.control_epoch()));
+        let mut next = preview_button(&sequence, PreviewAction::Play, 2);
+        tree.diff(next.as_widget());
+        assert!(send(
+            &mut next,
+            &mut tree,
+            mouse::Event::ButtonReleased(mouse::Button::Left)
+        )
+        .is_empty());
+    }
+
     fn first_palette_button(
         palette: &crate::command_palette::PaletteState,
     ) -> Element<'static, u8, iced::Theme, TestRenderer> {

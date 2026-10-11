@@ -3959,9 +3959,7 @@ enum Message {
     SetOrganismExpanded(bool),
     SetOrganismMotion(organism::MotionChoice),
     SetOrganismPose(organism::Pose),
-    OrganismHello,
-    OrganismDemoPlay,
-    OrganismDemoStop,
+    OrganismPreviewAction(organism_preview::PreviewRequest),
     OrganismTick,
     OrganismHoverEnter(usize, u64),
     OrganismHoverExit(usize, u64),
@@ -5747,6 +5745,8 @@ impl Frost {
         if self.config_panel_open != open {
             self.remote_host_editor.retire();
             self.config_panel_open = open;
+            self.organism
+                .sync_preview_visibility(self.organism_preview_visible());
         }
     }
 
@@ -13816,9 +13816,8 @@ impl Frost {
             self.organism.pause_clock();
             self.organism_pointer_buttons.clear();
         }
-        if !self.organism_preview_visible() {
-            self.organism.close_preview();
-        }
+        self.organism
+            .sync_preview_visibility(self.organism_preview_visible());
         self.sync_organism_watch();
         match message {
             Message::PtyOutput(id, fd, data) => {
@@ -16835,17 +16834,11 @@ impl Frost {
                 self.config_dirty = true;
             }
             Message::SetOrganismPose(pose) => self.organism.select_pose(pose),
-            Message::OrganismHello => {
+            Message::OrganismPreviewAction(request) => {
                 if self.organism_preview_visible() {
-                    self.organism.say_hello();
+                    self.organism.apply_preview_request(&request);
                 }
             }
-            Message::OrganismDemoPlay => {
-                if self.organism_preview_visible() {
-                    self.organism.start_demo();
-                }
-            }
-            Message::OrganismDemoStop => self.organism.stop_demo(),
             Message::OrganismHoverEnter(id, epoch) => {
                 if self.organism_owner() == Some(id) {
                     let eligible = self.organism_hover_eligible();
@@ -23057,24 +23050,55 @@ impl Frost {
             .organism
             .preview_presentation(self.config.ascii_organism_motion);
         let availability = preview.hello;
-        let (demo_button, demo_caption) = if let Some(step) = preview.demo_step {
-            (
-                button(text("Stop demo")).on_press(Message::OrganismDemoStop),
-                format!(
-                    "Demo {step}/5: {} (example). No command runs.",
-                    preview.pose.label()
-                ),
-            )
-        } else {
-            (
-                button(text("Play demo")).on_press(Message::OrganismDemoPlay),
-                "A 10-second example sequence. No command runs.".to_string(),
+        use organism_preview::PreviewAction;
+        let demo_button = |action, label: &'static str| -> Element<'_, Message> {
+            widget_identity_scope::scope(
+                self.organism.preview_action_identity(action),
+                button(text(label)).on_press(Message::OrganismPreviewAction(
+                    self.organism.preview_request(action),
+                )),
             )
         };
+        let (demo_controls, demo_caption): (Element<'_, Message>, String) =
+            if let Some(step) = preview.demo_step {
+                let (action, label) = if preview.demo_paused {
+                    (PreviewAction::Resume, "Resume demo")
+                } else {
+                    (PreviewAction::Pause, "Pause demo")
+                };
+                (
+                    row![
+                        demo_button(action, label),
+                        demo_button(PreviewAction::Stop, "Stop demo")
+                    ]
+                    .spacing(8)
+                    .into(),
+                    format!(
+                        "Demo {step}/5: {} (example){} No command runs.",
+                        preview.pose.label(),
+                        if preview.demo_paused {
+                            " · Paused."
+                        } else {
+                            "."
+                        }
+                    ),
+                )
+            } else {
+                (
+                    demo_button(PreviewAction::Play, "Play demo"),
+                    "A 10-second example sequence. No command runs.".to_string(),
+                )
+            };
         let mut hello_button = button(text("Say hello"));
         if availability == organism::HelloAvailability::Available {
-            hello_button = hello_button.on_press(Message::OrganismHello);
+            hello_button = hello_button.on_press(Message::OrganismPreviewAction(
+                self.organism.preview_request(PreviewAction::Hello),
+            ));
         }
+        let hello_button = widget_identity_scope::scope(
+            self.organism.preview_action_identity(PreviewAction::Hello),
+            hello_button,
+        );
         let mut hello_controls = column![hello_button].spacing(4);
         match availability {
             organism::HelloAvailability::Demonstrating => {
@@ -23089,6 +23113,10 @@ impl Frost {
             }
             organism::HelloAvailability::Available => {}
         }
+        let preview_controls = widget_identity_scope::scope(
+            self.organism.preview_control_epoch(),
+            column![demo_controls, text(demo_caption).size(11), hello_controls].spacing(8),
+        );
         column![
             checkbox(self.config.ascii_organism_enabled).label("ASCII Organism")
                 .on_toggle(Message::SetAsciiOrganism),
@@ -23116,9 +23144,7 @@ impl Frost {
                 .font(self.mono).size(13))
                 .width(Length::Fixed(200.0)).height(Length::Fixed(72.0)),
             text(preview.pose.explanation()).size(11),
-            demo_button,
-            text(demo_caption).size(11),
-            hello_controls,
+            preview_controls,
             text("Preview is isolated: no command, terminal input, life change, or saved memory.").size(11),
         ].spacing(8).into()
     }
@@ -27048,8 +27074,9 @@ impl Frost {
         // Reuse the one maintenance timer across every presentable layout,
         // including a temporarily remote/alt/overlay-suppressed narrow body.
         let live_visible = live_layout.maintenance_eligible(self.focused);
-        let preview_full =
-            preview_visible && self.config.ascii_organism_motion == Some(organism::Motion::Full);
+        let preview_full = preview_visible
+            && self.organism.preview_animation_enabled()
+            && self.config.ascii_organism_motion == Some(organism::Motion::Full);
         if preview_full || live_visible {
             let full = preview_full
                 || (self.config.ascii_organism_motion == Some(organism::Motion::Full)
@@ -29085,7 +29112,7 @@ mod tests {
         let production = source.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
         assert_eq!(
             production.matches("widget_identity_scope::scope(").count(),
-            5
+            8
         );
         assert!(production.contains(
             "widget_identity_scope::scope(self.remote_host_editor.identity(), remote_hosts_section)"
@@ -29355,41 +29382,77 @@ mod tests {
         let gate = source
             .split_once("    fn organism_preview_visible(&self)")
             .unwrap()
-            .1;
-        let gate = gate
-            .split_once("    fn organism_settings(&self)")
+            .1
+            .split_once("    fn organism_settings(")
             .unwrap()
             .0;
-        for field in [
-            "self.focused",
-            "self.config_panel_open",
-            "self.theme_editor.is_some()",
-        ] {
-            assert!(gate.contains(field));
-        }
-        for marker in ["Message::OrganismHello =>", "Message::OrganismDemoPlay =>"] {
-            let handler = source
-                .split_once(marker)
-                .unwrap()
-                .1
-                .split_once("            Message::")
-                .unwrap()
-                .0;
-            assert!(handler.contains("if self.organism_preview_visible()"));
-            assert!(!handler.contains("write_pty"));
-        }
-        assert!(source.contains("Message::OrganismDemoStop => self.organism.stop_demo()"));
-        assert!(source.contains("let preview_visible = self.organism_preview_visible();"));
+        assert!(gate.contains("self.focused"));
+        assert!(gate.contains("self.config_panel_open"));
+        assert!(gate.contains("self.theme_editor.is_some()"));
+        let handler = source
+            .split_once("            Message::OrganismPreviewAction(request) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismHoverEnter")
+            .unwrap()
+            .0;
+        assert!(handler.contains("if self.organism_preview_visible()"));
+        assert!(handler.contains("self.organism.apply_preview_request(&request)"));
         let update = source
             .split_once("    fn update(&mut self, message: Message)")
             .unwrap()
-            .1;
-        let update = update.split_once("        match message {").unwrap().0;
-        assert!(update.contains("if !self.organism_preview_visible()"));
-        assert!(update.contains("self.organism.close_preview()"));
-        let blur = source.split_once("Message::Focus(f) => {").unwrap().1;
-        let blur = blur.split_once("Message::NewSession =>").unwrap().0;
+            .1
+            .split_once("        match message {")
+            .unwrap()
+            .0;
+        assert!(update.contains("sync_preview_visibility(self.organism_preview_visible())"));
+        let setter = source
+            .split_once("    fn set_config_panel_open(")
+            .unwrap()
+            .1
+            .split_once("    fn apply_config(")
+            .unwrap()
+            .0;
+        assert!(setter.contains("sync_preview_visibility(self.organism_preview_visible())"));
+        let blur = source
+            .split_once("Message::Focus(f) => {")
+            .unwrap()
+            .1
+            .split_once("Message::NewSession =>")
+            .unwrap()
+            .0;
         assert!(blur.contains("self.organism.close_preview()"));
+    }
+
+    #[test]
+    fn paused_demo_stops_only_preview_animation_and_scopes_all_preview_actions() {
+        let source = include_str!("main.rs");
+        let subs = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subs.contains("self.organism.preview_animation_enabled()"));
+        assert!(subs.contains("if preview_visible && !preview_full"));
+        assert!(subs.contains("self.organism.preview_deadline()"));
+        assert_eq!(subs.matches("iced::time::every(").count(), 1);
+        let settings = source
+            .split_once("    fn organism_settings(")
+            .unwrap()
+            .1
+            .split_once("    fn config_panel(")
+            .unwrap()
+            .0;
+        assert!(settings.contains("self.organism.preview_control_epoch()"));
+        assert!(settings.contains("self.organism.preview_action_identity(action)"));
+        assert!(settings.contains("self.organism.preview_action_identity(PreviewAction::Hello)"));
+        assert!(settings.contains("PreviewAction::Pause"));
+        assert!(settings.contains("PreviewAction::Resume"));
+        assert!(settings.contains("Some(self.organism.pose)"));
+        assert!(settings.contains("preview.pose.explanation()"));
+        assert!(settings.contains("No command runs."));
     }
 
     #[test]
