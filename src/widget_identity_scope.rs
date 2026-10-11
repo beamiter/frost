@@ -189,6 +189,106 @@ mod tests {
         }
     }
 
+    // Exercise the real pinned Container draw boundary without fonts or a GPU.
+    struct ViewportSpy<'a>(&'a std::cell::Cell<Option<Rectangle>>);
+
+    impl Widget<(), iced::Theme, TestRenderer> for ViewportSpy<'_> {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fill)
+        }
+
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &TestRenderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.max())
+        }
+
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut TestRenderer,
+            _theme: &iced::Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            self.0.set(Some(*viewport));
+        }
+    }
+
+    fn container_viewport(
+        clip: bool,
+        available_height: f32,
+        viewport: Rectangle,
+    ) -> (Rectangle, Rectangle, Option<Rectangle>) {
+        let received = std::cell::Cell::new(None);
+        let child: Element<'_, (), iced::Theme, TestRenderer> =
+            Element::new(ViewportSpy(&received));
+        let mut container: Element<'_, (), iced::Theme, TestRenderer> =
+            iced::widget::container(child)
+                .width(200)
+                .height(88)
+                .padding(8)
+                .clip(clip)
+                .into();
+        let mut tree = Tree::new(container.as_widget());
+        let node = container
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &TestRenderer,
+                &layout::Limits::new(Size::ZERO, Size::new(220.0, available_height)),
+            )
+            .move_to(iced::Point::new(10.0, 20.0));
+        container.as_widget().draw(
+            &tree,
+            &mut TestRenderer,
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        (node.bounds(), node.children()[0].bounds(), received.get())
+    }
+
+    #[test]
+    fn clipped_container_bounds_infinite_tooltip_viewport_without_changing_layout() {
+        let infinite = Rectangle::with_size(Size::INFINITE);
+        for height in [1.0, 8.0, 88.0, 160.0] {
+            let (bounds, child, clipped) = container_viewport(true, height, infinite);
+            let (plain_bounds, plain_child, plain) = container_viewport(false, height, infinite);
+            assert_eq!((bounds, child), (plain_bounds, plain_child));
+            assert_eq!(bounds.height, height.min(88.0));
+            assert_eq!(clipped, Some(bounds));
+            assert_eq!(plain, Some(infinite));
+        }
+    }
+
+    #[test]
+    fn clipped_container_intersects_finite_parent_and_skips_outside_draw() {
+        let viewport = Rectangle {
+            x: 15.0,
+            y: 22.0,
+            width: 80.0,
+            height: 3.0,
+        };
+        let (bounds, _, received) = container_viewport(true, 8.0, viewport);
+        assert_eq!(received, bounds.intersection(&viewport));
+        assert_eq!(received, Some(viewport));
+        let outside = Rectangle {
+            x: 500.0,
+            y: 500.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        assert_eq!(container_viewport(true, 88.0, outside).2, None);
+    }
+
     fn preview_button(
         sequence: &crate::organism_preview::PreviewSequence,
         action: crate::organism_preview::PreviewAction,

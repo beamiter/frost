@@ -20629,6 +20629,8 @@ impl Frost {
         let companion = container(companion)
             .width(Length::Fill)
             .height(Length::Fixed(companion_height))
+            // Keep shortened-window text inside its allocated chrome strip.
+            .clip(true)
             .padding([8.0, COMPANION_HORIZONTAL_PADDING])
             .style(self.chrome_bar_style());
         if layout.glyph {
@@ -20679,7 +20681,9 @@ impl Frost {
                 )
                 .padding(8)
                 .width(Length::Fixed(220.0))
-                .max_height(160.0);
+                .max_height(160.0)
+                // Tooltip overlays otherwise pass an unbounded draw viewport.
+                .clip(true);
                 tooltip(slot, detail, tooltip::Position::Top).into()
             };
             let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
@@ -29377,6 +29381,26 @@ mod tests {
             .0;
         assert!(control.contains(".motion_changed(self.config.ascii_organism_motion, next)"));
         assert!(control.contains("self.config.ascii_organism_motion = next;"));
+    }
+
+    #[test]
+    fn companion_strip_and_tooltip_clip_to_their_allocated_bounds() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
+        let bar = bar.split_once("    fn ").unwrap().0;
+        let companion = bar
+            .split_once("let companion = container(companion)")
+            .unwrap()
+            .1;
+        let companion = companion.split_once("if layout.glyph").unwrap().0;
+        assert!(companion.contains(".height(Length::Fixed(companion_height))"));
+        assert!(companion.contains(".clip(true)"));
+        let tooltip = bar.split_once("let detail = container(").unwrap().1;
+        let tooltip = tooltip.split_once("tooltip(slot, detail").unwrap().0;
+        assert!(tooltip.contains(".width(Length::Fixed(220.0))"));
+        assert!(tooltip.contains(".max_height(160.0)"));
+        assert!(tooltip.contains(".clip(true)"));
+        assert_eq!(bar.matches(".clip(true)").count(), 2);
     }
 
     #[test]
