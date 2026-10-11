@@ -4,6 +4,13 @@ use std::time::Duration;
 use jterm_core::organism::RenderContext;
 use jterm_core::organism_daily::GentleInteraction;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExplicitGreeting {
+    Accepted,
+    Busy,
+    Cooldown,
+}
+
 const DWELL: Duration = Duration::from_millis(600);
 
 #[derive(Default)]
@@ -17,6 +24,7 @@ pub(crate) struct LiveGreeting {
     entry_epoch: Option<u64>,
     candidate: Option<Duration>,
     active_until: Option<Duration>,
+    explicit_hold: bool,
 }
 
 impl LiveGreeting {
@@ -47,7 +55,14 @@ impl LiveGreeting {
         self.epoch = self.epoch.wrapping_add(1);
         self.candidate = None;
         self.active_until = None;
+        self.explicit_hold = false;
         self.interaction.cancel();
+    }
+
+    pub fn cancel_hover(&mut self) {
+        if !self.explicit_hold {
+            self.cancel();
+        }
     }
 
     pub fn cancel_owner(&mut self, id: usize) {
@@ -67,10 +82,39 @@ impl LiveGreeting {
     }
 
     pub fn leave(&mut self) {
+        if self.explicit_hold {
+            // Pointer departure retires the physical visit, not an explicit
+            // acknowledgment. Keyboard/drag/owner cancellation still cancels.
+            self.epoch = self.epoch.wrapping_add(1);
+            self.inside = false;
+            self.entry_epoch = None;
+            self.candidate = None;
+            return;
+        }
         self.cancel();
         self.inside = false;
         self.owner = None;
         self.entry_epoch = None;
+    }
+
+    pub fn request_explicit(
+        &mut self,
+        id: usize,
+        now: Duration,
+        context: RenderContext,
+    ) -> ExplicitGreeting {
+        if !GentleInteraction::default().request(now, context) {
+            return ExplicitGreeting::Busy;
+        }
+        if !self.interaction.request(now, context) {
+            return ExplicitGreeting::Cooldown;
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        self.owner = Some(id);
+        self.candidate = None;
+        self.active_until = Some(now.saturating_add(GentleInteraction::HOLD));
+        self.explicit_hold = true;
+        ExplicitGreeting::Accepted
     }
 
     pub fn advance(
@@ -92,12 +136,18 @@ impl LiveGreeting {
             self.candidate = None;
             if self.interaction.request(now, context) {
                 self.active_until = Some(now.saturating_add(GentleInteraction::HOLD));
+                self.explicit_hold = false;
             }
         }
         if self.active_until.is_some_and(|deadline| now >= deadline) {
             self.active_until = None;
+            self.explicit_hold = false;
             self.interaction.cancel();
         }
+    }
+
+    pub fn explicit_active(&self, now: Duration) -> bool {
+        self.explicit_hold && self.active_until.is_some_and(|deadline| now < deadline)
     }
 
     pub fn deadline(&self, now: Duration) -> Option<Duration> {
@@ -142,6 +192,93 @@ mod tests {
 
     fn idle() -> RenderContext {
         PreviewPose::Calm.context()
+    }
+
+    #[test]
+    fn explicit_greeting_holds_without_pointer_and_departure_does_not_cancel() {
+        let mut hello = LiveGreeting::default();
+        assert_eq!(
+            hello.request_explicit(1, Duration::ZERO, idle()),
+            ExplicitGreeting::Accepted
+        );
+        assert!(!hello.inside);
+        assert!(!hello.candidate_visible(1, Duration::ZERO, idle()));
+        hello.advance(Some(1), Duration::from_millis(900), idle(), true);
+        hello.leave();
+        assert!(!hello.inside);
+        assert_eq!(
+            hello.apply(1, Duration::from_millis(1900), idle()).behavior,
+            Behavior::Approach
+        );
+        assert_eq!(
+            hello.deadline(Duration::from_millis(1900)),
+            Some(GentleInteraction::HOLD)
+        );
+        hello.advance(Some(1), GentleInteraction::HOLD, idle(), true);
+        assert!(!hello.explicit_hold);
+        assert_eq!(hello.apply(1, GentleInteraction::HOLD, idle()), idle());
+        assert_eq!(hello.deadline(GentleInteraction::HOLD), None);
+        hello.advance(Some(1), Duration::from_secs(12), idle(), true);
+        assert_eq!(hello.deadline(Duration::from_secs(12)), None);
+    }
+
+    #[test]
+    fn explicit_and_hover_share_cooldown_but_not_physical_entry() {
+        let mut hello = LiveGreeting::default();
+        hello.enter(1, hello.epoch(), Duration::ZERO, idle(), true);
+        let physical = hello.exit_reference().unwrap();
+        assert_eq!(
+            hello.request_explicit(1, Duration::from_millis(100), idle()),
+            ExplicitGreeting::Accepted
+        );
+        hello.exit(physical.0, physical.1);
+        assert!(!hello.inside);
+        assert!(hello.explicit_hold);
+        hello.cancel(); // Real input still cancels an explicit acknowledgment.
+        assert!(!hello.explicit_hold);
+        hello.enter(1, hello.epoch(), Duration::from_secs(1), idle(), true);
+        assert_eq!(hello.deadline(Duration::from_secs(1)), None);
+        assert_eq!(
+            hello.request_explicit(1, Duration::from_secs(1), idle()),
+            ExplicitGreeting::Cooldown
+        );
+        hello.leave();
+        hello.enter(1, hello.epoch(), Duration::from_secs(9), idle(), true);
+        hello.advance(Some(1), Duration::from_millis(9600), idle(), true);
+        assert_eq!(
+            hello.request_explicit(1, Duration::from_secs(10), idle()),
+            ExplicitGreeting::Cooldown
+        );
+    }
+
+    #[test]
+    fn explicit_refusal_or_owner_busy_cancellation_never_queues_a_later_greeting() {
+        let busy = RenderContext {
+            behavior: Behavior::WatchCommand,
+            ..idle()
+        };
+        let mut hello = LiveGreeting::default();
+        assert_eq!(
+            hello.request_explicit(1, Duration::ZERO, busy),
+            ExplicitGreeting::Busy
+        );
+        hello.advance(Some(1), Duration::from_secs(1), idle(), true);
+        assert_eq!(hello.deadline(Duration::from_secs(1)), None);
+        for (owner, context, eligible) in [
+            (Some(2), idle(), true),
+            (Some(1), busy, true),
+            (Some(1), idle(), false),
+        ] {
+            let mut hello = LiveGreeting::default();
+            assert_eq!(
+                hello.request_explicit(1, Duration::ZERO, idle()),
+                ExplicitGreeting::Accepted
+            );
+            hello.advance(owner, Duration::from_millis(100), context, eligible);
+            assert!(!hello.explicit_hold);
+            hello.advance(Some(1), Duration::from_secs(10), idle(), true);
+            assert_eq!(hello.deadline(Duration::from_secs(10)), None);
+        }
     }
 
     #[test]

@@ -501,6 +501,12 @@ impl Organism {
         self.retreat_until = Instant::now() + Duration::from_millis(900);
     }
 
+    /// Only the actual palette-opening branch may undo its own key's extension.
+    /// Already canceled visits/watch are deliberately not restored.
+    pub fn restore_retreat_after_palette_open(&mut self, previous: Option<Instant>) {
+        self.retreat_until = previous.unwrap_or_else(Instant::now);
+    }
+
     pub fn is_retreating(&self) -> bool {
         Instant::now() < self.retreat_until
     }
@@ -616,6 +622,15 @@ impl Organism {
         }
     }
 
+    pub fn sync_greeting_geometry(&mut self, glyph: bool, presentable: bool) {
+        if !glyph {
+            self.live_greeting.cancel_hover();
+        }
+        if !presentable {
+            self.pause_clock();
+        }
+    }
+
     pub fn cancel_live_greeting(&mut self) {
         self.live_greeting.cancel();
     }
@@ -663,6 +678,18 @@ impl Organism {
         );
     }
 
+    pub fn greet_live(&mut self, id: usize) -> crate::organism_hover::ExplicitGreeting {
+        let Some(life) = self
+            .sessions
+            .get(&id)
+            .filter(|life| self.enabled && !life.remote)
+        else {
+            return crate::organism_hover::ExplicitGreeting::Busy;
+        };
+        self.live_greeting
+            .request_explicit(id, self.born.elapsed(), life.context)
+    }
+
     pub fn live_greeting_candidate_visible(&self, id: usize) -> bool {
         self.enabled
             && self.sessions.get(&id).is_some_and(|life| {
@@ -671,6 +698,10 @@ impl Organism {
                         .live_greeting
                         .candidate_visible(id, self.born.elapsed(), life.context)
             })
+    }
+
+    pub fn explicit_greeting_active(&self) -> bool {
+        self.live_greeting.explicit_active(self.born.elapsed())
     }
 
     pub fn live_greeting_deadline(&self) -> Option<Instant> {
@@ -797,6 +828,112 @@ mod tests {
             state.attachment,
             state.confidence,
         ]
+    }
+
+    #[test]
+    fn palette_open_restores_only_previous_retreat_deadline_not_canceled_state() {
+        let mut organism = Organism::default();
+        let previous = Instant::now() + Duration::from_millis(300);
+        organism.retreat_until = previous;
+        organism.live_greeting.enter(
+            1,
+            organism.live_greeting.epoch(),
+            Duration::ZERO,
+            PreviewPose::Calm.context(),
+            true,
+        );
+        let snapshot = organism.retreat_deadline();
+        organism.retreat();
+        organism.restore_retreat_after_palette_open(snapshot);
+        assert_eq!(organism.retreat_until, previous);
+        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        organism.retreat();
+        organism.restore_retreat_after_palette_open(None);
+        assert!(!organism.is_retreating());
+        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn greeting_geometry_preserves_explicit_body_hold_but_retires_hidden_or_hover() {
+        let mut organism = Organism::default();
+        let context = PreviewPose::Calm.context();
+        organism.live_greeting.enter(
+            1,
+            organism.live_greeting.epoch(),
+            Duration::ZERO,
+            context,
+            true,
+        );
+        organism.sync_greeting_geometry(false, true);
+        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        organism.sync_greeting_geometry(true, true);
+        organism.live_greeting.enter(
+            1,
+            organism.live_greeting.epoch(),
+            Duration::ZERO,
+            context,
+            true,
+        );
+        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        assert_eq!(
+            organism
+                .live_greeting
+                .request_explicit(1, Duration::ZERO, context),
+            crate::organism_hover::ExplicitGreeting::Accepted
+        );
+        for (glyph, presentable) in [(true, true), (false, true), (false, true), (true, true)] {
+            organism.sync_greeting_geometry(glyph, presentable);
+            assert_eq!(
+                organism
+                    .live_greeting
+                    .apply(1, Duration::from_millis(500), context)
+                    .behavior,
+                Behavior::Approach
+            );
+        }
+        organism.sync_greeting_geometry(false, false);
+        organism.sync_greeting_geometry(true, true);
+        assert_eq!(
+            organism
+                .live_greeting
+                .apply(1, Duration::from_millis(500), context),
+            context
+        );
+        assert_eq!(
+            organism.live_greeting.deadline(Duration::from_millis(500)),
+            None
+        );
+        assert_eq!(
+            organism
+                .live_greeting
+                .request_explicit(1, Duration::from_secs(1), context),
+            crate::organism_hover::ExplicitGreeting::Cooldown
+        );
+    }
+
+    #[test]
+    fn explicit_live_greeting_does_not_change_life_or_preview_cooldown() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.say_hello_at(Duration::ZERO);
+        let before = values(organism.life.state());
+        let preview_ready = organism.preview_deadlines.ready_at;
+        assert_eq!(
+            organism.greet_live(1),
+            crate::organism_hover::ExplicitGreeting::Accepted
+        );
+        assert_eq!(values(organism.life.state()), before);
+        assert_eq!(organism.preview_deadlines.ready_at, preview_ready);
+        assert_eq!(
+            organism.greet_live(1),
+            crate::organism_hover::ExplicitGreeting::Cooldown
+        );
+        assert_eq!(
+            organism.greet_live(99),
+            crate::organism_hover::ExplicitGreeting::Busy
+        );
     }
 
     #[test]

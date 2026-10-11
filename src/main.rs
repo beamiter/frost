@@ -196,6 +196,15 @@ fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) 
 }
 
 /// Explain stable layout capabilities, not transient live-owner eligibility.
+fn organism_pointer_observation_needed(
+    glyph: bool,
+    explicit: bool,
+    buttons_down: bool,
+    motion: Option<organism::Motion>,
+) -> bool {
+    buttons_down || ((glyph || explicit) && motion != Some(organism::Motion::Static))
+}
+
 fn organism_settings_hint(
     width: f32,
     enabled: bool,
@@ -210,7 +219,7 @@ fn organism_settings_hint(
     }
     let layout = organism_layout(width, enabled, expanded, bottom_bar);
     if layout.body && !layout.glyph {
-        return "This width has room for the body, but not the status glyph. Body-only has no live hover target; Preview Say hello is separate.";
+        return "This width has room for the body, but not the status glyph. Body-only has no live hover target. When idle, use Greet companion in the command palette. Preview Say hello is separate.";
     }
     if !layout.presentable() {
         return if organism_layout(width, enabled, true, bottom_bar).body {
@@ -9415,11 +9424,17 @@ impl Frost {
         &mut self,
         key: &keyboard::Key,
         mods: keyboard::Modifiers,
+        retreat_before_key: Option<std::time::Instant>,
     ) -> Option<Task<Message>> {
         match chrome_shortcut(key, mods)? {
             ChromeShortcut::CommandPalette => {
                 self.palette.toggle();
                 Some(if self.palette.is_open {
+                    self.organism
+                        .restore_retreat_after_palette_open(retreat_before_key);
+                    self.palette.bind_greeting_target(
+                        self.sessions.get(self.active).map(|session| session.id),
+                    );
                     iced::widget::operation::focus(PALETTE_INPUT_ID.clone())
                 } else {
                     Task::none()
@@ -12296,9 +12311,10 @@ impl Frost {
             }
             Key::Named(Named::Enter) => {
                 let action = self.palette.selected_action();
+                let greeting_target = self.palette.greeting_target();
                 self.palette.close();
                 return Some(match action {
-                    Some(a) => self.execute_palette_action(a),
+                    Some(a) => self.execute_palette_action(a, greeting_target),
                     None => Task::none(),
                 });
             }
@@ -12379,10 +12395,18 @@ impl Frost {
     }
 
     /// Dispatch a palette action to the matching existing operation.
-    fn execute_palette_action(&mut self, action: command_palette::PaletteAction) -> Task<Message> {
+    fn execute_palette_action(
+        &mut self,
+        action: command_palette::PaletteAction,
+        greeting_target: Option<usize>,
+    ) -> Task<Message> {
         use command_palette::PaletteAction;
         self.palette.record_use(action);
         match action {
+            PaletteAction::GreetCompanion => {
+                self.greet_companion(greeting_target);
+                Task::none()
+            }
             PaletteAction::NewTab => {
                 self.new_session();
                 Task::none()
@@ -14968,6 +14992,7 @@ impl Frost {
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
+                let retreat_before_key = self.organism.retreat_deadline();
                 if self.terminal_input_active()
                     && matches!(&event, keyboard::Event::KeyPressed { .. })
                 {
@@ -15388,7 +15413,9 @@ impl Frost {
                     if let Some(task) = self.handle_keybinding(&key, modifiers) {
                         return task;
                     }
-                    if let Some(task) = self.handle_tab_shortcut(&key, modifiers) {
+                    if let Some(task) =
+                        self.handle_tab_shortcut(&key, modifiers, retreat_before_key)
+                    {
                         return task;
                     }
                     if self.handle_scroll_shortcut(&key, modifiers) {
@@ -16620,8 +16647,9 @@ impl Frost {
             }
             Message::PaletteExecute(epoch, i) => {
                 if let Some(action) = self.palette.action_at(&epoch, i) {
+                    let greeting_target = self.palette.greeting_target();
                     self.palette.close();
-                    return self.execute_palette_action(action);
+                    return self.execute_palette_action(action, greeting_target);
                 }
             }
             Message::ToggleConfigPanel => {
@@ -16867,10 +16895,10 @@ impl Frost {
                 });
                 self.sync_organism_watch();
                 self.organism.tick(owner, running, any_running);
-                let hover_owner = self.organism_owner();
-                let hover_eligible = self.organism_hover_eligible();
+                let interaction_owner = self.organism_owner();
+                let interaction_eligible = self.organism_interaction_eligible();
                 self.organism
-                    .poll_live_greeting(hover_owner, hover_eligible);
+                    .poll_live_greeting(interaction_owner, interaction_eligible);
             }
             Message::SetBottomBar(show) => {
                 self.config.bottom_bar = show;
@@ -20439,12 +20467,10 @@ impl Frost {
 
     fn sync_organism_geometry(&mut self) {
         let layout = self.organism_layout();
-        if !layout.glyph {
-            self.organism.cancel_live_greeting();
-            self.organism_pointer_buttons.clear();
-        }
+        self.organism
+            .sync_greeting_geometry(layout.glyph, layout.presentable());
         if !layout.presentable() {
-            self.organism.pause_clock();
+            self.organism_pointer_buttons.clear();
         }
         self.sync_organism_watch();
     }
@@ -20489,8 +20515,39 @@ impl Frost {
         self.organism.observe_watch(owner, running);
     }
 
+    fn greet_companion(&mut self, target: Option<usize>) {
+        let refusal = if !self.config.ascii_organism_enabled {
+            Some("Enable ASCII Organism in Settings before greeting.")
+        } else if self.config.ascii_organism_motion == Some(organism::Motion::Static) {
+            Some("Choose Full or Calm motion before greeting the live companion.")
+        } else if target.is_none()
+            || target != self.organism_owner()
+            || !self.organism_interaction_eligible()
+        {
+            Some("The companion is unavailable for the original pane right now.")
+        } else {
+            match self
+                .organism
+                .greet_live(target.expect("checked original owner"))
+            {
+                organism_hover::ExplicitGreeting::Accepted => None,
+                organism_hover::ExplicitGreeting::Busy => Some("The companion is busy right now."),
+                organism_hover::ExplicitGreeting::Cooldown => {
+                    Some("The companion is cooling down. Try again later.")
+                }
+            }
+        };
+        if let Some(message) = refusal {
+            self.push_toast(message.to_string(), ToastKind::Info);
+        }
+    }
+
     fn organism_hover_eligible(&self) -> bool {
-        self.organism_layout().glyph
+        self.organism_layout().glyph && self.organism_interaction_eligible()
+    }
+
+    fn organism_interaction_eligible(&self) -> bool {
+        self.organism_layout().presentable()
             && self.organism_owner().is_some()
             && self.config.ascii_organism_motion != Some(organism::Motion::Static)
             && self.organism_pointer_buttons.is_empty()
@@ -27014,10 +27071,16 @@ impl Frost {
             }
         }
         if live_visible
-            && live_layout.glyph
-            && self.config.ascii_organism_motion != Some(organism::Motion::Static)
+            && organism_pointer_observation_needed(
+                live_layout.glyph,
+                self.organism.explicit_greeting_active(),
+                !self.organism_pointer_buttons.is_empty(),
+                self.config.ascii_organism_motion,
+            )
         {
             // Observe without consuming or rerouting the original mouse event.
+            // A narrow explicit hold observes input only while active; after a
+            // press cancels it, retain the listener through release cleanup.
             // Iced supplies no native snapshot of buttons pressed outside this
             // window; only observed button-down/drag state is claimed here.
             subs.push(iced::event::listen_with(
@@ -27035,7 +27098,7 @@ impl Frost {
                 },
             ));
         }
-        if self.organism_hover_eligible() {
+        if self.organism_interaction_eligible() {
             if let Some(deadline) = self.organism.live_greeting_deadline() {
                 subs.push(organism_deadline_subscription(deadline));
             }
@@ -29509,7 +29572,7 @@ mod tests {
             .0;
         assert!(subs.contains("let live_layout = self.organism_layout()"));
         assert!(subs.contains("live_layout.maintenance_eligible(self.focused)"));
-        assert!(subs.contains("&& live_layout.glyph"));
+        assert!(subs.contains("organism_pointer_observation_needed("));
         assert!(subs.contains("let millis = if full { 100 } else { 900 }"));
         assert_eq!(subs.matches("iced::time::every(").count(), 1);
         let resize = source
@@ -29530,8 +29593,7 @@ mod tests {
             .split_once("    fn organism_owner(")
             .unwrap()
             .0;
-        assert!(sync.contains("self.organism.cancel_live_greeting()"));
-        assert!(sync.contains("self.organism.pause_clock()"));
+        assert!(sync.contains("sync_greeting_geometry(layout.glyph, layout.presentable())"));
         assert!(!sync.contains("enter_live_greeting"));
         assert!(!sync.contains("preview"));
         assert!(!sync.contains("demo"));
@@ -36075,6 +36137,187 @@ mod tests {
     }
 
     #[test]
+    fn narrow_explicit_pointer_observation_keeps_release_cleanup_after_cancellation() {
+        use std::time::Duration;
+        let mut buttons = Vec::new();
+        let mut greeting = organism_hover::LiveGreeting::default();
+        assert_eq!(
+            greeting.request_explicit(
+                1,
+                Duration::ZERO,
+                jterm_core::organism_daily::PreviewPose::Calm.context()
+            ),
+            organism_hover::ExplicitGreeting::Accepted
+        );
+        assert!(greeting.explicit_active(Duration::ZERO));
+        assert!(!organism_pointer_observation_needed(
+            false, false, false, None
+        ));
+        assert!(organism_pointer_observation_needed(
+            false, true, false, None
+        ));
+        organism_hover::update_pressed_button(&mut buttons, 1, true);
+        greeting.cancel();
+        assert!(!greeting.explicit_active(Duration::ZERO));
+        // Press cancels the hold, but its truthful ledger keeps the listener.
+        for motion in [
+            None,
+            Some(organism::Motion::Calm),
+            Some(organism::Motion::Static),
+        ] {
+            for width in [700.0, 500.0] {
+                let layout = organism_layout(width, true, true, true);
+                assert!(layout.presentable());
+                assert!(organism_pointer_observation_needed(
+                    layout.glyph,
+                    greeting.explicit_active(Duration::from_millis(100)),
+                    !buttons.is_empty(),
+                    motion,
+                ));
+            }
+        }
+        organism_hover::update_pressed_button(&mut buttons, 1, false);
+        assert!(!organism_pointer_observation_needed(
+            false,
+            false,
+            !buttons.is_empty(),
+            None
+        ));
+        assert!(!organism_pointer_observation_needed(
+            true,
+            true,
+            false,
+            Some(organism::Motion::Static)
+        ));
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let sync = source
+            .split_once("    fn sync_organism_geometry(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_owner(")
+            .unwrap()
+            .0;
+        assert!(sync.contains("if !layout.presentable()"));
+        assert!(!sync.contains("if !layout.glyph"));
+        let subs = source
+            .split_once("        let preview_visible =")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(subs.contains("organism_pointer_observation_needed("));
+        assert!(subs.contains("self.organism.explicit_greeting_active()"));
+        assert!(subs.contains("!self.organism_pointer_buttons.is_empty()"));
+    }
+
+    #[test]
+    fn palette_greeting_uses_opening_target_after_close_and_presentable_admission() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let key = source
+            .split_once("    fn handle_palette_key(")
+            .unwrap()
+            .1
+            .split_once("    fn edit_copy_task(")
+            .unwrap()
+            .0;
+        assert!(
+            key.find("let greeting_target = self.palette.greeting_target()")
+                .unwrap()
+                < key
+                    .find("Some(a) => self.execute_palette_action(a, greeting_target)")
+                    .unwrap()
+        );
+        let click = source
+            .split_once("            Message::PaletteExecute(epoch, i) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ToggleConfigPanel")
+            .unwrap()
+            .0;
+        assert!(
+            click.find("self.palette.action_at(&epoch, i)").unwrap()
+                < click.find("self.palette.greeting_target()").unwrap()
+        );
+        assert!(
+            click.find("self.palette.greeting_target()").unwrap()
+                < click.find("self.palette.close()").unwrap()
+        );
+        let greet = source
+            .split_once("    fn greet_companion(")
+            .unwrap()
+            .1
+            .split_once("    fn status_bar(")
+            .unwrap()
+            .0;
+        assert!(greet.contains("target != self.organism_owner()"));
+        assert!(greet.contains("!self.organism_interaction_eligible()"));
+        assert!(greet.contains("Some(organism::Motion::Static)"));
+        assert!(greet.contains("self.organism_layout().presentable()"));
+        assert!(
+            greet.contains("self.organism_layout().glyph && self.organism_interaction_eligible()")
+        );
+        assert!(!greet.contains("Task::"));
+        assert!(!greet.contains("write_pty"));
+        assert!(!greet.contains("say_hello"));
+        assert!(!greet.contains("set_enabled"));
+    }
+
+    #[test]
+    fn palette_navigation_restores_only_its_own_retreat_after_custom_binding_precedence() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let key = source
+            .split_once("            Message::Key(event) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Ime(")
+            .unwrap()
+            .0;
+        assert!(
+            key.find("let retreat_before_key = self.organism.retreat_deadline()")
+                .unwrap()
+                < key.find("self.organism.retreat()").unwrap()
+        );
+        assert!(
+            key.find("self.handle_keybinding(&key, modifiers)").unwrap()
+                < key
+                    .find("self.handle_tab_shortcut(&key, modifiers, retreat_before_key)")
+                    .unwrap()
+        );
+        let chrome = source
+            .split_once("    fn handle_tab_shortcut(")
+            .unwrap()
+            .1
+            .split_once("    fn handle_tab_switcher_key(")
+            .unwrap()
+            .0;
+        assert!(
+            chrome.find("if self.palette.is_open").unwrap()
+                < chrome.find("restore_retreat_after_palette_open").unwrap()
+        );
+        assert_eq!(
+            chrome.matches("restore_retreat_after_palette_open").count(),
+            1
+        );
+        let query = source
+            .split_once("    fn handle_palette_key(")
+            .unwrap()
+            .1
+            .split_once("    fn edit_copy_task(")
+            .unwrap()
+            .0;
+        assert!(!query.contains(".retreat("));
+        let input = source
+            .split_once("    fn terminal_input_active(")
+            .unwrap()
+            .1
+            .split_once("    fn terminal_mouse_active(")
+            .unwrap()
+            .0;
+        assert!(input.contains("!self.palette.is_open"));
+    }
+
+    #[test]
     fn hover_candidate_cue_stays_inside_glyph_slot_and_uses_existing_admission() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let bar = source
@@ -36145,7 +36388,7 @@ mod tests {
             .split_once("        // A right-press on a tab")
             .unwrap()
             .0;
-        assert!(subscriptions.contains("if self.organism_hover_eligible()"));
+        assert!(subscriptions.contains("if self.organism_interaction_eligible()"));
         assert!(subscriptions.contains("self.organism.live_greeting_deadline()"));
     }
 

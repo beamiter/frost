@@ -38,6 +38,7 @@ fn bound_palette_query(query: impl Into<String>) -> String {
 /// 面板可分发的动作，每一项都 1:1 对应一个已有的 frost 操作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
+    GreetCompanion,
     NewTab,
     CloseTab,
     NextTab,
@@ -149,6 +150,7 @@ impl PaletteItem {
 /// 命令面板状态。
 pub struct PaletteState {
     epoch: std::sync::Arc<()>,
+    greeting_target: Option<usize>,
     pub is_open: bool,
     pub query: String,
     /// 当前过滤结果中的高亮位置。
@@ -676,9 +678,17 @@ impl PaletteState {
                 shortcut: "",
                 action: PaletteAction::LaunchKimi,
             },
+            PaletteItem {
+                name: "Greet companion",
+                description: "Say hello to the idle live companion (Full or Calm)",
+                binding: None,
+                shortcut: "",
+                action: PaletteAction::GreetCompanion,
+            },
         ];
         Self {
             epoch: std::sync::Arc::new(()),
+            greeting_target: None,
             is_open: false,
             query: String::new(),
             selected: 0,
@@ -702,13 +712,25 @@ impl PaletteState {
 
     pub fn open(&mut self) {
         self.epoch = std::sync::Arc::new(());
+        self.greeting_target = None;
         self.is_open = true;
         self.query.clear();
         self.selected = 0;
     }
 
     pub fn close(&mut self) {
+        self.greeting_target = None;
         self.is_open = false;
+    }
+
+    pub fn bind_greeting_target(&mut self, target: Option<usize>) {
+        if self.is_open {
+            self.greeting_target = target;
+        }
+    }
+
+    pub fn greeting_target(&self) -> Option<usize> {
+        self.is_open.then_some(self.greeting_target).flatten()
     }
 
     pub fn toggle(&mut self) {
@@ -847,6 +869,39 @@ impl PaletteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_action_is_palette_only_and_target_survives_query_until_close() {
+        let mut palette = PaletteState::new();
+        palette.open();
+        assert_eq!(palette.selected_action(), Some(PaletteAction::NewTab));
+        palette.bind_greeting_target(Some(10));
+        let epoch = palette.epoch();
+        palette.set_query("greet companion");
+        assert_eq!(
+            palette.selected_action(),
+            Some(PaletteAction::GreetCompanion)
+        );
+        let (index, item) = palette.filtered()[0];
+        assert_eq!(item.binding, None);
+        assert!(item.shortcut.is_empty());
+        assert_eq!(
+            palette.action_at(&epoch, index),
+            Some(PaletteAction::GreetCompanion)
+        );
+        assert_eq!(palette.greeting_target(), Some(10));
+        palette.set_query("hello");
+        assert_eq!(
+            palette.selected_action(),
+            Some(PaletteAction::GreetCompanion)
+        );
+        palette.close();
+        assert_eq!(palette.greeting_target(), None);
+        palette.open();
+        palette.bind_greeting_target(Some(20));
+        assert_eq!(palette.action_at(&epoch, index), None);
+        assert_eq!(palette.greeting_target(), Some(20));
+    }
 
     #[test]
     fn rendered_actions_cannot_survive_close_reopen_or_filter_removal() {
