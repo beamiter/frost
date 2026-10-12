@@ -2603,6 +2603,16 @@ pub(crate) enum ZoneOutputExport {
     Unavailable,
 }
 
+/// Fixed-size, content-free summary of accepted native lifecycle changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WatchBatch {
+    pub starts: u8,
+    pub boundary: bool,
+    pub interrupted: bool,
+    pub ended: bool,
+    pub fragmented: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 enum ZoneState {
     #[default]
@@ -3217,6 +3227,8 @@ pub struct TerminalState {
     /// Next [`CommandZone::id`]; monotonic for the life of the terminal.
     next_zone_id: u64,
     current_zone_state: ZoneState,
+    watch_generation: Option<u64>,
+    watch_batch: WatchBatch,
     /// Exact cursor column at OSC 133 `B`, after the prompt finished drawing.
     /// The existing zone model stores only rows for navigation; Agent needs
     /// the column as well so prompt text cannot be mistaken for command text.
@@ -3539,6 +3551,8 @@ impl TerminalState {
             finished_output_provenance: HashMap::new(),
             next_zone_id: 0,
             current_zone_state: ZoneState::default(),
+            watch_generation: Some(0),
+            watch_batch: WatchBatch::default(),
             current_command_start_col: None,
             current_command_extent_row: None,
             current_output_start_col: None,
@@ -4608,6 +4622,8 @@ impl TerminalState {
         }
         match mark {
             'A' => {
+                self.watch_batch.ended |= self.is_command_running();
+                self.watch_batch.boundary = true;
                 // A fresh prompt while a command was still mid-output (`C`
                 // seen, `D` lost in an alt-screen detour or crashed shell
                 // integration) finalizes that zone instead of silently
@@ -4762,6 +4778,9 @@ impl TerminalState {
                             execution_id: mark_id.clone(),
                         });
                     }
+                    self.watch_generation = self.watch_generation.and_then(|n| n.checked_add(1));
+                    self.watch_batch.starts = self.watch_batch.starts.saturating_add(1).min(2);
+                    self.watch_batch.boundary = true;
                     self.current_zone_state =
                         ZoneState::OutputStarted(prompt_start, cmd_start, absolute_row);
                     self.current_command_started_at = Some(std::time::Instant::now());
@@ -4931,6 +4950,8 @@ impl TerminalState {
                             crate::block_mode::CompletionProvenance::ShellReported,
                     },
                 );
+                self.watch_batch.boundary = true;
+                self.watch_batch.ended = true;
                 self.remember_consumed_execution_id(consumed_id.as_deref());
                 self.current_zone_state = ZoneState::Idle;
                 self.current_command_start_col = None;
@@ -7693,7 +7714,21 @@ impl TerminalState {
 
     /// P3 优化：批量处理输入数据，只在处理完成后触发一次网格版本更新
     /// 相比多次 process_input，这个方法避免了多次网格版本递增
+    pub(crate) fn watch_generation(&self) -> Option<u64> {
+        self.watch_generation.filter(|_| self.is_command_running())
+    }
+
+    pub(crate) fn watch_batch(&self) -> WatchBatch {
+        self.watch_batch
+    }
+
     pub fn process_batch(&mut self, input: &[u8]) {
+        self.watch_batch = WatchBatch {
+            // A control prefix from an earlier read cannot certify a fresh C.
+            // No extra byte storage, scanning or parser behavior is introduced.
+            fragmented: !self.pending_escape.is_empty() || !self.pending_osc.is_empty(),
+            ..WatchBatch::default()
+        };
         // Resize, an alternate-screen swap and the projection restore all park
         // the viewport at the bottom without going through the scroll helpers.
         self.settle_pending_saved_line_purge();
@@ -9481,6 +9516,8 @@ impl TerminalState {
 
     /// RIS (ESC c): reset the terminal to its initial state.
     fn full_reset(&mut self) {
+        self.watch_batch.boundary = true;
+        self.watch_batch.interrupted = true;
         if self.use_alt_buffer {
             self.reset_mode(1049, true);
         }
@@ -9704,6 +9741,8 @@ impl TerminalState {
                         &mut self.keyboard_enhancement_stack,
                         &mut self.alt_keyboard_enhancement_stack,
                     );
+                    self.watch_batch.interrupted = true;
+                    self.watch_batch.boundary = true;
                     self.use_alt_buffer = true;
                     // Retained cells keep their keys, but an unterminated
                     // primary-screen link must not arm alternate-screen text.
@@ -9808,6 +9847,8 @@ impl TerminalState {
                         &mut self.keyboard_enhancement_stack,
                         &mut self.alt_keyboard_enhancement_stack,
                     );
+                    self.watch_batch.interrupted = true;
+                    self.watch_batch.boundary = true;
                     self.use_alt_buffer = false;
                     // Whatever the alternate screen last left in scrollback is
                     // all that remains of it, so it stops being provisional.
@@ -21169,5 +21210,144 @@ mod tests {
         assert_eq!(terminal.scrollback_len(), history);
         assert_eq!(terminal.selection, selection);
         assert_eq!(terminal.copy_selection(), before);
+    }
+}
+
+#[cfg(test)]
+mod shared_watch_native_tests {
+    use super::*;
+    use crate::organism_watch::{CommandIdentity, WatchObservation};
+    use jterm_core::organism::WatchRhythm;
+    use std::time::Duration;
+
+    const START: &[u8] = b"\x1b]133;A\x07\x1b]133;B\x07echo x\x1b]133;C\x07";
+    const END: &[u8] = b"\x1b]133;D;0\x07";
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+    fn feed(
+        terminal: &mut TerminalState,
+        watch: &mut WatchObservation,
+        bytes: &[u8],
+        seq: u64,
+        read: u64,
+        dispatch: u64,
+    ) {
+        terminal.process_batch(bytes);
+        let command = terminal.watch_generation().map(|command| CommandIdentity {
+            owner: 1,
+            fd: 7,
+            source: 11,
+            command,
+        });
+        watch.batch(
+            command,
+            terminal.watch_batch(),
+            seq,
+            (ms(read), ms(dispatch)),
+            true,
+            !bytes.is_empty(),
+        );
+        watch.sync(Some((1, 7, 11)), terminal.watch_generation(), ms(dispatch));
+    }
+    #[test]
+    fn native_watch_only_accepted_c_mints_generation() {
+        let mut t = TerminalState::new(40, 8);
+        t.process_batch(b"\x1b]133;C\x07");
+        assert_eq!(t.watch_generation(), None);
+        assert_eq!(t.watch_batch().starts, 0);
+        t.process_batch(START);
+        assert_eq!(t.watch_generation(), Some(1));
+        assert_eq!(t.watch_batch().starts, 1);
+        t.process_batch(b"\x1b]133;C\x07");
+        assert_eq!(t.watch_generation(), Some(1));
+        assert_eq!(t.watch_batch().starts, 0);
+        t.process_batch(END);
+        assert_eq!(t.watch_generation(), None);
+        assert!(t.watch_batch().ended);
+    }
+    #[test]
+    fn native_watch_fragmented_marker_is_bounded_and_not_trusted_start() {
+        let mut t = TerminalState::new(40, 8);
+        t.process_batch(b"\x1b]133;A\x07\x1b]133;B\x07echo x\x1b]13");
+        t.process_batch(b"3;C\x07");
+        assert_eq!(t.watch_generation(), Some(1));
+        assert_eq!(t.watch_batch().starts, 1);
+        assert!(t.watch_batch().fragmented);
+        t.process_batch(b"x");
+        assert_eq!(t.watch_batch(), WatchBatch::default());
+        assert!(std::mem::size_of::<WatchBatch>() <= 8);
+    }
+    #[test]
+    fn native_watch_coalesced_mixed_commands_cannot_borrow_previous_output() {
+        let mut t = TerminalState::new(40, 8);
+        let mut w = WatchObservation::default();
+        w.sync(Some((1, 7, 11)), None, ms(0));
+        let bytes = [START, b"first", END, START, b"second", END, START, b"third"].concat();
+        feed(&mut t, &mut w, &bytes, 1, 10, 20);
+        assert_eq!(t.watch_generation(), Some(3));
+        assert_eq!(t.watch_batch().starts, 2); // bounded 0/1/many
+        assert!(t.watch_batch().ended);
+        assert_eq!(t.take_completed_commands().len(), 2);
+        for (seq, read) in [(2, 100), (3, 200), (4, 300)] {
+            feed(&mut t, &mut w, b"out", seq, read, read + 10);
+        }
+        assert_eq!(w.rhythm(1, ms(300)), WatchRhythm::Steady);
+        feed(&mut t, &mut w, b"out", 5, 400, 410);
+        assert_eq!(w.rhythm(1, ms(400)), WatchRhythm::Busy);
+    }
+    #[test]
+    fn native_watch_control_only_nonempty_batches_keep_existing_activity_definition() {
+        let mut t = TerminalState::new(40, 8);
+        let mut w = WatchObservation::default();
+        w.sync(Some((1, 7, 11)), None, ms(0));
+        feed(&mut t, &mut w, START, 0, 10, 20);
+        for (seq, read) in [(1, 100), (2, 200), (3, 300)] {
+            feed(&mut t, &mut w, b"\x1b[2K\r", seq, read, read + 10);
+        }
+        assert_eq!(w.rhythm(1, ms(300)), WatchRhythm::Busy);
+        assert_eq!(t.watch_batch(), WatchBatch::default());
+    }
+    #[test]
+    fn native_watch_prompt_reset_and_alt_are_summary_boundaries_only() {
+        for boundary in [
+            b"\x1b]133;A\x07".as_slice(),
+            b"\x1bc".as_slice(),
+            b"\x1b[?1049h\x1b[?1049l".as_slice(),
+        ] {
+            let mut t = TerminalState::new(40, 8);
+            t.process_batch(START);
+            t.process_batch(boundary);
+            assert!(t.watch_batch().boundary);
+            if boundary == b"\x1b]133;A\x07" {
+                assert!(t.watch_batch().ended);
+            } else {
+                assert!(t.watch_batch().interrupted);
+            }
+        }
+    }
+    #[test]
+    fn native_watch_generation_exhaustion_does_not_stop_terminal_execution() {
+        let mut t = TerminalState::new(40, 8);
+        t.watch_generation = Some(u64::MAX);
+        t.process_batch(START);
+        assert!(t.is_command_running());
+        assert_eq!(t.watch_generation(), None);
+        t.process_batch(END);
+        assert!(!t.is_command_running());
+        assert_eq!(t.take_completed_commands().len(), 1);
+        t.process_batch(START);
+        assert_eq!(t.watch_generation(), None);
+        assert!(t.is_command_running());
+    }
+    #[test]
+    fn native_watch_settled_age_stays_native_after_observation_restore() {
+        let mut t = TerminalState::new(40, 8);
+        t.process_batch(START);
+        t.current_command_started_at = Some(std::time::Instant::now() - Duration::from_secs(61));
+        let mut w = WatchObservation::default();
+        w.sync(Some((1, 7, 11)), t.watch_generation(), ms(5000));
+        assert!(t.running_duration_ms().unwrap() >= 60_000);
+        assert_eq!(w.rhythm(1, ms(5000)), WatchRhythm::Steady);
     }
 }

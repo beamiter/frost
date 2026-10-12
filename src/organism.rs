@@ -457,7 +457,7 @@ impl Organism {
         exit: Option<i32>,
         duration: Option<u64>,
     ) {
-        self.watch.reset_owner(id);
+        self.watch.retire_owner(id);
         if !self.enabled {
             return;
         }
@@ -515,31 +515,56 @@ impl Organism {
         self.watch.reset();
     }
 
-    pub fn observe_watch(&mut self, owner: Option<usize>, running: bool) {
-        self.watch.observe(
-            owner.filter(|id| self.enabled && self.is_local(*id)),
-            running,
-            self.born.elapsed(),
-        );
+    pub fn freeze_watch(&mut self, frozen: bool) {
+        self.watch.freeze(frozen);
+    }
+
+    pub fn bind_watch_source(&mut self, source: Option<crate::organism_watch::SourceAuthority>) {
+        self.watch.bind_source(source);
+    }
+
+    pub fn observe_watch(&mut self, eligible: Option<(usize, i32, u64)>, command: Option<u64>) {
+        self.watch.sync(eligible, command, self.born.elapsed());
     }
 
     pub fn watch_output(
         &mut self,
-        id: usize,
-        owner: Option<usize>,
-        running: bool,
+        eligible: Option<(usize, i32, u64)>,
+        command: Option<u64>,
+        batch: crate::terminal::WatchBatch,
+        stamp: crate::organism_watch::SourceStamp,
         nonempty: bool,
         admitted: bool,
     ) {
         let now = self.born.elapsed();
-        self.watch.observe(
-            owner.filter(|id| self.enabled && self.is_local(*id)),
-            running,
-            now,
-        );
-        if nonempty {
-            self.watch.output(id, now, admitted);
+        if eligible.is_some_and(|source| source.2 != stamp.epoch) {
+            return;
         }
+        self.watch.prepare(eligible, now);
+        let identity = eligible.zip(command).map(|((owner, fd, source), command)| {
+            crate::organism_watch::CommandIdentity {
+                owner,
+                fd,
+                source,
+                command,
+            }
+        });
+        if identity.is_none() {
+            self.watch.sync(eligible, None, now);
+            return;
+        }
+        let read_at = stamp
+            .read_at
+            .checked_duration_since(self.born)
+            .unwrap_or_default();
+        self.watch.batch(
+            identity,
+            batch,
+            stamp.seq,
+            (read_at, now),
+            admitted,
+            nonempty,
+        );
     }
 
     pub fn note_output(&mut self, id: usize) {
@@ -709,6 +734,7 @@ impl Organism {
     pub fn tick(&mut self, owner: Option<usize>, running: bool, any_running: bool) {
         let now = Instant::now();
         let elapsed = self.born.elapsed();
+        self.watch.heartbeat(elapsed);
         let dt = self.life.advance(
             elapsed,
             self.enabled && owner.is_some(),
@@ -2207,7 +2233,7 @@ mod tests {
         assert!(!organism.watch_batch_admitted(1));
         organism.batch_finished(1, true);
         assert!(organism.watch_batch_admitted(1));
-        organism.observe_watch(Some(1), true);
+        organism.observe_watch(Some((1, 1, 1)), Some(1));
         organism.set_remote(1, true);
         assert_eq!(
             organism.watch.rhythm(1, Duration::from_secs(20)),

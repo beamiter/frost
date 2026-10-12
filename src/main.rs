@@ -3798,7 +3798,7 @@ enum Message {
     SetAiKeyDraft(String),
     StoreAiKey,
     SetAgentMaxTurns(u32),
-    PtyOutput(usize, RawFd, Vec<u8>),
+    PtyOutput(usize, RawFd, Vec<u8>, Option<organism_watch::SourceStamp>),
     PtyExited(usize, RawFd, i32),
     Key(keyboard::Event),
     /// An input-method (IME) composition event: open/close, pre-edit updates,
@@ -4144,6 +4144,7 @@ struct PtySubscriptionKey {
     id: usize,
     master_fd: RawFd,
     reader_fd: Arc<OwnedFd>,
+    watch_source: organism_watch::SourceAuthority,
     /// The session leader's pid. The reader thread probes it to tell a closed
     /// slave stream (a possibly transient hangup) apart from a real child
     /// exit — observing only, never reaping: reaping stays with the
@@ -4188,6 +4189,8 @@ struct Session {
     pty: Pty,
     master_fd: RawFd,
     reader_fd: Arc<OwnedFd>,
+    watch_source: organism_watch::SourceAuthority,
+    watch_receiver: organism_watch::SourceReceiver,
     /// One immutable materialization shared by rendering, links, and stable
     /// coordinate consumers for this refresh.
     projection: Arc<ProjectedViewport>,
@@ -4586,6 +4589,8 @@ impl Session {
             pty,
             master_fd,
             reader_fd,
+            watch_source: organism_watch::SourceAuthority::default(),
+            watch_receiver: organism_watch::SourceReceiver::default(),
             projection,
             projection_block_mode: config.block_mode,
             projection_policy,
@@ -13861,6 +13866,20 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Reject output provenance before generic synchronization can touch Watch.
+        // Invalid/old source metadata never prevents valid native bytes from being
+        // parsed and displayed by the original id/fd route below.
+        let watch_source_valid = match &message {
+            Message::PtyOutput(id, fd, _, stamp) => self
+                .session_by_identity(*id, *fd)
+                .is_some_and(|s| s.watch_receiver.accept(&s.watch_source, *stamp)),
+            _ => true,
+        };
+        let is_pty_output = matches!(&message, Message::PtyOutput(..));
+        // During native parsing all Watch changes are deferred. In particular,
+        // an old completion cannot retire a newly published reader incarnation.
+        // This scope is restored before every PtyOutput return below.
+        self.organism.freeze_watch(is_pty_output);
         // Coordinate identity only: due attention is not accepted ahead of input.
         self.sync_organism_attention_owner();
         self.organism
@@ -13871,9 +13890,11 @@ impl Frost {
         }
         self.organism
             .sync_preview_visibility(self.organism_preview_visible());
-        self.sync_organism_watch();
+        if !is_pty_output {
+            self.sync_organism_watch();
+        }
         match message {
-            Message::PtyOutput(id, fd, data) => {
+            Message::PtyOutput(id, fd, data, watch_stamp) => {
                 let t0 = std::time::Instant::now();
                 let is_active_output = self
                     .sessions
@@ -13905,10 +13926,6 @@ impl Frost {
                     }
                 }
                 // Snapshot admission before the batch lifts enable-time quarantine.
-                let watch_batch_identity = self
-                    .sessions
-                    .iter()
-                    .any(|s| s.id == id && s.master_fd == fd);
                 let watch_batch_admitted = self.organism.watch_batch_admitted(id);
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.terminal.process_batch(&data);
@@ -13986,19 +14003,46 @@ impl Frost {
                 {
                     self.organism.note_output(id);
                 }
-                let watch_owner = self.organism_watch_owner();
-                let watch_running = self
-                    .sessions
-                    .iter()
-                    .find(|s| Some(s.id) == watch_owner)
-                    .is_some_and(|s| s.terminal.is_command_running());
-                self.organism.watch_output(
-                    id,
-                    watch_owner,
-                    watch_running,
-                    watch_batch_identity && !data.is_empty(),
-                    watch_batch_admitted && completed_commands.is_empty(),
-                );
+                if watch_source_valid {
+                    if let Some(stamp) = watch_stamp {
+                        // Linearize Watch admission against the same native source.
+                        // No generic sync in this message can attach to a newer one.
+                        let source = self
+                            .sessions
+                            .iter()
+                            .find(|s| {
+                                s.id == id
+                                    && s.master_fd == fd
+                                    && s.watch_source.epoch() == Some(stamp.epoch)
+                            })
+                            .map(|s| s.watch_source.clone());
+                        if let Some(source) = source {
+                            let eligible = self.organism_watch_source();
+                            if eligible.is_none()
+                                || eligible
+                                    .is_some_and(|e| e.0 == id && e.1 == fd && e.2 == stamp.epoch)
+                            {
+                                if let Some(sess) = self
+                                    .sessions
+                                    .iter()
+                                    .find(|s| s.id == id && s.master_fd == fd)
+                                {
+                                    self.organism.freeze_watch(false);
+                                    self.organism.bind_watch_source(Some(source));
+                                    self.organism.watch_output(
+                                        eligible,
+                                        sess.terminal.watch_generation(),
+                                        sess.terminal.watch_batch(),
+                                        stamp,
+                                        !data.is_empty(),
+                                        watch_batch_admitted,
+                                    );
+                                    self.organism.freeze_watch(true);
+                                }
+                            }
+                        }
+                    }
+                }
                 if is_active_output {
                     let facts = self.organism_attention_facts();
                     self.organism.poll_live_greeting(Some(id), facts);
@@ -14299,6 +14343,7 @@ impl Frost {
                         tasks.push(task);
                     }
                 }
+                self.organism.freeze_watch(false);
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
                 }
@@ -20569,13 +20614,24 @@ impl Frost {
             .filter(|_| self.config.ascii_organism_motion != Some(organism::Motion::Static))
     }
 
+    fn organism_watch_source(&self) -> Option<(usize, i32, u64)> {
+        let owner = self.organism_watch_owner()?;
+        let session = self.sessions.get(self.active).filter(|s| s.id == owner)?;
+        Some((owner, session.master_fd, session.watch_source.epoch()?))
+    }
+
     fn sync_organism_watch(&mut self) {
-        let owner = self.organism_watch_owner();
-        let running = self
+        self.organism.bind_watch_source(
+            self.sessions
+                .get(self.active)
+                .map(|session| session.watch_source.clone()),
+        );
+        let eligible = self.organism_watch_source();
+        let command = self
             .sessions
             .get(self.active)
-            .is_some_and(|s| s.terminal.is_command_running());
-        self.organism.observe_watch(owner, running);
+            .and_then(|s| s.terminal.watch_generation());
+        self.organism.observe_watch(eligible, command);
     }
 
     fn greet_companion(&mut self, target: Option<usize>) {
@@ -27155,6 +27211,7 @@ impl Frost {
                     id: s.id,
                     master_fd: s.master_fd,
                     reader_fd: Arc::clone(&s.reader_fd),
+                    watch_source: s.watch_source.clone(),
                     child_pid: s.pty.get_child_pid(),
                 })
             })
@@ -28327,6 +28384,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
             let id = key.id;
             let fd = key.master_fd;
+            let mut watch_source = key.watch_source.start();
             // Each message is capped at 1 MiB below. Two shallow handoff queues
             // keep only a few MiB resident per session while backpressuring read(2).
             let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(2);
@@ -28370,6 +28428,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                             Ok(ReaderPoll::Timeout) => continue,
                             Ok(ReaderPoll::Data) => {
                                 let mut acc: Vec<u8> = Vec::new();
+                                let mut first_read = None;
                                 let mut hangup = false;
                                 let mut errored = false;
                                 loop {
@@ -28381,6 +28440,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                                         )
                                     };
                                     if n > 0 {
+                                        first_read.get_or_insert_with(std::time::Instant::now);
                                         acc.extend_from_slice(&buf[..n as usize]);
                                         if acc.len() >= COALESCE_CAP {
                                             break;
@@ -28412,9 +28472,14 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                                     }
                                 }
                                 if !acc.is_empty()
-                                    && iced::futures::executor::block_on(
-                                        tx.send(Message::PtyOutput(id, fd, acc)),
-                                    )
+                                    && iced::futures::executor::block_on(tx.send(
+                                        Message::PtyOutput(
+                                            id,
+                                            fd,
+                                            acc,
+                                            first_read.and_then(|at| watch_source.stamp(at)),
+                                        ),
+                                    ))
                                     .is_err()
                                 {
                                     break;
@@ -28433,6 +28498,7 @@ fn pty_stream(key: PtySubscriptionKey) -> impl iced::futures::Stream<Item = Mess
                                         shutdown_raw,
                                         child_pid,
                                         &mut tx,
+                                        &mut watch_source,
                                     ) {
                                         HangupOutcome::Recovered => continue,
                                         HangupOutcome::Exited | HangupOutcome::Shutdown => break,
@@ -28489,6 +28555,7 @@ fn wait_out_hangup(
     shutdown_raw: RawFd,
     child_pid: i32,
     tx: &mut iced::futures::channel::mpsc::Sender<Message>,
+    watch_source: &mut organism_watch::SourceWriter,
 ) -> HangupOutcome {
     use iced::futures::SinkExt;
 
@@ -28507,8 +28574,10 @@ fn wait_out_hangup(
             break n;
         };
         if n > 0 {
+            let stamp = watch_source.stamp(std::time::Instant::now());
             let data = buf[..n as usize].to_vec();
-            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data))).is_err()
+            if iced::futures::executor::block_on(tx.send(Message::PtyOutput(id, fd, data, stamp)))
+                .is_err()
             {
                 return HangupOutcome::Shutdown;
             }
@@ -30161,6 +30230,58 @@ mod tests {
     }
 
     #[test]
+    fn watch_source_callback_defers_all_watch_mutation_and_restores_scope() {
+        let source = include_str!("main.rs");
+        let update = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1;
+        let (entry, output) = update
+            .split_once("            Message::PtyOutput(id, fd, data, watch_stamp) => {")
+            .unwrap();
+        assert!(
+            entry.find("watch_receiver.accept").unwrap()
+                < entry.find("freeze_watch(is_pty_output)").unwrap()
+        );
+        assert!(entry.contains("if !is_pty_output {"));
+        let output = output
+            .split_once("            Message::JshChecked(status)")
+            .unwrap()
+            .0;
+        assert_eq!(output.matches("return ").count(), 1);
+        assert!(
+            output.rfind("freeze_watch(false)").unwrap()
+                < output.find("return Task::batch(tasks)").unwrap()
+        );
+        assert!(output.contains("s.watch_source.epoch() == Some(stamp.epoch)"));
+        assert!(output.contains("e.0 == id && e.1 == fd && e.2 == stamp.epoch"));
+        assert!(
+            output.find("process_batch(&data)").unwrap()
+                < output.find("self.organism.watch_output(").unwrap()
+        );
+        assert!(output.contains("self.organism.freeze_watch(true);"));
+        assert!(!output.contains("self.sync_organism_watch()"));
+    }
+
+    #[test]
+    fn watch_source_stamp_is_created_in_both_native_handoff_paths() {
+        let source = include_str!("main.rs");
+        let stream = source.split_once("fn pty_stream(").unwrap().1;
+        let stream = stream
+            .split_once("/// Outcome of riding out a PTY hangup")
+            .unwrap()
+            .0;
+        assert!(stream.contains("let mut watch_source = key.watch_source.start();"));
+        assert!(stream.contains("const COALESCE_CAP: usize = 1 << 20"));
+        assert!(stream.contains("let mut buf = vec![0u8; 65536]"));
+        assert!(stream.contains("first_read.get_or_insert_with(std::time::Instant::now)"));
+        assert!(stream.contains("first_read.and_then(|at| watch_source.stamp(at))"));
+        let hangup = source.split_once("fn wait_out_hangup(").unwrap().1;
+        assert!(hangup.contains("let stamp = watch_source.stamp(std::time::Instant::now());"));
+        assert!(hangup.contains("Message::PtyOutput(id, fd, data, stamp)"));
+    }
+
+    #[test]
     fn watch_rhythm_uses_only_visible_running_nonempty_admitted_batches() {
         let source = include_str!("main.rs");
         let update = source
@@ -30168,7 +30289,7 @@ mod tests {
             .unwrap()
             .1;
         let output = update
-            .split_once("            Message::PtyOutput(id, fd, data) => {")
+            .split_once("            Message::PtyOutput(id, fd, data, watch_stamp) => {")
             .unwrap()
             .1;
         let output = output
@@ -30180,10 +30301,11 @@ mod tests {
             output.find("watch_batch_admitted(id)").unwrap()
                 < output.find("process_batch(&data)").unwrap()
         );
-        assert!(output.contains("watch_batch_admitted && completed_commands.is_empty()"));
-        assert!(output.contains("watch_batch_identity && !data.is_empty(),"));
-        assert!(output.contains("s.terminal.is_command_running()"));
-        assert!(output.contains("self.organism_watch_owner()"));
+        assert!(output.contains("watch_batch_admitted,"));
+        assert!(output.contains("sess.terminal.watch_batch()"));
+        assert!(output.contains("!data.is_empty(),"));
+        assert!(output.contains("sess.terminal.watch_generation()"));
+        assert!(output.contains("self.organism_watch_source()"));
         let owner = source
             .split_once("    fn organism_watch_owner(&self)")
             .unwrap()
@@ -36426,10 +36548,18 @@ mod tests {
 
         // The old implementation emitted PtyExited(-1) here, causing the live
         // child to be dropped and killed before it could reopen /dev/tty.
-        let outcome = wait_out_hangup(id, fd, fd, shutdown_r, pty.get_child_pid(), &mut tx);
+        let outcome = wait_out_hangup(
+            id,
+            fd,
+            fd,
+            shutdown_r,
+            pty.get_child_pid(),
+            &mut tx,
+            &mut organism_watch::SourceAuthority::default().start(),
+        );
         assert!(matches!(outcome, HangupOutcome::Recovered));
         let output = match iced::futures::executor::block_on(rx.next()) {
-            Some(Message::PtyOutput(msg_id, msg_fd, bytes)) => {
+            Some(Message::PtyOutput(msg_id, msg_fd, bytes, _)) => {
                 assert_eq!((msg_id, msg_fd), (id, fd));
                 bytes
             }
@@ -36451,7 +36581,15 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let outcome = wait_out_hangup(id, fd, fd, shutdown_r, pty.get_child_pid(), &mut tx);
+        let outcome = wait_out_hangup(
+            id,
+            fd,
+            fd,
+            shutdown_r,
+            pty.get_child_pid(),
+            &mut tx,
+            &mut organism_watch::SourceAuthority::default().start(),
+        );
         assert!(matches!(outcome, HangupOutcome::Exited));
         match iced::futures::executor::block_on(rx.next()) {
             Some(Message::PtyExited(msg_id, msg_fd, code)) => {
@@ -36601,7 +36739,7 @@ mod tests {
     fn activity_facts_reconcile_only_fresh_active_output_after_context_updates() {
         let source = include_str!("main.rs");
         let output = source
-            .split_once("            Message::PtyOutput(id, fd, data) => {")
+            .split_once("            Message::PtyOutput(id, fd, data, watch_stamp) => {")
             .unwrap()
             .1
             .split_once("                self.last_ingest_us =")
