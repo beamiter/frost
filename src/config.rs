@@ -121,13 +121,17 @@ pub enum TabPosition {
     Side,
 }
 
+fn default_organism_expanded() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Offline companion in the existing bottom status bar; opt-in.
     #[serde(default)]
     pub ascii_organism_enabled: bool,
-    /// Reserve a full-body companion strip above the status bar; compact by default.
-    #[serde(default)]
+    /// Reserve a full-body card by default when enabled; explicit collapse is retained.
+    #[serde(default = "default_organism_expanded")]
     pub ascii_organism_expanded: bool,
     /// Missing means Automatic (currently a disclosed Calm fallback).
     #[serde(default)]
@@ -626,7 +630,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             ascii_organism_enabled: false,
-            ascii_organism_expanded: false,
+            ascii_organism_expanded: true,
             ascii_organism_motion: None,
             jsh_update_check: default_jsh_update_check(),
             ai_enabled: false,
@@ -1258,11 +1262,11 @@ mod tests {
     }
 
     #[test]
-    fn expanded_organism_is_explicit_and_old_configs_stay_compact() {
-        assert!(!Config::default().ascii_organism_expanded);
+    fn expanded_organism_defaults_to_card_but_preserves_explicit_collapse_and_off() {
+        assert!(Config::default().ascii_organism_expanded);
         let old = Config::from_toml("ascii_organism_enabled = true\n").unwrap();
         assert!(old.ascii_organism_enabled);
-        assert!(!old.ascii_organism_expanded);
+        assert!(old.ascii_organism_expanded);
         for expanded in [false, true] {
             let config =
                 Config::from_toml(&format!("ascii_organism_expanded = {expanded}\n")).unwrap();
@@ -1273,6 +1277,29 @@ mod tests {
                 Config::from_toml(&saved).unwrap().ascii_organism_expanded,
                 expanded
             );
+        }
+        for enabled in [false, true] {
+            for expanded in [false, true] {
+                let input = format!(
+                    "ascii_organism_enabled = {enabled}\nascii_organism_expanded = {expanded}\n"
+                );
+                let parsed = Config::from_toml(&input).unwrap();
+                assert_eq!(
+                    (
+                        parsed.ascii_organism_enabled,
+                        parsed.ascii_organism_expanded
+                    ),
+                    (enabled, expanded)
+                );
+                let reloaded = Config::from_toml(&toml::to_string(&parsed).unwrap()).unwrap();
+                assert_eq!(
+                    (
+                        reloaded.ascii_organism_enabled,
+                        reloaded.ascii_organism_expanded
+                    ),
+                    (enabled, expanded)
+                );
+            }
         }
         assert!(Config::from_toml("ascii_organism_expanded = \"yes\"\n").is_err());
     }

@@ -162,6 +162,8 @@ fn chrome_height(bottom_bar: bool) -> f32 {
 
 const COMPANION_BODY_WIDTH: f32 = 200.0;
 const COMPANION_HORIZONTAL_PADDING: f32 = 10.0;
+const COMPANION_CARD_SPRITE_WIDTH: f32 = 104.0;
+const COMPANION_CARD_DETAILS_MIN_WIDTH: f32 = 360.0;
 const ORGANISM_STATUS_MIN_WIDTH: f32 = 640.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +183,9 @@ impl OrganismLayout {
     }
 }
 
-/// The expanded strip has no border. Body-only needs its existing 200-unit
-/// container plus 10 units of padding on each side; the crowded status row
-/// keeps its original threshold. All values are Iced logical layout units.
+/// Preserve the established 220-unit expanded minimum and 640-unit status
+/// threshold. The native card may show details before the crowded status row
+/// fits; its body and collapse control have priority. Iced logical units.
 fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> OrganismLayout {
     let enabled = enabled && bottom_bar && width.is_finite();
     let glyph = enabled && width >= ORGANISM_STATUS_MIN_WIDTH;
@@ -192,8 +194,40 @@ fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) 
     OrganismLayout {
         glyph,
         body,
-        explanation: body && glyph,
+        explanation: body && width >= COMPANION_CARD_DETAILS_MIN_WIDTH,
     }
+}
+
+fn companion_compact_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
+    glyph: Element<'a, Message, iced::Theme, R>,
+    toggle: Element<'a, Message, iced::Theme, R>,
+) -> iced::widget::Container<'a, Message, iced::Theme, R> {
+    container(row![glyph, toggle].align_y(iced::Alignment::Center)).width(Length::Fixed(84.0))
+}
+
+/// The same native card geometry is used by production and renderer-free tests.
+fn companion_card_content<'a, R: iced::advanced::renderer::Renderer + 'a>(
+    body: Element<'a, Message, iced::Theme, R>,
+    detail: Option<Element<'a, Message, iced::Theme, R>>,
+    toggle: Element<'a, Message, iced::Theme, R>,
+) -> iced::widget::Container<'a, Message, iced::Theme, R> {
+    let body = container(body)
+        .width(Length::Fixed(COMPANION_CARD_SPRITE_WIDTH))
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center);
+    let detail = container(detail.unwrap_or_else(|| Space::new().width(Length::Fill).into()))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center)
+        .clip(true);
+    container(
+        row![body, detail, toggle]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding([8.0, 12.0])
 }
 
 /// Explain stable layout capabilities, not transient live-owner eligibility.
@@ -220,7 +254,7 @@ fn organism_settings_hint(
     }
     let layout = organism_layout(width, enabled, expanded, bottom_bar);
     if layout.body && !layout.glyph {
-        return "This width has room for the body, but not the status glyph. Body-only has no live hover target. When idle, use Greet companion in the command palette. Preview Say hello is separate.";
+        return "This width shows the companion card with a collapse arrow, but no live hover target or status glyph. When idle, use Greet companion in the command palette. Preview Say hello is separate.";
     }
     if !layout.presentable() {
         return if organism_layout(width, enabled, true, bottom_bar).body {
@@ -234,11 +268,11 @@ fn organism_settings_hint(
     if expanded {
         organism::expanded_companion_hint(true)
     } else {
-        "This width has room for the compact status glyph. Enable Show expanded companion for a full-body layout."
+        "Use the status-bar arrow or enable Show expanded companion to keep the full body visible."
     }
 }
 
-/// Visibility changes only clear this opt-in strip; they never change its height.
+/// Live eligibility never changes the reserved card height.
 fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
     if enabled && expanded && bottom_bar {
         88.0
@@ -20671,38 +20705,57 @@ impl Frost {
                 attention_facts,
             )
         });
-        let presentation = presentation.unwrap_or_default();
+        let presentation =
+            presentation.unwrap_or_else(organism::LivePresentation::passive_presence);
         let companion_height = self.organism_strip_height();
         let companion: Element<'_, Message> = if !layout.body || presentation.explanation.is_empty()
         {
             Space::new().width(Length::Fill).into()
         } else {
-            let body = container(text(presentation.sprite.clone()).font(self.mono).size(13))
-                .width(Length::Fixed(COMPANION_BODY_WIDTH))
-                .height(Length::Fixed(72.0));
-            if layout.explanation {
-                row![
-                    body,
-                    text(presentation.explanation.clone().into_owned()).size(11)
+            // The complete shared sprite uses at most twelve monospace columns.
+            // Three rows at 13px with a fixed 16px line height fit in the card.
+            let body = text(presentation.sprite.clone())
+                .font(iced::Font::MONOSPACE)
+                .size(13)
+                .line_height(iced::widget::text::LineHeight::Absolute(16.0.into()))
+                .color(self.c_accent())
+                .into();
+            let detail = layout.explanation.then(|| {
+                column![
+                    text("ASCII organism").size(12),
+                    text(presentation.explanation.clone().into_owned())
+                        .size(11)
+                        .wrapping(text::Wrapping::WordOrGlyph),
                 ]
-                .spacing(12)
-                .align_y(iced::Alignment::Center)
+                .spacing(3)
+                .width(Length::Fill)
                 .into()
-            } else {
-                // Passive body only: do not create a second hover target.
-                body.into()
-            }
+            });
+            let accent = self.c_accent();
+            let border = blend(self.c_border(), accent, 0.35);
+            let background = self.with_window_opacity(blend(self.c_panel(), accent, 0.035));
+            companion_card_content(body, detail, self.companion_toggle(true))
+                .style(move |_| container::Style {
+                    background: Some(background.into()),
+                    border: iced::Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into()
         };
         let companion = container(companion)
             .width(Length::Fill)
             .height(Length::Fixed(companion_height))
-            // Keep shortened-window text inside its allocated chrome strip.
+            // The reserved strip is separate from the terminal, even when tiny.
             .clip(true)
-            .padding([8.0, COMPANION_HORIZONTAL_PADDING])
+            .padding([3.0, 8.0])
             .style(self.chrome_bar_style());
         if layout.glyph {
-            // Reserve the same slot while hidden/retreating so typing, focus
-            // and pane changes cannot move the ordinary status segments.
+            // Keep a still presence in the same slot while live reactions pause.
+            // Typing, focus and pane changes cannot move the status segments.
             let organism::LivePresentation {
                 glyph,
                 sprite,
@@ -20726,7 +20779,7 @@ impl Frost {
             let slot = container(
                 row![
                     text(glyph)
-                        .font(self.mono)
+                        .font(iced::Font::MONOSPACE)
                         .size(11)
                         .color(self.c_text_dim()),
                     Space::new().width(Length::Fill),
@@ -20734,26 +20787,28 @@ impl Frost {
                 ]
                 .align_y(iced::Alignment::Center),
             )
-            .width(Length::Fixed(84.0));
-            let slot: Element<'_, Message> = if explanation.is_empty() {
-                slot.into()
-            } else {
-                let detail = container(
-                    column![
-                        container(text(sprite).font(self.mono).size(13))
-                            .width(Length::Fixed(200.0))
-                            .height(Length::Fixed(72.0)),
-                        text(explanation.into_owned()).size(11),
-                    ]
-                    .spacing(8),
-                )
-                .padding(8)
-                .width(Length::Fixed(220.0))
-                .max_height(160.0)
-                // Tooltip overlays otherwise pass an unbounded draw viewport.
-                .clip(true);
-                tooltip(slot, detail, tooltip::Position::Top).into()
-            };
+            .width(Length::Fixed(64.0))
+            .clip(true);
+            let slot: Element<'_, Message> =
+                if explanation.is_empty() || !self.terminal_input_active() {
+                    slot.into()
+                } else {
+                    let detail = container(
+                        column![
+                            container(text(sprite).font(iced::Font::MONOSPACE).size(13))
+                                .width(Length::Fixed(200.0))
+                                .height(Length::Fixed(72.0)),
+                            text(explanation.into_owned()).size(11),
+                        ]
+                        .spacing(8),
+                    )
+                    .padding(8)
+                    .width(Length::Fixed(220.0))
+                    .max_height(160.0)
+                    // Tooltip overlays otherwise pass an unbounded draw viewport.
+                    .clip(true);
+                    tooltip(slot, detail, tooltip::Position::Top).into()
+                };
             let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
                 // One core offer binds both edges before the next view rebuild.
                 let mut area = mouse_area(slot);
@@ -20767,7 +20822,11 @@ impl Frost {
             } else {
                 slot
             };
-            right = right.push(slot);
+            // Separate sibling of the greeting target; never an implicit hello.
+            right = right.push(companion_compact_slot(
+                slot,
+                self.companion_toggle(self.config.ascii_organism_expanded),
+            ));
         }
         let bar = row![left, Space::new().width(Length::Fill), right]
             .spacing(12)
@@ -20783,6 +20842,32 @@ impl Frost {
             column![companion, bar].into()
         } else {
             bar
+        }
+    }
+
+    /// A native chrome action, not part of the live greeting hit area.
+    fn companion_toggle(&self, expanded: bool) -> Element<'_, Message> {
+        let available = self.focused && self.terminal_input_active();
+        let toggle = button(text(if expanded { "v" } else { "^" }).size(11))
+            .width(Length::Fixed(20.0))
+            .height(Length::Fixed(STATUS_BAR_H))
+            .padding(0)
+            .on_press_maybe(available.then_some(Message::SetOrganismExpanded(!expanded)))
+            .style(self.ghost_btn_style());
+        if available {
+            tooltip(
+                toggle,
+                text(if expanded {
+                    "Collapse companion"
+                } else {
+                    "Keep companion expanded"
+                })
+                .size(11),
+                tooltip::Position::Top,
+            )
+            .into()
+        } else {
+            toggle.into()
         }
     }
 
@@ -29484,7 +29569,7 @@ mod tests {
         assert!(tooltip.contains(".width(Length::Fixed(220.0))"));
         assert!(tooltip.contains(".max_height(160.0)"));
         assert!(tooltip.contains(".clip(true)"));
-        assert_eq!(bar.matches(".clip(true)").count(), 2);
+        assert_eq!(bar.matches(".clip(true)").count(), 3);
     }
 
     #[test]
@@ -29609,7 +29694,7 @@ mod tests {
             assert!(body_only.contains("no live hover target"));
             assert!(body_only.contains("Preview Say hello is separate"));
         }
-        assert!(organism_settings_hint(640.0, true, false, true).contains("compact status glyph"));
+        assert!(organism_settings_hint(640.0, true, false, true).contains("status-bar arrow"));
         assert_eq!(
             organism_settings_hint(640.0, true, true, true),
             organism::expanded_companion_hint(true)
@@ -29623,7 +29708,7 @@ mod tests {
             .split_once("fn organism_settings_hint(")
             .unwrap()
             .1
-            .split_once("/// Visibility changes only clear")
+            .split_once("fn companion_strip_height(")
             .unwrap()
             .0;
         assert!(helper.contains("organism_layout(width, enabled, expanded, bottom_bar)"));
@@ -29665,7 +29750,10 @@ mod tests {
             let expanded = organism_layout(width, true, true, true);
             assert!(expanded.body);
             assert!(!expanded.glyph);
-            assert!(!expanded.explanation);
+            assert_eq!(
+                expanded.explanation,
+                width >= COMPANION_CARD_DETAILS_MIN_WIDTH
+            );
             assert!(!organism_layout(width, true, false, true).presentable());
         }
         assert_eq!(
@@ -29796,7 +29884,7 @@ mod tests {
             .0;
         assert!(bar.contains("let layout = self.organism_layout()"));
         assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
-        assert!(bar.contains("if layout.explanation"));
+        assert!(bar.contains("layout.explanation.then("));
         assert!(bar.contains("if layout.glyph"));
         assert_eq!(
             bar.matches(".on_enter(Message::OrganismHoverEnter(")
@@ -29919,7 +30007,139 @@ mod tests {
     }
 
     #[test]
-    fn live_sprite_detail_remains_inside_the_existing_visible_owner_gate() {
+    fn passive_companion_does_not_expand_live_admission_or_add_wakes() {
+        let source = include_str!("main.rs");
+        let bar = source
+            .split_once("    fn status_bar(&self)")
+            .unwrap()
+            .1
+            .split_once("    /// One-line offer")
+            .unwrap()
+            .0;
+        assert!(bar
+            .contains("presentation.unwrap_or_else(organism::LivePresentation::passive_presence)"));
+        assert!(bar.contains("if explanation.is_empty() || !self.terminal_input_active()"));
+        assert!(bar
+            .contains("let slot: Element<'_, Message> = if let Some(id) = self.organism_owner()"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
+        assert!(!bar.contains("greet_live("));
+        assert!(!bar.contains("KnownIdle"));
+        assert!(!bar.contains("time::every"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        for gate in [
+            "!self.focused",
+            "!self.terminal_input_active()",
+            "!s.managed_remote",
+            "!s.transcript_read_only()",
+            "!s.terminal.is_alt_buffer_active()",
+            "self.organism.is_local(s.id)",
+        ] {
+            assert!(owner.contains(gate), "missing live gate: {gate}");
+        }
+    }
+
+    #[test]
+    fn companion_chrome_click_is_not_redispatched_as_terminal_mouse_input() {
+        let source = include_str!("main.rs");
+        let subs = source.split_once("    fn subscription(&self)").unwrap().1;
+        let subs = subs.split_once("\n    fn ").unwrap().0;
+        assert!(!subs.contains("Message::MousePane"));
+        assert!(!subs.contains("MouseInput::"));
+        let observer = subs
+            .split_once("// Observe without consuming or rerouting")
+            .unwrap()
+            .1
+            .split_once("// A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(observer.contains("Some(Message::OrganismPointerButton(button, true))"));
+        assert!(observer.contains("Some(Message::OrganismPointerButton(button, false))"));
+        let handler = source
+            .split_once("            Message::OrganismPointerButton(button, pressed) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismPointerLeft")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "write_pty",
+            "write_paste",
+            "MousePane",
+            "greet_live",
+            "handle_mouse",
+        ] {
+            assert!(!handler.contains(forbidden));
+        }
+        let terminal = include_str!("terminal_view.rs");
+        let press = terminal
+            .split_once("Event::Mouse(mouse::Event::ButtonPressed(btn)) => {")
+            .unwrap()
+            .1
+            .split_once("Event::Mouse(mouse::Event::ButtonReleased")
+            .unwrap()
+            .0;
+        assert!(
+            press.find("cursor.position_over(bounds)").unwrap()
+                < press.find("self.cell_at(pos, bounds)").unwrap()
+        );
+        assert!(terminal.contains("state.published_presses[button.slot()]"));
+        assert!(terminal.contains("if !state.dragging"));
+    }
+
+    #[test]
+    fn companion_toggle_is_separate_config_chrome_without_terminal_or_greeting_actions() {
+        let source = include_str!("main.rs");
+        let bar = source
+            .split_once("    fn status_bar(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn companion_toggle(")
+            .unwrap()
+            .0;
+        assert!(bar.contains("self.companion_toggle(self.config.ascii_organism_expanded)"));
+        assert!(bar.contains("companion_card_content(body, detail, self.companion_toggle(true))"));
+        assert!(bar.contains("companion_compact_slot("));
+        let toggle = source
+            .split_once("    fn companion_toggle(")
+            .unwrap()
+            .1
+            .split_once("    /// One-line offer")
+            .unwrap()
+            .0;
+        assert!(toggle.contains("self.focused && self.terminal_input_active()"));
+        assert!(toggle.contains("available.then_some(Message::SetOrganismExpanded(!expanded))"));
+        assert!(toggle.contains("Length::Fixed(20.0)"));
+        assert!(toggle.contains("if available {"));
+        assert!(!toggle.contains("mouse_area"));
+        assert!(!toggle.contains("OrganismHover"));
+        assert!(!toggle.contains("OrganismHello"));
+        let handler = source
+            .split_once("            Message::SetOrganismExpanded(expanded) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetOrganismMotion")
+            .unwrap()
+            .0;
+        assert!(handler.contains("self.config.ascii_organism_expanded = expanded"));
+        assert!(handler.contains("self.config_dirty = true"));
+        assert!(handler.contains("self.apply_config()"));
+        for forbidden in ["greet_", "write_pty", "write_paste", "focus(", "KnownIdle"] {
+            assert!(!handler.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn live_sprite_detail_keeps_passive_presence_separate_from_live_owner_gate() {
         let source = include_str!("main.rs");
         let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let slot = bar
@@ -29930,10 +30150,11 @@ mod tests {
             .split_once("            let slot: Element<'_, Message> = if let Some(id)")
             .unwrap()
             .0;
-        assert!(slot.contains("presentation.unwrap_or_default()"));
-        assert!(slot.contains("if explanation.is_empty()"));
-        assert!(slot.contains("Length::Fixed(84.0)"));
-        assert!(slot.contains("text(sprite).font(self.mono)"));
+        assert!(slot
+            .contains("presentation.unwrap_or_else(organism::LivePresentation::passive_presence)"));
+        assert!(slot.contains("if explanation.is_empty() || !self.terminal_input_active()"));
+        assert!(slot.contains("Length::Fixed(64.0)"));
+        assert!(slot.contains("text(sprite).font(iced::Font::MONOSPACE)"));
         assert!(slot.contains(".max_height(160.0)"));
         assert!(slot.contains("tooltip(slot, detail, tooltip::Position::Top)"));
         assert!(!slot.contains("on_press"));
@@ -36827,7 +37048,8 @@ mod tests {
         assert!(glyph.contains("background: candidate_visible.then_some(cue_color.into())"));
         assert!(glyph.contains(".width(Length::Fixed(2.0))"));
         assert!(glyph.contains(".height(Length::Fixed(2.0))"));
-        assert!(glyph.contains(".width(Length::Fixed(84.0))"));
+        assert!(glyph.contains(".width(Length::Fixed(64.0))"));
+        assert!(glyph.contains("companion_compact_slot("));
         assert!(!bar.contains("time::"));
         assert!(!bar.contains("Behavior::"));
         assert_eq!(
@@ -36847,7 +37069,7 @@ mod tests {
             .split_once("    fn jsh_notice(")
             .unwrap()
             .0;
-        assert!(bar.contains("Length::Fixed(84.0)"));
+        assert!(bar.contains("companion_compact_slot("));
         assert!(bar.contains(".on_enter(Message::OrganismHoverEnter("));
         assert!(bar.contains("self.organism.live_greeting_offer(id)"));
         assert!(bar.contains(".on_exit(Message::OrganismHoverExit(id, ticket))"));

@@ -190,6 +190,125 @@ mod tests {
     }
 
     #[test]
+    fn companion_compact_toggle_captures_click_without_greeting_or_terminal_delivery() {
+        use crate::{
+            companion_compact_slot,
+            organism::{AttentionFacts, Organism},
+            Message,
+        };
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.sync_live_attention_owner(Some(1));
+        let offer = organism.live_greeting_offer(1).unwrap();
+        let area = iced::widget::mouse_area(Space::new().width(64).height(22))
+            .on_enter(Message::OrganismHoverEnter(1, offer))
+            .on_exit(Message::OrganismHoverExit(1, offer));
+        let toggle = button(Space::new())
+            .width(20)
+            .height(22)
+            .padding(0)
+            .on_press(Message::SetOrganismExpanded(true));
+        let mut element: Element<'_, Message, iced::Theme, TestRenderer> =
+            companion_compact_slot(area.into(), toggle.into()).into();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &TestRenderer,
+            &layout::Limits::new(Size::ZERO, Size::new(100.0, 100.0)),
+        );
+        let mut messages = Vec::new();
+        let arrow = iced::Point::new(74.0, 11.0);
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(arrow),
+                &TestRenderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(Size::new(100.0, 100.0)),
+            );
+            // Test native widget capture here; the source/geometry regression
+            // separately verifies that chrome is not rerouted into terminal input.
+            assert!(shell.is_event_captured());
+        }
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], Message::SetOrganismExpanded(true)));
+        assert!(organism
+            .live_greeting_snapshot(AttentionFacts::known_idle_for_test(true, true))
+            .unwrap()
+            .candidate
+            .is_none());
+        messages.clear();
+        for position in [iced::Point::new(10.0, 11.0), arrow] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved { position }),
+                Layout::new(&node),
+                mouse::Cursor::Available(position),
+                &TestRenderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(100.0, 100.0)),
+            );
+        }
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0], Message::OrganismHoverEnter(1, _)));
+        assert!(matches!(messages[1], Message::OrganismHoverExit(1, _)));
+    }
+
+    #[test]
+    fn companion_card_native_layout_keeps_body_and_collapse_in_reserved_chrome() {
+        use crate::{companion_card_content, companion_strip_height, organism_layout, Message};
+        for width in [220.0, 359.99, 360.0, 639.99, 640.0, 1024.0] {
+            let layout = organism_layout(width, true, true, true);
+            let body: Element<'_, Message, iced::Theme, TestRenderer> =
+                Space::new().width(94).height(48).into();
+            let detail = layout.explanation.then(|| {
+                iced::widget::container(Space::new().width(4000).height(4000))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            });
+            let toggle = button(Space::new())
+                .width(20)
+                .height(22)
+                .padding(0)
+                .on_press(Message::SetOrganismExpanded(false));
+            let mut card: Element<'_, Message, iced::Theme, TestRenderer> =
+                companion_card_content(body, detail, toggle.into()).into();
+            let mut tree = Tree::new(card.as_widget());
+            let node = card.as_widget_mut().layout(
+                &mut tree,
+                &TestRenderer,
+                &layout::Limits::new(
+                    Size::ZERO,
+                    Size::new(width - 16.0, companion_strip_height(true, true, true) - 6.0),
+                ),
+            );
+            let row = &node.children()[0];
+            let body = &row.children()[0];
+            let detail = &row.children()[1];
+            let toggle = &row.children()[2];
+            assert_eq!(body.bounds().width, crate::COMPANION_CARD_SPRITE_WIDTH);
+            assert!(body.bounds().height >= 48.0);
+            assert_eq!(body.children()[0].bounds().height, 48.0);
+            assert!(body.bounds().x + body.bounds().width <= detail.bounds().x);
+            assert!(detail.bounds().x + detail.bounds().width <= toggle.bounds().x);
+            assert_eq!(toggle.bounds().width, 20.0);
+            assert!(toggle.bounds().x + toggle.bounds().width <= row.bounds().width + 0.01);
+            assert!(node.bounds().height <= 82.0);
+        }
+    }
+
+    #[test]
     fn mouse_area_queues_same_offer_enter_and_exit_before_view_rebuild() {
         use crate::{
             organism::{AttentionFacts, Organism},
@@ -277,7 +396,7 @@ mod tests {
     // Exercise the real pinned Container draw boundary without fonts or a GPU.
     struct ViewportSpy<'a>(&'a std::cell::Cell<Option<Rectangle>>);
 
-    impl Widget<(), iced::Theme, TestRenderer> for ViewportSpy<'_> {
+    impl<Message> Widget<Message, iced::Theme, TestRenderer> for ViewportSpy<'_> {
         fn size(&self) -> Size<Length> {
             Size::new(Length::Fill, Length::Fill)
         }
@@ -302,6 +421,58 @@ mod tests {
             viewport: &Rectangle,
         ) {
             self.0.set(Some(*viewport));
+        }
+    }
+
+    #[test]
+    fn companion_card_short_viewports_clip_body_and_details_without_terminal_overlap() {
+        use crate::{companion_card_content, Message};
+        for height in [0.0, 1.0, 8.0, 40.0, 88.0] {
+            let body_viewport = std::cell::Cell::new(None);
+            let detail_viewport = std::cell::Cell::new(None);
+            let body = Element::new(ViewportSpy(&body_viewport));
+            let detail = Element::new(ViewportSpy(&detail_viewport));
+            let toggle = button(Space::new())
+                .width(20)
+                .height(22)
+                .padding(0)
+                .on_press(Message::SetOrganismExpanded(false));
+            let card = companion_card_content(body, Some(detail), toggle.into());
+            let mut strip: Element<'_, Message, iced::Theme, TestRenderer> =
+                iced::widget::container(card)
+                    .width(640)
+                    .height(88)
+                    .padding([3.0, 8.0])
+                    .clip(true)
+                    .into();
+            let mut tree = Tree::new(strip.as_widget());
+            let node = strip.as_widget_mut().layout(
+                &mut tree,
+                &TestRenderer,
+                &layout::Limits::new(Size::ZERO, Size::new(640.0, height)),
+            );
+            strip.as_widget().draw(
+                &tree,
+                &mut TestRenderer,
+                &iced::Theme::Dark,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &Rectangle::with_size(Size::INFINITE),
+            );
+            assert!(node.bounds().height <= height);
+            if height == 88.0 {
+                assert!(body_viewport.get().is_some());
+                assert!(detail_viewport.get().is_some());
+            }
+            for seen in [body_viewport.get(), detail_viewport.get()]
+                .into_iter()
+                .flatten()
+            {
+                assert!(seen.x >= 0.0 && seen.y >= 0.0);
+                assert!(seen.x + seen.width <= node.bounds().width + 0.01);
+                assert!(seen.y + seen.height <= node.bounds().height + 0.01);
+            }
         }
     }
 

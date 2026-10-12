@@ -121,7 +121,7 @@ impl fmt::Display for MotionChoice {
 
 pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
     if bottom_bar {
-        "Reserves a fixed-height strip above the bottom bar. When space allows, narrow windows show only the body. It stays blank while hidden; hover the status-bar glyph in a wider window to greet."
+        "Reserves a fixed-height strip above the bottom bar. Narrow windows prioritize the body and collapse arrow. A still companion remains when live reactions pause. Use the status-bar arrow to collapse or expand; hover the glyph in a wider window for details."
     } else {
         "Turn on Bottom status bar (cwd, git, last command) to show the live companion."
     }
@@ -298,6 +298,19 @@ pub struct LivePresentation {
     pub glyph: String,
     pub sprite: String,
     pub explanation: Cow<'static, str>,
+}
+
+impl LivePresentation {
+    /// Paint-only fallback for reserved chrome, never evidence of shell idleness.
+    /// No owner, live facts, physiology, or animation clock is consulted here.
+    pub fn passive_presence() -> Self {
+        let context = PreviewPose::Calm.context();
+        Self {
+            glyph: sticky_glyph_with_context(context, 0).into_owned(),
+            sprite: sprite_frame_with_context(context, 0).into_owned(),
+            explanation: Cow::Borrowed("Quietly here. Live reactions are paused in this context."),
+        }
+    }
 }
 
 /// Describe only the output rhythm already selected for this render snapshot.
@@ -1175,6 +1188,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_shared_pose_and_transition_fits_the_three_line_companion_card() {
+        use jterm_core::organism::{
+            Behavior, BodyLanguage, RenderContext, VisualGrowthStage, VisualTransition, WatchRhythm,
+        };
+        let behaviors = [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ];
+        let check = |context, frame| {
+            let sprite = sprite_frame_with_context(context, frame);
+            assert_eq!(sprite.lines().count(), 3, "{context:?} frame={frame}");
+            assert!(
+                sprite.lines().all(|line| line.chars().count() <= 12),
+                "{context:?} frame={frame}: {sprite}"
+            );
+        };
+        for behavior in behaviors {
+            for bits in 0..8 {
+                let language = BodyLanguage {
+                    drowsy: bits & 1 != 0,
+                    tense: bits & 2 != 0,
+                    listless: bits & 4 != 0,
+                };
+                for walking in [false, true] {
+                    for rhythm in [
+                        WatchRhythm::Steady,
+                        WatchRhythm::Busy,
+                        WatchRhythm::Waiting,
+                        WatchRhythm::Resumed,
+                    ] {
+                        for stage in [
+                            VisualGrowthStage::Juvenile,
+                            VisualGrowthStage::Adult,
+                            VisualGrowthStage::Seasoned,
+                        ] {
+                            let context = RenderContext::new(behavior, language, walking)
+                                .with_watch_rhythm(rhythm)
+                                .with_growth_stage(stage);
+                            for frame in 0..130 {
+                                check(context, frame);
+                            }
+                        }
+                    }
+                }
+            }
+            for target in behaviors {
+                if let Some(transition) = VisualTransition::between(behavior, target) {
+                    for stage in [
+                        VisualGrowthStage::Juvenile,
+                        VisualGrowthStage::Adult,
+                        VisualGrowthStage::Seasoned,
+                    ] {
+                        let context = RenderContext::new(target, BodyLanguage::default(), false)
+                            .with_growth_stage(stage)
+                            .with_transition(Some(transition));
+                        for frame in 0..transition.frame_count() {
+                            check(context, frame);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn passive_presence_is_nonempty_static_and_does_not_claim_shell_idle() {
+        let first = LivePresentation::passive_presence();
+        let second = LivePresentation::passive_presence();
+        assert!(!first.glyph.is_empty());
+        assert!(!first.sprite.is_empty());
+        assert_eq!(first.glyph, second.glyph);
+        assert_eq!(first.sprite, second.sprite);
+        assert!(first.glyph.chars().count() <= 9);
+        assert!(first.explanation.contains("Live reactions are paused"));
+        assert!(!first.explanation.contains("idle"));
+        assert!(!first.explanation.contains("between commands"));
+    }
+
+    #[test]
+    fn passive_presence_is_pure_rendering_without_owner_attention_or_clock() {
+        let source = include_str!("organism.rs");
+        let passive = source
+            .split_once("impl LivePresentation {")
+            .unwrap()
+            .1
+            .split_once("/// Describe only the output rhythm")
+            .unwrap()
+            .0;
+        assert!(passive.contains("sticky_glyph_with_context(context, 0)"));
+        assert!(passive.contains("sprite_frame_with_context(context, 0)"));
+        for forbidden in [
+            "LiveActivityKnowledge",
+            "live_attention",
+            "Instant::",
+            "Duration::",
+            "&mut",
+            "self.",
+            "command_started",
+            "deadline",
+            "advance(",
+        ] {
+            assert!(!passive.contains(forbidden));
+        }
+    }
+
     fn values(state: LifeState) -> [f32; 8] {
         [
             state.energy,
@@ -1750,7 +1885,7 @@ mod tests {
         assert!(
             expanded_companion_hint(false).contains("Bottom status bar (cwd, git, last command)")
         );
-        assert!(expanded_companion_hint(true).contains("stays blank while hidden"));
+        assert!(expanded_companion_hint(true).contains("still companion remains"));
     }
 
     #[test]
