@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn companion_action_is_palette_only_and_target_survives_query_until_close() {
+    fn companion_action_is_unbound_by_default_and_target_survives_query_until_close() {
         let mut palette = PaletteState::new();
         palette.open();
         assert_eq!(palette.selected_action(), Some(PaletteAction::NewTab));
@@ -925,7 +925,11 @@ mod tests {
             Some(PaletteAction::GreetCompanion)
         );
         let (index, item) = palette.filtered()[0];
-        assert_eq!(item.binding, None);
+        assert_eq!(item.binding, Some("organism:hello"));
+        assert_eq!(
+            item.shortcut_label(&crate::keybindings::KeyBindings::default_bindings()),
+            None
+        );
         assert!(item.shortcut.is_empty());
         assert_eq!(
             palette.action_at(&epoch, index),
