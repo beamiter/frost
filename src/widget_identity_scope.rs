@@ -191,7 +191,10 @@ mod tests {
 
     #[test]
     fn mouse_area_queues_same_offer_enter_and_exit_before_view_rebuild() {
-        use crate::{organism::Organism, Message};
+        use crate::{
+            organism::{AttentionFacts, Organism},
+            Message,
+        };
         let mut organism = Organism::default();
         organism.set_enabled(true);
         for id in [1, 2] {
@@ -231,31 +234,41 @@ mod tests {
         match messages[0] {
             Message::OrganismHoverEnter(id, ticket) => {
                 assert_eq!((id, ticket), (1, offer));
-                organism.enter_live_greeting(id, ticket, true, true);
+                organism.enter_live_greeting(
+                    id,
+                    ticket,
+                    AttentionFacts::known_idle_for_test(true, true),
+                );
             }
             _ => panic!("expected native enter"),
         }
         assert!(organism
-            .live_greeting_snapshot(true, true)
+            .live_greeting_snapshot(AttentionFacts::known_idle_for_test(true, true))
             .unwrap()
             .candidate
             .is_some());
         match messages[1] {
             Message::OrganismHoverExit(id, ticket) => {
                 assert_eq!((id, ticket), (1, offer));
-                organism.exit_live_greeting(id, ticket, true, true);
+                organism.exit_live_greeting(
+                    id,
+                    ticket,
+                    AttentionFacts::known_idle_for_test(true, true),
+                );
             }
             _ => panic!("expected native exit"),
         }
-        let snapshot = organism.live_greeting_snapshot(true, true).unwrap();
+        let snapshot = organism
+            .live_greeting_snapshot(AttentionFacts::known_idle_for_test(true, true))
+            .unwrap();
         assert!(snapshot.entry.is_none());
         assert!(snapshot.candidate.is_none());
         organism.sync_live_attention_owner(Some(2));
         let new_offer = organism.live_greeting_offer(2).unwrap();
-        organism.enter_live_greeting(1, offer, true, true);
+        organism.enter_live_greeting(1, offer, AttentionFacts::known_idle_for_test(true, true));
         assert_eq!(organism.live_greeting_offer(2), Some(new_offer));
         assert!(organism
-            .live_greeting_snapshot(true, true)
+            .live_greeting_snapshot(AttentionFacts::known_idle_for_test(true, true))
             .unwrap()
             .candidate
             .is_none());

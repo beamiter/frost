@@ -7,8 +7,9 @@
 use crate::organism_preview::{PreviewAction, PreviewRequest, PreviewSequence};
 use crate::organism_watch::WatchObservation;
 use jterm_core::organism_live::{
-    LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
-    LiveAttentionRejection, LiveAttentionSnapshot, LiveAttentionSource, LiveAttentionTicket,
+    LiveActivityKnowledge, LiveAttention, LiveAttentionEvent, LiveAttentionInput,
+    LiveAttentionOutcome, LiveAttentionRejection, LiveAttentionSnapshot, LiveAttentionSource,
+    LiveAttentionTicket,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -22,6 +23,25 @@ use jterm_core::organism::{
 };
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
+
+/// Current native admission facts; no controller state or timing policy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttentionFacts {
+    pub eligible: bool,
+    pub hover_available: bool,
+    pub activity: LiveActivityKnowledge,
+}
+
+impl AttentionFacts {
+    #[cfg(test)]
+    pub(crate) fn known_idle_for_test(eligible: bool, hover_available: bool) -> Self {
+        Self {
+            eligible,
+            hover_available,
+            activity: LiveActivityKnowledge::KnownIdle,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -727,7 +747,7 @@ impl Organism {
         }
     }
 
-    fn live_input(&self, id: usize, eligible: bool, hover_available: bool) -> LiveAttentionInput {
+    fn live_input(&self, id: usize, facts: AttentionFacts) -> LiveAttentionInput {
         let base_context = self
             .sessions
             .get(&id)
@@ -735,8 +755,9 @@ impl Organism {
             .unwrap_or_else(|| PreviewPose::Calm.context());
         LiveAttentionInput {
             base_context,
-            hard_eligible: eligible && self.enabled && self.is_local(id),
-            hover_available,
+            hard_eligible: facts.eligible && self.enabled && self.is_local(id),
+            activity: facts.activity,
+            hover_available: facts.hover_available,
             pointer_inside: self.live_pointer_inside,
         }
     }
@@ -761,8 +782,7 @@ impl Organism {
         &mut self,
         id: usize,
         ticket: LiveAttentionTicket,
-        eligible: bool,
-        hover_available: bool,
+        facts: AttentionFacts,
     ) {
         // A stale widget cannot rewrite even native pointer facts.
         if self.live_attention.owner() != Some(&id)
@@ -771,7 +791,7 @@ impl Organism {
             return;
         }
         self.live_pointer_inside = true;
-        let input = self.live_input(id, eligible, hover_available);
+        let input = self.live_input(id, facts);
         let _ = self.live_attention.advance(
             self.born.elapsed(),
             &id,
@@ -784,8 +804,7 @@ impl Organism {
         &mut self,
         id: usize,
         ticket: LiveAttentionTicket,
-        eligible: bool,
-        hover_available: bool,
+        facts: AttentionFacts,
     ) {
         if self.live_attention.owner() != Some(&id)
             || self.live_attention.entry_ticket() != Some(ticket)
@@ -793,7 +812,7 @@ impl Organism {
             return;
         }
         self.live_pointer_inside = false;
-        let input = self.live_input(id, eligible, hover_available);
+        let input = self.live_input(id, facts);
         let _ = self.live_attention.advance(
             self.born.elapsed(),
             &id,
@@ -802,11 +821,11 @@ impl Organism {
         );
     }
 
-    pub fn leave_live_greeting(&mut self, eligible: bool, hover_available: bool) {
+    pub fn leave_live_greeting(&mut self, facts: AttentionFacts) {
         self.live_pointer_inside = false;
         if let Some(owner) = self.live_attention.owner().copied() {
             if let Some(ticket) = self.live_attention.entry_ticket() {
-                let input = self.live_input(owner, eligible, hover_available);
+                let input = self.live_input(owner, facts);
                 let _ = self.live_attention.advance(
                     self.born.elapsed(),
                     &owner,
@@ -819,15 +838,10 @@ impl Organism {
         }
     }
 
-    pub fn poll_live_greeting(
-        &mut self,
-        owner: Option<usize>,
-        eligible: bool,
-        hover_available: bool,
-    ) {
+    pub fn poll_live_greeting(&mut self, owner: Option<usize>, facts: AttentionFacts) {
         self.sync_live_attention_owner(owner);
         if let Some(owner) = owner {
-            let input = self.live_input(owner, eligible, hover_available);
+            let input = self.live_input(owner, facts);
             let _ = self.live_attention.advance(
                 self.born.elapsed(),
                 &owner,
@@ -837,13 +851,8 @@ impl Organism {
         }
     }
 
-    pub fn greet_live(
-        &mut self,
-        id: usize,
-        eligible: bool,
-        hover_available: bool,
-    ) -> LiveAttentionOutcome {
-        let input = self.live_input(id, eligible, hover_available);
+    pub fn greet_live(&mut self, id: usize, facts: AttentionFacts) -> LiveAttentionOutcome {
+        let input = self.live_input(id, facts);
         self.live_attention
             .advance(
                 self.born.elapsed(),
@@ -857,41 +866,28 @@ impl Organism {
             ))
     }
 
-    pub fn live_greeting_snapshot(
-        &self,
-        eligible: bool,
-        hover_available: bool,
-    ) -> Option<LiveAttentionSnapshot> {
+    pub fn live_greeting_snapshot(&self, facts: AttentionFacts) -> Option<LiveAttentionSnapshot> {
         let owner = self.live_attention.owner().copied()?;
         self.live_attention
-            .snapshot(
-                self.born.elapsed(),
-                &owner,
-                self.live_input(owner, eligible, hover_available),
-            )
+            .snapshot(self.born.elapsed(), &owner, self.live_input(owner, facts))
             .ok()
     }
 
-    pub fn live_greeting_candidate_visible(
-        &self,
-        id: usize,
-        eligible: bool,
-        hover_available: bool,
-    ) -> bool {
+    pub fn live_greeting_candidate_visible(&self, id: usize, facts: AttentionFacts) -> bool {
         self.live_attention.owner() == Some(&id)
             && self
-                .live_greeting_snapshot(eligible, hover_available)
+                .live_greeting_snapshot(facts)
                 .is_some_and(|snapshot| snapshot.candidate_visible)
     }
 
-    pub fn explicit_greeting_active(&self, eligible: bool, hover_available: bool) -> bool {
-        self.live_greeting_snapshot(eligible, hover_available)
+    pub fn explicit_greeting_active(&self, facts: AttentionFacts) -> bool {
+        self.live_greeting_snapshot(facts)
             .and_then(|snapshot| snapshot.active)
             .is_some_and(|active| active.source == LiveAttentionSource::Explicit)
     }
 
-    pub fn live_greeting_deadline(&self, eligible: bool, hover_available: bool) -> Option<Instant> {
-        self.live_greeting_snapshot(eligible, hover_available)?
+    pub fn live_greeting_deadline(&self, facts: AttentionFacts) -> Option<Instant> {
+        self.live_greeting_snapshot(facts)?
             .next_deadline()
             .and_then(|deadline| self.born.checked_add(deadline))
     }
@@ -910,8 +906,7 @@ impl Organism {
         running: bool,
         settled: bool,
         motion: Option<Motion>,
-        eligible: bool,
-        hover_available: bool,
+        facts: AttentionFacts,
     ) -> LivePresentation {
         self.presentation_at_with_attention(
             id,
@@ -919,7 +914,7 @@ impl Organism {
             settled,
             motion,
             self.born.elapsed(),
-            (eligible, hover_available, self.live_pointer_inside),
+            (facts, self.live_pointer_inside),
         )
     }
 
@@ -949,7 +944,10 @@ impl Organism {
             settled,
             motion,
             now,
-            (true, true, self.live_attention.entry_ticket().is_some()),
+            (
+                AttentionFacts::known_idle_for_test(true, true),
+                self.live_attention.entry_ticket().is_some(),
+            ),
         )
     }
 
@@ -960,9 +958,9 @@ impl Organism {
         settled: bool,
         motion: Option<Motion>,
         now: Duration,
-        native: (bool, bool, bool),
+        native: (AttentionFacts, bool),
     ) -> LivePresentation {
-        let (eligible, hover_available, pointer_inside) = native;
+        let (facts, pointer_inside) = native;
         let context = if running {
             // Display only. No fabricated Start is fed into the life reducer.
             let behavior = if settled {
@@ -996,8 +994,9 @@ impl Organism {
                     &id,
                     LiveAttentionInput {
                         base_context: context,
-                        hard_eligible: eligible && self.enabled && self.is_local(id),
-                        hover_available,
+                        hard_eligible: facts.eligible && self.enabled && self.is_local(id),
+                        activity: facts.activity,
+                        hover_available: facts.hover_available,
                         pointer_inside,
                     },
                 )
@@ -1092,6 +1091,7 @@ mod tests {
         LiveAttentionInput {
             base_context: context,
             hard_eligible: eligible,
+            activity: LiveActivityKnowledge::KnownIdle,
             hover_available: true,
             pointer_inside: inside,
         }
@@ -1389,7 +1389,7 @@ mod tests {
             let eligible = !organism.is_retreating();
             assert_eq!(eligible, !has_prior_input);
             assert_eq!(
-                organism.greet_live(1, eligible, true),
+                organism.greet_live(1, AttentionFacts::known_idle_for_test(eligible, true)),
                 if has_prior_input {
                     LiveAttentionOutcome::Rejected(LiveAttentionRejection::Unavailable)
                 } else {
@@ -1499,17 +1499,17 @@ mod tests {
         let preview_ready = organism.preview_deadlines.ready_at;
         organism.sync_live_attention_owner(Some(1));
         assert_eq!(
-            organism.greet_live(1, true, true),
+            organism.greet_live(1, AttentionFacts::known_idle_for_test(true, true)),
             LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
         );
         assert_eq!(values(organism.life.state()), before);
         assert_eq!(organism.preview_deadlines.ready_at, preview_ready);
         assert_eq!(
-            organism.greet_live(1, true, true),
+            organism.greet_live(1, AttentionFacts::known_idle_for_test(true, true)),
             LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
         );
         assert_eq!(
-            organism.greet_live(99, true, true),
+            organism.greet_live(99, AttentionFacts::known_idle_for_test(true, true)),
             LiveAttentionOutcome::Rejected(LiveAttentionRejection::Unavailable)
         );
     }
@@ -1630,16 +1630,16 @@ mod tests {
         organism.sync_live_attention_owner(Some(1));
         let old = organism.live_greeting_offer(1).unwrap();
         organism.cancel_live_greeting();
-        organism.enter_live_greeting(1, old, true, true);
+        organism.enter_live_greeting(1, old, AttentionFacts::known_idle_for_test(true, true));
         assert!(!organism.live_pointer_inside);
         let ticket = organism.live_greeting_offer(1).unwrap();
-        organism.enter_live_greeting(1, ticket, true, true);
+        organism.enter_live_greeting(1, ticket, AttentionFacts::known_idle_for_test(true, true));
         assert!(organism.live_pointer_inside);
         assert_eq!(organism.live_greeting_exit_reference(1), Some(ticket));
-        organism.exit_live_greeting(1, old, true, true);
+        organism.exit_live_greeting(1, old, AttentionFacts::known_idle_for_test(true, true));
         assert!(organism.live_pointer_inside);
         // The same captured offer exits correctly without an intervening view.
-        organism.exit_live_greeting(1, ticket, true, true);
+        organism.exit_live_greeting(1, ticket, AttentionFacts::known_idle_for_test(true, true));
         assert!(!organism.live_pointer_inside);
         assert_eq!(organism.live_attention.entry_ticket(), None);
     }
@@ -1652,7 +1652,7 @@ mod tests {
         organism.set_remote(1, false);
         organism.sync_live_attention_owner(Some(1));
         let ticket = organism.live_greeting_offer(1).unwrap();
-        organism.enter_live_greeting(1, ticket, true, true);
+        organism.enter_live_greeting(1, ticket, AttentionFacts::known_idle_for_test(true, true));
         organism.accepted_input();
         organism.live_attention.test_advance(
             Some(1),
@@ -2120,8 +2120,14 @@ mod tests {
                 }
                 organism.sync_live_attention_owner(Some(1));
                 let ticket = organism.live_greeting_offer(1).unwrap();
-                organism.enter_live_greeting(1, ticket, true, true);
-                assert!(organism.live_greeting_deadline(true, true).is_some());
+                organism.enter_live_greeting(
+                    1,
+                    ticket,
+                    AttentionFacts::known_idle_for_test(true, true),
+                );
+                assert!(organism
+                    .live_greeting_deadline(AttentionFacts::known_idle_for_test(true, true))
+                    .is_some());
                 match event {
                     "remote" => organism.set_remote(target, true),
                     "forget" => organism.forget_session(target),
@@ -2129,7 +2135,9 @@ mod tests {
                     _ => organism.batch_finished(target, true),
                 }
                 assert_eq!(
-                    organism.live_greeting_deadline(true, true).is_some(),
+                    organism
+                        .live_greeting_deadline(AttentionFacts::known_idle_for_test(true, true))
+                        .is_some(),
                     target == 2
                 );
             }

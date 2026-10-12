@@ -4073,6 +4073,23 @@ impl TerminalState {
         Some(capture)
     }
 
+    /// Existing terminal observations only; no new input ledger or protocol state.
+    /// Check cheap dirty/pending facts before the existing bounded prompt capture.
+    pub(crate) fn live_activity_facts(&self) -> crate::organism_activity::ActivityFacts {
+        crate::organism_activity::ActivityFacts {
+            running: self.is_command_running(),
+            prompt_ready: false,
+            input_tainted: self.agent_prompt_input_tainted,
+            input_dirty: self.idle_prompt_input_dirty,
+            submission_pending: self.prompt_submission_pending,
+            cancel_pending: self.prompt_cancel_pending,
+            typeahead_pending: self.pending_prompt_typeahead,
+            agent_armed: self.armed_agent_execution.is_some(),
+            agent_active: self.active_agent_execution.is_some(),
+        }
+        .with_prompt_ready(|| self.agent_prompt_status().is_ready())
+    }
+
     pub fn agent_prompt_status(&self) -> AgentPromptStatus {
         match self.current_zone_state {
             ZoneState::CommandStarted(_, _) => {
@@ -14152,6 +14169,94 @@ mod tests {
             Err(AgentPromptStatus::UnsafeCommand)
         );
         assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Ready);
+    }
+
+    #[test]
+    fn live_activity_observes_prompt_agent_submission_running_and_completion_boundaries() {
+        use jterm_core::organism_live::LiveActivityKnowledge as K;
+        let mut terminal = TerminalState::new(40, 8);
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"\x1b]133;B\x07");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::KnownIdle);
+        terminal.arm_agent_execution(41, "ls -la").unwrap();
+        // Existing Ready alone is not sufficient before the delayed C arrives.
+        assert_eq!(terminal.agent_prompt_status(), AgentPromptStatus::Ready);
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"ls -la\r\n\x1b]133;C;id=run-1\x07out\r\n");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Busy);
+        terminal.process_input(b"\x1b]133;D;0;id=run-1\x07");
+        assert!(!terminal.is_command_running());
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"\x1b]133;B\x07");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::KnownIdle);
+    }
+
+    #[test]
+    fn live_activity_prompt_restart_retires_pointer_before_next_prompt() {
+        use jterm_core::organism_daily::PreviewPose;
+        use jterm_core::organism_live::{LiveAttention, LiveAttentionEvent, LiveAttentionInput};
+        use std::time::Duration;
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let mut live = LiveAttention::default();
+        live.set_owner(Some(1));
+        let mut input = LiveAttentionInput {
+            base_context: PreviewPose::Calm.context(),
+            hard_eligible: true,
+            hover_available: true,
+            pointer_inside: true,
+            activity: terminal.live_activity_facts().knowledge(),
+        };
+        let ticket = live.entry_offer().unwrap();
+        live.advance(
+            Duration::ZERO,
+            &1,
+            input,
+            LiveAttentionEvent::PointerEntered { ticket },
+        )
+        .unwrap();
+        terminal.process_input(b"\r\n\x1b]133;A\x07$ ");
+        assert!(!terminal.is_command_running());
+        input.activity = terminal.live_activity_facts().knowledge();
+        let lost = live
+            .advance(
+                Duration::from_millis(599),
+                &1,
+                input,
+                LiveAttentionEvent::Reconcile,
+            )
+            .unwrap();
+        assert!(lost.candidate.is_none());
+        terminal.process_input(b"\x1b]133;B\x07");
+        input.activity = terminal.live_activity_facts().knowledge();
+        let next = live
+            .advance(
+                Duration::from_millis(601),
+                &1,
+                input,
+                LiveAttentionEvent::Reconcile,
+            )
+            .unwrap();
+        assert!(next.candidate.is_none());
+        assert!(next.active.is_none());
+        assert_eq!(next.entry, Some(ticket));
+    }
+
+    #[test]
+    fn live_activity_keeps_local_edits_and_future_prompt_typeahead_unknown() {
+        use jterm_core::organism_live::LiveActivityKnowledge as K;
+        let mut terminal = TerminalState::new(40, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        terminal.note_user_input(b"echo x\rnext");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"echo x\r\n\x1b]133;C\x07x\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.live_activity_facts().knowledge(), K::Unknown);
     }
 
     #[test]

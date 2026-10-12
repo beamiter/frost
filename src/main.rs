@@ -29,6 +29,7 @@ mod kitty_graphics;
 mod link;
 mod native_enter;
 mod organism;
+mod organism_activity;
 mod organism_hover;
 mod organism_preview;
 mod organism_watch;
@@ -13964,6 +13965,10 @@ impl Frost {
                     watch_batch_identity && !data.is_empty(),
                     watch_batch_admitted && completed_commands.is_empty(),
                 );
+                if is_active_output {
+                    let facts = self.organism_attention_facts();
+                    self.organism.poll_live_greeting(Some(id), facts);
+                }
                 self.last_ingest_us = t0.elapsed().as_micros();
                 self.last_ingest_bytes = data.len();
                 if is_active_output
@@ -16864,19 +16869,13 @@ impl Frost {
             }
             Message::OrganismHoverEnter(id, epoch) => {
                 if self.organism_owner() == Some(id) {
-                    let eligible = self.organism_hover_eligible();
-                    self.organism.enter_live_greeting(
-                        id,
-                        epoch,
-                        eligible,
-                        self.organism_layout().glyph,
-                    );
+                    let facts = self.organism_attention_facts();
+                    self.organism.enter_live_greeting(id, epoch, facts);
                 }
             }
             Message::OrganismHoverExit(id, epoch) => {
-                let eligible = self.organism_interaction_eligible();
-                self.organism
-                    .exit_live_greeting(id, epoch, eligible, self.organism_layout().glyph);
+                let facts = self.organism_attention_facts();
+                self.organism.exit_live_greeting(id, epoch, facts);
             }
             Message::OrganismPointerButton(button, pressed) => {
                 organism_hover::update_pressed_button(
@@ -16890,9 +16889,8 @@ impl Frost {
             }
             Message::OrganismPointerLeft => {
                 self.organism_pointer_buttons.clear();
-                let eligible = self.organism_interaction_eligible();
-                self.organism
-                    .leave_live_greeting(eligible, self.organism_layout().glyph);
+                let facts = self.organism_attention_facts();
+                self.organism.leave_live_greeting(facts);
             }
             Message::OrganismTick => {
                 if self.config.ascii_organism_enabled {
@@ -16923,12 +16921,8 @@ impl Frost {
                 self.sync_organism_watch();
                 self.organism.tick(owner, running, any_running);
                 let interaction_owner = self.sessions.get(self.active).map(|session| session.id);
-                let interaction_eligible = self.organism_interaction_eligible();
-                self.organism.poll_live_greeting(
-                    interaction_owner,
-                    interaction_eligible,
-                    self.organism_layout().glyph,
-                );
+                let facts = self.organism_attention_facts();
+                self.organism.poll_live_greeting(interaction_owner, facts);
             }
             Message::SetBottomBar(show) => {
                 self.config.bottom_bar = show;
@@ -20564,10 +20558,8 @@ impl Frost {
             use jterm_core::organism_live::{
                 LiveAttentionOutcome, LiveAttentionRejection, LiveAttentionSource,
             };
-            match self
-                .organism
-                .greet_live(id, true, self.organism_layout().glyph)
-            {
+            let facts = self.organism_attention_facts();
+            match self.organism.greet_live(id, facts) {
                 LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit) => None,
                 LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown) => {
                     Some("The companion is cooling down. Try again later.")
@@ -20579,6 +20571,27 @@ impl Frost {
         };
         if let Some(message) = refusal {
             self.push_toast(message.to_string(), ToastKind::Info);
+        }
+    }
+
+    fn organism_attention_facts(&self) -> organism::AttentionFacts {
+        let eligible = self.organism_interaction_eligible();
+        organism::AttentionFacts {
+            eligible,
+            hover_available: self.organism_layout().glyph,
+            activity: self.sessions.get(self.active).map_or(
+                jterm_core::organism_live::LiveActivityKnowledge::Unknown,
+                |session| {
+                    if session.terminal.is_command_running() {
+                        jterm_core::organism_live::LiveActivityKnowledge::Busy
+                    } else if eligible {
+                        session.terminal.live_activity_facts().knowledge()
+                    } else {
+                        // Hard-ineligible input never needs a prompt-grid capture.
+                        jterm_core::organism_live::LiveActivityKnowledge::Unknown
+                    }
+                },
+            ),
         }
     }
 
@@ -20604,6 +20617,7 @@ impl Frost {
 
     fn status_bar(&self) -> Element<'_, Message> {
         let layout = self.organism_layout();
+        let attention_facts = self.organism_attention_facts();
         let sess = self.sessions.get(self.active);
         let cwd = sess
             .and_then(|s| s.cwd_cache.as_deref())
@@ -20654,8 +20668,7 @@ impl Frost {
                 running,
                 settled,
                 self.config.ascii_organism_motion,
-                self.organism_interaction_eligible(),
-                layout.glyph,
+                attention_facts,
             )
         });
         let presentation = presentation.unwrap_or_default();
@@ -20697,11 +20710,8 @@ impl Frost {
             } = presentation;
             let candidate_visible = self.organism_hover_eligible()
                 && self.organism_owner().is_some_and(|id| {
-                    self.organism.live_greeting_candidate_visible(
-                        id,
-                        self.organism_interaction_eligible(),
-                        layout.glyph,
-                    )
+                    self.organism
+                        .live_greeting_candidate_visible(id, attention_facts)
                 });
             // Always reserve this tiny mark inside the existing slot. It is
             // a passive dwell cue, not a focus ring or a behavior change.
@@ -27137,6 +27147,7 @@ impl Frost {
         subs.push(events);
         let preview_visible = self.organism_preview_visible();
         let live_layout = self.organism_layout();
+        let attention_facts = self.organism_attention_facts();
         // Reuse the one maintenance timer across every presentable layout,
         // including a temporarily remote/alt/overlay-suppressed narrow body.
         let live_visible = live_layout.maintenance_eligible(self.focused);
@@ -27169,10 +27180,7 @@ impl Frost {
         if live_visible
             && organism_pointer_observation_needed(
                 live_layout.glyph,
-                self.organism.explicit_greeting_active(
-                    self.organism_interaction_eligible(),
-                    live_layout.glyph,
-                ),
+                self.organism.explicit_greeting_active(attention_facts),
                 !self.organism_pointer_buttons.is_empty(),
                 self.config.ascii_organism_motion,
             )
@@ -27198,10 +27206,7 @@ impl Frost {
             ));
         }
         if self.organism_interaction_eligible() {
-            if let Some(deadline) = self
-                .organism
-                .live_greeting_deadline(self.organism_interaction_eligible(), live_layout.glyph)
-            {
+            if let Some(deadline) = self.organism.live_greeting_deadline(attention_facts) {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
@@ -29714,6 +29719,7 @@ mod tests {
         let mut input = LiveAttentionInput {
             base_context: context,
             hard_eligible: true,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
             hover_available: true,
             pointer_inside: true,
         };
@@ -36371,6 +36377,75 @@ mod tests {
     }
 
     #[test]
+    fn activity_facts_reconcile_only_fresh_active_output_after_context_updates() {
+        let source = include_str!("main.rs");
+        let output = source
+            .split_once("            Message::PtyOutput(id, fd, data) => {")
+            .unwrap()
+            .1
+            .split_once("                self.last_ingest_us =")
+            .unwrap()
+            .0;
+        assert!(output.contains("session.id == id && session.master_fd == fd"));
+        assert!(output.contains("if is_active_output {"));
+        assert!(
+            output.find("sess.terminal.process_batch(&data)").unwrap()
+                < output
+                    .find("self.organism.poll_live_greeting(Some(id), facts)")
+                    .unwrap()
+        );
+        assert!(
+            output.find("self.organism.completed(").unwrap()
+                < output
+                    .find("self.organism.poll_live_greeting(Some(id), facts)")
+                    .unwrap()
+        );
+        assert!(
+            output
+                .find(".batch_finished(id, sess.terminal.is_command_running())")
+                .unwrap()
+                < output
+                    .find("self.organism.poll_live_greeting(Some(id), facts)")
+                    .unwrap()
+        );
+        let facts = source
+            .split_once("    fn organism_attention_facts(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_hover_eligible(")
+            .unwrap()
+            .0;
+        assert!(facts.contains("self.organism_interaction_eligible()"));
+        assert!(
+            facts.find("session.terminal.is_command_running()").unwrap()
+                < facts
+                    .find("session.terminal.live_activity_facts().knowledge()")
+                    .unwrap()
+        );
+        assert!(facts.contains("else if eligible"));
+        let terminal = include_str!("terminal.rs");
+        let getter = terminal
+            .split_once("    pub(crate) fn live_activity_facts(")
+            .unwrap()
+            .1
+            .split_once("    pub fn agent_prompt_status(")
+            .unwrap()
+            .0;
+        for field in [
+            "agent_prompt_input_tainted",
+            "idle_prompt_input_dirty",
+            "prompt_submission_pending",
+            "prompt_cancel_pending",
+            "pending_prompt_typeahead",
+            "armed_agent_execution",
+            "active_agent_execution",
+        ] {
+            assert!(getter.contains(field));
+        }
+        assert!(getter.contains(".with_prompt_ready(|| self.agent_prompt_status().is_ready())"));
+    }
+
+    #[test]
     fn shared_attention_coordinates_identity_without_accepting_before_input() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let entry = source
@@ -36399,8 +36474,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(edges.contains("self.organism.enter_live_greeting("));
-        assert!(edges
-            .contains(".exit_live_greeting(id, epoch, eligible, self.organism_layout().glyph)"));
+        assert!(edges.contains(".exit_live_greeting(id, epoch, facts)"));
         let view = source
             .split_once("// One core offer binds both edges before the next view rebuild.")
             .unwrap()
@@ -36431,6 +36505,7 @@ mod tests {
         let input = LiveAttentionInput {
             base_context: jterm_core::organism_daily::PreviewPose::Calm.context(),
             hard_eligible: true,
+            activity: jterm_core::organism_live::LiveActivityKnowledge::KnownIdle,
             hover_available: false,
             pointer_inside: false,
         };
@@ -36511,7 +36586,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(subs.contains("organism_pointer_observation_needed("));
-        assert!(subs.contains("self.organism.explicit_greeting_active("));
+        assert!(subs.contains(".explicit_greeting_active(attention_facts)"));
         assert!(subs.contains("!self.organism_pointer_buttons.is_empty()"));
     }
 
@@ -36748,7 +36823,7 @@ mod tests {
             .0;
         let glyph = bar.split_once("        if layout.glyph {").unwrap().1;
         assert!(glyph.contains("let candidate_visible = self.organism_hover_eligible()"));
-        assert!(glyph.contains("self.organism.live_greeting_candidate_visible("));
+        assert!(glyph.contains(".live_greeting_candidate_visible(id, attention_facts)"));
         assert!(glyph.contains("background: candidate_visible.then_some(cue_color.into())"));
         assert!(glyph.contains(".width(Length::Fixed(2.0))"));
         assert!(glyph.contains(".height(Length::Fixed(2.0))"));
@@ -36808,9 +36883,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(subscriptions.contains("if self.organism_interaction_eligible()"));
-        assert!(subscriptions.contains(
-            ".live_greeting_deadline(self.organism_interaction_eligible(), live_layout.glyph)"
-        ));
+        assert!(subscriptions.contains(".live_greeting_deadline(attention_facts)"));
     }
 
     #[test]
