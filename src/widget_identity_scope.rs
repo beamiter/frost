@@ -265,6 +265,79 @@ mod tests {
     }
 
     #[test]
+    fn narrow_reopen_reserves_clickable_control_beside_overflowing_status() {
+        use crate::{companion_narrow_status, Message};
+        for width in [220.0, 359.99, 360.0, 639.99] {
+            for available in [false, true] {
+                let status = Space::new().width(4000).height(22).into();
+                let toggle = button(Space::new())
+                    .width(20)
+                    .height(22)
+                    .padding(0)
+                    .on_press_maybe(available.then_some(Message::SetOrganismExpanded(true)));
+                let mut element: Element<'_, Message, iced::Theme, TestRenderer> =
+                    companion_narrow_status(status, toggle.into());
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &TestRenderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(width - 20.0, 22.0)),
+                );
+                let content = node.children()[0].bounds();
+                let arrow = node.children()[1].bounds();
+                assert_eq!(node.bounds().width, width - 20.0);
+                assert!(content.x + content.width <= arrow.x);
+                assert_eq!(arrow.width, 20.0);
+                assert_eq!(arrow.height, 22.0);
+                assert!(arrow.x + arrow.width <= width - 20.0);
+                let mut messages = Vec::new();
+                for _ in 0..2 {
+                    for event in [
+                        mouse::Event::ButtonPressed(mouse::Button::Left),
+                        mouse::Event::ButtonReleased(mouse::Button::Left),
+                    ] {
+                        let mut shell = Shell::new(&mut messages);
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(event),
+                            Layout::new(&node),
+                            mouse::Cursor::Available(arrow.center()),
+                            &TestRenderer,
+                            &mut iced::advanced::clipboard::Null,
+                            &mut shell,
+                            &Rectangle::with_size(Size::new(width - 20.0, 22.0)),
+                        );
+                        assert_eq!(shell.is_event_captured(), available);
+                    }
+                }
+                assert_eq!(messages.len(), if available { 2 } else { 0 });
+                assert!(messages
+                    .iter()
+                    .all(|message| matches!(message, Message::SetOrganismExpanded(true))));
+                // The neighboring status content and its clipped tail are not
+                // an alias of the control, even with repeated pointer events.
+                messages.clear();
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(event),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(iced::Point::new(10.0, 11.0)),
+                        &TestRenderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &Rectangle::with_size(Size::new(width - 20.0, 22.0)),
+                    );
+                }
+                assert!(messages.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn companion_card_native_layout_keeps_body_and_collapse_in_reserved_chrome() {
         use crate::{companion_card_content, companion_strip_height, organism_layout, Message};
         for width in [220.0, 359.99, 360.0, 639.99, 640.0, 1024.0] {

@@ -198,11 +198,32 @@ fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) 
     }
 }
 
+/// A narrow collapsed card still has a way back, without admitting a live body
+/// or hover observer while it is hidden. Configuration chrome only.
+fn companion_narrow_reopen(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> bool {
+    !expanded
+        && !organism_layout(width, enabled, false, bottom_bar).glyph
+        && organism_layout(width, enabled, true, bottom_bar).body
+}
+
 fn companion_compact_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
     glyph: Element<'a, Message, iced::Theme, R>,
     toggle: Element<'a, Message, iced::Theme, R>,
 ) -> iced::widget::Container<'a, Message, iced::Theme, R> {
     container(row![glyph, toggle].align_y(iced::Alignment::Center)).width(Length::Fixed(84.0))
+}
+
+/// Reserve the narrow reopen button before laying out crowded status content.
+/// Only the status content is clipped; the sibling control keeps its hit box.
+fn companion_narrow_status<'a, R: iced::advanced::renderer::Renderer + 'a>(
+    status: Element<'a, Message, iced::Theme, R>,
+    toggle: Element<'a, Message, iced::Theme, R>,
+) -> Element<'a, Message, iced::Theme, R> {
+    row![container(status).width(Length::Fill).clip(true), toggle]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 /// The same native card geometry is used by production and renderer-free tests.
@@ -258,7 +279,7 @@ fn organism_settings_hint(
     }
     if !layout.presentable() {
         return if organism_layout(width, enabled, true, bottom_bar).body {
-            "This width has no room for the status glyph. Enable Show expanded companion to allow a body-only layout, or widen the window."
+            "Use the status-bar arrow to reopen the companion card. This width has no room for the status glyph or live hover target."
         } else if expanded {
             "Resize the window to make room for the live body. The expanded strip keeps its reserved height."
         } else {
@@ -20777,11 +20798,29 @@ impl Frost {
                 .color(self.c_accent())
                 .into();
             let detail = layout.explanation.then(|| {
+                let mut header = row![text("ASCII organism").size(12).font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::DEFAULT
+                })]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
+                // Frost has no persistent organism memory. Keep that boundary
+                // visible without crowding the narrower body-first card.
+                if layout.glyph {
+                    header = header
+                        .push(Space::new().width(Length::Fill))
+                        .push(text("volatile · no LLM").size(10).color(self.c_text_dim()));
+                }
                 column![
-                    text("ASCII organism").size(12),
-                    text(presentation.explanation.clone().into_owned())
-                        .size(11)
-                        .wrapping(text::Wrapping::WordOrGlyph),
+                    header,
+                    container(
+                        text(presentation.explanation.clone().into_owned())
+                            .size(11)
+                            .line_height(iced::widget::text::LineHeight::Absolute(16.0.into()))
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    )
+                    .height(Length::Fixed(32.0))
+                    .clip(true),
                 ]
                 .spacing(3)
                 .width(Length::Fill)
@@ -20887,6 +20926,16 @@ impl Frost {
         let bar = row![left, Space::new().width(Length::Fill), right]
             .spacing(12)
             .align_y(iced::Alignment::Center);
+        let bar: Element<'_, Message> = if companion_narrow_reopen(
+            self.win_size.width,
+            self.config.ascii_organism_enabled,
+            self.config.ascii_organism_expanded,
+            self.config.bottom_bar,
+        ) {
+            companion_narrow_status(bar.into(), self.companion_toggle(false))
+        } else {
+            bar.into()
+        };
         let bar: Element<'_, Message> = container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(STATUS_BAR_H))
@@ -29638,7 +29687,7 @@ mod tests {
         assert!(tooltip.contains(".width(Length::Fixed(220.0))"));
         assert!(tooltip.contains(".max_height(160.0)"));
         assert!(tooltip.contains(".clip(true)"));
-        assert_eq!(bar.matches(".clip(true)").count(), 3);
+        assert_eq!(bar.matches(".clip(true)").count(), 4);
     }
 
     #[test]
@@ -29753,12 +29802,10 @@ mod tests {
     fn organism_settings_hint_tracks_shared_width_capabilities_and_preview_distinction() {
         for width in [0.0, 219.99, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(organism_settings_hint(width, true, true, true).contains("Resize the window"));
-            assert!(!organism_settings_hint(width, true, false, true)
-                .contains("Enable Show expanded companion"));
+            assert!(!organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
         }
         for width in [220.0, 639.99] {
-            assert!(organism_settings_hint(width, true, false, true)
-                .contains("Enable Show expanded companion"));
+            assert!(organism_settings_hint(width, true, false, true).contains("status-bar arrow"));
             let body_only = organism_settings_hint(width, true, true, true);
             assert!(body_only.contains("no live hover target"));
             assert!(body_only.contains("Preview Say hello is separate"));
@@ -29805,6 +29852,80 @@ mod tests {
             "self.config.bottom_bar",
         ] {
             assert!(settings.contains(current));
+        }
+    }
+
+    #[test]
+    fn narrow_reopen_is_configuration_only_and_preserves_live_thresholds() {
+        for width in [
+            0.0,
+            219.99,
+            220.0,
+            359.99,
+            360.0,
+            639.99,
+            640.0,
+            1024.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            for enabled in [false, true] {
+                for expanded in [false, true] {
+                    for bottom_bar in [false, true] {
+                        let reopen = companion_narrow_reopen(width, enabled, expanded, bottom_bar);
+                        assert_eq!(
+                            reopen,
+                            enabled && bottom_bar && !expanded && (220.0..640.0).contains(&width)
+                        );
+                        if reopen {
+                            let layout = organism_layout(width, enabled, expanded, bottom_bar);
+                            assert!(!layout.presentable());
+                            assert!(!layout.maintenance_eligible(true));
+                            assert_eq!(companion_strip_height(enabled, expanded, bottom_bar), 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_card_header_and_narrow_reopen_do_not_add_live_inputs() {
+        let source = include_str!("main.rs");
+        let bar = source
+            .split_once("    fn status_bar(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn companion_toggle(")
+            .unwrap()
+            .0;
+        assert!(bar.contains("text(\"volatile · no LLM\").size(10).color(self.c_text_dim())"));
+        assert!(bar.contains("weight: iced::font::Weight::Bold"));
+        assert!(bar.contains(".height(Length::Fixed(32.0))"));
+        assert!(bar.contains("companion_narrow_status(bar.into(), self.companion_toggle(false))"));
+        assert_eq!(
+            bar.matches(".on_enter(Message::OrganismHoverEnter(")
+                .count(),
+            1
+        );
+        let narrow = source
+            .split_once("fn companion_narrow_status<")
+            .unwrap()
+            .1
+            .split_once("/// The same native card geometry")
+            .unwrap()
+            .0;
+        assert!(narrow.contains("container(status).width(Length::Fill).clip(true), toggle"));
+        for forbidden in [
+            "OrganismHello",
+            "OrganismHover",
+            "KnownIdle",
+            "write_pty",
+            "focus(",
+            "time::every",
+        ] {
+            assert!(!narrow.contains(forbidden));
         }
     }
 
