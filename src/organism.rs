@@ -4,9 +4,12 @@
 //! host supplies one-shot completed commands and a content-free running flag.
 //! Stable live Start identities are not public in Frost's terminal boundary,
 //! so watching is display-only: no synthetic `command_started` is generated.
-use crate::organism_hover::LiveGreeting;
 use crate::organism_preview::{PreviewAction, PreviewRequest, PreviewSequence};
 use crate::organism_watch::WatchObservation;
+use jterm_core::organism_live::{
+    LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
+    LiveAttentionRejection, LiveAttentionSnapshot, LiveAttentionSource, LiveAttentionTicket,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
@@ -315,7 +318,9 @@ pub struct Organism {
     preview_deadlines: PreviewDeadlines,
     preview_sequence: PreviewSequence,
     preview_visible: bool,
-    live_greeting: LiveGreeting,
+    live_attention: LiveAttention<usize>,
+    // Native pointer observation only. Entry consumption is owned by the core.
+    live_pointer_inside: bool,
     watch: WatchObservation,
 }
 
@@ -333,7 +338,8 @@ impl Default for Organism {
             preview_deadlines: PreviewDeadlines::default(),
             preview_sequence: PreviewSequence::default(),
             preview_visible: false,
-            live_greeting: LiveGreeting::default(),
+            live_attention: LiveAttention::default(),
+            live_pointer_inside: false,
             watch: WatchObservation::default(),
         }
     }
@@ -356,7 +362,9 @@ impl Organism {
     pub fn motion_changed(&mut self, previous: Option<Motion>, next: Option<Motion>) {
         if previous != next {
             self.reset_watch();
-            self.cancel_live_greeting();
+            if next == Some(Motion::Static) {
+                self.cancel_live_greeting();
+            }
         }
     }
 
@@ -364,7 +372,7 @@ impl Organism {
     pub fn owner_changed(&mut self, previous: Option<usize>, next: Option<usize>) {
         if previous != next {
             self.reset_watch();
-            self.cancel_live_greeting();
+            self.sync_live_attention_owner(next);
         }
     }
 
@@ -385,7 +393,7 @@ impl Organism {
     pub fn set_remote(&mut self, id: usize, remote: bool) {
         if remote {
             self.watch.reset_owner(id);
-            self.live_greeting.cancel_owner(id);
+            self.live_attention.cancel(&id);
         }
         if let Some(life) = self.sessions.get_mut(&id) {
             life.remote = remote;
@@ -399,7 +407,7 @@ impl Organism {
 
     pub fn forget_session(&mut self, id: usize) {
         self.watch.reset_owner(id);
-        self.live_greeting.cancel_owner(id);
+        self.live_attention.cancel(&id);
         self.sessions.remove(&id);
     }
 
@@ -432,7 +440,7 @@ impl Organism {
             life.accept_completion = true;
             return;
         }
-        self.live_greeting.cancel_owner(id);
+        self.live_attention.cancel(&id);
         let now = Instant::now();
         life.native.sync_state(self.life.state());
         let reaction = life
@@ -450,7 +458,7 @@ impl Organism {
 
     pub fn batch_finished(&mut self, id: usize, running: bool) {
         if running {
-            self.live_greeting.cancel_owner(id);
+            self.live_attention.cancel(&id);
         }
         if let Some(life) = self.sessions.get_mut(&id) {
             if life.quarantine_batch {
@@ -688,9 +696,18 @@ impl Organism {
         }
     }
 
+    pub fn sync_live_attention_owner(&mut self, owner: Option<usize>) {
+        if self.live_attention.set_owner(owner) {
+            self.live_pointer_inside = false;
+        }
+    }
+
     pub fn sync_greeting_geometry(&mut self, glyph: bool, presentable: bool) {
         if !glyph {
-            self.live_greeting.cancel_hover();
+            self.live_pointer_inside = false;
+            if let Some(owner) = self.live_attention.owner().copied() {
+                self.live_attention.cancel_hover(&owner);
+            }
         }
         if !presentable {
             self.pause_clock();
@@ -698,82 +715,178 @@ impl Organism {
     }
 
     pub fn cancel_live_greeting(&mut self) {
-        self.live_greeting.cancel();
+        if let Some(owner) = self.live_attention.owner().copied() {
+            self.live_attention.cancel(&owner);
+        }
     }
 
-    pub fn leave_live_greeting(&mut self) {
-        self.live_greeting.leave();
+    fn live_input(&self, id: usize, eligible: bool, hover_available: bool) -> LiveAttentionInput {
+        let base_context = self
+            .sessions
+            .get(&id)
+            .map(|life| life.context)
+            .unwrap_or_else(|| PreviewPose::Calm.context());
+        LiveAttentionInput {
+            base_context,
+            hard_eligible: eligible && self.enabled && self.is_local(id),
+            hover_available,
+            pointer_inside: self.live_pointer_inside,
+        }
     }
 
-    pub fn live_greeting_exit_reference(&self, id: usize) -> (usize, u64) {
-        self.live_greeting
-            .exit_reference()
-            .unwrap_or((id, self.live_greeting.epoch()))
+    pub fn live_greeting_offer(&self, id: usize) -> Option<LiveAttentionTicket> {
+        (self.live_attention.owner() == Some(&id))
+            .then(|| self.live_attention.entry_offer())
+            .flatten()
     }
 
-    pub fn exit_live_greeting(&mut self, id: usize, epoch: u64) {
-        self.live_greeting.exit(id, epoch);
+    pub fn live_greeting_exit_reference(&self, id: usize) -> Option<LiveAttentionTicket> {
+        (self.live_attention.owner() == Some(&id))
+            .then(|| {
+                self.live_attention
+                    .entry_ticket()
+                    .or(self.live_attention.entry_offer())
+            })
+            .flatten()
     }
 
-    pub fn live_greeting_epoch(&self) -> u64 {
-        self.live_greeting.epoch()
+    pub fn enter_live_greeting(
+        &mut self,
+        id: usize,
+        ticket: LiveAttentionTicket,
+        eligible: bool,
+        hover_available: bool,
+    ) {
+        // A stale widget cannot rewrite even native pointer facts.
+        if self.live_attention.owner() != Some(&id)
+            || self.live_attention.entry_offer() != Some(ticket)
+        {
+            return;
+        }
+        self.live_pointer_inside = true;
+        let input = self.live_input(id, eligible, hover_available);
+        let _ = self.live_attention.advance(
+            self.born.elapsed(),
+            &id,
+            input,
+            LiveAttentionEvent::PointerEntered { ticket },
+        );
     }
 
-    pub fn enter_live_greeting(&mut self, id: usize, epoch: u64, eligible: bool) {
-        if let Some(life) = self.sessions.get(&id) {
-            self.live_greeting.enter(
-                id,
-                epoch,
+    pub fn exit_live_greeting(
+        &mut self,
+        id: usize,
+        ticket: LiveAttentionTicket,
+        eligible: bool,
+        hover_available: bool,
+    ) {
+        if self.live_attention.owner() != Some(&id)
+            || self.live_attention.entry_ticket() != Some(ticket)
+        {
+            return;
+        }
+        self.live_pointer_inside = false;
+        let input = self.live_input(id, eligible, hover_available);
+        let _ = self.live_attention.advance(
+            self.born.elapsed(),
+            &id,
+            input,
+            LiveAttentionEvent::PointerLeft { ticket },
+        );
+    }
+
+    pub fn leave_live_greeting(&mut self, eligible: bool, hover_available: bool) {
+        self.live_pointer_inside = false;
+        if let Some(owner) = self.live_attention.owner().copied() {
+            if let Some(ticket) = self.live_attention.entry_ticket() {
+                let input = self.live_input(owner, eligible, hover_available);
+                let _ = self.live_attention.advance(
+                    self.born.elapsed(),
+                    &owner,
+                    input,
+                    LiveAttentionEvent::PointerLeft { ticket },
+                );
+            } else {
+                self.live_attention.cancel_hover(&owner);
+            }
+        }
+    }
+
+    pub fn poll_live_greeting(
+        &mut self,
+        owner: Option<usize>,
+        eligible: bool,
+        hover_available: bool,
+    ) {
+        self.sync_live_attention_owner(owner);
+        if let Some(owner) = owner {
+            let input = self.live_input(owner, eligible, hover_available);
+            let _ = self.live_attention.advance(
                 self.born.elapsed(),
-                life.context,
-                eligible && self.enabled && !life.remote,
+                &owner,
+                input,
+                LiveAttentionEvent::Reconcile,
             );
         }
     }
 
-    pub fn poll_live_greeting(&mut self, owner: Option<usize>, eligible: bool) {
-        let context = owner
-            .and_then(|id| self.sessions.get(&id))
-            .map(|life| life.context)
-            .unwrap_or_else(|| PreviewPose::Calm.context());
-        self.live_greeting.advance(
-            owner,
-            self.born.elapsed(),
-            context,
-            self.enabled && eligible,
-        );
+    pub fn greet_live(
+        &mut self,
+        id: usize,
+        eligible: bool,
+        hover_available: bool,
+    ) -> LiveAttentionOutcome {
+        let input = self.live_input(id, eligible, hover_available);
+        self.live_attention
+            .advance(
+                self.born.elapsed(),
+                &id,
+                input,
+                LiveAttentionEvent::Explicit,
+            )
+            .map(|snapshot| snapshot.outcome)
+            .unwrap_or(LiveAttentionOutcome::Rejected(
+                LiveAttentionRejection::Unavailable,
+            ))
     }
 
-    pub fn greet_live(&mut self, id: usize) -> crate::organism_hover::ExplicitGreeting {
-        let Some(life) = self
-            .sessions
-            .get(&id)
-            .filter(|life| self.enabled && !life.remote)
-        else {
-            return crate::organism_hover::ExplicitGreeting::Busy;
-        };
-        self.live_greeting
-            .request_explicit(id, self.born.elapsed(), life.context)
+    pub fn live_greeting_snapshot(
+        &self,
+        eligible: bool,
+        hover_available: bool,
+    ) -> Option<LiveAttentionSnapshot> {
+        let owner = self.live_attention.owner().copied()?;
+        self.live_attention
+            .snapshot(
+                self.born.elapsed(),
+                &owner,
+                self.live_input(owner, eligible, hover_available),
+            )
+            .ok()
     }
 
-    pub fn live_greeting_candidate_visible(&self, id: usize) -> bool {
-        self.enabled
-            && self.sessions.get(&id).is_some_and(|life| {
-                !life.remote
-                    && self
-                        .live_greeting
-                        .candidate_visible(id, self.born.elapsed(), life.context)
-            })
+    pub fn live_greeting_candidate_visible(
+        &self,
+        id: usize,
+        eligible: bool,
+        hover_available: bool,
+    ) -> bool {
+        self.live_attention.owner() == Some(&id)
+            && self
+                .live_greeting_snapshot(eligible, hover_available)
+                .is_some_and(|snapshot| snapshot.candidate_visible)
     }
 
-    pub fn explicit_greeting_active(&self) -> bool {
-        self.live_greeting.explicit_active(self.born.elapsed())
+    pub fn explicit_greeting_active(&self, eligible: bool, hover_available: bool) -> bool {
+        self.live_greeting_snapshot(eligible, hover_available)
+            .and_then(|snapshot| snapshot.active)
+            .is_some_and(|active| active.source == LiveAttentionSource::Explicit)
     }
 
-    pub fn live_greeting_deadline(&self) -> Option<Instant> {
-        self.live_greeting
-            .deadline(self.born.elapsed())
-            .map(|deadline| self.born + deadline)
+    pub fn live_greeting_deadline(&self, eligible: bool, hover_available: bool) -> Option<Instant> {
+        self.live_greeting_snapshot(eligible, hover_available)?
+            .next_deadline()
+            .and_then(|deadline| self.born.checked_add(deadline))
     }
 
     fn frame_at(motion: Option<Motion>, now: Duration) -> u64 {
@@ -784,7 +897,27 @@ impl Organism {
         }
     }
 
-    pub fn presentation(
+    pub fn presentation_with_attention(
+        &self,
+        id: usize,
+        running: bool,
+        settled: bool,
+        motion: Option<Motion>,
+        eligible: bool,
+        hover_available: bool,
+    ) -> LivePresentation {
+        self.presentation_at_with_attention(
+            id,
+            running,
+            settled,
+            motion,
+            self.born.elapsed(),
+            (eligible, hover_available, self.live_pointer_inside),
+        )
+    }
+
+    #[cfg(test)]
+    fn presentation(
         &self,
         id: usize,
         running: bool,
@@ -794,6 +927,7 @@ impl Organism {
         self.presentation_at(id, running, settled, motion, self.born.elapsed())
     }
 
+    #[cfg(test)]
     fn presentation_at(
         &self,
         id: usize,
@@ -802,6 +936,26 @@ impl Organism {
         motion: Option<Motion>,
         now: Duration,
     ) -> LivePresentation {
+        self.presentation_at_with_attention(
+            id,
+            running,
+            settled,
+            motion,
+            now,
+            (true, true, self.live_attention.entry_ticket().is_some()),
+        )
+    }
+
+    fn presentation_at_with_attention(
+        &self,
+        id: usize,
+        running: bool,
+        settled: bool,
+        motion: Option<Motion>,
+        now: Duration,
+        native: (bool, bool, bool),
+    ) -> LivePresentation {
+        let (eligible, hover_available, pointer_inside) = native;
         let context = if running {
             // Display only. No fabricated Start is fed into the life reducer.
             let behavior = if settled {
@@ -829,7 +983,18 @@ impl Organism {
         let context = if running || motion == Some(Motion::Static) {
             context
         } else {
-            self.live_greeting.apply(id, now, context)
+            self.live_attention
+                .snapshot(
+                    now,
+                    &id,
+                    LiveAttentionInput {
+                        base_context: context,
+                        hard_eligible: eligible && self.enabled && self.is_local(id),
+                        hover_available,
+                        pointer_inside,
+                    },
+                )
+                .map_or(context, |snapshot| snapshot.presentation)
         };
         let frame = Self::frame_at(motion, now);
         LivePresentation {
@@ -894,6 +1059,114 @@ fn reaction_duration(reaction: &Reaction) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Native-fact fixtures delegate to the real shared controller. They contain
+    // no dwell/hold/cooldown policy; host integration trajectories stay here.
+    trait AttentionFixture {
+        fn test_enter(&mut self, id: usize, now: Duration, context: RenderContext, eligible: bool);
+        fn test_advance(
+            &mut self,
+            owner: Option<usize>,
+            now: Duration,
+            context: RenderContext,
+            eligible: bool,
+        );
+        fn test_explicit(
+            &mut self,
+            id: usize,
+            now: Duration,
+            context: RenderContext,
+        ) -> LiveAttentionOutcome;
+        fn test_apply(&self, id: usize, now: Duration, context: RenderContext) -> RenderContext;
+        fn test_deadline(&self, now: Duration) -> Option<Duration>;
+        fn test_leave(&mut self);
+    }
+    fn fixture_input(context: RenderContext, eligible: bool, inside: bool) -> LiveAttentionInput {
+        LiveAttentionInput {
+            base_context: context,
+            hard_eligible: eligible,
+            hover_available: true,
+            pointer_inside: inside,
+        }
+    }
+    impl AttentionFixture for LiveAttention<usize> {
+        fn test_enter(&mut self, id: usize, now: Duration, context: RenderContext, eligible: bool) {
+            self.set_owner(Some(id));
+            if let Some(ticket) = self.entry_offer() {
+                let _ = self.advance(
+                    now,
+                    &id,
+                    fixture_input(context, eligible, true),
+                    LiveAttentionEvent::PointerEntered { ticket },
+                );
+            }
+        }
+        fn test_advance(
+            &mut self,
+            owner: Option<usize>,
+            now: Duration,
+            context: RenderContext,
+            eligible: bool,
+        ) {
+            self.set_owner(owner);
+            if let Some(id) = owner {
+                let _ = self.advance(
+                    now,
+                    &id,
+                    fixture_input(context, eligible, self.entry_ticket().is_some()),
+                    LiveAttentionEvent::Reconcile,
+                );
+            }
+        }
+        fn test_explicit(
+            &mut self,
+            id: usize,
+            now: Duration,
+            context: RenderContext,
+        ) -> LiveAttentionOutcome {
+            self.set_owner(Some(id));
+            self.advance(
+                now,
+                &id,
+                fixture_input(context, true, self.entry_ticket().is_some()),
+                LiveAttentionEvent::Explicit,
+            )
+            .unwrap()
+            .outcome
+        }
+        fn test_apply(&self, id: usize, now: Duration, context: RenderContext) -> RenderContext {
+            self.snapshot(
+                now,
+                &id,
+                fixture_input(context, true, self.entry_ticket().is_some()),
+            )
+            .map_or(context, |snapshot| snapshot.presentation)
+        }
+        fn test_deadline(&self, now: Duration) -> Option<Duration> {
+            let owner = self.owner()?;
+            self.snapshot(
+                now,
+                owner,
+                fixture_input(
+                    PreviewPose::Calm.context(),
+                    true,
+                    self.entry_ticket().is_some(),
+                ),
+            )
+            .ok()?
+            .next_deadline()
+        }
+        fn test_leave(&mut self) {
+            if let (Some(owner), Some(ticket)) = (self.owner().copied(), self.entry_ticket()) {
+                let _ = self.advance(
+                    Duration::ZERO,
+                    &owner,
+                    fixture_input(PreviewPose::Calm.context(), true, false),
+                    LiveAttentionEvent::PointerLeft { ticket },
+                );
+            }
+        }
+    }
 
     fn values(state: LifeState) -> [f32; 8] {
         [
@@ -967,8 +1240,8 @@ mod tests {
             organism.set_enabled(true);
             organism.select_pose(Pose(PreviewPose::Curious));
             organism
-                .live_greeting
-                .request_explicit(1, Duration::ZERO, PreviewPose::Calm.context());
+                .live_attention
+                .test_explicit(1, Duration::ZERO, PreviewPose::Calm.context());
             organism.start_demo_at(Duration::ZERO);
             let pause = organism.preview_request(PreviewAction::Pause);
             organism.apply_preview_request_at(&pause, Duration::from_millis(500));
@@ -990,12 +1263,12 @@ mod tests {
                 None
             );
             assert_eq!(
-                organism.live_greeting.request_explicit(
+                organism.live_attention.test_explicit(
                     1,
                     Duration::from_secs(1),
                     PreviewPose::Calm.context()
                 ),
-                crate::organism_hover::ExplicitGreeting::Cooldown
+                LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
             );
         }
     }
@@ -1072,58 +1345,46 @@ mod tests {
         let mut organism = Organism::default();
         let previous = Instant::now() + Duration::from_millis(300);
         organism.retreat_until = previous;
-        organism.live_greeting.enter(
-            1,
-            organism.live_greeting.epoch(),
-            Duration::ZERO,
-            PreviewPose::Calm.context(),
-            true,
-        );
+        organism
+            .live_attention
+            .test_enter(1, Duration::ZERO, PreviewPose::Calm.context(), true);
         let snapshot = organism.retreat_deadline();
         organism.retreat();
         organism.restore_retreat_after_palette_open(snapshot);
         assert_eq!(organism.retreat_until, previous);
-        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        assert_eq!(organism.live_attention.test_deadline(Duration::ZERO), None);
         organism.retreat();
         organism.restore_retreat_after_palette_open(None);
         assert!(!organism.is_retreating());
-        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        assert_eq!(organism.live_attention.test_deadline(Duration::ZERO), None);
     }
 
     #[test]
     fn greeting_geometry_preserves_explicit_body_hold_but_retires_hidden_or_hover() {
         let mut organism = Organism::default();
         let context = PreviewPose::Calm.context();
-        organism.live_greeting.enter(
-            1,
-            organism.live_greeting.epoch(),
-            Duration::ZERO,
-            context,
-            true,
-        );
+        organism
+            .live_attention
+            .test_enter(1, Duration::ZERO, context, true);
         organism.sync_greeting_geometry(false, true);
-        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        assert_eq!(organism.live_attention.test_deadline(Duration::ZERO), None);
         organism.sync_greeting_geometry(true, true);
-        organism.live_greeting.enter(
-            1,
-            organism.live_greeting.epoch(),
-            Duration::ZERO,
-            context,
-            true,
-        );
-        assert_eq!(organism.live_greeting.deadline(Duration::ZERO), None);
+        organism
+            .live_attention
+            .test_enter(1, Duration::ZERO, context, true);
+        assert_eq!(organism.live_attention.test_deadline(Duration::ZERO), None);
         assert_eq!(
             organism
-                .live_greeting
-                .request_explicit(1, Duration::ZERO, context),
-            crate::organism_hover::ExplicitGreeting::Accepted
+                .live_attention
+                .test_explicit(1, Duration::ZERO, context),
+            LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
         );
         for (glyph, presentable) in [(true, true), (false, true), (false, true), (true, true)] {
             organism.sync_greeting_geometry(glyph, presentable);
             assert_eq!(
                 organism
-                    .live_greeting
-                    .apply(1, Duration::from_millis(500), context)
+                    .live_attention
+                    .test_apply(1, Duration::from_millis(500), context)
                     .behavior,
                 Behavior::Approach
             );
@@ -1132,19 +1393,21 @@ mod tests {
         organism.sync_greeting_geometry(true, true);
         assert_eq!(
             organism
-                .live_greeting
-                .apply(1, Duration::from_millis(500), context),
+                .live_attention
+                .test_apply(1, Duration::from_millis(500), context),
             context
         );
         assert_eq!(
-            organism.live_greeting.deadline(Duration::from_millis(500)),
+            organism
+                .live_attention
+                .test_deadline(Duration::from_millis(500)),
             None
         );
         assert_eq!(
             organism
-                .live_greeting
-                .request_explicit(1, Duration::from_secs(1), context),
-            crate::organism_hover::ExplicitGreeting::Cooldown
+                .live_attention
+                .test_explicit(1, Duration::from_secs(1), context),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
         );
     }
 
@@ -1157,31 +1420,27 @@ mod tests {
         organism.say_hello_at(Duration::ZERO);
         let before = values(organism.life.state());
         let preview_ready = organism.preview_deadlines.ready_at;
+        organism.sync_live_attention_owner(Some(1));
         assert_eq!(
-            organism.greet_live(1),
-            crate::organism_hover::ExplicitGreeting::Accepted
+            organism.greet_live(1, true, true),
+            LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
         );
         assert_eq!(values(organism.life.state()), before);
         assert_eq!(organism.preview_deadlines.ready_at, preview_ready);
         assert_eq!(
-            organism.greet_live(1),
-            crate::organism_hover::ExplicitGreeting::Cooldown
+            organism.greet_live(1, true, true),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
         );
         assert_eq!(
-            organism.greet_live(99),
-            crate::organism_hover::ExplicitGreeting::Busy
+            organism.greet_live(99, true, true),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Unavailable)
         );
     }
 
     #[test]
-    fn motion_changes_cancel_transients_but_keep_cooldown_and_unchanged_visits() {
+    fn motion_changes_preserve_live_deadlines_except_static_and_keep_watch_policy() {
         use jterm_core::organism::WatchRhythm;
-        for previous in [
-            None,
-            Some(Motion::Full),
-            Some(Motion::Calm),
-            Some(Motion::Static),
-        ] {
+        for previous in [None, Some(Motion::Full), Some(Motion::Calm)] {
             for next in [
                 None,
                 Some(Motion::Full),
@@ -1196,56 +1455,41 @@ mod tests {
                         .watch
                         .output(1, Duration::from_millis(millis), true);
                 }
-                organism.live_greeting.enter(
-                    1,
-                    organism.live_greeting.epoch(),
-                    Duration::ZERO,
+                organism
+                    .live_attention
+                    .test_enter(1, Duration::ZERO, context, true);
+                organism.live_attention.test_advance(
+                    Some(1),
+                    Duration::from_millis(600),
                     context,
                     true,
                 );
-                organism
-                    .live_greeting
-                    .advance(Some(1), Duration::from_millis(600), context, true);
                 organism.say_hello_at(Duration::ZERO);
                 let before = values(organism.life.state());
                 let now = Duration::from_millis(700);
-                assert_eq!(organism.watch.rhythm(1, now), WatchRhythm::Busy);
-                assert_eq!(
-                    organism.live_greeting.apply(1, now, context).behavior,
-                    PreviewPose::Greeting.context().behavior
-                );
+                let deadline = organism.live_attention.test_deadline(now);
                 organism.motion_changed(previous, next);
-                if previous == next {
-                    assert_eq!(organism.watch.rhythm(1, now), WatchRhythm::Busy);
+                assert_eq!(
+                    organism.watch.rhythm(1, now),
+                    if previous == next {
+                        WatchRhythm::Busy
+                    } else {
+                        WatchRhythm::Steady
+                    }
+                );
+                if next == Some(Motion::Static) {
+                    assert_eq!(organism.live_attention.test_apply(1, now, context), context);
+                    assert_eq!(organism.live_attention.test_deadline(now), None);
                     assert_eq!(
-                        organism.live_greeting.apply(1, now, context).behavior,
-                        PreviewPose::Greeting.context().behavior
+                        organism.live_attention.test_explicit(2, now, context),
+                        LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
                     );
                 } else {
-                    assert_eq!(organism.watch.rhythm(1, now), WatchRhythm::Steady);
-                    assert_eq!(organism.live_greeting.apply(1, now, context), context);
-                    assert_eq!(organism.live_greeting.deadline(now), None);
-                    // A new visit still cannot spend the accepted greeting's cooldown.
-                    organism.live_greeting.leave();
-                    organism.live_greeting.enter(
-                        1,
-                        organism.live_greeting.epoch(),
-                        now,
-                        context,
-                        true,
-                    );
-                    organism.live_greeting.advance(
-                        Some(1),
-                        Duration::from_millis(1300),
-                        context,
-                        true,
-                    );
                     assert_eq!(
-                        organism
-                            .live_greeting
-                            .apply(1, Duration::from_millis(1300), context),
-                        context
+                        organism.live_attention.test_apply(1, now, context).behavior,
+                        Behavior::Approach
                     );
+                    assert_eq!(organism.live_attention.test_deadline(now), deadline);
                 }
                 assert_eq!(organism.preview_deadlines.ready_at, Duration::from_secs(8));
                 assert_eq!(values(organism.life.state()), before);
@@ -1254,45 +1498,104 @@ mod tests {
     }
 
     #[test]
-    fn motion_change_cancels_pending_dwell_without_rearming_stationary_pointer() {
+    fn motion_change_preserves_pending_dwell_until_static_cancels_without_rearm() {
         let mut organism = Organism::default();
         let context = PreviewPose::Calm.context();
-        organism.live_greeting.enter(
-            1,
-            organism.live_greeting.epoch(),
-            Duration::ZERO,
-            context,
-            true,
-        );
-        organism.motion_changed(Some(Motion::Full), Some(Motion::Full));
-        assert_eq!(
-            organism.live_greeting.deadline(Duration::from_millis(200)),
-            Some(Duration::from_millis(600))
-        );
-        organism.motion_changed(Some(Motion::Full), Some(Motion::Calm));
-        assert_eq!(
-            organism.live_greeting.deadline(Duration::from_millis(300)),
-            None
-        );
-        organism.live_greeting.enter(
-            1,
-            organism.live_greeting.epoch(),
-            Duration::from_millis(300),
-            context,
-            true,
-        );
         organism
-            .live_greeting
-            .advance(Some(1), Duration::from_secs(1), context, true);
+            .live_attention
+            .test_enter(1, Duration::ZERO, context, true);
+        for (previous, next) in [
+            (Some(Motion::Full), Some(Motion::Calm)),
+            (Some(Motion::Calm), None),
+        ] {
+            organism.motion_changed(previous, next);
+            assert_eq!(
+                organism
+                    .live_attention
+                    .test_deadline(Duration::from_millis(300)),
+                Some(Duration::from_millis(600))
+            );
+        }
+        organism.motion_changed(None, Some(Motion::Static));
         assert_eq!(
             organism
-                .live_greeting
-                .apply(1, Duration::from_secs(1), context),
+                .live_attention
+                .test_deadline(Duration::from_millis(300)),
+            None
+        );
+        organism.motion_changed(Some(Motion::Static), Some(Motion::Full));
+        organism
+            .live_attention
+            .test_enter(1, Duration::from_millis(300), context, true);
+        organism
+            .live_attention
+            .test_advance(Some(1), Duration::from_secs(1), context, true);
+        assert_eq!(
+            organism
+                .live_attention
+                .test_apply(1, Duration::from_secs(1), context),
             context
         );
         assert_eq!(
-            organism.live_greeting.deadline(Duration::from_secs(1)),
+            organism
+                .live_attention
+                .test_deadline(Duration::from_secs(1)),
             None
+        );
+    }
+
+    #[test]
+    fn native_entry_tickets_reject_stale_edges_before_changing_pointer_facts() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.sync_live_attention_owner(Some(1));
+        let old = organism.live_greeting_offer(1).unwrap();
+        organism.cancel_live_greeting();
+        organism.enter_live_greeting(1, old, true, true);
+        assert!(!organism.live_pointer_inside);
+        let ticket = organism.live_greeting_offer(1).unwrap();
+        organism.enter_live_greeting(1, ticket, true, true);
+        assert!(organism.live_pointer_inside);
+        assert_eq!(organism.live_greeting_exit_reference(1), Some(ticket));
+        organism.exit_live_greeting(1, old, true, true);
+        assert!(organism.live_pointer_inside);
+        // The same captured offer exits correctly without an intervening view.
+        organism.exit_live_greeting(1, ticket, true, true);
+        assert!(!organism.live_pointer_inside);
+        assert_eq!(organism.live_attention.entry_ticket(), None);
+    }
+
+    #[test]
+    fn actual_input_cancels_due_candidate_before_tick_without_spending_cooldown() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.sync_live_attention_owner(Some(1));
+        let ticket = organism.live_greeting_offer(1).unwrap();
+        organism.enter_live_greeting(1, ticket, true, true);
+        organism.accepted_input();
+        organism.live_attention.test_advance(
+            Some(1),
+            Duration::from_secs(1),
+            PreviewPose::Calm.context(),
+            true,
+        );
+        assert_eq!(
+            organism
+                .live_attention
+                .test_deadline(Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            organism.live_attention.test_explicit(
+                1,
+                Duration::from_secs(1),
+                PreviewPose::Calm.context()
+            ),
+            LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
         );
     }
 
@@ -1311,20 +1614,22 @@ mod tests {
                     .watch
                     .output(10, Duration::from_millis(millis), true);
             }
-            organism.live_greeting.enter(
-                10,
-                organism.live_greeting.epoch(),
-                Duration::ZERO,
+            organism
+                .live_attention
+                .test_enter(10, Duration::ZERO, context, true);
+            organism.live_attention.test_advance(
+                Some(10),
+                Duration::from_millis(600),
                 context,
                 true,
             );
-            organism
-                .live_greeting
-                .advance(Some(10), Duration::from_millis(600), context, true);
             let now = Duration::from_millis(700);
             assert_eq!(organism.watch.rhythm(10, now), WatchRhythm::Busy);
             assert_eq!(
-                organism.live_greeting.apply(10, now, context).behavior,
+                organism
+                    .live_attention
+                    .test_apply(10, now, context)
+                    .behavior,
                 PreviewPose::Greeting.context().behavior
             );
             organism.forget_session(if next == Some(10) { 20 } else { 10 });
@@ -1332,22 +1637,22 @@ mod tests {
             if next == Some(10) {
                 assert_eq!(organism.watch.rhythm(10, now), WatchRhythm::Busy);
                 assert_eq!(
-                    organism.live_greeting.apply(10, now, context).behavior,
+                    organism
+                        .live_attention
+                        .test_apply(10, now, context)
+                        .behavior,
                     PreviewPose::Greeting.context().behavior
                 );
             } else {
                 assert_eq!(organism.watch.rhythm(10, now), WatchRhythm::Steady);
-                assert_eq!(organism.live_greeting.apply(10, now, context), context);
-                assert_eq!(organism.live_greeting.deadline(now), None);
-                organism.live_greeting.leave();
-                organism.live_greeting.enter(
-                    20,
-                    organism.live_greeting.epoch(),
-                    now,
-                    context,
-                    true,
+                assert_eq!(
+                    organism.live_attention.test_apply(10, now, context),
+                    context
                 );
-                organism.live_greeting.advance(
+                assert_eq!(organism.live_attention.test_deadline(now), None);
+                organism.live_attention.test_leave();
+                organism.live_attention.test_enter(20, now, context, true);
+                organism.live_attention.test_advance(
                     Some(20),
                     Duration::from_millis(1300),
                     context,
@@ -1355,8 +1660,8 @@ mod tests {
                 );
                 assert_eq!(
                     organism
-                        .live_greeting
-                        .apply(20, Duration::from_millis(1300), context),
+                        .live_attention
+                        .test_apply(20, Duration::from_millis(1300), context),
                     context
                 );
             }
@@ -1380,14 +1685,15 @@ mod tests {
         organism.select_pose(Pose(PreviewPose::Curious));
         organism.say_hello_at(Duration::ZERO);
         let context = organism.sessions[&1].context;
-        let epoch = organism.live_greeting.epoch();
         organism
-            .live_greeting
-            .enter(1, epoch, Duration::ZERO, context, true);
+            .live_attention
+            .test_enter(1, Duration::ZERO, context, true);
         organism
-            .live_greeting
-            .advance(Some(1), Duration::from_millis(600), context, true);
-        let live_deadline = organism.live_greeting.deadline(Duration::from_secs(1));
+            .live_attention
+            .test_advance(Some(1), Duration::from_millis(600), context, true);
+        let live_deadline = organism
+            .live_attention
+            .test_deadline(Duration::from_secs(1));
         assert_eq!(live_deadline, Some(Duration::from_millis(2600)));
         let before = values(organism.life.state());
         organism.start_demo_at(Duration::from_secs(1));
@@ -1395,7 +1701,9 @@ mod tests {
         assert_eq!(organism.preview_deadlines.ready_at, Duration::from_secs(8));
         assert_eq!(organism.preview_deadlines.greeting_until, Duration::ZERO);
         assert_eq!(
-            organism.live_greeting.deadline(Duration::from_secs(1)),
+            organism
+                .live_attention
+                .test_deadline(Duration::from_secs(1)),
             live_deadline
         );
         for (time, pose, step) in [
@@ -1474,16 +1782,15 @@ mod tests {
             body_language: BodyLanguage::from_state(organism.life.state()),
             ..organism.sessions[&1].context
         };
-        let epoch = organism.live_greeting.epoch();
         organism
-            .live_greeting
-            .enter(1, epoch, Duration::ZERO, context, true);
+            .live_attention
+            .test_enter(1, Duration::ZERO, context, true);
         organism
-            .live_greeting
-            .advance(Some(1), Duration::from_millis(600), context, true);
+            .live_attention
+            .test_advance(Some(1), Duration::from_millis(600), context, true);
         let before = values(organism.life.state());
         let now = Duration::from_millis(700);
-        let final_context = organism.live_greeting.apply(1, now, context);
+        let final_context = organism.live_attention.test_apply(1, now, context);
         assert_eq!(
             final_context.behavior,
             PreviewPose::Greeting.context().behavior
@@ -1704,14 +2011,11 @@ mod tests {
         organism.set_remote(1, false);
         let before = values(organism.life.state());
         let preview_ready = organism.preview_deadlines.ready_at;
-        organism.live_greeting.enter(
-            1,
-            organism.live_greeting.epoch(),
-            Duration::ZERO,
-            PreviewPose::Calm.context(),
-            true,
-        );
-        organism.live_greeting.advance(
+        organism.sync_live_attention_owner(Some(1));
+        organism
+            .live_attention
+            .test_enter(1, Duration::ZERO, PreviewPose::Calm.context(), true);
+        organism.live_attention.test_advance(
             Some(1),
             Duration::from_millis(600),
             PreviewPose::Calm.context(),
@@ -1737,15 +2041,20 @@ mod tests {
                     organism.set_remote(id, false);
                     organism.batch_finished(id, false);
                 }
-                organism.enter_live_greeting(1, organism.live_greeting_epoch(), true);
-                assert!(organism.live_greeting_deadline().is_some());
+                organism.sync_live_attention_owner(Some(1));
+                let ticket = organism.live_greeting_offer(1).unwrap();
+                organism.enter_live_greeting(1, ticket, true, true);
+                assert!(organism.live_greeting_deadline(true, true).is_some());
                 match event {
                     "remote" => organism.set_remote(target, true),
                     "forget" => organism.forget_session(target),
                     "completed" => organism.completed(target, "cargo test", Some(0), Some(1)),
                     _ => organism.batch_finished(target, true),
                 }
-                assert_eq!(organism.live_greeting_deadline().is_some(), target == 2);
+                assert_eq!(
+                    organism.live_greeting_deadline(true, true).is_some(),
+                    target == 2
+                );
             }
         }
     }

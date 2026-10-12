@@ -3961,8 +3961,8 @@ enum Message {
     SetOrganismPose(organism::Pose),
     OrganismPreviewAction(organism_preview::PreviewRequest),
     OrganismTick,
-    OrganismHoverEnter(usize, u64),
-    OrganismHoverExit(usize, u64),
+    OrganismHoverEnter(usize, jterm_core::organism_live::LiveAttentionTicket),
+    OrganismHoverExit(usize, jterm_core::organism_live::LiveAttentionTicket),
     OrganismPointerButton(iced::mouse::Button, bool),
     OrganismPointerLeft,
     ThemeEditOpen,
@@ -5667,6 +5667,7 @@ impl Frost {
         // Re-apply the saved tabs once the sessions exist. The snapshot is
         // external input, so every index is validated before use.
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
+        app.sync_organism_attention_owner();
         app.sync_theme_colors();
         app.relayout();
         // The file tree carries a snapshot of the configured remote hosts.
@@ -7442,6 +7443,7 @@ impl Frost {
     /// Refresh every cache/state object whose coordinates belong to the active
     /// session. All tab/pane activation paths call this before accepting input.
     fn refresh_active_context(&mut self) {
+        self.sync_organism_attention_owner();
         self.organism.reset_watch();
         self.organism.cancel_live_greeting();
         self.refresh_active_context_caches();
@@ -13810,6 +13812,8 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Coordinate identity only: due attention is not accepted ahead of input.
+        self.sync_organism_attention_owner();
         self.organism
             .set_enabled(self.config.ascii_organism_enabled);
         if self.organism_observation_owner().is_none() {
@@ -16842,10 +16846,19 @@ impl Frost {
             Message::OrganismHoverEnter(id, epoch) => {
                 if self.organism_owner() == Some(id) {
                     let eligible = self.organism_hover_eligible();
-                    self.organism.enter_live_greeting(id, epoch, eligible);
+                    self.organism.enter_live_greeting(
+                        id,
+                        epoch,
+                        eligible,
+                        self.organism_layout().glyph,
+                    );
                 }
             }
-            Message::OrganismHoverExit(id, epoch) => self.organism.exit_live_greeting(id, epoch),
+            Message::OrganismHoverExit(id, epoch) => {
+                let eligible = self.organism_interaction_eligible();
+                self.organism
+                    .exit_live_greeting(id, epoch, eligible, self.organism_layout().glyph);
+            }
             Message::OrganismPointerButton(button, pressed) => {
                 organism_hover::update_pressed_button(
                     &mut self.organism_pointer_buttons,
@@ -16858,7 +16871,9 @@ impl Frost {
             }
             Message::OrganismPointerLeft => {
                 self.organism_pointer_buttons.clear();
-                self.organism.leave_live_greeting();
+                let eligible = self.organism_interaction_eligible();
+                self.organism
+                    .leave_live_greeting(eligible, self.organism_layout().glyph);
             }
             Message::OrganismTick => {
                 if self.config.ascii_organism_enabled {
@@ -16888,10 +16903,13 @@ impl Frost {
                 });
                 self.sync_organism_watch();
                 self.organism.tick(owner, running, any_running);
-                let interaction_owner = self.organism_owner();
+                let interaction_owner = self.sessions.get(self.active).map(|session| session.id);
                 let interaction_eligible = self.organism_interaction_eligible();
-                self.organism
-                    .poll_live_greeting(interaction_owner, interaction_eligible);
+                self.organism.poll_live_greeting(
+                    interaction_owner,
+                    interaction_eligible,
+                    self.organism_layout().glyph,
+                );
             }
             Message::SetBottomBar(show) => {
                 self.config.bottom_bar = show;
@@ -20468,6 +20486,11 @@ impl Frost {
         self.sync_organism_watch();
     }
 
+    fn sync_organism_attention_owner(&mut self) {
+        let owner = self.sessions.get(self.active).map(|session| session.id);
+        self.organism.sync_live_attention_owner(owner);
+    }
+
     fn organism_owner(&self) -> Option<usize> {
         self.organism_observation_owner()
             .filter(|_| !self.organism.is_retreating())
@@ -20519,12 +20542,18 @@ impl Frost {
         {
             Some("The companion is unavailable for the original pane right now.")
         } else if let Some(id) = target {
-            match self.organism.greet_live(id) {
-                organism_hover::ExplicitGreeting::Accepted => None,
-                organism_hover::ExplicitGreeting::Busy => Some("The companion is busy right now."),
-                organism_hover::ExplicitGreeting::Cooldown => {
+            use jterm_core::organism_live::{
+                LiveAttentionOutcome, LiveAttentionRejection, LiveAttentionSource,
+            };
+            match self
+                .organism
+                .greet_live(id, true, self.organism_layout().glyph)
+            {
+                LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit) => None,
+                LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown) => {
                     Some("The companion is cooling down. Try again later.")
                 }
+                _ => Some("The companion is busy right now."),
             }
         } else {
             Some("The companion is unavailable for the original pane right now.")
@@ -20601,8 +20630,14 @@ impl Frost {
             let settled = sess
                 .and_then(|s| s.terminal.running_duration_ms())
                 .is_some_and(|ms| ms >= 60_000);
-            self.organism
-                .presentation(id, running, settled, self.config.ascii_organism_motion)
+            self.organism.presentation_with_attention(
+                id,
+                running,
+                settled,
+                self.config.ascii_organism_motion,
+                self.organism_interaction_eligible(),
+                layout.glyph,
+            )
         });
         let presentation = presentation.unwrap_or_default();
         let companion_height = self.organism_strip_height();
@@ -20642,9 +20677,13 @@ impl Frost {
                 explanation,
             } = presentation;
             let candidate_visible = self.organism_hover_eligible()
-                && self
-                    .organism_owner()
-                    .is_some_and(|id| self.organism.live_greeting_candidate_visible(id));
+                && self.organism_owner().is_some_and(|id| {
+                    self.organism.live_greeting_candidate_visible(
+                        id,
+                        self.organism_interaction_eligible(),
+                        layout.glyph,
+                    )
+                });
             // Always reserve this tiny mark inside the existing slot. It is
             // a passive dwell cue, not a focus ring or a behavior change.
             let cue_color = self.c_text_dim();
@@ -20687,14 +20726,15 @@ impl Frost {
                 tooltip(slot, detail, tooltip::Position::Top).into()
             };
             let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
-                let (exit_id, exit_epoch) = self.organism.live_greeting_exit_reference(id);
-                mouse_area(slot)
-                    .on_enter(Message::OrganismHoverEnter(
-                        id,
-                        self.organism.live_greeting_epoch(),
-                    ))
-                    .on_exit(Message::OrganismHoverExit(exit_id, exit_epoch))
-                    .into()
+                // One core offer binds both edges before the next view rebuild.
+                let mut area = mouse_area(slot);
+                if let Some(ticket) = self.organism.live_greeting_offer(id) {
+                    area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
+                }
+                if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
+                    area = area.on_exit(Message::OrganismHoverExit(id, ticket));
+                }
+                area.into()
             } else {
                 slot
             };
@@ -27110,7 +27150,10 @@ impl Frost {
         if live_visible
             && organism_pointer_observation_needed(
                 live_layout.glyph,
-                self.organism.explicit_greeting_active(),
+                self.organism.explicit_greeting_active(
+                    self.organism_interaction_eligible(),
+                    live_layout.glyph,
+                ),
                 !self.organism_pointer_buttons.is_empty(),
                 self.config.ascii_organism_motion,
             )
@@ -27136,7 +27179,10 @@ impl Frost {
             ));
         }
         if self.organism_interaction_eligible() {
-            if let Some(deadline) = self.organism.live_greeting_deadline() {
+            if let Some(deadline) = self
+                .organism
+                .live_greeting_deadline(self.organism_interaction_eligible(), live_layout.glyph)
+            {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
@@ -29408,10 +29454,7 @@ mod tests {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let bar = bar.split_once("    fn ").unwrap().0;
-        assert_eq!(
-            bar.matches(".presentation(id, running, settled,").count(),
-            1
-        );
+        assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);
         assert!(bar.contains("text(presentation.explanation.clone().into_owned())"));
         assert!(bar.contains("text(explanation.into_owned())"));
         assert!(!bar.contains("behavior_explanation("));
@@ -29630,33 +29673,66 @@ mod tests {
 
     #[test]
     fn shrinking_away_the_glyph_cancels_visit_without_rearming_on_width_restore() {
+        use jterm_core::organism_live::{LiveAttention, LiveAttentionEvent, LiveAttentionInput};
         use std::time::Duration;
         let context = jterm_core::organism_daily::PreviewPose::Calm.context();
-        let mut greeting = organism_hover::LiveGreeting::default();
-        greeting.enter(1, greeting.epoch(), Duration::ZERO, context, true);
-        greeting.advance(Some(1), Duration::from_millis(600), context, true);
+        let mut greeting = LiveAttention::default();
+        greeting.set_owner(Some(1));
+        let mut input = LiveAttentionInput {
+            base_context: context,
+            hard_eligible: true,
+            hover_available: true,
+            pointer_inside: true,
+        };
+        let ticket = greeting.entry_offer().unwrap();
+        greeting
+            .advance(
+                Duration::ZERO,
+                &1,
+                input,
+                LiveAttentionEvent::PointerEntered { ticket },
+            )
+            .unwrap();
         assert_ne!(
-            greeting.apply(1, Duration::from_millis(700), context),
+            greeting
+                .advance(
+                    Duration::from_millis(600),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile
+                )
+                .unwrap()
+                .presentation,
             context
         );
         for width in [500.0, 219.0, 700.0] {
-            if !organism_layout(width, true, true, true).glyph {
-                greeting.cancel();
-            }
+            let layout = organism_layout(width, true, true, true);
+            input.hover_available = layout.glyph;
+            input.hard_eligible = layout.presentable();
+            greeting
+                .advance(
+                    Duration::from_millis(700),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile,
+                )
+                .unwrap();
         }
-        // Same physical visit stays consumed even when the old target returns.
-        greeting.enter(
-            1,
-            greeting.epoch(),
-            Duration::from_millis(800),
-            context,
-            true,
-        );
-        assert!(greeting.deadline(Duration::from_millis(800)).is_none());
-        assert_eq!(
-            greeting.apply(1, Duration::from_millis(800), context),
-            context
-        );
+        // A new native offer cannot rearm the still-consumed physical visit.
+        let ticket = greeting.entry_offer().unwrap();
+        greeting
+            .advance(
+                Duration::from_millis(800),
+                &1,
+                input,
+                LiveAttentionEvent::PointerEntered { ticket },
+            )
+            .unwrap();
+        let snapshot = greeting
+            .snapshot(Duration::from_millis(800), &1, input)
+            .unwrap();
+        assert!(snapshot.next_deadline().is_none());
+        assert_eq!(snapshot.presentation, context);
     }
 
     #[test]
@@ -29778,7 +29854,7 @@ mod tests {
         assert!(source.contains("STATUS_BAR_H + self.organism_strip_height() + 12.0"));
         let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let bar = bar.split_once("    fn jsh_notice(&self)").unwrap().0;
-        assert_eq!(bar.matches(".presentation(").count(), 1);
+        assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);
         assert!(bar.contains("let presentation = self.organism_owner().map"));
         assert!(bar.contains("if !layout.body || presentation.explanation.is_empty()"));
         assert!(bar.contains("let companion_height = self.organism_strip_height()"));
@@ -36262,19 +36338,81 @@ mod tests {
     }
 
     #[test]
+    fn shared_attention_coordinates_identity_without_accepting_before_input() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let entry = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1
+            .split_once("        match message {")
+            .unwrap()
+            .0;
+        assert!(entry.contains("self.sync_organism_attention_owner();"));
+        assert!(!entry.contains("poll_live_greeting"));
+        let tick = source
+            .split_once("            Message::OrganismTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetBottomBar")
+            .unwrap()
+            .0;
+        assert!(tick.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(tick.contains(".poll_live_greeting("));
+        let edges = source
+            .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismPointerButton")
+            .unwrap()
+            .0;
+        assert!(edges.contains("self.organism.enter_live_greeting("));
+        assert!(edges
+            .contains(".exit_live_greeting(id, epoch, eligible, self.organism_layout().glyph)"));
+        let view = source
+            .split_once("// One core offer binds both edges before the next view rebuild.")
+            .unwrap()
+            .1
+            .split_once("                area.into()")
+            .unwrap()
+            .0;
+        assert!(view.contains("live_greeting_offer(id)"));
+        assert!(view.contains("on_enter(Message::OrganismHoverEnter(id, ticket))"));
+        assert!(view.contains("live_greeting_exit_reference(id)"));
+        assert!(view.contains("on_exit(Message::OrganismHoverExit(id, ticket))"));
+        let adapter = include_str!("organism_hover.rs");
+        assert!(!adapter.contains("GentleInteraction"));
+        assert!(!adapter.contains("struct LiveGreeting"));
+        assert!(adapter.contains("update_pressed_button"));
+    }
+
+    #[test]
     fn narrow_explicit_pointer_observation_keeps_release_cleanup_after_cancellation() {
+        use jterm_core::organism_live::{
+            LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
+            LiveAttentionSource,
+        };
         use std::time::Duration;
         let mut buttons = Vec::new();
-        let mut greeting = organism_hover::LiveGreeting::default();
+        let mut greeting = LiveAttention::default();
+        greeting.set_owner(Some(1));
+        let input = LiveAttentionInput {
+            base_context: jterm_core::organism_daily::PreviewPose::Calm.context(),
+            hard_eligible: true,
+            hover_available: false,
+            pointer_inside: false,
+        };
         assert_eq!(
-            greeting.request_explicit(
-                1,
-                Duration::ZERO,
-                jterm_core::organism_daily::PreviewPose::Calm.context()
-            ),
-            organism_hover::ExplicitGreeting::Accepted
+            greeting
+                .advance(Duration::ZERO, &1, input, LiveAttentionEvent::Explicit)
+                .unwrap()
+                .outcome,
+            LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
         );
-        assert!(greeting.explicit_active(Duration::ZERO));
+        assert!(greeting
+            .snapshot(Duration::ZERO, &1, input)
+            .unwrap()
+            .active
+            .is_some());
         assert!(!organism_pointer_observation_needed(
             false, false, false, None
         ));
@@ -36282,8 +36420,12 @@ mod tests {
             false, true, false, None
         ));
         organism_hover::update_pressed_button(&mut buttons, 1, true);
-        greeting.cancel();
-        assert!(!greeting.explicit_active(Duration::ZERO));
+        greeting.cancel(&1);
+        assert!(!greeting
+            .snapshot(Duration::ZERO, &1, input)
+            .unwrap()
+            .active
+            .is_some());
         // Press cancels the hold, but its truthful ledger keeps the listener.
         for motion in [
             None,
@@ -36295,7 +36437,11 @@ mod tests {
                 assert!(layout.presentable());
                 assert!(organism_pointer_observation_needed(
                     layout.glyph,
-                    greeting.explicit_active(Duration::from_millis(100)),
+                    greeting
+                        .snapshot(Duration::from_millis(100), &1, input)
+                        .unwrap()
+                        .active
+                        .is_some(),
                     !buttons.is_empty(),
                     motion,
                 ));
@@ -36332,7 +36478,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(subs.contains("organism_pointer_observation_needed("));
-        assert!(subs.contains("self.organism.explicit_greeting_active()"));
+        assert!(subs.contains("self.organism.explicit_greeting_active("));
         assert!(subs.contains("!self.organism_pointer_buttons.is_empty()"));
     }
 
@@ -36454,7 +36600,7 @@ mod tests {
             .0;
         let glyph = bar.split_once("        if layout.glyph {").unwrap().1;
         assert!(glyph.contains("let candidate_visible = self.organism_hover_eligible()"));
-        assert!(glyph.contains("self.organism.live_greeting_candidate_visible(id)"));
+        assert!(glyph.contains("self.organism.live_greeting_candidate_visible("));
         assert!(glyph.contains("background: candidate_visible.then_some(cue_color.into())"));
         assert!(glyph.contains(".width(Length::Fixed(2.0))"));
         assert!(glyph.contains(".height(Length::Fixed(2.0))"));
@@ -36480,7 +36626,7 @@ mod tests {
             .0;
         assert!(bar.contains("Length::Fixed(84.0)"));
         assert!(bar.contains(".on_enter(Message::OrganismHoverEnter("));
-        assert!(bar.contains("self.organism.live_greeting_epoch()"));
+        assert!(bar.contains("self.organism.live_greeting_offer(id)"));
         assert!(bar.contains(".on_exit(Message::OrganismHoverExit(exit_id, exit_epoch))"));
         assert!(!bar.contains(".on_press("));
         assert!(!bar.contains("write_pty"));
@@ -36514,7 +36660,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(subscriptions.contains("if self.organism_interaction_eligible()"));
-        assert!(subscriptions.contains("self.organism.live_greeting_deadline()"));
+        assert!(subscriptions.contains("self.organism.live_greeting_deadline("));
     }
 
     #[test]

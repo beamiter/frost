@@ -189,6 +189,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mouse_area_queues_same_offer_enter_and_exit_before_view_rebuild() {
+        use crate::{organism::Organism, Message};
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        for id in [1, 2] {
+            organism.prime_session(id, false);
+            organism.set_remote(id, false);
+        }
+        organism.sync_live_attention_owner(Some(1));
+        let offer = organism.live_greeting_offer(1).unwrap();
+        let exit = organism.live_greeting_exit_reference(1).unwrap();
+        assert_eq!(offer, exit);
+        let mut area: Element<'_, Message, iced::Theme, TestRenderer> =
+            iced::widget::mouse_area(Space::new().width(84).height(30))
+                .on_enter(Message::OrganismHoverEnter(1, offer))
+                .on_exit(Message::OrganismHoverExit(1, exit))
+                .into();
+        let mut tree = Tree::new(area.as_widget());
+        let node = area.as_widget_mut().layout(
+            &mut tree,
+            &TestRenderer,
+            &layout::Limits::new(Size::ZERO, Size::new(100.0, 100.0)),
+        );
+        let mut messages = Vec::new();
+        // Both native edges are dispatched against the same tree and callbacks.
+        for position in [iced::Point::new(10.0, 10.0), iced::Point::new(95.0, 95.0)] {
+            area.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved { position }),
+                Layout::new(&node),
+                mouse::Cursor::Available(position),
+                &TestRenderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(100.0, 100.0)),
+            );
+        }
+        assert_eq!(messages.len(), 2);
+        match messages[0] {
+            Message::OrganismHoverEnter(id, ticket) => {
+                assert_eq!((id, ticket), (1, offer));
+                organism.enter_live_greeting(id, ticket, true, true);
+            }
+            _ => panic!("expected native enter"),
+        }
+        assert!(organism
+            .live_greeting_snapshot(true, true)
+            .unwrap()
+            .candidate
+            .is_some());
+        match messages[1] {
+            Message::OrganismHoverExit(id, ticket) => {
+                assert_eq!((id, ticket), (1, offer));
+                organism.exit_live_greeting(id, ticket, true, true);
+            }
+            _ => panic!("expected native exit"),
+        }
+        let snapshot = organism.live_greeting_snapshot(true, true).unwrap();
+        assert!(snapshot.entry.is_none());
+        assert!(snapshot.candidate.is_none());
+        organism.sync_live_attention_owner(Some(2));
+        let new_offer = organism.live_greeting_offer(2).unwrap();
+        organism.enter_live_greeting(1, offer, true, true);
+        assert_eq!(organism.live_greeting_offer(2), Some(new_offer));
+        assert!(organism
+            .live_greeting_snapshot(true, true)
+            .unwrap()
+            .candidate
+            .is_none());
+    }
+
     // Exercise the real pinned Container draw boundary without fonts or a GPU.
     struct ViewportSpy<'a>(&'a std::cell::Cell<Option<Rectangle>>);
 
