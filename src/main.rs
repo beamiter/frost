@@ -9054,8 +9054,17 @@ impl Frost {
         &mut self,
         key: &keyboard::Key,
         mods: keyboard::Modifiers,
+        retreat_before_key: Option<std::time::Instant>,
     ) -> Option<Task<Message>> {
         let cmd = resolve_keybinding_command(&self.keybindings, key, mods)?;
+        if cmd == keybindings::Command::OrganismHello {
+            // This key is an application action after all higher-priority owners
+            // have declined it. Keep prior real input retreat, but do not let
+            // this action's own entry retreat make every greeting unavailable.
+            // Cancellation already happened; no old visit or hold is restored.
+            self.organism
+                .restore_retreat_after_app_action(retreat_before_key);
+        }
         self.dispatch_command(cmd)
     }
 
@@ -9357,6 +9366,11 @@ impl Frost {
                 self.equalize_panes();
                 Task::none()
             }
+            C::OrganismHello => {
+                let target = self.sessions.get(self.active).map(|session| session.id);
+                self.greet_companion(target);
+                Task::none()
+            }
             C::ConfigOpen => {
                 self.set_config_panel_open(true);
                 Task::none()
@@ -9433,7 +9447,7 @@ impl Frost {
                 self.palette.toggle();
                 Some(if self.palette.is_open {
                     self.organism
-                        .restore_retreat_after_palette_open(retreat_before_key);
+                        .restore_retreat_after_app_action(retreat_before_key);
                     self.palette.bind_greeting_target(
                         self.sessions.get(self.active).map(|session| session.id),
                     );
@@ -14996,10 +15010,14 @@ impl Frost {
             }
             Message::Key(event) => {
                 let retreat_before_key = self.organism.retreat_deadline();
-                if self.terminal_input_active()
-                    && matches!(&event, keyboard::Event::KeyPressed { .. })
-                {
-                    self.organism.retreat();
+                if self.terminal_input_active() {
+                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                        if organism_modifier_only_key(key) {
+                            self.organism.modifier_pressed();
+                        } else {
+                            self.organism.retreat();
+                        }
+                    }
                 }
                 // These surfaces confirm/open reviewed commands. Search-only
                 // Enter navigation remains unchanged; all physical presses are
@@ -15413,7 +15431,8 @@ impl Frost {
                             _ => {}
                         }
                     }
-                    if let Some(task) = self.handle_keybinding(&key, modifiers) {
+                    if let Some(task) = self.handle_keybinding(&key, modifiers, retreat_before_key)
+                    {
                         return task;
                     }
                     if let Some(task) =
@@ -28466,6 +28485,20 @@ fn wait_out_hangup(
     }
 }
 
+/// These standalone modifier keys encode no payload in Frost's supported
+/// legacy/Kitty/xterm paths. Unknown keys keep ordinary retreat semantics.
+fn organism_modifier_only_key(key: &keyboard::Key) -> bool {
+    matches!(
+        key,
+        keyboard::Key::Named(
+            keyboard::key::Named::Control
+                | keyboard::key::Named::Shift
+                | keyboard::key::Named::Alt
+                | keyboard::key::Named::Super
+        )
+    )
+}
+
 /// Build the canonical binding string (e.g. `"ctrl+shift+t"`) for a key event
 /// by constructing a `jterm_core::keybindings::Chord` from the iced key data
 /// and rendering `Chord::canonical()` — the exact form `KeyBinding::canonical`
@@ -36535,6 +36568,120 @@ mod tests {
     }
 
     #[test]
+    fn standalone_modifiers_never_encode_payload_across_keyboard_protocols() {
+        use keyboard::{key::Named, Key, Location, Modifiers};
+        for named in [Named::Control, Named::Shift, Named::Alt, Named::Super] {
+            let key = Key::Named(named);
+            assert!(organism_modifier_only_key(&key));
+            for kitty_flags in [0, 1, 8, 31] {
+                for modify_other_keys in [0, 1, 2] {
+                    for format_other_keys in [0, 1] {
+                        for report_all_keys in [false, true] {
+                            for location in [Location::Left, Location::Right] {
+                                for app_cursor in [false, true] {
+                                    for application_keypad in [false, true] {
+                                        assert_eq!(
+                                            encode_key(
+                                                &key,
+                                                location,
+                                                Modifiers::CTRL
+                                                    | Modifiers::SHIFT
+                                                    | Modifiers::ALT
+                                                    | Modifiers::LOGO,
+                                                None,
+                                                app_cursor,
+                                                KeyboardEnhancements {
+                                                    kitty_flags,
+                                                    modify_other_keys,
+                                                    format_other_keys,
+                                                    report_all_keys,
+                                                    application_keypad,
+                                                },
+                                            ),
+                                            None
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for key in [
+            Key::Character("h".into()),
+            Key::Named(Named::Enter),
+            Key::Named(Named::F8),
+            Key::Unidentified,
+        ] {
+            assert!(!organism_modifier_only_key(&key));
+        }
+    }
+
+    #[test]
+    fn greeting_binding_classifies_before_restoring_retreat_and_uses_shared_admission() {
+        let source = include_str!("main.rs");
+        let binding = source
+            .split_once("    fn handle_keybinding(")
+            .unwrap()
+            .1
+            .split_once("    fn dispatch_command(")
+            .unwrap()
+            .0;
+        assert!(
+            binding.find("resolve_keybinding_command").unwrap()
+                < binding
+                    .find("if cmd == keybindings::Command::OrganismHello")
+                    .unwrap()
+        );
+        assert!(
+            binding
+                .find("if cmd == keybindings::Command::OrganismHello")
+                .unwrap()
+                < binding.find("restore_retreat_after_app_action").unwrap()
+        );
+        assert!(binding.contains(".restore_retreat_after_app_action(retreat_before_key)"));
+        assert!(
+            binding.find("restore_retreat_after_app_action").unwrap()
+                < binding.find("self.dispatch_command(cmd)").unwrap()
+        );
+        let dispatch = source
+            .split_once("            C::OrganismHello => {")
+            .unwrap()
+            .1
+            .split_once("            C::ConfigOpen => {")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(dispatch.contains("self.greet_companion(target)"));
+        assert!(dispatch.contains("Task::none()"));
+        assert!(!dispatch.contains("Task::done"));
+        assert!(!dispatch.contains("write_pty"));
+        let key = source
+            .split_once("            Message::Key(event) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Ime(")
+            .unwrap()
+            .0;
+        assert!(key.contains("if organism_modifier_only_key(key)"));
+        assert!(key.contains("self.organism.modifier_pressed()"));
+        assert!(key.contains("self.organism.retreat()"));
+        assert!(
+            key.find("self.handle_sidebar_files_key").unwrap()
+                < key
+                    .find("self.handle_keybinding(&key, modifiers, retreat_before_key)")
+                    .unwrap()
+        );
+        assert!(
+            key.find("let block_key_context =").unwrap()
+                < key
+                    .find("self.handle_keybinding(&key, modifiers, retreat_before_key)")
+                    .unwrap()
+        );
+    }
+
+    #[test]
     fn palette_navigation_restores_only_its_own_retreat_after_custom_binding_precedence() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let key = source
@@ -36550,7 +36697,8 @@ mod tests {
                 < key.find("self.organism.retreat()").unwrap()
         );
         assert!(
-            key.find("self.handle_keybinding(&key, modifiers)").unwrap()
+            key.find("self.handle_keybinding(&key, modifiers, retreat_before_key)")
+                .unwrap()
                 < key
                     .find("self.handle_tab_shortcut(&key, modifiers, retreat_before_key)")
                     .unwrap()
@@ -36564,10 +36712,10 @@ mod tests {
             .0;
         assert!(
             chrome.find("if self.palette.is_open").unwrap()
-                < chrome.find("restore_retreat_after_palette_open").unwrap()
+                < chrome.find("restore_retreat_after_app_action").unwrap()
         );
         assert_eq!(
-            chrome.matches("restore_retreat_after_palette_open").count(),
+            chrome.matches("restore_retreat_after_app_action").count(),
             1
         );
         let query = source

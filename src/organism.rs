@@ -527,14 +527,21 @@ impl Organism {
 
     /// Presentation-only retreat also serves blur and attempted gestures.
     pub fn retreat(&mut self) {
-        self.watch.reset();
-        self.cancel_live_greeting();
+        self.modifier_pressed();
         self.retreat_until = Instant::now() + Duration::from_millis(900);
     }
 
-    /// Only the actual palette-opening branch may undo its own key's extension.
+    /// A standalone modifier does not encode terminal input. It still retires
+    /// current attention and observation, without extending a real input deadline.
+    pub fn modifier_pressed(&mut self) {
+        self.watch.reset();
+        self.cancel_live_greeting();
+    }
+
+    /// Only an identified palette-opening or greeting action may undo its own
+    /// key's extension; unrelated input never calls this boundary.
     /// Already canceled visits/watch are deliberately not restored.
-    pub fn restore_retreat_after_palette_open(&mut self, previous: Option<Instant>) {
+    pub fn restore_retreat_after_app_action(&mut self, previous: Option<Instant>) {
         self.retreat_until = previous.unwrap_or_else(Instant::now);
     }
 
@@ -1341,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_open_restores_only_previous_retreat_deadline_not_canceled_state() {
+    fn app_action_restores_only_previous_retreat_deadline_not_canceled_state() {
         let mut organism = Organism::default();
         let previous = Instant::now() + Duration::from_millis(300);
         organism.retreat_until = previous;
@@ -1350,13 +1357,83 @@ mod tests {
             .test_enter(1, Duration::ZERO, PreviewPose::Calm.context(), true);
         let snapshot = organism.retreat_deadline();
         organism.retreat();
-        organism.restore_retreat_after_palette_open(snapshot);
+        organism.restore_retreat_after_app_action(snapshot);
         assert_eq!(organism.retreat_until, previous);
         assert_eq!(organism.live_attention.test_deadline(Duration::ZERO), None);
         organism.retreat();
-        organism.restore_retreat_after_palette_open(None);
+        organism.restore_retreat_after_app_action(None);
         assert!(!organism.is_retreating());
         assert_eq!(organism.live_attention.test_deadline(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn modifier_then_greeting_key_preserves_only_prior_real_input_retreat() {
+        for has_prior_input in [false, true] {
+            let mut organism = Organism::default();
+            organism.set_enabled(true);
+            organism.prime_session(1, false);
+            organism.set_remote(1, false);
+            organism.sync_live_attention_owner(Some(1));
+            if has_prior_input {
+                organism.retreat();
+            }
+            let original = organism.retreat_deadline();
+            organism.modifier_pressed();
+            assert_eq!(organism.retreat_deadline(), original);
+            // The actual bound character follows normal Key cancellation, then
+            // its recognized application action restores only the old deadline.
+            let before_character = organism.retreat_deadline();
+            organism.retreat();
+            organism.restore_retreat_after_app_action(before_character);
+            assert_eq!(organism.retreat_deadline(), original);
+            let eligible = !organism.is_retreating();
+            assert_eq!(eligible, !has_prior_input);
+            assert_eq!(
+                organism.greet_live(1, eligible, true),
+                if has_prior_input {
+                    LiveAttentionOutcome::Rejected(LiveAttentionRejection::Unavailable)
+                } else {
+                    LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_greeting_key_cancels_hold_but_keeps_cooldown_without_replay() {
+        let mut organism = Organism::default();
+        let context = PreviewPose::Calm.context();
+        assert_eq!(
+            organism
+                .live_attention
+                .test_explicit(1, Duration::ZERO, context),
+            LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit)
+        );
+        // Native key entry cancels before the binding is classified. Restoring
+        // its own retreat does not recreate the accepted hold or reset cooldown.
+        organism.retreat();
+        organism.restore_retreat_after_app_action(None);
+        assert_eq!(
+            organism
+                .live_attention
+                .test_explicit(1, Duration::from_millis(100), context),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
+        );
+        assert_eq!(
+            organism
+                .live_attention
+                .test_deadline(Duration::from_millis(100)),
+            None
+        );
+        organism
+            .live_attention
+            .test_advance(Some(1), Duration::from_secs(9), context, true);
+        assert_eq!(
+            organism
+                .live_attention
+                .test_deadline(Duration::from_secs(9)),
+            None
+        );
     }
 
     #[test]

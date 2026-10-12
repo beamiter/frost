@@ -131,6 +131,9 @@ pub enum Command {
     AgentLaunchOpenCode,
     AgentLaunchKimi,
 
+    /// Explicit application-only greeting; deliberately has no default chord.
+    OrganismHello,
+
     // === 字体缩放 ===
     FontZoomIn,
     FontZoomOut,
@@ -144,6 +147,7 @@ pub enum Command {
 impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Command::OrganismHello => write!(f, "organism:hello"),
             Command::SessionNew => write!(f, "session:new"),
             Command::SessionClose => write!(f, "session:close"),
             Command::SessionNext => write!(f, "session:next"),
@@ -237,6 +241,7 @@ impl std::str::FromStr for Command {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "organism:hello" => Ok(Command::OrganismHello),
             "session:new" => Ok(Command::SessionNew),
             "session:close" => Ok(Command::SessionClose),
             "session:next" => Ok(Command::SessionNext),
@@ -848,6 +853,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn organism_hello_is_bindable_but_never_shipped_on_a_default_chord() {
+        assert_eq!(
+            "organism:hello".parse::<Command>(),
+            Ok(Command::OrganismHello)
+        );
+        assert_eq!(Command::OrganismHello.to_string(), "organism:hello");
+        let defaults = KeyBindings::default_bindings();
+        assert!(defaults.chords_for("organism:hello").is_empty());
+        let loaded =
+            KeyBindings::from_toml_with_diagnostics("\"F8\" = \"organism:hello\"\n").unwrap();
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(
+            loaded.bindings.get_command("f8"),
+            Some(Command::OrganismHello)
+        );
+        assert_eq!(
+            loaded.bindings.shortcut_label("organism:hello").as_deref(),
+            Some("F8")
+        );
+        let modified_chord =
+            KeyBindings::from_toml_with_diagnostics("\"ctrl+h\" = \"organism:hello\"\n").unwrap();
+        assert!(modified_chord.diagnostics.is_empty());
+        assert_eq!(
+            modified_chord.bindings.get_command("ctrl+h"),
+            Some(Command::OrganismHello)
+        );
     }
 
     #[test]

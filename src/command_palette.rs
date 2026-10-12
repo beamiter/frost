@@ -683,7 +683,7 @@ impl PaletteState {
             PaletteItem {
                 name: "Greet companion",
                 description: "Say hello to the idle live companion (Full or Calm)",
-                binding: None,
+                binding: Some("organism:hello"),
                 shortcut: "",
                 action: PaletteAction::GreetCompanion,
             },
@@ -1039,6 +1039,26 @@ mod tests {
         for (action, expected) in cases {
             assert_eq!(shortcut(action).as_deref(), Some(expected), "{action:?}");
         }
+    }
+
+    #[test]
+    fn greeting_palette_hint_tracks_an_optional_custom_binding() {
+        let palette = PaletteState::new();
+        let item = palette
+            .all
+            .iter()
+            .find(|item| item.action == PaletteAction::GreetCompanion)
+            .unwrap();
+        assert_eq!(item.binding, Some("organism:hello"));
+        assert_eq!(
+            item.shortcut_label(&crate::keybindings::KeyBindings::default_bindings()),
+            None
+        );
+        let loaded = crate::keybindings::KeyBindings::from_toml_with_diagnostics(
+            "\"F8\" = \"organism:hello\"\n",
+        )
+        .unwrap();
+        assert_eq!(item.shortcut_label(&loaded.bindings).as_deref(), Some("F8"));
     }
 
     /// Every configurable item names a command the binding table can actually
