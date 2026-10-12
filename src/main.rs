@@ -36627,7 +36627,7 @@ mod tests {
         assert!(bar.contains("Length::Fixed(84.0)"));
         assert!(bar.contains(".on_enter(Message::OrganismHoverEnter("));
         assert!(bar.contains("self.organism.live_greeting_offer(id)"));
-        assert!(bar.contains(".on_exit(Message::OrganismHoverExit(exit_id, exit_epoch))"));
+        assert!(bar.contains(".on_exit(Message::OrganismHoverExit(id, ticket))"));
         assert!(!bar.contains(".on_press("));
         assert!(!bar.contains("write_pty"));
         let eligible = source
@@ -36660,7 +36660,9 @@ mod tests {
             .unwrap()
             .0;
         assert!(subscriptions.contains("if self.organism_interaction_eligible()"));
-        assert!(subscriptions.contains("self.organism.live_greeting_deadline("));
+        assert!(subscriptions.contains(
+            ".live_greeting_deadline(self.organism_interaction_eligible(), live_layout.glyph)"
+        ));
     }
 
     #[test]
