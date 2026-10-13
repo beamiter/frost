@@ -27747,9 +27747,13 @@ impl Frost {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
-        // The dormant 900ms heartbeat must not add another phase of retreat.
-        if self.organism_observation_owner().is_some() {
+        // The dormant 900ms heartbeat must not extend retreat or a completion
+        // hold. Only the eligible foreground owner gets a finite expiry wake.
+        if let Some(owner) = self.organism_observation_owner() {
             if let Some(deadline) = self.organism.retreat_deadline() {
+                subs.push(organism_deadline_subscription(deadline));
+            }
+            if let Some(deadline) = self.organism.reaction_deadline(owner) {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
@@ -38260,7 +38264,7 @@ mod tests {
     }
 
     #[test]
-    fn organism_preview_and_retreat_use_one_shot_deadlines() {
+    fn organism_preview_retreat_and_completion_use_one_shot_deadlines() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let subscription = source
             .split_once("        let preview_visible =")
@@ -38272,8 +38276,10 @@ mod tests {
         assert!(subscription.contains("if preview_full || live_visible"));
         assert!(subscription.contains("if preview_visible && !preview_full"));
         assert!(subscription.contains("self.organism.preview_deadline()"));
-        assert!(subscription.contains("self.organism_observation_owner().is_some()"));
+        assert!(subscription.contains("if let Some(owner) = self.organism_observation_owner()"));
         assert!(subscription.contains("self.organism.retreat_deadline()"));
+        assert!(subscription.contains("self.organism.reaction_deadline(owner)"));
+        assert_eq!(subscription.matches("iced::time::every(").count(), 1);
         let deadline = source
             .split_once("fn organism_deadline_subscription(")
             .unwrap()
@@ -38284,6 +38290,44 @@ mod tests {
         assert!(deadline.contains("Subscription::run_with(deadline"));
         assert!(deadline.contains("stream::once"));
         assert!(deadline.contains("sleep_until(deadline.into())"));
+    }
+
+    #[test]
+    fn completion_expiry_wake_uses_the_current_eligible_observation_owner() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        for gate in [
+            "!self.config.ascii_organism_enabled",
+            "!self.config.bottom_bar",
+            "!self.focused",
+            "!self.terminal_input_active()",
+            "!self.organism_layout().presentable()",
+            ".get(self.active)",
+            "!s.managed_remote",
+            "!s.transcript_read_only()",
+            "!s.terminal.is_alt_buffer_active()",
+            "self.organism.is_local(s.id)",
+            "Some(\"ssh\" | \"mosh\" | \"telnet\")",
+        ] {
+            assert!(owner.contains(gate), "missing expiry owner gate: {gate}");
+        }
+        let expiry = source
+            .split_once("        if let Some(owner) = self.organism_observation_owner() {")
+            .unwrap()
+            .1
+            .split_once("        if live_visible")
+            .unwrap()
+            .0;
+        assert!(expiry.contains("self.organism.reaction_deadline(owner)"));
+        assert!(expiry.contains("organism_deadline_subscription(deadline)"));
+        assert!(!expiry.contains("time::every"));
+        assert!(!expiry.contains("sessions.iter()"));
     }
 
     #[test]

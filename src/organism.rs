@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 
 use jterm_core::organism::{
     classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind, Behavior,
-    BodyLanguage, CircadianPhase, LifeState, NativeOrganism, Reaction, RenderContext, RepoVigil,
-    Tone, WatchRhythm,
+    BodyLanguage, CircadianPhase, LifeState, NativeOrganism, RenderContext, RepoVigil, WatchRhythm,
 };
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
@@ -146,7 +145,7 @@ struct SessionLife {
     accept_completion: bool,
     /// No event-source activation epoch exists: discard the initial PTY batch.
     quarantine_batch: bool,
-    reaction_until: Instant,
+    reaction_until: Option<Instant>,
     remote: bool,
     next_remote_probe: Instant,
 }
@@ -159,7 +158,7 @@ impl SessionLife {
             context: PreviewPose::Calm.context(),
             accept_completion: !running,
             quarantine_batch: true,
-            reaction_until: now,
+            reaction_until: None,
             remote: true,
             next_remote_probe: now,
         }
@@ -365,6 +364,17 @@ impl Organism {
         exit: Option<i32>,
         duration: Option<u64>,
     ) {
+        self.completed_at(id, command, exit, duration, self.born.elapsed());
+    }
+
+    fn completed_at(
+        &mut self,
+        id: usize,
+        command: &str,
+        exit: Option<i32>,
+        duration: Option<u64>,
+        now: Duration,
+    ) {
         self.watch.retire_owner(id);
         if !self.enabled {
             return;
@@ -382,7 +392,6 @@ impl Organism {
             return;
         }
         self.live_attention.cancel(&id);
-        let now = Instant::now();
         life.native.sync_state(self.life.state());
         let reaction = life
             .native
@@ -394,7 +403,7 @@ impl Organism {
             BodyLanguage::from_state(life.native.state()),
             false,
         );
-        life.reaction_until = now + reaction_duration(&reaction);
+        life.reaction_until = Some(self.born + now + reaction.hold_duration());
     }
 
     pub fn batch_finished(&mut self, id: usize, running: bool) {
@@ -632,6 +641,37 @@ impl Organism {
         (now < self.retreat_until).then_some(self.retreat_until)
     }
 
+    /// The host requests this only for the current eligible observation owner.
+    /// Keep the original absolute expiry; redraws must never restart a hold.
+    pub fn reaction_deadline(&self, id: usize) -> Option<Instant> {
+        self.reaction_deadline_at(id, self.born.elapsed())
+    }
+
+    fn reaction_deadline_at(&self, id: usize, now: Duration) -> Option<Instant> {
+        if !self.enabled || !self.is_local(id) {
+            return None;
+        }
+        self.sessions
+            .get(&id)?
+            .reaction_until
+            .filter(|deadline| now < deadline.saturating_duration_since(self.born))
+    }
+
+    /// A background completion can expire without an owner tick. Resolve it at
+    /// read time so returning to the pane cannot flash the stale reaction. The
+    /// next eligible tick resumes ambient behavior without advancing it here.
+    fn base_context_at(&self, id: usize, now: Duration) -> RenderContext {
+        self.sessions
+            .get(&id)
+            .filter(|life| {
+                !life
+                    .reaction_until
+                    .is_some_and(|deadline| now >= deadline.saturating_duration_since(self.born))
+            })
+            .map(|life| life.context)
+            .unwrap_or_else(|| PreviewPose::Calm.context())
+    }
+
     pub fn pause_clock(&mut self) {
         self.watch.reset();
         self.cancel_live_greeting();
@@ -640,8 +680,16 @@ impl Organism {
     }
 
     pub fn tick(&mut self, owner: Option<usize>, running: bool, any_running: bool) {
-        let now = Instant::now();
-        let elapsed = self.born.elapsed();
+        self.tick_at(owner, running, any_running, self.born.elapsed());
+    }
+
+    fn tick_at(
+        &mut self,
+        owner: Option<usize>,
+        running: bool,
+        any_running: bool,
+        elapsed: Duration,
+    ) {
         self.watch.heartbeat(elapsed);
         let dt = self.life.advance(
             elapsed,
@@ -649,12 +697,16 @@ impl Organism {
             any_running,
             CircadianPhase::Unlearned,
         );
-        let retreating = self.is_retreating();
+        let retreating = elapsed < self.retreat_until.saturating_duration_since(self.born);
         if let Some(life) = owner.and_then(|id| self.sessions.get_mut(&id)) {
             life.native.sync_state(self.life.state());
             if running || retreating {
                 life.ambient.interrupt();
-            } else if now >= life.reaction_until {
+            } else if life
+                .reaction_until
+                .is_none_or(|deadline| elapsed >= deadline.saturating_duration_since(self.born))
+            {
+                life.reaction_until = None;
                 let behavior = life.ambient.step(
                     self.life.state(),
                     self.life.idle_for(elapsed).as_secs_f32(),
@@ -695,11 +747,7 @@ impl Organism {
     }
 
     fn live_input(&self, id: usize, facts: AttentionFacts) -> LiveAttentionInput {
-        let base_context = self
-            .sessions
-            .get(&id)
-            .map(|life| life.context)
-            .unwrap_or_else(|| PreviewPose::Calm.context());
+        let base_context = self.base_context_at(id, self.born.elapsed());
         LiveAttentionInput {
             base_context,
             hard_eligible: facts.eligible && self.enabled && self.is_local(id),
@@ -923,10 +971,7 @@ impl Organism {
                 context.with_watch_rhythm(self.watch.rhythm(id, now))
             }
         } else {
-            self.sessions
-                .get(&id)
-                .map(|life| life.context)
-                .unwrap_or_else(|| PreviewPose::Calm.context())
+            self.base_context_at(id, now)
         };
         let context = RenderContext {
             body_language: BodyLanguage::from_state(self.life.state()),
@@ -992,21 +1037,6 @@ impl Organism {
             hello: self.hello_availability_at(now),
         }
     }
-}
-
-fn reaction_duration(reaction: &Reaction) -> Duration {
-    Duration::from_millis(match reaction.behavior {
-        Behavior::Idle => 1500,
-        Behavior::Celebrate if reaction.tone == Tone::Quiet => 1800,
-        Behavior::Celebrate => 2500,
-        Behavior::GlanceAside => 1400,
-        Behavior::InspectError => 5000,
-        Behavior::SitNearError => 10000,
-        Behavior::CelebrateBig => 7000,
-        Behavior::RestAfterPush => 5000,
-        Behavior::UnknownOutcome => 4500,
-        _ => 2500,
-    })
 }
 
 #[cfg(test)]
@@ -2278,11 +2308,13 @@ mod tests {
             Behavior::UnknownOutcome,
             Behavior::RestAfterPush,
         ] {
-            organism.sessions.get_mut(&3).unwrap().context = RenderContext::new(
+            let life = organism.sessions.get_mut(&3).unwrap();
+            life.context = RenderContext::new(
                 behavior,
                 BodyLanguage::from_state(organism.life.state()),
                 false,
             );
+            life.reaction_until = Some(organism.born + Duration::from_secs(60));
             let LivePresentation {
                 glyph,
                 sprite,
@@ -2665,6 +2697,259 @@ mod tests {
             organism.sessions[&3].context.behavior,
             Behavior::UnknownOutcome
         );
+    }
+
+    fn completion_fixture(ids: &[usize]) -> Organism {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        for &id in ids {
+            organism.prime_session(id, false);
+            organism.set_remote(id, false);
+            organism.batch_finished(id, false);
+        }
+        organism
+    }
+
+    #[test]
+    fn sustained_completion_expires_at_exact_shared_hold_without_waiting_for_heartbeat() {
+        let mut organism = completion_fixture(&[1]);
+        let completed_at = Duration::from_secs(1);
+        let expires_at = Duration::from_millis(2800);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), completed_at);
+        assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+        let deadline = organism.born + expires_at;
+        let before = values(organism.life.state());
+        for now in [
+            completed_at,
+            Duration::from_millis(1900),
+            expires_at - Duration::from_nanos(1),
+        ] {
+            assert_eq!(organism.reaction_deadline_at(1, now), Some(deadline));
+            assert_eq!(
+                organism.base_context_at(1, now).behavior,
+                Behavior::Celebrate
+            );
+        }
+        assert_eq!(organism.reaction_deadline_at(1, expires_at), None);
+        assert_eq!(
+            organism.base_context_at(1, expires_at).behavior,
+            Behavior::Idle
+        );
+        let expired = organism.presentation_at(1, false, false, Some(Motion::Calm), expires_at);
+        assert_eq!(
+            expired.explanation,
+            live_explanation(PreviewPose::Calm.context())
+        );
+        assert_eq!(values(organism.life.state()), before);
+        // A deadline tick retires the cache and resumes ordinary ambient state.
+        organism.tick_at(Some(1), false, false, expires_at);
+        assert_eq!(organism.sessions[&1].reaction_until, None);
+        assert_ne!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+        assert_eq!(
+            organism.base_context_at(1, expires_at + Duration::from_secs(60)),
+            organism.sessions[&1].context
+        );
+    }
+
+    #[test]
+    fn newer_completion_replaces_deadline_and_old_wake_cannot_retire_it() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        let first_expiry = Duration::from_millis(1800);
+        assert_eq!(
+            organism.reaction_deadline_at(1, Duration::ZERO),
+            Some(organism.born + first_expiry)
+        );
+        let next_completion = Duration::from_millis(500);
+        organism.completed_at(1, "cargo test", Some(1), Some(100), next_completion);
+        let next_expiry = Duration::from_millis(5500);
+        assert_eq!(
+            organism.sessions[&1].context.behavior,
+            Behavior::InspectError
+        );
+        assert_eq!(
+            organism.reaction_deadline_at(1, next_completion),
+            Some(organism.born + next_expiry)
+        );
+        organism.tick_at(Some(1), false, false, first_expiry);
+        assert_eq!(
+            organism.base_context_at(1, first_expiry).behavior,
+            Behavior::InspectError
+        );
+        assert_eq!(
+            organism.reaction_deadline_at(1, first_expiry),
+            Some(organism.born + next_expiry)
+        );
+        assert_eq!(organism.reaction_deadline_at(1, next_expiry), None);
+        assert_eq!(
+            organism.base_context_at(1, next_expiry).behavior,
+            Behavior::Idle
+        );
+    }
+
+    #[test]
+    fn expired_background_completion_does_not_flash_when_owner_returns_before_tick() {
+        let mut organism = completion_fixture(&[1, 2]);
+        organism.owner_changed(None, Some(1));
+        organism.completed_at(2, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        let returned_at = Duration::from_secs(3);
+        organism.tick_at(Some(1), false, false, returned_at);
+        assert_eq!(organism.sessions[&2].context.behavior, Behavior::Celebrate);
+        organism.owner_changed(Some(1), Some(2));
+        let before = values(organism.life.state());
+        assert_eq!(organism.reaction_deadline_at(2, returned_at), None);
+        for motion in [
+            None,
+            Some(Motion::Full),
+            Some(Motion::Calm),
+            Some(Motion::Static),
+        ] {
+            let sample = organism.presentation_at(2, false, false, motion, returned_at);
+            assert_eq!(
+                sample.explanation,
+                live_explanation(PreviewPose::Calm.context())
+            );
+            let context = RenderContext::new(
+                Behavior::Idle,
+                BodyLanguage::from_state(organism.life.state()),
+                false,
+            );
+            let frame = Organism::frame_at(motion, returned_at);
+            assert_eq!(sample.sprite, sprite_frame_with_context(context, frame));
+            assert_eq!(sample.glyph, sticky_glyph_with_context(context, frame));
+        }
+        assert_eq!(values(organism.life.state()), before);
+        // The read-time fallback is pure; it neither queues nor renews a hold.
+        assert_eq!(organism.sessions[&2].context.behavior, Behavior::Celebrate);
+        assert_eq!(organism.reaction_deadline_at(2, returned_at), None);
+    }
+
+    #[test]
+    fn new_running_command_overrides_completion_before_and_after_expiry() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        let before = values(organism.life.state());
+        for now in [Duration::from_millis(500), Duration::from_millis(1800)] {
+            for motion in [None, Some(Motion::Calm), Some(Motion::Static)] {
+                for (settled, behavior) in [
+                    (false, Behavior::WatchCommand),
+                    (true, Behavior::WatchSettled),
+                ] {
+                    let sample = organism.presentation_at(1, true, settled, motion, now);
+                    let context = RenderContext::new(
+                        behavior,
+                        BodyLanguage::from_state(organism.life.state()),
+                        false,
+                    );
+                    assert_eq!(sample.sprite, sprite_frame_with_context(context, 0));
+                    assert_eq!(sample.glyph, sticky_glyph_with_context(context, 0));
+                    assert_eq!(sample.explanation, live_explanation(context));
+                }
+            }
+        }
+        assert_eq!(values(organism.life.state()), before);
+        organism.tick_at(Some(1), true, true, Duration::from_millis(1800));
+        assert_eq!(
+            organism.reaction_deadline_at(1, Duration::from_millis(1800)),
+            None
+        );
+        assert_eq!(
+            organism
+                .base_context_at(1, Duration::from_millis(1800))
+                .behavior,
+            Behavior::Idle
+        );
+    }
+
+    #[test]
+    fn completion_deadlines_are_local_finite_and_disabled_holds_cannot_replay() {
+        let mut organism = completion_fixture(&[1, 2]);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        assert_eq!(organism.reaction_deadline_at(99, Duration::ZERO), None);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        assert!(organism.reaction_deadline_at(1, Duration::ZERO).is_some());
+        assert_eq!(organism.reaction_deadline_at(2, Duration::ZERO), None);
+        organism.set_remote(1, true);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        organism.set_remote(1, false);
+        organism.set_enabled(false);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        assert!(organism.sessions.is_empty());
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        assert_eq!(
+            organism.base_context_at(1, Duration::ZERO).behavior,
+            Behavior::Idle
+        );
+        // The initial batch remains quarantined after re-enabling.
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        assert_eq!(
+            organism.base_context_at(1, Duration::ZERO).behavior,
+            Behavior::Idle
+        );
+        organism.batch_finished(1, false);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        assert!(organism.reaction_deadline_at(1, Duration::ZERO).is_some());
+        organism.forget_session(1);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
+        assert_eq!(
+            organism.base_context_at(1, Duration::ZERO).behavior,
+            Behavior::Idle
+        );
+    }
+
+    #[test]
+    fn sustained_completion_reduced_motion_uses_one_fixed_fitting_frame() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        let context = organism.sessions[&1].context;
+        assert_eq!(context.behavior, Behavior::Celebrate);
+        for motion in [None, Some(Motion::Calm), Some(Motion::Static)] {
+            for millis in [0, 400, 900, 1799] {
+                let sample = organism.presentation_at(
+                    1,
+                    false,
+                    false,
+                    motion,
+                    Duration::from_millis(millis),
+                );
+                assert_eq!(sample.sprite, sprite_frame_with_context(context, 0));
+                assert_eq!(sample.glyph, sticky_glyph_with_context(context, 0));
+                assert_eq!(sample.sprite.lines().count(), 3);
+                assert!(sample.sprite.lines().all(|line| line.chars().count() <= 12));
+                assert!(sample.glyph.chars().count() <= 9);
+                assert!(crate::organism_block::sprite_fits(&sample.sprite));
+            }
+        }
+    }
+
+    #[test]
+    fn completion_context_expiry_is_shared_by_presentation_and_attention_admission() {
+        let source = include_str!("organism.rs");
+        let input = source
+            .split_once("    fn live_input(")
+            .unwrap()
+            .1
+            .split_once("    pub fn live_greeting_offer(")
+            .unwrap()
+            .0;
+        assert!(input.contains("self.base_context_at(id, self.born.elapsed())"));
+        let presentation = source
+            .split_once("    fn presentation_at_with_attention(")
+            .unwrap()
+            .1
+            .split_once("    pub fn preview_presentation(")
+            .unwrap()
+            .0;
+        assert!(presentation.contains("self.base_context_at(id, now)"));
+        assert!(!presentation.contains(".map(|life| life.context)"));
     }
 
     #[test]
