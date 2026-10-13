@@ -767,7 +767,9 @@ fn finalized_block_at_viewport_row(
                     .is_some_and(|zone| !zone.rows_evicted))
             .then_some(key.zone_id);
         }
-        terminal::ProjectedRowKind::Padding => return None,
+        terminal::ProjectedRowKind::Padding | terminal::ProjectedRowKind::BlockSpacer { .. } => {
+            return None
+        }
         terminal::ProjectedRowKind::Raw => {}
     }
     let abs_row = projection.view_row_absolute(row)?;
@@ -4605,7 +4607,8 @@ impl Session {
         let mut terminal = TerminalState::new(cols, rows);
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
-        let projection_policy = ProjectionPolicy::new();
+        let mut projection_policy = ProjectionPolicy::new();
+        projection_policy.set_block_spacing(!config.block_compact);
         let mut projection_view_state = ProjectionViewState::new();
         let projection = terminal.get_projected_viewport_with_state(
             config.block_mode,
@@ -4899,7 +4902,8 @@ impl Session {
                             .zone_by_id(key.zone_id)
                             .map(|zone| zone.prompt_start)
                     }),
-                terminal::ProjectedRowKind::Padding => None,
+                terminal::ProjectedRowKind::Padding
+                | terminal::ProjectedRowKind::BlockSpacer { .. } => None,
             })
             .unwrap_or_else(|| self.terminal.scrollback_len());
         let active_prompt = self
@@ -5173,11 +5177,68 @@ struct TerminalMouseGesture {
     session_id: usize,
     button: MouseButton,
     report_to_app: bool,
+    /// Last raw live-grid cell whose press/drag report the PTY accepted. `None`
+    /// means no press was sent, so a trailing event must not manufacture one.
+    last_app_cell: Option<(usize, usize)>,
     /// The app layer claimed this sequence after the widget had already
     /// published an ordinary press (for example an inactive pane whose link
     /// cache was refreshed only after focus moved). Subsequent drag/release
     /// messages close the slot without touching selection or the PTY.
     consumed: bool,
+}
+
+impl TerminalMouseGesture {
+    /// Drag reports require a paired app press and a current raw cell. A
+    /// synthetic spacer/history row never inherits an earlier drag position.
+    fn app_drag_cell(self, current: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        if !self.report_to_app || self.consumed || self.last_app_cell.is_none() {
+            return None;
+        }
+        current
+    }
+
+    /// A matched release must close its accepted press even when the pointer
+    /// moved into a spacer/history row. Prefer the current live mapping; only
+    /// the paired release may fall back to the last accepted raw coordinates.
+    fn app_release_cell(
+        self,
+        current: Option<(usize, usize)>,
+        grid_cols: usize,
+        grid_rows: usize,
+    ) -> Option<(usize, usize)> {
+        if !self.report_to_app || self.consumed {
+            return None;
+        }
+        let last = self.last_app_cell?;
+        current.or_else(|| {
+            // The pane may have shrunk since the accepted press/drag. Only
+            // the saved fallback needs clamping; a current mapping is exact.
+            Some((
+                last.0.min(grid_cols.checked_sub(1)?),
+                last.1.min(grid_rows.checked_sub(1)?),
+            ))
+        })
+    }
+}
+
+/// Remember only reports accepted by the gesture's own PTY. Button slots and
+/// stable pane ownership prevent another pane or button from moving this cell.
+fn record_terminal_app_mouse_cell(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    source_session_id: usize,
+    button: MouseButton,
+    cell: (usize, usize),
+) {
+    let Some(Some(gesture)) = gestures.get_mut(button.slot()) else {
+        return;
+    };
+    if gesture.session_id == source_session_id
+        && gesture.button == button
+        && gesture.report_to_app
+        && !gesture.consumed
+    {
+        gesture.last_app_cell = Some(cell);
+    }
 }
 
 /// Only the pane that started a gesture may retire it. Every visible widget
@@ -5893,7 +5954,10 @@ impl Frost {
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
-            if projection_mode_changed {
+            let spacing_changed = sess
+                .projection_policy
+                .set_block_spacing(!self.config.block_compact);
+            if projection_mode_changed || spacing_changed {
                 sess.refresh();
             }
         }
@@ -11797,6 +11861,7 @@ impl Frost {
                         session_id: source_session_id,
                         button,
                         report_to_app: false,
+                        last_app_cell: None,
                         consumed: true,
                     });
                 if let Some(link) = current_link {
@@ -11820,7 +11885,7 @@ impl Frost {
         // Resolve each event to the stable pane chosen at press time. Focus may
         // move (or an overlay may open) while buttons are held; neither may
         // redirect the trailing event to the newly active PTY.
-        let (report_to_app, target_session_id) = match input {
+        let (report_to_app, target_session_id, gesture) = match input {
             MouseInput::Press {
                 button,
                 shift,
@@ -11836,13 +11901,15 @@ impl Frost {
                     app_eligible,
                     false,
                 );
-                self.terminal_mouse_gestures[button.slot()] = Some(TerminalMouseGesture {
+                let gesture = TerminalMouseGesture {
                     session_id: source_session_id,
                     button,
                     report_to_app,
+                    last_app_cell: None,
                     consumed: false,
-                });
-                (report_to_app, source_session_id)
+                };
+                self.terminal_mouse_gestures[button.slot()] = Some(gesture);
+                (report_to_app, source_session_id, Some(gesture))
             }
             MouseInput::Drag { .. } => {
                 let Some(gesture) = self.terminal_mouse_gestures[MouseButton::Left.slot()] else {
@@ -11854,7 +11921,7 @@ impl Frost {
                 {
                     return Task::none();
                 }
-                (gesture.report_to_app, gesture.session_id)
+                (gesture.report_to_app, gesture.session_id, Some(gesture))
             }
             MouseInput::Release { button, .. } => {
                 let Some(gesture) = take_terminal_mouse_gesture(
@@ -11867,7 +11934,7 @@ impl Frost {
                 if gesture.consumed {
                     return Task::none();
                 }
-                (gesture.report_to_app, gesture.session_id)
+                (gesture.report_to_app, gesture.session_id, Some(gesture))
             }
             MouseInput::Wheel {
                 shift,
@@ -11884,9 +11951,10 @@ impl Frost {
                         app_eligible,
                     ),
                     source_session_id,
+                    None,
                 )
             }
-            MouseInput::ScrollTo { .. } => (false, source_session_id),
+            MouseInput::ScrollTo { .. } => (false, source_session_id, None),
         };
 
         // Click-to-place-cursor acts on release, so that a drag which happens
@@ -11950,7 +12018,14 @@ impl Frost {
                             sess.terminal
                                 .get_mouse_report(btn_code(button), grid_col, grid_row)
                         {
-                            sess.write_pty(&report);
+                            if sess.write_pty(&report) {
+                                record_terminal_app_mouse_cell(
+                                    &mut self.terminal_mouse_gestures,
+                                    target_session_id,
+                                    button,
+                                    (grid_col, grid_row),
+                                );
+                            }
                         }
                     }
                     return Task::none();
@@ -11985,13 +12060,22 @@ impl Frost {
             MouseInput::Drag { col, row, count } => {
                 if report_to_app {
                     if sess.terminal.is_mouse_motion_enabled() {
+                        let current =
+                            projected_live_grid_cell(&sess.terminal, &sess.projection, row, col);
                         if let Some((grid_col, grid_row)) =
-                            projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
+                            gesture.and_then(|gesture| gesture.app_drag_cell(current))
                         {
                             if let Some(report) =
                                 sess.terminal.get_mouse_report(32, grid_col, grid_row)
                             {
-                                sess.write_pty(&report);
+                                if sess.write_pty(&report) {
+                                    record_terminal_app_mouse_cell(
+                                        &mut self.terminal_mouse_gestures,
+                                        target_session_id,
+                                        MouseButton::Left,
+                                        (grid_col, grid_row),
+                                    );
+                                }
                             }
                         }
                     }
@@ -12013,9 +12097,15 @@ impl Frost {
             }
             MouseInput::Release { col, row, button } => {
                 if report_to_app {
-                    if let Some((grid_col, grid_row)) =
-                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col)
-                    {
+                    let current =
+                        projected_live_grid_cell(&sess.terminal, &sess.projection, row, col);
+                    if let Some((grid_col, grid_row)) = gesture.and_then(|gesture| {
+                        gesture.app_release_cell(
+                            current,
+                            sess.terminal.grid.row_len(),
+                            sess.terminal.grid.rows(),
+                        )
+                    }) {
                         if let Some(report) = sess.terminal.get_mouse_release_report(
                             btn_code(button),
                             grid_col,
@@ -16976,10 +17066,17 @@ impl Frost {
                 self.apply_config();
             }
             Message::SetBlockCompact(compact) => {
-                // Paint-only in Frost's continuous grid: current nested panes
-                // update immediately without a PTY resize or history reflow.
+                // Reproject every pane through stable raw anchors. Density
+                // never resizes a PTY or adds blank lines to terminal output.
                 self.config.block_compact = compact;
                 self.config_dirty = true;
+                for sess in &mut self.sessions {
+                    if sess.projection_policy.set_block_spacing(!compact) {
+                        sess.refresh();
+                    }
+                }
+                self.sync_organism_geometry();
+                self.refresh_active_context();
             }
             Message::SetShowRepoStrip(show) => {
                 self.config.show_repo_strip = show;
@@ -21344,6 +21441,9 @@ impl Frost {
         // matching the semantic Block palette in Anvil/Forge.
         let accent = self.c_accent();
         let mut paint = vec![terminal_view::BlockPaintRow::default(); rows];
+        for (row, kind) in paint.iter_mut().zip(sess.projection.row_kinds()) {
+            row.host_spacer = matches!(kind, terminal::ProjectedRowKind::BlockSpacer { .. });
+        }
         let view_absolute_rows: Vec<_> = (0..rows)
             .map(|row| sess.projection.view_row_absolute(row))
             .collect();
@@ -21574,11 +21674,7 @@ impl Frost {
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
-        if sess.projection.mode() == terminal::ProjectionMode::Transformed {
-            return Vec::new();
-        }
         let terminal = &sess.terminal;
-        let total = terminal.scrollback_len() + terminal.grid.rows();
         let failed: Vec<usize> = terminal
             .command_zones
             .iter()
@@ -21592,7 +21688,7 @@ impl Frost {
             })
             .map(|zone| zone.prompt_start)
             .collect();
-        block_mode::marker_fractions(&failed, total)
+        terminal.projected_marker_fractions(&sess.projection, &failed)
     }
 
     /// Bookmark-notch scrollbar fractions for bookmarked zones. Called only
@@ -21601,12 +21697,8 @@ impl Frost {
         if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
-        // Raw document fractions are invalid once rows have been vertically
-        // projected. Hide them until markers carry stable raw origins.
-        if sess.projection.mode() == terminal::ProjectionMode::Transformed {
-            return Vec::new();
-        }
-        let total = sess.terminal.scrollback_len() + sess.terminal.grid.rows();
+        // Resolve through the exact plan so gaps and collapsed output cannot
+        // shift a bookmark's scrollbar position onto a neighbouring block.
         let rows: Vec<usize> = sess
             .terminal
             .command_zones
@@ -21614,7 +21706,8 @@ impl Frost {
             .filter(|zone| !zone.rows_evicted && sess.block_bookmarks.contains(zone.id))
             .map(|zone| zone.prompt_start)
             .collect();
-        block_mode::marker_fractions(&rows, total)
+        sess.terminal
+            .projected_marker_fractions(&sess.projection, &rows)
     }
 
     /// Active Block identity comes from native OSC lifecycle/provenance only.
@@ -32835,7 +32928,9 @@ mod tests {
             .enumerate()
             .find_map(|(row, kind)| match kind {
                 terminal::ProjectedRowKind::CollapsedSummary { key, .. } => Some((row, *key)),
-                terminal::ProjectedRowKind::Raw | terminal::ProjectedRowKind::Padding => None,
+                terminal::ProjectedRowKind::Raw
+                | terminal::ProjectedRowKind::Padding
+                | terminal::ProjectedRowKind::BlockSpacer { .. } => None,
             })
             .expect("visible collapsed summary");
         let activation = SummaryActivation {
@@ -33084,6 +33179,7 @@ mod tests {
                 session_id: 7,
                 button,
                 report_to_app: true,
+                last_app_cell: None,
                 consumed: false,
             });
         }
@@ -33095,23 +33191,301 @@ mod tests {
     }
 
     #[test]
+    fn terminal_app_mouse_release_fallback_is_paired_and_button_owned() {
+        let mut gestures = [None; 3];
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let session_id = 40 + button.slot();
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+            let pending = gestures[button.slot()].unwrap();
+            assert_eq!(pending.app_drag_cell(Some((2, 3))), None);
+            assert_eq!(pending.app_release_cell(Some((2, 3)), 24, 8), None);
+            assert_eq!(pending.app_release_cell(None, 24, 8), None);
+
+            record_terminal_app_mouse_cell(&mut gestures, 99, button, (9, 9));
+            assert_eq!(gestures[button.slot()], Some(pending));
+            record_terminal_app_mouse_cell(
+                &mut gestures,
+                session_id,
+                button,
+                (button.slot() + 1, 4),
+            );
+        }
+
+        // Releasing in reverse order cannot borrow another button's accepted
+        // coordinates or retire a sibling pane's still-pending gesture.
+        for button in [MouseButton::Right, MouseButton::Middle, MouseButton::Left] {
+            let session_id = 40 + button.slot();
+            let pending = gestures[button.slot()].unwrap();
+            assert_eq!(take_terminal_mouse_gesture(&mut gestures, 99, button), None);
+            assert_eq!(gestures[button.slot()], Some(pending));
+            let released = take_terminal_mouse_gesture(&mut gestures, session_id, button).unwrap();
+            assert_eq!(
+                released.app_release_cell(None, 24, 8),
+                Some((button.slot() + 1, 4))
+            );
+            assert_eq!(released.app_release_cell(Some((7, 6)), 24, 8), Some((7, 6)));
+            assert_eq!(
+                take_terminal_mouse_gesture(&mut gestures, session_id, button),
+                None
+            );
+        }
+        assert!(gestures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn terminal_app_mouse_drag_preserves_the_last_accepted_raw_cell() {
+        let button = MouseButton::Left;
+        let mut gestures = [None; 3];
+        gestures[button.slot()] = Some(TerminalMouseGesture {
+            session_id: 7,
+            button,
+            report_to_app: true,
+            last_app_cell: Some((1, 2)),
+            consumed: false,
+        });
+        let dragged = gestures[button.slot()].unwrap().app_drag_cell(Some((5, 6)));
+        assert_eq!(dragged, Some((5, 6)));
+        record_terminal_app_mouse_cell(&mut gestures, 7, button, dragged.unwrap());
+        let pending = gestures[button.slot()].unwrap();
+        assert_eq!(
+            pending.app_drag_cell(None),
+            None,
+            "gap/history has no drag cell"
+        );
+        assert_eq!(pending.app_release_cell(None, 24, 8), Some((5, 6)));
+        assert_eq!(pending.app_release_cell(Some((8, 3)), 24, 8), Some((8, 3)));
+
+        for mut unowned in [
+            TerminalMouseGesture {
+                report_to_app: false,
+                ..pending
+            },
+            TerminalMouseGesture {
+                consumed: true,
+                ..pending
+            },
+        ] {
+            unowned.last_app_cell = None;
+            gestures[button.slot()] = Some(unowned);
+            record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
+            assert_eq!(gestures[button.slot()], Some(unowned));
+            assert_eq!(unowned.app_drag_cell(Some((3, 4))), None);
+            assert_eq!(unowned.app_release_cell(Some((3, 4)), 24, 8), None);
+            assert_eq!(unowned.app_release_cell(None, 24, 8), None);
+        }
+
+        // A corrupted/mismatched slot is never treated as a paired button.
+        gestures[button.slot()] = Some(TerminalMouseGesture {
+            button: MouseButton::Right,
+            ..pending
+        });
+        record_terminal_app_mouse_cell(&mut gestures, 7, button, (9, 9));
+        assert_eq!(gestures[button.slot()].unwrap().last_app_cell, Some((5, 6)));
+        assert_eq!(take_terminal_mouse_gesture(&mut gestures, 7, button), None);
+    }
+
+    #[test]
+    fn block_spacer_projection_keeps_helpers_and_app_release_on_raw_cells() {
+        let mut terminal = terminal::TerminalState::new(24, 8);
+        terminal.process_input(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07LEFT\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07RIGHT\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07\x1b[?1002h\x1b[?1006h",
+            )
+            .as_bytes(),
+        );
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_block_spacing(true);
+        let projection = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let gap = projection
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, terminal::ProjectedRowKind::BlockSpacer { .. }))
+            .expect("real display spacer between completed blocks");
+        for col in 0..24 {
+            assert_eq!(
+                projected_live_grid_cell(&terminal, &projection, gap, col),
+                None
+            );
+        }
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &projection, gap),
+            None
+        );
+
+        let before = projection.view_row_absolute(gap - 1).unwrap();
+        let after = projection.view_row_absolute(gap + 1).unwrap();
+        assert_eq!(after, before + 1, "display spacer adds no raw row");
+        let current = projected_live_grid_cell(&terminal, &projection, gap + 1, 1);
+        assert_eq!(current, Some((1, after - terminal.scrollback_len())));
+        assert_eq!(
+            finalized_block_at_viewport_row(true, &terminal, &projection, gap + 1),
+            Some(terminal.command_zones[1].id),
+        );
+        assert_eq!(
+            project_search_match(
+                &terminal,
+                &projection,
+                &search::SearchMatch {
+                    line: after,
+                    col_start: 0,
+                    col_end: 1
+                },
+            ),
+            Some(search::SearchMatch {
+                line: gap + 1,
+                col_start: 0,
+                col_end: 1
+            }),
+        );
+        assert_eq!(
+            projected_kitty_anchor(&terminal, &projection, before, 0, 1, 2),
+            None,
+            "an image spanning a spacer cannot bridge two cards",
+        );
+        assert_eq!(
+            projected_kitty_anchor(&terminal, &projection, after, 0, 1, 1),
+            Some(terminal::ViewportCell {
+                row: gap + 1,
+                col: 0
+            }),
+        );
+
+        let live_row = terminal.live_prompt_row().expect("current prompt");
+        let live_origin = terminal.raw_cell_origin_at_absolute(live_row, 1).unwrap();
+        let live_view = projection
+            .raw_to_view(live_origin)
+            .expect("visible live prompt");
+        let live_cell =
+            projected_live_grid_cell(&terminal, &projection, live_view.row, live_view.col);
+        let mut gestures = [None; 3];
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id: 7,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+            let (col, row) = live_cell.unwrap();
+            assert!(terminal
+                .get_mouse_report(btn_code(button), col, row)
+                .is_some());
+            record_terminal_app_mouse_cell(&mut gestures, 7, button, (col, row));
+            let gap_cell = projected_live_grid_cell(&terminal, &projection, gap, 1);
+            assert_eq!(
+                gestures[button.slot()].unwrap().app_drag_cell(gap_cell),
+                None
+            );
+            assert_eq!(
+                overlay_release_disposition(gestures[button.slot()], 7, button),
+                OverlayReleaseDisposition::DispatchApp,
+            );
+            let released = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
+            let (release_col, release_row) = released.app_release_cell(gap_cell, 24, 8).unwrap();
+            assert_eq!((release_col, release_row), (col, row));
+            assert_eq!(
+                terminal.get_mouse_release_report(btn_code(button), release_col, release_row),
+                Some(format!("\x1b[<{};{};{}m", btn_code(button), col + 1, row + 1).into_bytes()),
+            );
+        }
+        // A narrower/shorter pane can invalidate saved raw coordinates while
+        // the pointer remains on a gap. The paired release stays in bounds.
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            gestures[button.slot()] = Some(TerminalMouseGesture {
+                session_id: 7,
+                button,
+                report_to_app: true,
+                last_app_cell: None,
+                consumed: false,
+            });
+            assert!(terminal.get_mouse_report(btn_code(button), 23, 7).is_some());
+            record_terminal_app_mouse_cell(&mut gestures, 7, button, (23, 7));
+        }
+        terminal.on_resize(12, 4);
+        let resized = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let gap = resized
+            .row_kinds()
+            .iter()
+            .position(|kind| matches!(kind, terminal::ProjectedRowKind::BlockSpacer { .. }))
+            .expect("spacer remains visible after resize");
+        let gap_cell = projected_live_grid_cell(&terminal, &resized, gap, 0);
+        assert_eq!(gap_cell, None);
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let released = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
+            let cell =
+                released.app_release_cell(gap_cell, terminal.grid.row_len(), terminal.grid.rows());
+            assert_eq!(cell, Some((11, 3)));
+            let (col, row) = cell.unwrap();
+            assert_eq!(
+                terminal.get_mouse_release_report(btn_code(button), col, row),
+                Some(format!("\x1b[<{};12;4m", btn_code(button)).into_bytes()),
+            );
+            assert_eq!(released.app_release_cell(gap_cell, 0, 4), None);
+            assert_eq!(released.app_release_cell(gap_cell, 12, 0), None);
+        }
+    }
+
+    #[test]
+    fn terminal_app_mouse_release_over_history_uses_the_paired_raw_cell() {
+        let mut terminal = terminal::TerminalState::new(24, 4);
+        terminal.process_input(b"old\r\nnew\r\nmore\r\nlast\r\nlive");
+        terminal.set_scroll_offset(terminal.scrollback_len());
+        let projection = terminal.get_projected_viewport(true);
+        assert!(terminal.scrollback_len() > 0);
+        assert_eq!(projection.view_row_absolute(0), Some(0));
+        let history_cell = projected_live_grid_cell(&terminal, &projection, 0, 1);
+        assert_eq!(history_cell, None);
+        let gesture = TerminalMouseGesture {
+            session_id: 7,
+            button: MouseButton::Left,
+            report_to_app: true,
+            last_app_cell: Some((2, 3)),
+            consumed: false,
+        };
+        assert_eq!(gesture.app_drag_cell(history_cell), None);
+        assert_eq!(gesture.app_release_cell(history_cell, 24, 8), Some((2, 3)));
+        let live_view = projection
+            .raw_to_view(
+                terminal
+                    .raw_cell_origin_at_absolute(terminal.scrollback_len(), 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let current =
+            projected_live_grid_cell(&terminal, &projection, live_view.row, live_view.col);
+        assert_eq!(current, Some((1, 0)));
+        assert_eq!(gesture.app_release_cell(current, 24, 8), Some((1, 0)));
+    }
+
+    #[test]
     fn overlay_only_dispatches_origin_app_release() {
         let app_left = TerminalMouseGesture {
             session_id: 7,
             button: MouseButton::Left,
             report_to_app: true,
+            last_app_cell: None,
             consumed: false,
         };
         let local_right = TerminalMouseGesture {
             session_id: 8,
             button: MouseButton::Right,
             report_to_app: false,
+            last_app_cell: None,
             consumed: false,
         };
         let consumed_middle = TerminalMouseGesture {
             session_id: 8,
             button: MouseButton::Middle,
             report_to_app: false,
+            last_app_cell: None,
             consumed: true,
         };
 
@@ -38156,6 +38530,7 @@ mod tests {
                 session_id: 42,
                 button,
                 report_to_app: true,
+                last_app_cell: None,
                 consumed: false,
             };
             let mut slots = [None; 3];
@@ -38172,6 +38547,7 @@ mod tests {
             session_id: 42,
             button: MouseButton::Left,
             report_to_app: false,
+            last_app_cell: None,
             consumed: true,
         };
         let mut slots = [Some(consumed), None, None];

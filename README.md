@@ -586,7 +586,7 @@ tab_position = "top"
 restore_session = true
 disable_alt_screen = false
 block_mode = true     # OSC 133 命令块、gutter、搜索与右键动作
-block_compact = false # Compact Block Spacing；仅收紧卡片内缩/圆角，不改变终端行列
+block_compact = false # Compact Block Spacing；关闭块间展示空行并收紧卡片，不改变 PTY 行列
 
 # 可选：明确指定 shell
 shell = "/bin/bash"
@@ -739,7 +739,7 @@ pane 头部显示 `■ exited`，键盘与粘贴输入不再写入已死的 PTY�
 
 `Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
 
-设置中的 **Compact Block Spacing** 与 `block_compact` 是同一开关，并会立即更新所有当前 pane。它只收紧卡片内缩与圆角，不改变连续终端 grid 的行列、OSC 133 区域坐标或 PTY 大小。
+设置中的 **Compact Block Spacing** 与 `block_compact` 是同一开关，并会立即更新所有当前 pane。普通模式在已确认独占行的相邻 Block 之间加入一行展示留白；Compact 移除这行留白并收紧卡片内缩与圆角。留白只属于展示投影，不进入复制、搜索、鼠标上报或原始输出，也不改变 PTY 行列和 OSC 133 原始区域坐标。滚动与折叠仍锚定原始内容；全屏应用和非 Block 模式不加留白。
 
 如果 `config.toml` 或 `keybindings.toml` 编辑出错，frost 会保留最后一次可用配置并在窗口内显示诊断。主配置有错误时自动保存会暂停，避免默认值覆盖原文件；修正文件后会自动恢复热重载。
 

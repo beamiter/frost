@@ -277,6 +277,9 @@ pub fn ctrl_link_eligible(
 /// nothing to draw.
 #[derive(Clone, Debug, Default)]
 pub struct BlockPaintRow {
+    /// Display-only inter-card whitespace; even middle-click must remain
+    /// inert instead of turning a synthetic row into a paste/input target.
+    pub host_spacer: bool,
     /// This row belongs to a finalized block and participates in card hit
     /// routing. Running/live-prompt chrome deliberately leaves this false so
     /// their presses remain ordinary terminal/application input.
@@ -647,6 +650,21 @@ impl Default for State {
 }
 
 impl State {
+    fn consume_spacer_press(&mut self, button: MouseButton, spacer: bool) -> bool {
+        if !spacer {
+            return false;
+        }
+        self.consumed_presses[button.slot()] = true;
+        self.published_presses[button.slot()] = false;
+        if button == MouseButton::Left {
+            self.dragging = false;
+            self.summary_press = None;
+            self.last_click = None;
+            self.click_count = 0;
+        }
+        true
+    }
+
     /// Focus loss can swallow the release that ends a gesture. Retire every
     /// widget-local owner before handling later mouse events in a surviving tree.
     fn reset_on_unfocused(&mut self, event: &Event) -> bool {
@@ -970,7 +988,8 @@ impl<'a, Message> TermWidget<'a, Message> {
             && position.y < grid_bottom
             && position.x >= grid_left
             && position.x < grid_left + grid_width;
-        let eligible = block.is_none_or(|block| block.collapsed_summary.is_none())
+        let eligible = block
+            .is_none_or(|block| !block.host_spacer && block.collapsed_summary.is_none())
             && link_surface_eligible(
                 over_real_grid,
                 block.is_some_and(|block| block.selectable),
@@ -1673,6 +1692,8 @@ mod tests {
             mode: crate::terminal::ProjectionMode::Transformed,
             policy_revision: 3,
             policy_ids: std::sync::Arc::from([7]),
+            block_spacing: false,
+            plan_revision: 0,
             document_rows: 8,
         };
         let paint = CollapsedSummaryPaint {
@@ -2440,6 +2461,13 @@ where
                             return;
                         }
                     }
+                }
+                if state.consume_spacer_press(
+                    button,
+                    self.blocks.get(row).is_some_and(|block| block.host_spacer),
+                ) {
+                    shell.capture_event();
+                    return;
                 }
                 // Count every left press before deciding ownership. A first
                 // header click belongs to Block Mode, but a rapid second/third
@@ -3709,6 +3737,167 @@ mod focus_state_tests {
             assert!(state.published_presses[MouseButton::Left.slot()]);
             assert_eq!(state.click_count, 2);
             assert_eq!(state.scroll_accum, 0.5);
+        }
+    }
+}
+
+#[cfg(test)]
+mod block_spacing_render_tests {
+    use super::*;
+
+    #[test]
+    fn block_spacing_consumes_new_presses_without_selection_paste_or_app_gestures() {
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            let mut state = State {
+                published_presses: [true; 3],
+                dragging: true,
+                ..State::default()
+            };
+            assert!(state.consume_spacer_press(button, true));
+            assert!(!state.published_presses[button.slot()]);
+            assert!(state.consumed_presses[button.slot()]);
+            for other in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                if other != button {
+                    assert!(state.published_presses[other.slot()]);
+                }
+            }
+            assert!(!owns_mouse_release(
+                &state.published_presses,
+                state.dragging,
+                false,
+                button
+            ));
+            assert!(
+                !state.consume_spacer_press(button, false),
+                "real cells retain ordinary routing"
+            );
+        }
+    }
+
+    #[test]
+    fn block_spacing_organism_and_card_geometry_follow_real_cells_at_every_density() {
+        for columns in [13, 80] {
+            for font_size in [8.0, 14.0, 24.0, 72.0] {
+                for line_spacing in [0.8, 1.0, 1.5, 3.0] {
+                    let mut terminal = crate::terminal::TerminalState::new(columns, 14);
+                    for _ in 0..2 {
+                        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+                    }
+                    terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                    let active = terminal.live_prompt_row().unwrap();
+                    let raw_block = terminal.raw_row_id_at_absolute(active).unwrap();
+                    let end = terminal.raw_row_id_at_absolute(active + 5).unwrap();
+                    let theme = Theme::default();
+                    let metrics = Metrics::new(font_size, line_spacing, 4.0, true);
+                    let bounds = Rectangle {
+                        x: 0.0,
+                        y: 0.0,
+                        width: columns as f32 * metrics.cell_w
+                            + 2.0 * metrics.padding
+                            + BLOCK_GUTTER_WIDTH
+                            + SCROLLBAR_WIDTH,
+                        height: 14.0 * metrics.cell_h + 2.0 * metrics.padding,
+                    };
+                    let dimensions =
+                        metrics.grid_size(bounds.width - SCROLLBAR_WIDTH, bounds.height);
+                    let mut body_y = None;
+                    let mut pointer = organism_block::Pointer::default();
+                    for compact in [false, true, false] {
+                        let mut policy = crate::terminal::ProjectionPolicy::new();
+                        policy.set_block_spacing(!compact);
+                        let projection =
+                            terminal.get_projected_viewport_with_policy(true, &policy, 0);
+                        let top = projection.raw_row_view_bounds(raw_block).unwrap().0;
+                        let bottom = projection.raw_row_view_bounds(end).unwrap().1;
+                        let raw_cursor = terminal.get_cursor_pos();
+                        let cursor = projection
+                            .raw_to_view(
+                                terminal
+                                    .raw_cell_origin_at_absolute(
+                                        terminal.scrollback_len() + raw_cursor.0,
+                                        raw_cursor.1,
+                                    )
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        let mut blocks = vec![BlockPaintRow::default(); projection.cells().len()];
+                        for (index, block) in
+                            blocks.iter_mut().enumerate().take(bottom + 1).skip(top)
+                        {
+                            block.card_group = Some(0);
+                            block.card_kind = BlockCardKind::Active;
+                            block.app_eligible = true;
+                            block.card_top = index == top;
+                            block.card_bottom = index == bottom;
+                        }
+                        let widget = TermWidget::<()>::new(
+                            projection.cells(),
+                            (cursor.row, cursor.col),
+                            true,
+                            CursorShape::Block,
+                            true,
+                            &theme,
+                            metrics,
+                            iced::Font::MONOSPACE,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Vec::new(),
+                            0,
+                            projection.max_scroll_offset(),
+                        )
+                        .blocks(blocks)
+                        .block_compact(compact)
+                        .on_summary(projection.key(), |_| ())
+                        .organism_body(
+                            Some(OrganismBody {
+                                block: raw_block,
+                                epoch: 1,
+                                sprite: crate::organism::LivePresentation::passive_presence()
+                                    .sprite,
+                            }),
+                            None,
+                            None,
+                            |_| (),
+                        );
+                        assert_eq!(
+                            metrics.grid_size(bounds.width - SCROLLBAR_WIDTH, bounds.height),
+                            dimensions
+                        );
+                        let pos = Point::new(
+                            metrics.padding
+                                + BLOCK_GUTTER_WIDTH
+                                + (cursor.col as f32 + 0.5) * metrics.cell_w,
+                            metrics.padding + (cursor.row as f32 + 0.5) * metrics.cell_h,
+                        );
+                        assert_eq!(widget.cell_at(pos, bounds), (cursor.col, cursor.row));
+                        let geometry = widget.organism_geometry(bounds, &bounds);
+                        if columns == 13 {
+                            assert!(geometry.is_none(), "narrow panes still fail closed");
+                            continue;
+                        }
+                        let geometry = geometry.unwrap();
+                        assert_eq!(geometry.rect.height, 3.0 * metrics.cell_h);
+                        assert_eq!(geometry.rect.width, 12.0 * metrics.cell_w);
+                        assert!(geometry.rect.y >= pos.y + metrics.cell_h);
+                        if let Some(previous) = body_y {
+                            assert_eq!(
+                                geometry.rect.y, previous,
+                                "density never moves the live grid"
+                            );
+                        }
+                        body_y = Some(geometry.rect.y);
+                        let point = Some((geometry.rect.x + 1.0, geometry.rect.y + 1.0));
+                        let edge = pointer.observe(Some(geometry), point, true, false);
+                        assert_ne!(
+                            edge,
+                            Some(BodyEdge::Enter),
+                            "reprojection is not pointer entry"
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -43,6 +43,9 @@ thread_local! {
     static PROJECTED_HISTORY_LAYOUT_BYTE_SCAN_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static PROJECTION_HISTORY_LAYOUT_ROWS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static PROJECTION_PLAN_BUILD_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -819,6 +822,8 @@ impl ScrollbackLine {
 
     #[allow(dead_code)] // P1 plan core; consumer wiring lands in the collapse slice.
     fn layout(&self, absolute_row: usize) -> RawRowLayout {
+        #[cfg(test)]
+        PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.set(count.get() + 1));
         RawRowLayout {
             absolute_row,
             raw_row: self.raw_row_id,
@@ -1161,6 +1166,10 @@ pub struct SyntheticRowKey {
 pub enum ProjectedRowKind {
     Raw,
     Padding,
+    /// Host-owned whitespace before a proven semantic boundary. No raw cells.
+    BlockSpacer {
+        next: RawRowId,
+    },
     CollapsedSummary {
         key: SyntheticRowKey,
         hidden_range: FinishedOutputRange,
@@ -1226,6 +1235,7 @@ struct ProjectionPlan {
     rows: Vec<ProjectionPlanRow>,
     raw_rows: Vec<RawRowPlacement>,
     raw_slice_count: usize,
+    spacer_count: usize,
     policy_revision: u64,
     effective_collapsed: BTreeSet<u64>,
     resolved_collapses: Vec<ResolvedCollapse>,
@@ -1316,6 +1326,7 @@ impl ProjectionPlan {
             rows,
             raw_rows,
             raw_slice_count,
+            spacer_count: 0,
             policy_revision: 0,
             effective_collapsed: BTreeSet::new(),
             resolved_collapses: Vec::new(),
@@ -1806,6 +1817,57 @@ impl ProjectionPlan {
         self
     }
 
+    /// Insert whitespace only at a standalone raw-row start after collapse.
+    /// No source slices are split, stretched, deleted or assigned to the gap.
+    fn splice_block_spacing(self, boundaries: &[RawRowId]) -> Self {
+        self.splice_block_spacing_after(boundaries, false)
+    }
+
+    fn splice_block_spacing_after(mut self, boundaries: &[RawRowId], has_prefix: bool) -> Self {
+        if boundaries.is_empty() {
+            return self;
+        }
+        let boundaries: BTreeSet<_> = boundaries.iter().copied().collect();
+        let mut output = Vec::with_capacity(self.rows.len() + boundaries.len());
+        let mut emitted = BTreeSet::new();
+        for row in self.rows {
+            if let Some(source) = row.row_source {
+                let next = source.raw_row;
+                let standalone_start = row.kind == ProjectedRowKind::Raw
+                    && boundaries.contains(&next)
+                    && !emitted.contains(&next)
+                    && row.raw_slices.first().is_none_or(|slice| {
+                        slice.view_col_start == 0 && slice.source.col_start == 0
+                    })
+                    && row
+                        .raw_slices
+                        .iter()
+                        .all(|slice| slice.origin.is_some_and(|origin| origin.row == next))
+                    && output
+                        .last()
+                        .map_or(has_prefix, |previous: &ProjectionPlanRow| !previous.wrapped);
+                if standalone_start {
+                    output.push(ProjectionPlanRow {
+                        raw_slices: SmallVec::new(),
+                        row_source: None,
+                        wrapped: false,
+                        kind: ProjectedRowKind::BlockSpacer { next },
+                    });
+                    emitted.insert(next);
+                }
+            }
+            output.push(row);
+        }
+        self.rows = output;
+        self.spacer_count += emitted.len();
+        self.rebuild_raw_row_placements();
+        self
+    }
+
+    fn has_transforms(&self) -> bool {
+        self.spacer_count > 0 || !self.effective_collapsed.is_empty()
+    }
+
     fn summary_row(&self, zone_id: u64) -> Option<usize> {
         self.rows.iter().position(|row| {
             matches!(
@@ -1920,6 +1982,11 @@ impl ProjectionPlan {
                 })?;
                 self.summary_row(collapse.range.zone_id)
             }),
+            ProjectedTopAnchor::Spacer { next } => self
+                .rows
+                .iter()
+                .position(|row| row.kind == ProjectedRowKind::BlockSpacer { next })
+                .or_else(|| self.raw_row_document_row(next)),
             ProjectedTopAnchor::Summary {
                 zone_id,
                 hidden_range,
@@ -1956,6 +2023,7 @@ impl ProjectionPlan {
 pub struct ProjectionPolicy {
     revision: u64,
     collapsed: BTreeSet<u64>,
+    block_spacing: bool,
 }
 
 impl Default for ProjectionPolicy {
@@ -1963,6 +2031,7 @@ impl Default for ProjectionPolicy {
         Self {
             revision: 1,
             collapsed: BTreeSet::new(),
+            block_spacing: false,
         }
     }
 }
@@ -1978,7 +2047,20 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty()
+        self.collapsed.is_empty() && !self.block_spacing
+    }
+
+    /// Spacing is a display transform, never a PTY resize or a raw blank line.
+    pub fn set_block_spacing(&mut self, enabled: bool) -> bool {
+        if self.block_spacing == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.block_spacing = enabled;
+        self.revision = revision;
+        true
     }
 
     pub fn is_collapsed(&self, zone_id: u64) -> bool {
@@ -2029,6 +2111,8 @@ pub struct ProjectionKey {
     pub mode: ProjectionMode,
     pub policy_revision: u64,
     pub policy_ids: std::sync::Arc<[u64]>,
+    pub block_spacing: bool,
+    pub plan_revision: u64,
     pub document_rows: usize,
 }
 
@@ -2054,6 +2138,7 @@ pub struct ProjectedViewport {
     scroll_offset: usize,
     policy_revision: u64,
     policy_ids: std::sync::Arc<[u64]>,
+    block_spacing: bool,
     document_rows: usize,
     document_start: usize,
     top_padding: usize,
@@ -2165,6 +2250,8 @@ impl ProjectedViewport {
             mode: self.mode,
             policy_revision: self.policy_revision,
             policy_ids: std::sync::Arc::clone(&self.policy_ids),
+            block_spacing: self.block_spacing,
+            plan_revision: self.plan_revision,
             document_rows: self.document_rows,
         }
     }
@@ -2242,18 +2329,26 @@ struct ProjectedViewportCacheKey {
     mode: ProjectionMode,
     policy_revision: u64,
     policy_ids: SmallVec<[u64; 4]>,
+    block_spacing: bool,
+    spacing_boundaries: SmallVec<[RawRowId; 4]>,
     view_scroll_offset: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectionPlanCacheKey {
     history_revision: u64,
+    history_len: usize,
+    scrollback_pushes: u64,
+    full_screen_scroll_revision: u64,
+    grid_row_ids: SmallVec<[RawRowId; 64]>,
     row_identity_revision: u64,
     rows: usize,
     cols: usize,
     row_wrapped: SmallVec<[bool; 64]>,
     policy_revision: u64,
     policy_ids: SmallVec<[u64; 4]>,
+    block_spacing: bool,
+    spacing_boundaries: SmallVec<[RawRowId; 4]>,
     next_zone_id: u64,
     zone_count: usize,
     provenance_count: usize,
@@ -2265,6 +2360,9 @@ type ProjectionPlanCache = (ProjectionPlanCacheKey, std::sync::Arc<ProjectionPla
 enum ProjectedTopAnchor {
     RawCell(RawCellOrigin),
     RawRow(RawRowId),
+    Spacer {
+        next: RawRowId,
+    },
     Summary {
         zone_id: u64,
         hidden_range: FinishedOutputRange,
@@ -3068,6 +3166,8 @@ pub struct TerminalState {
     /// Monotonic count of rows appended to scrollback, used to tell whether the
     /// provisional alternate-screen snapshot is still the tail.
     scrollback_pushes: u64,
+    /// Certifies ordinary whole-grid upward scrolls for bounded plan reuse.
+    full_screen_scroll_revision: u64,
     /// The alternate screen's superseding snapshot: `(rows, pushes)` recorded
     /// when it was appended. Replaced by the next synchronized frame, and left
     /// as permanent history once the alternate screen ends or the app scrolls
@@ -3227,6 +3327,8 @@ pub struct TerminalState {
     /// Next [`CommandZone::id`]; monotonic for the life of the terminal.
     next_zone_id: u64,
     current_zone_state: ZoneState,
+    /// Bounded evidence that OSC 133 A really began at column zero.
+    spacing_prompt_rows: VecDeque<RawRowId>,
     watch_generation: Option<u64>,
     watch_batch: WatchBatch,
     /// Exact cursor column at OSC 133 `B`, after the prompt finished drawing.
@@ -3465,6 +3567,7 @@ impl TerminalState {
             scroll_offset: 0,
             pending_saved_line_purge: 0,
             scrollback_pushes: 0,
+            full_screen_scroll_revision: 0,
             provisional_alt_snapshot: None,
             max_scrollback: 10000,
             use_alt_buffer: false,
@@ -3551,6 +3654,7 @@ impl TerminalState {
             finished_output_provenance: HashMap::new(),
             next_zone_id: 0,
             current_zone_state: ZoneState::default(),
+            spacing_prompt_rows: VecDeque::new(),
             watch_generation: Some(0),
             watch_batch: WatchBatch::default(),
             current_command_start_col: None,
@@ -4646,6 +4750,15 @@ impl TerminalState {
                 // Prompt start. Any leftover execution timestamp belongs to a
                 // command that never reported `D`; drop it so it cannot leak
                 // into a later command's duration.
+                if let Some(row) = self.raw_row_id_at_absolute(absolute_row) {
+                    self.spacing_prompt_rows.retain(|previous| *previous != row);
+                    if self.cursor_col == 0 && !self.use_alt_buffer {
+                        self.spacing_prompt_rows.push_back(row);
+                        while self.spacing_prompt_rows.len() > MAX_COMMAND_ZONES + 1 {
+                            self.spacing_prompt_rows.pop_front();
+                        }
+                    }
+                }
                 self.current_zone_state = ZoneState::PromptStarted(absolute_row);
                 self.current_command_started_at = None;
                 self.current_command_start_col = None;
@@ -7618,6 +7731,9 @@ impl TerminalState {
 
         if let Some(line) = scrollback_line {
             self.push_scrollback_compressed_with_options(line, allow_alt_scrollback);
+            if !self.use_alt_buffer && top == 0 && bottom + 1 == self.grid.rows() {
+                self.full_screen_scroll_revision = self.full_screen_scroll_revision.wrapping_add(1);
+            }
         }
     }
 
@@ -10519,6 +10635,59 @@ impl TerminalState {
             .collect()
     }
 
+    /// Only retained semantic starts with column-zero evidence may acquire a
+    /// separator. The first block and ambiguous/shared-row starts stay intact.
+    /// At most MAX_COMMAND_ZONES separators can be introduced into a document.
+    fn block_spacing_boundaries(&self, enabled: bool) -> SmallVec<[RawRowId; 4]> {
+        if !enabled {
+            return SmallVec::new();
+        }
+        // Keep the semantic index before filtering eviction: an evicted
+        // prompt can leave a retained output prefix before the next block.
+        let mut starts: Vec<(usize, bool, bool)> = self
+            .command_zones
+            .iter()
+            .enumerate()
+            .filter(|(_, zone)| !zone.rows_evicted)
+            .map(|(index, zone)| {
+                (
+                    zone.prompt_start,
+                    index > 0,
+                    zone.command.is_none()
+                        && zone.output_start_col == 0
+                        && zone.output_start == Some(zone.prompt_start),
+                )
+            })
+            .collect();
+        if let Some(start) = self.running_zone_start().or_else(|| self.live_prompt_row()) {
+            starts.push((start, !self.command_zones.is_empty(), false));
+        }
+        starts.sort_unstable_by_key(|(start, _, _)| *start);
+        starts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(start, eligible, background))| {
+                if !eligible
+                    || index > 0 && starts[index - 1].0 == start
+                    || starts.get(index + 1).is_some_and(|next| next.0 == start)
+                {
+                    return None;
+                }
+                let row = self.raw_row_id_at_absolute(start)?;
+                let previous = start.checked_sub(1)?;
+                let wrapped = if previous < self.scrollback.len() {
+                    self.scrollback[previous].is_wrapped
+                } else {
+                    *self
+                        .grid
+                        .row_wrapped
+                        .get(previous - self.scrollback.len())?
+                };
+                (!wrapped && (background || self.spacing_prompt_rows.contains(&row))).then_some(row)
+            })
+            .collect()
+    }
+
     #[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
     fn collapsed_projection_plan(&self, cols: usize, policy: &ProjectionPolicy) -> ProjectionPlan {
         let mut identity = self.identity_projection_plan(cols);
@@ -10527,7 +10696,9 @@ impl TerminalState {
             return identity;
         }
         let collapses = self.resolved_collapses(policy);
-        identity.splice_collapses(&collapses, policy.revision())
+        identity
+            .splice_collapses(&collapses, policy.revision())
+            .splice_block_spacing(&self.block_spacing_boundaries(policy.block_spacing))
     }
 
     fn cached_collapsed_projection_plan(
@@ -10538,21 +10709,24 @@ impl TerminalState {
         let key = self.projection_plan_cache_key(cols, policy);
         if let Some((cached_key, plan)) = &self.projection_plan_cache {
             if *cached_key == key {
-                return Some(std::sync::Arc::clone(plan));
+                return plan.has_transforms().then(|| std::sync::Arc::clone(plan));
             }
         }
+        if let Some(plan) = self.advance_spaced_projection_plan(&key) {
+            return plan.has_transforms().then_some(plan);
+        }
         let collapses = self.resolved_collapses(policy);
-        if collapses.is_empty() {
+        if collapses.is_empty() && key.spacing_boundaries.is_empty() {
             return None;
         }
         #[cfg(test)]
         PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         let mut plan = self
             .identity_projection_plan(cols)
-            .splice_collapses(&collapses, policy.revision());
-        if plan.effective_collapsed.is_empty() {
-            return None;
-        }
+            .splice_collapses(&collapses, policy.revision())
+            .splice_block_spacing(&key.spacing_boundaries);
+        // Cache an ineffective plan too: a proven prompt can still share a
+        // reflowed row, and idle redraws must not repeatedly rebuild history.
         plan.plan_revision = self.next_projection_plan_revision;
         if self.next_projection_plan_revision != 0 {
             self.next_projection_plan_revision = self
@@ -10562,7 +10736,180 @@ impl TerminalState {
         }
         let plan = std::sync::Arc::new(plan);
         self.projection_plan_cache = Some((key, std::sync::Arc::clone(&plan)));
-        Some(plan)
+        plan.has_transforms().then_some(plan)
+    }
+
+    /// Reuse unchanged history during ordinary streaming in the default
+    /// spaced view. Only certified full-screen scrolls qualify; wraps across
+    /// the history/grid seam, collapse, resize, ownership changes and edits
+    /// retain the cold builder. Prefix eviction rebases metadata in-place,
+    /// avoiding per-history-row layout allocations even at the scrollback cap.
+    fn advance_spaced_projection_plan(
+        &mut self,
+        key: &ProjectionPlanCacheKey,
+    ) -> Option<std::sync::Arc<ProjectionPlan>> {
+        let (old, plan) = self.projection_plan_cache.as_ref()?;
+        let scrolled = usize::try_from(
+            key.full_screen_scroll_revision
+                .checked_sub(old.full_screen_scroll_revision)?,
+        )
+        .ok()?;
+        let evicted = old
+            .history_len
+            .checked_add(scrolled)?
+            .checked_sub(key.history_len)?;
+        if scrolled == 0
+            || scrolled > old.rows
+            || evicted > old.history_len
+            || !old.block_spacing
+            || !key.block_spacing
+            || !old.policy_ids.is_empty()
+            || !key.policy_ids.is_empty()
+            || old.policy_revision != key.policy_revision
+            || old.spacing_boundaries != key.spacing_boundaries
+            || old.cols != key.cols
+            || old.rows != key.rows
+            || old.next_zone_id != key.next_zone_id
+            || old.zone_count != key.zone_count
+            || old.provenance_count != key.provenance_count
+            || key.scrollback_pushes.checked_sub(old.scrollback_pushes)? != scrolled as u64
+            || key
+                .row_identity_revision
+                .checked_sub(old.row_identity_revision)?
+                != scrolled as u64
+            || key.history_revision.checked_sub(old.history_revision)?
+                != (scrolled + evicted) as u64
+            || std::sync::Arc::strong_count(plan) != 1
+        {
+            return None;
+        }
+        let retained_history = old.history_len - evicted;
+        if retained_history > 0 && self.scrollback.get(retained_history - 1)?.is_wrapped {
+            return None;
+        }
+        // These identities certify a pure append/front-eviction operation,
+        // excluding partial scrolling regions, row insertion and screen swaps.
+        if self.scrollback.front()?.raw_row_id() != plan.raw_rows.get(evicted)?.raw_row
+            || old.grid_row_ids[scrolled..] != key.grid_row_ids[..key.rows - scrolled]
+            || (0..scrolled).any(|index| {
+                self.scrollback
+                    .get(retained_history + index)
+                    .map(ScrollbackLine::raw_row_id)
+                    != old.grid_row_ids.get(index).copied()
+            })
+        {
+            return None;
+        }
+        let mut tail_start = plan.raw_rows.get(old.history_len)?.first_view_row?;
+        if tail_start > 0
+            && matches!(
+                plan.rows[tail_start - 1].kind,
+                ProjectedRowKind::BlockSpacer { .. }
+            )
+        {
+            tail_start -= 1;
+        }
+        let remove_rows = if evicted == 0 {
+            0
+        } else {
+            let first = plan.raw_rows.get(evicted)?.first_view_row?;
+            let row = plan.rows.get(first)?;
+            // A reflow row sharing the evicted prefix must be replanned from
+            // source; never retain a partial logical line under new columns.
+            if row
+                .raw_slices
+                .first()
+                .is_some_and(|slice| slice.view_col_start != 0 || slice.source.col_start != 0)
+                || row
+                    .raw_slices
+                    .iter()
+                    .any(|slice| slice.source.absolute_row < evicted)
+            {
+                return None;
+            }
+            first
+        };
+        if remove_rows > tail_start {
+            return None;
+        }
+        let view_base = tail_start - remove_rows;
+        let history_layouts = self
+            .scrollback
+            .iter()
+            .skip(retained_history)
+            .enumerate()
+            .map(|(index, line)| line.layout(index));
+        let grid_layouts = self.grid.iter().enumerate().map(|(index, cells)| {
+            RawRowLayout::from_cells(
+                cells,
+                self.grid.row_wrapped[index],
+                scrolled + index,
+                self.grid.row_ids[index],
+            )
+        });
+        let mut suffix = ProjectionPlan::identity(history_layouts, grid_layouts, key.cols)
+            .splice_block_spacing_after(&key.spacing_boundaries, view_base > 0);
+        for row in &mut suffix.rows {
+            for slice in &mut row.raw_slices {
+                slice.source.absolute_row += retained_history;
+            }
+            if let Some(source) = row.row_source.as_mut() {
+                source.raw_absolute_row += retained_history;
+            }
+        }
+        for row in &mut suffix.raw_rows {
+            row.absolute_row += retained_history;
+            row.first_view_row = row.first_view_row.map(|value| value + view_base);
+            row.last_view_row = row.last_view_row.map(|value| value + view_base);
+        }
+        let old_history_len = old.history_len;
+        let old_grid_rows = old.rows;
+        let removed_tail_spacers = plan.rows.len() - tail_start - old_grid_rows;
+        let removed_prefix_spacers = plan.rows[..remove_rows]
+            .iter()
+            .filter(|row| matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }))
+            .count();
+        let (cached_key, cached_plan) = self.projection_plan_cache.as_mut()?;
+        let plan = std::sync::Arc::get_mut(cached_plan)?;
+        plan.rows.truncate(tail_start);
+        plan.rows.drain(..remove_rows);
+        plan.raw_rows.truncate(old_history_len);
+        plan.raw_rows.drain(..evicted);
+        let mut retained_slices = 0;
+        if evicted > 0 {
+            for row in &mut plan.rows {
+                for slice in &mut row.raw_slices {
+                    slice.source.absolute_row -= evicted;
+                }
+                if let Some(source) = row.row_source.as_mut() {
+                    source.raw_absolute_row -= evicted;
+                }
+                retained_slices += row.raw_slices.len();
+            }
+            for row in &mut plan.raw_rows {
+                row.absolute_row -= evicted;
+                row.first_view_row = row.first_view_row.map(|value| value - remove_rows);
+                row.last_view_row = row.last_view_row.map(|value| value - remove_rows);
+            }
+        } else {
+            // The retained prefix is immutable; derive its count without
+            // walking it (all removed tail rows belong to the old live grid).
+            retained_slices = plan.raw_slice_count.saturating_sub(old_grid_rows);
+        }
+        plan.raw_slice_count = retained_slices + suffix.raw_slice_count;
+        plan.spacer_count =
+            plan.spacer_count - removed_tail_spacers - removed_prefix_spacers + suffix.spacer_count;
+        plan.rows.extend(suffix.rows);
+        plan.raw_rows.extend(suffix.raw_rows);
+        plan.plan_revision = self.next_projection_plan_revision;
+        if self.next_projection_plan_revision != 0 {
+            self.next_projection_plan_revision = self
+                .next_projection_plan_revision
+                .checked_add(1)
+                .unwrap_or(0);
+        }
+        *cached_key = key.clone();
+        Some(std::sync::Arc::clone(cached_plan))
     }
 
     fn projection_plan_cache_key(
@@ -10572,12 +10919,18 @@ impl TerminalState {
     ) -> ProjectionPlanCacheKey {
         ProjectionPlanCacheKey {
             history_revision: self.history_revision,
+            history_len: self.scrollback.len(),
+            scrollback_pushes: self.scrollback_pushes,
+            full_screen_scroll_revision: self.full_screen_scroll_revision,
+            grid_row_ids: self.grid.row_ids.iter().copied().collect(),
             row_identity_revision: self.grid.identity_revision,
             rows: self.grid.rows(),
             cols,
             row_wrapped: self.grid.row_wrapped.iter().copied().collect(),
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
+            block_spacing: policy.block_spacing,
+            spacing_boundaries: self.block_spacing_boundaries(policy.block_spacing),
             next_zone_id: self.next_zone_id,
             zone_count: self.command_zones.len(),
             provenance_count: self.finished_output_provenance.len(),
@@ -10875,6 +11228,8 @@ impl TerminalState {
             mode,
             policy_revision: 0,
             policy_ids: SmallVec::new(),
+            block_spacing: false,
+            spacing_boundaries: SmallVec::new(),
             view_scroll_offset: self.scroll_offset,
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
@@ -10951,6 +11306,7 @@ impl TerminalState {
             scroll_offset: self.scroll_offset,
             policy_revision: 0,
             policy_ids: std::sync::Arc::from([]),
+            block_spacing: false,
             document_rows: self.scrollback.len().saturating_add(rows),
             document_start: self.viewport_absolute_start(),
             top_padding: 0,
@@ -11124,6 +11480,8 @@ impl TerminalState {
             mode: ProjectionMode::Transformed,
             policy_revision: policy.revision(),
             policy_ids: policy.ids(),
+            block_spacing: policy.block_spacing,
+            spacing_boundaries: self.block_spacing_boundaries(policy.block_spacing),
             view_scroll_offset,
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
@@ -11167,6 +11525,7 @@ impl TerminalState {
             scroll_offset: materialized.scroll_offset,
             policy_revision: policy.revision(),
             policy_ids: std::sync::Arc::from(policy.collapsed_zone_ids().collect::<Vec<_>>()),
+            block_spacing: policy.block_spacing,
             document_rows,
             document_start: materialized.document_start,
             top_padding: materialized.top_padding,
@@ -11198,6 +11557,7 @@ impl TerminalState {
         let view_row = viewport.top_padding;
         match viewport.row_kinds.get(view_row).copied()? {
             ProjectedRowKind::Padding => None,
+            ProjectedRowKind::BlockSpacer { next } => Some(ProjectedTopAnchor::Spacer { next }),
             ProjectedRowKind::CollapsedSummary {
                 key, hidden_range, ..
             } => Some(ProjectedTopAnchor::Summary {
@@ -11249,6 +11609,7 @@ impl TerminalState {
         let raw_row = match state.top_anchor {
             Some(ProjectedTopAnchor::RawCell(origin)) => Some(origin.row),
             Some(ProjectedTopAnchor::RawRow(row)) => Some(row),
+            Some(ProjectedTopAnchor::Spacer { next }) => Some(next),
             Some(ProjectedTopAnchor::Summary { hidden_range, .. }) => Some(hidden_range.start.row),
             None => None,
         };
@@ -11373,6 +11734,34 @@ impl TerminalState {
         }
     }
 
+    /// Resolve scrollbar markers against the same complete document as the
+    /// viewport. Looking up retained absolute rows is O(1) per marker; adding
+    /// spacer rows must not hide every failure/bookmark marker in normal mode.
+    pub fn projected_marker_fractions(
+        &self,
+        projection: &ProjectedViewport,
+        absolute_rows: &[usize],
+    ) -> Vec<f32> {
+        if projection.mode() != ProjectionMode::Transformed {
+            return crate::block_mode::marker_fractions(absolute_rows, projection.document_rows());
+        }
+        let Some((key, plan)) = &self.projection_plan_cache else {
+            return Vec::new();
+        };
+        if plan.plan_revision != projection.plan_revision
+            || !self.projection_plan_key_matches_current_source(key)
+        {
+            return Vec::new();
+        }
+        absolute_rows
+            .iter()
+            .filter_map(|absolute| {
+                let row = plan.raw_rows.get(*absolute)?.first_view_row?;
+                Some(row as f32 / plan.rows.len().max(1) as f32)
+            })
+            .collect()
+    }
+
     /// Move a transformed view to a retained raw cell without changing the
     /// collapse policy. Callers explicitly expand a hidden owner first, then
     /// invoke this method to reveal and highlight the same stable raw match.
@@ -11392,7 +11781,15 @@ impl TerminalState {
         let cols = self.grid.row_len().max(1);
         let plan_key = self.projection_plan_cache_key(cols, policy);
         let Some(plan) = self.cached_collapsed_projection_plan(cols, policy) else {
-            return false;
+            // A requested transform can be ineffective (no OSC partitions,
+            // one prompt, or every boundary ambiguous). Search/navigation
+            // must still reveal raw history through the identity projection.
+            let Some(absolute) = self.retained_absolute_for_raw(origin.row) else {
+                return false;
+            };
+            state.last_plan_key = None;
+            self.reveal_buffer_row(absolute);
+            return true;
         };
         let Some(target) = plan
             .raw_cell_document_row(origin)
@@ -11615,6 +12012,7 @@ impl TerminalState {
             && key.next_zone_id == self.next_zone_id
             && key.zone_count == self.command_zones.len()
             && key.provenance_count == self.finished_output_provenance.len()
+            && key.spacing_boundaries == self.block_spacing_boundaries(key.block_spacing)
     }
 
     /// Carry a projected text selection across a plan rebuild instead of
@@ -12395,6 +12793,9 @@ impl TerminalState {
                 )
             };
 
+            if matches!(planned.kind, ProjectedRowKind::BlockSpacer { .. }) {
+                continue;
+            }
             if matches!(planned.kind, ProjectedRowKind::CollapsedSummary { .. }) {
                 hard_break_pending = !result.ends_with('\n');
                 continue;
@@ -15101,7 +15502,9 @@ mod tests {
                     hidden_display_rows,
                     ..
                 } => Some(hidden_display_rows),
-                super::ProjectedRowKind::Raw | super::ProjectedRowKind::Padding => None,
+                super::ProjectedRowKind::Raw
+                | super::ProjectedRowKind::Padding
+                | super::ProjectedRowKind::BlockSpacer { .. } => None,
             })
             .expect("one summary row");
         assert_eq!(summary, 2, "visible output plus its blank line are hidden");
@@ -21349,5 +21752,431 @@ mod shared_watch_native_tests {
         w.sync(Some((1, 7, 11)), t.watch_generation(), ms(5000));
         assert!(t.running_duration_ms().unwrap() >= 60_000);
         assert_eq!(w.rhythm(1, ms(5000)), WatchRhythm::Steady);
+    }
+}
+
+#[cfg(test)]
+mod block_spacing_tests {
+    use super::*;
+
+    fn fixture(cols: usize, rows: usize) -> TerminalState {
+        let mut terminal = TerminalState::new(cols, rows);
+        terminal.process_input(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07",
+                "\x1b]8;;https://example.com\x07LEFT中\x1b]8;;\x07\r\n\x1b]133;D;0\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07RIGHT\r\n\x1b]133;D;1\x07",
+                "\x1b]133;A\x07$ \x1b]133;B\x07"
+            )
+            .as_bytes(),
+        );
+        terminal
+    }
+
+    fn normal() -> ProjectionPolicy {
+        let mut policy = ProjectionPolicy::new();
+        assert!(policy.set_block_spacing(true));
+        policy
+    }
+
+    fn spacer_count(plan: &ProjectionPlan) -> usize {
+        plan.rows
+            .iter()
+            .filter(|row| matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }))
+            .count()
+    }
+
+    #[test]
+    fn block_spacing_adds_real_rows_without_changing_terminal_cells_or_columns() {
+        for cols in [4, 12, 80] {
+            let terminal = fixture(cols, 12);
+            let raw = terminal.grid.to_vec();
+            let cursor = terminal.get_cursor_pos();
+            let history = terminal.scrollback.len();
+            let identity = terminal.identity_projection_plan(cols);
+            let spaced = terminal.collapsed_projection_plan(cols, &normal());
+            assert_eq!(spacer_count(&spaced), 2, "width={cols}");
+            assert_eq!(spaced.rows.len(), identity.rows.len() + 2);
+            let materialized = terminal.materialize_identity_projection_plan(&spaced);
+            let real: Vec<_> = spaced
+                .rows
+                .iter()
+                .zip(materialized)
+                .filter_map(|(row, cells)| {
+                    if matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }) {
+                        assert!(row.raw_slices.is_empty());
+                        assert!(row.row_source.is_none());
+                        assert!(cells.iter().all(|cell| *cell == TerminalCell::default()));
+                        None
+                    } else {
+                        Some(cells)
+                    }
+                })
+                .collect();
+            assert_eq!(
+                real,
+                terminal.materialize_identity_projection_plan(&identity)
+            );
+            assert_eq!(terminal.grid.to_vec(), raw);
+            assert_eq!(terminal.get_cursor_pos(), cursor);
+            assert_eq!(terminal.scrollback.len(), history);
+            assert_eq!(spaced.cols, cols);
+        }
+    }
+
+    #[test]
+    fn block_spacing_cells_have_no_mouse_link_search_or_selection_origin() {
+        let mut terminal = fixture(24, 8);
+        let policy = normal();
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let gap = view
+            .row_kinds()
+            .iter()
+            .position(|row| matches!(row, ProjectedRowKind::BlockSpacer { .. }))
+            .unwrap();
+        for col in 0..24 {
+            assert_eq!(view.view_to_raw(ViewportCell { row: gap, col }), None);
+            assert_eq!(view.view_row_absolute(gap), None);
+        }
+        terminal.start_selection_in_projection(&view, (gap, 0), SelectionMode::Normal);
+        assert!(!terminal.has_text_selection());
+        let left = view
+            .cells()
+            .iter()
+            .position(|row| row[0].character == 'L')
+            .unwrap();
+        let right = view
+            .cells()
+            .iter()
+            .position(|row| row[0].character == 'R')
+            .unwrap();
+        terminal.start_selection_in_projection(&view, (left, 0), SelectionMode::Normal);
+        terminal.update_selection_in_projection(&view, (right, 4));
+        let copied = terminal.copy_selection().unwrap();
+        assert_eq!(copied.lines().count(), 3, "{copied:?}");
+        assert!(copied.starts_with("LEFT中"));
+        assert!(copied.ends_with("RIGHT"));
+        assert!(!copied.contains("\n\n"));
+        for (row, cells) in view.cells().iter().enumerate() {
+            for (col, cell) in cells.iter().enumerate() {
+                if let Some(raw) = view.view_to_raw(ViewportCell { row, col }) {
+                    assert_eq!(view.raw_to_view(raw), Some(ViewportCell { row, col }));
+                    if cell.character == 'L' {
+                        assert_ne!(cell.hyperlink, 0, "OSC 8 survives the transform");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_spacing_collapse_and_density_changes_keep_semantic_boundaries() {
+        let mut terminal = fixture(24, 8);
+        let mut policy = normal();
+        let zone = terminal.command_zones[0].id;
+        policy.collapse(zone);
+        let collapsed = terminal.collapsed_projection_plan(24, &policy);
+        assert_eq!(spacer_count(&collapsed), 2);
+        assert!(collapsed.effective_collapsed.contains(&zone));
+        policy.set_block_spacing(false);
+        let compact = terminal.collapsed_projection_plan(24, &policy);
+        assert_eq!(spacer_count(&compact), 0);
+        assert_eq!(compact.effective_collapsed, collapsed.effective_collapsed);
+        assert_eq!(compact.rows.len() + 2, collapsed.rows.len());
+        assert!(
+            !policy.set_block_spacing(false),
+            "repeated toggle is a no-op"
+        );
+        policy.expand(zone);
+        assert!(policy.is_identity());
+        let identity = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        assert!(identity.uses_identity_fast_path());
+    }
+
+    #[test]
+    fn block_spacing_top_gap_anchor_survives_streaming_and_compact_toggle() {
+        let mut terminal = fixture(24, 4);
+        let mut policy = normal();
+        let mut state = ProjectionViewState::new();
+        let first = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let plan = terminal
+            .cached_collapsed_projection_plan(24, &policy)
+            .unwrap();
+        let gap = plan
+            .rows
+            .iter()
+            .position(|row| matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }))
+            .unwrap();
+        let ProjectedRowKind::BlockSpacer { next } = plan.rows[gap].kind else {
+            unreachable!()
+        };
+        state.set_offset(first.max_scroll_offset() - gap, &first);
+        let anchored = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(
+            anchored.row_kinds()[0],
+            ProjectedRowKind::BlockSpacer { next }
+        );
+        terminal.process_input(b"\r\nmore\r\nmore\r\n");
+        let streamed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(
+            streamed.row_kinds()[0],
+            ProjectedRowKind::BlockSpacer { next }
+        );
+        policy.set_block_spacing(false);
+        let compact = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(
+            compact.raw_row_view_bounds(next).map(|bounds| bounds.0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn block_spacing_bottom_follow_cursor_and_bypass_stay_native() {
+        let mut terminal = fixture(24, 8);
+        let policy = normal();
+        let mut state = ProjectionViewState::new();
+        for _ in 0..3 {
+            let view = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            let cursor = terminal.get_cursor_pos();
+            let raw = terminal
+                .raw_cell_origin_at_absolute(terminal.scrollback.len() + cursor.0, cursor.1)
+                .unwrap();
+            let mapped = view.raw_to_view(raw).unwrap();
+            assert_eq!((mapped.row, mapped.col), cursor);
+            assert_eq!(view.scroll_offset(), 0);
+            terminal.process_input(b"\r\n");
+        }
+        let bypass = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+        assert_eq!(bypass.mode(), ProjectionMode::Bypass);
+        assert!(bypass
+            .row_kinds()
+            .iter()
+            .all(|row| *row == ProjectedRowKind::Raw));
+        terminal.process_input(b"\x1b[?1049hfull screen");
+        let alt = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(alt.mode(), ProjectionMode::Bypass);
+        assert!(alt
+            .row_kinds()
+            .iter()
+            .all(|row| *row == ProjectedRowKind::Raw));
+        terminal.process_input(b"\x1b[?1049l");
+        let restored = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert_eq!(restored.mode(), ProjectionMode::Transformed);
+    }
+
+    #[test]
+    fn block_spacing_rejects_midrow_prompts_and_soft_wrap_joins() {
+        let mut terminal = TerminalState::new(24, 8);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07prefix\x1b]133;A\x07$ ");
+        assert_eq!(
+            spacer_count(&terminal.collapsed_projection_plan(24, &normal())),
+            0
+        );
+        let mut wrapped = fixture(24, 8);
+        let boundary = wrapped.command_zones[1].prompt_start;
+        wrapped.grid.row_wrapped[boundary - 1] = true;
+        let plan = wrapped.collapsed_projection_plan(24, &normal());
+        assert_eq!(
+            spacer_count(&plan),
+            1,
+            "no gap in a soft-wrapped logical line"
+        );
+        let mut single = TerminalState::new(24, 8);
+        single.process_input(b"banner\r\n\x1b]133;A\x07$ ");
+        assert_eq!(
+            spacer_count(&single.collapsed_projection_plan(24, &normal())),
+            0,
+            "no leading gap before first block"
+        );
+    }
+
+    #[test]
+    fn block_spacing_cache_tracks_prompt_boundaries_and_density() {
+        let mut terminal = fixture(24, 8);
+        let policy = normal();
+        let first = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        let cached = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        assert!(std::sync::Arc::ptr_eq(&first, &cached));
+        terminal.process_input(b"\r\n\x1b]133;A\x07$ ");
+        let next = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        assert_ne!(next.key(), first.key());
+        assert!(!std::sync::Arc::ptr_eq(&next, &first));
+        let markers =
+            terminal.projected_marker_fractions(&next, &[terminal.command_zones[1].prompt_start]);
+        let plan = terminal
+            .cached_collapsed_projection_plan(24, &policy)
+            .unwrap();
+        let row = plan.raw_rows[terminal.command_zones[1].prompt_start]
+            .first_view_row
+            .unwrap();
+        assert_eq!(markers, vec![row as f32 / plan.rows.len() as f32]);
+        assert!(
+            terminal.projected_marker_fractions(&first, &[0]).is_empty(),
+            "stale plan never supplies markers"
+        );
+    }
+
+    #[test]
+    fn block_spacing_is_bounded_and_cached_with_deep_history() {
+        let mut terminal = TerminalState::new(24, 8);
+        for _ in 0..300 {
+            terminal.process_input(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+            );
+        }
+        terminal.process_input(b"\x1b]133;A\x07$ ");
+        assert!(terminal.spacing_prompt_rows.len() <= MAX_COMMAND_ZONES + 1);
+        let policy = normal();
+        PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+        let first = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+        let plan = terminal
+            .cached_collapsed_projection_plan(24, &policy)
+            .unwrap();
+        assert_eq!(spacer_count(&plan), MAX_COMMAND_ZONES);
+        assert_eq!(
+            plan.rows.len(),
+            terminal.scrollback.len() + terminal.grid.rows() + MAX_COMMAND_ZONES
+        );
+        for _ in 0..8 {
+            let cached = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+            assert!(std::sync::Arc::ptr_eq(&first, &cached));
+        }
+        PROJECTION_PLAN_BUILD_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+    #[test]
+    fn block_spacing_ineffective_policy_still_reveals_offscreen_history() {
+        for prefix in ["", "\x1b]133;A\x07$ "] {
+            let mut terminal = TerminalState::new(24, 4);
+            terminal.process_batch(prefix.as_bytes());
+            terminal.process_batch(b"needle\r\n");
+            let origin = terminal.raw_cell_origin_at_absolute(0, 0).unwrap();
+            terminal.process_batch("filler\r\n".repeat(20).as_bytes());
+            let policy = normal();
+            let mut state = ProjectionViewState::new();
+            let before = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            assert!(before.is_identity());
+            assert!(before.raw_to_view(origin).is_none());
+            assert!(terminal.reveal_raw_cell_in_projection(&policy, &mut state, origin));
+            let after = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            assert!(after.raw_to_view(origin).is_some());
+        }
+    }
+
+    #[test]
+    fn block_spacing_streaming_deep_history_measurement() {
+        for limit in [50_000, 100_000] {
+            let mut terminal = TerminalState::new(80, 24);
+            terminal.set_max_scrollback(limit);
+            terminal.process_batch("history\r\n".repeat(50_030).as_bytes());
+            for _ in 0..2 {
+                terminal.process_batch(
+                    b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+                );
+            }
+            terminal.process_batch(b"\x1b]133;A\x07$ \x1b]133;B\x07stream\r\n\x1b]133;C\x07");
+            let policy = normal();
+            let mut state = ProjectionViewState::new();
+            let started = std::time::Instant::now();
+            terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+            let cold = started.elapsed();
+            PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+            PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.set(0));
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                terminal.process_batch(b"streaming\r\n");
+                let view = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+                assert_eq!(view.scroll_offset(), 0);
+                assert_eq!(view.mode(), ProjectionMode::Transformed);
+            }
+            let elapsed = started.elapsed();
+            let builds = PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get());
+            let layouts = PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.get());
+            eprintln!("Frost spacing 50k history limit={limit}: cold={cold:?}, 20 streaming frames={elapsed:?}, full builds={builds}, history layouts={layouts}");
+            assert_eq!(
+                builds, 0,
+                "ordinary streaming must not replan the whole history"
+            );
+            assert_eq!(
+                layouts, 20,
+                "one appended layout per frame at and below the cap"
+            );
+        }
+    }
+
+    fn assert_spacing_plan_matches_cold(terminal: &mut TerminalState, policy: &ProjectionPolicy) {
+        let cold = terminal.collapsed_projection_plan(terminal.grid.row_len(), policy);
+        let Some(warm) = terminal.cached_collapsed_projection_plan(terminal.grid.row_len(), policy)
+        else {
+            assert_eq!(spacer_count(&cold), 0);
+            assert!(cold.effective_collapsed.is_empty());
+            return;
+        };
+        assert_eq!(warm.rows, cold.rows);
+        assert_eq!(warm.raw_rows, cold.raw_rows);
+        assert_eq!(warm.raw_slice_count, cold.raw_slice_count);
+        assert_eq!(warm.spacer_count, cold.spacer_count);
+        assert_eq!(
+            terminal.materialize_identity_projection_plan(&warm),
+            terminal.materialize_identity_projection_plan(&cold)
+        );
+    }
+
+    #[test]
+    fn block_spacing_streaming_matches_cold_on_eviction_wrap_resize_and_lifecycle() {
+        for limit in [16, 1_000] {
+            let mut terminal = fixture(24, 8);
+            terminal.set_max_scrollback(limit);
+            let mut policy = normal();
+            terminal.process_batch(b"stream\r\n\x1b]133;C\x07");
+            assert_spacing_plan_matches_cold(&mut terminal, &policy);
+            for frame in 0..40 {
+                terminal.process_batch(b"row\r\n");
+                assert_spacing_plan_matches_cold(&mut terminal, &policy);
+                if frame == 10 {
+                    terminal.process_batch("wide 中 wrapped content ".repeat(8).as_bytes());
+                    terminal.process_batch(b"\r\n");
+                    assert_spacing_plan_matches_cold(&mut terminal, &policy);
+                }
+            }
+            terminal.process_batch(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+            // At a tiny cap all preceding safe starts may be evicted, making
+            // spacing ineffective; the large fixture keeps a transformed plan.
+            if terminal
+                .cached_collapsed_projection_plan(24, &policy)
+                .is_some()
+            {
+                assert_spacing_plan_matches_cold(&mut terminal, &policy);
+                terminal.on_resize(12, 6);
+                assert_spacing_plan_matches_cold(&mut terminal, &policy);
+                if let Some(zone) = terminal
+                    .command_zones
+                    .iter()
+                    .find(|zone| !zone.rows_evicted)
+                {
+                    policy.collapse(zone.id);
+                    assert_spacing_plan_matches_cold(&mut terminal, &policy);
+                }
+            }
+        }
+    }
+    #[test]
+    fn block_spacing_caches_ineffective_reflow_boundaries() {
+        let mut terminal = TerminalState::new(8, 4);
+        terminal.process_batch(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+        );
+        terminal.process_batch(b"\x1b]133;A\x07$ \x1b]133;B\x07very-long-command\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        terminal.process_batch("filler\r\n".repeat(10).as_bytes());
+        let policy = normal();
+        assert!(!terminal.block_spacing_boundaries(true).is_empty());
+        PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(0));
+        // Query a wider history projection: the second header joins its own
+        // wrapped raw suffix, so it is intentionally not a standalone start.
+        for _ in 0..8 {
+            assert!(terminal
+                .cached_collapsed_projection_plan(40, &policy)
+                .is_none());
+        }
+        PROJECTION_PLAN_BUILD_COUNT.with(|count| assert_eq!(count.get(), 1));
     }
 }
