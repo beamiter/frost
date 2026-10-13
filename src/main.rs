@@ -29741,8 +29741,9 @@ mod tests {
             exit.find("command_history::flush_pending").unwrap()
                 < exit.find("self.flush_config_on_exit();").unwrap()
         );
+        let exit_call = format!("iced::{}()", "exit");
         assert!(
-            exit.find("self.flush_config_on_exit();").unwrap() < exit.find("iced::exit()").unwrap()
+            exit.find("self.flush_config_on_exit();").unwrap() < exit.find(&exit_call).unwrap()
         );
         let last_save = source
             .split_once("    fn flush_config_on_exit(")
