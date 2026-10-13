@@ -31,6 +31,7 @@ mod link;
 mod native_enter;
 mod organism;
 mod organism_activity;
+mod organism_block;
 mod organism_hover;
 mod organism_preview;
 mod organism_watch;
@@ -4019,6 +4020,13 @@ enum Message {
     SetOrganismPose(organism::Pose),
     OrganismPreviewAction(organism_preview::PreviewRequest),
     OrganismTick,
+    OrganismBodyObserved(
+        usize,
+        u64,
+        terminal::ProjectionKey,
+        Option<terminal::RawRowId>,
+        terminal_view::OrganismBodyObservation,
+    ),
     OrganismHoverEnter(usize, jterm_core::organism_live::LiveAttentionTicket),
     OrganismHoverExit(usize, jterm_core::organism_live::LiveAttentionTicket),
     OrganismPointerButton(iced::mouse::Button, bool),
@@ -5216,6 +5224,8 @@ struct Frost {
     config: Config,
     organism: organism::Organism,
     organism_pointer_buttons: Vec<iced::mouse::Button>,
+    organism_body_geometry: Option<(usize, terminal_view::OrganismBodyGeometry)>,
+    organism_geometry_epoch: u64,
     theme: Theme,
     metrics: Metrics,
     sessions: Vec<Session>,
@@ -5590,6 +5600,8 @@ impl Frost {
             config,
             organism: organism::Organism::default(),
             organism_pointer_buttons: Vec::new(),
+            organism_body_geometry: None,
+            organism_geometry_epoch: 0,
             theme,
             metrics,
             sessions,
@@ -17004,8 +17016,21 @@ impl Frost {
                     self.organism.apply_preview_request(&request);
                 }
             }
+            Message::OrganismBodyObserved(id, epoch, projection, block, observation) => {
+                // Even a withdrawal carries the originating native snapshot.
+                // An old None must not erase a newly visible body in this pane.
+                if epoch == self.organism_geometry_epoch
+                    && block == self.organism_block_key()
+                    && self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|s| s.id == id && s.projection.key() == projection)
+                {
+                    self.observe_organism_body(id, observation);
+                }
+            }
             Message::OrganismHoverEnter(id, epoch) => {
-                if self.organism_owner() == Some(id) {
+                if !self.config.block_mode && self.organism_owner() == Some(id) {
                     let facts = self.organism_attention_facts();
                     self.organism.enter_live_greeting(id, epoch, facts);
                 }
@@ -20631,9 +20656,13 @@ impl Frost {
     }
 
     fn sync_organism_geometry(&mut self) {
+        self.organism_body_geometry = None;
+        self.organism_geometry_epoch = self.organism_geometry_epoch.saturating_add(1);
         let layout = self.organism_layout();
-        self.organism
-            .sync_greeting_geometry(layout.glyph, layout.presentable());
+        self.organism.sync_greeting_geometry(
+            !self.config.block_mode && layout.glyph,
+            layout.presentable(),
+        );
         if !layout.presentable() {
             self.organism_pointer_buttons.clear();
         }
@@ -20730,7 +20759,11 @@ impl Frost {
         let eligible = self.organism_interaction_eligible();
         organism::AttentionFacts {
             eligible,
-            hover_available: self.organism_layout().glyph,
+            hover_available: if self.config.block_mode {
+                self.organism_body_hover_available()
+            } else {
+                self.organism_layout().glyph
+            },
             activity: self.sessions.get(self.active).map_or(
                 jterm_core::organism_live::LiveActivityKnowledge::Unknown,
                 |session| {
@@ -20748,7 +20781,11 @@ impl Frost {
     }
 
     fn organism_hover_eligible(&self) -> bool {
-        self.organism_layout().glyph && self.organism_interaction_eligible()
+        (if self.config.block_mode {
+            self.organism_body_hover_available()
+        } else {
+            self.organism_layout().glyph
+        }) && self.organism_interaction_eligible()
     }
 
     fn organism_interaction_eligible(&self) -> bool {
@@ -20949,11 +20986,13 @@ impl Frost {
             let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
                 // One core offer binds both edges before the next view rebuild.
                 let mut area = mouse_area(slot);
-                if let Some(ticket) = self.organism.live_greeting_offer(id) {
-                    area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
-                }
-                if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
-                    area = area.on_exit(Message::OrganismHoverExit(id, ticket));
+                if !self.config.block_mode {
+                    if let Some(ticket) = self.organism.live_greeting_offer(id) {
+                        area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
+                    }
+                    if let Some(ticket) = self.organism.live_greeting_exit_reference(id) {
+                        area = area.on_exit(Message::OrganismHoverExit(id, ticket));
+                    }
                 }
                 area.into()
             } else {
@@ -21509,6 +21548,105 @@ impl Frost {
         block_mode::marker_fractions(&rows, total)
     }
 
+    /// Active Block identity comes from native OSC lifecycle/provenance only.
+    fn organism_block_key(&self) -> Option<terminal::RawRowId> {
+        let session = self.sessions.get(self.active)?;
+        let (start, _) = Self::active_zone_span(&session.terminal)?;
+        session.terminal.raw_row_id_at_absolute(start)
+    }
+
+    /// Drawing can represent Busy/watch while hover still requires shared idle
+    /// admission. There is one body owner and no body in Static/traditional UI.
+    fn organism_body_owner(&self) -> Option<usize> {
+        if !self.config.block_mode
+            || self.organism_geometry_epoch == u64::MAX
+            || self.config.ascii_organism_motion == Some(organism::Motion::Static)
+            || !self.organism_pointer_buttons.is_empty()
+            || self.dragging_tab.is_some()
+            || self.pane_drag.is_some()
+            || self.dragging_divider.is_some()
+            || self.dragging_sidebar
+            || self.terminal_mouse_gestures.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        let owner = self.organism_owner()?;
+        let session = self.sessions.get(self.active)?;
+        if session.terminal.has_text_selection()
+            || session.terminal.is_mouse_enabled()
+            || !session.terminal.preedit_text.is_empty()
+            || !session.terminal.kitty_graphics.get_placements().is_empty()
+        {
+            return None;
+        }
+        self.organism_block_key().map(|_| owner)
+    }
+
+    fn organism_body_hover_available(&self) -> bool {
+        self.organism_body_geometry
+            .as_ref()
+            .is_some_and(|(id, geometry)| {
+                self.organism_body_owner() == Some(*id)
+                    && self.organism_block_key() == Some(geometry.block)
+                    && geometry.epoch == self.organism_geometry_epoch
+                    && self
+                        .sessions
+                        .get(self.active)
+                        .is_some_and(|s| s.projection.key() == geometry.projection)
+            })
+    }
+
+    fn observe_organism_body(
+        &mut self,
+        id: usize,
+        observation: terminal_view::OrganismBodyObservation,
+    ) {
+        use organism_block::Edge;
+        if self.sessions.get(self.active).map(|s| s.id) != Some(id) {
+            return;
+        }
+        if let Some(geometry) = observation.geometry.as_ref() {
+            if self.organism_body_owner() != Some(id)
+                || self.organism_block_key() != Some(geometry.block)
+                || geometry.epoch != self.organism_geometry_epoch
+                || !self
+                    .sessions
+                    .get(self.active)
+                    .is_some_and(|s| s.projection.key() == geometry.projection)
+            {
+                return;
+            }
+        }
+        if observation.edge == Edge::Geometry {
+            // Layout, scroll, Block/pane replacement and typing restoration only
+            // reconcile geometry. None of them is a physical pointer entry.
+            let mut facts = self.organism_attention_facts();
+            facts.hover_available = false;
+            self.organism.leave_live_greeting(facts);
+            self.organism_body_geometry = observation.geometry.map(|g| (id, g));
+            return;
+        }
+        if observation.geometry.as_ref()
+            != self
+                .organism_body_geometry
+                .as_ref()
+                .filter(|(owner, _)| *owner == id)
+                .map(|(_, g)| g)
+        {
+            return;
+        }
+        let facts = self.organism_attention_facts();
+        if let Some(ticket) = observation.ticket {
+            match observation.edge {
+                Edge::Enter if self.organism_body_hover_available() => {
+                    self.organism.enter_live_greeting(id, ticket, facts);
+                }
+                Edge::Exit => self.organism.exit_live_greeting(id, ticket, facts),
+                _ => {}
+            }
+        }
+    }
+
     /// Build the terminal widget for the pane showing `sess_idx`.
     /// Overlay-style decorations (search, links, Kitty images) are only attached
     /// to the active pane; the other panes render plain.
@@ -21565,6 +21703,28 @@ impl Frost {
             sess.terminal.is_alt_buffer_active(),
             sess.terminal.has_usable_block_partitions(),
         );
+        let organism_projection = sess.projection.key();
+        let organism_block = self.organism_block_key();
+        let organism_epoch = self.organism_geometry_epoch;
+        let organism_body = (self.organism_body_owner() == Some(session_id))
+            .then(|| self.organism_block_key())
+            .flatten()
+            .map(|block| {
+                let presentation = self.organism.presentation_with_attention(
+                    session_id,
+                    sess.terminal.is_command_running(),
+                    sess.terminal
+                        .running_duration_ms()
+                        .is_some_and(|ms| ms >= 60_000),
+                    self.config.ascii_organism_motion,
+                    self.organism_attention_facts(),
+                );
+                terminal_view::OrganismBody {
+                    block,
+                    epoch: self.organism_geometry_epoch,
+                    sprite: presentation.sprite,
+                }
+            });
         TermWidget::new(
             sess.projection.cells(),
             sess.cursor,
@@ -21593,6 +21753,20 @@ impl Frost {
         ))
         .search(search_matches, current)
         .blocks(blocks)
+        .organism_body(
+            organism_body,
+            self.organism.live_greeting_offer(session_id),
+            self.organism.live_greeting_exit_reference(session_id),
+            move |observation| {
+                Message::OrganismBodyObserved(
+                    session_id,
+                    organism_epoch,
+                    organism_projection.clone(),
+                    organism_block,
+                    observation,
+                )
+            },
+        )
         .app_mouse_full_grid(app_mouse_full_grid)
         .block_compact(self.config.block_compact)
         .block_markers(block_markers)
@@ -27417,7 +27591,7 @@ impl Frost {
         }
         if live_visible
             && organism_pointer_observation_needed(
-                live_layout.glyph,
+                live_layout.glyph || (self.config.block_mode && live_layout.presentable()),
                 self.organism.explicit_greeting_active(attention_facts),
                 !self.organism_pointer_buttons.is_empty(),
                 self.config.ascii_organism_motion,
@@ -30027,6 +30201,103 @@ mod tests {
     }
 
     #[test]
+    fn native_body_uses_shared_context_and_current_owner_without_new_timers() {
+        let source = include_str!("main.rs");
+        let pane = source
+            .split_once("    fn pane_view(")
+            .unwrap()
+            .1
+            .split_once("    fn sidebar_view(")
+            .unwrap()
+            .0;
+        assert!(pane.contains("self.organism_body_owner() == Some(session_id)"));
+        assert!(pane.contains("self.organism.presentation_with_attention("));
+        assert!(pane.contains("sess.terminal.is_command_running()"));
+        assert!(pane.contains("self.organism_attention_facts()"));
+        assert!(!pane.contains("sprite_frame"));
+        let owner = source
+            .split_once("    fn organism_body_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_body_hover_available(")
+            .unwrap()
+            .0;
+        for gate in [
+            "Some(organism::Motion::Static)",
+            "self.organism_owner()?",
+            "has_text_selection()",
+            "is_mouse_enabled()",
+            "preedit_text",
+            "get_placements()",
+            "terminal_mouse_gestures",
+            "dragging_sidebar",
+        ] {
+            assert!(owner.contains(gate), "missing native gate: {gate}");
+        }
+        assert!(!owner.contains("!session.terminal.is_command_running()"));
+        let body = include_str!("organism_block.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!body.contains("Duration"));
+        assert!(!body.contains("LiveAttention"));
+        assert!(!body.contains("std::thread"));
+        assert!(!body.contains("Behavior::"));
+    }
+
+    #[test]
+    fn native_body_withdrawals_and_entries_validate_exact_native_snapshot() {
+        let source = include_str!("main.rs");
+        let dispatch = source
+            .split_once("            Message::OrganismBodyObserved(id,")
+            .unwrap()
+            .1
+            .split_once("            Message::OrganismHoverEnter")
+            .unwrap()
+            .0;
+        for check in [
+            "epoch == self.organism_geometry_epoch",
+            "block == self.organism_block_key()",
+            "s.id == id && s.projection.key() == projection",
+        ] {
+            assert!(dispatch.contains(check));
+        }
+        let observer = source
+            .split_once("    fn observe_organism_body(")
+            .unwrap()
+            .1
+            .split_once("    /// Build the terminal widget")
+            .unwrap()
+            .0;
+        assert!(observer.contains("facts.hover_available = false"));
+        assert!(observer.contains("self.organism.leave_live_greeting(facts)"));
+        assert!(observer.contains("Edge::Enter if self.organism_body_hover_available()"));
+        assert!(observer.contains("self.organism.enter_live_greeting(id, ticket, facts)"));
+        assert!(!observer.contains("write_pty"));
+        assert!(!observer.contains("resize"));
+        let status = source
+            .split_once("// One core offer binds both edges")
+            .unwrap()
+            .1
+            .split_once("                area.into()")
+            .unwrap()
+            .0;
+        assert!(status.contains("if !self.config.block_mode"));
+        let widget = include_str!("terminal_view.rs");
+        let passive = widget
+            .split_once("// Observe the exact geometry used by draw")
+            .unwrap()
+            .1
+            .split_once("// Keep the input method")
+            .unwrap()
+            .0;
+        assert!(passive.contains("self.organism_geometry(bounds, viewport)"));
+        assert!(passive.contains("CursorMoved"));
+        assert!(!passive.contains("capture_event"));
+        assert!(!passive.contains("request_redraw"));
+    }
+
+    #[test]
     fn narrow_reopen_is_configuration_only_and_preserves_live_thresholds() {
         for width in [
             0.0,
@@ -30287,7 +30558,9 @@ mod tests {
             .split_once("    fn organism_owner(")
             .unwrap()
             .0;
-        assert!(sync.contains("sync_greeting_geometry(layout.glyph, layout.presentable())"));
+        assert!(sync.contains("!self.config.block_mode && layout.glyph"));
+        assert!(sync.contains("layout.presentable()"));
+        assert!(sync.contains("self.organism_geometry_epoch"));
         assert!(!sync.contains("enter_live_greeting"));
         assert!(!sync.contains("preview"));
         assert!(!sync.contains("demo"));
@@ -37289,9 +37562,7 @@ mod tests {
         assert!(greet.contains("!self.organism_interaction_eligible()"));
         assert!(greet.contains("Some(organism::Motion::Static)"));
         assert!(greet.contains("self.organism_layout().presentable()"));
-        assert!(
-            greet.contains("self.organism_layout().glyph && self.organism_interaction_eligible()")
-        );
+        assert!(greet.contains("self.organism_body_hover_available()"));
         assert!(!greet.contains("Task::"));
         assert!(!greet.contains("write_pty"));
         assert!(!greet.contains("say_hello"));

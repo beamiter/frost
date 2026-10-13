@@ -1,4 +1,5 @@
 use crate::color::{resolve_bg_with_palette, resolve_fg_with_palette};
+use crate::organism_block::{self, Edge as BodyEdge};
 use crate::search::SearchMatch;
 use crate::terminal::{
     clamp_terminal_dimensions, CursorShape, DynamicColorPalette, ProjectionKey, SyntheticRowKey,
@@ -6,6 +7,7 @@ use crate::terminal::{
 };
 use crate::theme::Theme;
 use crate::theme::ThemeExt as _;
+use jterm_core::organism_live::LiveAttentionTicket;
 
 use std::time::Instant;
 
@@ -20,6 +22,37 @@ use iced::{
     border, Background, Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Shadow,
     Size, Vector,
 };
+
+/// Same-frame native body identity. It contains no terminal text or policy.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OrganismBodyGeometry {
+    pub block: crate::terminal::RawRowId,
+    pub epoch: u64,
+    pub projection: ProjectionKey,
+    pub rect: organism_block::Rect,
+}
+
+pub(crate) struct OrganismBody {
+    pub block: crate::terminal::RawRowId,
+    pub epoch: u64,
+    pub sprite: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OrganismBodyObservation {
+    pub geometry: Option<OrganismBodyGeometry>,
+    pub edge: BodyEdge,
+    pub ticket: Option<LiveAttentionTicket>,
+}
+
+fn native_body_rect(rect: Rectangle) -> organism_block::Rect {
+    organism_block::Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
 
 /// Which mouse button a [`MouseInput`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,6 +605,7 @@ struct State {
     /// deltas accumulate into whole-line scrolls instead of being lost.
     scroll_accum: f32,
     summary_press: Option<SummaryPress>,
+    organism_pointer: organism_block::Pointer<OrganismBodyGeometry>,
 }
 
 #[derive(Clone, Debug)]
@@ -607,6 +641,7 @@ impl Default for State {
             click_count: 0,
             scroll_accum: 0.0,
             summary_press: None,
+            organism_pointer: organism_block::Pointer::default(),
         }
     }
 }
@@ -729,6 +764,10 @@ pub struct TermWidget<'a, Message> {
     /// Per visible row block chrome (stripes, separators, badges), aligned
     /// with the grid rows exactly like `selection`. Empty = no block mode.
     blocks: Vec<BlockPaintRow>,
+    organism_body: Option<OrganismBody>,
+    organism_offer: Option<LiveAttentionTicket>,
+    organism_exit: Option<LiveAttentionTicket>,
+    on_organism: Option<Box<dyn Fn(OrganismBodyObservation) -> Message + 'a>>,
     /// Alternate screen and disabled Block Mode have no history-card split;
     /// every real grid cell is application-owned there.
     app_mouse_full_grid: bool,
@@ -812,6 +851,10 @@ impl<'a, Message> TermWidget<'a, Message> {
             scroll_offset,
             scrollback_len,
             blocks: Vec::new(),
+            organism_body: None,
+            organism_offer: None,
+            organism_exit: None,
+            on_organism: None,
             app_mouse_full_grid: false,
             block_compact: false,
             block_markers: Vec::new(),
@@ -947,6 +990,89 @@ impl<'a, Message> TermWidget<'a, Message> {
     pub fn blocks(mut self, blocks: Vec<BlockPaintRow>) -> Self {
         self.blocks = blocks;
         self
+    }
+
+    /// Paint/observe only. Native input routing and layout are untouched.
+    pub(crate) fn organism_body(
+        mut self,
+        body: Option<OrganismBody>,
+        offer: Option<LiveAttentionTicket>,
+        exit: Option<LiveAttentionTicket>,
+        callback: impl Fn(OrganismBodyObservation) -> Message + 'a,
+    ) -> Self {
+        self.organism_body = body;
+        self.organism_offer = offer;
+        self.organism_exit = exit;
+        self.on_organism = Some(Box::new(callback));
+        self
+    }
+
+    fn organism_geometry(
+        &self,
+        bounds: Rectangle,
+        viewport: &Rectangle,
+    ) -> Option<OrganismBodyGeometry> {
+        let body = self.organism_body.as_ref()?;
+        if !self.focused
+            || self.app_mouse_full_grid
+            || self.preedit.is_some()
+            || !self.images.is_empty()
+            || self.selection.iter().any(Option::is_some)
+            || !organism_block::sprite_fits(&body.sprite)
+        {
+            return None;
+        }
+        let clip = bounds.intersection(viewport)?;
+        let segment = block_card_segments(&self.blocks)
+            .into_iter()
+            .find(|segment| segment.kind == BlockCardKind::Active)?;
+        let (cw, ch) = (self.metrics.cell_w, self.metrics.cell_h);
+        let origin = (
+            bounds.x + self.metrics.padding + self.metrics.block_gutter_width(),
+            bounds.y + self.metrics.padding,
+        );
+        let card = block_card_geometry(
+            bounds,
+            bounds.x + bounds.width - self.metrics.padding - SCROLLBAR_WIDTH,
+            origin.1,
+            ch,
+            segment,
+            self.block_compact,
+        )
+        .body;
+        // Complete default cells only. Styled blanks, wide continuations, links,
+        // badges and synthetic rows are occupied; no prompt/password guessing.
+        let mut last_occupied_row = None;
+        let mut columns = usize::MAX;
+        for row in segment.start_row..segment.end_row {
+            let cells = self.grid.get(row)?;
+            columns = columns.min(cells.len());
+            let block = self.blocks.get(row)?;
+            if cells.iter().any(|cell| *cell != TerminalCell::default())
+                || block.badge.is_some()
+                || block.collapsed_summary.is_some()
+            {
+                last_occupied_row = Some(row);
+            }
+        }
+        let rect = organism_block::placement(organism_block::Surface {
+            card: native_body_rect(card),
+            clip: native_body_rect(clip),
+            grid_origin: origin,
+            cell: (cw, ch),
+            start_row: segment.start_row,
+            end_row: segment.end_row,
+            cursor_row: self.cursor.0,
+            last_occupied_row,
+            columns,
+            complete: segment.real_top && segment.real_bottom,
+        })?;
+        Some(OrganismBodyGeometry {
+            block: body.block,
+            epoch: body.epoch,
+            projection: self.projection_key.clone()?,
+            rect,
+        })
     }
 
     pub fn app_mouse_full_grid(mut self, full_grid: bool) -> Self {
@@ -1300,6 +1426,233 @@ mod tests {
         BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Point, Rectangle};
+
+    // CPU only: construct plain snapshots and a widget value; never create a
+    // renderer, window, font database, PTY, or event loop.
+    fn with_native_body(test: impl FnOnce(&mut super::TermWidget<'_, ()>, Rectangle)) {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = crate::theme::Theme::default();
+        let mut blocks = vec![BlockPaintRow::default(); 8];
+        for (index, row) in blocks.iter_mut().enumerate().take(6) {
+            row.card_group = Some(0);
+            row.card_kind = BlockCardKind::Active;
+            row.app_eligible = true;
+            row.card_top = index == 0;
+            row.card_bottom = index == 5;
+        }
+        let mut widget = super::TermWidget::new(
+            projection.cells(),
+            (0, 0),
+            true,
+            crate::terminal::CursorShape::Block,
+            true,
+            &theme,
+            Metrics::new(10.0, 1.0, 4.0, true),
+            iced::Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        )
+        .blocks(blocks)
+        .organism_body(
+            Some(super::OrganismBody {
+                block: terminal.raw_row_id_at_absolute(0).unwrap(),
+                epoch: 9,
+                sprite: crate::organism::LivePresentation::passive_presence().sprite,
+            }),
+            None,
+            None,
+            |_| (),
+        )
+        .on_summary(projection.key(), |_| ());
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 150.0,
+        };
+        test(&mut widget, bounds);
+    }
+
+    #[test]
+    fn native_body_geometry_uses_current_projection_and_real_card() {
+        with_native_body(|widget, bounds| {
+            let geometry = widget.organism_geometry(bounds, &bounds).unwrap();
+            assert_eq!(geometry.epoch, 9);
+            assert_eq!(Some(&geometry.projection), widget.projection_key.as_ref());
+            assert_eq!(geometry.rect.y, 28.0);
+            assert_eq!(geometry.rect.height, 36.0);
+            // Moving only the native widget origin moves the body by the same
+            // amount; it never acquires a viewport-bottom anchor.
+            let moved = Rectangle { y: 24.0, ..bounds };
+            let moved_geometry = widget.organism_geometry(moved, &moved).unwrap();
+            assert_eq!(moved_geometry.rect.y, geometry.rect.y + 24.0);
+            widget.blocks[0].card_top = false;
+            assert!(widget.organism_geometry(bounds, &bounds).is_none());
+        });
+    }
+
+    #[test]
+    fn native_body_rejects_styled_wide_link_and_nonblank_cells() {
+        with_native_body(|widget, bounds| {
+            let mut cells = widget.grid.to_vec();
+            let mut cases = vec![
+                crate::terminal::TerminalCell {
+                    character: 'x',
+                    ..Default::default()
+                },
+                crate::terminal::TerminalCell {
+                    character: '\0',
+                    ..Default::default()
+                },
+            ];
+            let mut styled = crate::terminal::TerminalCell::default();
+            styled.flags.set_dim(true);
+            cases.push(styled);
+            let mut wide = crate::terminal::TerminalCell::default();
+            wide.flags.set_wide_continuation(true);
+            cases.push(wide);
+            cases.push(crate::terminal::TerminalCell {
+                hyperlink: 1,
+                ..Default::default()
+            });
+            for cell in cases {
+                cells[2][50] = cell;
+                // The same production geometry method receives an immutable
+                // altered snapshot, with no parser or terminal I/O involved.
+                let test_widget: super::TermWidget<'_, ()> = super::TermWidget {
+                    grid: &cells,
+                    organism_body: widget.organism_body.as_ref().map(|b| super::OrganismBody {
+                        block: b.block,
+                        epoch: b.epoch,
+                        sprite: b.sprite.clone(),
+                    }),
+                    blocks: widget.blocks.clone(),
+                    projection_key: widget.projection_key.clone(),
+                    ..super::TermWidget::new(
+                        &cells,
+                        (0, 0),
+                        true,
+                        crate::terminal::CursorShape::Block,
+                        true,
+                        widget.theme,
+                        widget.metrics,
+                        iced::Font::MONOSPACE,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        0,
+                        0,
+                    )
+                };
+                assert!(test_widget.organism_geometry(bounds, &bounds).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn native_body_same_rect_new_projection_retires_core_ticket() {
+        use jterm_core::organism_live::{
+            LiveActivityKnowledge, LiveAttention, LiveAttentionError, LiveAttentionEvent,
+            LiveAttentionInput,
+        };
+        use std::time::Duration;
+        with_native_body(|widget, bounds| {
+            let geometry = widget.organism_geometry(bounds, &bounds).unwrap();
+            let mut pointer = crate::organism_block::Pointer::default();
+            let mut attention = LiveAttention::default();
+            attention.set_owner(Some(1));
+            let ticket = attention.entry_offer().unwrap();
+            let mut input = LiveAttentionInput {
+                base_context: jterm_core::organism_daily::PreviewPose::Calm.context(),
+                activity: LiveActivityKnowledge::KnownIdle,
+                hard_eligible: true,
+                hover_available: true,
+                pointer_inside: true,
+            };
+            pointer.observe(Some(geometry.clone()), Some((0.0, 0.0)), false, false);
+            let point = Some((geometry.rect.x + 1.0, geometry.rect.y + 1.0));
+            assert_eq!(
+                pointer.observe(Some(geometry.clone()), point, true, true),
+                Some(crate::organism_block::Edge::Enter)
+            );
+            attention
+                .advance(
+                    Duration::ZERO,
+                    &1,
+                    input,
+                    LiveAttentionEvent::PointerEntered { ticket },
+                )
+                .unwrap();
+            // Identical pixels with a different immutable projection are a
+            // new observation, never continued dwell on an old ticket.
+            widget.projection_key.as_mut().unwrap().policy_revision += 1;
+            let next = widget.organism_geometry(bounds, &bounds).unwrap();
+            assert_eq!(next.rect, geometry.rect);
+            assert_eq!(
+                pointer.observe(Some(next.clone()), point, true, false),
+                Some(crate::organism_block::Edge::Geometry)
+            );
+            input.hover_available = false;
+            input.pointer_inside = false;
+            attention
+                .advance(
+                    Duration::from_millis(300),
+                    &1,
+                    input,
+                    LiveAttentionEvent::PointerLeft { ticket },
+                )
+                .unwrap();
+            assert!(matches!(
+                attention.advance(
+                    Duration::from_millis(600),
+                    &1,
+                    input,
+                    LiveAttentionEvent::CandidateDue { ticket }
+                ),
+                Err(LiveAttentionError::StaleTicket)
+            ));
+            assert_eq!(pointer.observe(Some(next), point, true, false), None);
+        });
+    }
+
+    #[test]
+    fn native_body_rejects_cursor_selection_ime_synthetic_and_clipping() {
+        with_native_body(|widget, bounds| {
+            widget.cursor.0 = 2;
+            assert!(widget.organism_geometry(bounds, &bounds).is_none());
+            widget.cursor.0 = 0;
+            widget.selection = vec![Some((0, 1))];
+            assert!(widget.organism_geometry(bounds, &bounds).is_none());
+            widget.selection.clear();
+            widget.preedit = Some(("composition".into(), None));
+            assert!(widget.organism_geometry(bounds, &bounds).is_none());
+            widget.preedit = None;
+            widget.blocks[2].collapsed_summary = Some(CollapsedSummaryPaint {
+                key: crate::terminal::SyntheticRowKey {
+                    zone_id: 1,
+                    policy_revision: 1,
+                },
+                hidden_display_rows: 1,
+            });
+            assert!(widget.organism_geometry(bounds, &bounds).is_none());
+            widget.blocks[2].collapsed_summary = None;
+            let clipped = Rectangle {
+                height: 70.0,
+                ..bounds
+            };
+            assert!(widget.organism_geometry(bounds, &clipped).is_none());
+            widget.focused = false;
+            assert!(widget.organism_geometry(bounds, &bounds).is_none());
+        });
+    }
 
     #[test]
     fn collapsed_summary_activation_requires_same_key_projection_and_no_drag() {
@@ -1980,7 +2333,7 @@ where
         _renderer: &Renderer,
         _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) {
         // Do not capture focus changes: sibling widgets also need to retire
         // their gestures. This precedes IME and absent-callback early exits.
@@ -1988,6 +2341,34 @@ where
             return;
         }
         let bounds = layout.bounds();
+        // Observe the exact geometry used by draw, without capturing the event.
+        // A redraw/layout/projection change revokes a visit, never creates one.
+        if let Some(callback) = self.on_organism.as_ref() {
+            let geometry = self.organism_geometry(bounds, viewport);
+            let point = cursor.position().map(|p| (p.x, p.y));
+            let inside = geometry
+                .as_ref()
+                .zip(point)
+                .is_some_and(|(g, p)| g.rect.contains(p));
+            let moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
+            if let Some(edge) = tree.state.downcast_mut::<State>().organism_pointer.observe(
+                geometry.clone(),
+                point,
+                inside,
+                moved,
+            ) {
+                let ticket = match edge {
+                    BodyEdge::Enter => self.organism_offer,
+                    BodyEdge::Exit => self.organism_exit,
+                    BodyEdge::Geometry => None,
+                };
+                shell.publish(callback(OrganismBodyObservation {
+                    geometry,
+                    edge,
+                    ticket,
+                }));
+            }
+        }
 
         // Keep the input method enabled and positioned at the text cursor while
         // this pane is focused. The runtime only honors the request during a
@@ -3025,6 +3406,40 @@ where
             }
         }
 
+        // Paint the existing shared sprite only in the proven empty region.
+        // Per-cell shaping shares the terminal's real font metrics, including
+        // the heuristic-font fallback. This creates no widget or hit capture.
+        if let Some(geometry) = self.organism_geometry(bounds, viewport) {
+            if let Some(body) = self.organism_body.as_ref() {
+                for (row, line) in body.sprite.lines().enumerate() {
+                    for (col, glyph) in line.chars().enumerate() {
+                        if glyph == ' ' {
+                            continue;
+                        }
+                        renderer.fill_text(
+                            Text {
+                                content: glyph.to_string(),
+                                bounds: Size::new(cw, ch),
+                                size: Pixels(self.metrics.font_size),
+                                line_height: text::LineHeight::Absolute(Pixels(ch)),
+                                font: self.mono,
+                                align_x: text::Alignment::Center,
+                                align_y: iced::alignment::Vertical::Center,
+                                shaping: text::Shaping::Basic,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(
+                                geometry.rect.x + (col as f32 + 0.5) * cw,
+                                geometry.rect.y + (row as f32 + 0.5) * ch,
+                            ),
+                            block_accent,
+                            clip,
+                        );
+                    }
+                }
+            }
+        }
+
         // Cursor.
         if self.cursor_visible {
             let (cr, cc) = self.cursor;
@@ -3251,6 +3666,7 @@ mod focus_state_tests {
             click_count: 3,
             scroll_accum: 0.75,
             summary_press: None,
+            organism_pointer: organism_block::Pointer::default(),
         };
         assert!(state.reset_on_unfocused(&Event::Window(iced::window::Event::Unfocused)));
         assert!(!state.dragging);

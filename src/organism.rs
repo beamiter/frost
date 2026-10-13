@@ -85,7 +85,7 @@ impl MotionChoice {
     pub fn interaction_hint(self) -> &'static str {
         match self {
             Self::Static => "Hover greetings are unavailable in Static.",
-            _ => "While idle, hover over the status-bar glyph for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
+            _ => "While idle, hover over the live body in the active Block (the status-bar glyph outside Block mode) for 600 ms to say hello. Typing or busy work cancels it. One greeting per visit, with an 8-second cooldown.",
         }
     }
 
@@ -121,7 +121,7 @@ impl fmt::Display for MotionChoice {
 
 pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
     if bottom_bar {
-        "Reserves a fixed-height strip above the bottom bar. Narrow windows prioritize the body and collapse arrow. A still companion remains when live reactions pause. Use the status-bar arrow to collapse or expand; hover the glyph in a wider window for details."
+        "Reserves a fixed-height strip above the bottom bar. Narrow windows prioritize the body and collapse arrow. A still companion remains when live reactions pause. Use the status-bar arrow to collapse or expand; hover the glyph in a wider window for details. In Block mode, the live body uses only complete empty space inside the focused active card; typing, clipping or insufficient room hides it."
     } else {
         "Turn on Bottom status bar (cwd, git, last command) to show the live companion."
     }
@@ -2185,6 +2185,56 @@ mod tests {
             jterm_core::organism_daily::behavior_explanation(Behavior::WatchCommand)
         );
         assert_eq!(values(organism.life.state()), before);
+    }
+
+    #[test]
+    fn native_block_busy_and_finished_reuse_shared_sprite_context() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.batch_finished(1, false);
+        organism.sync_live_attention_owner(Some(1));
+        let busy = AttentionFacts {
+            eligible: false,
+            hover_available: true,
+            activity: LiveActivityKnowledge::Busy,
+        };
+        let ticket = organism.live_greeting_offer(1).unwrap();
+        organism.enter_live_greeting(1, ticket, busy);
+        assert!(!organism.live_greeting_candidate_visible(1, busy));
+        let running = organism.presentation_at_with_attention(
+            1,
+            true,
+            false,
+            Some(Motion::Calm),
+            Duration::ZERO,
+            (busy, true),
+        );
+        let context = RenderContext::new(
+            Behavior::WatchCommand,
+            BodyLanguage::from_state(organism.life.state()),
+            false,
+        );
+        assert_eq!(running.sprite, sprite_frame_with_context(context, 0));
+        organism.completed(1, "cargo test", Some(1), Some(20));
+        let facts = AttentionFacts::known_idle_for_test(true, true);
+        let finished = organism.presentation_at_with_attention(
+            1,
+            false,
+            false,
+            Some(Motion::Calm),
+            Duration::ZERO,
+            (facts, false),
+        );
+        let context = RenderContext {
+            body_language: BodyLanguage::from_state(organism.life.state()),
+            ..organism.sessions[&1].context
+        };
+        assert_eq!(finished.sprite, sprite_frame_with_context(context, 0));
+        assert_ne!(context.behavior, Behavior::Idle);
+        assert!(crate::organism_block::sprite_fits(&running.sprite));
+        assert!(crate::organism_block::sprite_fits(&finished.sprite));
     }
 
     #[test]
