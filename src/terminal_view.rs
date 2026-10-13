@@ -1302,22 +1302,53 @@ impl<'a, Message> TermWidget<'a, Message> {
         }
     }
 
-    fn organism_toggle_at(&self, position: Point, bounds: Rectangle) -> bool {
-        let (_, row) = self.cell_at(position, bounds);
-        self.focused
-            && self.organism_status.is_some()
-            && bounds.contains(position)
-            && self
-                .blocks
-                .get(row)
-                .is_some_and(|block| block.organism_status.is_some_and(|(line, _)| line == 0))
-            && bounds.width - self.metrics.padding - SCROLLBAR_WIDTH - 16.0 >= 160.0
-            && position.x
-                >= bounds.x + bounds.width
-                    - self.metrics.padding
-                    - SCROLLBAR_WIDTH
-                    - 3.0 * self.metrics.cell_w
-            && position.x < bounds.x + bounds.width - self.metrics.padding - SCROLLBAR_WIDTH - 8.0
+    /// Share the exact status-card and arrow rectangles between paint and hit
+    /// testing. The retained line index also preserves a partly scrolled arrow.
+    fn organism_status_geometry(
+        &self,
+        row_index: usize,
+        bounds: Rectangle,
+    ) -> Option<(Rectangle, Rectangle)> {
+        let (line, rows) = self.blocks.get(row_index)?.organism_status?;
+        if row_index > 0 && self.blocks[row_index - 1].organism_status.is_some() {
+            return None;
+        }
+        let ch = self.metrics.cell_h;
+        let cw = self.metrics.cell_w;
+        let right = block_chrome_right(bounds, self.metrics);
+        let area = Rectangle {
+            x: bounds.x + 8.0,
+            y: bounds.y
+                + self.metrics.padding
+                + (row_index as f32 - line as f32) * ch
+                + if rows == 1 { 1.0 } else { 3.0 },
+            width: (right - bounds.x - 16.0).max(0.0),
+            height: rows as f32 * ch - if rows == 1 { 2.0 } else { 6.0 },
+        };
+        if area.width < 160.0 || area.height <= 0.0 {
+            return None;
+        }
+        let toggle = Rectangle {
+            x: right - 3.0 * cw,
+            y: area.y,
+            width: 2.0 * cw,
+            height: ch.min(area.height),
+        };
+        Some((area, toggle))
+    }
+
+    fn organism_toggle_at(&self, position: Point, bounds: Rectangle, viewport: &Rectangle) -> bool {
+        if !self.focused || self.organism_status.is_none() {
+            return false;
+        }
+        let Some(clip) = bounds.intersection(viewport) else {
+            return false;
+        };
+        self.blocks.iter().enumerate().any(|(row, _)| {
+            self.organism_status_geometry(row, bounds)
+                .and_then(|(_, toggle)| toggle.intersection(&clip))
+                .is_some_and(|toggle| toggle.contains(position))
+        })
     }
 
     pub fn app_mouse_full_grid(mut self, full_grid: bool) -> Self {
@@ -1990,18 +2021,116 @@ mod tests {
                     - 2.0 * widget.metrics.cell_w,
                 widget.metrics.padding + widget.metrics.cell_h * 0.5,
             );
-            assert!(widget.organism_toggle_at(point, bounds));
+            assert!(widget.organism_toggle_at(point, bounds, &bounds));
             let mut state = super::State::default();
             assert!(state.consume_spacer_press(super::MouseButton::Middle, true));
             assert!(state.consumed_presses[super::MouseButton::Middle.slot()]);
             assert!(!state.published_presses[super::MouseButton::Middle.slot()]);
             widget.focused = false;
-            assert!(!widget.organism_toggle_at(point, bounds));
+            assert!(!widget.organism_toggle_at(point, bounds, &bounds));
             widget.focused = true;
             widget.blocks[0].organism_status = Some((1, 4));
-            assert!(!widget.organism_toggle_at(point, bounds));
+            assert!(!widget.organism_toggle_at(point, bounds, &bounds));
             widget.blocks[0].organism_status = None;
-            assert!(!widget.organism_toggle_at(point, bounds));
+            assert!(!widget.organism_toggle_at(point, bounds, &bounds));
+        });
+    }
+
+    #[test]
+    fn inline_status_toggle_rejects_unpainted_padding_and_row_inset() {
+        with_native_body(|widget, bounds| {
+            widget.organism_status = Some(crate::organism::LivePresentation::passive_presence());
+            widget.blocks[0].organism_status = Some((0, 1));
+            widget.blocks[0].host_spacer = true;
+            let x = super::block_chrome_right(bounds, widget.metrics) - 2.0 * widget.metrics.cell_w;
+            for y in [bounds.y + 0.5, bounds.y + widget.metrics.padding + 0.5] {
+                assert!(
+                    !widget.organism_toggle_at(Point::new(x, y), bounds, &bounds),
+                    "unpainted top padding/inset must not toggle at y={y}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn inline_status_toggle_matches_painted_edges_at_scaled_fonts() {
+        with_native_body(|widget, original_bounds| {
+            let bounds = Rectangle {
+                x: 41.0,
+                y: 23.0,
+                ..original_bounds
+            };
+            widget.organism_status = Some(crate::organism::LivePresentation::passive_presence());
+            for font in [10.0, 14.0, 28.0] {
+                widget.metrics = Metrics::new(font, 1.0, 4.0, true);
+                for rows in [1, 4] {
+                    widget.blocks[0].organism_status = Some((0, rows));
+                    let right = super::block_chrome_right(bounds, widget.metrics);
+                    let top = bounds.y + widget.metrics.padding + if rows == 1 { 1.0 } else { 3.0 };
+                    // These are the exact rectangle edges passed to chrome_text by draw.
+                    let left = right - 3.0 * widget.metrics.cell_w;
+                    let painted_right = right - widget.metrics.cell_w;
+                    for x in [left + 0.25, painted_right - 0.25] {
+                        assert!(
+                            widget.organism_toggle_at(Point::new(x, top + 0.5), bounds, &bounds),
+                            "painted toggle must hit: font={font}, rows={rows}, x={x}"
+                        );
+                    }
+                    assert!(
+                        !widget.organism_toggle_at(
+                            Point::new(painted_right + 0.25, top + 0.5),
+                            bounds,
+                            &bounds
+                        ),
+                        "outside painted toggle must not hit: font={font}, rows={rows}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn inline_status_toggle_keeps_visible_scrolled_header_fragment() {
+        with_native_body(|widget, bounds| {
+            widget.organism_status = Some(crate::organism::LivePresentation::passive_presence());
+            widget.blocks[0].organism_status = Some((1, 4));
+            widget.blocks[1].organism_status = Some((2, 4));
+            widget.blocks[2].organism_status = Some((3, 4));
+            let x = super::block_chrome_right(bounds, widget.metrics) - 2.0 * widget.metrics.cell_w;
+            // The expanded toggle begins 3 px into its original first row. A one-row
+            // scroll leaves its bottom 3 px visible at the start of the next row.
+            let y = bounds.y + widget.metrics.padding + 1.0;
+            assert!(widget.organism_toggle_at(Point::new(x, y), bounds, &bounds));
+        });
+    }
+
+    #[test]
+    fn inline_status_toggle_obeys_narrow_visibility_and_viewport_clip() {
+        with_native_body(|widget, bounds| {
+            widget.organism_status = Some(crate::organism::LivePresentation::passive_presence());
+            widget.blocks[0].organism_status = Some((0, 1));
+            for width in [189.0, 190.0, 220.0, 600.0] {
+                let bounds = Rectangle { width, ..bounds };
+                let point = Point::new(
+                    super::block_chrome_right(bounds, widget.metrics) - 2.0 * widget.metrics.cell_w,
+                    bounds.y + widget.metrics.padding + 2.0,
+                );
+                let visible =
+                    width - widget.metrics.padding - super::SCROLLBAR_WIDTH - 16.0 >= 160.0;
+                assert_eq!(widget.organism_toggle_at(point, bounds, &bounds), visible);
+                let clip = Rectangle {
+                    y: point.y + 1.0,
+                    ..bounds
+                };
+                assert!(!widget.organism_toggle_at(point, bounds, &clip));
+                let offscreen = Rectangle {
+                    y: bounds.y + bounds.height + 1.0,
+                    ..bounds
+                };
+                assert!(!widget.organism_toggle_at(point, bounds, &offscreen));
+            }
+            widget.blocks[0].organism_status = None;
+            assert!(widget.organism_status_geometry(0, bounds).is_none());
         });
     }
 
@@ -2910,7 +3039,7 @@ where
                         }
                     }
                 }
-                if button == MouseButton::Left && self.organism_toggle_at(pos, bounds) {
+                if button == MouseButton::Left && self.organism_toggle_at(pos, bounds, viewport) {
                     if let Some(toggle) = self.on_organism_toggle.as_ref() {
                         state.consumed_presses[button.slot()] = true;
                         state.published_presses[button.slot()] = false;
@@ -3994,23 +4123,12 @@ where
                     clip,
                 );
             }
-            if let (Some((line, rows)), Some(presentation)) =
+            if let (Some((_, rows)), Some(presentation)) =
                 (block.organism_status, self.organism_status.as_ref())
             {
-                // Derive the unclipped group top from the retained line index,
-                // so partial scroll slices never fabricate a new header.
-                if row_index > 0 && self.blocks[row_index - 1].organism_status.is_some() {
+                let Some((area, toggle)) = self.organism_status_geometry(row_index, bounds) else {
                     continue;
-                }
-                let area = Rectangle {
-                    x: bounds.x + 8.0,
-                    y: y - line as f32 * ch + if rows == 1 { 1.0 } else { 3.0 },
-                    width: (scrollbar_track_left - bounds.x - 16.0).max(0.0),
-                    height: rows as f32 * ch - if rows == 1 { 2.0 } else { 6.0 },
                 };
-                if area.width < 160.0 {
-                    continue;
-                }
                 renderer.with_layer(clip, |renderer| {
                     let color = organism_tone_color(presentation.tone, self.theme);
                     let (border_opacity, fill_opacity) = organism_card_opacity(presentation.tone);
@@ -4027,12 +4145,6 @@ where
                         },
                         Background::Color(alpha(color, fill_opacity)),
                     );
-                    let toggle = Rectangle {
-                        x: scrollbar_track_left - 3.0 * cw,
-                        y: area.y,
-                        width: 2.0 * cw,
-                        height: ch.min(area.height),
-                    };
                     chrome_text(
                         renderer,
                         if rows == 1 { "▸" } else { "▾" },
@@ -4432,7 +4544,7 @@ where
         _tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if let Some(p) = cursor.position_over(layout.bounds()) {
@@ -4443,7 +4555,7 @@ where
             if before_scrollbar
                 && self.blocks.get(r).is_some_and(|block| {
                     block.collapsed_summary.is_some()
-                        || self.organism_toggle_at(p, layout.bounds())
+                        || self.organism_toggle_at(p, layout.bounds(), viewport)
                         || (block.selectable && (c < block.header_end_col || self.shift))
                 })
             {
