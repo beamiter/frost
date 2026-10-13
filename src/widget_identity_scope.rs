@@ -265,8 +265,83 @@ mod tests {
     }
 
     #[test]
+    fn wide_companion_reserves_glyph_and_toggle_beside_overflowing_status() {
+        use crate::{companion_compact_slot, companion_status_with_slot, Message};
+        for width in [640.0, 800.0, 1024.0] {
+            for height in [1.0, 8.0, 22.0] {
+                for available in [false, true] {
+                    for expanded in [false, true] {
+                        let status = iced::widget::row![
+                            Space::new().width(4000).height(22),
+                            Space::new().width(Length::Fill),
+                            Space::new().width(4000).height(22),
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Alignment::Center);
+                        let glyph = Space::new().width(64).height(22).into();
+                        let toggle = button(Space::new())
+                            .width(20)
+                            .height(22)
+                            .padding(0)
+                            .on_press_maybe(
+                                available.then_some(Message::SetOrganismExpanded(!expanded)),
+                            );
+                        let slot = companion_compact_slot(glyph, toggle.into()).into();
+                        let mut element: Element<'_, Message, iced::Theme, TestRenderer> =
+                            companion_status_with_slot(status.into(), slot, 12);
+                        let mut tree = Tree::new(element.as_widget());
+                        let viewport = Rectangle::with_size(Size::new(width - 20.0, height));
+                        let node = element.as_widget_mut().layout(
+                            &mut tree,
+                            &TestRenderer,
+                            &layout::Limits::new(Size::ZERO, viewport.size()),
+                        );
+                        let content = node.children()[0].bounds();
+                        let slot = Layout::new(&node).children().nth(1).unwrap();
+                        let slot_row = slot.children().next().unwrap();
+                        let glyph = slot_row.children().next().unwrap().bounds();
+                        let arrow = slot_row.children().nth(1).unwrap().bounds();
+                        assert_eq!(node.bounds().width, width - 20.0);
+                        assert_eq!(node.bounds().height, height);
+                        assert!(content.x + content.width <= slot.bounds().x);
+                        assert_eq!(slot.bounds().width, 84.0);
+                        assert_eq!(glyph.width, 64.0);
+                        assert_eq!(arrow.width, 20.0);
+                        assert_eq!(arrow.height, height);
+                        assert!(arrow.x + arrow.width <= width - 20.0);
+                        let mut messages = Vec::new();
+                        for _ in 0..2 {
+                            for event in [
+                                mouse::Event::ButtonPressed(mouse::Button::Left),
+                                mouse::Event::ButtonReleased(mouse::Button::Left),
+                            ] {
+                                let mut shell = Shell::new(&mut messages);
+                                element.as_widget_mut().update(
+                                    &mut tree,
+                                    &Event::Mouse(event),
+                                    Layout::new(&node),
+                                    mouse::Cursor::Available(arrow.center()),
+                                    &TestRenderer,
+                                    &mut iced::advanced::clipboard::Null,
+                                    &mut shell,
+                                    &viewport,
+                                );
+                                assert_eq!(shell.is_event_captured(), available);
+                            }
+                        }
+                        assert_eq!(messages.len(), if available { 2 } else { 0 });
+                        assert!(messages.iter().all(|message| matches!(message,
+                            Message::SetOrganismExpanded(next) if *next == !expanded
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn narrow_reopen_reserves_clickable_control_beside_overflowing_status() {
-        use crate::{companion_narrow_status, Message};
+        use crate::{companion_status_with_slot, Message};
         for width in [220.0, 359.99, 360.0, 639.99] {
             for available in [false, true] {
                 let status = Space::new().width(4000).height(22).into();
@@ -276,7 +351,7 @@ mod tests {
                     .padding(0)
                     .on_press_maybe(available.then_some(Message::SetOrganismExpanded(true)));
                 let mut element: Element<'_, Message, iced::Theme, TestRenderer> =
-                    companion_narrow_status(status, toggle.into());
+                    companion_status_with_slot(status, toggle.into(), 8);
                 let mut tree = Tree::new(element.as_widget());
                 let node = element.as_widget_mut().layout(
                     &mut tree,

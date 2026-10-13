@@ -213,14 +213,15 @@ fn companion_compact_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
     container(row![glyph, toggle].align_y(iced::Alignment::Center)).width(Length::Fixed(84.0))
 }
 
-/// Reserve the narrow reopen button before laying out crowded status content.
-/// Only the status content is clipped; the sibling control keeps its hit box.
-fn companion_narrow_status<'a, R: iced::advanced::renderer::Renderer + 'a>(
+/// Reserve companion chrome before laying out crowded status content.
+/// Only the status content is clipped; the sibling slot keeps its hit boxes.
+fn companion_status_with_slot<'a, R: iced::advanced::renderer::Renderer + 'a>(
     status: Element<'a, Message, iced::Theme, R>,
-    toggle: Element<'a, Message, iced::Theme, R>,
+    slot: Element<'a, Message, iced::Theme, R>,
+    spacing: u32,
 ) -> Element<'a, Message, iced::Theme, R> {
-    row![container(status).width(Length::Fill).clip(true), toggle]
-        .spacing(8)
+    row![container(status).width(Length::Fill).clip(true), slot]
+        .spacing(spacing)
         .align_y(iced::Alignment::Center)
         .width(Length::Fill)
         .into()
@@ -20848,6 +20849,7 @@ impl Frost {
             .clip(true)
             .padding([3.0, 8.0])
             .style(self.chrome_bar_style());
+        let mut compact_slot: Option<Element<'_, Message>> = None;
         if layout.glyph {
             // Keep a still presence in the same slot while live reactions pause.
             // Typing, focus and pane changes cannot move the status segments.
@@ -20918,21 +20920,26 @@ impl Frost {
                 slot
             };
             // Separate sibling of the greeting target; never an implicit hello.
-            right = right.push(companion_compact_slot(
-                slot,
-                self.companion_toggle(self.config.ascii_organism_expanded),
-            ));
+            compact_slot = Some(
+                companion_compact_slot(
+                    slot,
+                    self.companion_toggle(self.config.ascii_organism_expanded),
+                )
+                .into(),
+            );
         }
         let bar = row![left, Space::new().width(Length::Fill), right]
             .spacing(12)
             .align_y(iced::Alignment::Center);
-        let bar: Element<'_, Message> = if companion_narrow_reopen(
+        let bar: Element<'_, Message> = if let Some(slot) = compact_slot {
+            companion_status_with_slot(bar.into(), slot, 12)
+        } else if companion_narrow_reopen(
             self.win_size.width,
             self.config.ascii_organism_enabled,
             self.config.ascii_organism_expanded,
             self.config.bottom_bar,
         ) {
-            companion_narrow_status(bar.into(), self.companion_toggle(false))
+            companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)
         } else {
             bar.into()
         };
@@ -29903,20 +29910,25 @@ mod tests {
         assert!(bar.contains("text(\"volatile · no LLM\").size(10).color(self.c_text_dim())"));
         assert!(bar.contains("weight: iced::font::Weight::Bold"));
         assert!(bar.contains(".height(Length::Fixed(32.0))"));
-        assert!(bar.contains("companion_narrow_status(bar.into(), self.companion_toggle(false))"));
+        assert!(
+            bar.contains("companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)")
+        );
+        assert!(bar.contains("let mut compact_slot: Option<Element<'_, Message>> = None;"));
+        assert!(bar.contains("companion_status_with_slot(bar.into(), slot, 12)"));
+        assert!(!bar.contains("right = right.push(companion_compact_slot"));
         assert_eq!(
             bar.matches(".on_enter(Message::OrganismHoverEnter(")
                 .count(),
             1
         );
         let narrow = source
-            .split_once("fn companion_narrow_status<")
+            .split_once("fn companion_status_with_slot<")
             .unwrap()
             .1
             .split_once("/// The same native card geometry")
             .unwrap()
             .0;
-        assert!(narrow.contains("container(status).width(Length::Fill).clip(true), toggle"));
+        assert!(narrow.contains("container(status).width(Length::Fill).clip(true), slot"));
         for forbidden in [
             "OrganismHello",
             "OrganismHover",
