@@ -14211,6 +14211,7 @@ impl Frost {
                                     &completed.command,
                                     exit,
                                     completed.duration_ms,
+                                    completed.command_cwd.as_deref(),
                                 );
                             }
                             self.organism

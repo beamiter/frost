@@ -140,6 +140,8 @@ pub use jterm_core::organism_clock::WindowLife;
 
 struct SessionLife {
     native: NativeOrganism,
+    /// Volatile command-scoped cwd, bounded independently of terminal history.
+    work_context: Option<String>,
     ambient: AmbientMind,
     context: RenderContext,
     /// A command already running when enabled is deliberately not replayed.
@@ -155,6 +157,7 @@ impl SessionLife {
     fn new(id: usize, running: bool, now: Instant) -> Self {
         Self {
             native: NativeOrganism::from_persisted_state(LifeState::default()),
+            work_context: None,
             ambient: AmbientMind::seeded(id as u64),
             context: PreviewPose::Calm.context(),
             accept_completion: !running,
@@ -162,6 +165,16 @@ impl SessionLife {
             reaction_until: None,
             remote: true,
             next_remote_probe: now,
+        }
+    }
+
+    fn set_work_context(&mut self, cwd: Option<&str>) {
+        let bounded = cwd.filter(|cwd| !cwd.is_empty() && cwd.len() <= 2048);
+        if bounded.is_none() || bounded != self.work_context.as_deref() {
+            // Unknown locations cannot join two commands into one work loop.
+            // Clear only repo work/habituation, retaining continuous life.
+            self.native.restore_repo_context(0, false, 0, 0);
+            self.work_context = bounded.map(str::to_owned);
         }
     }
 }
@@ -375,8 +388,16 @@ impl Organism {
         command: &str,
         exit: Option<i32>,
         duration: Option<u64>,
+        command_cwd: Option<&str>,
     ) {
-        self.completed_at(id, command, exit, duration, self.born.elapsed());
+        self.completed_at(
+            id,
+            command,
+            exit,
+            duration,
+            command_cwd,
+            self.born.elapsed(),
+        );
     }
 
     fn completed_at(
@@ -385,6 +406,7 @@ impl Organism {
         command: &str,
         exit: Option<i32>,
         duration: Option<u64>,
+        command_cwd: Option<&str>,
         now: Duration,
     ) {
         self.watch.retire_owner(id);
@@ -404,6 +426,7 @@ impl Organism {
             return;
         }
         self.live_attention.cancel(&id);
+        life.set_work_context(command_cwd);
         life.native.sync_state(self.life.state());
         let reaction = life
             .native
@@ -2231,7 +2254,7 @@ mod tests {
             false,
         );
         assert_eq!(running.sprite, sprite_frame_with_context(context, 0));
-        organism.completed(1, "cargo test", Some(1), Some(20));
+        organism.completed(1, "cargo test", Some(1), Some(20), None);
         let facts = AttentionFacts::known_idle_for_test(true, true);
         let finished = organism.presentation_at_with_attention(
             1,
@@ -2323,13 +2346,13 @@ mod tests {
             assert_eq!(glyph, sticky_glyph_with_context(context, 0));
         }
         assert_eq!(values(organism.life.state()), values(before));
-        organism.completed(2, "cargo test", Some(0), Some(10));
+        organism.completed(2, "cargo test", Some(0), Some(10), None);
         assert_eq!(
             organism.watch.rhythm(1, Duration::from_secs(10)),
             WatchRhythm::Waiting
         );
         // Even a completion ignored by enable-time quarantine retires cadence.
-        organism.completed(1, "cargo test", Some(0), Some(10));
+        organism.completed(1, "cargo test", Some(0), Some(10), None);
         assert_eq!(
             organism.watch.rhythm(1, Duration::from_secs(10)),
             WatchRhythm::Steady
@@ -2396,7 +2419,7 @@ mod tests {
                 match event {
                     "remote" => organism.set_remote(target, true),
                     "forget" => organism.forget_session(target),
-                    "completed" => organism.completed(target, "cargo test", Some(0), Some(1)),
+                    "completed" => organism.completed(target, "cargo test", Some(0), Some(1), None),
                     _ => organism.batch_finished(target, true),
                 }
                 assert_eq!(
@@ -2808,7 +2831,7 @@ mod tests {
         organism.prime_session(3, false);
         organism.set_remote(3, false);
         organism.batch_finished(3, false);
-        organism.completed(3, "cargo test", None, Some(1));
+        organism.completed(3, "cargo test", None, Some(1), None);
         organism.tick(Some(3), false, false);
         assert_eq!(
             organism.sessions[&3].context.behavior,
@@ -2828,11 +2851,183 @@ mod tests {
     }
 
     #[test]
+    fn completed_commands_do_not_recover_another_working_directory() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        let mut organism = completion_fixture(&[1]);
+        for (cwd, exit) in [
+            ("/workspace/project-a", 101),
+            ("/workspace/project-a", 101),
+            ("/workspace/project-a", 101),
+            ("/workspace/project-b", 0),
+        ] {
+            terminal.process_batch(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07cargo test\r\n\x1b]133;C;cmdline_url=cargo%20test;cwd={cwd}\x07\x1b]133;D;{exit};duration_ms=100\x07"
+                )
+                .as_bytes(),
+            );
+            assert_eq!(
+                terminal.command_zones.back().unwrap().cwd.as_deref(),
+                Some(cwd)
+            );
+            let completed = terminal.take_completed_commands();
+            assert_eq!(completed.len(), 1);
+            let completed = &completed[0];
+            organism.completed(
+                1,
+                &completed.command,
+                completed.exit_code,
+                completed.duration_ms,
+                completed.command_cwd.as_deref(),
+            );
+            organism.batch_finished(1, terminal.is_command_running());
+        }
+        assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+        assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+    }
+
+    fn fail_builds(organism: &mut Organism, id: usize, cwd: Option<&str>) {
+        for _ in 0..3 {
+            organism.completed(id, "cargo test", Some(101), Some(100), cwd);
+        }
+    }
+
+    #[test]
+    fn same_command_cwd_keeps_real_recovery_across_running_directory_changes() {
+        let mut organism = completion_fixture(&[1]);
+        fail_builds(&mut organism, 1, Some("/source"));
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        terminal.process_batch(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test\r\n\x1b]133;C;cwd=/source\x07",
+        );
+        terminal.process_batch(
+            b"\x1b]7;file://localhost/destination\x07\x1b]133;D;0;cwd=/destination\x07",
+        );
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        let completed = &completed[0];
+        organism.completed(
+            1,
+            &completed.command,
+            completed.exit_code,
+            completed.duration_ms,
+            completed.command_cwd.as_deref(),
+        );
+        assert_eq!(
+            organism.sessions[&1].context.behavior,
+            Behavior::CelebrateBig
+        );
+        assert_eq!(
+            organism.sessions[&1].native.repo_vigil(),
+            RepoVigil::Recovery
+        );
+    }
+
+    #[test]
+    fn unknown_or_oversized_command_cwd_cannot_join_build_work_loops() {
+        let oversized = format!("/{}", "x".repeat(2048));
+        for cwd in [None, Some(""), Some(oversized.as_str())] {
+            let mut organism = completion_fixture(&[1]);
+            fail_builds(&mut organism, 1, Some("/known"));
+            organism.completed(1, "cargo test", Some(0), Some(100), cwd);
+            assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+            assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+            assert!(organism.sessions[&1].work_context.is_none());
+            fail_builds(&mut organism, 1, cwd);
+            organism.completed(1, "cargo test", Some(0), Some(100), cwd);
+            assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+            assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+        }
+        let boundary = format!("/{}", "x".repeat(2047));
+        let mut organism = completion_fixture(&[1]);
+        fail_builds(&mut organism, 1, Some(&boundary));
+        organism.completed(1, "cargo test", Some(0), Some(100), Some(&boundary));
+        assert_eq!(
+            organism.sessions[&1].context.behavior,
+            Behavior::CelebrateBig
+        );
+    }
+
+    #[test]
+    fn work_context_reset_keeps_continuous_life_and_other_sessions_work() {
+        let mut organism = completion_fixture(&[1, 2]);
+        fail_builds(&mut organism, 1, Some("/first"));
+        fail_builds(&mut organism, 2, Some("/second"));
+        let before_window = values(organism.life.state());
+        let life = organism.sessions.get_mut(&1).unwrap();
+        let before_native = values(life.native.state());
+        life.set_work_context(Some("/third"));
+        assert_eq!(values(life.native.state()), before_native);
+        assert_eq!(values(organism.life.state()), before_window);
+        assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+        organism.completed(2, "cargo test", Some(0), Some(100), Some("/second"));
+        assert_eq!(
+            organism.sessions[&2].context.behavior,
+            Behavior::CelebrateBig
+        );
+    }
+
+    #[test]
+    fn ignored_completions_cannot_select_work_context_or_replay_recovery() {
+        let mut organism = Organism::default();
+        organism.completed(1, "cargo test", Some(101), None, Some("/old"));
+        assert!(organism.sessions.is_empty());
+        organism.set_enabled(true);
+        organism.prime_session(1, true);
+        organism.set_remote(1, false);
+        fail_builds(&mut organism, 1, Some("/old"));
+        assert!(organism.sessions[&1].work_context.is_none());
+        organism.batch_finished(1, true);
+        // The command that was running when enabled is still inadmissible.
+        organism.completed(1, "cargo test", Some(101), None, Some("/old"));
+        assert!(organism.sessions[&1].work_context.is_none());
+        organism.batch_finished(1, false);
+        organism.completed(1, "cargo test", Some(0), None, Some("/new"));
+        assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+        organism.set_enabled(false);
+        fail_builds(&mut organism, 1, Some("/old"));
+        assert!(organism.sessions.is_empty());
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        organism.batch_finished(1, false);
+        organism.completed(1, "cargo test", Some(0), None, Some("/old"));
+        assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+        assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+    }
+
+    #[test]
+    fn context_changes_keep_long_command_quiet_nod_and_shared_life_rewards() {
+        let mut organism = completion_fixture(&[1]);
+        fail_builds(&mut organism, 1, Some("/old"));
+        let mut expected = NativeOrganism::from_persisted_state(organism.life.state());
+        let reaction =
+            expected.command_finished(classify_command("sleep 60"), Some(0), Some(60_000));
+        assert_eq!(reaction.tone, Tone::Quiet);
+        assert!(reaction.speech.is_none());
+        organism.completed_at(
+            1,
+            "sleep 60",
+            Some(0),
+            Some(60_000),
+            Some("/new"),
+            Duration::ZERO,
+        );
+        assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+        assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+        assert_eq!(values(organism.life.state()), values(expected.state()));
+        assert_eq!(
+            organism.reaction_deadline_at(1, Duration::ZERO),
+            Some(organism.born + reaction.hold_duration())
+        );
+    }
+
+    #[test]
     fn sustained_completion_expires_at_exact_shared_hold_without_waiting_for_heartbeat() {
         let mut organism = completion_fixture(&[1]);
         let completed_at = Duration::from_secs(1);
         let expires_at = Duration::from_millis(2800);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), completed_at);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, completed_at);
         assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
         let deadline = organism.born + expires_at;
         let before = values(organism.life.state());
@@ -2871,14 +3066,14 @@ mod tests {
     #[test]
     fn newer_completion_replaces_deadline_and_old_wake_cannot_retire_it() {
         let mut organism = completion_fixture(&[1]);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         let first_expiry = Duration::from_millis(1800);
         assert_eq!(
             organism.reaction_deadline_at(1, Duration::ZERO),
             Some(organism.born + first_expiry)
         );
         let next_completion = Duration::from_millis(500);
-        organism.completed_at(1, "cargo test", Some(1), Some(100), next_completion);
+        organism.completed_at(1, "cargo test", Some(1), Some(100), None, next_completion);
         let next_expiry = Duration::from_millis(5500);
         assert_eq!(
             organism.sessions[&1].context.behavior,
@@ -2908,7 +3103,7 @@ mod tests {
     fn expired_background_completion_does_not_flash_when_owner_returns_before_tick() {
         let mut organism = completion_fixture(&[1, 2]);
         organism.owner_changed(None, Some(1));
-        organism.completed_at(2, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(2, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         let returned_at = Duration::from_secs(3);
         organism.tick_at(Some(1), false, false, returned_at);
         assert_eq!(organism.sessions[&2].context.behavior, Behavior::Celebrate);
@@ -2944,7 +3139,7 @@ mod tests {
     #[test]
     fn new_running_command_overrides_completion_before_and_after_expiry() {
         let mut organism = completion_fixture(&[1]);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         let before = values(organism.life.state());
         for now in [Duration::from_millis(500), Duration::from_millis(1800)] {
             for motion in [None, Some(Motion::Calm), Some(Motion::Static)] {
@@ -2983,7 +3178,7 @@ mod tests {
         let mut organism = completion_fixture(&[1, 2]);
         assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
         assert_eq!(organism.reaction_deadline_at(99, Duration::ZERO), None);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         assert!(organism.reaction_deadline_at(1, Duration::ZERO).is_some());
         assert_eq!(organism.reaction_deadline_at(2, Duration::ZERO), None);
         organism.set_remote(1, true);
@@ -2991,7 +3186,7 @@ mod tests {
         organism.set_remote(1, false);
         organism.set_enabled(false);
         assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         assert!(organism.sessions.is_empty());
         organism.set_enabled(true);
         organism.prime_session(1, false);
@@ -3002,14 +3197,14 @@ mod tests {
             Behavior::Idle
         );
         // The initial batch remains quarantined after re-enabling.
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
         assert_eq!(
             organism.base_context_at(1, Duration::ZERO).behavior,
             Behavior::Idle
         );
         organism.batch_finished(1, false);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         assert!(organism.reaction_deadline_at(1, Duration::ZERO).is_some());
         organism.forget_session(1);
         assert_eq!(organism.reaction_deadline_at(1, Duration::ZERO), None);
@@ -3025,7 +3220,7 @@ mod tests {
     #[test]
     fn sustained_completion_reduced_motion_uses_one_fixed_fitting_frame() {
         let mut organism = completion_fixture(&[1]);
-        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), Duration::ZERO);
+        organism.completed_at(1, "sleep 60", Some(0), Some(60_000), None, Duration::ZERO);
         let context = organism.sessions[&1].context;
         assert_eq!(context.behavior, Behavior::Celebrate);
         for motion in [None, Some(Motion::Calm), Some(Motion::Static)] {
@@ -3078,15 +3273,15 @@ mod tests {
         organism.prime_session(7, true);
         organism.set_remote(7, false);
         organism.batch_finished(7, true);
-        organism.completed(7, "cargo test", Some(0), Some(100));
+        organism.completed(7, "cargo test", Some(0), Some(100), None);
         assert_eq!(organism.sessions[&7].context.behavior, Behavior::Idle);
-        organism.completed(7, "cargo test", None, Some(100));
+        organism.completed(7, "cargo test", None, Some(100), None);
         assert_eq!(
             organism.sessions[&7].context.behavior,
             Behavior::UnknownOutcome
         );
         organism.set_enabled(false);
-        organism.completed(7, "cargo test", Some(0), None);
+        organism.completed(7, "cargo test", Some(0), None, None);
         assert!(organism.sessions.is_empty());
     }
 
@@ -3098,7 +3293,7 @@ mod tests {
         organism.set_remote(11, false);
         organism.batch_finished(11, false);
         organism.forget_session(11);
-        organism.completed(11, "cargo test", Some(0), Some(1));
+        organism.completed(11, "cargo test", Some(0), Some(1), None);
         assert!(organism.sessions.is_empty());
     }
 
@@ -3108,11 +3303,11 @@ mod tests {
         organism.set_enabled(true);
         organism.prime_session(9, false);
         organism.set_remote(9, false);
-        organism.completed(9, "cargo test", Some(0), Some(100));
-        organism.completed(9, "cargo test", Some(1), Some(100));
+        organism.completed(9, "cargo test", Some(0), Some(100), None);
+        organism.completed(9, "cargo test", Some(1), Some(100), None);
         assert_eq!(organism.sessions[&9].context.behavior, Behavior::Idle);
         organism.batch_finished(9, false);
-        organism.completed(9, "cargo test", None, Some(100));
+        organism.completed(9, "cargo test", None, Some(100), None);
         assert_eq!(
             organism.sessions[&9].context.behavior,
             Behavior::UnknownOutcome

@@ -1878,6 +1878,7 @@ mod tests {
     ) -> CompletedCommand {
         CompletedCommand {
             command: command.to_string(),
+            command_cwd: None,
             exit_code: Some(exit),
             output: output.to_string(),
             id: None,

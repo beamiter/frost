@@ -3184,6 +3184,7 @@ pub struct StartLifecycle {
 struct CompletedCommandMetadata {
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
+    command_cwd: Option<String>,
     execution_id: Option<String>,
     /// The Start identity captured at `C`, when the shell supplied a complete
     /// one. Never assembled at `D`.
@@ -3571,6 +3572,9 @@ pub struct TerminalState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedCommand {
     pub command: String,
+    /// Working directory observed during this command's A/B/C lifecycle.
+    /// Never filled from D's destination or the current directory at finish.
+    pub command_cwd: Option<String>,
     pub exit_code: Option<i32>,
     pub output: String,
     /// jsh correlation id from an OSC 133 `id=`/`execution_id=` param.
@@ -4915,7 +4919,7 @@ impl TerminalState {
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
                     }
-                    if metadata_cwd.is_some() {
+                    if seen_cwd {
                         self.current_command_cwd = metadata_cwd;
                     }
                     let typeahead = std::mem::take(&mut self.pending_prompt_typeahead);
@@ -4984,7 +4988,9 @@ impl TerminalState {
                     if mark_id.is_some() {
                         self.current_command_id.clone_from(&mark_id);
                     }
-                    if metadata_cwd.is_some() {
+                    // An explicit but invalid cwd invalidates the earlier
+                    // prompt observation; it cannot retain another location.
+                    if seen_cwd {
                         self.current_command_cwd = metadata_cwd;
                     }
                     let matching_generation = self
@@ -5120,9 +5126,9 @@ impl TerminalState {
                 // Markdown export and the agent prompt. So D may only FILL an
                 // empty slot, for a shell that reports cwd on D but not on C;
                 // it may never replace one. ember and forge both guard this.
-                let cwd = self
-                    .current_command_cwd
-                    .take()
+                let command_cwd = self.current_command_cwd.take();
+                let cwd = command_cwd
+                    .clone()
                     .or(metadata_cwd)
                     .or_else(|| self.control_free_osc7_cwd());
                 let output_start_col = self.current_output_start_col.unwrap_or(0);
@@ -5169,6 +5175,7 @@ impl TerminalState {
                     CompletedCommandMetadata {
                         exit_code,
                         duration_ms,
+                        command_cwd,
                         execution_id: finished_id,
                         lifecycle: start_lifecycle,
                         agent_generation,
@@ -5560,10 +5567,8 @@ impl TerminalState {
         else {
             return;
         };
-        let cwd = self
-            .current_command_cwd
-            .take()
-            .or_else(|| self.control_free_osc7_cwd());
+        let command_cwd = self.current_command_cwd.take();
+        let cwd = command_cwd.clone().or_else(|| self.control_free_osc7_cwd());
         let output_start_col = self.current_output_start_col.unwrap_or(0);
         let output_end = self.live_output_end_row(boundary_row);
         let provenance = self.bind_live_output_provenance(
@@ -5606,6 +5611,7 @@ impl TerminalState {
             CompletedCommandMetadata {
                 exit_code: None,
                 duration_ms: None,
+                command_cwd,
                 execution_id,
                 // The shell never reported `D`, so nothing here corresponds to
                 // a journal Finish. Publishing durable output against the
@@ -6477,6 +6483,7 @@ impl TerminalState {
         let total_bytes = output.len();
         self.pending_completed_commands.push_back(CompletedCommand {
             command,
+            command_cwd: metadata.command_cwd,
             exit_code: metadata.exit_code,
             output,
             id: metadata.execution_id,
@@ -6501,6 +6508,7 @@ impl TerminalState {
         }
         self.pending_completed_commands.push_back(CompletedCommand {
             command,
+            command_cwd: None,
             exit_code: None,
             output: String::new(),
             id: execution_id.clone(),
@@ -14394,6 +14402,12 @@ mod tests {
             Some("/home/u/proj"),
             "the block must name the directory the command RAN in"
         );
+        assert_eq!(
+            changed_directory.take_completed_commands()[0]
+                .command_cwd
+                .as_deref(),
+            Some("/home/u/proj")
+        );
 
         // A shell that reports its cwd only on `D` still gets one: this is
         // fill-only, not a refusal.
@@ -14401,6 +14415,66 @@ mod tests {
         d_only.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n\x1b]133;C\x07");
         d_only.process_input(b"\x1b]133;D;0;cwd_url=%2Ftmp\x07");
         assert_eq!(d_only.command_zones[0].cwd.as_deref(), Some("/tmp"));
+        assert_eq!(d_only.take_completed_commands()[0].command_cwd, None);
+    }
+
+    #[test]
+    fn completion_command_cwd_is_frozen_before_running_directory_changes() {
+        for finish in ["\x1b]133;D;0;cwd=/destination\x07", "\x1b]133;A\x07"] {
+            let mut terminal = super::TerminalState::new(80, 24);
+            terminal.process_batch(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test\r\n\x1b]133;C;cwd=/source\x07",
+            );
+            terminal.process_batch(b"\x1b]7;file://localhost/destination\x07");
+            terminal.process_batch(finish.as_bytes());
+            let completed = terminal.take_completed_commands();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].command_cwd.as_deref(), Some("/source"));
+            assert!(terminal.take_completed_commands().is_empty());
+        }
+    }
+
+    #[test]
+    fn completion_command_cwd_never_guesses_from_current_directory() {
+        let mut terminal = super::TerminalState::new(80, 24);
+        terminal.process_batch(b"\x1b]7;file://localhost/current\x07\x1b]133;A\x07$ \x1b]133;B\x07cargo test\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(terminal.command_zones[0].cwd.as_deref(), Some("/current"));
+        assert_eq!(terminal.take_completed_commands()[0].command_cwd, None);
+    }
+
+    #[test]
+    fn coalesced_completions_keep_each_commands_own_cwd() {
+        let mut terminal = super::TerminalState::new(80, 24);
+        terminal.process_batch(b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test\r\n\x1b]133;C;cwd=/first\x07\x1b]133;D;1;cwd=/destination\x07\x1b]133;A\x07$ \x1b]133;B\x07cargo test\r\n\x1b]133;C;cwd=/second\x07\x1b]133;D;0\x07");
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].command_cwd.as_deref(), Some("/first"));
+        assert_eq!(completed[1].command_cwd.as_deref(), Some("/second"));
+    }
+
+    #[test]
+    fn invalid_later_command_cwd_retires_earlier_prompt_location() {
+        for invalid in [
+            "cwd=".to_owned(),
+            "cwd=/first;cwd=/second".to_owned(),
+            format!("cwd=/{}", "x".repeat(4096)),
+        ] {
+            for mark in ["B", "C"] {
+                let mut terminal = super::TerminalState::new(80, 24);
+                terminal.process_batch(b"\x1b]133;A;cwd=/previous\x07$ ");
+                if mark == "B" {
+                    terminal.process_batch(
+                        format!("\x1b]133;B;{invalid}\x07cargo test\r\n\x1b]133;C\x07").as_bytes(),
+                    );
+                } else {
+                    terminal.process_batch(
+                        format!("\x1b]133;B\x07cargo test\r\n\x1b]133;C;{invalid}\x07").as_bytes(),
+                    );
+                }
+                terminal.process_batch(b"\x1b]133;D;0;cwd=/destination\x07");
+                assert_eq!(terminal.take_completed_commands()[0].command_cwd, None);
+            }
+        }
     }
 
     /// All four command spellings name the same slot and all four are
@@ -14742,6 +14816,7 @@ mod tests {
         let metadata = || super::CompletedCommandMetadata {
             exit_code: Some(0),
             duration_ms: None,
+            command_cwd: None,
             execution_id: None,
             lifecycle: None,
             agent_generation: None,
