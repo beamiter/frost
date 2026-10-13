@@ -2595,12 +2595,21 @@ mod tests {
             false,
             CircadianPhase::Unlearned,
         );
-        assert!(life.state().energy > before_rest.energy);
-        assert!(life.state().stress < before.stress);
-        life.note_output(Duration::from_secs(60));
-        let before_work = life.state().energy;
+        // Exactly reaching the quiet threshold does not credit earlier time as rest.
+        assert!((life.state().energy - before_rest.energy + 0.002).abs() < 0.000001);
+        let at_threshold = life.state().energy;
         life.advance(
             Duration::from_secs(61),
+            true,
+            false,
+            CircadianPhase::Unlearned,
+        );
+        assert!((life.state().energy - at_threshold - 0.030).abs() < 0.000001);
+        assert!(life.state().stress < before.stress);
+        life.note_output(Duration::from_secs(61));
+        let before_work = life.state().energy;
+        life.advance(
+            Duration::from_secs(62),
             true,
             false,
             CircadianPhase::Unlearned,
