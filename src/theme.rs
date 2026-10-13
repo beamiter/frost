@@ -110,6 +110,63 @@ pub(crate) fn apply_custom_theme_deletion<E>(
     }
 }
 
+/// Conservative popup bounds for configured-font rows with 4px vertical
+/// button padding, 2px row spacing and 8px panel padding. Overflow scrolls.
+pub(crate) fn popup_menu_size(font_size: f32, rows: usize, available: iced::Size) -> iced::Size {
+    let font_size = crate::config::Config::clamp_font_size(font_size);
+    let width = (240.0 * (font_size / 14.0).max(1.0)).min(available.width.max(1.0));
+    let line_height = font_size * 1.3;
+    let height =
+        (line_height + 18.0 + rows as f32 * (line_height + 10.0)).min(available.height.max(1.0));
+    iced::Size::new(width, height)
+}
+
+/// Input fields in semantic popups use the same effective UI palette.
+pub(crate) fn popup_input_style(
+    theme: &Theme,
+    status: iced::widget::text_input::Status,
+) -> iced::widget::text_input::Style {
+    use iced::widget::text_input::Status;
+    let text = Theme::rgb_to_color32(theme.ui.text);
+    let dim = Theme::rgb_to_color32(theme.ui.text_disabled);
+    let accent = Theme::rgb_to_color32(theme.tabbar.active_border);
+    iced::widget::text_input::Style {
+        background: Theme::rgb_to_color32(theme.ui.panel_bg).into(),
+        border: iced::Border {
+            color: if matches!(status, Status::Focused { .. } | Status::Hovered) {
+                accent
+            } else {
+                Theme::rgb_to_color32(theme.ui.border)
+            },
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        icon: dim,
+        placeholder: dim,
+        value: if status == Status::Disabled {
+            dim
+        } else {
+            text
+        },
+        selection: Color { a: 0.35, ..accent },
+    }
+}
+
+/// Context menus stay readable independently of terminal transparency.
+/// Use the UI palette so custom and light themes update open popups too.
+pub(crate) fn popup_style(theme: &Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        text_color: Some(Theme::rgb_to_color32(theme.ui.text)),
+        background: Some(Theme::rgb_to_color32(theme.ui.panel_bg).into()),
+        border: iced::Border {
+            color: Theme::rgb_to_color32(theme.ui.border),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 /// iced color views over the shared RGB theme data.
 pub trait ThemeExt {
     fn rgb_to_color32(rgb: [u8; 3]) -> Color;
@@ -190,6 +247,89 @@ mod tests {
         MAX_CUSTOM_THEME_NAME_BYTES, MAX_THEME_EDITOR_ERROR_BYTES,
     };
     use iced::Color;
+
+    #[test]
+    fn popup_input_uses_ui_text_background_and_focus_colors() {
+        use iced::widget::text_input::Status;
+        let mut theme = Theme::builtin_light();
+        theme.ui.panel_bg = [21, 43, 65];
+        theme.ui.text = [211, 233, 255];
+        theme.ui.text_disabled = [123, 145, 167];
+        theme.ui.border = [54, 76, 98];
+        theme.tabbar.active_border = [190, 130, 70];
+        for status in [
+            Status::Active,
+            Status::Hovered,
+            Status::Focused { is_hovered: false },
+            Status::Focused { is_hovered: true },
+            Status::Disabled,
+        ] {
+            let style = super::popup_input_style(&theme, status);
+            assert_eq!(
+                style.background,
+                Theme::rgb_to_color32(theme.ui.panel_bg).into()
+            );
+            assert_eq!(
+                style.placeholder,
+                Theme::rgb_to_color32(theme.ui.text_disabled)
+            );
+            assert_eq!(
+                style.value,
+                Theme::rgb_to_color32(if status == Status::Disabled {
+                    theme.ui.text_disabled
+                } else {
+                    theme.ui.text
+                })
+            );
+            let focused = matches!(status, Status::Hovered | Status::Focused { .. });
+            assert_eq!(
+                style.border.color,
+                Theme::rgb_to_color32(if focused {
+                    theme.tabbar.active_border
+                } else {
+                    theme.ui.border
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn popup_bounds_follow_font_size_and_scroll_inside_small_windows() {
+        let available = iced::Size::new(800.0, 600.0);
+        let normal = super::popup_menu_size(14.0, 8, available);
+        let large = super::popup_menu_size(28.0, 8, available);
+        assert!(large.width > normal.width);
+        assert!(large.height > normal.height);
+        assert!(large.height <= available.height);
+        let small = iced::Size::new(180.0, 140.0);
+        let bounded = super::popup_menu_size(72.0, 100, small);
+        assert_eq!(bounded, small);
+    }
+
+    #[test]
+    fn popup_palette_follows_live_dark_light_and_custom_ui_colors_opaquely() {
+        let mut custom = Theme::builtin_light();
+        custom.ui.panel_bg = [31, 57, 83];
+        custom.ui.text = [213, 225, 237];
+        custom.ui.border = [101, 123, 145];
+        // Rebuilding against each effective theme models switching while a
+        // popup is open; terminal colors must not substitute for UI colors.
+        for theme in [Theme::default(), Theme::builtin_light(), custom] {
+            let style = super::popup_style(&theme);
+            assert_eq!(
+                style.background,
+                Some(Theme::rgb_to_color32(theme.ui.panel_bg).into())
+            );
+            assert_eq!(style.text_color, Some(Theme::rgb_to_color32(theme.ui.text)));
+            assert_eq!(style.border.color, Theme::rgb_to_color32(theme.ui.border));
+            assert_eq!(style.border.width, 1.0);
+            assert_eq!(style.text_color.unwrap().a, 1.0);
+            let Some(iced::Background::Color(background)) = style.background else {
+                panic!("solid popup background");
+            };
+            assert_eq!(background.a, 1.0);
+        }
+    }
 
     #[test]
     fn rgba_converts_with_alpha_scale() {

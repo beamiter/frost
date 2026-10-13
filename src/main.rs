@@ -17865,6 +17865,36 @@ impl Frost {
     }
 
     // --- Theme-derived chrome colors and styles ---------------------------
+    fn popup_style(&self) -> impl Fn(&iced::Theme) -> container::Style {
+        let style = theme::popup_style(&self.theme);
+        move |_| style
+    }
+
+    fn popup_input_style(&self) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
+        let active = theme::popup_input_style(&self.theme, text_input::Status::Active);
+        let hovered = theme::popup_input_style(&self.theme, text_input::Status::Hovered);
+        let focused = theme::popup_input_style(
+            &self.theme,
+            text_input::Status::Focused { is_hovered: false },
+        );
+        let disabled = theme::popup_input_style(&self.theme, text_input::Status::Disabled);
+        move |_, status| match status {
+            text_input::Status::Active => active,
+            text_input::Status::Hovered => hovered,
+            text_input::Status::Focused { .. } => focused,
+            text_input::Status::Disabled => disabled,
+        }
+    }
+
+    fn popup_text<'a>(
+        &self,
+        content: impl iced::widget::text::IntoFragment<'a>,
+    ) -> iced::widget::Text<'a> {
+        text(content)
+            .font(self.mono)
+            .size(self.effective_font_size())
+    }
+
     fn c_panel(&self) -> Color {
         Theme::rgb_to_color32(self.theme.ui.panel_bg)
     }
@@ -18307,7 +18337,7 @@ impl Frost {
             label
         };
         let row_btn = |t: &str, msg: Message| -> Element<'_, Message> {
-            button(text(t.to_string()).size(13))
+            button(self.popup_text(t.to_string()))
                 .on_press(msg)
                 .padding([4, 10])
                 .width(Length::Fill)
@@ -18321,17 +18351,23 @@ impl Frost {
         let marked_count = self.tabs.iter().filter(|tab| tab.marked).count();
         let is_marked = self.tabs.get(i).is_some_and(|tab| tab.marked);
 
-        let mut menu = column![text(label).size(12).style(text::secondary)].spacing(2);
+        let mut menu = column![self
+            .popup_text(label)
+            .size(self.effective_font_size())
+            .color(self.c_text_dim())]
+        .spacing(2);
 
         // Renaming replaces the item list with an inline editor so the menu
         // stays one panel; Enter commits, Esc backs out to the items.
         if let Some((_, draft)) = self.tab_rename.as_ref().filter(|(target, _)| *target == id) {
             menu = menu.push(
                 text_input("Tab name (empty = follow shell)", draft)
+                    .style(self.popup_input_style())
                     .id(TAB_RENAME_INPUT_ID.clone())
                     .on_input(Message::TabRenameInput)
                     .on_submit(Message::TabRenameSubmit)
-                    .size(13),
+                    .font(self.mono)
+                    .size(self.effective_font_size()),
             );
             menu = menu.push(row_btn("Rename", Message::TabRenameSubmit));
             menu = menu.push(row_btn("Cancel", Message::TabMenuClose));
@@ -18433,27 +18469,31 @@ impl Frost {
         menu: iced::widget::Column<'a, Message>,
         rows: usize,
     ) -> Element<'a, Message> {
-        const PANEL_W: f32 = 240.0;
-        const ROW_H: f32 = 27.0;
-        /// Header line + the panel's own vertical padding.
-        const PANEL_CHROME_H: f32 = 40.0;
         const EDGE_GAP: f32 = 4.0;
-
-        let panel_h = PANEL_CHROME_H + rows as f32 * ROW_H;
-        // Keep the whole panel on screen. `max(EDGE_GAP)` runs last so a window
-        // too small to hold the panel still shows its top-left corner rather
-        // than pushing it off past the left/top edge.
-        let x = (self.tab_menu_at.x)
-            .min(self.win_size.width - PANEL_W - EDGE_GAP)
+        let size = theme::popup_menu_size(
+            self.effective_font_size(),
+            rows,
+            iced::Size::new(
+                (self.win_size.width - EDGE_GAP * 2.0).max(1.0),
+                (self.win_size.height - TAB_BAR_H - EDGE_GAP * 2.0).max(1.0),
+            ),
+        );
+        let x = self
+            .tab_menu_at
+            .x
+            .min(self.win_size.width - size.width - EDGE_GAP)
             .max(EDGE_GAP);
-        let y = (self.tab_menu_at.y)
-            .min(self.win_size.height - panel_h - EDGE_GAP)
-            .max(TAB_BAR_H);
+        let y = self
+            .tab_menu_at
+            .y
+            .min(self.win_size.height - size.height - EDGE_GAP)
+            .max(TAB_BAR_H + EDGE_GAP);
 
-        let panel = container(menu)
-            .width(Length::Fixed(PANEL_W))
+        let panel = container(scrollable(menu).height(Length::Shrink))
+            .width(Length::Fixed(size.width))
+            .max_height(size.height)
             .padding(8)
-            .style(container::dark);
+            .style(self.popup_style());
 
         // Dismiss-on-outside-click sheet behind the panel.
         let dismiss = mouse_area(
@@ -18481,7 +18521,11 @@ impl Frost {
         } else {
             crate::sidebar::bound_sidebar_path_label(&state.path)
         };
-        let mut menu = column![text(header).size(12).style(text::secondary)].spacing(2);
+        let mut menu = column![self
+            .popup_text(header)
+            .size(self.effective_font_size())
+            .color(self.c_text_dim())]
+        .spacing(2);
         let paste_clip = self.sidebar_clipboard.as_ref();
         let paste_label = match paste_clip {
             Some(clip) => {
@@ -18514,7 +18558,7 @@ impl Frost {
             };
             let focused = index == state.cursor;
             let row: Element<'_, Message> = if enabled {
-                let mut btn = button(text(label).size(13))
+                let mut btn = button(self.popup_text(label))
                     .on_press(Message::SidebarMenuAction(action))
                     .padding([4, 10])
                     .width(Length::Fill);
@@ -18525,7 +18569,7 @@ impl Frost {
                 };
                 btn.into()
             } else {
-                button(text(label).size(13).style(text::secondary))
+                button(self.popup_text(label).color(self.c_text_dim()))
                     .padding([4, 10])
                     .width(Length::Fill)
                     .style(self.ghost_btn_style())
@@ -18534,23 +18578,31 @@ impl Frost {
             menu = menu.push(row);
         }
 
-        const PANEL_W: f32 = 220.0;
-        const ROW_H: f32 = 27.0;
-        /// Header line + the panel's own vertical padding.
-        const PANEL_CHROME_H: f32 = 40.0;
         const EDGE_GAP: f32 = 4.0;
-        let action_rows = 9.0 + if multi == 1 && state.is_dir { 1.0 } else { 0.0 };
-        let panel_h = PANEL_CHROME_H + action_rows * ROW_H;
-        let x = (state.at.x)
-            .min(self.win_size.width - PANEL_W - EDGE_GAP)
+        let action_rows = 9 + usize::from(multi == 1 && state.is_dir);
+        let size = theme::popup_menu_size(
+            self.effective_font_size(),
+            action_rows,
+            iced::Size::new(
+                (self.win_size.width - EDGE_GAP * 2.0).max(1.0),
+                (self.win_size.height - TAB_BAR_H - EDGE_GAP * 2.0).max(1.0),
+            ),
+        );
+        let x = state
+            .at
+            .x
+            .min(self.win_size.width - size.width - EDGE_GAP)
             .max(EDGE_GAP);
-        let y = (state.at.y)
-            .min(self.win_size.height - panel_h - EDGE_GAP)
-            .max(TAB_BAR_H);
-        let panel = container(menu)
-            .width(Length::Fixed(PANEL_W))
+        let y = state
+            .at
+            .y
+            .min(self.win_size.height - size.height - EDGE_GAP)
+            .max(TAB_BAR_H + EDGE_GAP);
+        let panel = container(scrollable(menu).height(Length::Shrink))
+            .width(Length::Fixed(size.width))
+            .max_height(size.height)
             .padding(8)
-            .style(container::dark);
+            .style(self.popup_style());
         // Dismiss-on-outside-click sheet behind the panel.
         let dismiss = mouse_area(
             container(Space::new())
@@ -18575,45 +18627,50 @@ impl Frost {
             SidebarDialogKind::Rename => ("Rename", "new name", "Rename"),
         };
         let mut body = column![
-            text(title).size(14),
-            text(crate::sidebar::bound_sidebar_notice(
+            self.popup_text(title).size(self.effective_font_size()),
+            self.popup_text(crate::sidebar::bound_sidebar_notice(
                 state.path.display().to_string(),
             ))
-            .size(11)
+            .size(self.effective_font_size())
             .wrapping(text::Wrapping::Word)
-            .style(text::secondary),
+            .color(self.c_text_dim()),
             text_input(placeholder, &state.input)
+                .font(self.mono)
+                .style(self.popup_input_style())
                 .id(SIDEBAR_DIALOG_INPUT_ID.clone())
                 .on_input(Message::SidebarDialogInput)
                 .on_submit(Message::SidebarDialogSubmit)
-                .size(13),
+                .size(self.effective_font_size()),
         ]
         .spacing(8);
         if let Some(error) = &state.error {
             body = body.push(
-                text(crate::sidebar::bound_sidebar_notice(error))
-                    .size(11)
+                self.popup_text(crate::sidebar::bound_sidebar_notice(error))
+                    .size(self.effective_font_size())
                     .style(text::danger),
             );
         }
         body = body.push(
             row![
-                button(text("Cancel").size(13))
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
                     .on_press(Message::SidebarDialogCancel)
                     .padding([4, 12])
                     .style(self.ghost_btn_style()),
                 Space::new().width(Length::Fill),
-                button(text(confirm).size(13))
+                button(self.popup_text(confirm).size(self.effective_font_size()))
                     .on_press(Message::SidebarDialogSubmit)
                     .padding([4, 12]),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
         );
-        let panel = container(body)
-            .width(Length::Fixed(360.0))
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(
+                (self.win_size.width - 16.0).clamp(1.0, 360.0),
+            ))
             .padding(14)
-            .style(container::dark);
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -18636,36 +18693,38 @@ impl Frost {
         } else {
             format!("Delete {count} items permanently?")
         };
-        let mut body = column![text(title).size(14)].spacing(10);
+        let mut body = column![self.popup_text(title).size(self.effective_font_size())].spacing(10);
         for path in paths.iter().take(5) {
             body = body.push(
-                text(crate::sidebar::bound_sidebar_path_label(path))
-                    .size(12)
+                self.popup_text(crate::sidebar::bound_sidebar_path_label(path))
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
-                    .style(text::secondary),
+                    .color(self.c_text_dim()),
             );
         }
         if count > 5 {
             body = body.push(
-                text(format!("…and {} more", count - 5))
-                    .size(12)
-                    .style(text::secondary),
+                self.popup_text(format!("…and {} more", count - 5))
+                    .size(self.effective_font_size())
+                    .color(self.c_text_dim()),
             );
         }
         body = body.push(
-            text("Directories are removed with everything inside them. This cannot be undone.")
-                .size(12)
-                .wrapping(text::Wrapping::Word)
-                .style(text::danger),
+            self.popup_text(
+                "Directories are removed with everything inside them. This cannot be undone.",
+            )
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word)
+            .style(text::danger),
         );
         body = body.push(
             row![
-                button(text("Cancel").size(13))
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
                     .on_press(Message::SidebarDeleteCancel)
                     .padding([4, 12])
                     .style(self.ghost_btn_style()),
                 Space::new().width(Length::Fill),
-                button(text("Delete").size(13))
+                button(self.popup_text("Delete").size(self.effective_font_size()))
                     .on_press(Message::SidebarDeleteConfirm)
                     .padding([4, 12])
                     .style(button::danger),
@@ -18673,10 +18732,13 @@ impl Frost {
             .spacing(8)
             .align_y(iced::Alignment::Center),
         );
-        let panel = container(body)
-            .width(Length::Fixed(380.0))
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(
+                (self.win_size.width - 16.0).clamp(1.0, 380.0),
+            ))
             .padding(14)
-            .style(container::dark);
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -18701,29 +18763,36 @@ impl Frost {
         );
         let proc_name = session_persistence::bound_tab_title_draft(proc_name);
         let body = column![
-            text(format!("Close \"{}\"?", label)).size(14),
-            text(format!("Foreground process: {}", proc_name))
-                .size(12)
-                .style(text::secondary),
+            self.popup_text(format!("Close \"{}\"?", label))
+                .size(self.effective_font_size()),
+            self.popup_text(format!("Foreground process: {}", proc_name))
+                .size(self.effective_font_size())
+                .color(self.c_text_dim()),
             row![
-                button(text("Cancel").size(13))
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
                     .on_press(Message::TabCloseConfirmNo)
                     .padding([4, 12])
                     .style(self.ghost_btn_style()),
                 Space::new().width(Length::Fill),
-                button(text("Close anyway").size(13))
-                    .on_press(Message::TabCloseConfirmYes)
-                    .padding([4, 12])
-                    .style(button::danger),
+                button(
+                    self.popup_text("Close anyway")
+                        .size(self.effective_font_size())
+                )
+                .on_press(Message::TabCloseConfirmYes)
+                .padding([4, 12])
+                .style(button::danger),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
         ]
         .spacing(10);
-        let panel = container(body)
-            .width(Length::Fixed(320.0))
+        let panel = container(scrollable(body).height(Length::Shrink))
+            .width(Length::Fixed(
+                (self.win_size.width - 16.0).clamp(1.0, 320.0),
+            ))
             .padding(14)
-            .style(container::dark);
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -18743,21 +18812,21 @@ impl Frost {
         let count = confirm.block_count;
         let noun = if count == 1 { "block" } else { "blocks" };
         let body = column![
-            text(format!("Clear {count} command {noun}?")).size(14),
-            text(format!(
+            self.popup_text(format!("Clear {count} command {noun}?")).size(self.effective_font_size()),
+            self.popup_text(format!(
                 "This clears {count} completed command {noun}, their bookmarks, and captured output from this pane."
             ))
-            .size(12)
+            .size(self.effective_font_size())
             .wrapping(text::Wrapping::Word)
-            .style(text::secondary),
-            text("Undo Clear Blocks can restore the latest clear, within history limits. Bookmarks and selection are not restored.").size(12).wrapping(text::Wrapping::Word).style(text::warning),
+            .color(self.c_text_dim()),
+            self.popup_text("Undo Clear Blocks can restore the latest clear, within history limits. Bookmarks and selection are not restored.").size(self.effective_font_size()).wrapping(text::Wrapping::Word).style(text::warning),
             row![
-                button(text("Cancel").size(13))
+                button(self.popup_text("Cancel").size(self.effective_font_size()))
                     .on_press(Message::BlockClearConfirmNo)
                     .padding([4, 12])
                     .style(self.ghost_btn_style()),
                 Space::new().width(Length::Fill),
-                button(text(format!("Clear {count} {noun}")).size(13))
+                button(self.popup_text(format!("Clear {count} {noun}")).size(self.effective_font_size()))
                     .on_press(Message::BlockClearConfirmYes)
                     .padding([4, 12])
                     .style(button::danger),
@@ -18767,10 +18836,11 @@ impl Frost {
         ]
         .spacing(10);
         let panel_width = (self.win_size.width - 32.0).clamp(240.0, 380.0);
-        let panel = container(body)
+        let panel = container(scrollable(body).height(Length::Shrink))
             .width(Length::Fixed(panel_width))
             .padding(14)
-            .style(container::dark);
+            .max_height((self.win_size.height - 16.0).max(1.0))
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -18890,17 +18960,19 @@ impl Frost {
         let filtered = tab_switcher_filtered(&labels, &state.query);
 
         let query: Element<'_, Message> = text_input("Jump to tab…", &state.query)
+            .style(self.popup_input_style())
+            .font(self.mono)
             .id(TAB_SWITCHER_INPUT_ID.clone())
             .on_input(Message::TabSwitcherInput)
-            .size(14)
+            .size(self.effective_font_size())
             .into();
-        let query_line = row![text("↦").size(16), query]
+        let query_line = row![self.popup_text("↦"), query]
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
         let mut list = column![].spacing(2);
         if filtered.is_empty() {
-            list = list.push(text("No tabs match").size(13).style(text::secondary));
+            list = list.push(self.popup_text("No tabs match").color(self.c_text_dim()));
         } else {
             for &(pos, idx) in filtered.iter() {
                 let selected = pos == state.selected;
@@ -18910,10 +18982,9 @@ impl Frost {
                 let label = self.tab_label(idx);
                 let id = tab.id;
                 let info = row![
-                    text(format!("{:>2}", idx + 1))
-                        .size(12)
-                        .style(text::secondary),
-                    text(label).size(13),
+                    self.popup_text(format!("{:>2}", idx + 1))
+                        .color(self.c_text_dim()),
+                    self.popup_text(label),
                     Space::new().width(Length::Fill),
                 ]
                 .spacing(10)
@@ -18943,7 +19014,7 @@ impl Frost {
             .width(Length::Fixed(420.0))
             .max_height(420.0)
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -18964,11 +19035,10 @@ impl Frost {
         let mut list = column![].spacing(2);
         if state.hosts.is_empty() {
             list = list.push(
-                text(
+                self.popup_text(
                     "No [[remote_hosts]] configured. Add one in Settings (Ctrl+Shift+O, Remote hosts) or in config.toml:\n\n[[remote_hosts]]  # ssh\nname = \"dev\"\nhost = \"dev.example.com\"\nuser = \"yj\"\ndeploy = \"persist\"\nssh_args = [\"-p\", \"22\"]\n\n[[remote_hosts]]  # running container\nname = \"myubuntu\"\nhost = \"myubuntu\"\ndocker = true\ndeploy = \"persist\"",
                 )
-                .size(13)
-                .style(text::secondary),
+                .color(self.c_text_dim()),
             );
         }
         for (index, host) in state
@@ -18989,14 +19059,12 @@ impl Frost {
             match validation {
                 Ok(_) => {
                     let info = row![
-                        text(format!("{:>2}", index + 1))
-                            .size(12)
-                            .style(text::secondary),
-                        text(display_name).size(13),
+                        self.popup_text(format!("{:>2}", index + 1))
+                            .color(self.c_text_dim()),
+                        self.popup_text(display_name),
                         Space::new().width(Length::Fill),
-                        text(format!("{transport} · deploy {deploy}"))
-                            .size(12)
-                            .style(text::secondary),
+                        self.popup_text(format!("{transport} · deploy {deploy}"))
+                            .color(self.c_text_dim()),
                     ]
                     .spacing(10)
                     .align_y(iced::Alignment::Center);
@@ -19024,9 +19092,9 @@ impl Frost {
                 Err(problem) => {
                     list = list.push(
                         row![
-                            text(display_name).size(13).style(text::secondary),
+                            self.popup_text(display_name).color(self.c_text_dim()),
                             Space::new().width(Length::Fill),
-                            text(problem).size(12).style(text::secondary),
+                            self.popup_text(problem).color(self.c_text_dim()),
                         ]
                         .spacing(10)
                         .align_y(iced::Alignment::Center),
@@ -19036,22 +19104,20 @@ impl Frost {
         }
         if state.hosts.len() > config::MAX_REMOTE_HOST_UI_ROWS {
             list = list.push(
-                text(format!(
+                self.popup_text(format!(
                     "{} additional drafts remain saved but are omitted from this bounded view.",
                     state.hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS
                 ))
-                .size(11)
-                .style(text::secondary),
+                .color(self.c_text_dim()),
             );
         }
         list = list.push(
-            text("deploy off connects plainly; persist/incognito bring jsh along.")
-                .size(11)
-                .style(text::secondary),
+            self.popup_text("deploy off connects plainly; persist/incognito bring jsh along.")
+                .color(self.c_text_dim()),
         );
 
         let body = column![
-            row![text("🖧").size(16), text("Remote hosts").size(14)]
+            row![self.popup_text("🖧"), self.popup_text("Remote hosts")]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
             list
@@ -19061,7 +19127,7 @@ impl Frost {
             .width(Length::Fixed(460.0))
             .max_height(420.0)
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -19099,11 +19165,13 @@ impl Frost {
         let snapshot = state.snapshot_identity();
 
         let query: Element<'_, Message> = text_input("Run a workflow…", state.query())
+            .style(self.popup_input_style())
+            .font(self.mono)
             .id(WORKFLOW_PICKER_INPUT_ID.clone())
             .on_input(move |query| Message::WorkflowPickerInput(snapshot, query))
-            .size(14)
+            .size(self.effective_font_size())
             .into();
-        let query_line = row![text("⚙").size(16), query]
+        let query_line = row![self.popup_text("⚙"), query]
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
@@ -19114,39 +19182,37 @@ impl Frost {
             } else {
                 "No workflows match"
             };
-            list = list.push(text(hint).size(13).style(text::secondary));
+            list = list.push(self.popup_text(hint).color(self.c_text_dim()));
         } else {
             for (pos, workflow) in filtered.iter().enumerate() {
                 let selected = pos == state.selected();
-                let mut info = row![text(crate::workflow_picker::bound_workflow_feedback(
-                    &workflow.name
-                ))
-                .size(13)]
+                let mut info = row![self
+                    .popup_text(crate::workflow_picker::bound_workflow_feedback(
+                        &workflow.name
+                    ))
+                    .size(self.effective_font_size())]
                 .spacing(10)
                 .align_y(iced::Alignment::Center);
                 if !workflow.args.is_empty() {
                     info = info.push(
-                        text(format!("{} args", workflow.args.len()))
-                            .size(11)
-                            .style(text::secondary),
+                        self.popup_text(format!("{} args", workflow.args.len()))
+                            .color(self.c_text_dim()),
                     );
                 }
                 info = info.push(Space::new().width(Length::Fill));
                 for tag in workflow.tags.iter().take(3) {
                     info = info.push(
-                        text(crate::workflow_picker::bound_workflow_feedback(tag))
-                            .size(11)
-                            .style(text::secondary),
+                        self.popup_text(crate::workflow_picker::bound_workflow_feedback(tag))
+                            .color(self.c_text_dim()),
                     );
                 }
                 let mut rows = column![info].spacing(2);
                 if !workflow.description.is_empty() {
                     rows = rows.push(
-                        text(crate::workflow_picker::bound_workflow_feedback(
+                        self.popup_text(crate::workflow_picker::bound_workflow_feedback(
                             workflow.description.clone(),
                         ))
-                        .size(11)
-                        .style(text::secondary),
+                        .color(self.c_text_dim()),
                     );
                 }
                 let accent = self.c_accent();
@@ -19192,7 +19258,7 @@ impl Frost {
             .width(Length::Fixed(panel_size.width))
             .height(Length::Fixed(panel_size.height))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -19216,13 +19282,13 @@ impl Frost {
         form: &workflow_picker::WorkflowArgsState,
     ) -> Element<'_, Message> {
         let header = row![
-            text(format!(
+            self.popup_text(format!(
                 "Workflow: {}",
                 crate::workflow_picker::bound_workflow_feedback(&form.workflow().name)
             ))
-            .size(14),
+            .size(self.effective_font_size()),
             Space::new().width(Length::Fill),
-            button(text("✕").size(12))
+            button(self.popup_text("✕").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::WorkflowArgClose(form.identity())),
         ]
@@ -19232,20 +19298,20 @@ impl Frost {
         let mut card = column![header].spacing(8);
         if !form.workflow().description.is_empty() {
             card = card.push(
-                text(crate::workflow_picker::bound_workflow_feedback(
+                self.popup_text(crate::workflow_picker::bound_workflow_feedback(
                     form.workflow().description.clone(),
                 ))
-                .size(12)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
-                .style(text::secondary),
+                .color(self.c_text_dim()),
             );
         }
         card = card.push(
-            text(crate::review_text::visible_bounded(
+            self.popup_text(crate::review_text::visible_bounded(
                 &form.workflow().command,
                 4 * 1024,
             ))
-            .size(12)
+            .size(self.effective_font_size())
             .font(iced::Font::MONOSPACE)
             .wrapping(text::Wrapping::Word),
         );
@@ -19262,23 +19328,31 @@ impl Frost {
             );
             let field = row![
                 input,
-                button(text("Reset").size(11))
+                button(self.popup_text("Reset").size(self.effective_font_size()))
                     .style(button::secondary)
                     .on_press(Message::WorkflowArgReset(form.identity(), index)),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
             card = card.push(
-                container(column![text(label).size(11).style(text::secondary), field].spacing(2))
-                    .id(workflow_focus::row_id(index)),
+                container(
+                    column![
+                        self.popup_text(label)
+                            .size(self.effective_font_size())
+                            .color(self.c_text_dim()),
+                        field
+                    ]
+                    .spacing(2),
+                )
+                .id(workflow_focus::row_id(index)),
             );
         }
 
         if let Some(feedback) = form.feedback.as_deref() {
             card = card.push(
                 container(
-                    text(crate::workflow_picker::bound_workflow_feedback(feedback))
-                        .size(11)
+                    self.popup_text(crate::workflow_picker::bound_workflow_feedback(feedback))
+                        .size(self.effective_font_size())
                         .style(text::danger),
                 )
                 .id(workflow_focus::ERROR_ID),
@@ -19286,12 +19360,15 @@ impl Frost {
         }
 
         let actions = row![
-            button(text("Insert command").size(12))
-                .style(button::primary)
-                .on_press_maybe(
-                    (!form.is_pending()).then(|| Message::WorkflowArgSubmit(form.identity()))
-                ),
-            button(text("Cancel").size(12))
+            button(
+                self.popup_text("Insert command")
+                    .size(self.effective_font_size())
+            )
+            .style(button::primary)
+            .on_press_maybe(
+                (!form.is_pending()).then(|| Message::WorkflowArgSubmit(form.identity()))
+            ),
+            button(self.popup_text("Cancel").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::WorkflowArgClose(form.identity())),
         ]
@@ -19315,7 +19392,7 @@ impl Frost {
             .width(Length::Fixed(panel_size.width))
             .height(Length::Fixed(panel_size.height))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -19345,24 +19422,23 @@ impl Frost {
         let scroll_panel = self.win_size.height < 244.0;
 
         let query: Element<'_, Message> = text_input("Recall a command…", state.query())
+            .style(self.popup_input_style())
+            .font(self.mono)
             .id(HISTORY_PICKER_INPUT_ID.clone())
             .on_input(Message::HistoryPickerInput)
-            .size(14)
+            .size(self.effective_font_size())
             .into();
-        let query_line = row![text("↺").size(16), query]
+        let query_line = row![self.popup_text("↺"), query]
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
         use history_picker::{HistoryFilterAction as Filter, HistoryStatus};
         let directory = tooltip(
-            button(
-                text(if compact {
-                    "Directory"
-                } else {
-                    "This directory"
-                })
-                .size(11),
-            )
+            button(self.popup_text(if compact {
+                "Directory"
+            } else {
+                "This directory"
+            }))
             .on_press_maybe(
                 state
                     .current_directory()
@@ -19374,22 +19450,19 @@ impl Frost {
             } else {
                 button::secondary
             }),
-            container(
-                text(match state.current_directory() {
-                    Some(cwd) => format!(
-                        "{} (Ctrl+D)",
-                        history_picker::display_cwd(&abbreviate_home(cwd))
-                    ),
-                    None => "Current directory unavailable".to_string(),
-                })
-                .size(11),
-            )
+            container(self.popup_text(match state.current_directory() {
+                Some(cwd) => format!(
+                    "{} (Ctrl+D)",
+                    history_picker::display_cwd(&abbreviate_home(cwd))
+                ),
+                None => "Current directory unavailable".to_string(),
+            }))
             .padding(6)
             .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
         let status_button = |label: &str, status: HistoryStatus| {
-            button(text(label.to_string()).size(11))
+            button(self.popup_text(label.to_string()))
                 .on_press(Message::HistoryPickerFilter(Filter::SetStatus(status)))
                 .padding([3, 7])
                 .style(if state.status() == status {
@@ -19398,7 +19471,7 @@ impl Frost {
                     button::secondary
                 })
         };
-        let unique = button(text("Unique").size(11))
+        let unique = button(self.popup_text("Unique"))
             .on_press(Message::HistoryPickerFilter(Filter::ToggleUnique))
             .padding([3, 7])
             .style(if state.unique() {
@@ -19406,7 +19479,7 @@ impl Frost {
             } else {
                 button::secondary
             });
-        let reset = button(text("Reset").size(11))
+        let reset = button(self.popup_text("Reset"))
             .on_press(Message::HistoryPickerFilter(Filter::Reset))
             .padding([3, 7])
             .style(button::secondary);
@@ -19421,19 +19494,20 @@ impl Frost {
         .spacing(4)
         .align_y(iced::Alignment::Center)
         .wrap();
-        let summary = text(format!(
-            "{} of {} matches · {} recent entries{}",
-            filtered.len(),
-            state.match_count(),
-            state.entry_count(),
-            if state.older_not_loaded() {
-                " · older entries not loaded"
-            } else {
-                ""
-            }
-        ))
-        .size(11)
-        .style(text::secondary);
+        let summary = self
+            .popup_text(format!(
+                "{} of {} matches · {} recent entries{}",
+                filtered.len(),
+                state.match_count(),
+                state.entry_count(),
+                if state.older_not_loaded() {
+                    " · older entries not loaded"
+                } else {
+                    ""
+                }
+            ))
+            .size(self.effective_font_size())
+            .color(self.c_text_dim());
 
         let mut list = column![].spacing(2);
         if filtered.is_empty() {
@@ -19442,32 +19516,31 @@ impl Frost {
             } else {
                 "No commands match — adjust the query or reset the filters"
             };
-            list = list.push(text(hint).size(13).style(text::secondary));
+            list = list.push(self.popup_text(hint).color(self.c_text_dim()));
         } else {
             for (pos, record) in filtered.iter().enumerate() {
                 let selected = pos == state.selected;
-                let mut info = row![text(history_picker::display_command(&record.command))
-                    .size(13)
+                let mut info = row![self
+                    .popup_text(history_picker::display_command(&record.command))
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::WordOrGlyph)
                     .width(Length::Fill)]
                 .spacing(10)
                 .align_y(iced::Alignment::Center);
                 if record.exit_code != 0 {
                     info = info.push(
-                        text(format!("✗ {}", record.exit_code))
-                            .size(12)
+                        self.popup_text(format!("✗ {}", record.exit_code))
                             .style(text::danger),
                     );
                 }
                 let content: Element<'_, Message> = if let Some(cwd) = record.cwd.as_deref() {
                     column![
                         info,
-                        text(history_picker::display_cwd(&abbreviate_home(cwd)))
-                            .size(11)
+                        self.popup_text(history_picker::display_cwd(&abbreviate_home(cwd)))
                             .width(Length::Fill)
                             .shaping(text::Shaping::Advanced)
                             .wrapping(text::Wrapping::WordOrGlyph)
-                            .style(text::secondary),
+                            .color(self.c_text_dim()),
                     ]
                     .spacing(1)
                     .into()
@@ -19496,15 +19569,14 @@ impl Frost {
             }
         }
 
-        let keys = text(if compact {
+        let keys = self.popup_text(if compact {
             "↑/↓ select · Enter insert · Esc close"
         } else {
             "↑/↓ select · Enter insert · Esc close · Ctrl+D directory · Ctrl+O status · Ctrl+U unique"
         })
-        .size(10)
         .width(Length::Fill)
         .wrapping(text::Wrapping::Word)
-        .style(text::secondary);
+        .color(self.c_text_dim());
         let list_height = (filtered.len().max(1) as f32 * 44.0).min(300.0);
         let body = column![
             query_line,
@@ -19532,7 +19604,7 @@ impl Frost {
             .width(Length::Fixed(panel_width))
             .height(Length::Fixed(panel_height))
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -20370,7 +20442,7 @@ impl Frost {
                     .map(|zone| (sess, zone))
             });
         let row_btn = |label: &str, action: BlockMenuAction| {
-            button(text(label.to_string()).size(12))
+            button(self.popup_text(label.to_string()))
                 .on_press(Message::BlockMenuAction(action))
                 .padding([5, 9])
                 .width(Length::Fill)
@@ -20428,9 +20500,9 @@ impl Frost {
                 .push(row_btn("Open block details", BlockMenuAction::Details))
                 .push(
                     row![
-                        text(format!("Command Block #{}", zone.id)).size(16),
+                        self.popup_text(format!("Command Block #{}", zone.id)),
                         Space::new().width(Length::Fill),
-                        button(text("×").size(13))
+                        button(self.popup_text("×"))
                             .on_press(Message::BlockMenuClose)
                             .padding([2, 7])
                             .style(self.ghost_btn_style()),
@@ -20438,30 +20510,27 @@ impl Frost {
                     .align_y(iced::Alignment::Center),
                 )
                 .push(
-                    text(preview)
-                        .size(13)
+                    self.popup_text(preview)
                         .wrapping(text::Wrapping::Word)
                         .width(Length::Fill),
                 )
                 .push(
-                    text(block_mode::display_block_search_text(&meta))
-                        .size(11)
+                    self.popup_text(block_mode::display_block_search_text(&meta))
                         .wrapping(text::Wrapping::Word)
-                        .style(text::secondary),
+                        .color(self.c_text_dim()),
                 );
             if let Some(retention) = retention {
-                body = body.push(text(retention).size(11).style(text::warning));
+                body = body.push(self.popup_text(retention).style(text::warning));
             }
             if !matches!(outcome, block_mode::BlockOutcome::Background)
                 && block_mode::assess_lifecycle(zone.start_mark_seen, zone.completion_provenance)
                     != block_mode::BlockLifecycleHealth::Healthy
             {
                 body = body.push(
-                    text(block_mode::lifecycle_detail(
+                    self.popup_text(block_mode::lifecycle_detail(
                         zone.start_mark_seen,
                         zone.completion_provenance,
                     ))
-                    .size(11)
                     .style(text::warning),
                 );
             }
@@ -20595,14 +20664,14 @@ impl Frost {
                     .spacing(6),
                 )
                 .push(
-                    button(text("Clear all completed blocks…").size(12))
+                    button(self.popup_text("Clear all completed blocks…"))
                         .on_press(Message::BlockMenuAction(BlockMenuAction::Clear))
                         .padding([5, 9])
                         .width(Length::Fill)
                         .style(button::danger),
                 )
                 .push(
-                    button(text("Undo clear blocks").size(12))
+                    button(self.popup_text("Undo clear blocks"))
                         .on_press(Message::BlockMenuAction(BlockMenuAction::UndoClear))
                         .padding([5, 9])
                         .width(Length::Fill)
@@ -20610,9 +20679,9 @@ impl Frost {
                 );
         } else {
             body = body
-                .push(text("Command block is no longer available").size(14))
+                .push(self.popup_text("Command block is no longer available"))
                 .push(
-                    button(text("Close").size(12))
+                    button(self.popup_text("Close"))
                         .on_press(Message::BlockMenuClose)
                         .style(self.ghost_btn_style()),
                 );
@@ -20624,7 +20693,7 @@ impl Frost {
             .width(Length::Fixed(panel_width))
             .max_height(panel_height)
             .padding(12)
-            .style(container::dark);
+            .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -23441,27 +23510,28 @@ impl Frost {
         let epoch = self.palette.epoch();
         let input_epoch = std::sync::Arc::clone(&epoch);
         let query = text_input("Type to filter…", &self.palette.query)
+            .style(self.popup_input_style())
+            .font(self.mono)
             .id(PALETTE_INPUT_ID.clone())
             .on_input(move |value| {
                 Message::PaletteInput(std::sync::Arc::clone(&input_epoch), value)
             })
-            .size(14);
-        let query_line = row![text("›").size(16), query]
+            .size(self.effective_font_size());
+        let query_line = row![self.popup_text("›"), query]
             .spacing(8)
             .align_y(iced::Alignment::Center);
 
         let mut list = column![].spacing(2);
         let filtered = self.palette.filtered();
         if filtered.is_empty() {
-            list = list.push(text("No commands").size(13).style(text::secondary));
+            list = list.push(self.popup_text("No commands").color(self.c_text_dim()));
         } else {
             for (pos, (idx, item)) in filtered.iter().enumerate() {
                 let labels = column![
-                    text(item.name).size(14),
-                    text(item.description)
-                        .size(11)
+                    self.popup_text(item.name),
+                    self.popup_text(item.description)
                         .wrapping(text::Wrapping::None)
-                        .style(text::secondary),
+                        .color(self.c_text_dim()),
                 ]
                 .spacing(1)
                 .width(Length::Fill);
@@ -23472,7 +23542,7 @@ impl Frost {
                 // default: a user who rebound or unbound this command must be
                 // shown what they actually have.
                 if let Some(shortcut) = item.shortcut_label(&self.keybindings) {
-                    info = info.push(text(shortcut).size(11).style(text::secondary));
+                    info = info.push(self.popup_text(shortcut).color(self.c_text_dim()));
                 }
                 let row_btn = button(info)
                     .on_press(Message::PaletteExecute(std::sync::Arc::clone(&epoch), *idx))
@@ -23489,9 +23559,10 @@ impl Frost {
             }
         }
 
-        let footer = text("↑↓ navigate · PgUp/PgDn jump · Enter run · Esc close")
-            .size(10)
-            .style(text::secondary);
+        let footer = self
+            .popup_text("↑↓ navigate · PgUp/PgDn jump · Enter run · Esc close")
+            .size(self.effective_font_size())
+            .color(self.c_text_dim());
         let panel_width = (self.win_size.width - 32.0).clamp(300.0, 640.0);
         let panel_height = (self.win_size.height - 48.0).clamp(220.0, 520.0);
         let inner = container(
@@ -23507,7 +23578,7 @@ impl Frost {
         .width(Length::Fixed(panel_width))
         .max_height(panel_height)
         .padding(12)
-        .style(container::dark);
+        .style(self.popup_style());
         widget_identity_scope::scope(
             epoch,
             container(inner)
