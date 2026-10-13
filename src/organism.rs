@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use jterm_core::organism::{
     classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind, Behavior,
-    BodyLanguage, CircadianPhase, LifeState, NativeOrganism, RenderContext, RepoVigil, WatchRhythm,
+    BodyLanguage, CircadianPhase, LifeState, NativeOrganism, RenderContext, RepoVigil, Tone,
+    WatchRhythm,
 };
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
@@ -120,9 +121,9 @@ impl fmt::Display for MotionChoice {
 
 pub fn expanded_companion_hint(bottom_bar: bool) -> &'static str {
     if bottom_bar {
-        "Reserves a fixed-height strip above the bottom bar. Narrow windows prioritize the body and collapse arrow. A still companion remains when live reactions pause. Use the status-bar arrow to collapse or expand; hover the glyph in a wider window for details. In Block mode, the live body uses only complete empty space inside the focused active card; typing, clipping or insufficient room hides it."
+        "In Block mode, the status card sits between history and the active input card. Traditional mode reserves a fixed-height strip above the bottom bar. Narrow windows prioritize the body and collapse arrow. A still companion remains when live reactions pause. Use the inline arrow in Block mode, or the status-bar arrow in traditional mode, to collapse or expand; hover the glyph in a wider window for details. In Block mode, the live body uses only complete empty space inside the focused active card; typing, clipping or insufficient room hides it. Full wanders only while idle/exploring, hover pauses movement, and Calm keeps a still body; Static shows only the status card."
     } else {
-        "Turn on Bottom status bar (cwd, git, last command) to show the live companion."
+        "Traditional mode needs Bottom status bar (cwd, git, last command) to show the companion. Block mode keeps its inline status card independently."
     }
 }
 
@@ -204,7 +205,13 @@ impl PreviewDeadlines {
 pub struct LivePresentation {
     pub glyph: String,
     pub sprite: String,
+    /// Same shared pose with the presentation-only native walking flag.
+    pub walking_sprite: String,
     pub explanation: Cow<'static, str>,
+    pub status: &'static str,
+    pub tone: Option<Tone>,
+    pub wander: Option<u64>,
+    pub bottom: bool,
 }
 
 impl LivePresentation {
@@ -215,7 +222,12 @@ impl LivePresentation {
         Self {
             glyph: sticky_glyph_with_context(context, 0).into_owned(),
             sprite: sprite_frame_with_context(context, 0).into_owned(),
+            walking_sprite: sprite_frame_with_context(context, 0).into_owned(),
             explanation: Cow::Borrowed("Quietly here. Live reactions are paused in this context."),
+            status: "quiet · live reactions paused",
+            tone: Some(Tone::Quiet),
+            wander: None,
+            bottom: true,
         }
     }
 }
@@ -895,6 +907,11 @@ impl Organism {
         }
     }
 
+    /// Paint clock only; native layout never changes the shared life state.
+    pub fn paint_frame(&self, motion: Option<Motion>) -> u64 {
+        Self::frame_at(motion, self.born.elapsed())
+    }
+
     pub fn presentation_with_attention(
         &self,
         id: usize,
@@ -998,7 +1015,66 @@ impl Organism {
         LivePresentation {
             glyph: sticky_glyph_with_context(context, frame).into_owned(),
             sprite: sprite_frame_with_context(context, frame).into_owned(),
+            walking_sprite: sprite_frame_with_context(
+                RenderContext {
+                    walking: true,
+                    ..context
+                },
+                frame,
+            )
+            .into_owned(),
             explanation: live_explanation(context),
+            wander: (motion == Some(Motion::Full)
+                && matches!(context.behavior, Behavior::Idle | Behavior::Explore))
+            .then_some(if context.behavior == Behavior::Explore {
+                120
+            } else if context.body_language.drowsy {
+                0
+            } else if context.body_language.listless {
+                120
+            } else {
+                40
+            }),
+            bottom: matches!(
+                context.behavior,
+                Behavior::Idle
+                    | Behavior::Sleep
+                    | Behavior::Explore
+                    | Behavior::Approach
+                    | Behavior::GuardRecovery
+                    | Behavior::GuardCautious
+            ),
+            status: match context.behavior {
+                Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => {
+                    "watching · command running"
+                }
+                Behavior::InspectError
+                | Behavior::SitNearError
+                | Behavior::GuardFailure
+                | Behavior::GuardStuck => "quiet · keeping an eye on the last result",
+                Behavior::Celebrate
+                | Behavior::CelebrateBig
+                | Behavior::RestAfterPush
+                | Behavior::GuardRecovery => "settled · work completed",
+                Behavior::Approach => "hello · keeping you company",
+                _ => "quiet · waiting for a real Block event",
+            },
+            tone: Some(match context.behavior {
+                Behavior::InspectError
+                | Behavior::SitNearError
+                | Behavior::GuardFailure
+                | Behavior::GuardStuck => Tone::Error,
+                Behavior::Celebrate
+                | Behavior::CelebrateBig
+                | Behavior::RestAfterPush
+                | Behavior::GuardRecovery => Tone::Success,
+                Behavior::UnknownOutcome | Behavior::GuardCautious => Tone::Warning,
+                Behavior::WatchCommand
+                | Behavior::WatchSettled
+                | Behavior::WatchAgent
+                | Behavior::Approach => Tone::Active,
+                _ => Tone::Quiet,
+            }),
         }
     }
 
@@ -2176,6 +2252,46 @@ mod tests {
     }
 
     #[test]
+    fn native_walk_variant_reuses_shared_context_without_mutating_life() {
+        let mut organism = Organism::default();
+        organism.set_enabled(true);
+        organism.prime_session(1, false);
+        organism.set_remote(1, false);
+        let before = values(organism.life.state());
+        for behavior in [Behavior::Idle, Behavior::Explore] {
+            organism.sessions.get_mut(&1).unwrap().context =
+                RenderContext::new(behavior, BodyLanguage::default(), false);
+            for motion in [Some(Motion::Full), Some(Motion::Calm), Some(Motion::Static)] {
+                let now = Duration::from_secs(38);
+                let presentation = organism.presentation_at_with_attention(
+                    1,
+                    false,
+                    false,
+                    motion,
+                    now,
+                    (AttentionFacts::known_idle_for_test(false, false), false),
+                );
+                let context = RenderContext::new(
+                    behavior,
+                    BodyLanguage::from_state(organism.life.state()),
+                    true,
+                );
+                assert_eq!(
+                    presentation.walking_sprite,
+                    sprite_frame_with_context(context, Organism::frame_at(motion, now))
+                );
+                assert!(crate::organism_block::sprite_fits(
+                    &presentation.walking_sprite
+                ));
+                if motion != Some(Motion::Full) {
+                    assert!(presentation.wander.is_none());
+                }
+            }
+        }
+        assert_eq!(values(organism.life.state()), before);
+    }
+
+    #[test]
     fn watch_rhythm_is_display_only_static_safe_and_owner_bound() {
         use jterm_core::organism::WatchRhythm;
         let mut organism = Organism::default();
@@ -2319,6 +2435,7 @@ mod tests {
                 glyph,
                 sprite,
                 explanation,
+                ..
             } = organism.presentation(3, false, false, Some(Motion::Static));
             assert!(!glyph.is_empty());
             assert_eq!(

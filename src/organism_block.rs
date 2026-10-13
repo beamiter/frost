@@ -5,6 +5,9 @@
 /// The renderer rejects any future shared sprite that exceeds this envelope.
 pub(crate) const BODY_COLS: usize = 12;
 pub(crate) const BODY_ROWS: usize = 3;
+pub(crate) const BODY_PAD_X: f32 = 6.0;
+pub(crate) const BODY_PAD_Y: f32 = 3.0;
+pub(crate) const BODY_BORDER: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Rect {
@@ -22,7 +25,7 @@ impl Rect {
             && point.1 < self.y + self.height
     }
 
-    fn includes(self, other: Self) -> bool {
+    pub(crate) fn includes(self, other: Self) -> bool {
         [
             self.x,
             self.y,
@@ -62,7 +65,7 @@ pub(crate) struct Surface {
 
 /// Find a suffix of the actual active card after all occupied/cursor rows.
 /// Never extend a card, clamp to the viewport, or infer emptiness from text.
-pub(crate) fn placement(surface: Surface) -> Option<Rect> {
+pub(crate) fn travel_band(surface: Surface) -> Option<Rect> {
     let Surface {
         card,
         clip,
@@ -88,21 +91,77 @@ pub(crate) fn placement(surface: Surface) -> Option<Rect> {
         return None;
     }
     let row = cursor_row
-        .checked_add(2)?
+        .checked_add(1)?
         .max(start_row.checked_add(1)?)
-        .max(last_occupied_row.map_or(Some(start_row + 1), |r| r.checked_add(2))?);
+        .max(last_occupied_row.map_or(Some(start_row + 1), |r| r.checked_add(1))?);
     if row.checked_add(BODY_ROWS)? >= end_row {
         return None;
     }
-    // One native cell margin, further bounded by the actual card inset.
+    let left = (x + cw).max(card.x + cw);
     let right = (x + (columns - 1) as f32 * cw).min(card.x + card.width - cw);
+    let top = y + row as f32 * ch;
+    let bottom = (y + end_row as f32 * ch).min(card.y + card.height - 3.0);
+    let width = BODY_COLS as f32 * cw + 2.0 * (BODY_PAD_X + BODY_BORDER);
+    let height = BODY_ROWS as f32 * ch + 2.0 * (BODY_PAD_Y + BODY_BORDER);
     let rect = Rect {
-        x: right - BODY_COLS as f32 * cw,
-        y: y + row as f32 * ch,
-        width: BODY_COLS as f32 * cw,
-        height: BODY_ROWS as f32 * ch,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
     };
-    (rect.x >= x + cw && card.includes(rect) && clip.includes(rect)).then_some(rect)
+    (rect.width >= width && rect.height >= height && card.includes(rect) && clip.includes(rect))
+        .then_some(rect)
+}
+
+/// The travel band is wholly default-cell blank space, never a text estimate.
+pub(crate) fn placement(surface: Surface) -> Option<Rect> {
+    let band = travel_band(surface)?;
+    let width = BODY_COLS as f32 * surface.cell.0 + 2.0 * (BODY_PAD_X + BODY_BORDER);
+    let height = BODY_ROWS as f32 * surface.cell.1 + 2.0 * (BODY_PAD_Y + BODY_BORDER);
+    Some(Rect {
+        x: band.x + band.width - width,
+        y: band.y,
+        width,
+        height,
+    })
+}
+
+/// Same quiet edge/pacing/edge/pacing cycle as the GTK reference, using the
+/// existing 100 ms presentation clock. Reduced motion never calls this path.
+pub(crate) fn wander(
+    band: Rect,
+    body: Rect,
+    frame: u64,
+    walk: Option<u64>,
+    cell_width: f32,
+) -> Rect {
+    let Some(walk) = walk else {
+        return body;
+    };
+    let step = wander_phase(frame, walk);
+    let offset = (band.width - body.width) * step as f32 / 40.0;
+    Rect {
+        x: band.x + (offset / cell_width).floor() * cell_width,
+        ..body
+    }
+}
+
+fn wander_phase(frame: u64, walk: u64) -> u64 {
+    if walk == 0 {
+        return 0;
+    }
+    let walk = walk.min(120);
+    let phase = frame % 800;
+    let sit = (800 - 2 * walk) / 2;
+    if phase < sit {
+        0
+    } else if phase < sit + walk {
+        (phase - sit) * 40 / walk
+    } else if phase < sit + walk + sit {
+        40
+    } else {
+        40 - (phase - sit - walk - sit) * 40 / walk
+    }
 }
 
 pub(crate) fn sprite_fits(sprite: &str) -> bool {
@@ -192,13 +251,13 @@ mod tests {
     fn empty_input_uses_real_six_row_card_without_resizing_it() {
         let s = surface();
         let r = placement(s).unwrap();
-        assert_eq!((r.y, r.width, r.height), (40.0, 96.0, 60.0));
+        assert_eq!((r.y, r.width, r.height), (20.0, 110.0, 68.0));
         assert!(s.card.includes(r));
         assert!(r.y > s.cursor_row as f32 * s.cell.1);
     }
     #[test]
     fn multiline_content_and_cursor_leave_no_room_instead_of_overlaying_text() {
-        for last in 1..6 {
+        for last in 2..6 {
             let mut s = surface();
             s.last_occupied_row = Some(last);
             assert!(placement(s).is_none());
@@ -220,7 +279,7 @@ mod tests {
             s.card.height *= scale;
             s.clip.width *= scale;
             s.clip.height *= scale;
-            assert_eq!(placement(s).unwrap().height, 60.0 * scale);
+            assert_eq!(placement(s).unwrap().height, 60.0 * scale + 8.0);
         }
         let mut s = surface();
         s.cell.0 = f32::NAN;
@@ -274,6 +333,31 @@ mod tests {
         );
         assert_eq!(p.observe(Some(2), Some((1.0, 1.0)), true, true), None);
     }
+    #[test]
+    fn padded_body_and_reference_wander_stay_inside_proven_blank_band() {
+        let surface = surface();
+        let band = travel_band(surface).unwrap();
+        let body = placement(surface).unwrap();
+        for walk in [Some(0), Some(40), Some(120), None] {
+            for frame in 0..1600 {
+                let rect = wander(band, body, frame, walk, surface.cell.0);
+                assert!(band.includes(rect));
+                assert_eq!(rect.y, body.y);
+                assert_eq!((rect.width, rect.height), (body.width, body.height));
+                if walk.is_none() {
+                    assert_eq!(rect, body);
+                }
+            }
+        }
+        assert_eq!(wander_phase(359, 40), 0);
+        assert_eq!(wander_phase(380, 40), 20);
+        assert_eq!(wander_phase(400, 40), 40);
+        assert_eq!(wander_phase(780, 40), 20);
+        assert_eq!(wander_phase(340, 120), 20);
+        assert_eq!(wander_phase(800, 120), 0);
+        assert_eq!(wander_phase(500, 0), 0);
+    }
+
     #[test]
     fn future_shared_sprite_growth_is_fail_closed() {
         assert!(sprite_fits(" /\\_/\\\n( o.o )\n > ^ <"));

@@ -188,6 +188,37 @@ impl OrganismLayout {
 /// Preserve the established 220-unit expanded minimum and 640-unit status
 /// threshold. The native card may show details before the crowded status row
 /// fits; its body and collapse control have priority. Iced logical units.
+fn native_status_rows(enabled: bool, expanded: bool, cell_height: f32) -> usize {
+    if !enabled {
+        return 0;
+    }
+    if !expanded {
+        return 1;
+    }
+    ((3.0 * cell_height * 0.82 + 22.0) / cell_height.max(1.0))
+        .ceil()
+        .clamp(3.0, 8.0) as usize
+}
+
+fn organism_host_layout(
+    width: f32,
+    enabled: bool,
+    expanded: bool,
+    bottom_bar: bool,
+    block_mode: bool,
+) -> OrganismLayout {
+    if block_mode {
+        let presentable = enabled && width.is_finite() && width >= 160.0;
+        OrganismLayout {
+            glyph: false,
+            body: presentable,
+            explanation: presentable && expanded && width >= COMPANION_CARD_DETAILS_MIN_WIDTH,
+        }
+    } else {
+        organism_layout(width, enabled, expanded, bottom_bar)
+    }
+}
+
 fn organism_layout(width: f32, enabled: bool, expanded: bool, bottom_bar: bool) -> OrganismLayout {
     let enabled = enabled && bottom_bar && width.is_finite();
     let glyph = enabled && width >= ORGANISM_STATUS_MIN_WIDTH;
@@ -766,6 +797,19 @@ fn finalized_block_at_viewport_row(
                     .zone_by_id(key.zone_id)
                     .is_some_and(|zone| !zone.rows_evicted))
             .then_some(key.zone_id);
+        }
+        terminal::ProjectedRowKind::BlockChrome { boundary, .. } => {
+            return match boundary.kind {
+                terminal::ChromeKind::Header { zone_id } => terminal
+                    .zone_by_id(zone_id)
+                    .filter(|zone| {
+                        !zone.rows_evicted
+                            && terminal.raw_row_id_at_absolute(zone.prompt_start)
+                                == Some(boundary.next)
+                    })
+                    .map(|zone| zone.id),
+                terminal::ChromeKind::Organism => None,
+            };
         }
         terminal::ProjectedRowKind::Padding | terminal::ProjectedRowKind::BlockSpacer { .. } => {
             return None
@@ -4609,6 +4653,14 @@ impl Session {
         terminal.set_disable_alt_screen(config.disable_alt_screen);
         let mut projection_policy = ProjectionPolicy::new();
         projection_policy.set_block_spacing(!config.block_compact);
+        projection_policy.set_native_chrome(
+            true,
+            native_status_rows(
+                config.ascii_organism_enabled,
+                config.ascii_organism_expanded,
+                Metrics::new(config.font_size, config.line_spacing, config.padding, true).cell_h,
+            ),
+        );
         let mut projection_view_state = ProjectionViewState::new();
         let projection = terminal.get_projected_viewport_with_state(
             config.block_mode,
@@ -4903,7 +4955,8 @@ impl Session {
                             .map(|zone| zone.prompt_start)
                     }),
                 terminal::ProjectedRowKind::Padding
-                | terminal::ProjectedRowKind::BlockSpacer { .. } => None,
+                | terminal::ProjectedRowKind::BlockSpacer { .. }
+                | terminal::ProjectedRowKind::BlockChrome { .. } => None,
             })
             .unwrap_or_else(|| self.terminal.scrollback_len());
         let active_prompt = self
@@ -5957,7 +6010,15 @@ impl Frost {
             let spacing_changed = sess
                 .projection_policy
                 .set_block_spacing(!self.config.block_compact);
-            if projection_mode_changed || spacing_changed {
+            let chrome_changed = sess.projection_policy.set_native_chrome(
+                true,
+                native_status_rows(
+                    self.config.ascii_organism_enabled,
+                    self.config.ascii_organism_expanded,
+                    self.metrics.cell_h,
+                ),
+            );
+            if projection_mode_changed || spacing_changed || chrome_changed {
                 sess.refresh();
             }
         }
@@ -7536,6 +7597,9 @@ impl Frost {
     }
 
     fn organism_strip_height(&self) -> f32 {
+        if self.config.block_mode {
+            return 0.0;
+        }
         companion_strip_height(
             self.config.ascii_organism_enabled,
             self.config.ascii_organism_expanded,
@@ -11779,6 +11843,13 @@ impl Frost {
                 BlockMouseAction::Replace => sess.block_selection.click(&ids, id, false, false),
                 BlockMouseAction::Range => sess.block_selection.click(&ids, id, false, true),
                 BlockMouseAction::Toggle => sess.block_selection.click(&ids, id, true, true),
+                BlockMouseAction::Collapse => {
+                    if sess.projection_policy.is_collapsed(id) {
+                        sess.projection_policy.expand(id);
+                    } else {
+                        sess.projection_policy.collapse(id);
+                    }
+                }
                 BlockMouseAction::Menu => {
                     sess.block_selection.activate(&ids, id);
                     self.block_menu = Some(BlockMenuState {
@@ -20813,11 +20884,23 @@ impl Frost {
     /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
     /// left; last-command status, grid size, and tab count on the right.
     fn organism_layout(&self) -> OrganismLayout {
-        organism_layout(
-            self.win_size.width,
+        let width = if self.config.block_mode {
+            self.pane_rects()
+                .into_iter()
+                .find(|pane| pane.session == self.active)
+                .map_or(0.0, |pane| {
+                    (pane.rect.width - self.metrics.padding - terminal_view::SCROLLBAR_WIDTH - 16.0)
+                        .max(0.0)
+                })
+        } else {
+            self.win_size.width
+        };
+        organism_host_layout(
+            width,
             self.config.ascii_organism_enabled,
             self.config.ascii_organism_expanded,
             self.config.bottom_bar,
+            self.config.block_mode,
         )
     }
 
@@ -20847,7 +20930,7 @@ impl Frost {
 
     fn organism_observation_owner(&self) -> Option<usize> {
         if !self.config.ascii_organism_enabled
-            || !self.config.bottom_bar
+            || (!self.config.block_mode && !self.config.bottom_bar)
             || !self.focused
             || !self.terminal_input_active()
             || !self.organism_layout().presentable()
@@ -20972,6 +21055,15 @@ impl Frost {
 
     fn status_bar(&self) -> Element<'_, Message> {
         let layout = self.organism_layout();
+        let layout = if self.config.block_mode {
+            OrganismLayout {
+                glyph: false,
+                body: false,
+                explanation: false,
+            }
+        } else {
+            layout
+        };
         let attention_facts = self.organism_attention_facts();
         let sess = self.sessions.get(self.active);
         let cwd = sess
@@ -21100,6 +21192,7 @@ impl Frost {
                 glyph,
                 sprite,
                 explanation,
+                ..
             } = presentation;
             let candidate_visible = self.organism_hover_eligible()
                 && self.organism_owner().is_some_and(|id| {
@@ -21178,12 +21271,14 @@ impl Frost {
             .align_y(iced::Alignment::Center);
         let bar: Element<'_, Message> = if let Some(slot) = compact_slot {
             companion_status_with_slot(bar.into(), slot, 12)
-        } else if companion_narrow_reopen(
-            self.win_size.width,
-            self.config.ascii_organism_enabled,
-            self.config.ascii_organism_expanded,
-            self.config.bottom_bar,
-        ) {
+        } else if !self.config.block_mode
+            && companion_narrow_reopen(
+                self.win_size.width,
+                self.config.ascii_organism_enabled,
+                self.config.ascii_organism_expanded,
+                self.config.bottom_bar,
+            )
+        {
             companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)
         } else {
             bar.into()
@@ -21455,6 +21550,15 @@ impl Frost {
             .collect();
         let mut summary_bounds = vec![(None, None); zones.len()];
         for (view_row, kind) in sess.projection.row_kinds().iter().enumerate() {
+            if let terminal::ProjectedRowKind::BlockChrome { boundary, .. } = kind {
+                if let terminal::ChromeKind::Header { zone_id } = boundary.kind {
+                    if let Some(&zone_index) = zone_indexes.get(&zone_id) {
+                        memberships.rows[view_row] =
+                            Some((zone_index, zones[zone_index].prompt_start));
+                    }
+                }
+                continue;
+            }
             let terminal::ProjectedRowKind::CollapsedSummary { key, .. } = kind else {
                 continue;
             };
@@ -21476,14 +21580,17 @@ impl Frost {
                     .raw_row_id_at_absolute(zone_start)
                     .and_then(|row| sess.projection.raw_row_view_bounds(row))
                     .map(|(first, _)| first);
-                let top = projected_card_real_top(
+                let header_top = sess.projection.row_kinds().iter().position(|kind| matches!(kind,
+                    terminal::ProjectedRowKind::BlockChrome { boundary: terminal::ChromeBoundary {
+                        kind: terminal::ChromeKind::Header { zone_id }, .. }, line: 0 } if *zone_id == zones[zone_index].id));
+                let top = header_top.or_else(|| projected_card_real_top(
                     visible_raw_top,
                     summary_bounds[zone_index].0,
                     block_mode::classify(
                         zones[zone_index].command.as_deref(),
                         zones[zone_index].exit_code,
                     ),
-                );
+                ).filter(|row| *row > 0 || sess.projection.uses_identity_fast_path()));
                 let bottom = if sess
                     .projection
                     .effective_collapsed()
@@ -21586,6 +21693,44 @@ impl Frost {
             };
             let active = sess.block_selection.active() == Some(zone.id);
             let row = &mut paint[top_view];
+            if matches!(
+                sess.projection.row_kinds().get(top_view),
+                Some(terminal::ProjectedRowKind::BlockChrome { .. })
+            ) {
+                let cwd = zone.cwd.as_deref().unwrap_or("unknown directory");
+                let cwd = crate::review_text::bound_toast_text(cwd.to_owned());
+                let clock = zone
+                    .finished_at_ms
+                    .map(|ms| {
+                        block_mode::clock_at_offset(
+                            ms,
+                            block_mode::local_offset_secs((ms / 1000) as i64),
+                        )
+                    })
+                    .unwrap_or_default();
+                let badge = block_mode::badge_ladder(
+                    outcome,
+                    zone.duration_ms,
+                    zone.start_mark_seen,
+                    zone.completion_provenance,
+                    None,
+                )
+                .next()
+                .unwrap_or_default();
+                row.native_header = Some(terminal_view::BlockHeaderPaint {
+                    label: format!("cwd · {cwd} · {clock} · {badge}"),
+                    status: match outcome {
+                        BlockOutcome::Success => "✓",
+                        BlockOutcome::Failed(_) => "×",
+                        BlockOutcome::Unknown => "?",
+                        BlockOutcome::Background => "·",
+                    },
+                    collapsed: sess.projection_policy.is_collapsed(zone.id),
+                });
+                row.header_end_col = usize::MAX;
+                row.bookmarked = sess.block_bookmarks.contains(zone.id);
+                continue;
+            }
             row.separator = true;
             row.bookmarked = sess.block_bookmarks.contains(zone.id);
             // The selected block's badge appends its LOCAL finish time; when
@@ -21662,6 +21807,14 @@ impl Frost {
                 }
             }
         }
+        for (row, kind) in paint.iter_mut().zip(sess.projection.row_kinds()) {
+            if let terminal::ProjectedRowKind::BlockChrome { boundary, line } = kind {
+                if boundary.kind == terminal::ChromeKind::Organism {
+                    row.host_spacer = true;
+                    row.organism_status = Some((*line, boundary.rows));
+                }
+            }
+        }
         paint
     }
 
@@ -21721,8 +21874,8 @@ impl Frost {
     /// admission. There is one body owner and no body in Static/traditional UI.
     fn organism_body_owner(&self) -> Option<usize> {
         if !self.config.block_mode
-            || self.organism_geometry_epoch == u64::MAX
             || self.config.ascii_organism_motion == Some(organism::Motion::Static)
+            || self.organism_geometry_epoch == u64::MAX
             || !self.organism_pointer_buttons.is_empty()
             || self.dragging_tab.is_some()
             || self.pane_drag.is_some()
@@ -21885,6 +22038,29 @@ impl Frost {
                     block,
                     epoch: self.organism_geometry_epoch,
                     sprite: presentation.sprite,
+                    walking_sprite: presentation.walking_sprite,
+                    tone: presentation.tone,
+                    frame: self.organism.paint_frame(self.config.ascii_organism_motion),
+                    wander: presentation.wander,
+                    bottom: presentation.bottom,
+                }
+            });
+        let status_presentation = (self.config.block_mode && self.config.ascii_organism_enabled)
+            .then(|| {
+                if is_active {
+                    self.organism_owner()
+                        .map(|id| {
+                            self.organism.presentation_with_attention(
+                                id,
+                                sess.terminal.is_command_running(),
+                                false,
+                                self.config.ascii_organism_motion,
+                                self.organism_attention_facts(),
+                            )
+                        })
+                        .unwrap_or_else(organism::LivePresentation::passive_presence)
+                } else {
+                    organism::LivePresentation::passive_presence()
                 }
             });
         TermWidget::new(
@@ -21915,6 +22091,11 @@ impl Frost {
         ))
         .search(search_matches, current)
         .blocks(blocks)
+        .organism_status(
+            status_presentation,
+            self.config.ascii_organism_expanded,
+            Message::SetOrganismExpanded,
+        )
         .organism_body(
             organism_body,
             self.organism.live_greeting_offer(session_id),
@@ -23771,15 +23952,17 @@ impl Frost {
         column![
             checkbox(self.config.ascii_organism_enabled).label("ASCII Organism")
                 .on_toggle(Message::SetAsciiOrganism),
-            text("Local bottom-bar companion. Memory is volatile; it resets when disabled or closed.").size(11),
+            text("Local companion. Memory is volatile; it resets when disabled or closed.").size(11),
             checkbox(self.config.ascii_organism_expanded).label("Show expanded companion")
                 .on_toggle(Message::SetOrganismExpanded),
-            text(organism_settings_hint(
+            text(if self.config.block_mode && self.config.ascii_organism_enabled {
+                "Block mode keeps the status card between history and current input. Its arrow switches between a full card and one line, independently of the bottom bar. Full wanders in safe blank space; Calm rests; Static shows only this status card."
+            } else { organism_settings_hint(
                 self.win_size.width,
                 self.config.ascii_organism_enabled,
                 self.config.ascii_organism_expanded,
                 self.config.bottom_bar,
-            )).size(11),
+            ) }).size(11),
             text("Organism Motion").size(13),
             pick_list(organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
@@ -27724,9 +27907,25 @@ impl Frost {
         let preview_visible = self.organism_preview_visible();
         let live_layout = self.organism_layout();
         let attention_facts = self.organism_attention_facts();
-        // Reuse the one maintenance timer across every presentable layout,
-        // including a temporarily remote/alt/overlay-suppressed narrow body.
-        let live_visible = live_layout.maintenance_eligible(self.focused);
+        // Reuse the existing maintenance timer. A scrolled-out/alternate-screen
+        // inline companion owns no cadence when neither status nor body paints.
+        let native_visible = !self.config.block_mode
+            || self.organism_body_hover_available()
+            || self.sessions.get(self.active).is_some_and(|session| {
+                session.projection.row_kinds().iter().any(|kind| {
+                    matches!(
+                        kind,
+                        terminal::ProjectedRowKind::BlockChrome {
+                            boundary: terminal::ChromeBoundary {
+                                kind: terminal::ChromeKind::Organism,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                })
+            });
+        let live_visible = live_layout.maintenance_eligible(self.focused) && native_visible;
         let preview_full = preview_visible
             && self.organism.preview_animation_enabled()
             && self.config.ascii_organism_motion == Some(organism::Motion::Full);
@@ -30352,7 +30551,7 @@ mod tests {
             assert!(!helper.contains(forbidden));
         }
         let settings = source
-            .split_once("            text(organism_settings_hint(")
+            .split_once("            text(if self.config.block_mode")
             .unwrap()
             .1
             .split_once("            text(\"Organism Motion\")")
@@ -30459,10 +30658,10 @@ mod tests {
             .split_once("// Keep the input method")
             .unwrap()
             .0;
-        assert!(passive.contains("self.organism_geometry(bounds, viewport)"));
+        assert!(passive.contains("self.painted_organism_geometry("));
         assert!(passive.contains("CursorMoved"));
         assert!(!passive.contains("capture_event"));
-        assert!(!passive.contains("request_redraw"));
+        assert!(passive.contains("shell.request_redraw()"));
     }
 
     #[test]
@@ -30542,6 +30741,38 @@ mod tests {
         ] {
             assert!(!narrow.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn inline_organism_mode_expanded_footer_motion_matrix() {
+        for block in [false, true] {
+            for expanded in [false, true] {
+                for bottom in [false, true] {
+                    for motion in [
+                        organism::Motion::Full,
+                        organism::Motion::Calm,
+                        organism::Motion::Static,
+                    ] {
+                        let layout = organism_host_layout(900.0, true, expanded, bottom, block);
+                        assert_eq!(layout.presentable(), block || bottom);
+                        if block {
+                            assert!(!layout.glyph, "Block mode never duplicates the footer slot");
+                            assert_eq!(
+                                native_status_rows(true, expanded, 18.0),
+                                if expanded { 4 } else { 1 }
+                            );
+                            let moving = motion == organism::Motion::Full;
+                            let body = motion != organism::Motion::Static;
+                            assert!(!moving || body);
+                        } else {
+                            assert_eq!(layout.body, bottom && expanded);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(native_status_rows(false, true, 18.0), 0);
+        assert!(!organism_host_layout(120.0, true, true, false, true).presentable());
     }
 
     #[test]
@@ -32934,7 +33165,8 @@ mod tests {
                 terminal::ProjectedRowKind::CollapsedSummary { key, .. } => Some((row, *key)),
                 terminal::ProjectedRowKind::Raw
                 | terminal::ProjectedRowKind::Padding
-                | terminal::ProjectedRowKind::BlockSpacer { .. } => None,
+                | terminal::ProjectedRowKind::BlockSpacer { .. }
+                | terminal::ProjectedRowKind::BlockChrome { .. } => None,
             })
             .expect("visible collapsed summary");
         let activation = SummaryActivation {

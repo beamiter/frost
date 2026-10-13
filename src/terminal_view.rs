@@ -30,12 +30,18 @@ pub(crate) struct OrganismBodyGeometry {
     pub epoch: u64,
     pub projection: ProjectionKey,
     pub rect: organism_block::Rect,
+    pub travel: organism_block::Rect,
 }
 
 pub(crate) struct OrganismBody {
     pub block: crate::terminal::RawRowId,
     pub epoch: u64,
     pub sprite: String,
+    pub walking_sprite: String,
+    pub frame: u64,
+    pub wander: Option<u64>,
+    pub bottom: bool,
+    pub tone: Option<jterm_core::organism::Tone>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +49,96 @@ pub(crate) struct OrganismBodyObservation {
     pub geometry: Option<OrganismBodyGeometry>,
     pub edge: BodyEdge,
     pub ticket: Option<LiveAttentionTicket>,
+}
+
+fn organism_tone_color(tone: Option<jterm_core::organism::Tone>, theme: &Theme) -> Color {
+    use jterm_core::organism::Tone;
+    match tone {
+        Some(Tone::Error) => theme.ansi_color(1),
+        Some(Tone::Success) => theme.ansi_color(2),
+        Some(Tone::Warning) => theme.ansi_color(3),
+        Some(Tone::Quiet) => theme.ansi_color(4),
+        _ => Theme::rgb_to_color32(theme.tabbar.active_border),
+    }
+}
+
+/// The status card shares the reference CSS state colors without changing the
+/// shared reaction or motion policy. Values are logical paint-only opacities.
+fn organism_card_opacity(tone: Option<jterm_core::organism::Tone>) -> (f32, f32) {
+    use jterm_core::organism::Tone;
+    match tone {
+        Some(Tone::Quiet) => (0.70, 0.035),
+        Some(Tone::Success) => (0.55, 0.08),
+        Some(Tone::Error) => (0.70, 0.10),
+        Some(Tone::Warning) => (0.62, 0.07),
+        _ => (0.90, 0.07),
+    }
+}
+
+fn organism_body_border_opacity(tone: Option<jterm_core::organism::Tone>) -> f32 {
+    use jterm_core::organism::Tone;
+    match tone {
+        Some(Tone::Quiet) => 0.32,
+        Some(Tone::Error) => 0.55,
+        _ => 0.50,
+    }
+}
+
+fn chrome_text<Renderer: text::Renderer<Font = iced::Font>>(
+    renderer: &mut Renderer,
+    content: &str,
+    area: Rectangle,
+    font: iced::Font,
+    size: f32,
+    color: Color,
+    clip: Rectangle,
+) {
+    if area.width <= 0.0 || area.height <= 0.0 {
+        return;
+    }
+    let Some(clip) = clip.intersection(&area) else {
+        return;
+    };
+    renderer.fill_text(
+        Text {
+            content: content.to_owned(),
+            bounds: area.size(),
+            size: Pixels(size),
+            line_height: text::LineHeight::Absolute(Pixels(area.height)),
+            font,
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Center,
+            shaping: glyph_shaping(content),
+            wrapping: text::Wrapping::None,
+        },
+        Point::new(area.x, area.center_y()),
+        color,
+        clip,
+    );
+}
+
+/// Native chrome always excludes the reserved scrollbar lane, even when Auto
+/// hides the thumb. Paint and control hit targets must share this coordinate.
+fn block_chrome_right(bounds: Rectangle, metrics: Metrics) -> f32 {
+    bounds.x + bounds.width - metrics.padding - SCROLLBAR_WIDTH
+}
+
+fn native_header_action(
+    button: MouseButton,
+    x: f32,
+    bounds: Rectangle,
+    metrics: Metrics,
+    shift: bool,
+    ctrl: bool,
+) -> Option<BlockMouseAction> {
+    let right = block_chrome_right(bounds, metrics);
+    match button {
+        MouseButton::Right => Some(BlockMouseAction::Menu),
+        MouseButton::Left if x >= right - 3.0 * metrics.cell_w => Some(BlockMouseAction::Collapse),
+        MouseButton::Left if x >= right - 6.0 * metrics.cell_w => Some(BlockMouseAction::Menu),
+        MouseButton::Left => block_mouse_action(button, true, true, shift, ctrl, 1),
+        MouseButton::Middle => None,
+    }
 }
 
 fn native_body_rect(rect: Rectangle) -> organism_block::Rect {
@@ -84,6 +180,7 @@ pub enum BlockMouseAction {
     Toggle,
     /// Right press anywhere in the completed card.
     Menu,
+    Collapse,
 }
 
 /// A collapsed-output summary that completed a stable click gesture. The
@@ -280,6 +377,8 @@ pub struct BlockPaintRow {
     /// Display-only inter-card whitespace; even middle-click must remain
     /// inert instead of turning a synthetic row into a paste/input target.
     pub host_spacer: bool,
+    pub native_header: Option<BlockHeaderPaint>,
+    pub organism_status: Option<(usize, usize)>,
     /// This row belongs to a finalized block and participates in card hit
     /// routing. Running/live-prompt chrome deliberately leaves this false so
     /// their presses remain ordinary terminal/application input.
@@ -322,6 +421,13 @@ pub struct BlockPaintRow {
     /// Host-owned collapse affordance. Summary rows never participate in
     /// links, terminal text selection, cursor placement, or app mouse mode.
     pub collapsed_summary: Option<CollapsedSummaryPaint>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockHeaderPaint {
+    pub label: String,
+    pub status: &'static str,
+    pub collapsed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -609,6 +715,9 @@ struct State {
     scroll_accum: f32,
     summary_press: Option<SummaryPress>,
     organism_pointer: organism_block::Pointer<OrganismBodyGeometry>,
+    body_geometry: Option<OrganismBodyGeometry>,
+    body_frame: u64,
+    body_walking: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -645,6 +754,9 @@ impl Default for State {
             scroll_accum: 0.0,
             summary_press: None,
             organism_pointer: organism_block::Pointer::default(),
+            body_geometry: None,
+            body_frame: 0,
+            body_walking: false,
         }
     }
 }
@@ -783,6 +895,9 @@ pub struct TermWidget<'a, Message> {
     /// with the grid rows exactly like `selection`. Empty = no block mode.
     blocks: Vec<BlockPaintRow>,
     organism_body: Option<OrganismBody>,
+    organism_status: Option<crate::organism::LivePresentation>,
+    organism_expanded: bool,
+    on_organism_toggle: Option<Box<dyn Fn(bool) -> Message + 'a>>,
     organism_offer: Option<LiveAttentionTicket>,
     organism_exit: Option<LiveAttentionTicket>,
     on_organism: Option<Box<dyn Fn(OrganismBodyObservation) -> Message + 'a>>,
@@ -870,6 +985,9 @@ impl<'a, Message> TermWidget<'a, Message> {
             scrollback_len,
             blocks: Vec::new(),
             organism_body: None,
+            organism_status: None,
+            organism_expanded: false,
+            on_organism_toggle: None,
             organism_offer: None,
             organism_exit: None,
             on_organism: None,
@@ -1011,6 +1129,18 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    pub(crate) fn organism_status(
+        mut self,
+        presentation: Option<crate::organism::LivePresentation>,
+        expanded: bool,
+        toggle: impl Fn(bool) -> Message + 'a,
+    ) -> Self {
+        self.organism_status = presentation;
+        self.organism_expanded = expanded;
+        self.on_organism_toggle = Some(Box::new(toggle));
+        self
+    }
+
     /// Paint/observe only. Native input routing and layout are untouched.
     pub(crate) fn organism_body(
         mut self,
@@ -1038,6 +1168,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             || !self.images.is_empty()
             || self.selection.iter().any(Option::is_some)
             || !organism_block::sprite_fits(&body.sprite)
+            || !organism_block::sprite_fits(&body.walking_sprite)
         {
             return None;
         }
@@ -1074,7 +1205,7 @@ impl<'a, Message> TermWidget<'a, Message> {
                 last_occupied_row = Some(row);
             }
         }
-        let rect = organism_block::placement(organism_block::Surface {
+        let surface = organism_block::Surface {
             card: native_body_rect(card),
             clip: native_body_rect(clip),
             grid_origin: origin,
@@ -1085,13 +1216,108 @@ impl<'a, Message> TermWidget<'a, Message> {
             last_occupied_row,
             columns,
             complete: segment.real_top && segment.real_bottom,
-        })?;
+        };
+        let travel = organism_block::travel_band(surface)?;
+        let mut resting = organism_block::placement(surface)?;
+        if body.bottom {
+            resting.y = travel.y + travel.height - resting.height;
+        }
+        let rect = organism_block::wander(travel, resting, body.frame, body.wander, cw);
         Some(OrganismBodyGeometry {
             block: body.block,
             epoch: body.epoch,
             projection: self.projection_key.clone()?,
             rect,
+            travel: organism_block::travel_band(surface)?,
         })
+    }
+
+    fn painted_organism_geometry(
+        &self,
+        bounds: Rectangle,
+        viewport: &Rectangle,
+        previous: Option<&OrganismBodyGeometry>,
+        previous_frame: u64,
+        point: Option<(f32, f32)>,
+    ) -> Option<OrganismBodyGeometry> {
+        let mut current = self.organism_geometry(bounds, viewport)?;
+        let body = self.organism_body.as_ref()?;
+        if let Some(previous) = previous.filter(|old| {
+            old.block == current.block
+                && old.epoch == current.epoch
+                && old.projection == current.projection
+                && old.travel == current.travel
+                && old.rect.y == current.rect.y
+                && old.rect.width == current.rect.width
+                && old.rect.height == current.rect.height
+        }) {
+            // Hold under the pointer regardless of greeting eligibility. On
+            // release there is no catch-up jump: only one native cell per new
+            // shared 100 ms epoch, never per arbitrary input/redraw event.
+            if point.is_some_and(|point| previous.rect.contains(point))
+                || body.frame == previous_frame
+            {
+                current.rect = previous.rect;
+            } else if body.wander.is_some() {
+                current.rect.x = previous.rect.x
+                    + (current.rect.x - previous.rect.x)
+                        .clamp(-self.metrics.cell_w, self.metrics.cell_w);
+            }
+        }
+        Some(current)
+    }
+
+    /// Select the existing shared stride only for actual native movement. A
+    /// geometry snap, hover freeze or reduced-motion placement is never a step.
+    fn organism_walking(
+        &self,
+        current: Option<&OrganismBodyGeometry>,
+        previous: &State,
+        point: Option<(f32, f32)>,
+    ) -> bool {
+        let Some(body) = self.organism_body.as_ref() else {
+            return false;
+        };
+        if !body.wander.is_some_and(|walk| walk > 0) {
+            return false;
+        }
+        let Some((current, old)) = current.zip(previous.body_geometry.as_ref()) else {
+            return false;
+        };
+        if current.block != old.block
+            || current.epoch != old.epoch
+            || current.projection != old.projection
+            || current.travel != old.travel
+            || current.rect.y != old.rect.y
+            || current.rect.width != old.rect.width
+            || current.rect.height != old.rect.height
+            || point.is_some_and(|p| old.rect.contains(p) || current.rect.contains(p))
+        {
+            return false;
+        }
+        if body.frame == previous.body_frame {
+            previous.body_walking
+        } else {
+            current.rect.x != old.rect.x
+        }
+    }
+
+    fn organism_toggle_at(&self, position: Point, bounds: Rectangle) -> bool {
+        let (_, row) = self.cell_at(position, bounds);
+        self.focused
+            && self.organism_status.is_some()
+            && bounds.contains(position)
+            && self
+                .blocks
+                .get(row)
+                .is_some_and(|block| block.organism_status.is_some_and(|(line, _)| line == 0))
+            && bounds.width - self.metrics.padding - SCROLLBAR_WIDTH - 16.0 >= 160.0
+            && position.x
+                >= bounds.x + bounds.width
+                    - self.metrics.padding
+                    - SCROLLBAR_WIDTH
+                    - 3.0 * self.metrics.cell_w
+            && position.x < bounds.x + bounds.width - self.metrics.padding - SCROLLBAR_WIDTH - 8.0
     }
 
     pub fn app_mouse_full_grid(mut self, full_grid: bool) -> Self {
@@ -1483,6 +1709,12 @@ mod tests {
                 block: terminal.raw_row_id_at_absolute(0).unwrap(),
                 epoch: 9,
                 sprite: crate::organism::LivePresentation::passive_presence().sprite,
+                walking_sprite: crate::organism::LivePresentation::passive_presence()
+                    .walking_sprite,
+                frame: 0,
+                wander: None,
+                bottom: false,
+                tone: None,
             }),
             None,
             None,
@@ -1504,8 +1736,8 @@ mod tests {
             let geometry = widget.organism_geometry(bounds, &bounds).unwrap();
             assert_eq!(geometry.epoch, 9);
             assert_eq!(Some(&geometry.projection), widget.projection_key.as_ref());
-            assert_eq!(geometry.rect.y, 28.0);
-            assert_eq!(geometry.rect.height, 36.0);
+            assert_eq!(geometry.rect.y, 16.0);
+            assert_eq!(geometry.rect.height, 44.0);
             // Moving only the native widget origin moves the body by the same
             // amount; it never acquires a viewport-bottom anchor.
             let moved = Rectangle { y: 24.0, ..bounds };
@@ -1550,6 +1782,11 @@ mod tests {
                         block: b.block,
                         epoch: b.epoch,
                         sprite: b.sprite.clone(),
+                        walking_sprite: b.walking_sprite.clone(),
+                        frame: b.frame,
+                        wander: b.wander,
+                        bottom: b.bottom,
+                        tone: b.tone,
                     }),
                     blocks: widget.blocks.clone(),
                     projection_key: widget.projection_key.clone(),
@@ -1573,6 +1810,198 @@ mod tests {
                 };
                 assert!(test_widget.organism_geometry(bounds, &bounds).is_none());
             }
+        });
+    }
+
+    #[test]
+    fn native_body_wander_freezes_hover_and_geometry_never_enters_by_itself() {
+        with_native_body(|widget, bounds| {
+            widget.organism_body.as_mut().unwrap().wander = Some(40);
+            widget.organism_body.as_mut().unwrap().frame = 380;
+            let initial = widget.organism_geometry(bounds, &bounds).unwrap();
+            let point = Some((initial.rect.x + 2.0, initial.rect.y + 2.0));
+            widget.organism_body.as_mut().unwrap().frame = 390;
+            assert_ne!(
+                widget.organism_geometry(bounds, &bounds),
+                Some(initial.clone())
+            );
+            assert_eq!(
+                widget.painted_organism_geometry(bounds, &bounds, Some(&initial), 380, point),
+                Some(initial.clone())
+            );
+            let moved = widget
+                .painted_organism_geometry(bounds, &bounds, Some(&initial), 380, None)
+                .unwrap();
+            assert!((moved.rect.x - initial.rect.x).abs() <= widget.metrics.cell_w + 0.001);
+            assert_eq!(
+                widget.painted_organism_geometry(bounds, &bounds, Some(&moved), 390, None),
+                Some(moved.clone())
+            );
+            let mut pointer = crate::organism_block::Pointer::default();
+            pointer.observe(Some(initial), point, false, false);
+            assert_eq!(
+                pointer.observe(Some(moved), point, true, false),
+                Some(crate::organism_block::Edge::Geometry)
+            );
+            let shifted = Rectangle {
+                x: bounds.x + 20.0,
+                ..bounds
+            };
+            assert_ne!(
+                widget
+                    .painted_organism_geometry(shifted, &shifted, None, 0, point)
+                    .unwrap()
+                    .travel,
+                widget.organism_geometry(bounds, &bounds).unwrap().travel
+            );
+        });
+    }
+
+    #[test]
+    fn native_organism_colors_match_reference_state_hierarchy() {
+        use crate::theme::ThemeExt as _;
+        use jterm_core::organism::Tone;
+        let theme = crate::theme::Theme::default();
+        for (tone, ansi, card, body) in [
+            (Tone::Quiet, 4, (0.70, 0.035), 0.32),
+            (Tone::Success, 2, (0.55, 0.08), 0.50),
+            (Tone::Error, 1, (0.70, 0.10), 0.55),
+            (Tone::Warning, 3, (0.62, 0.07), 0.50),
+        ] {
+            assert_eq!(
+                super::organism_tone_color(Some(tone), &theme),
+                theme.ansi_color(ansi)
+            );
+            assert_eq!(super::organism_card_opacity(Some(tone)), card);
+            assert_eq!(super::organism_body_border_opacity(Some(tone)), body);
+        }
+        assert_eq!(
+            super::organism_card_opacity(Some(Tone::Active)),
+            (0.90, 0.07)
+        );
+        assert_eq!(super::organism_card_opacity(None), (0.90, 0.07));
+    }
+
+    #[test]
+    fn native_stride_tracks_real_steps_and_stops_for_hover_rest_or_reduced_motion() {
+        with_native_body(|widget, bounds| {
+            widget.organism_body.as_mut().unwrap().wander = Some(40);
+            widget.organism_body.as_mut().unwrap().frame = 380;
+            let initial = widget.organism_geometry(bounds, &bounds).unwrap();
+            let mut state = super::State {
+                body_geometry: Some(initial.clone()),
+                body_frame: 380,
+                ..Default::default()
+            };
+            widget.organism_body.as_mut().unwrap().frame = 390;
+            let moved = widget
+                .painted_organism_geometry(bounds, &bounds, Some(&initial), 380, None)
+                .unwrap();
+            assert_ne!(moved.rect.x, initial.rect.x);
+            assert!(widget.organism_walking(Some(&moved), &state, None));
+            state.body_geometry = Some(moved.clone());
+            state.body_frame = 390;
+            state.body_walking = true;
+            assert!(
+                widget.organism_walking(Some(&moved), &state, None),
+                "same-frame redraw retains the stride"
+            );
+            let point = Some((moved.rect.x + 2.0, moved.rect.y + 2.0));
+            assert!(!widget.organism_walking(Some(&moved), &state, point));
+            widget.organism_body.as_mut().unwrap().frame = 391;
+            assert!(
+                !widget.organism_walking(Some(&moved), &state, None),
+                "a new stationary frame rests"
+            );
+            let mut changed = moved.clone();
+            changed.epoch += 1;
+            assert!(!widget.organism_walking(Some(&changed), &state, None));
+            for wander in [None, Some(0)] {
+                widget.organism_body.as_mut().unwrap().wander = wander;
+                assert!(!widget.organism_walking(Some(&initial), &state, None));
+            }
+            widget.organism_body = None;
+            assert!(!widget.organism_walking(Some(&initial), &state, None));
+        });
+    }
+
+    #[test]
+    fn native_header_hit_zones_match_paint_when_scrollbar_auto_hides() {
+        with_native_body(|widget, bounds| {
+            for (history, offset, always, visible) in [
+                (0, 0, false, false),
+                (100, 0, false, false),
+                (100, 5, false, true),
+                (100, 0, true, true),
+            ] {
+                widget.scrollback_len = history;
+                widget.scroll_offset = offset;
+                widget.scrollbar_always = always;
+                assert_eq!(widget.scrollbar_geometry(bounds).is_some(), visible);
+                let right = super::block_chrome_right(bounds, widget.metrics);
+                let cw = widget.metrics.cell_w;
+                assert_eq!(
+                    super::native_header_action(
+                        super::MouseButton::Left,
+                        right - 2.0 * cw,
+                        bounds,
+                        widget.metrics,
+                        false,
+                        false
+                    ),
+                    Some(super::BlockMouseAction::Collapse)
+                );
+                assert_eq!(
+                    super::native_header_action(
+                        super::MouseButton::Left,
+                        right - 5.0 * cw,
+                        bounds,
+                        widget.metrics,
+                        false,
+                        false
+                    ),
+                    Some(super::BlockMouseAction::Menu)
+                );
+                assert_eq!(
+                    super::native_header_action(
+                        super::MouseButton::Left,
+                        right - 8.0 * cw,
+                        bounds,
+                        widget.metrics,
+                        false,
+                        false
+                    ),
+                    Some(super::BlockMouseAction::Replace)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn inline_status_toggle_is_host_only_and_hidden_controls_do_not_hit() {
+        with_native_body(|widget, bounds| {
+            widget.organism_status = Some(crate::organism::LivePresentation::passive_presence());
+            widget.blocks[0].organism_status = Some((0, 1));
+            widget.blocks[0].host_spacer = true;
+            let point = Point::new(
+                bounds.width
+                    - widget.metrics.padding
+                    - super::SCROLLBAR_WIDTH
+                    - 2.0 * widget.metrics.cell_w,
+                widget.metrics.padding + widget.metrics.cell_h * 0.5,
+            );
+            assert!(widget.organism_toggle_at(point, bounds));
+            let mut state = super::State::default();
+            assert!(state.consume_spacer_press(super::MouseButton::Middle, true));
+            assert!(state.consumed_presses[super::MouseButton::Middle.slot()]);
+            assert!(!state.published_presses[super::MouseButton::Middle.slot()]);
+            widget.focused = false;
+            assert!(!widget.organism_toggle_at(point, bounds));
+            widget.focused = true;
+            widget.blocks[0].organism_status = Some((1, 4));
+            assert!(!widget.organism_toggle_at(point, bounds));
+            widget.blocks[0].organism_status = None;
+            assert!(!widget.organism_toggle_at(point, bounds));
         });
     }
 
@@ -2365,19 +2794,38 @@ where
         // Observe the exact geometry used by draw, without capturing the event.
         // A redraw/layout/projection change revokes a visit, never creates one.
         if let Some(callback) = self.on_organism.as_ref() {
-            let geometry = self.organism_geometry(bounds, viewport);
             let point = cursor.position().map(|p| (p.x, p.y));
+            let geometry = self.painted_organism_geometry(
+                bounds,
+                viewport,
+                tree.state.downcast_ref::<State>().body_geometry.as_ref(),
+                tree.state.downcast_ref::<State>().body_frame,
+                point,
+            );
+            let walking =
+                self.organism_walking(geometry.as_ref(), tree.state.downcast_ref::<State>(), point);
+            let state = tree.state.downcast_mut::<State>();
+            state.body_frame = self.organism_body.as_ref().map_or(0, |body| body.frame);
+            if state.body_walking != walking {
+                state.body_walking = walking;
+                shell.request_redraw();
+            }
+            if state.body_geometry != geometry {
+                // Iced redraws the complete primitive list, removing the old quad.
+                shell.request_redraw();
+                state.body_geometry = geometry.clone();
+            }
             let inside = geometry
                 .as_ref()
                 .zip(point)
                 .is_some_and(|(g, p)| g.rect.contains(p));
             let moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
-            if let Some(edge) = tree.state.downcast_mut::<State>().organism_pointer.observe(
-                geometry.clone(),
-                point,
-                inside,
-                moved,
-            ) {
+            if let Some(edge) =
+                state
+                    .organism_pointer
+                    .observe(geometry.clone(), point, inside, moved)
+            {
+                shell.request_redraw();
                 let ticket = match edge {
                     BodyEdge::Enter => self.organism_offer,
                     BodyEdge::Exit => self.organism_exit,
@@ -2462,9 +2910,22 @@ where
                         }
                     }
                 }
+                if button == MouseButton::Left && self.organism_toggle_at(pos, bounds) {
+                    if let Some(toggle) = self.on_organism_toggle.as_ref() {
+                        state.consumed_presses[button.slot()] = true;
+                        state.published_presses[button.slot()] = false;
+                        state.dragging = false;
+                        shell.publish(toggle(!self.organism_expanded));
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 if state.consume_spacer_press(
                     button,
-                    self.blocks.get(row).is_some_and(|block| block.host_spacer),
+                    self.blocks.get(row).is_some_and(|block| {
+                        block.host_spacer
+                            || (block.native_header.is_some() && button == MouseButton::Middle)
+                    }),
                 ) {
                     shell.capture_event();
                     return;
@@ -2555,8 +3016,12 @@ where
                         return;
                     }
                 }
-                let block =
-                    block_mouse_action(button, finalized, row_is_header, shift, ctrl, count);
+                let block = if finalized && block_row.is_some_and(|row| row.native_header.is_some())
+                {
+                    native_header_action(button, pos.x, bounds, self.metrics, shift, ctrl)
+                } else {
+                    block_mouse_action(button, finalized, row_is_header, shift, ctrl, count)
+                };
                 let block_zone_id = block.and_then(|_| block_row.and_then(|row| row.zone_id));
                 let link = block.is_none()
                     && ctrl_link_eligible(button, count, ctrl, shift, link_eligible)
@@ -2784,7 +3249,7 @@ where
         let ch = self.metrics.cell_h;
         let ox = bounds.x + pad + self.metrics.block_gutter_width();
         let oy = bounds.y + pad;
-        let scrollbar_track_left = bounds.x + bounds.width - pad - SCROLLBAR_WIDTH;
+        let scrollbar_track_left = block_chrome_right(bounds, self.metrics);
         let default_fg = self
             .dynamic_fg
             .map(|(r, g, b)| Color::from_rgb8(r, g, b))
@@ -3057,7 +3522,15 @@ where
                 let span = if is_wide { 2.0 } else { 1.0 };
                 let x = ox + col_idx as f32 * cw;
                 let mut fg = if cell.foreground == crate::terminal::Color::Default {
-                    default_fg
+                    if self.blocks.get(row_idx).is_some_and(|block| {
+                        block.selectable
+                            && block.native_header.is_none()
+                            && col_idx < block.header_end_col
+                    }) {
+                        block_accent
+                    } else {
+                        default_fg
+                    }
                 } else {
                     resolve_fg_with_palette(
                         cell.foreground,
@@ -3434,12 +3907,323 @@ where
             }
         }
 
-        // Paint the existing shared sprite only in the proven empty region.
-        // Per-cell shaping shares the terminal's real font metrics, including
-        // the heuristic-font fallback. This creates no widget or hit capture.
-        if let Some(geometry) = self.organism_geometry(bounds, viewport) {
+        // Native header/status chrome has no raw-cell provenance. It is never
+        // part of terminal selection, output exports, links, IME, or app reports.
+        for (row_index, block) in self.blocks.iter().enumerate() {
+            let y = oy + row_index as f32 * ch;
+            if let Some(header) = &block.native_header {
+                let area = Rectangle {
+                    x: bounds.x + BLOCK_CARD_INSET,
+                    y: y + 1.0,
+                    width: (scrollbar_track_left - bounds.x - 2.0 * BLOCK_CARD_INSET).max(0.0),
+                    height: ch - 1.0,
+                };
+                renderer.fill_quad(
+                    solid_quad(area),
+                    Background::Color(alpha(default_fg, 0.035)),
+                );
+                let controls = 6.0 * cw;
+                let status_color = block.stripe.unwrap_or(block_accent);
+                let badge = Rectangle {
+                    x: area.x + 8.0,
+                    y: area.y + 2.0,
+                    width: (ch - 4.0).max(0.0),
+                    height: (ch - 4.0).max(0.0),
+                };
+                renderer.fill_quad(
+                    Quad {
+                        bounds: badge,
+                        border: Border {
+                            radius: (ch / 2.0).into(),
+                            ..Border::default()
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(alpha(status_color, 0.12)),
+                );
+                chrome_text(
+                    renderer,
+                    header.status,
+                    Rectangle {
+                        x: badge.x + 3.0,
+                        ..badge
+                    },
+                    self.mono,
+                    self.metrics.font_size * 0.72,
+                    status_color,
+                    clip,
+                );
+                chrome_text(
+                    renderer,
+                    &header.label,
+                    Rectangle {
+                        x: area.x + ch + 10.0,
+                        width: (area.width - controls - ch - 18.0).max(0.0),
+                        ..area
+                    },
+                    self.mono,
+                    self.metrics.font_size * 0.82,
+                    alpha(default_fg, 0.6),
+                    clip,
+                );
+                chrome_text(
+                    renderer,
+                    "⋮",
+                    Rectangle {
+                        x: scrollbar_track_left - 6.0 * cw,
+                        width: 3.0 * cw,
+                        ..area
+                    },
+                    self.mono,
+                    self.metrics.font_size,
+                    alpha(default_fg, 0.5),
+                    clip,
+                );
+                chrome_text(
+                    renderer,
+                    if header.collapsed { "▸" } else { "▾" },
+                    Rectangle {
+                        x: scrollbar_track_left - 3.0 * cw,
+                        width: 2.0 * cw,
+                        ..area
+                    },
+                    self.mono,
+                    self.metrics.font_size,
+                    alpha(default_fg, 0.5),
+                    clip,
+                );
+            }
+            if let (Some((line, rows)), Some(presentation)) =
+                (block.organism_status, self.organism_status.as_ref())
+            {
+                // Derive the unclipped group top from the retained line index,
+                // so partial scroll slices never fabricate a new header.
+                if row_index > 0 && self.blocks[row_index - 1].organism_status.is_some() {
+                    continue;
+                }
+                let area = Rectangle {
+                    x: bounds.x + 8.0,
+                    y: y - line as f32 * ch + if rows == 1 { 1.0 } else { 3.0 },
+                    width: (scrollbar_track_left - bounds.x - 16.0).max(0.0),
+                    height: rows as f32 * ch - if rows == 1 { 2.0 } else { 6.0 },
+                };
+                if area.width < 160.0 {
+                    continue;
+                }
+                renderer.with_layer(clip, |renderer| {
+                    let color = organism_tone_color(presentation.tone, self.theme);
+                    let (border_opacity, fill_opacity) = organism_card_opacity(presentation.tone);
+                    renderer.fill_quad(
+                        Quad {
+                            bounds: area,
+                            border: Border {
+                                color: alpha(color, border_opacity),
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            shadow: Shadow::default(),
+                            snap: true,
+                        },
+                        Background::Color(alpha(color, fill_opacity)),
+                    );
+                    let toggle = Rectangle {
+                        x: scrollbar_track_left - 3.0 * cw,
+                        y: area.y,
+                        width: 2.0 * cw,
+                        height: ch.min(area.height),
+                    };
+                    chrome_text(
+                        renderer,
+                        if rows == 1 { "▸" } else { "▾" },
+                        toggle,
+                        self.mono,
+                        self.metrics.font_size * 0.82,
+                        alpha(default_fg, 0.6),
+                        clip,
+                    );
+                    if rows == 1 {
+                        chrome_text(
+                            renderer,
+                            &presentation.glyph,
+                            Rectangle {
+                                x: area.x + 12.0,
+                                width: 6.0 * cw,
+                                ..area
+                            },
+                            self.mono,
+                            self.metrics.font_size * 0.82,
+                            color,
+                            clip,
+                        );
+                        chrome_text(
+                            renderer,
+                            &format!("ASCII organism · {}", presentation.status),
+                            Rectangle {
+                                x: area.x + 12.0 + 6.0 * cw,
+                                width: (area.width - 24.0 - 9.0 * cw).max(0.0),
+                                ..area
+                            },
+                            self.mono,
+                            self.metrics.font_size * 0.82,
+                            alpha(default_fg, 0.7),
+                            clip,
+                        );
+                        return;
+                    }
+                    let status_ch = ch * 0.82;
+                    let sprite_w = organism_block::BODY_COLS as f32 * cw * 0.82;
+                    let sprite_x = area.x + 12.0;
+                    let sprite_y = area.y + (area.height - 3.0 * status_ch) * 0.5;
+                    let bold = iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..self.mono
+                    };
+                    for (line, content) in presentation.sprite.lines().enumerate() {
+                        chrome_text(
+                            renderer,
+                            content,
+                            Rectangle {
+                                x: sprite_x,
+                                y: sprite_y + line as f32 * status_ch,
+                                width: sprite_w,
+                                height: status_ch,
+                            },
+                            bold,
+                            self.metrics.font_size * 0.82,
+                            color,
+                            clip,
+                        );
+                    }
+                    let detail_x = sprite_x + sprite_w + 12.0;
+                    let detail_w = (area.x + area.width - 12.0 - 3.0 * cw - detail_x).max(0.0);
+                    if detail_w > 100.0 {
+                        let text_h = ((area.height - 16.0 - 6.0) / 3.0).min(ch);
+                        let top = area.y + 8.0;
+                        chrome_text(
+                            renderer,
+                            "ASCII organism",
+                            Rectangle {
+                                x: detail_x,
+                                y: top,
+                                width: detail_w,
+                                height: text_h,
+                            },
+                            bold,
+                            self.metrics.font_size * 0.9,
+                            default_fg,
+                            clip,
+                        );
+                        chrome_text(
+                            renderer,
+                            presentation.status,
+                            Rectangle {
+                                x: detail_x,
+                                y: top + text_h + 3.0,
+                                width: detail_w,
+                                height: text_h,
+                            },
+                            self.mono,
+                            self.metrics.font_size * 0.9,
+                            if matches!(
+                                presentation.tone,
+                                Some(
+                                    jterm_core::organism::Tone::Success
+                                        | jterm_core::organism::Tone::Error
+                                )
+                            ) {
+                                color
+                            } else {
+                                alpha(default_fg, 0.85)
+                            },
+                            clip,
+                        );
+                        chrome_text(
+                            renderer,
+                            &presentation.explanation,
+                            Rectangle {
+                                x: detail_x,
+                                y: top + 2.0 * (text_h + 3.0),
+                                width: detail_w,
+                                height: text_h,
+                            },
+                            self.mono,
+                            self.metrics.font_size * 0.82,
+                            alpha(default_fg, 0.5),
+                            clip,
+                        );
+                        let badge_w = 19.0 * cw * 0.82;
+                        if detail_w > 330.0 + badge_w {
+                            chrome_text(
+                                renderer,
+                                "volatile · no LLM",
+                                Rectangle {
+                                    x: area.x + area.width - 12.0 - 3.0 * cw - badge_w,
+                                    y: top,
+                                    width: badge_w,
+                                    height: text_h,
+                                },
+                                self.mono,
+                                self.metrics.font_size * 0.82,
+                                alpha(default_fg, 0.5),
+                                clip,
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
+        // One padded/bordered native body, no overlay label. The entire old and
+        // new primitive lists are redrawn on movement, avoiding stale pixels.
+        if let Some(geometry) = self.painted_organism_geometry(
+            bounds,
+            viewport,
+            _tree.state.downcast_ref::<State>().body_geometry.as_ref(),
+            _tree.state.downcast_ref::<State>().body_frame,
+            cursor.position().map(|p| (p.x, p.y)),
+        ) {
             if let Some(body) = self.organism_body.as_ref() {
-                for (row, line) in body.sprite.lines().enumerate() {
+                let rect = Rectangle {
+                    x: geometry.rect.x,
+                    y: geometry.rect.y,
+                    width: geometry.rect.width,
+                    height: geometry.rect.height,
+                };
+                let color = organism_tone_color(body.tone, self.theme);
+                let hovered = cursor.position().is_some_and(|p| rect.contains(p));
+                renderer.fill_quad(
+                    Quad {
+                        bounds: rect,
+                        border: Border {
+                            color: if hovered {
+                                alpha(default_fg, 0.45)
+                            } else {
+                                alpha(color, organism_body_border_opacity(body.tone))
+                            },
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(alpha(default_bg, 0.8)),
+                );
+                let bold = iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..self.mono
+                };
+                let walking = self.organism_walking(
+                    Some(&geometry),
+                    _tree.state.downcast_ref::<State>(),
+                    cursor.position().map(|p| (p.x, p.y)),
+                );
+                let sprite = if walking {
+                    &body.walking_sprite
+                } else {
+                    &body.sprite
+                };
+                for (row, line) in sprite.lines().enumerate() {
                     for (col, glyph) in line.chars().enumerate() {
                         if glyph == ' ' {
                             continue;
@@ -3450,17 +4234,23 @@ where
                                 bounds: Size::new(cw, ch),
                                 size: Pixels(self.metrics.font_size),
                                 line_height: text::LineHeight::Absolute(Pixels(ch)),
-                                font: self.mono,
+                                font: bold,
                                 align_x: text::Alignment::Center,
                                 align_y: iced::alignment::Vertical::Center,
                                 shaping: text::Shaping::Basic,
                                 wrapping: text::Wrapping::None,
                             },
                             Point::new(
-                                geometry.rect.x + (col as f32 + 0.5) * cw,
-                                geometry.rect.y + (row as f32 + 0.5) * ch,
+                                rect.x
+                                    + organism_block::BODY_PAD_X
+                                    + organism_block::BODY_BORDER
+                                    + (col as f32 + 0.5) * cw,
+                                rect.y
+                                    + organism_block::BODY_PAD_Y
+                                    + organism_block::BODY_BORDER
+                                    + (row as f32 + 0.5) * ch,
                             ),
-                            block_accent,
+                            color,
                             clip,
                         );
                     }
@@ -3653,6 +4443,7 @@ where
             if before_scrollbar
                 && self.blocks.get(r).is_some_and(|block| {
                     block.collapsed_summary.is_some()
+                        || self.organism_toggle_at(p, layout.bounds())
                         || (block.selectable && (c < block.header_end_col || self.shift))
                 })
             {
@@ -3695,6 +4486,9 @@ mod focus_state_tests {
             scroll_accum: 0.75,
             summary_press: None,
             organism_pointer: organism_block::Pointer::default(),
+            body_geometry: None,
+            body_frame: 0,
+            body_walking: false,
         };
         assert!(state.reset_on_unfocused(&Event::Window(iced::window::Event::Unfocused)));
         assert!(!state.dragging);
@@ -3856,6 +4650,13 @@ mod block_spacing_render_tests {
                                 epoch: 1,
                                 sprite: crate::organism::LivePresentation::passive_presence()
                                     .sprite,
+                                walking_sprite:
+                                    crate::organism::LivePresentation::passive_presence()
+                                        .walking_sprite,
+                                frame: 0,
+                                wander: None,
+                                bottom: false,
+                                tone: None,
                             }),
                             None,
                             None,
@@ -3878,9 +4679,9 @@ mod block_spacing_render_tests {
                             continue;
                         }
                         let geometry = geometry.unwrap();
-                        assert_eq!(geometry.rect.height, 3.0 * metrics.cell_h);
-                        assert_eq!(geometry.rect.width, 12.0 * metrics.cell_w);
-                        assert!(geometry.rect.y >= pos.y + metrics.cell_h);
+                        assert_eq!(geometry.rect.height, 3.0 * metrics.cell_h + 8.0);
+                        assert_eq!(geometry.rect.width, 12.0 * metrics.cell_w + 14.0);
+                        assert!(geometry.rect.y + 0.001 >= pos.y + metrics.cell_h * 0.5);
                         if let Some(previous) = body_y {
                             assert_eq!(
                                 geometry.rect.y, previous,

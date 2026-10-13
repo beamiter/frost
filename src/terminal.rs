@@ -28,7 +28,7 @@ use base64::Engine;
 use jterm_core::click_cursor;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
@@ -1170,11 +1170,29 @@ pub enum ProjectedRowKind {
     BlockSpacer {
         next: RawRowId,
     },
+    BlockChrome {
+        boundary: ChromeBoundary,
+        line: usize,
+    },
     CollapsedSummary {
         key: SyntheticRowKey,
         hidden_range: FinishedOutputRange,
         hidden_display_rows: usize,
     },
+}
+
+/// Native chrome is projected whitespace with no terminal-cell provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChromeKind {
+    Header { zone_id: u64 },
+    Organism,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChromeBoundary {
+    pub next: RawRowId,
+    pub kind: ChromeKind,
+    pub rows: usize,
 }
 
 /// One contiguous piece of a physical raw row referenced by a planned
@@ -1864,6 +1882,70 @@ impl ProjectionPlan {
         self
     }
 
+    /// Insert whole host rows only before a proven, standalone raw boundary.
+    /// This transform never changes source slices, PTY dimensions, or copying.
+    fn splice_native_chrome(
+        mut self,
+        boundaries: &[ChromeBoundary],
+        spare_tail_rows: usize,
+        viewport_rows: usize,
+    ) -> Self {
+        if boundaries.is_empty() {
+            return self;
+        }
+        let by_row: BTreeMap<_, _> = boundaries.iter().map(|b| (b.next, *b)).collect();
+        let mut output: Vec<ProjectionPlanRow> =
+            Vec::with_capacity(self.rows.len() + boundaries.len());
+        let mut emitted = BTreeSet::new();
+        for row in self.rows {
+            let source_row = row
+                .row_source
+                .map(|source| source.raw_row)
+                .or(match row.kind {
+                    ProjectedRowKind::CollapsedSummary { hidden_range, .. } => {
+                        Some(hidden_range.start.row)
+                    }
+                    _ => None,
+                });
+            if let Some(boundary) = source_row.and_then(|source| by_row.get(&source)).copied() {
+                let header_summary = matches!((row.kind, boundary.kind),
+                    (ProjectedRowKind::CollapsedSummary { key, .. }, ChromeKind::Header { zone_id }) if key.zone_id == zone_id);
+                let standalone = (row.kind == ProjectedRowKind::Raw || header_summary)
+                    && !emitted.contains(&boundary.next)
+                    && row.raw_slices.first().is_none_or(|slice| {
+                        slice.view_col_start == 0 && slice.source.col_start == 0
+                    })
+                    && row.raw_slices.iter().all(|slice| {
+                        slice
+                            .origin
+                            .is_some_and(|origin| origin.row == boundary.next)
+                    })
+                    && output.last().is_none_or(|previous| !previous.wrapped);
+                if standalone {
+                    for line in 0..boundary.rows {
+                        output.push(ProjectionPlanRow {
+                            raw_slices: SmallVec::new(),
+                            row_source: None,
+                            wrapped: false,
+                            kind: ProjectedRowKind::BlockChrome { boundary, line },
+                        });
+                    }
+                    self.spacer_count += boundary.rows;
+                    emitted.insert(boundary.next);
+                }
+            }
+            output.push(row);
+        }
+        let trim = spare_tail_rows
+            .min(self.spacer_count)
+            .min(output.len().saturating_sub(viewport_rows));
+        output.truncate(output.len().saturating_sub(trim));
+        self.rows = output;
+        self.raw_slice_count = self.rows.iter().map(|row| row.raw_slices.len()).sum();
+        self.rebuild_raw_row_placements();
+        self
+    }
+
     fn has_transforms(&self) -> bool {
         self.spacer_count > 0 || !self.effective_collapsed.is_empty()
     }
@@ -1987,6 +2069,11 @@ impl ProjectionPlan {
                 .iter()
                 .position(|row| row.kind == ProjectedRowKind::BlockSpacer { next })
                 .or_else(|| self.raw_row_document_row(next)),
+            ProjectedTopAnchor::Chrome { boundary, line } => self
+                .rows
+                .iter()
+                .position(|row| row.kind == ProjectedRowKind::BlockChrome { boundary, line })
+                .or_else(|| self.raw_row_document_row(boundary.next)),
             ProjectedTopAnchor::Summary {
                 zone_id,
                 hidden_range,
@@ -2024,6 +2111,8 @@ pub struct ProjectionPolicy {
     revision: u64,
     collapsed: BTreeSet<u64>,
     block_spacing: bool,
+    native_chrome: bool,
+    organism_rows: usize,
 }
 
 impl Default for ProjectionPolicy {
@@ -2032,6 +2121,8 @@ impl Default for ProjectionPolicy {
             revision: 1,
             collapsed: BTreeSet::new(),
             block_spacing: false,
+            native_chrome: false,
+            organism_rows: 0,
         }
     }
 }
@@ -2047,7 +2138,7 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty() && !self.block_spacing
+        self.collapsed.is_empty() && !self.block_spacing && !self.native_chrome
     }
 
     /// Spacing is a display transform, never a PTY resize or a raw blank line.
@@ -2059,6 +2150,20 @@ impl ProjectionPolicy {
             return false;
         };
         self.block_spacing = enabled;
+        self.revision = revision;
+        true
+    }
+
+    pub fn set_native_chrome(&mut self, enabled: bool, organism_rows: usize) -> bool {
+        let rows = organism_rows.min(8);
+        if self.native_chrome == enabled && self.organism_rows == rows {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.native_chrome = enabled;
+        self.organism_rows = rows;
         self.revision = revision;
         true
     }
@@ -2331,6 +2436,8 @@ struct ProjectedViewportCacheKey {
     policy_ids: SmallVec<[u64; 4]>,
     block_spacing: bool,
     spacing_boundaries: SmallVec<[RawRowId; 4]>,
+    chrome_boundaries: SmallVec<[ChromeBoundary; 4]>,
+    chrome_tail_rows: usize,
     view_scroll_offset: usize,
 }
 
@@ -2349,6 +2456,8 @@ struct ProjectionPlanCacheKey {
     policy_ids: SmallVec<[u64; 4]>,
     block_spacing: bool,
     spacing_boundaries: SmallVec<[RawRowId; 4]>,
+    chrome_boundaries: SmallVec<[ChromeBoundary; 4]>,
+    chrome_tail_rows: usize,
     next_zone_id: u64,
     zone_count: usize,
     provenance_count: usize,
@@ -2362,6 +2471,10 @@ enum ProjectedTopAnchor {
     RawRow(RawRowId),
     Spacer {
         next: RawRowId,
+    },
+    Chrome {
+        boundary: ChromeBoundary,
+        line: usize,
     },
     Summary {
         zone_id: u64,
@@ -10688,6 +10801,97 @@ impl TerminalState {
             .collect()
     }
 
+    /// Unused live-grid tail only: preserve the cursor, every styled/occupied
+    /// cell, and the six-row input card. Raw terminal storage remains untouched.
+    fn native_chrome_tail_rows(&self, policy: &ProjectionPolicy) -> usize {
+        // Kitty placements are independent of cell contents. Until their exact
+        // footprint is proven clear, retain the entire live grid conservatively.
+        if !policy.native_chrome || !self.kitty_graphics.get_placements().is_empty() {
+            return 0;
+        }
+        let Some(start) = self.running_zone_start().or_else(|| self.live_prompt_row()) else {
+            return 0;
+        };
+        let protected = (self.scrollback.len() + self.cursor_row + 1)
+            .max(
+                self.active_app_extent_row()
+                    .map_or(0, |row| row.saturating_add(1)),
+            )
+            .max(start.saturating_add(crate::block_mode::MIN_INPUT_ROWS));
+        (0..self.grid.rows())
+            .rev()
+            .take_while(|&row| {
+                self.scrollback.len() + row >= protected
+                    && !self.grid.row_wrapped[row]
+                    && row
+                        .checked_sub(1)
+                        .is_none_or(|previous| !self.grid.row_wrapped[previous])
+                    && self.grid[row]
+                        .iter()
+                        .all(|cell| *cell == TerminalCell::default())
+            })
+            .count()
+    }
+
+    fn native_chrome_boundaries(&self, policy: &ProjectionPolicy) -> SmallVec<[ChromeBoundary; 4]> {
+        if !policy.native_chrome {
+            return SmallVec::new();
+        }
+        let standalone = |start: usize, background: bool| {
+            let row = self.raw_row_id_at_absolute(start)?;
+            let wrapped = start.checked_sub(1).is_some_and(|previous| {
+                if previous < self.scrollback.len() {
+                    self.scrollback[previous].is_wrapped
+                } else {
+                    self.grid
+                        .row_wrapped
+                        .get(previous - self.scrollback.len())
+                        .copied()
+                        .unwrap_or(true)
+                }
+            });
+            (!wrapped && (background || self.spacing_prompt_rows.contains(&row))).then_some(row)
+        };
+        let mut boundaries: SmallVec<[ChromeBoundary; 4]> = self
+            .command_zones
+            .iter()
+            .filter(|zone| !zone.rows_evicted)
+            .filter_map(|zone| {
+                standalone(
+                    zone.prompt_start,
+                    zone.command.is_none()
+                        && zone.output_start_col == 0
+                        && zone.output_start == Some(zone.prompt_start),
+                )
+                .map(|next| ChromeBoundary {
+                    next,
+                    kind: ChromeKind::Header { zone_id: zone.id },
+                    rows: 1,
+                })
+            })
+            .collect();
+        if policy.organism_rows > 0 {
+            if let Some(next) = self
+                .running_zone_start()
+                .or_else(|| self.live_prompt_row())
+                .and_then(|start| standalone(start, false))
+            {
+                boundaries.push(ChromeBoundary {
+                    next,
+                    kind: ChromeKind::Organism,
+                    rows: policy.organism_rows,
+                });
+            }
+        }
+        // Shared-row lifecycle boundaries are ambiguous; no chrome may claim them.
+        let mut counts = BTreeMap::new();
+        for b in &boundaries {
+            *counts.entry(b.next).or_insert(0) += 1;
+        }
+        boundaries.retain(|b| counts[&b.next] == 1);
+        boundaries
+    }
+
     #[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
     fn collapsed_projection_plan(&self, cols: usize, policy: &ProjectionPolicy) -> ProjectionPlan {
         let mut identity = self.identity_projection_plan(cols);
@@ -10699,6 +10903,11 @@ impl TerminalState {
         identity
             .splice_collapses(&collapses, policy.revision())
             .splice_block_spacing(&self.block_spacing_boundaries(policy.block_spacing))
+            .splice_native_chrome(
+                &self.native_chrome_boundaries(policy),
+                self.native_chrome_tail_rows(policy),
+                self.grid.rows(),
+            )
     }
 
     fn cached_collapsed_projection_plan(
@@ -10716,7 +10925,10 @@ impl TerminalState {
             return plan.has_transforms().then_some(plan);
         }
         let collapses = self.resolved_collapses(policy);
-        if collapses.is_empty() && key.spacing_boundaries.is_empty() {
+        if collapses.is_empty()
+            && key.spacing_boundaries.is_empty()
+            && key.chrome_boundaries.is_empty()
+        {
             return None;
         }
         #[cfg(test)]
@@ -10724,7 +10936,8 @@ impl TerminalState {
         let mut plan = self
             .identity_projection_plan(cols)
             .splice_collapses(&collapses, policy.revision())
-            .splice_block_spacing(&key.spacing_boundaries);
+            .splice_block_spacing(&key.spacing_boundaries)
+            .splice_native_chrome(&key.chrome_boundaries, key.chrome_tail_rows, key.rows);
         // Cache an ineffective plan too: a proven prompt can still share a
         // reflowed row, and idle redraws must not repeatedly rebuild history.
         plan.plan_revision = self.next_projection_plan_revision;
@@ -10767,6 +10980,9 @@ impl TerminalState {
             || !key.policy_ids.is_empty()
             || old.policy_revision != key.policy_revision
             || old.spacing_boundaries != key.spacing_boundaries
+            || old.chrome_boundaries != key.chrome_boundaries
+            || old.chrome_tail_rows > 0
+            || key.chrome_tail_rows > 0
             || old.cols != key.cols
             || old.rows != key.rows
             || old.next_zone_id != key.next_zone_id
@@ -10801,10 +11017,10 @@ impl TerminalState {
             return None;
         }
         let mut tail_start = plan.raw_rows.get(old.history_len)?.first_view_row?;
-        if tail_start > 0
+        while tail_start > 0
             && matches!(
                 plan.rows[tail_start - 1].kind,
-                ProjectedRowKind::BlockSpacer { .. }
+                ProjectedRowKind::BlockSpacer { .. } | ProjectedRowKind::BlockChrome { .. }
             )
         {
             tail_start -= 1;
@@ -10848,7 +11064,8 @@ impl TerminalState {
             )
         });
         let mut suffix = ProjectionPlan::identity(history_layouts, grid_layouts, key.cols)
-            .splice_block_spacing_after(&key.spacing_boundaries, view_base > 0);
+            .splice_block_spacing_after(&key.spacing_boundaries, view_base > 0)
+            .splice_native_chrome(&key.chrome_boundaries, key.chrome_tail_rows, key.rows);
         for row in &mut suffix.rows {
             for slice in &mut row.raw_slices {
                 slice.source.absolute_row += retained_history;
@@ -10867,7 +11084,12 @@ impl TerminalState {
         let removed_tail_spacers = plan.rows.len() - tail_start - old_grid_rows;
         let removed_prefix_spacers = plan.rows[..remove_rows]
             .iter()
-            .filter(|row| matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }))
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    ProjectedRowKind::BlockSpacer { .. } | ProjectedRowKind::BlockChrome { .. }
+                )
+            })
             .count();
         let (cached_key, cached_plan) = self.projection_plan_cache.as_mut()?;
         let plan = std::sync::Arc::get_mut(cached_plan)?;
@@ -10931,6 +11153,8 @@ impl TerminalState {
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
             spacing_boundaries: self.block_spacing_boundaries(policy.block_spacing),
+            chrome_boundaries: self.native_chrome_boundaries(policy),
+            chrome_tail_rows: self.native_chrome_tail_rows(policy),
             next_zone_id: self.next_zone_id,
             zone_count: self.command_zones.len(),
             provenance_count: self.finished_output_provenance.len(),
@@ -11230,6 +11454,8 @@ impl TerminalState {
             policy_ids: SmallVec::new(),
             block_spacing: false,
             spacing_boundaries: SmallVec::new(),
+            chrome_boundaries: SmallVec::new(),
+            chrome_tail_rows: 0,
             view_scroll_offset: self.scroll_offset,
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
@@ -11482,6 +11708,8 @@ impl TerminalState {
             policy_ids: policy.ids(),
             block_spacing: policy.block_spacing,
             spacing_boundaries: self.block_spacing_boundaries(policy.block_spacing),
+            chrome_boundaries: self.native_chrome_boundaries(policy),
+            chrome_tail_rows: self.native_chrome_tail_rows(policy),
             view_scroll_offset,
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
@@ -11557,6 +11785,9 @@ impl TerminalState {
         let view_row = viewport.top_padding;
         match viewport.row_kinds.get(view_row).copied()? {
             ProjectedRowKind::Padding => None,
+            ProjectedRowKind::BlockChrome { boundary, line } => {
+                Some(ProjectedTopAnchor::Chrome { boundary, line })
+            }
             ProjectedRowKind::BlockSpacer { next } => Some(ProjectedTopAnchor::Spacer { next }),
             ProjectedRowKind::CollapsedSummary {
                 key, hidden_range, ..
@@ -11610,6 +11841,7 @@ impl TerminalState {
             Some(ProjectedTopAnchor::RawCell(origin)) => Some(origin.row),
             Some(ProjectedTopAnchor::RawRow(row)) => Some(row),
             Some(ProjectedTopAnchor::Spacer { next }) => Some(next),
+            Some(ProjectedTopAnchor::Chrome { boundary, .. }) => Some(boundary.next),
             Some(ProjectedTopAnchor::Summary { hidden_range, .. }) => Some(hidden_range.start.row),
             None => None,
         };
@@ -12793,7 +13025,10 @@ impl TerminalState {
                 )
             };
 
-            if matches!(planned.kind, ProjectedRowKind::BlockSpacer { .. }) {
+            if matches!(
+                planned.kind,
+                ProjectedRowKind::BlockSpacer { .. } | ProjectedRowKind::BlockChrome { .. }
+            ) {
                 continue;
             }
             if matches!(planned.kind, ProjectedRowKind::CollapsedSummary { .. }) {
@@ -15504,7 +15739,8 @@ mod tests {
                 } => Some(hidden_display_rows),
                 super::ProjectedRowKind::Raw
                 | super::ProjectedRowKind::Padding
-                | super::ProjectedRowKind::BlockSpacer { .. } => None,
+                | super::ProjectedRowKind::BlockSpacer { .. }
+                | super::ProjectedRowKind::BlockChrome { .. } => None,
             })
             .expect("one summary row");
         assert_eq!(summary, 2, "visible output plus its blank line are hidden");
@@ -21784,6 +22020,254 @@ mod block_spacing_tests {
             .iter()
             .filter(|row| matches!(row.kind, ProjectedRowKind::BlockSpacer { .. }))
             .count()
+    }
+
+    fn native() -> ProjectionPolicy {
+        let mut policy = normal();
+        policy.set_native_chrome(true, 5);
+        policy
+    }
+
+    #[test]
+    fn native_chrome_preserves_raw_cells_and_places_status_before_active_prompt() {
+        for compact in [false, true] {
+            let mut terminal = fixture(80, 30);
+            let raw = terminal.grid.to_vec();
+            let cursor = terminal.get_cursor_pos();
+            let mut policy = native();
+            policy.set_block_spacing(!compact);
+            let view = terminal.get_projected_viewport_with_policy(true, &policy, 0);
+            assert_eq!(terminal.grid.to_vec(), raw);
+            assert_eq!(terminal.get_cursor_pos(), cursor);
+            assert_eq!(view.cells().len(), 30);
+            let status: Vec<_> = view
+                .row_kinds()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, kind)| {
+                    matches!(
+                        kind,
+                        ProjectedRowKind::BlockChrome {
+                            boundary: ChromeBoundary {
+                                kind: ChromeKind::Organism,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                    .then_some(i)
+                })
+                .collect();
+            assert_eq!(status.len(), 5);
+            let prompt = terminal
+                .raw_row_id_at_absolute(terminal.live_prompt_row().unwrap())
+                .unwrap();
+            assert_eq!(view.raw_row_view_bounds(prompt).unwrap().0, status[4] + 1);
+            assert_eq!(
+                view.row_kinds()
+                    .iter()
+                    .filter(|kind| matches!(
+                        kind,
+                        ProjectedRowKind::BlockChrome {
+                            boundary: ChromeBoundary {
+                                kind: ChromeKind::Header { .. },
+                                ..
+                            },
+                            ..
+                        }
+                    ))
+                    .count(),
+                2
+            );
+            for row in 0..view.cells().len() {
+                if matches!(view.row_kinds()[row], ProjectedRowKind::BlockChrome { .. }) {
+                    assert_eq!(view.view_row_absolute(row), None);
+                    assert_eq!(view.view_to_raw(ViewportCell { row, col: 0 }), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_chrome_copy_crosses_headers_and_status_without_synthetic_newlines() {
+        let mut terminal = fixture(80, 30);
+        let view = terminal.get_projected_viewport_with_policy(true, &native(), 0);
+        let left = view
+            .cells()
+            .iter()
+            .position(|row| row[0].character == 'L')
+            .unwrap();
+        let right = view
+            .cells()
+            .iter()
+            .position(|row| row[0].character == 'R')
+            .unwrap();
+        terminal.start_selection_in_projection(&view, (left, 0), SelectionMode::Normal);
+        terminal.update_selection_in_projection(&view, (right, 4));
+        let copied = terminal.copy_selection().unwrap();
+        assert_eq!(copied.lines().count(), 3, "{copied:?}");
+        assert!(!copied.contains("\n\n"));
+        assert!(!copied.contains("ASCII organism"));
+        for (row, cells) in view.cells().iter().enumerate() {
+            for col in 0..cells.len() {
+                if let Some(raw) = view.view_to_raw(ViewportCell { row, col }) {
+                    assert_eq!(view.raw_to_view(raw), Some(ViewportCell { row, col }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_chrome_empty_prompt_tail_and_occupied_tail_fail_closed() {
+        let mut terminal = TerminalState::new(80, 30);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let view = terminal.get_projected_viewport_with_policy(true, &native(), 0);
+        assert!(matches!(
+            view.row_kinds()[0],
+            ProjectedRowKind::BlockChrome { line: 0, .. }
+        ));
+        assert_eq!(view.cells()[5][0].character, '$');
+        assert_eq!(terminal.grid.rows(), 30);
+        terminal.grid[29][0].flags.set_dim(true);
+        assert_eq!(terminal.native_chrome_tail_rows(&native()), 0);
+        terminal.grid[29][0] = TerminalCell::default();
+        terminal.cursor_row = 28;
+        assert_eq!(terminal.native_chrome_tail_rows(&native()), 1);
+    }
+
+    #[test]
+    fn native_chrome_never_reclaims_blank_cells_under_kitty_graphics() {
+        let mut terminal = TerminalState::new(80, 30);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(terminal.native_chrome_tail_rows(&native()) > 0);
+        terminal.process_input(b"\x1b[29;1H\x1b_Gf=32,s=1,v=1,a=T,i=51;AQIDBA==\x1b\\\x1b[1;3H");
+        assert!(!terminal.kitty_graphics.get_placements().is_empty());
+        assert_eq!(terminal.native_chrome_tail_rows(&native()), 0);
+    }
+
+    #[test]
+    fn native_chrome_keeps_default_blank_soft_wrap_continuation() {
+        let mut terminal = TerminalState::new(24, 20);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[19;1H");
+        terminal.process_input(b"                         ");
+        terminal.process_input(b"\x1b[1;3H");
+        assert!(terminal.grid.row_wrapped[18]);
+        assert!(terminal.grid[19]
+            .iter()
+            .all(|cell| *cell == TerminalCell::default()));
+        assert_eq!(terminal.native_chrome_tail_rows(&native()), 0);
+        let raw = terminal.raw_row_id_at_absolute(19).unwrap();
+        let plan = terminal.collapsed_projection_plan(24, &native());
+        assert!(plan.raw_row_document_row(raw).is_some());
+    }
+
+    #[test]
+    fn native_chrome_collapse_toggle_modes_and_scroll_anchor_use_raw_identity() {
+        let mut terminal = fixture(40, 16);
+        let mut policy = native();
+        let zone = terminal.command_zones[0].id;
+        let mut state = ProjectionViewState::new();
+        let first = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        let plan = terminal
+            .cached_collapsed_projection_plan(40, &policy)
+            .unwrap();
+        let status = plan
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    ProjectedRowKind::BlockChrome {
+                        boundary: ChromeBoundary {
+                            kind: ChromeKind::Organism,
+                            ..
+                        },
+                        line: 1
+                    }
+                )
+            })
+            .unwrap();
+        let anchor = match plan.rows[status].kind {
+            ProjectedRowKind::BlockChrome { boundary, line } => {
+                ProjectedTopAnchor::Chrome { boundary, line }
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(plan.document_row_for_anchor(anchor), Some(status));
+        drop(plan);
+        policy.collapse(zone);
+        let collapsed = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(collapsed.effective_collapsed().contains(&zone));
+        let full = terminal
+            .cached_collapsed_projection_plan(40, &policy)
+            .unwrap();
+        assert!(full.rows.iter().map(|row| &row.kind).any(|kind| matches!(kind, ProjectedRowKind::BlockChrome { boundary: ChromeBoundary { kind: ChromeKind::Header { zone_id }, .. }, .. } if *zone_id == zone)));
+        policy.set_native_chrome(true, 0);
+        let hidden = terminal.get_projected_viewport_with_state(true, &policy, &mut state);
+        assert!(!hidden.row_kinds().iter().any(|kind| matches!(
+            kind,
+            ProjectedRowKind::BlockChrome {
+                boundary: ChromeBoundary {
+                    kind: ChromeKind::Organism,
+                    ..
+                },
+                ..
+            }
+        )));
+        let bypass = terminal.get_projected_viewport_with_state(false, &policy, &mut state);
+        assert_eq!(bypass.mode(), ProjectionMode::Bypass);
+        assert_eq!(
+            first.cells().first().unwrap().len(),
+            bypass.cells().first().unwrap().len()
+        );
+        terminal.process_input(b"\x1b[?1049hfull screen");
+        assert_eq!(
+            terminal
+                .get_projected_viewport_with_state(true, &policy, &mut state)
+                .mode(),
+            ProjectionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn native_chrome_keeps_header_when_background_output_is_fully_collapsed() {
+        let mut terminal = TerminalState::new(40, 16);
+        terminal.process_input(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07background output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let background = terminal
+            .command_zones
+            .iter()
+            .find(|zone| zone.command.is_none())
+            .unwrap()
+            .id;
+        let mut policy = native();
+        policy.collapse(background);
+        let plan = terminal.collapsed_projection_plan(40, &policy);
+        assert!(plan.effective_collapsed.contains(&background));
+        let header = plan.rows.iter().position(|row| matches!(row.kind,
+            ProjectedRowKind::BlockChrome { boundary: ChromeBoundary { kind: ChromeKind::Header { zone_id }, .. }, .. }
+                if zone_id == background)).unwrap();
+        assert!(matches!(
+            plan.rows[header + 1].kind,
+            ProjectedRowKind::CollapsedSummary { .. }
+        ));
+    }
+
+    #[test]
+    fn native_chrome_streaming_plan_matches_cold_with_headers_and_status() {
+        let mut terminal = fixture(40, 12);
+        terminal.process_input(b"run\r\n\x1b]133;C\x07");
+        let policy = native();
+        for index in 0..100 {
+            terminal.process_input(format!("output {index}\r\n").as_bytes());
+            let hot = terminal
+                .cached_collapsed_projection_plan(40, &policy)
+                .unwrap();
+            let cold = terminal.collapsed_projection_plan(40, &policy);
+            assert_eq!(hot.rows, cold.rows, "frame={index}");
+            assert_eq!(hot.raw_rows, cold.raw_rows, "frame={index}");
+            assert_eq!(hot.raw_slice_count, cold.raw_slice_count, "frame={index}");
+            assert_eq!(hot.spacer_count, cold.spacer_count, "frame={index}");
+        }
     }
 
     #[test]
