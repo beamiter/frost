@@ -21,6 +21,7 @@ mod color;
 mod command_correction;
 mod command_palette;
 mod config;
+mod config_retry;
 mod debug;
 mod history_picker;
 mod image_drop;
@@ -5299,6 +5300,7 @@ struct Frost {
     /// 设置面板中待存储的 API key 明文；提交后立即清空，从不落入配置。
     ai_key_draft: String,
     config_dirty: bool,
+    config_save_retry: config_retry::ConfigSaveRetry,
     link_detector: link::LinkDetector,
     links: Vec<link::Link>,
     /// Stable session plus the complete immutable projection identity used by
@@ -5636,6 +5638,7 @@ impl Frost {
             ai_temperature_draft,
             ai_key_draft: String::new(),
             config_dirty: false,
+            config_save_retry: config_retry::ConfigSaveRetry::default(),
             link_detector: link::LinkDetector::new(link::LinkDetectionConfig::default()),
             links: Vec::new(),
             links_cache_key: None,
@@ -5958,6 +5961,7 @@ impl Frost {
                 self.config = candidate;
                 self.config_revision = Some(revision);
                 self.config_dirty = false;
+                self.config_save_retry.reset();
                 Ok(())
             }
             Err(error) => {
@@ -5988,7 +5992,19 @@ impl Frost {
     }
 
     fn note_config_save_error(&mut self, error: &persistence::AtomicWriteError) {
-        eprintln!("[Config] Save failed: {error}");
+        // Display text excludes revision bytes; retain only a bounded key.
+        // Categories stay distinct even if two errors have the same wording.
+        let key = format!(
+            "{:?}:{}",
+            std::mem::discriminant(error),
+            crate::review_text::bound_diagnostic_text(error.to_string()),
+        );
+        if self
+            .config_save_retry
+            .failed(std::time::Instant::now(), key)
+        {
+            eprintln!("[Config] Save failed: {error}");
+        }
         if error.blocks_automatic_writes() {
             self.block_config_writes(error.to_string());
         }
@@ -5996,6 +6012,9 @@ impl Frost {
 
     fn persist_live_config(&mut self) {
         if !self.config_dirty || self.config_write_blocked {
+            return;
+        }
+        if !self.config_save_retry.ready(std::time::Instant::now()) {
             return;
         }
         if let Err(error) = self.save_config_checked() {
@@ -6064,6 +6083,7 @@ impl Frost {
                     .map(|temperature| temperature.to_string())
                     .unwrap_or_default();
                 self.config_dirty = false;
+                self.config_save_retry.reset();
                 self.config_write_blocked = false;
                 self.sync_tab_position_ui();
                 self.apply_config();
@@ -8157,7 +8177,21 @@ impl Frost {
         if let Err(error) = jterm_core::command_history::flush_pending(EXIT_FLUSH_TIMEOUT) {
             log::warn!("command history did not flush before exit: {error}");
         }
+        self.flush_config_on_exit();
         iced::exit()
+    }
+
+    /// Backoff must not strand a pending setting when the process exits.
+    /// One best-effort CAS attempt; no reload side effects or retry loop.
+    fn flush_config_on_exit(&mut self) {
+        if !self.config_dirty || self.config_write_blocked {
+            return;
+        }
+        if let Err(error) = self.save_config_checked() {
+            // Always report the final unconfirmed save, even when an earlier
+            // automatic attempt already reported the same failure.
+            log::warn!("Config persistence was not confirmed before exit: {error}");
+        }
     }
 
     /// Next/Prev walk tabs, not the session vector: the extra sessions a split
@@ -14978,11 +15012,13 @@ impl Frost {
                                 || candidate.ai_api_key_file != self.config.ai_api_key_file;
                             self.ai_key_draft.clear();
                             if needs_config_save {
+                                self.config_save_retry.reset();
                                 match candidate.save_if_unchanged(self.config_revision.as_ref()) {
                                     Ok(revision) => {
                                         self.config = candidate;
                                         self.config_revision = Some(revision);
                                         self.config_dirty = false;
+                                        self.config_save_retry.reset();
                                         self.push_toast(
                                             "API key stored (0600) and config path saved",
                                             ToastKind::Success,
@@ -17138,6 +17174,7 @@ impl Frost {
                         ToastKind::Warning,
                     );
                 } else {
+                    self.config_save_retry.reset();
                     match self.save_config_checked() {
                         Ok(()) => {
                             let (invalid, inactive) =
@@ -17193,6 +17230,7 @@ impl Frost {
                             self.scale_factor(),
                         );
                         self.config_dirty = false;
+                        self.config_save_retry.reset();
                         self.config_write_blocked = false;
                         self.config_diagnostic = None;
                         self.ai_temperature_draft.clear();
@@ -17223,6 +17261,8 @@ impl Frost {
                             self.config_dirty = true;
                             self.config_write_blocked = false;
                             self.config_diagnostic = None;
+                            self.config_save_retry.reset();
+                            self.note_config_save_error(&error);
                             self.ai_temperature_draft.clear();
                             self.sync_tab_position_ui();
                             self.apply_config();
@@ -29595,6 +29635,129 @@ mod tests {
         let save = save.split_once("    /// Observe external edits").unwrap().0;
         assert!(save.contains("if !self.config_dirty || self.config_write_blocked"));
         assert!(save.contains("self.save_config_checked()"));
+    }
+
+    #[test]
+    fn config_retry_keeps_live_changes_cas_and_manual_recovery_paths() {
+        let source = include_str!("main.rs");
+        let auto = source
+            .split_once("    fn persist_live_config(&mut self)")
+            .unwrap()
+            .1
+            .split_once("    /// Observe external edits")
+            .unwrap()
+            .0;
+        assert!(
+            auto.find("self.config_write_blocked").unwrap()
+                < auto.find("self.config_save_retry.ready").unwrap()
+        );
+        assert!(
+            auto.find("self.config_save_retry.ready").unwrap()
+                < auto.find("self.save_config_checked()").unwrap()
+        );
+        let checked = source
+            .split_once("    fn save_config_checked(")
+            .unwrap()
+            .1
+            .split_once("    fn block_config_writes(")
+            .unwrap()
+            .0;
+        assert!(checked.contains("self.config.clone().normalized()"));
+        assert!(checked.contains("candidate.save_if_unchanged(self.config_revision.as_ref())"));
+        assert!(checked.contains("self.config_save_retry.reset();"));
+        let uncertain = checked
+            .split_once("if let Some(revision) = error.committed_revision().cloned()")
+            .unwrap()
+            .1;
+        assert!(uncertain.contains("self.config_revision = Some(revision);"));
+        assert!(uncertain.contains("self.config_dirty = true;"));
+        let manual = source
+            .split_once("            Message::ConfigSave => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .0;
+        assert!(
+            manual.find("if self.config_write_blocked").unwrap()
+                < manual.find("self.config_save_retry.reset();").unwrap()
+        );
+        assert!(
+            manual.find("self.config_save_retry.reset();").unwrap()
+                < manual.find("self.save_config_checked()").unwrap()
+        );
+        assert!(!manual.contains(".ready("));
+        let reset = source
+            .split_once("            Message::ConfigReset => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ConfigTick => {")
+            .unwrap()
+            .0;
+        assert_eq!(reset.matches("self.config_save_retry.reset();").count(), 2);
+        let partial_reset = reset
+            .split_once("if let Some(revision) = error.committed_revision().cloned()")
+            .unwrap()
+            .1;
+        assert!(
+            partial_reset
+                .find("self.config_revision = Some(revision);")
+                .unwrap()
+                < partial_reset
+                    .find("self.note_config_save_error(&error);")
+                    .unwrap()
+        );
+        let reload = source
+            .split_once("    fn reload_config_if_changed(")
+            .unwrap()
+            .1
+            .split_once("    /// Whether the left dock")
+            .unwrap()
+            .0;
+        assert!(reload.contains("self.config_save_retry.reset();"));
+        let direct = source
+            .split_once("                            if needs_config_save {")
+            .unwrap()
+            .1
+            .split_once("                            } else {")
+            .unwrap()
+            .0;
+        assert!(direct.contains("self.config_save_retry.reset();"));
+        assert!(direct.contains("candidate.save_if_unchanged(self.config_revision.as_ref())"));
+    }
+
+    #[test]
+    fn exit_attempts_pending_config_once_after_existing_flushes_without_reload() {
+        let source = include_str!("main.rs");
+        let exit = source
+            .split_once("    fn exit_flushing_durable_state(")
+            .unwrap()
+            .1
+            .split_once("    /// Backoff must not strand")
+            .unwrap()
+            .0;
+        assert_eq!(exit.matches("self.flush_config_on_exit();").count(), 1);
+        assert!(
+            exit.find("command_history::flush_pending").unwrap()
+                < exit.find("self.flush_config_on_exit();").unwrap()
+        );
+        assert!(
+            exit.find("self.flush_config_on_exit();").unwrap() < exit.find("iced::exit()").unwrap()
+        );
+        let last_save = source
+            .split_once("    fn flush_config_on_exit(")
+            .unwrap()
+            .1
+            .split_once("    /// Next/Prev")
+            .unwrap()
+            .0;
+        assert!(last_save.contains("if !self.config_dirty || self.config_write_blocked"));
+        assert_eq!(last_save.matches("self.save_config_checked()").count(), 1);
+        assert!(!last_save.contains(".ready("));
+        assert!(!last_save.contains("reload_config_if_changed"));
+        assert!(!last_save.contains("save_force"));
+        assert!(!last_save.contains("loop"));
+        assert!(last_save.contains("not confirmed before exit"));
     }
 
     #[test]
