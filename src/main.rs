@@ -286,14 +286,29 @@ fn companion_card_content<'a, R: iced::advanced::renderer::Renderer + 'a>(
     .padding([8.0, 12.0])
 }
 
-/// Explain stable layout capabilities, not transient live-owner eligibility.
+/// Retain release cleanup offscreen without admitting new hidden observations.
 fn organism_pointer_observation_needed(
+    visible: bool,
     glyph: bool,
     explicit: bool,
     buttons_down: bool,
     motion: Option<organism::Motion>,
 ) -> bool {
-    buttons_down || ((glyph || explicit) && motion != Some(organism::Motion::Static))
+    buttons_down || (visible && (glyph || explicit) && motion != Some(organism::Motion::Static))
+}
+
+/// A hidden companion listens only long enough to retire its held-button ledger.
+fn organism_pointer_event(event: iced::Event, visible: bool) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) if visible => {
+            Some(Message::OrganismPointerButton(button, true))
+        }
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
+            Some(Message::OrganismPointerButton(button, false))
+        }
+        iced::Event::Mouse(iced::mouse::Event::CursorLeft) => Some(Message::OrganismPointerLeft),
+        _ => None,
+    }
 }
 
 fn organism_settings_hint(
@@ -11518,7 +11533,13 @@ impl Frost {
             self.native_enter_ownership.lock().claim_pressed();
             self.prompt_recall_enter_latch.begin_recall();
         }
-        self.organism.retreat();
+        // Clipboard completion may arrive after its target lost focus or closed.
+        // A refused attempt on the current input owner still dismisses attention.
+        self.organism.retreat_for_input_attempt(
+            id,
+            self.sessions.get(self.active).map(|session| session.id),
+            self.focused && self.terminal_input_active(),
+        );
         let mut rejected = false;
         let mut written = false;
         let mut dead_input = false;
@@ -28303,33 +28324,23 @@ impl Frost {
                 subs.push(organism_deadline_subscription(deadline));
             }
         }
-        if live_visible
-            && organism_pointer_observation_needed(
-                live_layout.glyph || (self.config.is_card_mode() && live_layout.presentable()),
-                self.organism.explicit_greeting_active(attention_facts),
-                !self.organism_pointer_buttons.is_empty(),
-                self.config.ascii_organism_motion,
-            )
-        {
+        if organism_pointer_observation_needed(
+            live_visible,
+            live_layout.glyph || (self.config.is_card_mode() && live_layout.presentable()),
+            self.organism.explicit_greeting_active(attention_facts),
+            !self.organism_pointer_buttons.is_empty(),
+            self.config.ascii_organism_motion,
+        ) {
             // Observe without consuming or rerouting the original mouse event.
             // A narrow explicit hold observes input only while active; after a
             // press cancels it, retain the listener through release cleanup.
             // Iced supplies no native snapshot of buttons pressed outside this
             // window; only observed button-down/drag state is claimed here.
-            subs.push(iced::event::listen_with(
-                |event, _status, _id| match event {
-                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => {
-                        Some(Message::OrganismPointerButton(button, true))
-                    }
-                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
-                        Some(Message::OrganismPointerButton(button, false))
-                    }
-                    iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
-                        Some(Message::OrganismPointerLeft)
-                    }
-                    _ => None,
-                },
-            ));
+            subs.push(iced::event::listen_with(if live_visible {
+                |event, _status, _id| organism_pointer_event(event, true)
+            } else {
+                |event, _status, _id| organism_pointer_event(event, false)
+            }));
         }
         if self.organism_interaction_eligible() {
             if let Some(deadline) = self.organism.live_greeting_deadline(attention_facts) {
@@ -31695,8 +31706,8 @@ mod tests {
             .split_once("// A right-press on a tab")
             .unwrap()
             .0;
-        assert!(observer.contains("Some(Message::OrganismPointerButton(button, true))"));
-        assert!(observer.contains("Some(Message::OrganismPointerButton(button, false))"));
+        assert!(observer.contains("organism_pointer_event(event, true)"));
+        assert!(observer.contains("organism_pointer_event(event, false)"));
         let handler = source
             .split_once("            Message::OrganismPointerButton(button, pressed) => {")
             .unwrap()
@@ -38698,6 +38709,92 @@ mod tests {
     }
 
     #[test]
+    fn organism_pointer_offscreen_release_retires_held_buttons() {
+        use iced::mouse::{Button, Event};
+        for cleanup in [Event::ButtonReleased(Button::Left), Event::CursorLeft] {
+            let mut buttons = Vec::new();
+            assert!(organism_pointer_observation_needed(
+                true, true, false, false, None
+            ));
+            let Some(Message::OrganismPointerButton(button, pressed)) = organism_pointer_event(
+                iced::Event::Mouse(Event::ButtonPressed(Button::Left)),
+                true,
+            ) else {
+                panic!("visible press must be observed")
+            };
+            organism_hover::update_pressed_button(&mut buttons, button, pressed);
+            // Scrolling both status and body offscreen must retain cleanup.
+            assert!(organism_pointer_observation_needed(
+                false,
+                true,
+                false,
+                !buttons.is_empty(),
+                None
+            ));
+            assert!(organism_pointer_event(
+                iced::Event::Mouse(Event::ButtonPressed(Button::Right)),
+                false
+            )
+            .is_none());
+            match organism_pointer_event(iced::Event::Mouse(cleanup), false) {
+                Some(Message::OrganismPointerButton(button, pressed)) => {
+                    organism_hover::update_pressed_button(&mut buttons, button, pressed)
+                }
+                Some(Message::OrganismPointerLeft) => buttons.clear(),
+                _ => panic!("offscreen cleanup must be observed"),
+            }
+            assert!(
+                buttons.is_empty(),
+                "returning body must not be blocked by a stale press"
+            );
+            assert!(!organism_pointer_observation_needed(
+                false,
+                true,
+                true,
+                !buttons.is_empty(),
+                None
+            ));
+            assert!(organism_pointer_observation_needed(
+                true,
+                true,
+                false,
+                !buttons.is_empty(),
+                None
+            ));
+        }
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let subs = source.split_once("    fn subscription(&self)").unwrap().1;
+        assert!(subs.contains("if organism_pointer_observation_needed(\n            live_visible,"));
+    }
+
+    #[test]
+    fn organism_paste_attempt_is_target_gated_before_queue_admission() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let paste = source
+            .split_once("    fn write_paste_to_session(")
+            .unwrap()
+            .1
+            .split_once("    /// History picker key handling.")
+            .unwrap()
+            .0;
+        assert!(paste.contains("self.organism.retreat_for_input_attempt("));
+        assert!(paste.contains("self.sessions.get(self.active).map(|session| session.id)"));
+        assert!(paste.contains("self.focused && self.terminal_input_active()"));
+        assert!(!paste.contains("self.organism.retreat();"));
+        assert!(
+            paste.find("retreat_for_input_attempt").unwrap()
+                < paste.find("can_queue_user_bytes").unwrap()
+        );
+        assert!(paste.contains("if written\n            && self.organism.is_local(id)"));
+    }
+
+    #[test]
     fn narrow_explicit_pointer_observation_keeps_release_cleanup_after_cancellation() {
         use jterm_core::organism_live::{
             LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
@@ -38727,10 +38824,10 @@ mod tests {
             .active
             .is_some());
         assert!(!organism_pointer_observation_needed(
-            false, false, false, None
+            true, false, false, false, None
         ));
         assert!(organism_pointer_observation_needed(
-            false, true, false, None
+            true, false, true, false, None
         ));
         organism_hover::update_pressed_button(&mut buttons, 1, true);
         greeting.cancel(&1);
@@ -38749,6 +38846,7 @@ mod tests {
                 let layout = organism_layout(width, true, true, true);
                 assert!(layout.presentable());
                 assert!(organism_pointer_observation_needed(
+                    true,
                     layout.glyph,
                     greeting
                         .snapshot(Duration::from_millis(100), &1, input)
@@ -38762,12 +38860,14 @@ mod tests {
         }
         organism_hover::update_pressed_button(&mut buttons, 1, false);
         assert!(!organism_pointer_observation_needed(
+            true,
             false,
             false,
             !buttons.is_empty(),
             None
         ));
         assert!(!organism_pointer_observation_needed(
+            true,
             true,
             true,
             false,
@@ -39148,7 +39248,7 @@ mod tests {
             .split_once("        if let Some(owner) = self.organism_observation_owner() {")
             .unwrap()
             .1
-            .split_once("        if live_visible")
+            .split_once("        if organism_pointer_observation_needed(")
             .unwrap()
             .0;
         assert!(expiry.contains("self.organism.reaction_deadline(owner)"));

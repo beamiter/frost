@@ -535,6 +535,19 @@ impl Organism {
         self.retreat();
     }
 
+    /// An asynchronous input result belongs to its original pane, not whichever
+    /// pane happens to own the live companion when delivery completes.
+    pub fn retreat_for_input_attempt(
+        &mut self,
+        target: usize,
+        active: Option<usize>,
+        input_eligible: bool,
+    ) {
+        if active == Some(target) && input_eligible {
+            self.retreat();
+        }
+    }
+
     /// Presentation-only retreat also serves blur and attempted gestures.
     pub fn retreat(&mut self) {
         self.modifier_pressed();
@@ -1543,6 +1556,59 @@ mod tests {
         );
         assert_eq!(organism.preview_deadlines.ready_at, ready);
         assert_eq!(values(organism.life.state()), before);
+    }
+
+    #[test]
+    fn stale_paste_attempt_preserves_current_owner_attention() {
+        use jterm_core::organism::WatchRhythm;
+        // Target 1 either still exists in the background or has been deleted.
+        for target_exists in [true, false] {
+            for (target, active, eligible, retreats) in [
+                (1, Some(2), true, false),
+                (1, None, true, false),
+                (2, Some(2), false, false),
+                (2, Some(2), true, true),
+            ] {
+                let mut organism = Organism::default();
+                organism.set_enabled(true);
+                if target_exists {
+                    organism.prime_session(1, false);
+                }
+                organism.prime_session(2, false);
+                let context = PreviewPose::Calm.context();
+                organism
+                    .live_attention
+                    .test_explicit(2, Duration::ZERO, context);
+                organism.watch.observe(Some(2), true, Duration::ZERO);
+                for millis in [0, 100, 200, 300] {
+                    organism
+                        .watch
+                        .output(2, Duration::from_millis(millis), true);
+                }
+                let now = Duration::from_millis(700);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                organism.retreat_until = deadline;
+                let greeting = organism.live_attention.test_deadline(now);
+                assert!(greeting.is_some());
+                assert_eq!(organism.watch.rhythm(2, now), WatchRhythm::Busy);
+                let life = values(organism.life.state());
+                organism.retreat_for_input_attempt(target, active, eligible);
+                assert_eq!(values(organism.life.state()), life);
+                if retreats {
+                    // Active attempts retreat even if the queue subsequently refuses.
+                    assert_ne!(organism.retreat_until, deadline);
+                    assert!(organism.is_retreating());
+                    assert_eq!(organism.live_attention.test_deadline(now), None);
+                    assert_eq!(organism.watch.rhythm(2, now), WatchRhythm::Steady);
+                    organism.accepted_input();
+                    assert!(organism.is_retreating());
+                } else {
+                    assert_eq!(organism.retreat_until, deadline);
+                    assert_eq!(organism.live_attention.test_deadline(now), greeting);
+                    assert_eq!(organism.watch.rhythm(2, now), WatchRhythm::Busy);
+                }
+            }
+        }
     }
 
     #[test]
