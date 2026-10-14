@@ -109,6 +109,25 @@ pub enum ScrollbarVisibility {
     Always,
 }
 
+/// Explicit presentation. Missing preserves the legacy `block_mode` switch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    Normal,
+    Block,
+    Chat,
+}
+
+impl std::fmt::Display for TerminalMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Normal => "Normal",
+            Self::Block => "Block",
+            Self::Chat => "Chat",
+        })
+    }
+}
+
 /// Where the session tab strip is rendered.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -342,6 +361,10 @@ pub struct Config {
     /// duration badges. Same `block_mode` key and default as the family.
     #[serde(default = "default_block_mode")]
     pub block_mode: bool,
+
+    /// Independent opt-in Chat presentation; never serialized as `block`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_mode: Option<TerminalMode>,
 
     /// Paint the same Block cards with the family's compact 4px inset / 6px
     /// radius. Frost's continuous terminal grid does not change dimensions;
@@ -681,6 +704,7 @@ impl Default for Config {
             bottom_bar: default_bottom_bar(),
             click_moves_cursor: default_click_moves_cursor(),
             block_mode: default_block_mode(),
+            terminal_mode: None,
             block_compact: false,
             command_history_enabled: default_command_history_enabled(),
             command_history_path: None,
@@ -690,6 +714,26 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn effective_terminal_mode(&self) -> TerminalMode {
+        self.terminal_mode.unwrap_or(if self.block_mode {
+            TerminalMode::Block
+        } else {
+            TerminalMode::Normal
+        })
+    }
+
+    pub fn is_block_mode(&self) -> bool {
+        self.effective_terminal_mode() == TerminalMode::Block
+    }
+
+    pub fn is_chat_mode(&self) -> bool {
+        self.effective_terminal_mode() == TerminalMode::Chat
+    }
+
+    pub fn is_card_mode(&self) -> bool {
+        self.effective_terminal_mode() != TerminalMode::Normal
+    }
+
     /// Parse and normalize configuration from TOML. Keeping this as the single
     /// path ensures startup and live reload enforce identical bounds.
     pub fn from_toml(content: &str) -> Result<Self, toml::de::Error> {
@@ -1860,6 +1904,37 @@ mod tests {
 
         let config = Config::from_toml("bottom_bar = false\n").expect("override parses");
         assert!(!config.bottom_bar);
+    }
+
+    #[test]
+    fn chat_mode_is_explicit_preserves_legacy_and_round_trips() {
+        for legacy in [false, true] {
+            let old = Config::from_toml(&format!("block_mode = {legacy}\n")).unwrap();
+            assert_eq!(old.is_block_mode(), legacy);
+            assert!(!old.is_chat_mode());
+            for (value, expected) in [
+                ("normal", TerminalMode::Normal),
+                ("block", TerminalMode::Block),
+                ("chat", TerminalMode::Chat),
+            ] {
+                let config = Config::from_toml(&format!(
+                    "block_mode = {legacy}\nterminal_mode = \"{value}\"\n"
+                ))
+                .unwrap();
+                assert_eq!(config.effective_terminal_mode(), expected);
+                let serialized = toml::to_string(&config).unwrap();
+                assert!(serialized.contains(&format!("terminal_mode = \"{value}\"")));
+                let restored = Config::from_toml(&serialized).unwrap();
+                assert_eq!(restored.effective_terminal_mode(), expected);
+                assert_eq!(restored.block_mode, legacy);
+            }
+        }
+        assert!(Config::default().is_block_mode());
+        assert!(Config::default().terminal_mode.is_none());
+        assert!(!toml::to_string(&Config::default())
+            .unwrap()
+            .contains("terminal_mode"));
+        assert!(Config::from_toml("terminal_mode = \"unknown\"\n").is_err());
     }
 
     #[test]

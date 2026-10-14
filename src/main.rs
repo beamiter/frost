@@ -17,6 +17,7 @@ mod block_export;
 mod block_mode;
 mod block_review;
 mod block_search_layout;
+mod chat_mode;
 mod color;
 mod command_correction;
 mod command_palette;
@@ -4056,7 +4057,9 @@ enum Message {
     SetAllowClipboardRead(bool),
     SetAllowRemoteClipboardWrite(bool),
     SetNotifyLongBlocks(bool),
-    SetBlockMode(bool),
+    SetTerminalMode(config::TerminalMode),
+    ChatSubmit(chat_mode::ControlToken),
+    ChatInterrupt(chat_mode::ControlToken),
     SetBlockCompact(bool),
     SetShowRepoStrip(bool),
     SetBottomBar(bool),
@@ -4652,7 +4655,8 @@ impl Session {
         terminal.set_max_scrollback(config.scrollback_lines);
         terminal.set_disable_alt_screen(config.disable_alt_screen);
         let mut projection_policy = ProjectionPolicy::new();
-        projection_policy.set_block_spacing(!config.block_compact);
+        projection_policy.set_chat(config.is_chat_mode());
+        projection_policy.set_block_spacing(config.is_block_mode() && !config.block_compact);
         projection_policy.set_native_chrome(
             true,
             native_status_rows(
@@ -4663,7 +4667,7 @@ impl Session {
         );
         let mut projection_view_state = ProjectionViewState::new();
         let projection = terminal.get_projected_viewport_with_state(
-            config.block_mode,
+            config.is_card_mode(),
             &projection_policy,
             &mut projection_view_state,
         );
@@ -4678,7 +4682,7 @@ impl Session {
             watch_source: organism_watch::SourceAuthority::default(),
             watch_receiver: organism_watch::SourceReceiver::default(),
             projection,
-            projection_block_mode: config.block_mode,
+            projection_block_mode: config.is_card_mode(),
             projection_policy,
             projection_view_state,
             cursor,
@@ -4886,7 +4890,9 @@ impl Session {
             self.cursor = mapped
                 .map(|cell| (cell.row, cell.col))
                 .unwrap_or(raw_cursor);
-            self.cursor_visible = self.terminal.is_cursor_visible() && mapped.is_some();
+            self.cursor_visible = self
+                .terminal
+                .is_mapped_cursor_visible(&self.projection, mapped.is_some());
         } else {
             self.cursor = raw_cursor;
             self.cursor_visible = self.terminal.is_cursor_visible();
@@ -5115,6 +5121,115 @@ impl Session {
         user_input_blocked(self.hold_after_exit)
     }
 
+    fn chat_backlog(&self) -> chat_mode::InputBacklog {
+        chat_mode::InputBacklog {
+            entries: self.write_queue.len(),
+            offset: self.write_queue_offset,
+            user_bytes: self.queued_write_bytes,
+            response_bytes: self.queued_response_bytes,
+        }
+    }
+
+    fn chat_control_bytes(&self, kind: chat_mode::ControlKind) -> Option<Vec<u8>> {
+        let (key, modifiers) = match kind {
+            chat_mode::ControlKind::Submit => (
+                keyboard::Key::Named(keyboard::key::Named::Enter),
+                keyboard::Modifiers::empty(),
+            ),
+            chat_mode::ControlKind::Interrupt => (
+                keyboard::Key::Character("c".into()),
+                keyboard::Modifiers::CTRL,
+            ),
+        };
+        encode_key(
+            &key,
+            keyboard::Location::Standard,
+            modifiers,
+            None,
+            self.terminal.is_application_cursor_keys(),
+            KeyboardEnhancements {
+                kitty_flags: self.terminal.keyboard_enhancement_flags(),
+                modify_other_keys: self.terminal.xterm_modify_other_keys(),
+                format_other_keys: self.terminal.xterm_format_other_keys(),
+                report_all_keys: self.terminal.is_report_all_keys_enabled(),
+                application_keypad: self.terminal.is_application_keypad(),
+            },
+        )
+    }
+
+    fn chat_control_token(&self, kind: chat_mode::ControlKind) -> Option<chat_mode::ControlToken> {
+        use chat_mode::{ChatSurface, ControlAction, ControlKind, ControlToken};
+        let action = match (kind, self.terminal.chat_surface()) {
+            (ControlKind::Submit, ChatSurface::Prompt) => {
+                ControlAction::Submit(self.projection.key())
+            }
+            (ControlKind::Interrupt, ChatSurface::Running) => {
+                ControlAction::Interrupt(self.terminal.watch_generation()?)
+            }
+            _ => return None,
+        };
+        // The displayed action owns the actual kernel foreground group, never
+        // a process-name cache. Shell builtins (e.g. read) legitimately share
+        // the shell PGID and remain interruptible.
+        let foreground = jterm_core::process::tty_foreground_pgid(self.master_fd)?;
+        if kind == ControlKind::Submit && foreground != self.pty.get_child_pid() {
+            return None;
+        }
+        Some(ControlToken {
+            session: self.id,
+            foreground,
+            action,
+        })
+    }
+
+    fn enabled_chat_control(
+        &self,
+        kind: chat_mode::ControlKind,
+        input_ready: bool,
+    ) -> Option<chat_mode::ControlToken> {
+        if !input_ready || self.transcript_read_only() || !self.terminal.preedit_text.is_empty() {
+            return None;
+        }
+        let bytes = self.chat_control_bytes(kind)?;
+        chat_mode::control_enabled(
+            &bytes,
+            self.chat_backlog(),
+            input_ready && !self.transcript_read_only() && self.terminal.preedit_text.is_empty(),
+        )
+        .then(|| self.chat_control_token(kind))
+        .flatten()
+    }
+
+    fn try_chat_control(&mut self, displayed: &chat_mode::ControlToken, input_ready: bool) -> bool {
+        let Some(bytes) = self.chat_control_bytes(displayed.kind()) else {
+            return false;
+        };
+        let backlog = self.chat_backlog();
+        let input_ready =
+            input_ready && !self.transcript_read_only() && self.terminal.preedit_text.is_empty();
+        if !chat_mode::control_enabled(&bytes, backlog, input_ready) || !self.pty.is_alive() {
+            return false;
+        }
+        // This is the final writer admission. No FIFO flush, append, scheduled
+        // retry or partial enhanced-key suffix exists on this optional path.
+        let current = self.chat_control_token(displayed.kind());
+        let accepted = chat_mode::admit_control(
+            displayed,
+            current.as_ref(),
+            &bytes,
+            backlog,
+            input_ready,
+            |byte| self.pty.write(byte),
+        );
+        if accepted {
+            self.terminal.note_user_input(&bytes);
+            if displayed.kind() == chat_mode::ControlKind::Submit {
+                self.terminal.note_chat_submit();
+            }
+        }
+        accepted
+    }
+
     /// Queue data in-order and make one non-blocking drain attempt. Returns false
     /// if the bounded queue rejected the write or the PTY has failed.
     fn write_pty(&mut self, data: &[u8]) -> bool {
@@ -5238,6 +5353,40 @@ struct TerminalMouseGesture {
     /// cache was refreshed only after focus moved). Subsequent drag/release
     /// messages close the slot without touching selection or the PTY.
     consumed: bool,
+}
+
+/// Shared press-origin gate for the app handler and CPU interaction tests.
+/// Returning a button means no terminal/clipboard action may run for this
+/// press; its later drag/release remains owned by this consumed gesture.
+fn reject_chat_press(
+    projection: Option<&ProjectedViewport>,
+    session_id: usize,
+    input: MouseInput,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+) -> Option<MouseButton> {
+    let MouseInput::Press {
+        button,
+        link_revision,
+        row,
+        col,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    if projection.is_some_and(|projection| {
+        chat_mode::terminal_press_allowed(projection, link_revision, row, col)
+    }) {
+        return None;
+    }
+    gestures[button.slot()] = Some(TerminalMouseGesture {
+        session_id,
+        button,
+        report_to_app: false,
+        last_app_cell: None,
+        consumed: true,
+    });
+    Some(button)
 }
 
 impl TerminalMouseGesture {
@@ -5665,7 +5814,7 @@ impl Frost {
             config.font_size,
             config.line_spacing,
             config.padding,
-            config.block_mode,
+            config.is_card_mode(),
         );
         let cols = config.cols.max(1);
         let rows = config.rows.max(1);
@@ -5969,7 +6118,7 @@ impl Frost {
                 }
             }
         }
-        if !self.config.block_mode {
+        if !self.config.is_block_mode() {
             self.close_block_search();
             self.block_menu = None;
             self.block_review = None;
@@ -5990,7 +6139,7 @@ impl Frost {
             self.effective_font_size(),
             self.config.line_spacing,
             self.config.padding,
-            self.config.block_mode,
+            self.config.is_card_mode(),
         );
         let term_h = self.term_height();
         let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
@@ -6001,15 +6150,17 @@ impl Frost {
             self.rows = rows;
         }
         for sess in &mut self.sessions {
-            let projection_mode_changed = sess.projection_block_mode != self.config.block_mode;
-            sess.projection_block_mode = self.config.block_mode;
+            let chat_mode_changed = sess.projection_policy.set_chat(self.config.is_chat_mode());
+            let projection_mode_changed =
+                sess.projection_block_mode != self.config.is_card_mode() || chat_mode_changed;
+            sess.projection_block_mode = self.config.is_card_mode();
             sess.terminal
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
             let spacing_changed = sess
                 .projection_policy
-                .set_block_spacing(!self.config.block_compact);
+                .set_block_spacing(self.config.is_block_mode() && !self.config.block_compact);
             let chrome_changed = sess.projection_policy.set_native_chrome(
                 true,
                 native_status_rows(
@@ -6268,6 +6419,20 @@ impl Frost {
             && self.sidebar_dialog.is_none()
             && self.sidebar_delete_confirm.is_none()
             && !self.sidebar_files_focused
+    }
+
+    fn chat_input_ready(&self, session_id: usize) -> bool {
+        self.config.is_chat_mode()
+            && self.focused
+            && self.terminal_input_active()
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| session.id == session_id)
+            && self.layout().contains_session(self.active)
+            && self.prompt_recall_enter_latch.pressed == 0
+            && self.prompt_recall_enter_latch.owned == 0
+            && !self.history_reflow_sessions.contains(&session_id)
     }
 
     /// Search is intentionally non-modal for scrolling/selection. The remaining
@@ -7585,7 +7750,7 @@ impl Frost {
     /// it hosts the dock toggle) so floating chrome never overlaps terminal
     /// content.
     fn block_reading_bar_height(&self) -> f32 {
-        if !self.config.block_mode {
+        if !self.config.is_block_mode() {
             0.0
         } else if self.term_width() < 220.0 {
             116.0
@@ -7597,7 +7762,7 @@ impl Frost {
     }
 
     fn organism_strip_height(&self) -> f32 {
-        if self.config.block_mode {
+        if self.config.is_card_mode() {
             return 0.0;
         }
         companion_strip_height(
@@ -9460,7 +9625,7 @@ impl Frost {
                             .collect();
                         sess.block_selection.retain(&ids);
                         ctrl_scroll_block_navigation(
-                            self.config.block_mode,
+                            self.config.is_block_mode(),
                             older,
                             sess.terminal.is_alt_buffer_active(),
                             sess.terminal.is_command_running(),
@@ -10036,7 +10201,7 @@ impl Frost {
     /// in the alternate screen, so neither keybindings nor palette actions may
     /// mutate or read an invisible selection there.
     fn block_action_available(&self) -> bool {
-        self.config.block_mode
+        self.config.is_block_mode()
             && self
                 .sessions
                 .get(self.active)
@@ -10055,7 +10220,7 @@ impl Frost {
     }
 
     fn ensure_block_action_available(&mut self, action: &str) -> bool {
-        if !self.config.block_mode {
+        if !self.config.is_block_mode() {
             self.push_toast(
                 format!("{action} unavailable: block mode is disabled"),
                 ToastKind::Info,
@@ -11099,7 +11264,7 @@ impl Frost {
     ) -> Option<Task<Message>> {
         use keyboard::key::Named;
         use keyboard::Key;
-        if !self.config.block_mode
+        if !self.config.is_block_mode()
             || self
                 .sessions
                 .get(self.active)
@@ -11750,7 +11915,7 @@ impl Frost {
     fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
         let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
         finalized_block_at_viewport_row(
-            self.config.block_mode,
+            self.config.is_block_mode(),
             &sess.terminal,
             &sess.projection,
             row,
@@ -11794,7 +11959,27 @@ impl Frost {
     /// and scrollback handling.
     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
         let speed = self.config.scroll_speed.max(1) as isize;
-
+        // Validate the exact current cell before *any* terminal action,
+        // including clipboard reads and multi-click selection. Consume the
+        // whole rejected gesture so a later real-cell release cannot revive it.
+        if self.config.is_chat_mode() {
+            let projection = self
+                .sessions
+                .iter()
+                .find(|session| session.id == source_session_id)
+                .map(|session| session.projection.as_ref());
+            if let Some(button) = reject_chat_press(
+                projection,
+                source_session_id,
+                input,
+                &mut self.terminal_mouse_gestures,
+            ) {
+                if button == MouseButton::Left {
+                    self.click_tracker.cancel();
+                }
+                return Task::none();
+            }
+        }
         // Block selection first. The widget snapshots the exact family action
         // at press time and never arms native drag/release for a claimed card
         // gesture. Re-resolve its stable pane and row target here: a
@@ -13090,7 +13275,7 @@ impl Frost {
     ) -> Option<Task<Message>> {
         let result = {
             let sess = self.sessions.get_mut(self.active)?;
-            if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
                 return None;
             }
             if sess.block_selection.is_empty() {
@@ -13902,7 +14087,7 @@ impl Frost {
     fn block_copy_selected_markdown_task(&mut self) -> Option<Task<Message>> {
         let result = {
             let sess = self.sessions.get_mut(self.active)?;
-            if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+            if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
                 return None;
             }
             if sess.block_selection.is_empty() {
@@ -15634,7 +15819,7 @@ impl Frost {
                         && block_key_context.is_some_and(
                             |(has_selection, alt_screen, command_running)| {
                                 block_escape_owns_key(
-                                    self.config.block_mode,
+                                    self.config.is_block_mode(),
                                     has_selection,
                                     alt_screen,
                                     command_running,
@@ -15667,7 +15852,7 @@ impl Frost {
                     let selection_owns_keys = block_key_context.is_some_and(
                         |(has_selection, alt_screen, command_running)| {
                             block_selection_owns_keys(
-                                self.config.block_mode,
+                                self.config.is_block_mode(),
                                 has_selection,
                                 alt_screen,
                                 command_running,
@@ -15791,7 +15976,15 @@ impl Frost {
                             sess.block_selection.clear();
                             sess.terminal.scroll_to_bottom();
                             sess.projection_view_state.scroll_to_bottom();
-                            if sess.write_pty(&bytes)
+                            let accepted = sess.write_pty(&bytes);
+                            if accepted
+                                && self.config.is_chat_mode()
+                                && no_modifier
+                                && matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter))
+                            {
+                                sess.terminal.note_chat_submit();
+                            }
+                            if accepted
                                 && !sess.managed_remote
                                 && self.organism.is_local(sess.id)
                                 && !matches!(
@@ -17130,10 +17323,38 @@ impl Frost {
                 self.config.notify_long_blocks = enabled;
                 self.config_dirty = true;
             }
-            Message::SetBlockMode(enabled) => {
-                // The 8px block gutter is real layout space, so toggling mode
-                // regrids panes as well as clearing hidden interaction state.
-                self.config.block_mode = enabled;
+            Message::ChatInterrupt(token) | Message::ChatSubmit(token) => {
+                let input_ready = self.chat_input_ready(token.session);
+                let Some(sess) = self
+                    .sessions
+                    .get_mut(self.active)
+                    .filter(|session| session.id == token.session)
+                else {
+                    return Task::none();
+                };
+                // No UI FIFO admission is called acceptance. Revalidate the
+                // displayed action at the native single-byte write boundary.
+                if !sess.try_chat_control(&token, input_ready) {
+                    return Task::none();
+                }
+                if token.kind() == chat_mode::ControlKind::Submit {
+                    sess.block_selection.clear();
+                    sess.terminal.scroll_to_bottom();
+                    sess.projection_view_state.scroll_to_bottom();
+                }
+                if !sess.managed_remote
+                    && self.organism.is_local(sess.id)
+                    && !matches!(
+                        sess.fg_proc_cache.as_deref(),
+                        Some("ssh" | "mosh" | "telnet")
+                    )
+                {
+                    self.organism.accepted_input();
+                }
+                sess.refresh();
+            }
+            Message::SetTerminalMode(mode) => {
+                self.config.terminal_mode = Some(mode);
                 self.config_dirty = true;
                 self.apply_config();
             }
@@ -17143,7 +17364,10 @@ impl Frost {
                 self.config.block_compact = compact;
                 self.config_dirty = true;
                 for sess in &mut self.sessions {
-                    if sess.projection_policy.set_block_spacing(!compact) {
+                    if sess
+                        .projection_policy
+                        .set_block_spacing(self.config.is_block_mode() && !compact)
+                    {
                         sess.refresh();
                     }
                 }
@@ -17199,7 +17423,7 @@ impl Frost {
                 }
             }
             Message::OrganismHoverEnter(id, epoch) => {
-                if !self.config.block_mode && self.organism_owner() == Some(id) {
+                if !self.config.is_block_mode() && self.organism_owner() == Some(id) {
                     let facts = self.organism_attention_facts();
                     self.organism.enter_live_greeting(id, epoch, facts);
                 }
@@ -18436,6 +18660,26 @@ impl Frost {
         self.top_bar_with_close(scroller)
     }
 
+    fn chat_running_status(&self) -> Option<(usize, u64, u64)> {
+        if !self.config.is_chat_mode()
+            || self.win_size.width < 240.0
+            || !self.layout().contains_session(self.active)
+        {
+            return None;
+        }
+        let session = self.sessions.get(self.active)?;
+        (session.terminal.chat_surface() == chat_mode::ChatSurface::Running
+            && !session.transcript_read_only())
+        .then(|| {
+            Some((
+                session.id,
+                session.terminal.watch_generation()?,
+                session.terminal.running_duration_ms()?,
+            ))
+        })
+        .flatten()
+    }
+
     /// The top bar doubles as the window's title bar: the window is
     /// undecorated, so this row owns the title, the window buttons, and
     /// drag-to-move.
@@ -18452,6 +18696,23 @@ impl Frost {
             .style(self.close_btn_style());
 
         let mut bar = row![container(content).width(Length::Fill)];
+        if let Some((id, _, elapsed)) = self.chat_running_status() {
+            let label = if self.win_size.width >= 440.0 {
+                format!("Running · {}", block_mode::running_badge_text(elapsed))
+            } else {
+                block_mode::running_badge_text(elapsed)
+            };
+            bar = bar.push(text(label).size(11).color(self.c_text_dim()));
+            let session = &self.sessions[self.active];
+            let token = session
+                .enabled_chat_control(chat_mode::ControlKind::Interrupt, self.chat_input_ready(id));
+            let stop = container(text(if token.is_some() { "Stop" } else { "Ctrl+C" }).size(11))
+                .padding([3, 7]);
+            bar = bar.push(chat_mode::press_control(
+                stop,
+                token.map(Message::ChatInterrupt),
+            ));
+        }
         // In Side mode the tab labels live in the dock, so the title is the
         // only place the active session is named and there is room for it. In
         // Top mode the active tab already shows the very same string
@@ -20430,7 +20691,7 @@ impl Frost {
     /// not the escaped review display. Copy deliberately ignores prompt state.
     fn block_review_is_current(&self, review: &BlockReview, insertion: bool) -> bool {
         self.sessions.get(self.active).is_some_and(|sess| {
-            if !self.config.block_mode
+            if !self.config.is_block_mode()
                 || sess.terminal.is_alt_buffer_active()
                 || sess.id != review.session_id
                 || (insertion && sess.terminal.is_bracketed_paste_enabled() != review.bracketed)
@@ -20506,7 +20767,7 @@ impl Frost {
         let live = self.sessions.get(self.active).is_some_and(|sess| {
             sess.id == review.session_id
                 && !sess.terminal.is_alt_buffer_active()
-                && self.config.block_mode
+                && self.config.is_block_mode()
                 && review
                     .ids
                     .iter()
@@ -20885,7 +21146,7 @@ impl Frost {
     /// Family-wide bottom bar (`jterm_core::bottom_bar`): cwd and git on the
     /// left; last-command status, grid size, and tab count on the right.
     fn organism_layout(&self) -> OrganismLayout {
-        let width = if self.config.block_mode {
+        let width = if self.config.is_card_mode() {
             self.pane_rects()
                 .into_iter()
                 .find(|pane| pane.session == self.active)
@@ -20901,7 +21162,7 @@ impl Frost {
             self.config.ascii_organism_enabled,
             self.config.ascii_organism_expanded,
             self.config.bottom_bar,
-            self.config.block_mode,
+            self.config.is_card_mode(),
         )
     }
 
@@ -20910,7 +21171,7 @@ impl Frost {
         self.organism_geometry_epoch = self.organism_geometry_epoch.saturating_add(1);
         let layout = self.organism_layout();
         self.organism.sync_greeting_geometry(
-            !self.config.block_mode && layout.glyph,
+            !self.config.is_card_mode() && layout.glyph,
             layout.presentable(),
         );
         if !layout.presentable() {
@@ -20931,7 +21192,7 @@ impl Frost {
 
     fn organism_observation_owner(&self) -> Option<usize> {
         if !self.config.ascii_organism_enabled
-            || (!self.config.block_mode && !self.config.bottom_bar)
+            || (!self.config.is_card_mode() && !self.config.bottom_bar)
             || !self.focused
             || !self.terminal_input_active()
             || !self.organism_layout().presentable()
@@ -21009,7 +21270,7 @@ impl Frost {
         let eligible = self.organism_interaction_eligible();
         organism::AttentionFacts {
             eligible,
-            hover_available: if self.config.block_mode {
+            hover_available: if self.config.is_card_mode() {
                 self.organism_body_hover_available()
             } else {
                 self.organism_layout().glyph
@@ -21031,7 +21292,7 @@ impl Frost {
     }
 
     fn organism_hover_eligible(&self) -> bool {
-        (if self.config.block_mode {
+        (if self.config.is_card_mode() {
             self.organism_body_hover_available()
         } else {
             self.organism_layout().glyph
@@ -21056,7 +21317,7 @@ impl Frost {
 
     fn status_bar(&self) -> Element<'_, Message> {
         let layout = self.organism_layout();
-        let layout = if self.config.block_mode {
+        let layout = if self.config.is_card_mode() {
             OrganismLayout {
                 glyph: false,
                 body: false,
@@ -21246,7 +21507,7 @@ impl Frost {
             let slot: Element<'_, Message> = if let Some(id) = self.organism_owner() {
                 // One core offer binds both edges before the next view rebuild.
                 let mut area = mouse_area(slot);
-                if !self.config.block_mode {
+                if !self.config.is_card_mode() {
                     if let Some(ticket) = self.organism.live_greeting_offer(id) {
                         area = area.on_enter(Message::OrganismHoverEnter(id, ticket));
                     }
@@ -21272,7 +21533,7 @@ impl Frost {
             .align_y(iced::Alignment::Center);
         let bar: Element<'_, Message> = if let Some(slot) = compact_slot {
             companion_status_with_slot(bar.into(), slot, 12)
-        } else if !self.config.block_mode
+        } else if !self.config.is_card_mode()
             && companion_narrow_reopen(
                 self.win_size.width,
                 self.config.ascii_organism_enabled,
@@ -21411,7 +21672,7 @@ impl Frost {
     /// edge rather than wandering down the screen as output streams. The fit
     /// test stays per-frame: the chip must never be painted over real text.
     fn running_badge_target(&self, sess: &Session) -> Option<(usize, String, u64)> {
-        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
             return None;
         }
         let terminal = &sess.terminal;
@@ -21448,7 +21709,7 @@ impl Frost {
         &self,
         sess: &Session,
     ) -> (Vec<terminal_view::BlockPaintRow>, Vec<f32>, Vec<f32>) {
-        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
             return (Vec::new(), Vec::new(), Vec::new());
         }
         let projection_key = sess.projection.key();
@@ -21511,7 +21772,7 @@ impl Frost {
     fn build_block_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
         use block_mode::BlockOutcome;
 
-        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
         let rows = sess.projection.cells().len();
@@ -21825,7 +22086,7 @@ impl Frost {
     /// same red as the Failed stripe. The 256-zone cap keeps this scan
     /// trivial. Called only on a [`Self::block_chrome`] cache miss.
     fn block_marker_fractions(&self, sess: &Session) -> Vec<f32> {
-        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
         let terminal = &sess.terminal;
@@ -21848,7 +22109,7 @@ impl Frost {
     /// Bookmark-notch scrollbar fractions for bookmarked zones. Called only
     /// on a [`Self::block_chrome`] cache miss.
     fn block_bookmark_marker_fractions(&self, sess: &Session) -> Vec<f32> {
-        if !self.config.block_mode || sess.terminal.is_alt_buffer_active() {
+        if !self.config.is_block_mode() || sess.terminal.is_alt_buffer_active() {
             return Vec::new();
         }
         // Resolve through the exact plan so gaps and collapsed output cannot
@@ -21874,7 +22135,7 @@ impl Frost {
     /// Drawing can represent Busy/watch while hover still requires shared idle
     /// admission. There is one body owner and no body in Static/traditional UI.
     fn organism_body_owner(&self) -> Option<usize> {
-        if !self.config.block_mode
+        if !self.config.is_card_mode()
             || self.config.ascii_organism_motion == Some(organism::Motion::Static)
             || self.organism_geometry_epoch == u64::MAX
             || !self.organism_pointer_buttons.is_empty()
@@ -21963,9 +22224,68 @@ impl Frost {
         }
     }
 
-    /// Build the terminal widget for the pane showing `sess_idx`.
-    /// Overlay-style decorations (search, links, Kitty images) are only attached
-    /// to the active pane; the other panes render plain.
+    /// Chat chrome follows the independent projection's actual raw/synthetic
+    /// ownership. It does not activate Block selection or replay actions.
+    fn chat_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
+        use chat_mode::ChatRole;
+        sess.projection
+            .chat_rows()
+            .iter()
+            .enumerate()
+            .map(|(index, chat)| {
+                let raw = matches!(
+                    sess.projection.row_kinds().get(index),
+                    Some(terminal::ProjectedRowKind::Raw)
+                );
+                terminal_view::BlockPaintRow {
+                    host_spacer: !raw,
+                    app_eligible: raw && chat.app_eligible,
+                    organism_status: chat.status_line,
+                    badge: chat
+                        .status_zone
+                        .and_then(|id| sess.terminal.zone_by_id(id))
+                        .and_then(|zone| {
+                            let outcome =
+                                block_mode::classify(zone.command.as_deref(), zone.exit_code);
+                            block_mode::badge_text_with_lifecycle(
+                                outcome,
+                                zone.duration_ms,
+                                zone.start_mark_seen,
+                                zone.completion_provenance,
+                            )
+                            .map(|mut text| {
+                                let budget = sess.terminal.grid.cols().saturating_sub(3);
+                                if text.chars().count() > budget {
+                                    text = text.chars().take(budget).collect();
+                                }
+                                let color = match outcome {
+                                    block_mode::BlockOutcome::Failed(_) => self.theme.ansi_color(1),
+                                    block_mode::BlockOutcome::Success => self.theme.ansi_color(2),
+                                    _ => self.theme.ansi_color(3),
+                                };
+                                (text, color)
+                            })
+                        }),
+                    card_group: matches!(
+                        chat.role,
+                        ChatRole::Command | ChatRole::Output | ChatRole::Composer
+                    )
+                    .then_some(chat.group),
+                    card_kind: if chat.role == ChatRole::Composer {
+                        terminal_view::BlockCardKind::Active
+                    } else {
+                        terminal_view::BlockCardKind::Finished
+                    },
+                    card_top: chat.top,
+                    card_bottom: chat.bottom,
+                    ..terminal_view::BlockPaintRow::default()
+                }
+            })
+            .collect()
+    }
+
+    /// Build the terminal widget for one pane, using its exact projection for
+    /// cells, selection, search, links, image placement and pointer routing.
     fn pane_view(&self, sess_idx: usize) -> Element<'_, Message> {
         let sess = &self.sessions[sess_idx];
         let session_id = sess.id;
@@ -22013,9 +22333,13 @@ impl Frost {
         } else {
             Vec::new()
         };
-        let (blocks, block_markers, block_bookmark_markers) = self.block_chrome(sess);
+        let (blocks, block_markers, block_bookmark_markers) = if self.config.is_chat_mode() {
+            (self.chat_paint_rows(sess), Vec::new(), Vec::new())
+        } else {
+            self.block_chrome(sess)
+        };
         let app_mouse_full_grid = app_mouse_uses_full_grid(
-            self.config.block_mode,
+            self.config.is_block_mode() || !sess.projection.chat_rows().is_empty(),
             sess.terminal.is_alt_buffer_active(),
             sess.terminal.has_usable_block_partitions(),
         );
@@ -22046,8 +22370,8 @@ impl Frost {
                     bottom: presentation.bottom,
                 }
             });
-        let status_presentation = (self.config.block_mode && self.config.ascii_organism_enabled)
-            .then(|| {
+        let status_presentation =
+            (self.config.is_card_mode() && self.config.ascii_organism_enabled).then(|| {
                 if is_active {
                     self.organism_owner()
                         .map(|id| {
@@ -22064,6 +22388,10 @@ impl Frost {
                     organism::LivePresentation::passive_presence()
                 }
             });
+        let submit_token = sess.enabled_chat_control(
+            chat_mode::ControlKind::Submit,
+            self.chat_input_ready(session_id),
+        );
         TermWidget::new(
             sess.projection.cells(),
             sess.cursor,
@@ -22092,6 +22420,13 @@ impl Frost {
         ))
         .search(search_matches, current)
         .blocks(blocks)
+        .chat_rows(
+            sess.projection.chat_rows(),
+            self.config
+                .is_chat_mode()
+                .then_some(sess.projection.as_ref()),
+            submit_token.map(Message::ChatSubmit),
+        )
         .organism_status(
             status_presentation,
             self.config.ascii_organism_expanded,
@@ -23435,7 +23770,7 @@ impl Frost {
         } else {
             panes_body
         };
-        let panes_body: Element<'_, Message> = if self.config.block_mode {
+        let panes_body: Element<'_, Message> = if self.config.is_block_mode() {
             column![self.block_reading_bar(), panes_body]
                 .height(Length::Fill)
                 .into()
@@ -23956,7 +24291,7 @@ impl Frost {
             text("Local companion. Memory is volatile; it resets when disabled or closed.").size(11),
             checkbox(self.config.ascii_organism_expanded).label("Show expanded companion")
                 .on_toggle(Message::SetOrganismExpanded),
-            text(if self.config.block_mode && self.config.ascii_organism_enabled {
+            text(if self.config.is_block_mode() && self.config.ascii_organism_enabled {
                 "Block mode keeps the status card between history and current input. Its arrow switches between a full card and one line, independently of the bottom bar. Full wanders in safe blank space; Calm rests; Static shows only this status card."
             } else { organism_settings_hint(
                 self.win_size.width,
@@ -24259,12 +24594,18 @@ impl Frost {
 
         let block_mode_row = responsive_control_row(
             compact,
-            "Blocks",
-            checkbox(self.config.block_mode)
-                .label("Command cards (OSC 133)")
-                .text_size(13)
-                .on_toggle(Message::SetBlockMode)
-                .into(),
+            "Terminal",
+            pick_list(
+                [
+                    config::TerminalMode::Normal,
+                    config::TerminalMode::Block,
+                    config::TerminalMode::Chat,
+                ],
+                Some(self.config.effective_terminal_mode()),
+                Message::SetTerminalMode,
+            )
+            .text_size(13)
+            .into(),
         );
 
         let block_compact_row = responsive_control_row(
@@ -27910,21 +28251,26 @@ impl Frost {
         let attention_facts = self.organism_attention_facts();
         // Reuse the existing maintenance timer. A scrolled-out/alternate-screen
         // inline companion owns no cadence when neither status nor body paints.
-        let native_visible = !self.config.block_mode
+        let native_visible = !self.config.is_card_mode()
             || self.organism_body_hover_available()
             || self.sessions.get(self.active).is_some_and(|session| {
-                session.projection.row_kinds().iter().any(|kind| {
-                    matches!(
-                        kind,
-                        terminal::ProjectedRowKind::BlockChrome {
-                            boundary: terminal::ChromeBoundary {
-                                kind: terminal::ChromeKind::Organism,
+                session
+                    .projection
+                    .chat_rows()
+                    .iter()
+                    .any(|row| row.status_line.is_some())
+                    || session.projection.row_kinds().iter().any(|kind| {
+                        matches!(
+                            kind,
+                            terminal::ProjectedRowKind::BlockChrome {
+                                boundary: terminal::ChromeBoundary {
+                                    kind: terminal::ChromeKind::Organism,
+                                    ..
+                                },
                                 ..
-                            },
-                            ..
-                        }
-                    )
-                })
+                            }
+                        )
+                    })
             });
         let live_visible = live_layout.maintenance_eligible(self.focused) && native_visible;
         let preview_full = preview_visible
@@ -27959,7 +28305,7 @@ impl Frost {
         }
         if live_visible
             && organism_pointer_observation_needed(
-                live_layout.glyph || (self.config.block_mode && live_layout.presentable()),
+                live_layout.glyph || (self.config.is_card_mode() && live_layout.presentable()),
                 self.organism.explicit_greeting_active(attention_facts),
                 !self.organism_pointer_buttons.is_empty(),
                 self.config.ascii_organism_motion,
@@ -28110,7 +28456,13 @@ impl Frost {
                 })
             })
         };
-        let running_badge_interval = if !self.config.block_mode {
+        let running_badge_interval = if let Some((_, _, elapsed)) = self.chat_running_status() {
+            Some(std::time::Duration::from_secs(if elapsed < 3_600_000 {
+                1
+            } else {
+                60
+            }))
+        } else if !self.config.is_block_mode() {
             None
         } else if self.is_split() && self.pane_zoomed {
             pane_running_badge_interval(self.active)
@@ -29773,6 +30125,248 @@ fn xterm_modify_other_keys_encode(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn chat_running_controls_share_visible_timer_and_validate_generation() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let status = source
+            .split_once("    fn chat_running_status(&self)")
+            .unwrap()
+            .1
+            .split_once("    /// The top bar doubles")
+            .unwrap()
+            .0;
+        assert!(status.contains("ChatSurface::Running"));
+        assert!(status.contains("contains_session(self.active)"));
+        assert!(status.contains("watch_generation()?"));
+        let handler = source
+            .split_once(
+                "            Message::ChatInterrupt(token) | Message::ChatSubmit(token) => {",
+            )
+            .unwrap()
+            .1
+            .split_once("            Message::SetTerminalMode")
+            .unwrap()
+            .0;
+        assert!(handler.contains("self.chat_input_ready(token.session)"));
+        assert!(handler.contains("session.id == token.session"));
+        assert!(
+            handler.find("if !sess.try_chat_control").unwrap()
+                < handler.find("self.organism.accepted_input()").unwrap()
+        );
+        assert!(!handler.contains("write_pty"));
+        let admission = source
+            .split_once("    fn try_chat_control(")
+            .unwrap()
+            .1
+            .split_once("    /// Queue data in-order")
+            .unwrap()
+            .0;
+        for gate in [
+            "chat_mode::control_enabled",
+            "self.pty.is_alive()",
+            "self.chat_control_token",
+            "chat_mode::admit_control",
+            "self.pty.write(byte)",
+            "if accepted",
+        ] {
+            assert!(admission.contains(gate), "missing writer gate {gate}");
+        }
+        assert!(!admission.contains("flush_write_queue"));
+        assert!(!admission.contains("push_queue"));
+        let owner = source
+            .split_once("    fn chat_control_token(")
+            .unwrap()
+            .1
+            .split_once("    fn enabled_chat_control(")
+            .unwrap()
+            .0;
+        for gate in [
+            "ChatSurface::Prompt",
+            "ChatSurface::Running",
+            "self.terminal.watch_generation()?",
+            "tty_foreground_pgid(self.master_fd)?",
+            "self.pty.get_child_pid()",
+        ] {
+            assert!(owner.contains(gate), "missing action ownership {gate}");
+        }
+        assert!(source.contains("chat_mode::press_control("));
+        assert!(source.contains("token.map(Message::ChatInterrupt)"));
+        let visibility = source
+            .split_once("        let native_visible =")
+            .unwrap()
+            .1
+            .split_once("        let live_visible")
+            .unwrap()
+            .0;
+        assert!(visibility.contains("!self.config.is_card_mode()"));
+        assert!(!visibility.contains("self.config.is_chat_mode()"));
+        assert!(visibility.contains("row.status_line.is_some()"));
+        let bytes = encode_key(
+            &keyboard::Key::Character("c".into()),
+            keyboard::Location::Standard,
+            keyboard::Modifiers::CTRL,
+            None,
+            false,
+            KeyboardEnhancements::default(),
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x03");
+    }
+
+    #[test]
+    fn chat_exact_cell_gate_rejects_capsule_padding_all_buttons_and_latches_release() {
+        use chat_mode::ChatRole;
+        let mut terminal = terminal::TerminalState::new(40, 24);
+        terminal.process_batch("\x1b]133;A\x07$ \x1b]133;B\x07echo 中\r\n\x1b]133;C\x07answer\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07draft".as_bytes());
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_chat(true);
+        policy.set_native_chrome(false, 3);
+        let projection = terminal.get_projected_viewport_with_state(
+            true,
+            &policy,
+            &mut terminal::ProjectionViewState::new(),
+        );
+        let command = projection
+            .chat_rows()
+            .iter()
+            .position(|row| row.role == ChatRole::Command)
+            .unwrap();
+        let real = projection.cells()[command]
+            .iter()
+            .position(|cell| cell.character == '$')
+            .unwrap();
+        let wide = projection.cells()[command]
+            .iter()
+            .position(|cell| cell.flags.wide_continuation())
+            .unwrap();
+        let press = |row, col, button, count, revision| MouseInput::Press {
+            row,
+            col,
+            button,
+            count,
+            link_revision: revision,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            finalized: false,
+            link_eligible: true,
+            app_eligible: true,
+            block: None,
+            block_zone_id: None,
+            link: false,
+            x: 0.0,
+            y: 0.0,
+        };
+        let mut rejected = vec![
+            (command, 0),
+            (command, 39),
+            (usize::MAX, 0),
+            (0, usize::MAX),
+        ];
+        for row in 0..projection.cells().len() {
+            if (0..40).all(|col| {
+                projection
+                    .view_to_raw(terminal::ViewportCell { row, col })
+                    .is_none()
+            }) {
+                rejected.push((row, 0));
+            }
+        }
+        assert!(
+            rejected.len() > 7,
+            "fixture includes every synthetic row role"
+        );
+        for (row, col) in rejected {
+            for (button, count) in [
+                (MouseButton::Middle, 1),
+                (MouseButton::Left, 3),
+                (MouseButton::Right, 1),
+            ] {
+                let mut gestures = [None; 3];
+                assert_eq!(
+                    reject_chat_press(
+                        Some(&projection),
+                        7,
+                        press(row, col, button, count, projection.view_revision()),
+                        &mut gestures
+                    ),
+                    Some(button)
+                );
+                // Release over a real cell is still the rejected press's
+                // consumed gesture; it cannot paste, select, copy or report.
+                let release = take_terminal_mouse_gesture(&mut gestures, 7, button).unwrap();
+                assert!(release.consumed);
+                assert_eq!(
+                    release.app_release_cell(Some((real, command)), 40, 24),
+                    None
+                );
+            }
+        }
+        for col in [real, wide] {
+            let mut gestures = [None; 3];
+            assert_eq!(
+                reject_chat_press(
+                    Some(&projection),
+                    7,
+                    press(
+                        command,
+                        col,
+                        MouseButton::Middle,
+                        1,
+                        projection.view_revision()
+                    ),
+                    &mut gestures
+                ),
+                None,
+                "genuine cells, including CJK continuations, keep the ordinary middle-paste route"
+            );
+            assert_eq!(
+                reject_chat_press(
+                    Some(&projection),
+                    7,
+                    press(
+                        command,
+                        col,
+                        MouseButton::Left,
+                        3,
+                        projection.view_revision().wrapping_add(1)
+                    ),
+                    &mut gestures
+                ),
+                Some(MouseButton::Left)
+            );
+        }
+    }
+
+    #[test]
+    fn chat_rejected_press_returns_before_clipboard_selection_and_app_input() {
+        let source = include_str!("main.rs");
+        let handler = source
+            .split_once("    fn handle_mouse(&mut self,")
+            .unwrap()
+            .1
+            .split_once("    fn ")
+            .unwrap()
+            .0;
+        let gate = handler.find("reject_chat_press(").unwrap();
+        let early_return = gate + handler[gate..].find("return Task::none();").unwrap();
+        for side_effect in [
+            "self.block_menu =",
+            "self.click_tracker\n                    .press",
+            "select_line_in_projection",
+            "iced::clipboard::read_primary()",
+            "sess.write_pty(",
+        ] {
+            assert!(
+                early_return < handler.find(side_effect).unwrap(),
+                "gate must precede {side_effect}"
+            );
+        }
+    }
+
+    #[test]
     fn workflow_target_is_captured_at_opening_and_carried_through_both_accept_routes() {
         let source = include_str!("main.rs");
         let opening = source
@@ -30552,7 +31146,7 @@ mod tests {
             assert!(!helper.contains(forbidden));
         }
         let settings = source
-            .split_once("            text(if self.config.block_mode")
+            .split_once("            text(if self.config.is_block_mode()")
             .unwrap()
             .1
             .split_once("            text(\"Organism Motion\")")
@@ -30650,7 +31244,7 @@ mod tests {
             .split_once("                area.into()")
             .unwrap()
             .0;
-        assert!(status.contains("if !self.config.block_mode"));
+        assert!(status.contains("if !self.config.is_card_mode()"));
         let widget = include_str!("terminal_view.rs");
         let passive = widget
             .split_once("// Observe the exact geometry used by draw")
@@ -30958,7 +31552,7 @@ mod tests {
             .split_once("    fn organism_owner(")
             .unwrap()
             .0;
-        assert!(sync.contains("!self.config.block_mode && layout.glyph"));
+        assert!(sync.contains("!self.config.is_card_mode() && layout.glyph"));
         assert!(sync.contains("layout.presentable()"));
         assert!(sync.contains("self.organism_geometry_epoch"));
         assert!(!sync.contains("enter_live_greeting"));

@@ -1,3 +1,7 @@
+mod chat_projection;
+#[cfg(all(test, target_os = "linux"))]
+mod chat_pty_tests;
+
 /// Locate cancellation before the first real string terminator. A fresh ESC
 /// abandons the string and is parsed again; CAN/SUB are consumed. The bool says
 /// that ESC was the final byte of the previous read and must be restored.
@@ -1258,6 +1262,8 @@ struct ProjectionPlan {
     effective_collapsed: BTreeSet<u64>,
     resolved_collapses: Vec<ResolvedCollapse>,
     plan_revision: u64,
+    chat_rows: Vec<crate::chat_mode::ChatRow>,
+    chat_dock_start: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1349,6 +1355,8 @@ impl ProjectionPlan {
             effective_collapsed: BTreeSet::new(),
             resolved_collapses: Vec::new(),
             plan_revision: 0,
+            chat_rows: Vec::new(),
+            chat_dock_start: None,
         };
         plan.rebuild_raw_row_placements();
         plan
@@ -1947,7 +1955,7 @@ impl ProjectionPlan {
     }
 
     fn has_transforms(&self) -> bool {
-        self.spacer_count > 0 || !self.effective_collapsed.is_empty()
+        self.spacer_count > 0 || !self.effective_collapsed.is_empty() || !self.chat_rows.is_empty()
     }
 
     fn summary_row(&self, zone_id: u64) -> Option<usize> {
@@ -2113,6 +2121,7 @@ pub struct ProjectionPolicy {
     block_spacing: bool,
     native_chrome: bool,
     organism_rows: usize,
+    chat: bool,
 }
 
 impl Default for ProjectionPolicy {
@@ -2123,6 +2132,7 @@ impl Default for ProjectionPolicy {
             block_spacing: false,
             native_chrome: false,
             organism_rows: 0,
+            chat: false,
         }
     }
 }
@@ -2138,10 +2148,22 @@ impl ProjectionPolicy {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.collapsed.is_empty() && !self.block_spacing && !self.native_chrome
+        self.collapsed.is_empty() && !self.block_spacing && !self.native_chrome && !self.chat
     }
 
     /// Spacing is a display transform, never a PTY resize or a raw blank line.
+    pub fn set_chat(&mut self, enabled: bool) -> bool {
+        if self.chat == enabled {
+            return false;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
+        self.chat = enabled;
+        self.revision = revision;
+        true
+    }
+
     pub fn set_block_spacing(&mut self, enabled: bool) -> bool {
         if self.block_spacing == enabled {
             return false;
@@ -2249,10 +2271,16 @@ pub struct ProjectedViewport {
     top_padding: usize,
     effective_collapsed: std::sync::Arc<BTreeSet<u64>>,
     plan_revision: u64,
+    chat_rows: std::sync::Arc<Vec<crate::chat_mode::ChatRow>>,
+    document_row_map: std::sync::Arc<Vec<Option<usize>>>,
 }
 
 #[allow(dead_code)] // Transformed accessors are consumed by the P1 UI wiring slice.
 impl ProjectedViewport {
+    pub fn chat_rows(&self) -> &[crate::chat_mode::ChatRow] {
+        &self.chat_rows
+    }
+
     pub fn cells(&self) -> &[Vec<TerminalCell>] {
         self.cells.as_ref()
     }
@@ -2402,6 +2430,9 @@ impl ProjectedViewport {
     }
 
     pub fn view_document_row(&self, view_row: usize) -> Option<usize> {
+        if !self.document_row_map.is_empty() {
+            return self.document_row_map.get(view_row).copied().flatten();
+        }
         (view_row >= self.top_padding && view_row < self.cells.len()).then(|| {
             self.document_start
                 .saturating_add(view_row - self.top_padding)
@@ -2439,6 +2470,7 @@ struct ProjectedViewportCacheKey {
     chrome_boundaries: SmallVec<[ChromeBoundary; 4]>,
     chrome_tail_rows: usize,
     view_scroll_offset: usize,
+    chat: Option<chat_projection::ChatPlanKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2461,6 +2493,7 @@ struct ProjectionPlanCacheKey {
     next_zone_id: u64,
     zone_count: usize,
     provenance_count: usize,
+    chat: Option<chat_projection::ChatPlanKey>,
 }
 
 type ProjectionPlanCache = (ProjectionPlanCacheKey, std::sync::Arc<ProjectionPlan>);
@@ -2584,6 +2617,8 @@ struct MaterializedProjection {
     scroll_offset: usize,
     document_start: usize,
     top_padding: usize,
+    chat_rows: Vec<crate::chat_mode::ChatRow>,
+    document_row_map: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2609,7 +2644,7 @@ impl OriginSpan {
         (cell.row == self.view_row
             && (self.view_col_start..self.view_col_end).contains(&cell.col)
             && self.raw_row.is_tracked())
-        .then_some(RawCellOrigin {
+        .then(|| RawCellOrigin {
             row: self.raw_row,
             col: self.raw_col_start + cell.col - self.view_col_start,
         })
@@ -2619,7 +2654,7 @@ impl OriginSpan {
         let len = self.view_col_end - self.view_col_start;
         (origin.row == self.raw_row
             && (self.raw_col_start..self.raw_col_start + len).contains(&origin.col))
-        .then_some(ViewportCell {
+        .then(|| ViewportCell {
             row: self.view_row,
             col: self.view_col_start + origin.col - self.raw_col_start,
         })
@@ -3474,6 +3509,9 @@ pub struct TerminalState {
     /// the next A/B then represents a deliberate cancellation and may start
     /// clean unless effective bytes followed the interrupt as typeahead.
     prompt_cancel_pending: bool,
+    /// A primary-screen program took over geometry during this execution.
+    /// Retired by the next primary prompt, not by toggling its modes back off.
+    chat_native_takeover: bool,
     /// Independent prompt-edit gate for idle asynchronous output. Agent input
     /// deliberately does not taint Agent identity, but its echo still must not
     /// become a commandless background block.
@@ -3784,6 +3822,7 @@ impl TerminalState {
             agent_prompt_input_tainted: false,
             prompt_submission_pending: false,
             prompt_cancel_pending: false,
+            chat_native_takeover: false,
             idle_prompt_input_dirty: false,
             pending_prompt_typeahead: false,
             idle_background_output: None,
@@ -4877,6 +4916,7 @@ impl TerminalState {
                     }
                 }
                 self.current_zone_state = ZoneState::PromptStarted(absolute_row);
+                self.chat_native_takeover = false;
                 self.current_command_started_at = None;
                 self.current_command_start_col = None;
                 self.current_command_extent_row = None;
@@ -8018,6 +8058,7 @@ impl TerminalState {
         {
             crate::debug_log!("[APC] Kitty graphics error: {}", _error);
         }
+        self.note_chat_native_takeover();
         let responses = self.kitty_graphics.take_responses();
         if !responses.is_empty() {
             self.output_buffer.extend_from_slice(&responses);
@@ -8442,6 +8483,7 @@ impl TerminalState {
     pub fn process_input(&mut self, input: &[u8]) {
         self.process_input_inner(input);
         self.settle_zone_row_trim();
+        self.note_chat_native_takeover();
     }
 
     fn process_input_inner(&mut self, input: &[u8]) {
@@ -8937,6 +8979,9 @@ impl TerminalState {
                     }
                     i += 1;
                 }
+            }
+            if byte == 0x1b {
+                self.note_chat_native_takeover();
             }
             if capture_idle_background && self.idle_background_capture_active() && i > token_start {
                 self.append_idle_background_bytes(&data_slice[token_start..i]);
@@ -9791,6 +9836,7 @@ impl TerminalState {
         // blocks whose text is gone.
         self.cleared_blocks = None;
         self.current_zone_state = ZoneState::default();
+        self.chat_native_takeover = false;
         self.current_command_start_col = None;
         self.current_command_extent_row = None;
         self.current_output_start_col = None;
@@ -10291,12 +10337,30 @@ impl TerminalState {
         self.viewport_pixel_height = height;
     }
 
+    fn cursor_enabled(&self) -> bool {
+        // DEC mode 25 is independent of how a host viewport is scrolled.
+        self.modes.contains(&25)
+    }
+
     pub fn is_cursor_visible(&self) -> bool {
-        // Cursor is visible when mode 25 is SET (via \x1b[?25h)
-        // Hidden when mode 25 is RESET (via \x1b[?25l)
-        // While viewing scrollback we intentionally hide the live cursor,
-        // because the viewport no longer tracks the active prompt line.
-        self.modes.contains(&25) && self.scroll_offset == 0
+        // While viewing native scrollback we intentionally hide the live
+        // cursor, because that viewport no longer tracks the active prompt.
+        self.cursor_enabled() && self.scroll_offset == 0
+    }
+
+    /// Visibility for a raw cursor already resolved into a projected viewport.
+    pub fn is_mapped_cursor_visible(&self, projection: &ProjectedViewport, mapped: bool) -> bool {
+        let visible = if projection.mode() == ProjectionMode::Transformed
+            && !projection.chat_rows().is_empty()
+        {
+            // A fixed Chat composer can contain the live cursor while history
+            // remains parked in native scrollback across a D-only interval.
+            // The exact raw mapping, not that parked offset, decides visibility.
+            self.cursor_enabled()
+        } else {
+            self.is_cursor_visible()
+        };
+        visible && mapped
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -10814,7 +10878,8 @@ impl TerminalState {
     fn native_chrome_tail_rows(&self, policy: &ProjectionPolicy) -> usize {
         // Kitty placements are independent of cell contents. Until their exact
         // footprint is proven clear, retain the entire live grid conservatively.
-        if !policy.native_chrome || !self.kitty_graphics.get_placements().is_empty() {
+        if policy.chat || !policy.native_chrome || !self.kitty_graphics.get_placements().is_empty()
+        {
             return 0;
         }
         let Some(start) = self.running_zone_start().or_else(|| self.live_prompt_row()) else {
@@ -10842,7 +10907,7 @@ impl TerminalState {
     }
 
     fn native_chrome_boundaries(&self, policy: &ProjectionPolicy) -> SmallVec<[ChromeBoundary; 4]> {
-        if !policy.native_chrome {
+        if policy.chat || !policy.native_chrome {
             return SmallVec::new();
         }
         let standalone = |start: usize, background: bool| {
@@ -10903,6 +10968,9 @@ impl TerminalState {
     #[allow(dead_code)] // P1 plan core; consumer wiring lands in the next slice.
     fn collapsed_projection_plan(&self, cols: usize, policy: &ProjectionPolicy) -> ProjectionPlan {
         let mut identity = self.identity_projection_plan(cols);
+        if let Some(key) = self.chat_plan_key(policy) {
+            return self.chat_projection_plan(identity, &key, policy.revision());
+        }
         if policy.is_identity() {
             identity.policy_revision = policy.revision();
             return identity;
@@ -10924,6 +10992,9 @@ impl TerminalState {
         policy: &ProjectionPolicy,
     ) -> Option<std::sync::Arc<ProjectionPlan>> {
         let key = self.projection_plan_cache_key(cols, policy);
+        if policy.chat && key.chat.is_none() {
+            return None;
+        }
         if let Some((cached_key, plan)) = &self.projection_plan_cache {
             if *cached_key == key {
                 return plan.has_transforms().then(|| std::sync::Arc::clone(plan));
@@ -10936,16 +11007,20 @@ impl TerminalState {
         if collapses.is_empty()
             && key.spacing_boundaries.is_empty()
             && key.chrome_boundaries.is_empty()
+            && key.chat.is_none()
         {
             return None;
         }
         #[cfg(test)]
         PROJECTION_PLAN_BUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-        let mut plan = self
-            .identity_projection_plan(cols)
-            .splice_collapses(&collapses, policy.revision())
-            .splice_block_spacing(&key.spacing_boundaries)
-            .splice_native_chrome(&key.chrome_boundaries, key.chrome_tail_rows, key.rows);
+        let mut plan = if let Some(chat) = &key.chat {
+            self.chat_projection_plan(self.identity_projection_plan(cols), chat, policy.revision())
+        } else {
+            self.identity_projection_plan(cols)
+                .splice_collapses(&collapses, policy.revision())
+                .splice_block_spacing(&key.spacing_boundaries)
+                .splice_native_chrome(&key.chrome_boundaries, key.chrome_tail_rows, key.rows)
+        };
         // Cache an ineffective plan too: a proven prompt can still share a
         // reflowed row, and idle redraws must not repeatedly rebuild history.
         plan.plan_revision = self.next_projection_plan_revision;
@@ -10979,7 +11054,9 @@ impl TerminalState {
             .history_len
             .checked_add(scrolled)?
             .checked_sub(key.history_len)?;
-        if scrolled == 0
+        if old.chat.is_some()
+            || key.chat.is_some()
+            || scrolled == 0
             || scrolled > old.rows
             || evicted > old.history_len
             || !old.block_spacing
@@ -11166,6 +11243,7 @@ impl TerminalState {
             next_zone_id: self.next_zone_id,
             zone_count: self.command_zones.len(),
             provenance_count: self.finished_output_provenance.len(),
+            chat: self.chat_plan_key(policy),
         }
     }
 
@@ -11465,6 +11543,7 @@ impl TerminalState {
             chrome_boundaries: SmallVec::new(),
             chrome_tail_rows: 0,
             view_scroll_offset: self.scroll_offset,
+            chat: None,
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
             if *cached_key == key {
@@ -11522,6 +11601,8 @@ impl TerminalState {
             self.next_projected_view_revision = view_revision.checked_add(1).unwrap_or(0);
         }
         let viewport = std::sync::Arc::new(ProjectedViewport {
+            chat_rows: std::sync::Arc::new(Vec::new()),
+            document_row_map: std::sync::Arc::new(Vec::new()),
             row_kinds: std::sync::Arc::new(vec![ProjectedRowKind::Raw; cells.len()]),
             cells,
             row_wrapped,
@@ -11561,10 +11642,17 @@ impl TerminalState {
         cols: usize,
     ) -> MaterializedProjection {
         let scroll_offset = requested_scroll_offset.min(plan.rows.len().saturating_sub(rows));
-        let visible_end = plan.rows.len().saturating_sub(scroll_offset);
-        let visible_start = visible_end.saturating_sub(rows);
-        let visible_plan_rows = &plan.rows[visible_start..visible_end];
-        let top_padding = rows.saturating_sub(visible_plan_rows.len());
+        let dock_start = plan.chat_dock_start.unwrap_or(plan.rows.len());
+        let dock_rows = plan.rows.len().saturating_sub(dock_start).min(rows);
+        let history_capacity = rows.saturating_sub(dock_rows);
+        let visible_end = dock_start.saturating_sub(scroll_offset);
+        let visible_start = visible_end.saturating_sub(history_capacity);
+        let visible_indices: Vec<_> = (visible_start..visible_end)
+            .chain(dock_start..plan.rows.len())
+            .collect();
+        let top_padding = rows.saturating_sub(visible_indices.len());
+        let mut chat_rows = Vec::with_capacity(rows);
+        let mut document_row_map = Vec::with_capacity(rows);
 
         let mut cells = Vec::with_capacity(rows);
         let mut row_wrapped = Vec::with_capacity(rows);
@@ -11572,6 +11660,8 @@ impl TerminalState {
         let mut row_sources = Vec::with_capacity(rows);
         let mut origin_spans = Vec::new();
         for _ in 0..top_padding {
+            chat_rows.push(crate::chat_mode::ChatRow::default());
+            document_row_map.push(None);
             cells.push(vec![TerminalCell::default(); cols]);
             row_wrapped.push(false);
             row_kinds.push(ProjectedRowKind::Padding);
@@ -11579,7 +11669,15 @@ impl TerminalState {
         }
 
         let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
-        for planned in visible_plan_rows {
+        for document_row in visible_indices {
+            let planned = &plan.rows[document_row];
+            chat_rows.push(
+                plan.chat_rows
+                    .get(document_row)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+            document_row_map.push(Some(document_row));
             let view_row = cells.len();
             let mut line = vec![TerminalCell::default(); cols];
             if matches!(planned.kind, ProjectedRowKind::Raw) {
@@ -11639,13 +11737,43 @@ impl TerminalState {
             );
         }
         while cells.len() < rows {
+            chat_rows.push(crate::chat_mode::ChatRow::default());
+            document_row_map.push(None);
             cells.push(vec![TerminalCell::default(); cols]);
             row_wrapped.push(false);
             row_kinds.push(ProjectedRowKind::Padding);
             row_sources.push(None);
         }
 
+        if !plan.chat_rows.is_empty() {
+            // A wrap joins adjacent source document rows, never independent
+            // viewport slices or host chrome. Keep the PTY's wrap flags intact.
+            for (row, wrapped) in row_wrapped.iter_mut().enumerate() {
+                let contiguous = document_row_map
+                    .get(row)
+                    .copied()
+                    .flatten()
+                    .zip(document_row_map.get(row + 1).copied().flatten())
+                    .is_some_and(|(left, right)| left + 1 == right)
+                    && matches!(row_kinds.get(row), Some(ProjectedRowKind::Raw))
+                    && matches!(row_kinds.get(row + 1), Some(ProjectedRowKind::Raw));
+                if !contiguous {
+                    *wrapped = false;
+                }
+            }
+        }
+
         MaterializedProjection {
+            chat_rows: if plan.chat_rows.is_empty() {
+                Vec::new()
+            } else {
+                chat_rows
+            },
+            document_row_map: if plan.chat_rows.is_empty() {
+                Vec::new()
+            } else {
+                document_row_map
+            },
             cells,
             row_wrapped,
             row_kinds,
@@ -11697,7 +11825,11 @@ impl TerminalState {
         policy: &ProjectionPolicy,
         view_scroll_offset: usize,
     ) -> std::sync::Arc<ProjectedViewport> {
-        if !block_mode || self.use_alt_buffer || policy.is_identity() {
+        if !block_mode
+            || self.use_alt_buffer
+            || policy.is_identity()
+            || (policy.chat && self.chat_plan_key(policy).is_none())
+        {
             return self.get_projected_viewport(block_mode);
         }
 
@@ -11719,6 +11851,7 @@ impl TerminalState {
             chrome_boundaries: self.native_chrome_boundaries(policy),
             chrome_tail_rows: self.native_chrome_tail_rows(policy),
             view_scroll_offset,
+            chat: self.chat_plan_key(policy),
         };
         if let Some((cached_key, viewport)) = &self.projected_viewport_cache {
             if *cached_key == cache_key {
@@ -11745,6 +11878,8 @@ impl TerminalState {
         let viewport = std::sync::Arc::new(ProjectedViewport {
             cells: std::sync::Arc::new(materialized.cells),
             row_wrapped: std::sync::Arc::new(materialized.row_wrapped),
+            chat_rows: std::sync::Arc::new(materialized.chat_rows),
+            document_row_map: std::sync::Arc::new(materialized.document_row_map),
             row_kinds: std::sync::Arc::new(materialized.row_kinds),
             provenance: std::sync::Arc::new(materialized.provenance),
             raw_span_index: std::sync::Arc::new(raw_span_index),
@@ -11871,8 +12006,27 @@ impl TerminalState {
         policy: &ProjectionPolicy,
         state: &mut ProjectionViewState,
     ) -> std::sync::Arc<ProjectedViewport> {
-        if !block_mode || self.use_alt_buffer {
+        if !block_mode
+            || self.use_alt_buffer
+            || (policy.chat && self.chat_plan_key(policy).is_none())
+        {
             self.projected_selection = None;
+            if policy.chat && !self.use_alt_buffer {
+                // D and the next A/B can arrive in different reads. Park a
+                // reader's raw history anchor through that native interval;
+                // otherwise the display jumps to the live grid and the next
+                // Chat plan inherits the wrong reading position. This does
+                // not constrain a Running primary-screen takeover or alt app.
+                if self.chat_surface() == crate::chat_mode::ChatSurface::Passthrough
+                    && state.last_plan_key.is_some()
+                {
+                    self.restore_identity_scroll_from_projection(state);
+                }
+                // A primary-screen takeover may rewrite formerly completed
+                // rows. Never revive their old right-alignment plan afterward.
+                self.projection_plan_cache = None;
+                state.last_plan_key = None;
+            }
             return self.get_projected_viewport(block_mode);
         }
         if policy.is_identity() {
@@ -12244,7 +12398,10 @@ impl TerminalState {
     }
 
     fn projection_plan_key_matches_current_source(&self, key: &ProjectionPlanCacheKey) -> bool {
-        key.history_revision == self.history_revision
+        key.chat
+            .as_ref()
+            .is_none_or(|chat| self.chat_key_is_current(chat))
+            && key.history_revision == self.history_revision
             && key.row_identity_revision == self.grid.identity_revision
             && key.rows == self.grid.rows()
             && key.cols == self.grid.row_len().max(1)
@@ -12517,6 +12674,9 @@ impl TerminalState {
             let Some(point) = Self::projected_selection_point(projection, viewport_pos) else {
                 return;
             };
+            if !self.projected_selection_same_surface(point, point) {
+                return;
+            }
             let Some(selection) = self.projected_selection.as_mut() else {
                 return;
             };
@@ -12531,6 +12691,29 @@ impl TerminalState {
         if let Some(ref mut sel) = self.selection {
             sel.active = (abs_row, viewport_pos.1);
         }
+    }
+
+    /// All drag granularities share the same independent-surface boundary.
+    /// Word extension may swap endpoints, so validate both old endpoints and
+    /// the proposed range before any endpoint mutation.
+    fn projected_selection_same_surface(
+        &self,
+        start: ProjectedSelectionEndpoint,
+        end: ProjectedSelectionEndpoint,
+    ) -> bool {
+        let Some(dock) = self
+            .projection_plan_cache
+            .as_ref()
+            .and_then(|(_, plan)| plan.chat_dock_start)
+        else {
+            return true;
+        };
+        let surface = start.point.0 < dock;
+        (end.point.0 < dock) == surface
+            && self.projected_selection.as_ref().is_none_or(|selection| {
+                (selection.anchor.point.0 < dock) == surface
+                    && (selection.active.point.0 < dock) == surface
+            })
     }
 
     /// Select the word at the given (row, col) position in the visible grid.
@@ -12709,6 +12892,9 @@ impl TerminalState {
             else {
                 return;
             };
+            if !self.projected_selection_same_surface(target_start, target_end) {
+                return;
+            }
             let Some(selection) = self.projected_selection.as_mut() else {
                 self.projected_selection = Some(Self::new_projected_selection(
                     projection,
@@ -12826,6 +13012,9 @@ impl TerminalState {
             let Some(target_end) = Self::projected_selection_point(projection, (row, right)) else {
                 return;
             };
+            if !self.projected_selection_same_surface(target_start, target_end) {
+                return;
+            }
             let Some(selection) = self.projected_selection.as_mut() else {
                 return;
             };

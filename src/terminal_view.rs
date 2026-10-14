@@ -894,6 +894,9 @@ pub struct TermWidget<'a, Message> {
     /// Per visible row block chrome (stripes, separators, badges), aligned
     /// with the grid rows exactly like `selection`. Empty = no block mode.
     blocks: Vec<BlockPaintRow>,
+    chat_rows: &'a [crate::chat_mode::ChatRow],
+    chat_projection: Option<&'a crate::terminal::ProjectedViewport>,
+    on_chat_submit: Option<Box<dyn Fn() -> Message + 'a>>,
     organism_body: Option<OrganismBody>,
     organism_status: Option<crate::organism::LivePresentation>,
     organism_expanded: bool,
@@ -984,6 +987,9 @@ impl<'a, Message> TermWidget<'a, Message> {
             scroll_offset,
             scrollback_len,
             blocks: Vec::new(),
+            chat_rows: &[],
+            chat_projection: None,
+            on_chat_submit: None,
             organism_body: None,
             organism_status: None,
             organism_expanded: false,
@@ -1129,6 +1135,112 @@ impl<'a, Message> TermWidget<'a, Message> {
         self
     }
 
+    pub(crate) fn chat_rows(
+        mut self,
+        rows: &'a [crate::chat_mode::ChatRow],
+        projection: Option<&'a crate::terminal::ProjectedViewport>,
+        submit: Option<Message>,
+    ) -> Self
+    where
+        Message: Clone + 'a,
+    {
+        self.chat_rows = rows;
+        self.chat_projection = projection;
+        self.on_chat_submit = submit.map(|message| Box::new(move || message.clone()) as _);
+        self
+    }
+
+    fn card_geometry(&self, bounds: Rectangle, segment: BlockCardSegment) -> BlockCardGeometry {
+        let oy = bounds.y + self.metrics.padding;
+        let right = block_chrome_right(bounds, self.metrics);
+        let Some(chat) = self.chat_rows.get(segment.start_row) else {
+            return block_card_geometry(
+                bounds,
+                right,
+                oy,
+                self.metrics.cell_h,
+                segment,
+                self.block_compact,
+            );
+        };
+        let ox = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+        let left = (ox + chat.left_col as f32 * self.metrics.cell_w - 7.0).max(bounds.x + 2.0);
+        let top = oy + segment.start_row as f32 * self.metrics.cell_h;
+        let bottom = oy + segment.end_row as f32 * self.metrics.cell_h;
+        let radius = if chat.role == crate::chat_mode::ChatRole::Command {
+            18.0
+        } else {
+            14.0
+        };
+        BlockCardGeometry {
+            body: Rectangle {
+                x: left,
+                y: top,
+                width: (right - left).max(0.0),
+                height: bottom - top,
+            },
+            radius: border::Radius {
+                top_left: if segment.real_top { radius } else { 0.0 },
+                top_right: if segment.real_top { radius } else { 0.0 },
+                bottom_left: if segment.real_bottom { radius } else { 0.0 },
+                bottom_right: if segment.real_bottom { radius } else { 0.0 },
+            },
+        }
+    }
+
+    /// This exact clipped rectangle is shared by paint, pointer cursor and
+    /// activation. The footer is synthetic and can never own terminal input.
+    fn chat_submit_geometry(&self, bounds: Rectangle, viewport: &Rectangle) -> Option<Rectangle> {
+        if !self.focused || self.grid.first()?.len() < 8 {
+            return None;
+        }
+        let row = self.chat_rows.iter().enumerate().find_map(|(row, chat)| {
+            (chat.role == crate::chat_mode::ChatRole::Composer
+                && chat.bottom
+                && self.blocks.get(row).is_some_and(|block| block.host_spacer))
+            .then_some(row)
+        })?;
+        let size = (self.metrics.cell_h - 2.0).max(1.0);
+        Rectangle {
+            x: block_chrome_right(bounds, self.metrics) - size - 7.0,
+            y: bounds.y + self.metrics.padding + row as f32 * self.metrics.cell_h + 1.0,
+            width: size,
+            height: size,
+        }
+        .intersection(&bounds)?
+        .intersection(viewport)
+    }
+
+    fn chat_terminal_point_allowed(
+        &self,
+        pos: Point,
+        bounds: Rectangle,
+        viewport: &Rectangle,
+    ) -> bool {
+        let Some(projection) = self.chat_projection else {
+            return true;
+        };
+        let left = bounds.x + self.metrics.padding + self.metrics.block_gutter_width();
+        let top = bounds.y + self.metrics.padding;
+        let right = (left + self.grid.first().map_or(0, Vec::len) as f32 * self.metrics.cell_w)
+            .min(
+                self.scrollbar_geometry(bounds)
+                    .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x),
+            );
+        let bottom = top + self.grid.len() as f32 * self.metrics.cell_h;
+        if pos.x < left
+            || pos.x >= right
+            || pos.y < top
+            || pos.y >= bottom
+            || !bounds.contains(pos)
+            || !viewport.contains(pos)
+        {
+            return false;
+        }
+        let (col, row) = self.cell_at(pos, bounds);
+        crate::chat_mode::terminal_press_allowed(projection, projection.view_revision(), row, col)
+    }
+
     pub(crate) fn organism_status(
         mut self,
         presentation: Option<crate::organism::LivePresentation>,
@@ -1173,23 +1285,24 @@ impl<'a, Message> TermWidget<'a, Message> {
             return None;
         }
         let clip = bounds.intersection(viewport)?;
-        let segment = block_card_segments(&self.blocks)
+        let mut segment = block_card_segments(&self.blocks)
             .into_iter()
             .find(|segment| segment.kind == BlockCardKind::Active)?;
+        // The Chat footer owns the submit affordance. The body can use only
+        // the real, empty composer rows above it, even when wandering.
+        if !self.chat_rows.is_empty() {
+            while segment.end_row > segment.start_row
+                && self.blocks.get(segment.end_row - 1)?.host_spacer
+            {
+                segment.end_row -= 1;
+            }
+        }
         let (cw, ch) = (self.metrics.cell_w, self.metrics.cell_h);
         let origin = (
             bounds.x + self.metrics.padding + self.metrics.block_gutter_width(),
             bounds.y + self.metrics.padding,
         );
-        let card = block_card_geometry(
-            bounds,
-            bounds.x + bounds.width - self.metrics.padding - SCROLLBAR_WIDTH,
-            origin.1,
-            ch,
-            segment,
-            self.block_compact,
-        )
-        .body;
+        let card = self.card_geometry(bounds, segment).body;
         // Complete default cells only. Styled blanks, wide continuations, links,
         // badges and synthetic rows are occupied; no prompt/password guessing.
         let mut last_occupied_row = None;
@@ -1702,6 +1815,131 @@ mod tests {
         BLOCK_CARD_INSET, BLOCK_CARD_RADIUS, BLOCK_GUTTER_WIDTH,
     };
     use iced::{Color, Point, Rectangle};
+
+    #[test]
+    fn chat_submit_hit_is_the_clipped_paint_rect_and_body_stays_above_footer() {
+        use crate::chat_mode::{ChatRole, ChatRow};
+        const ROWS: [ChatRow; 8] = {
+            let row = ChatRow {
+                role: ChatRole::Composer,
+                group: 0,
+                left_col: 0,
+                top: false,
+                bottom: false,
+                app_eligible: true,
+                status_line: None,
+                status_zone: None,
+            };
+            let mut rows = [row; 8];
+            rows[0].top = true;
+            rows[5].bottom = true;
+            rows[5].app_eligible = false;
+            rows
+        };
+        with_native_body(|widget, bounds| {
+            widget.chat_rows = &ROWS;
+            widget.blocks[5].host_spacer = true;
+            let button = widget.chat_submit_geometry(bounds, &bounds).unwrap();
+            let body = widget.organism_geometry(bounds, &bounds).unwrap();
+            assert!(body.rect.y + body.rect.height <= button.y);
+            let viewport = Rectangle {
+                x: button.x + button.width / 2.0,
+                ..bounds
+            };
+            let clipped = widget.chat_submit_geometry(bounds, &viewport).unwrap();
+            assert!(clipped.width < button.width);
+            assert!(!clipped.contains(Point::new(button.x + 0.1, button.center_y())));
+            assert!(clipped.contains(Point::new(clipped.x + 0.1, clipped.center_y())));
+            widget.focused = false;
+            assert!(widget.chat_submit_geometry(bounds, &bounds).is_none());
+        });
+    }
+
+    #[test]
+    fn chat_pointer_geometry_rejects_horizontal_host_cells_and_outer_padding() {
+        let mut terminal = crate::terminal::TerminalState::new(40, 24);
+        terminal.process_batch("\x1b]133;A\x07$ \x1b]133;B\x07echo 中\r\n\x1b]133;C\x07answer\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07draft".as_bytes());
+        let mut policy = crate::terminal::ProjectionPolicy::new();
+        policy.set_chat(true);
+        policy.set_native_chrome(false, 3);
+        let projection = terminal.get_projected_viewport_with_state(
+            true,
+            &policy,
+            &mut crate::terminal::ProjectionViewState::new(),
+        );
+        let theme = crate::theme::Theme::default();
+        for font_size in [10.0, 16.0, 32.0] {
+            let metrics = Metrics::new(font_size, 1.0, 4.0, true);
+            let widget = super::TermWidget::new(
+                projection.cells(),
+                (0, 0),
+                true,
+                crate::terminal::CursorShape::Block,
+                true,
+                &theme,
+                metrics,
+                iced::Font::MONOSPACE,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                0,
+                0,
+            )
+            .chat_rows(projection.chat_rows(), Some(&projection), None::<()>);
+            let bounds = Rectangle {
+                x: 10.0,
+                y: 20.0,
+                width: metrics.cell_w * 40.0
+                    + metrics.padding * 2.0
+                    + metrics.block_gutter_width()
+                    + super::SCROLLBAR_WIDTH,
+                height: metrics.cell_h * 24.0 + metrics.padding * 2.0,
+            };
+            for row in 0..24 {
+                for col in 0..40 {
+                    let pos = Point::new(
+                        bounds.x
+                            + metrics.padding
+                            + metrics.block_gutter_width()
+                            + (col as f32 + 0.5) * metrics.cell_w,
+                        bounds.y + metrics.padding + (row as f32 + 0.5) * metrics.cell_h,
+                    );
+                    let real = projection
+                        .view_to_raw(crate::terminal::ViewportCell { row, col })
+                        .is_some();
+                    assert_eq!(
+                        widget.chat_terminal_point_allowed(pos, bounds, &bounds),
+                        real
+                    );
+                    for button in [
+                        super::MouseButton::Left,
+                        super::MouseButton::Middle,
+                        super::MouseButton::Right,
+                    ] {
+                        let mut state = super::State::default();
+                        assert_eq!(state.consume_spacer_press(button, !real), !real);
+                        if !real {
+                            assert!(!super::owns_mouse_release(
+                                &state.published_presses,
+                                state.dragging,
+                                false,
+                                button
+                            ));
+                        }
+                    }
+                }
+            }
+            for pos in [
+                Point::new(bounds.x + 1.0, bounds.center_y()),
+                Point::new(bounds.center_x(), bounds.y + 1.0),
+                Point::new(bounds.x - 1.0, bounds.y - 1.0),
+            ] {
+                assert!(!widget.chat_terminal_point_allowed(pos, bounds, &bounds));
+            }
+        }
+    }
 
     // CPU only: construct plain snapshots and a widget value; never create a
     // renderer, window, font database, PTY, or event loop.
@@ -3049,6 +3287,18 @@ where
                         return;
                     }
                 }
+                if button == MouseButton::Left
+                    && self
+                        .chat_submit_geometry(bounds, viewport)
+                        .is_some_and(|rect| rect.contains(pos))
+                {
+                    if let Some(submit) = &self.on_chat_submit {
+                        state.consume_spacer_press(button, true);
+                        shell.publish(submit());
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 if state.consume_spacer_press(
                     button,
                     self.blocks.get(row).is_some_and(|block| {
@@ -3100,6 +3350,11 @@ where
                     .map_or(bounds.x + bounds.width, |(_, _, x, _, _)| x);
                 let grid_right = (grid_left + grid_width).min(scrollbar_left);
                 let over_grid_columns = pos.x >= grid_left && pos.x < grid_right;
+                if !self.chat_terminal_point_allowed(pos, bounds, viewport) {
+                    state.consume_spacer_press(button, true);
+                    shell.capture_event();
+                    return;
+                }
                 let block_row = self.blocks.get(row);
                 let collapsed_summary = (over_grid && before_scrollbar && over_grid_columns)
                     .then(|| block_row.and_then(|block| block.collapsed_summary))
@@ -3420,14 +3675,7 @@ where
             let segment = card_segments
                 .iter()
                 .find(|segment| segment.group == group)?;
-            let geometry = block_card_geometry(
-                bounds,
-                scrollbar_track_left,
-                oy,
-                ch,
-                *segment,
-                self.block_compact,
-            );
+            let geometry = self.card_geometry(bounds, *segment);
             block_card_hover_contains(bounds, geometry.body, position.x, position.y)
                 .then_some(group)
         });
@@ -3437,24 +3685,27 @@ where
         // image. Explicit cell backgrounds therefore keep exact terminal
         // semantics, while default cells reveal the light theme-relative tint.
         for segment in &card_segments {
-            let geometry = block_card_geometry(
-                bounds,
-                scrollbar_track_left,
-                oy,
-                ch,
-                *segment,
-                self.block_compact,
-            );
+            let geometry = self.card_geometry(bounds, *segment);
             if geometry.body.width <= 0.0 || geometry.body.height <= 0.0 {
                 continue;
             }
-            let visual = block_card_visual(
+            let mut visual = block_card_visual(
                 *segment,
                 default_fg,
                 block_accent,
                 hovered_card == Some(segment.group),
                 self.opacity,
             );
+            if let Some(chat) = self.chat_rows.get(segment.start_row) {
+                let command = chat.role == crate::chat_mode::ChatRole::Command;
+                visual.background = alpha(
+                    if command { block_accent } else { default_fg },
+                    if command { 0.30 } else { 0.055 },
+                );
+                visual.border = alpha(if command { block_accent } else { default_fg }, 0.20);
+                visual.border_width = 1.0;
+                visual.shadow = Shadow::default();
+            }
             renderer.fill_quad(
                 Quad {
                     bounds: geometry.body,
@@ -3858,6 +4109,59 @@ where
             }
         }
 
+        if let Some(rect) = self.chat_submit_geometry(bounds, &clip) {
+            renderer.fill_quad(
+                Quad {
+                    bounds: rect,
+                    border: Border {
+                        radius: (rect.height / 2.0).into(),
+                        ..Border::default()
+                    },
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                Background::Color(alpha(
+                    block_accent,
+                    if self.on_chat_submit.is_some() {
+                        0.85
+                    } else {
+                        0.25
+                    },
+                )),
+            );
+            chrome_text(
+                renderer,
+                "↑",
+                Rectangle {
+                    x: rect.x + rect.width * 0.22,
+                    width: rect.width * 0.7,
+                    ..rect
+                },
+                self.mono,
+                self.metrics.font_size,
+                default_fg,
+                clip,
+            );
+            chrome_text(
+                renderer,
+                if self.on_chat_submit.is_some() {
+                    "shell · Enter"
+                } else {
+                    "keyboard · Enter"
+                },
+                Rectangle {
+                    x: ox + 6.0,
+                    y: rect.y,
+                    width: (rect.x - ox - 18.0).max(0.0),
+                    height: rect.height,
+                },
+                self.mono,
+                self.metrics.font_size * 0.72,
+                alpha(default_fg, 0.45),
+                clip,
+            );
+        }
+
         // Kitty graphics: paint each placement (already z-sorted) as a texture
         // stretched into its cell span. Block UI chrome and the cursor follow,
         // so images cannot hide selection/bookmark affordances or the caret.
@@ -3883,25 +4187,28 @@ where
         // state cannot disappear under a terminal graphic. They are still
         // batched per visible card, not repeated for every row.
         for segment in &card_segments {
-            let geometry = block_card_geometry(
-                bounds,
-                scrollbar_track_left,
-                oy,
-                ch,
-                *segment,
-                self.block_compact,
-            );
+            let geometry = self.card_geometry(bounds, *segment);
             if geometry.body.width <= 0.0 || geometry.body.height <= 0.0 {
                 continue;
             }
             let stripe = segment.stripe.unwrap_or(block_accent);
-            let visual = block_card_visual(
+            let mut visual = block_card_visual(
                 *segment,
                 default_fg,
                 block_accent,
                 hovered_card == Some(segment.group),
                 self.opacity,
             );
+            if let Some(chat) = self.chat_rows.get(segment.start_row) {
+                let command = chat.role == crate::chat_mode::ChatRole::Command;
+                visual.background = alpha(
+                    if command { block_accent } else { default_fg },
+                    if command { 0.30 } else { 0.055 },
+                );
+                visual.border = alpha(if command { block_accent } else { default_fg }, 0.20);
+                visual.border_width = 1.0;
+                visual.shadow = Shadow::default();
+            }
             if segment.real_top && segment.real_bottom {
                 renderer.fill_quad(
                     Quad {
@@ -3937,7 +4244,7 @@ where
             };
             let stripe_bounds =
                 block_card_stripe_bounds(bounds, geometry.body, requested_width, ox);
-            if stripe_bounds.width > 0.0 {
+            if self.chat_rows.is_empty() && stripe_bounds.width > 0.0 {
                 renderer.fill_quad(
                     Quad {
                         bounds: stripe_bounds,
@@ -4548,6 +4855,13 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if let Some(p) = cursor.position_over(layout.bounds()) {
+            if self.on_chat_submit.is_some()
+                && self
+                    .chat_submit_geometry(layout.bounds(), viewport)
+                    .is_some_and(|rect| rect.contains(p))
+            {
+                return mouse::Interaction::Pointer;
+            }
             let (c, r) = self.cell_at(p, layout.bounds());
             let before_scrollbar = self
                 .scrollbar_geometry(layout.bounds())
