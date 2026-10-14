@@ -3154,7 +3154,8 @@ where
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State>();
         if state.terminal_mode != Some(self.terminal_mode) || state.mode_epoch != self.mode_epoch {
-            // App ownership has already retired synchronously in apply_config.
+            // App ownership has already retired synchronously at its mode or
+            // visible-pane ownership boundary.
             // This covers retained local controls, including a same-batch mode
             // round trip that never rendered the intermediate presentation.
             *state = State {
@@ -5181,6 +5182,7 @@ mod mode_gesture_tests {
     #[derive(Debug, Clone)]
     enum Output {
         Mouse(MouseInput),
+        OwnedMouse(usize, MouseInput),
         Summary,
         Submit,
     }
@@ -5620,5 +5622,506 @@ mod mode_gesture_tests {
                 );
             }
         }
+    }
+    #[test]
+    fn pane_owner_swap_cannot_reuse_retained_widget_gesture() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 25.0);
+        let build = |epoch| -> Element<'_, Output, iced::Theme, ()> {
+            iced::widget::container(crate::terminal_panes_body(
+                None,
+                Element::new(fixture(&projection, &theme, TerminalMode::Normal, epoch)),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        };
+        let send = |element: &mut Element<'_, Output, iced::Theme, ()>, tree: &mut Tree, event| {
+            let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            messages
+        };
+        let mut layout = crate::PaneTree::Split {
+            axis: crate::Axis::Horizontal,
+            children: vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+            ratios: vec![0.5, 0.5],
+        };
+        let mut old = build(0);
+        let mut retained = Tree::new(old.as_widget());
+        assert!(matches!(
+            send(&mut old, &mut retained, press()).as_slice(),
+            [Output::Mouse(MouseInput::Press { .. })]
+        ));
+        let capture = |layout: &crate::PaneTree| crate::TerminalPaneOwners {
+            tab_id: Some(3),
+            tree: crate::TerminalPaneOwner::capture(layout, &|index| Some(index + 17)),
+        };
+        let mut previous = Some(capture(&layout));
+        let mut epoch = 0;
+        let mut gestures = [Some(owner(MouseButton::Left, true)), None, None];
+        let mut clicks = crate::TerminalClickTracker::default();
+        crate::swap_sessions_in_tree(&mut layout, 0, 1);
+        assert_eq!(layout.leaves(), vec![1, 0]);
+        let retired = crate::change_terminal_pane_owners(
+            &mut previous,
+            capture(&layout),
+            &mut epoch,
+            &mut gestures,
+            &mut clicks,
+        );
+        assert_eq!(retired.len(), 1);
+        assert!(gestures.iter().all(Option::is_none));
+        // The production swap keeps Iced's composition and mode unchanged,
+        // but the callback at the retained first leaf now addresses session 1.
+        let mut next = build(epoch);
+        retained.diff(next.as_widget());
+        assert!(
+            send(&mut next, &mut retained, moved(point)).is_empty(),
+            "old pane gesture was published by the replacement pane"
+        );
+        assert!(send(&mut next, &mut retained, release()).is_empty());
+    }
+    #[test]
+    fn pane_owner_boundaries_retire_all_buttons_exactly_once_and_keep_noop_owners() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        terminal.process_batch(b"\x1b[?1000h\x1b[?1006h");
+        let split = || crate::PaneTree::Split {
+            axis: crate::Axis::Horizontal,
+            children: vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+            ratios: vec![0.5, 0.5],
+        };
+        let capture = |tab_id, tree: &crate::PaneTree, ids: &[usize]| crate::TerminalPaneOwners {
+            tab_id: Some(tab_id),
+            tree: crate::TerminalPaneOwner::capture(tree, &|i| ids.get(i).copied()),
+        };
+        let initial = capture(3, &split(), &[17, 29]);
+        for change in ["tab", "swap", "close", "zoom", "reparent", "axis"] {
+            let mut next_tree = split();
+            let next = match change {
+                "tab" => capture(4, &next_tree, &[17, 29]),
+                "swap" => {
+                    crate::swap_sessions_in_tree(&mut next_tree, 0, 1);
+                    capture(3, &next_tree, &[17, 29])
+                }
+                "close" => capture(3, &crate::PaneTree::Leaf(0), &[29]),
+                "zoom" => capture(3, &crate::PaneTree::Leaf(0), &[17]),
+                "reparent" => capture(
+                    3,
+                    &crate::PaneTree::Split {
+                        axis: crate::Axis::Horizontal,
+                        children: vec![next_tree],
+                        ratios: vec![1.0],
+                    },
+                    &[17, 29],
+                ),
+                "axis" => {
+                    if let crate::PaneTree::Split { axis, .. } = &mut next_tree {
+                        *axis = crate::Axis::Vertical;
+                    }
+                    capture(3, &next_tree, &[17, 29])
+                }
+                _ => unreachable!(),
+            };
+            let mut previous = Some(initial.clone());
+            let mut epoch = 0;
+            let mut slots = [MouseButton::Left, MouseButton::Middle, MouseButton::Right]
+                .map(|button| Some(owner(button, true)));
+            let mut clicks = crate::TerminalClickTracker::default();
+            let retired = crate::change_terminal_pane_owners(
+                &mut previous,
+                next.clone(),
+                &mut epoch,
+                &mut slots,
+                &mut clicks,
+            );
+            let reports: Vec<_> = retired
+                .into_iter()
+                .map(|gesture| {
+                    (
+                        gesture.session_id,
+                        crate::cancelled_terminal_mouse_report(gesture, &terminal).unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                reports,
+                [
+                    (17, b"\x1b[<0;8;3m".to_vec()),
+                    (17, b"\x1b[<1;8;3m".to_vec()),
+                    (17, b"\x1b[<2;8;3m".to_vec())
+                ],
+                "{change}"
+            );
+            assert_eq!(epoch, 1);
+            for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                assert!(crate::take_terminal_mouse_gesture(&mut slots, 17, button).is_none());
+            }
+            // A fresh accepted press after the boundary survives redraw/resize
+            // and repeated synchronization at the same owner.
+            slots[0] = Some(owner(MouseButton::Left, true));
+            assert!(crate::change_terminal_pane_owners(
+                &mut previous,
+                next,
+                &mut epoch,
+                &mut slots,
+                &mut clicks
+            )
+            .is_empty());
+            assert!(slots[0].is_some());
+            assert_eq!(epoch, 1);
+        }
+        // Ratios, sizes and same-tab keyboard focus are not identities. Session
+        // index compaction must likewise preserve stable owners.
+        let mut resized = split();
+        if let crate::PaneTree::Split { ratios, .. } = &mut resized {
+            *ratios = vec![0.3, 0.7];
+        }
+        assert_eq!(initial, capture(3, &resized, &[17, 29]));
+        let mut previous = Some(initial.clone());
+        let mut epoch = 0;
+        let mut slots = [Some(owner(MouseButton::Left, false)), None, None];
+        let mut clicks = crate::TerminalClickTracker::default();
+        assert!(crate::change_terminal_pane_owners(
+            &mut previous,
+            initial,
+            &mut epoch,
+            &mut slots,
+            &mut clicks
+        )
+        .is_empty());
+        assert_eq!(epoch, 0);
+        assert!(slots[0].is_some());
+        let retired = crate::change_terminal_pane_owners(
+            &mut previous,
+            capture(4, &resized, &[17, 29]),
+            &mut epoch,
+            &mut slots,
+            &mut clicks,
+        );
+        assert_eq!(retired.len(), 1);
+        assert!(crate::cancelled_terminal_mouse_report(retired[0], &terminal).is_none());
+        assert!(
+            crate::take_terminal_mouse_gesture(&mut slots, 17, MouseButton::Left).is_none(),
+            "retired local release must not reach selection copy"
+        );
+    }
+
+    #[test]
+    fn pane_owner_close_releases_before_identity_removal_without_touching_siblings() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        terminal.process_batch(b"\x1b[?1000h\x1b[?1006h");
+        let mut slots = [
+            Some(owner(MouseButton::Left, true)),
+            Some(owner(MouseButton::Middle, true)),
+            Some(owner(MouseButton::Right, true)),
+        ];
+        slots[1].as_mut().unwrap().session_id = 29;
+        let mut clicks = crate::TerminalClickTracker::default();
+        let retired = crate::retire_closing_terminal_mouse_gestures(17, &mut slots, &mut clicks);
+        let reports: Vec<_> = retired
+            .iter()
+            .map(|&gesture| {
+                (
+                    gesture.session_id,
+                    crate::cancelled_terminal_mouse_report(gesture, &terminal).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            [
+                (17, b"\x1b[<0;8;3m".to_vec()),
+                (17, b"\x1b[<2;8;3m".to_vec())
+            ]
+        );
+        assert_eq!(slots[1].unwrap().session_id, 29);
+        assert!(
+            crate::retire_closing_terminal_mouse_gestures(17, &mut slots, &mut clicks).is_empty()
+        );
+        // Verify dispatch is still before both last-session and ordinary close
+        // destruction. Behavioral byte/owner assertions above use the same reducer.
+        let source = include_str!("main.rs");
+        let close = source
+            .split_once("    fn close_session(&mut self,")
+            .unwrap()
+            .1
+            .split_once("    /// Reconcile every tab")
+            .unwrap()
+            .0;
+        let finish = close
+            .find("self.finish_cancelled_terminal_mouse_gesture(gesture)")
+            .unwrap();
+        assert!(finish < close.find("self.sessions.remove(index)").unwrap());
+        assert!(finish < close.find("pty.terminate()").unwrap());
+    }
+    #[test]
+    fn pane_owner_composed_tabs_close_zoom_and_swap_do_not_transfer_selection() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 25.0);
+        let build = |ids: &[usize], epoch| -> Element<'_, Output, iced::Theme, ()> {
+            let mut panes = iced::widget::Row::new();
+            for &id in ids {
+                panes = panes.push(Element::new(
+                    fixture(&projection, &theme, TerminalMode::Normal, epoch)
+                        .on_mouse(move |input| Output::OwnedMouse(id, input)),
+                ));
+            }
+            iced::widget::container(crate::terminal_panes_body(None, panes.into()))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+        let send = |element: &mut Element<'_, Output, iced::Theme, ()>, tree: &mut Tree, event| {
+            let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            messages
+        };
+        let owners = |tab, ids: &[usize]| crate::TerminalPaneOwners {
+            tab_id: Some(tab),
+            tree: crate::TerminalPaneOwner::Split(
+                true,
+                ids.iter()
+                    .map(|&id| crate::TerminalPaneOwner::Leaf(Some(id)))
+                    .collect(),
+            ),
+        };
+        for (tab, ids) in [
+            (3, vec![29, 17]),
+            (4, vec![41, 53]),
+            (3, vec![29]),
+            (3, vec![17]),
+            (3, vec![17, 29]),
+        ] {
+            let mut old = build(&[17, 29], 0);
+            let mut retained = Tree::new(old.as_widget());
+            assert!(matches!(
+                send(&mut old, &mut retained, press()).as_slice(),
+                [Output::OwnedMouse(17, MouseInput::Press { .. })]
+            ));
+            let mut previous = Some(owners(3, &[17, 29]));
+            let mut epoch = 0;
+            let mut gestures = [Some(owner(MouseButton::Left, false)), None, None];
+            let mut clicks = crate::TerminalClickTracker::default();
+            let changed = tab != 3 || ids != [17, 29];
+            let retired = crate::change_terminal_pane_owners(
+                &mut previous,
+                owners(tab, &ids),
+                &mut epoch,
+                &mut gestures,
+                &mut clicks,
+            );
+            assert_eq!(retired.len(), usize::from(changed));
+            let mut next = build(&ids, epoch);
+            retained.diff(next.as_widget());
+            let motion = send(&mut next, &mut retained, moved(point));
+            let up = send(&mut next, &mut retained, release());
+            if changed {
+                assert!(motion.is_empty());
+                assert!(up.is_empty());
+                assert!(
+                    crate::take_terminal_mouse_gesture(&mut gestures, 17, MouseButton::Left)
+                        .is_none()
+                );
+            } else {
+                assert!(matches!(
+                    motion.as_slice(),
+                    [Output::OwnedMouse(17, MouseInput::Drag { .. })]
+                ));
+                assert!(matches!(
+                    up.as_slice(),
+                    [Output::OwnedMouse(17, MouseInput::Release { .. })]
+                ));
+            }
+            // New press/release after every redraw is still paired to the new
+            // first pane, including the unchanged-owner/focus-click case.
+            assert!(
+                matches!(send(&mut next, &mut retained, press()).as_slice(), [Output::OwnedMouse(id, MouseInput::Press { .. })] if *id == ids[0])
+            );
+            assert!(
+                matches!(send(&mut next, &mut retained, release()).as_slice(), [Output::OwnedMouse(id, MouseInput::Release { .. })] if *id == ids[0])
+            );
+        }
+    }
+
+    #[test]
+    fn pane_owner_round_trip_retires_summary_without_intermediate_redraw() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 10.0);
+        let summary = |epoch| {
+            let mut widget = fixture(&projection, &theme, TerminalMode::Block, epoch);
+            widget.blocks[0].collapsed_summary = Some(CollapsedSummaryPaint {
+                key: SyntheticRowKey {
+                    zone_id: 1,
+                    policy_revision: 1,
+                },
+                hidden_display_rows: 3,
+            });
+            widget
+        };
+        let mut old = summary(0);
+        let mut retained = tree(&old);
+        assert!(send(&mut old, &mut retained, press(), point).is_empty());
+        let owners = |id| crate::TerminalPaneOwners {
+            tab_id: Some(id),
+            tree: crate::TerminalPaneOwner::Leaf(Some(id)),
+        };
+        let mut previous = Some(owners(17));
+        let mut epoch = 0;
+        let mut slots = [None; 3];
+        let mut clicks = crate::TerminalClickTracker::default();
+        for id in [29, 17] {
+            assert!(crate::change_terminal_pane_owners(
+                &mut previous,
+                owners(id),
+                &mut epoch,
+                &mut slots,
+                &mut clicks
+            )
+            .is_empty());
+        }
+        assert_eq!(epoch, 2);
+        let mut next = summary(epoch);
+        diff(&mut retained, &next);
+        assert!(send(&mut next, &mut retained, release(), point).is_empty());
+    }
+    #[test]
+    fn pane_owner_nonalloc_match_equals_capture_for_tree_ids_and_zoom() {
+        let split = |axis, children, ratios| crate::PaneTree::Split {
+            axis,
+            children,
+            ratios,
+        };
+        let trees = vec![
+            crate::PaneTree::Leaf(0),
+            crate::PaneTree::Leaf(1),
+            split(
+                crate::Axis::Horizontal,
+                vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+                vec![0.5, 0.5],
+            ),
+            split(
+                crate::Axis::Horizontal,
+                vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+                vec![0.2, 0.8],
+            ),
+            split(
+                crate::Axis::Vertical,
+                vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+                vec![0.5, 0.5],
+            ),
+            split(
+                crate::Axis::Horizontal,
+                vec![crate::PaneTree::Leaf(1), crate::PaneTree::Leaf(0)],
+                vec![0.5, 0.5],
+            ),
+            split(
+                crate::Axis::Horizontal,
+                vec![
+                    split(
+                        crate::Axis::Vertical,
+                        vec![crate::PaneTree::Leaf(0), crate::PaneTree::Leaf(1)],
+                        vec![0.5, 0.5],
+                    ),
+                    crate::PaneTree::Leaf(2),
+                ],
+                vec![0.5, 0.5],
+            ),
+        ];
+        let mut tabs = vec![None];
+        for id in [3, 4] {
+            for tree in &trees {
+                let mut tab = crate::Tab::new(id, 0);
+                tab.tree = tree.clone();
+                tabs.push(Some(tab));
+            }
+        }
+        let id_sets: &[&[usize]] = &[&[17, 29, 41], &[29, 17, 41], &[17], &[]];
+        let mut snapshots = Vec::new();
+        for tab in &tabs {
+            for zoomed in [false, true] {
+                for active in [0, 1, 9] {
+                    for ids in id_sets {
+                        snapshots.push(crate::TerminalPaneOwners::capture(
+                            tab.as_ref(),
+                            zoomed,
+                            active,
+                            &|i| ids.get(i).copied(),
+                        ));
+                    }
+                }
+            }
+        }
+        for tab in &tabs {
+            for zoomed in [false, true] {
+                for active in [0, 1, 9] {
+                    for ids in id_sets {
+                        let lookup = |i| ids.get(i).copied();
+                        let captured = crate::TerminalPaneOwners::capture(
+                            tab.as_ref(),
+                            zoomed,
+                            active,
+                            &lookup,
+                        );
+                        for saved in &snapshots {
+                            assert_eq!(
+                                saved.matches(tab.as_ref(), zoomed, active, &lookup),
+                                *saved == captured
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Removing a background session compacts indices without changing
+        // visible stable IDs; neither the fast path nor capture can confuse it
+        // with a new owner.
+        let mut before = crate::Tab::new(3, 1);
+        before.tree = split(
+            crate::Axis::Horizontal,
+            vec![crate::PaneTree::Leaf(1), crate::PaneTree::Leaf(2)],
+            vec![0.5, 0.5],
+        );
+        let saved = crate::TerminalPaneOwners::capture(Some(&before), false, 1, &|i| {
+            [5, 17, 29].get(i).copied()
+        });
+        let mut after = crate::Tab::new(3, 0);
+        after.tree = trees[2].clone();
+        assert!(saved.matches(Some(&after), false, 0, &|i| [17, 29].get(i).copied()));
     }
 }

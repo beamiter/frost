@@ -5585,6 +5585,124 @@ fn change_terminal_interaction_mode(
     retire_terminal_mouse_gestures(gestures, clicks)
 }
 
+/// Identity of the visible widget composition, deliberately excluding pane
+/// ratios, pixel sizes and keyboard focus within an unchanged split.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalPaneOwner {
+    Leaf(Option<usize>),
+    Split(bool, Vec<TerminalPaneOwner>),
+}
+
+impl TerminalPaneOwner {
+    fn matches(&self, tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> bool {
+        match (self, tree) {
+            (Self::Leaf(saved), PaneTree::Leaf(index)) => *saved == session_id(*index),
+            (Self::Split(horizontal, saved), PaneTree::Split { axis, children, .. }) => {
+                *horizontal == (*axis == Axis::Horizontal)
+                    && saved.len() == children.len()
+                    && saved
+                        .iter()
+                        .zip(children)
+                        .all(|(saved, child)| saved.matches(child, session_id))
+            }
+            _ => false,
+        }
+    }
+
+    fn capture(tree: &PaneTree, session_id: &impl Fn(usize) -> Option<usize>) -> Self {
+        match tree {
+            PaneTree::Leaf(index) => Self::Leaf(session_id(*index)),
+            PaneTree::Split { axis, children, .. } => Self::Split(
+                *axis == Axis::Horizontal,
+                children
+                    .iter()
+                    .map(|child| Self::capture(child, session_id))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalPaneOwners {
+    tab_id: Option<usize>,
+    tree: TerminalPaneOwner,
+}
+
+impl TerminalPaneOwners {
+    fn matches(
+        &self,
+        tab: Option<&Tab>,
+        zoomed: bool,
+        active: usize,
+        session_id: &impl Fn(usize) -> Option<usize>,
+    ) -> bool {
+        self.tab_id == tab.map(|tab| tab.id)
+            && if zoomed {
+                self.tree == TerminalPaneOwner::Leaf(session_id(active))
+            } else {
+                tab.map(|tab| self.tree.matches(&tab.tree, session_id))
+                    .unwrap_or(self.tree == TerminalPaneOwner::Leaf(None))
+            }
+    }
+
+    fn capture(
+        tab: Option<&Tab>,
+        zoomed: bool,
+        active: usize,
+        session_id: &impl Fn(usize) -> Option<usize>,
+    ) -> Self {
+        Self {
+            tab_id: tab.map(|tab| tab.id),
+            tree: if zoomed {
+                TerminalPaneOwner::Leaf(session_id(active))
+            } else {
+                tab.map(|tab| TerminalPaneOwner::capture(&tab.tree, session_id))
+                    .unwrap_or(TerminalPaneOwner::Leaf(None))
+            },
+        }
+    }
+}
+
+fn change_terminal_pane_owners(
+    previous: &mut Option<TerminalPaneOwners>,
+    next: TerminalPaneOwners,
+    epoch: &mut u64,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    if previous.as_ref() == Some(&next) {
+        return Vec::new();
+    }
+    let initialized = previous.is_some();
+    *previous = Some(next);
+    if !initialized {
+        return Vec::new();
+    }
+    *epoch = epoch.wrapping_add(1);
+    retire_terminal_mouse_gestures(gestures, clicks)
+}
+
+/// Closing a background session must not cancel an unrelated visible gesture.
+/// Take the closing owner's slots while its PTY still exists.
+fn retire_closing_terminal_mouse_gestures(
+    session_id: usize,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    let mut retired = Vec::new();
+    for slot in gestures {
+        if slot.is_some_and(|gesture| gesture.session_id == session_id) {
+            let gesture = slot.take().expect("matched owner");
+            if gesture.button == MouseButton::Left {
+                clicks.cancel();
+            }
+            retired.push(gesture);
+        }
+    }
+    retired
+}
+
 fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>(
     reading_bar: Option<Element<'a, Message, iced::Theme, Renderer>>,
     panes: Element<'a, Message, iced::Theme, Renderer>,
@@ -5660,6 +5778,7 @@ struct Frost {
     config: Config,
     terminal_interaction_mode: config::TerminalMode,
     terminal_interaction_epoch: u64,
+    terminal_pane_owners: Option<TerminalPaneOwners>,
     organism: organism::Organism,
     organism_pointer_buttons: Vec<iced::mouse::Button>,
     organism_body_geometry: Option<(usize, terminal_view::OrganismBodyGeometry)>,
@@ -6037,6 +6156,7 @@ impl Frost {
         let mut app = Frost {
             terminal_interaction_mode: config.effective_terminal_mode(),
             terminal_interaction_epoch: 0,
+            terminal_pane_owners: None,
             config,
             organism: organism::Organism::default(),
             organism_pointer_buttons: Vec::new(),
@@ -8013,9 +8133,34 @@ impl Frost {
             .find(|session| session.id == id && session.master_fd == fd)
     }
 
+    /// Compare only the bounded visible tree (at most MAX_PANES leaves), using
+    /// stable identities so background closes/reindexing are harmless.
+    fn sync_terminal_pane_owners(&mut self) {
+        let session_id = |index| self.sessions.get(index).map(|session: &Session| session.id);
+        let tab = self.tabs.get(self.active_tab);
+        // PTY output visits this boundary frequently. Walk the borrowed tree
+        // without allocating when ownership is unchanged; only changes capture.
+        if self.terminal_pane_owners.as_ref().is_some_and(|previous| {
+            previous.matches(tab, self.pane_zoomed, self.active, &session_id)
+        }) {
+            return;
+        }
+        let next = TerminalPaneOwners::capture(tab, self.pane_zoomed, self.active, &session_id);
+        for gesture in change_terminal_pane_owners(
+            &mut self.terminal_pane_owners,
+            next,
+            &mut self.terminal_interaction_epoch,
+            &mut self.terminal_mouse_gestures,
+            &mut self.click_tracker,
+        ) {
+            self.finish_cancelled_terminal_mouse_gesture(gesture);
+        }
+    }
+
     /// Refresh every cache/state object whose coordinates belong to the active
     /// session. All tab/pane activation paths call this before accepting input.
     fn refresh_active_context(&mut self) {
+        self.sync_terminal_pane_owners();
         self.sync_organism_attention_owner();
         self.organism.reset_watch();
         self.organism.cancel_live_greeting();
@@ -8436,6 +8581,13 @@ impl Frost {
     fn close_session(&mut self, index: usize) -> Task<Message> {
         if index >= self.sessions.len() {
             return Task::none();
+        }
+        for gesture in retire_closing_terminal_mouse_gestures(
+            self.sessions[index].id,
+            &mut self.terminal_mouse_gestures,
+            &mut self.click_tracker,
+        ) {
+            self.finish_cancelled_terminal_mouse_gesture(gesture);
         }
         self.invalidate_sidebar_remote_follow_intent();
         // Session removal can invalidate a tab/pane drag source or target and
@@ -9389,6 +9541,8 @@ impl Frost {
     /// While a pane is zoomed every session gets the full area, so the zoomed
     /// pane renders full-size and unzooming is a plain relayout.
     fn relayout(&mut self) {
+        // Retire old raw coordinates before resizing or replacing projections.
+        self.sync_terminal_pane_owners();
         let mut targets = vec![(self.cols, self.rows); self.sessions.len()];
         if self.is_split() && !self.pane_zoomed {
             for pane in self.pane_rects() {
@@ -12159,6 +12313,7 @@ impl Frost {
     }
 
     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
+        self.sync_terminal_pane_owners();
         let speed = self.config.scroll_speed.max(1) as isize;
         // Validate the exact current cell before *any* terminal action,
         // including clipboard reads and multi-click selection. Consume the
@@ -14459,6 +14614,15 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.sync_terminal_pane_owners();
+        let task = self.update_message(message);
+        // Also cover early-return reducers. This runs before the next queued
+        // message, not after an Iced message batch or a widget tree redraw.
+        self.sync_terminal_pane_owners();
+        task
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         // Reject output provenance before generic synchronization can touch Watch.
         // Invalid/old source metadata never prevents valid native bytes from being
         // parsed and displayed by the original id/fd route below.
