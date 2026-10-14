@@ -201,6 +201,27 @@ fn native_status_rows(enabled: bool, expanded: bool, cell_height: f32) -> usize 
         .clamp(3.0, 8.0) as usize
 }
 
+/// Card admission uses the same visible pane width as the terminal renderer.
+fn organism_card_width(
+    panes: &[PaneRect],
+    active: usize,
+    zoomed: bool,
+    terminal_width: f32,
+    padding: f32,
+) -> f32 {
+    panes
+        .iter()
+        .find(|pane| pane.session == active)
+        .map_or(0.0, |pane| {
+            let width = if zoomed {
+                terminal_width
+            } else {
+                pane.rect.width
+            };
+            (width - padding - terminal_view::SCROLLBAR_WIDTH - 16.0).max(0.0)
+        })
+}
+
 fn organism_host_layout(
     width: f32,
     enabled: bool,
@@ -21487,13 +21508,13 @@ impl Frost {
     /// left; last-command status, grid size, and tab count on the right.
     fn organism_layout(&self) -> OrganismLayout {
         let width = if self.config.is_card_mode() {
-            self.pane_rects()
-                .into_iter()
-                .find(|pane| pane.session == self.active)
-                .map_or(0.0, |pane| {
-                    (pane.rect.width - self.metrics.padding - terminal_view::SCROLLBAR_WIDTH - 16.0)
-                        .max(0.0)
-                })
+            organism_card_width(
+                &self.pane_rects(),
+                self.active,
+                self.is_split() && self.pane_zoomed,
+                self.term_width(),
+                self.metrics.padding,
+            )
         } else {
             self.win_size.width
         };
@@ -31736,6 +31757,99 @@ mod tests {
                 explanation: false,
             }
         );
+    }
+
+    #[test]
+    fn companion_card_admission_tracks_zoom_and_unzoom_in_both_card_modes() {
+        let tree = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(0), PaneTree::Leaf(1)],
+            ratios: vec![0.85, 0.15],
+        };
+        // A sidebar already reduces the available terminal width. The right
+        // leaf has a nonzero origin, which must not reduce its zoomed width.
+        let area = pane_layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut panes = Vec::new();
+        collect_pane_rects(&tree, area, DIVIDER, &mut panes);
+        assert!(panes[1].rect.x > 600.0);
+        for mode in [config::TerminalMode::Block, config::TerminalMode::Chat] {
+            let config = Config {
+                terminal_mode: Some(mode),
+                ..Config::default()
+            };
+            for expanded in [false, true] {
+                for zoomed in [false, true, false] {
+                    let width = organism_card_width(&panes, 1, zoomed, area.width, 8.0);
+                    let layout =
+                        organism_host_layout(width, true, expanded, false, config.is_card_mode());
+                    assert_eq!(layout.presentable(), zoomed, "{mode:?}, zoomed={zoomed}");
+                    if zoomed {
+                        assert_eq!(width, 800.0 - 8.0 - terminal_view::SCROLLBAR_WIDTH - 16.0);
+                        assert_eq!(layout.explanation, expanded);
+                    }
+                    assert!(!organism_host_layout(
+                        width,
+                        false,
+                        expanded,
+                        false,
+                        config.is_card_mode()
+                    )
+                    .presentable());
+                }
+            }
+        }
+        for zoomed in [false, true] {
+            assert_eq!(organism_card_width(&panes, 99, zoomed, 800.0, 8.0), 0.0);
+            assert_eq!(organism_card_width(&[], 0, zoomed, 800.0, 8.0), 0.0);
+        }
+        // A zoomed terminal can itself be too narrow after sidebar allocation.
+        let width = organism_card_width(&panes, 1, true, 150.0, 8.0);
+        assert!(!organism_host_layout(width, true, true, false, true).presentable());
+        // Normal mode still uses the window-level bottom-bar contract.
+        assert!(!organism_host_layout(800.0, true, true, false, false).presentable());
+        assert!(organism_host_layout(800.0, true, true, true, false).presentable());
+    }
+
+    #[test]
+    fn companion_card_zoom_admission_uses_rendered_width_and_existing_ownership() {
+        let source = include_str!("main.rs");
+        let layout = source
+            .split_once("    fn organism_layout(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn sync_organism_geometry(")
+            .unwrap()
+            .0;
+        assert!(layout.contains("organism_card_width("));
+        assert!(layout.contains("self.is_split() && self.pane_zoomed"));
+        assert!(layout.contains("self.term_width()"));
+        assert!(layout.contains("self.config.is_card_mode()"));
+        let view = source
+            .split_once(
+                "let panes_body: Element<'_, Message> = if self.is_split() && self.pane_zoomed",
+            )
+            .unwrap()
+            .1;
+        assert!(view.starts_with(" {"));
+        assert!(view
+            .split_once("} else {")
+            .unwrap()
+            .0
+            .contains("self.pane_view(self.active)"));
+        let owner = source
+            .split_once("    fn organism_observation_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_watch_owner(")
+            .unwrap()
+            .0;
+        assert!(owner.contains("!self.organism_layout().presentable()"));
+        assert!(owner.contains("!self.terminal_input_active()"));
     }
 
     #[test]
