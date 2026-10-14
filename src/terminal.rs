@@ -11036,7 +11036,7 @@ impl TerminalState {
     }
 
     /// Reuse unchanged history during ordinary streaming in the default
-    /// spaced view. Only certified full-screen scrolls qualify; wraps across
+    /// spaced or native-header view. Only certified full-screen scrolls qualify; wraps across
     /// the history/grid seam, collapse, resize, ownership changes and edits
     /// retain the cold builder. Prefix eviction rebases metadata in-place,
     /// avoiding per-history-row layout allocations even at the scrollback cap.
@@ -11059,8 +11059,8 @@ impl TerminalState {
             || scrolled == 0
             || scrolled > old.rows
             || evicted > old.history_len
-            || !old.block_spacing
-            || !key.block_spacing
+            || old.block_spacing != key.block_spacing
+            || (!key.block_spacing && key.chrome_boundaries.is_empty())
             || !old.policy_ids.is_empty()
             || !key.policy_ids.is_empty()
             || old.policy_revision != key.policy_revision
@@ -11113,7 +11113,7 @@ impl TerminalState {
         let remove_rows = if evicted == 0 {
             0
         } else {
-            let first = plan.raw_rows.get(evicted)?.first_view_row?;
+            let mut first = plan.raw_rows.get(evicted)?.first_view_row?;
             let row = plan.rows.get(first)?;
             // A reflow row sharing the evicted prefix must be replanned from
             // source; never retain a partial logical line under new columns.
@@ -11127,6 +11127,19 @@ impl TerminalState {
                     .any(|slice| slice.source.absolute_row < evicted)
             {
                 return None;
+            }
+            // A native header/status immediately before the first retained
+            // raw row belongs to that row, not to the evicted prefix. Keep it
+            // just as the cold builder does. A leading BlockSpacer, however,
+            // is intentionally omitted by the cold builder and stays evicted.
+            while first > 0
+                && matches!(
+                    plan.rows[first - 1].kind,
+                    ProjectedRowKind::BlockChrome { boundary, .. }
+                        if boundary.next == plan.raw_rows[evicted].raw_row
+                )
+            {
+                first -= 1;
             }
             first
         };
@@ -22518,19 +22531,34 @@ mod block_spacing_tests {
 
     #[test]
     fn native_chrome_streaming_plan_matches_cold_with_headers_and_status() {
-        let mut terminal = fixture(40, 12);
-        terminal.process_input(b"run\r\n\x1b]133;C\x07");
-        let policy = native();
-        for index in 0..100 {
-            terminal.process_input(format!("output {index}\r\n").as_bytes());
-            let hot = terminal
-                .cached_collapsed_projection_plan(40, &policy)
-                .unwrap();
-            let cold = terminal.collapsed_projection_plan(40, &policy);
-            assert_eq!(hot.rows, cold.rows, "frame={index}");
-            assert_eq!(hot.raw_rows, cold.raw_rows, "frame={index}");
-            assert_eq!(hot.raw_slice_count, cold.raw_slice_count, "frame={index}");
-            assert_eq!(hot.spacer_count, cold.spacer_count, "frame={index}");
+        for spacing in [false, true] {
+            for limit in [16, 1_000] {
+                let mut terminal = fixture(40, 12);
+                terminal.set_max_scrollback(limit);
+                terminal.process_input(b"run\r\n\x1b]133;C\x07");
+                let mut policy = native();
+                policy.set_block_spacing(spacing);
+                for index in 0..100 {
+                    terminal.process_input(format!("output {index}\r\n").as_bytes());
+                    let cold = terminal.collapsed_projection_plan(40, &policy);
+                    let Some(hot) = terminal.cached_collapsed_projection_plan(40, &policy) else {
+                        assert!(
+                            !cold.has_transforms(),
+                            "all chrome may leave retained history"
+                        );
+                        continue;
+                    };
+                    assert_eq!(hot.rows, cold.rows, "frame={index}, spacing={spacing}");
+                    assert_eq!(hot.raw_rows, cold.raw_rows, "frame={index}");
+                    assert_eq!(hot.raw_slice_count, cold.raw_slice_count, "frame={index}");
+                    assert_eq!(hot.spacer_count, cold.spacer_count, "frame={index}");
+                    assert_eq!(
+                        terminal.materialize_identity_projection_plan(&hot),
+                        terminal.materialize_identity_projection_plan(&cold),
+                        "materialized frame={index}, spacing={spacing}"
+                    );
+                }
+            }
         }
     }
 
@@ -22812,7 +22840,12 @@ mod block_spacing_tests {
 
     #[test]
     fn block_spacing_streaming_deep_history_measurement() {
-        for limit in [50_000, 100_000] {
+        for (limit, native_headers) in [
+            (50_000, false),
+            (100_000, false),
+            (50_000, true),
+            (100_000, true),
+        ] {
             let mut terminal = TerminalState::new(80, 24);
             terminal.set_max_scrollback(limit);
             terminal.process_batch("history\r\n".repeat(50_030).as_bytes());
@@ -22822,7 +22855,13 @@ mod block_spacing_tests {
                 );
             }
             terminal.process_batch(b"\x1b]133;A\x07$ \x1b]133;B\x07stream\r\n\x1b]133;C\x07");
-            let policy = normal();
+            let policy = if native_headers {
+                let mut policy = ProjectionPolicy::new();
+                policy.set_native_chrome(true, 0);
+                policy
+            } else {
+                normal()
+            };
             let mut state = ProjectionViewState::new();
             let started = std::time::Instant::now();
             terminal.get_projected_viewport_with_state(true, &policy, &mut state);
@@ -22839,7 +22878,7 @@ mod block_spacing_tests {
             let elapsed = started.elapsed();
             let builds = PROJECTION_PLAN_BUILD_COUNT.with(|count| count.get());
             let layouts = PROJECTION_HISTORY_LAYOUT_ROWS.with(|count| count.get());
-            eprintln!("Frost spacing 50k history limit={limit}: cold={cold:?}, 20 streaming frames={elapsed:?}, full builds={builds}, history layouts={layouts}");
+            eprintln!("Frost spacing 50k history limit={limit} native_headers={native_headers}: cold={cold:?}, 20 streaming frames={elapsed:?}, full builds={builds}, history layouts={layouts}");
             assert_eq!(
                 builds, 0,
                 "ordinary streaming must not replan the whole history"
@@ -22871,10 +22910,16 @@ mod block_spacing_tests {
 
     #[test]
     fn block_spacing_streaming_matches_cold_on_eviction_wrap_resize_and_lifecycle() {
-        for limit in [16, 1_000] {
+        for (limit, native_headers) in [(16, false), (1_000, false), (16, true), (1_000, true)] {
             let mut terminal = fixture(24, 8);
             terminal.set_max_scrollback(limit);
-            let mut policy = normal();
+            let mut policy = if native_headers {
+                let mut policy = ProjectionPolicy::new();
+                policy.set_native_chrome(true, 0);
+                policy
+            } else {
+                normal()
+            };
             terminal.process_batch(b"stream\r\n\x1b]133;C\x07");
             assert_spacing_plan_matches_cold(&mut terminal, &policy);
             for frame in 0..40 {

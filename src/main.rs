@@ -4671,7 +4671,8 @@ impl Session {
         terminal.set_disable_alt_screen(config.disable_alt_screen);
         let mut projection_policy = ProjectionPolicy::new();
         projection_policy.set_chat(config.is_chat_mode());
-        projection_policy.set_block_spacing(config.is_block_mode() && !config.block_compact);
+        // Native metadata headers plus card-edge insets provide separation;
+        // a full synthetic terminal row between cards is unnecessary.
         projection_policy.set_native_chrome(
             true,
             native_status_rows(
@@ -6173,9 +6174,6 @@ impl Frost {
                 .set_max_scrollback(self.config.scrollback_lines);
             sess.terminal
                 .set_disable_alt_screen(self.config.disable_alt_screen);
-            let spacing_changed = sess
-                .projection_policy
-                .set_block_spacing(self.config.is_block_mode() && !self.config.block_compact);
             let chrome_changed = sess.projection_policy.set_native_chrome(
                 true,
                 native_status_rows(
@@ -6184,7 +6182,7 @@ impl Frost {
                     self.metrics.cell_h,
                 ),
             );
-            if projection_mode_changed || spacing_changed || chrome_changed {
+            if projection_mode_changed || chrome_changed {
                 sess.refresh();
             }
         }
@@ -17380,18 +17378,10 @@ impl Frost {
                 self.apply_config();
             }
             Message::SetBlockCompact(compact) => {
-                // Reproject every pane through stable raw anchors. Density
-                // never resizes a PTY or adds blank lines to terminal output.
+                // Density changes only card paint. Neither mode reserves a
+                // full blank terminal row between native metadata headers.
                 self.config.block_compact = compact;
                 self.config_dirty = true;
-                for sess in &mut self.sessions {
-                    if sess
-                        .projection_policy
-                        .set_block_spacing(self.config.is_block_mode() && !compact)
-                    {
-                        sess.refresh();
-                    }
-                }
                 self.sync_organism_geometry();
                 self.refresh_active_context();
             }
