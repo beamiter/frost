@@ -698,6 +698,8 @@ fn hovered_link_color() -> Color {
 
 /// Per-widget interaction state retained across frames.
 struct State {
+    terminal_mode: Option<crate::config::TerminalMode>,
+    mode_epoch: u64,
     dragging: bool,
     scrollbar_dragging: bool,
     /// Ordinary presses published to the app layer, independently per button.
@@ -745,6 +747,8 @@ fn stable_summary_activation(
 impl Default for State {
     fn default() -> Self {
         Self {
+            terminal_mode: None,
+            mode_epoch: 0,
             dragging: false,
             scrollbar_dragging: false,
             published_presses: [false; 3],
@@ -870,6 +874,8 @@ impl Metrics {
 /// A custom widget that renders a terminal grid snapshot using the advanced
 /// renderer (quads for backgrounds/cursor, real text shaping for glyphs).
 pub struct TermWidget<'a, Message> {
+    mode_epoch: u64,
+    terminal_mode: crate::config::TerminalMode,
     grid: &'a [Vec<TerminalCell>],
     cursor: (usize, usize),
     cursor_visible: bool,
@@ -967,6 +973,8 @@ impl<'a, Message> TermWidget<'a, Message> {
         scrollback_len: usize,
     ) -> Self {
         TermWidget {
+            mode_epoch: 0,
+            terminal_mode: crate::config::TerminalMode::Normal,
             grid,
             cursor,
             cursor_visible,
@@ -1017,6 +1025,17 @@ impl<'a, Message> TermWidget<'a, Message> {
             blink_on: true,
             opacity: 1.0,
         }
+    }
+
+    /// Retire local state even when a mode changes away and back in one batch.
+    pub(crate) fn interaction_mode(
+        mut self,
+        mode: crate::config::TerminalMode,
+        epoch: u64,
+    ) -> Self {
+        self.terminal_mode = mode;
+        self.mode_epoch = epoch;
+        self
     }
 
     /// Set the window background opacity applied to the widget's default
@@ -3125,7 +3144,25 @@ where
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::default())
+        tree::State::new(State {
+            terminal_mode: Some(self.terminal_mode),
+            mode_epoch: self.mode_epoch,
+            ..State::default()
+        })
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<State>();
+        if state.terminal_mode != Some(self.terminal_mode) || state.mode_epoch != self.mode_epoch {
+            // App ownership has already retired synchronously in apply_config.
+            // This covers retained local controls, including a same-batch mode
+            // round trip that never rendered the intermediate presentation.
+            *state = State {
+                terminal_mode: Some(self.terminal_mode),
+                mode_epoch: self.mode_epoch,
+                ..State::default()
+            };
+        }
     }
 
     fn size(&self) -> Size<Length> {
@@ -4903,6 +4940,8 @@ mod focus_state_tests {
     #[test]
     fn unfocused_resets_all_widget_local_input_ownership() {
         let mut state = State {
+            terminal_mode: None,
+            mode_epoch: 0,
             dragging: true,
             scrollbar_dragging: true,
             published_presses: [true; 3],
@@ -5124,6 +5163,461 @@ mod block_spacing_render_tests {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_gesture_tests {
+    use super::*;
+    use crate::config::TerminalMode;
+    const MODES: [TerminalMode; 3] = [
+        TerminalMode::Normal,
+        TerminalMode::Block,
+        TerminalMode::Chat,
+    ];
+
+    #[derive(Debug, Clone)]
+    enum Output {
+        Mouse(MouseInput),
+        Summary,
+        Submit,
+    }
+
+    fn fixture<'a>(
+        projection: &'a crate::terminal::ProjectedViewport,
+        theme: &'a Theme,
+        mode: TerminalMode,
+        epoch: u64,
+    ) -> TermWidget<'a, Output> {
+        let mut widget = TermWidget::new(
+            projection.cells(),
+            (0, 0),
+            true,
+            CursorShape::Block,
+            true,
+            theme,
+            Metrics::new(10.0, 1.0, 4.0, mode != TerminalMode::Normal),
+            iced::Font::MONOSPACE,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            0,
+            0,
+        )
+        .interaction_mode(mode, epoch)
+        .on_mouse(Output::Mouse)
+        .on_summary(projection.key(), |_| Output::Summary);
+        widget.app_mouse_full_grid = mode == TerminalMode::Normal;
+        if mode != TerminalMode::Normal {
+            widget.blocks = vec![BlockPaintRow::default(); projection.cells().len()];
+        }
+        if mode == TerminalMode::Chat {
+            widget.chat_projection = Some(projection);
+        }
+        widget
+    }
+    fn tree(widget: &TermWidget<'_, Output>) -> Tree {
+        Tree::new(widget as &dyn Widget<Output, iced::Theme, ()>)
+    }
+    fn diff(tree: &mut Tree, widget: &TermWidget<'_, Output>) {
+        tree.diff(widget as &dyn Widget<Output, iced::Theme, ()>);
+    }
+    fn send(
+        widget: &mut TermWidget<'_, Output>,
+        tree: &mut Tree,
+        event: Event,
+        point: Point,
+    ) -> Vec<Output> {
+        let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+        let node = layout::Node::new(bounds.size());
+        let mut messages = Vec::new();
+        <TermWidget<'_, Output> as Widget<Output, iced::Theme, ()>>::update(
+            widget,
+            tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        messages
+    }
+    fn press() -> Event {
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+    }
+    fn release() -> Event {
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+    }
+    fn moved(point: Point) -> Event {
+        Event::Mouse(mouse::Event::CursorMoved { position: point })
+    }
+    fn owner(button: MouseButton, app: bool) -> crate::TerminalMouseGesture {
+        crate::TerminalMouseGesture {
+            session_id: 17,
+            button,
+            report_to_app: app,
+            last_app_cell: app.then_some((7, 2)),
+            consumed: false,
+        }
+    }
+
+    #[test]
+    fn mode_switch_retires_ordinary_held_drag_and_release_but_same_mode_preserves_it() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 10.0);
+        for before in MODES {
+            for after in MODES {
+                let mut old = fixture(&projection, &theme, before, 0);
+                let mut retained = tree(&old);
+                assert!(matches!(
+                    send(&mut old, &mut retained, press(), point).as_slice(),
+                    [Output::Mouse(MouseInput::Press { .. })]
+                ));
+                let mut next = fixture(&projection, &theme, after, u64::from(before != after));
+                diff(&mut retained, &next);
+                let motion = send(&mut next, &mut retained, moved(point), point);
+                let up = send(&mut next, &mut retained, release(), point);
+                if before == after {
+                    assert!(matches!(
+                        motion.as_slice(),
+                        [Output::Mouse(MouseInput::Drag { .. })]
+                    ));
+                    assert!(matches!(
+                        up.as_slice(),
+                        [Output::Mouse(MouseInput::Release { .. })]
+                    ));
+                } else {
+                    assert!(
+                        motion.is_empty() && up.is_empty(),
+                        "{before:?}->{after:?}: {motion:?}, {up:?}"
+                    );
+                }
+                assert!(matches!(
+                    send(&mut next, &mut retained, press(), point).as_slice(),
+                    [Output::Mouse(MouseInput::Press { .. })]
+                ));
+                assert!(matches!(
+                    send(&mut next, &mut retained, release(), point).as_slice(),
+                    [Output::Mouse(MouseInput::Release { .. })]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn mode_switch_epoch_retires_summary_even_without_an_intermediate_tree_diff() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 10.0);
+        for middle in MODES {
+            let summary = |epoch| {
+                let mut widget = fixture(&projection, &theme, TerminalMode::Block, epoch);
+                widget.blocks[0].collapsed_summary = Some(CollapsedSummaryPaint {
+                    key: SyntheticRowKey {
+                        zone_id: 1,
+                        policy_revision: 1,
+                    },
+                    hidden_display_rows: 3,
+                });
+                widget
+            };
+            let mut old = summary(0);
+            let mut retained = tree(&old);
+            assert!(send(&mut old, &mut retained, press(), point).is_empty());
+            let mut mode = TerminalMode::Block;
+            let mut epoch = 0;
+            let mut gestures = [None; 3];
+            let mut clicks = crate::TerminalClickTracker::default();
+            for next in [middle, TerminalMode::Block] {
+                assert!(crate::change_terminal_interaction_mode(
+                    &mut mode,
+                    next,
+                    &mut epoch,
+                    &mut gestures,
+                    &mut clicks
+                )
+                .is_empty());
+            }
+            // No render or diff occurred between the two app mode changes.
+            let mut returned = summary(epoch);
+            diff(&mut retained, &returned);
+            let up = send(&mut returned, &mut retained, release(), point);
+            if middle == TerminalMode::Block {
+                assert!(matches!(up.as_slice(), [Output::Summary]));
+            } else {
+                assert!(up.is_empty());
+                assert_eq!(epoch, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn mode_switch_submit_is_press_only_and_cannot_transfer_to_a_new_mode() {
+        use crate::chat_mode::{ChatRole, ChatRow};
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let rows = [ChatRow {
+            role: ChatRole::Composer,
+            bottom: true,
+            ..ChatRow::default()
+        }];
+        let mut old = fixture(&projection, &theme, TerminalMode::Chat, 0);
+        old.chat_rows = &rows;
+        old.blocks[0].host_spacer = true;
+        old.on_chat_submit = Some(Box::new(|| Output::Submit));
+        let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+        let point = old.chat_submit_geometry(bounds, &bounds).unwrap().center();
+        let mut retained = tree(&old);
+        assert!(matches!(
+            send(&mut old, &mut retained, press(), point).as_slice(),
+            [Output::Submit]
+        ));
+        old.mode_epoch = 2;
+        diff(&mut retained, &old);
+        assert!(send(&mut old, &mut retained, release(), point).is_empty());
+        assert!(matches!(
+            send(&mut old, &mut retained, press(), point).as_slice(),
+            [Output::Submit]
+        ));
+    }
+
+    #[test]
+    fn mode_switch_app_entry_balances_each_accepted_origin_button_once() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        terminal.process_batch(b"\x1b[?1000h\x1b[?1006h");
+        for app in [false, true] {
+            let mut gestures = [None; 3];
+            for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                gestures[button.slot()] = Some(owner(button, app));
+            }
+            let mut clicks = crate::TerminalClickTracker::default();
+            let mut mode = TerminalMode::Normal;
+            let mut epoch = 0;
+            assert!(crate::change_terminal_interaction_mode(
+                &mut mode,
+                TerminalMode::Normal,
+                &mut epoch,
+                &mut gestures,
+                &mut clicks
+            )
+            .is_empty());
+            assert!(gestures.iter().all(Option::is_some));
+            assert_eq!(epoch, 0);
+            let retired = crate::change_terminal_interaction_mode(
+                &mut mode,
+                TerminalMode::Block,
+                &mut epoch,
+                &mut gestures,
+                &mut clicks,
+            );
+            assert!(clicks.cancelled);
+            assert!(gestures.iter().all(Option::is_none));
+            assert_eq!(retired.len(), 3);
+            for (code, gesture) in retired.into_iter().enumerate() {
+                assert_eq!(
+                    gesture.session_id, 17,
+                    "changing active pane cannot retarget retirement"
+                );
+                let report = crate::cancelled_terminal_mouse_report(gesture, &terminal);
+                if app {
+                    assert_eq!(report, Some(format!("\x1b[<{code};8;3m").into_bytes()));
+                } else {
+                    assert!(report.is_none());
+                }
+                assert!(crate::cancelled_terminal_mouse_report(
+                    crate::TerminalMouseGesture {
+                        last_app_cell: None,
+                        ..gesture
+                    },
+                    &terminal
+                )
+                .is_none());
+                assert!(crate::cancelled_terminal_mouse_report(
+                    crate::TerminalMouseGesture {
+                        consumed: true,
+                        ..gesture
+                    },
+                    &terminal
+                )
+                .is_none());
+                assert!(
+                    crate::take_terminal_mouse_gesture(&mut gestures, 17, gesture.button).is_none()
+                );
+            }
+            for next in [
+                TerminalMode::Chat,
+                TerminalMode::Normal,
+                TerminalMode::Normal,
+            ] {
+                assert!(crate::change_terminal_interaction_mode(
+                    &mut mode,
+                    next,
+                    &mut epoch,
+                    &mut gestures,
+                    &mut clicks
+                )
+                .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn mode_switch_and_unfocused_app_events_balance_once_in_either_order() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        terminal.process_batch(b"\x1b[?1000h\x1b[?1006h");
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 10.0);
+        for focus_first in [false, true] {
+            let mut old = fixture(&projection, &theme, TerminalMode::Normal, 0);
+            let mut retained = tree(&old);
+            assert!(matches!(
+                send(&mut old, &mut retained, press(), point).as_slice(),
+                [Output::Mouse(MouseInput::Press { .. })]
+            ));
+            let mut gestures = [Some(owner(MouseButton::Left, true)), None, None];
+            let mut clicks = crate::TerminalClickTracker::default();
+            let mut mode = TerminalMode::Normal;
+            let mut epoch = 0;
+            let mut retired = Vec::new();
+            if focus_first {
+                retired.extend(crate::retire_terminal_mouse_gestures(
+                    &mut gestures,
+                    &mut clicks,
+                ));
+            }
+            retired.extend(crate::change_terminal_interaction_mode(
+                &mut mode,
+                TerminalMode::Chat,
+                &mut epoch,
+                &mut gestures,
+                &mut clicks,
+            ));
+            if !focus_first {
+                retired.extend(crate::retire_terminal_mouse_gestures(
+                    &mut gestures,
+                    &mut clicks,
+                ));
+            }
+            let reports: Vec<_> = retired
+                .into_iter()
+                .filter_map(|gesture| crate::cancelled_terminal_mouse_report(gesture, &terminal))
+                .collect();
+            assert_eq!(reports, [b"\x1b[<0;8;3m".to_vec()]);
+            let mut next = fixture(&projection, &theme, mode, epoch);
+            diff(&mut retained, &next);
+            assert!(send(
+                &mut next,
+                &mut retained,
+                Event::Window(iced::window::Event::Unfocused),
+                point
+            )
+            .is_empty());
+            assert!(send(&mut next, &mut retained, release(), point).is_empty());
+        }
+    }
+
+    #[test]
+    fn mode_switch_real_panes_wrapper_retires_app_owner_before_tree_replacement() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 8);
+        terminal.process_batch(b"\x1b[?1000h\x1b[?1006h");
+        let projection = terminal.get_projected_viewport(false);
+        let theme = Theme::default();
+        let point = Point::new(40.0, 25.0);
+        let build = |mode, epoch| -> Element<'_, Output, iced::Theme, ()> {
+            let panes = Element::new(fixture(&projection, &theme, mode, epoch));
+            let bar =
+                (mode == TerminalMode::Block).then(|| iced::widget::Space::new().height(10).into());
+            iced::widget::container(crate::terminal_panes_body(bar, panes))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+        let send_composed =
+            |element: &mut Element<'_, Output, iced::Theme, ()>, tree: &mut Tree, event| {
+                let bounds = Rectangle::with_size(Size::new(600.0, 150.0));
+                let node = element.as_widget_mut().layout(
+                    tree,
+                    &(),
+                    &layout::Limits::new(Size::ZERO, bounds.size()),
+                );
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(point),
+                    &(),
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+                messages
+            };
+        for before in MODES {
+            for after in MODES {
+                if before == after {
+                    continue;
+                }
+                let mut old = build(before, 0);
+                let mut retained = Tree::new(old.as_widget());
+                assert!(matches!(
+                    send_composed(&mut old, &mut retained, press()).as_slice(),
+                    [Output::Mouse(MouseInput::Press { .. })]
+                ));
+                let mut gestures = [Some(owner(MouseButton::Left, true)), None, None];
+                let mut clicks = crate::TerminalClickTracker::default();
+                let mut applied = before;
+                let mut epoch = 0;
+                // Production apply_config reducer runs before Iced can rebuild
+                // Block's extra column or process old queued Drag/Release.
+                let retired = crate::change_terminal_interaction_mode(
+                    &mut applied,
+                    after,
+                    &mut epoch,
+                    &mut gestures,
+                    &mut clicks,
+                );
+                assert_eq!(retired.len(), 1);
+                assert_eq!(
+                    crate::cancelled_terminal_mouse_report(retired[0], &terminal),
+                    Some(b"\x1b[<0;8;3m".to_vec())
+                );
+                assert!(gestures.iter().all(Option::is_none));
+                // Iced drains an app message batch before rebuilding its tree.
+                // Exercise the still-old real widget, then the production
+                // owner gates that reject its queued motion and button-up.
+                assert!(matches!(
+                    send_composed(&mut old, &mut retained, moved(point)).as_slice(),
+                    [Output::Mouse(MouseInput::Drag { .. })]
+                ));
+                assert!(gestures[MouseButton::Left.slot()].is_none());
+                assert!(matches!(
+                    send_composed(&mut old, &mut retained, release()).as_slice(),
+                    [Output::Mouse(MouseInput::Release { .. })]
+                ));
+                assert!(
+                    crate::take_terminal_mouse_gesture(&mut gestures, 17, MouseButton::Left)
+                        .is_none()
+                );
+                let mut next = build(after, epoch);
+                retained.diff(next.as_widget());
+                assert!(send_composed(&mut next, &mut retained, moved(point)).is_empty());
+                assert!(send_composed(&mut next, &mut retained, release()).is_empty());
+                assert!(
+                    crate::take_terminal_mouse_gesture(&mut gestures, 17, MouseButton::Left)
+                        .is_none()
+                );
             }
         }
     }

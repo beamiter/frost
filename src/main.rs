@@ -5546,6 +5546,56 @@ impl TerminalMouseGesture {
     }
 }
 
+/// A mode boundary never remaps an old press onto the new presentation.
+fn cancelled_terminal_mouse_report(
+    gesture: TerminalMouseGesture,
+    terminal: &terminal::TerminalState,
+) -> Option<Vec<u8>> {
+    let (col, row) =
+        gesture.app_release_cell(None, terminal.grid.row_len(), terminal.grid.rows())?;
+    let code = match gesture.button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    terminal.get_mouse_release_report(code, col, row)
+}
+
+/// App ownership must retire before a mode change can replace the widget tree.
+fn retire_terminal_mouse_gestures(
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    clicks.cancel();
+    std::mem::take(gestures).into_iter().flatten().collect()
+}
+
+fn change_terminal_interaction_mode(
+    previous: &mut config::TerminalMode,
+    next: config::TerminalMode,
+    epoch: &mut u64,
+    gestures: &mut [Option<TerminalMouseGesture>; 3],
+    clicks: &mut TerminalClickTracker,
+) -> Vec<TerminalMouseGesture> {
+    if *previous == next {
+        return Vec::new();
+    }
+    *previous = next;
+    *epoch = epoch.wrapping_add(1);
+    retire_terminal_mouse_gestures(gestures, clicks)
+}
+
+fn terminal_panes_body<'a, Message: 'a, Renderer: iced::advanced::Renderer + 'a>(
+    reading_bar: Option<Element<'a, Message, iced::Theme, Renderer>>,
+    panes: Element<'a, Message, iced::Theme, Renderer>,
+) -> Element<'a, Message, iced::Theme, Renderer> {
+    if let Some(bar) = reading_bar {
+        column![bar, panes].height(Length::Fill).into()
+    } else {
+        panes
+    }
+}
+
 /// Remember only reports accepted by the gesture's own PTY. Button slots and
 /// stable pane ownership prevent another pane or button from moving this cell.
 fn record_terminal_app_mouse_cell(
@@ -5608,6 +5658,8 @@ fn overlay_release_disposition(
 
 struct Frost {
     config: Config,
+    terminal_interaction_mode: config::TerminalMode,
+    terminal_interaction_epoch: u64,
     organism: organism::Organism,
     organism_pointer_buttons: Vec<iced::mouse::Button>,
     organism_body_geometry: Option<(usize, terminal_view::OrganismBodyGeometry)>,
@@ -5983,6 +6035,8 @@ impl Frost {
         let sidebar_open = side_tabs;
 
         let mut app = Frost {
+            terminal_interaction_mode: config.effective_terminal_mode(),
+            terminal_interaction_epoch: 0,
             config,
             organism: organism::Organism::default(),
             organism_pointer_buttons: Vec::new(),
@@ -6229,6 +6283,15 @@ impl Frost {
     /// Single re-apply path for live config changes (Set*, Reset, hot reload):
     /// re-resolve the theme, rebuild metrics, and regrid every session.
     fn apply_config(&mut self) {
+        for gesture in change_terminal_interaction_mode(
+            &mut self.terminal_interaction_mode,
+            self.config.effective_terminal_mode(),
+            &mut self.terminal_interaction_epoch,
+            &mut self.terminal_mouse_gestures,
+            &mut self.click_tracker,
+        ) {
+            self.finish_cancelled_terminal_mouse_gesture(gesture);
+        }
         self.organism
             .set_enabled(self.config.ascii_organism_enabled);
         if self.config.ascii_organism_enabled {
@@ -12086,6 +12149,15 @@ impl Frost {
     /// Route a grid mouse interaction either to the running application (when it
     /// has enabled mouse reporting and Shift is not held) or to local selection
     /// and scrollback handling.
+    fn finish_cancelled_terminal_mouse_gesture(&mut self, gesture: TerminalMouseGesture) {
+        if let Some(index) = self.session_index_by_id(gesture.session_id) {
+            let session = &mut self.sessions[index];
+            if let Some(report) = cancelled_terminal_mouse_report(gesture, &session.terminal) {
+                session.write_pty(&report);
+            }
+        }
+    }
+
     fn handle_mouse(&mut self, source_session_id: usize, input: MouseInput) -> Task<Message> {
         let speed = self.config.scroll_speed.max(1) as isize;
         // Validate the exact current cell before *any* terminal action,
@@ -16360,7 +16432,12 @@ impl Frost {
                     self.organism_pointer_buttons.clear();
                     self.cancel_layout_drags();
                     self.hovered_tab = None;
-                    self.terminal_mouse_gestures = [None; 3];
+                    for gesture in retire_terminal_mouse_gestures(
+                        &mut self.terminal_mouse_gestures,
+                        &mut self.click_tracker,
+                    ) {
+                        self.finish_cancelled_terminal_mouse_gesture(gesture);
+                    }
                     if let Some(state) = self.block_search.as_mut() {
                         state.bookmark_key_held = false;
                         state.bookmark_key_claimed = false;
@@ -22508,6 +22585,10 @@ impl Frost {
             sess.projection.scroll_offset(),
             sess.projection.max_scroll_offset(),
         )
+        .interaction_mode(
+            self.config.effective_terminal_mode(),
+            self.terminal_interaction_epoch,
+        )
         .modifiers(
             self.modifiers.shift(),
             self.modifiers.alt(),
@@ -23869,13 +23950,12 @@ impl Frost {
         } else {
             panes_body
         };
-        let panes_body: Element<'_, Message> = if self.config.is_block_mode() {
-            column![self.block_reading_bar(), panes_body]
-                .height(Length::Fill)
-                .into()
-        } else {
-            panes_body
-        };
+        let panes_body = terminal_panes_body(
+            self.config
+                .is_block_mode()
+                .then(|| self.block_reading_bar()),
+            panes_body,
+        );
         let body = container(panes_body)
             .width(Length::Fill)
             .height(Length::Fill);
