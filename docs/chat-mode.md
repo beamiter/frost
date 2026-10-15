@@ -100,3 +100,25 @@ remain text selection. Composer cells, running output, and decorative spacing
 do not open card menus. Chat does not expose collapse, recall, command review,
 rerun, deletion, or agent dispatch here. The configurable **block:menu** shortcut
 (default Shift+F10) remains Block-only.
+
+## IME composition ownership
+
+An in-progress terminal composition belongs to that terminal session. Switching
+panes or tabs, closing its session, losing window focus, or opening an input-owning
+panel cancels it. A delayed commit from the cancelled composition is discarded;
+it is never replayed into a hidden pane or inserted into the newly focused prompt.
+The already committed shell draft is unchanged. Confirming a candidate with Enter
+while composition is active or awaiting cancellation consumes that press and its repeats through release;
+a separate normal Enter remains terminal input. After cancellation, only the first
+candidate-confirm press is claimed. If the platform emits no further IME events,
+a fresh Enter after physical release can submit normally while stale-commit
+rejection remains armed.
+
+The window input-method API does not provide a pane ID or composition generation.
+Frost therefore treats Opened, or Closed followed by a new nonempty Preedit, as a
+new lifecycle. Otherwise it discards the cancelled cycle through its next Commit;
+subsequent input, including commit-only input methods, works normally. If a platform
+omits these boundaries after a focus change, the first attempted composition may
+need to be entered again. Commit followed by an unrelated Enter without any active
+preedit cannot be identified as candidate confirmation by this API. Native IME
+behavior across Linux display backends still requires graphical acceptance tests.

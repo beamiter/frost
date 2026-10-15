@@ -214,6 +214,25 @@ mod tests {
     const PAD: PhysicalKey = PhysicalKey::Code(KeyCode::NumpadEnter);
 
     #[test]
+    fn ime_candidate_claim_uses_native_release_even_after_commit_or_focus_change() {
+        for key in [MAIN, PAD] {
+            let mut state = WindowEnterState::default();
+            assert!(!state.native.transition(key, true, false, true));
+            state.pending.insert(key, 1);
+            assert!(!state.acknowledge(key));
+            state.claim_pressed();
+            assert!(state.pending.is_empty());
+            // IME Commit or pane/modal focus changes do not reset physical
+            // ownership. A repeated candidate Enter cannot execute anything.
+            assert!(state.native.transition(key, true, false, true));
+            assert!(!state.native.transition(key, false, true, true));
+            assert!(state.native.transition(key, true, false, true));
+            assert!(!state.native.transition(key, false, false, true));
+            assert!(!state.native.transition(key, true, false, true));
+        }
+    }
+
+    #[test]
     fn outside_origin_snapshot_stays_passive_until_recall() {
         for key in [MAIN, PAD] {
             let mut state = EnterState::default();

@@ -48,6 +48,7 @@ mod search_replace_panel;
 mod session_persistence;
 mod sidebar;
 mod terminal;
+mod terminal_ime;
 mod terminal_view;
 mod theme;
 mod ui_typography;
@@ -4282,6 +4283,7 @@ enum Message {
     /// An input-method (IME) composition event: open/close, pre-edit updates,
     /// and committed text.
     Ime(iced::advanced::input_method::Event),
+    ImeCancelledCommit,
     ModifiersChanged(keyboard::Modifiers),
     /// A mouse interaction within the pane showing the stable session id.
     MousePane(usize, MouseInput),
@@ -4673,6 +4675,7 @@ struct ThemeEditState {
 /// A single terminal session: its own PTY child and terminal state.
 struct Session {
     id: usize,
+    ime_identity: Arc<()>,
     terminal: TerminalState,
     pty: Pty,
     master_fd: RawFd,
@@ -5084,6 +5087,7 @@ impl Session {
         let cursor_visible = terminal.is_cursor_visible();
         Ok(Session {
             id,
+            ime_identity: Arc::new(()),
             terminal,
             pty,
             master_fd,
@@ -6336,6 +6340,7 @@ struct Frost {
     /// may be consumed, rather than letting an ambiguous repeat execute input.
     prompt_recall_enter_latch: PromptRecallEnterLatch,
     native_enter_ownership: native_enter::SharedOwnership,
+    terminal_ime: terminal_ime::Ownership,
     /// Workflow overlay (Ctrl+Shift+M): fuzzy picker over TOML/YAML workflow
     /// files, then a per-argument form before the rendered command is typed
     /// into the active pane for review (never executed).
@@ -6572,6 +6577,7 @@ impl Frost {
             history_picker: None,
             prompt_recall_enter_latch: PromptRecallEnterLatch::default(),
             native_enter_ownership,
+            terminal_ime: terminal_ime::Ownership::default(),
             workflow_overlay: None,
             block_search: None,
             block_search_memory: BlockSearchMemory::default(),
@@ -7008,6 +7014,25 @@ impl Frost {
 
     /// Whether the terminal itself owns text/IME input. Every overlay with an
     /// editable field or modal action takes ownership until it closes.
+    fn sync_terminal_ime_owner(&mut self) {
+        let owner = (self.focused && self.terminal_input_active())
+            .then(|| {
+                self.sessions
+                    .get(self.active)
+                    .map(|session| terminal_ime::Owner {
+                        session: session.id,
+                        instance: Arc::clone(&session.ime_identity),
+                    })
+            })
+            .flatten();
+        if self.terminal_ime.sync(owner) {
+            for session in &mut self.sessions {
+                session.terminal.clear_preedit();
+                session.refresh();
+            }
+        }
+    }
+
     fn terminal_input_active(&self) -> bool {
         !self.search.is_open
             && !self.search_replace.is_open
@@ -15081,6 +15106,7 @@ impl Frost {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
         let task = self.update_message(message);
         self.organism.observe_agent(
@@ -15094,6 +15120,7 @@ impl Frost {
         // Also cover early-return reducers. This runs before the next queued
         // message, not after an Iced message batch or a widget tree redraw.
         self.sync_terminal_pane_owners();
+        self.sync_terminal_ime_owner();
         task
     }
 
@@ -16365,12 +16392,25 @@ impl Frost {
                 }
             }
             Message::WindowKey(id, event) => {
-                if self.native_enter_ownership.lock().acknowledge(id, &event) {
+                let ime_owned = self.terminal_ime.claim_enter(&event);
+                let mut native = self.native_enter_ownership.lock();
+                let native_owned = native.acknowledge(id, &event);
+                if ime_owned && !native_owned {
+                    // Match captured-input ordering: acknowledge an older
+                    // already-owned delivery before claiming any newer hold.
+                    native.claim_pressed();
+                }
+                drop(native);
+                if native_owned || ime_owned {
                     return Task::none();
                 }
                 return self.update(Message::Key(event));
             }
             Message::Key(event) => {
+                if self.terminal_ime.claim_enter(&event) {
+                    self.native_enter_ownership.lock().claim_pressed();
+                    return Task::none();
+                }
                 let retreat_before_key = self.organism.retreat_deadline();
                 if self.terminal_input_active() {
                     if let keyboard::Event::KeyPressed { key, .. } = &event {
@@ -16861,9 +16901,11 @@ impl Frost {
                     }
                 }
             }
+            Message::ImeCancelledCommit => self.terminal_ime.retire_cancelled_commit(),
             Message::Ime(event) => {
                 use iced::advanced::input_method::Event as Ime;
-                if !self.terminal_input_active() {
+                let ime_admitted = self.terminal_ime.admit(&event);
+                if !self.terminal_input_active() || !ime_admitted {
                     return Task::none();
                 }
                 let mut dead_input = false;
@@ -29759,6 +29801,11 @@ impl Frost {
                 }
             }
             iced::Event::Keyboard(k) => Some(Message::WindowKey(id, k)),
+            iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(_))
+                if status == iced::event::Status::Captured =>
+            {
+                Some(Message::ImeCancelledCommit)
+            }
             iced::Event::InputMethod(_) if status == iced::event::Status::Captured => None,
             iced::Event::InputMethod(ime) => Some(Message::Ime(ime)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
@@ -31664,6 +31711,69 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ime_owner_sync_brackets_every_reducer_and_admission_precedes_pty_write() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let update = source
+            .split_once("    fn update(&mut self, message: Message)")
+            .unwrap()
+            .1
+            .split_once("    fn update_message(")
+            .unwrap()
+            .0;
+        assert_eq!(update.matches("self.sync_terminal_ime_owner()").count(), 2);
+        let dispatch = update.find("self.update_message(message)").unwrap();
+        assert!(update.find("self.sync_terminal_ime_owner()").unwrap() < dispatch);
+        assert!(update.rfind("self.sync_terminal_ime_owner()").unwrap() > dispatch);
+        let ime = source
+            .split_once("            Message::Ime(event) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::ModifiersChanged")
+            .unwrap()
+            .0;
+        assert!(
+            ime.find("self.terminal_ime.admit(&event)").unwrap()
+                < ime.find("sess.write_pty").unwrap()
+        );
+        let sync = source
+            .split_once("    fn sync_terminal_ime_owner(")
+            .unwrap()
+            .1
+            .split_once("    fn terminal_input_active(")
+            .unwrap()
+            .0;
+        for required in [
+            "self.focused",
+            "self.terminal_input_active()",
+            "session.ime_identity",
+            "clear_preedit",
+        ] {
+            assert!(sync.contains(required));
+        }
+        let keys = source
+            .split_once("            Message::WindowKey(id, event) => {")
+            .unwrap()
+            .1
+            .split_once("            Message::Key(event)")
+            .unwrap()
+            .0;
+        assert!(keys.contains("native.claim_pressed()"));
+        assert!(keys.contains("native.acknowledge(id, &event)"));
+        assert!(keys.contains("if native_owned || ime_owned"));
+        assert!(
+            keys.find("native.acknowledge(id, &event)").unwrap()
+                < keys.find("native.claim_pressed()").unwrap()
+        );
+        assert!(source.contains("Some(Message::ImeCancelledCommit)"));
+        assert!(source.contains(
+            "Message::ImeCancelledCommit => self.terminal_ime.retire_cancelled_commit()"
+        ));
+    }
+
     fn chat_card_fixture(output: &str) -> terminal::TerminalState {
         let mut terminal = terminal::TerminalState::new(80, 20);
         terminal.process_input(format!(
