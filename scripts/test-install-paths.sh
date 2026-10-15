@@ -2982,7 +2982,7 @@ install_legacy_bound_output="$(
         FROST_TEST_INSTALL_LEGACY_BOUND_DISPLACED="${install_legacy_bound_displaced}" \
         FROST_TEST_INSTALL_LEGACY_BOUND_VICTIM="${install_legacy_bound_victim}" \
         DESTDIR="${install_legacy_bound_stage}" "${INSTALLER}" \
-        --binary "${prebuilt_binary}" --prefix "${install_legacy_bound_prefix}" 2>&1
+        --binary "${prebuilt_binary}" --prefix "${install_legacy_bound_prefix}" --no-config 2>&1
 )"
 [[ -L "${install_legacy_bound_app_dir}" ]] \
     || fail "install legacy cleanup did not replace its parent"
@@ -4472,3 +4472,6 @@ assert_contains "symlinked DESTDIR uninstall diagnostic" \
     || fail "symlinked DESTDIR uninstall removed an outside binary"
 
 printf 'install/uninstall path contract: ok\n'
+
+# Exercise the shared repeat-install and recoverable configuration policy.
+bash "${SCRIPT_DIR}/test-install-upgrade.sh"

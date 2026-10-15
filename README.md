@@ -1033,3 +1033,20 @@ Close, Copy and Insert stay outside that scroll area and remain reachable.
 
 Clear Blocks retains the existing single-level undo, subject to scrollback and
 capture budgets. Undo does not restore cleared bookmarks or block selection.
+
+### Source install upgrades
+
+`./scripts/install.sh` installs the executable to `~/.local/bin` by default.
+`--prefix PATH` selects `PATH/bin`; `--bin-dir PATH` overrides only the binary
+directory. Existing binaries are replaced atomically.
+
+The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/frost/config.toml`.
+An existing regular config is backed up as `config.toml.backup.<unique suffix>`
+before replacing it with the bundled defaults. Identical configs do not create
+extra backups. Use `--no-config` to retain all custom settings, or copy selected
+settings back from the private backup after installation. Symlinked configs are
+left unchanged. `--dry-run` does not write binaries, configs, or backups.
+
+An already-running terminal keeps its current process; restart it to use the new
+binary and configuration. If an older copy comes first in PATH, the installer
+prints the conflicting path.
