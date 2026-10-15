@@ -83,6 +83,9 @@ pub struct SearchState {
     /// 当前选中的匹配项索引
     pub current_match_index: usize,
 
+    /// Owner of the cached raw-row coordinates; never persisted.
+    results_session_id: Option<usize>,
+
     /// 搜索历史队列（最近在前）
     pub history: VecDeque<SearchHistoryEntry>,
 
@@ -114,6 +117,65 @@ impl Default for SearchState {
 }
 
 impl SearchState {
+    /// Reuse the ordinary bounded search for both the timer and explicit navigation.
+    pub(crate) fn refresh_matches<'a>(
+        &mut self,
+        lines: impl IntoIterator<Item = SearchLine<'a>>,
+        session_id: usize,
+    ) {
+        let (matches, error) = SearchEngine::search_lines(
+            lines,
+            &self.query,
+            self.use_regex,
+            self.case_sensitive,
+            &mut self.regex_cache,
+        );
+        self.matches = matches;
+        self.results_session_id = Some(session_id);
+        self.set_error_message(error);
+        if self.matches.is_empty() || self.current_match_index >= self.matches.len() {
+            self.current_match_index = 0;
+        }
+    }
+
+    /// A navigation press cannot wait for the live-search debounce tick.
+    pub(crate) fn navigate<'a>(
+        &mut self,
+        lines: impl IntoIterator<Item = SearchLine<'a>>,
+        dirty: &mut bool,
+        session_id: usize,
+        previous: bool,
+    ) {
+        if *dirty || self.results_session_id != Some(session_id) {
+            let selected = (self.results_session_id == Some(session_id))
+                .then(|| self.current_match())
+                .flatten();
+            self.refresh_matches(lines, session_id);
+            *dirty = false;
+            if let Some(index) = selected.and_then(|selected| {
+                self.matches
+                    .iter()
+                    .position(|candidate| *candidate == selected)
+            }) {
+                self.current_match_index = index;
+            } else {
+                // The old cursor no longer names a hit. Land at the edge in
+                // this direction instead of stepping past a fabricated first hit.
+                self.current_match_index = if previous {
+                    self.matches.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                return;
+            }
+        }
+        if previous {
+            self.prev_match();
+        } else {
+            self.next_match();
+        }
+    }
+
     /// 创建新的搜索状态
     pub fn new() -> Self {
         Self {
@@ -123,6 +185,7 @@ impl SearchState {
             case_sensitive: false,
             matches: Vec::new(),
             current_match_index: 0,
+            results_session_id: None,
             history: VecDeque::new(),
             history_nav_index: None,
             history_draft: None,
@@ -669,6 +732,86 @@ impl SearchEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_navigation_refreshes_deleted_match_before_the_debounce_tick() {
+        for previous in [false, true] {
+            let mut terminal = crate::terminal::TerminalState::new(24, 4);
+            terminal.process_input(b"needle A\r\nneedle B\r\nneedle C");
+            let mut state = SearchState::new();
+            state.set_query("needle");
+            state.refresh_matches(terminal.search_lines(), 1);
+            let old_matches = state.matches.clone();
+            assert_eq!(old_matches.len(), 3);
+            // The selected first match disappears while two matches survive.
+            terminal.process_input(b"\x1b[1;1H\x1b[2Kgone");
+            assert_eq!(state.matches.len(), 3, "no timer/frame refreshed yet");
+            let mut dirty = true;
+            state.navigate(terminal.search_lines(), &mut dirty, 1, previous);
+            assert!(!dirty);
+            assert_eq!(state.matches.len(), 2);
+            assert_eq!(
+                state.current_match(),
+                Some(old_matches[if previous { 2 } else { 1 }]),
+                "a missing cursor lands at the direction's edge without skipping it"
+            );
+            assert_eq!(state.query, "needle");
+        }
+    }
+
+    #[test]
+    fn live_navigation_preserves_surviving_match_and_rejects_other_session_coordinates() {
+        for previous in [false, true] {
+            let mut terminal = crate::terminal::TerminalState::new(24, 4);
+            terminal.process_input(b"needle A\r\nneedle B");
+            let mut state = SearchState::new();
+            state.set_query("needle");
+            state.refresh_matches(terminal.search_lines(), 1);
+            terminal.process_input(b"\r\nneedle C");
+            let mut dirty = true;
+            state.navigate(terminal.search_lines(), &mut dirty, 1, previous);
+            assert!(!dirty);
+            assert_eq!(state.matches.len(), 3);
+            assert_eq!(
+                state.current_match_index,
+                if previous { 2 } else { 1 },
+                "a surviving cursor moves exactly once"
+            );
+
+            let mut other = crate::terminal::TerminalState::new(24, 4);
+            other.process_input(b"needle X\r\nneedle Y");
+            // The other session deliberately reuses the same raw row/column IDs.
+            let mut dirty = false;
+            state.navigate(other.search_lines(), &mut dirty, 2, previous);
+            assert_eq!(state.matches.len(), 2);
+            assert_eq!(state.current_match_index, usize::from(previous));
+        }
+    }
+
+    #[test]
+    fn live_navigation_drops_erased_matches_and_refreshes_after_resize() {
+        let mut terminal = crate::terminal::TerminalState::new(24, 4);
+        terminal.process_input(b"needle");
+        let mut state = SearchState::new();
+        state.set_query("needle");
+        state.refresh_matches(terminal.search_lines(), 1);
+        terminal.process_input(b"\r\x1b[2Kgone");
+        let previous = false;
+        let mut dirty = true;
+        state.navigate(terminal.search_lines(), &mut dirty, 1, previous);
+        assert!(!dirty);
+        assert!(state.matches.is_empty());
+        assert_eq!(state.current_match(), None);
+
+        terminal.process_input(b"\r\x1b[2Kneedle");
+        state.refresh_matches(terminal.search_lines(), 1);
+        terminal.on_resize(16, 6);
+        let mut dirty = true;
+        state.navigate(terminal.search_lines(), &mut dirty, 1, previous);
+        assert!(!dirty);
+        assert_eq!(state.matches.len(), 1);
+        assert!(state.current_match().is_some());
+    }
+
     use super::*;
 
     #[test]

@@ -1204,6 +1204,75 @@ fn ad_hoc_block_semantic_context(
     })
 }
 
+/// A rendered reveal button names one search result, never the pane's next result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchRevealTarget {
+    session_id: usize,
+    query: String,
+    use_regex: bool,
+    case_sensitive: bool,
+    found: search::SearchMatch,
+    origin: terminal::RawCellOrigin,
+    zone_id: u64,
+    policy_revision: u64,
+}
+
+fn search_reveal_target(
+    search: &search::SearchState,
+    dirty: bool,
+    session_id: usize,
+    terminal: &terminal::TerminalState,
+    projection: &terminal::ProjectedViewport,
+    policy: &terminal::ProjectionPolicy,
+) -> Option<SearchRevealTarget> {
+    if !search.is_open || dirty {
+        return None;
+    }
+    let found = search.current_match()?;
+    let origin = terminal.raw_cell_origin_at_absolute(found.line, found.col_start)?;
+    let terminal::ProjectedRawCellLocation::Hidden { zone_id } =
+        terminal.locate_raw_cell_in_projection(projection, origin)
+    else {
+        return None;
+    };
+    Some(SearchRevealTarget {
+        session_id,
+        query: search.query.clone(),
+        use_regex: search.use_regex,
+        case_sensitive: search.case_sensitive,
+        found,
+        origin,
+        zone_id,
+        policy_revision: policy.revision(),
+    })
+}
+
+fn apply_search_reveal(
+    target: &SearchRevealTarget,
+    search: &search::SearchState,
+    dirty: bool,
+    session_id: usize,
+    terminal: &terminal::TerminalState,
+    projection: &terminal::ProjectedViewport,
+    policy: &mut terminal::ProjectionPolicy,
+) -> bool {
+    if search_reveal_target(search, dirty, session_id, terminal, projection, policy).as_ref()
+        != Some(target)
+    {
+        return false;
+    }
+    // A click is rare: recheck the actual bounded search instead of granting
+    // mutation authority to a cached row whose contents may have changed.
+    let (matches, error) = search::SearchEngine::search_lines(
+        terminal.search_lines(),
+        &search.query,
+        search.use_regex,
+        search.case_sensitive,
+        &mut search.regex_cache.clone(),
+    );
+    error.is_none() && matches.contains(&target.found) && policy.expand(target.zone_id)
+}
+
 fn clear_stale_hidden_match_diagnostic(error: &mut Option<String>) {
     if error
         .as_deref()
@@ -3956,6 +4025,8 @@ enum Message {
     TaskPanelToggle,
     TaskDashboardQuery(String),
     TaskDashboardView(agent_task::DashboardView),
+    TaskDashboardClear,
+    TaskDashboardOpenResult,
     TaskSelect(agent_task::TaskId),
     TaskHide(agent_task::TaskId),
     TaskCreateWithProvider(std::sync::Arc<()>, agent_task::AgentProvider),
@@ -3971,6 +4042,8 @@ enum Message {
     TaskValidationStart(agent_task::TaskId),
     TaskMarkComplete(agent_task::TaskId),
     TaskTerminalOpen(agent_task::TaskId),
+    TaskFocusTerminal(agent_task::TaskId),
+    TaskFocusValidation(agent_task::TaskId),
     /// Open a coding-agent CLI in a new tab at the active pane cwd.
     AgentLaunch(agent_task::AgentProvider),
     /// Periodic reducer/driver poll while the dashboard is open or a provider
@@ -4175,6 +4248,7 @@ enum Message {
     SearchToggleRegex,
     SearchToggleCase,
     SearchInput(String),
+    SearchRevealMatch(Box<SearchRevealTarget>),
     SearchReplaceFindInput(String),
     SearchReplaceReplaceInput(String),
     SearchReplaceToggleRegex,
@@ -9923,16 +9997,14 @@ impl Frost {
                 if !self.search.is_open {
                     return None;
                 }
-                self.search.next_match();
-                self.reveal_current_search_match();
+                self.navigate_search(false);
                 Task::none()
             }
             C::SearchPrev => {
                 if !self.search.is_open {
                     return None;
                 }
-                self.search.prev_match();
-                self.reveal_current_search_match();
+                self.navigate_search(true);
                 Task::none()
             }
             C::SearchHistoryPrev => {
@@ -12852,20 +12924,23 @@ impl Frost {
             self.search.matches.clear();
             return;
         };
-        let (matches, error) = search::SearchEngine::search_lines(
-            sess.terminal.search_lines(),
-            &self.search.query,
-            self.search.use_regex,
-            self.search.case_sensitive,
-            &mut self.search.regex_cache,
-        );
-        self.search.matches = matches;
-        self.search.set_error_message(error);
-        if self.search.matches.is_empty()
-            || self.search.current_match_index >= self.search.matches.len()
-        {
-            self.search.current_match_index = 0;
+        self.search
+            .refresh_matches(sess.terminal.search_lines(), sess.id);
+    }
+
+    fn navigate_search(&mut self, previous: bool) {
+        if let Some(session) = self.sessions.get(self.active) {
+            self.search.navigate(
+                session.terminal.search_lines(),
+                &mut self.search_dirty,
+                session.id,
+                previous,
+            );
+        } else {
+            self.search.matches.clear();
+            self.search_dirty = false;
         }
+        self.reveal_current_search_match();
     }
 
     /// Reveal the active full-buffer search result and refresh the session's
@@ -12910,6 +12985,40 @@ impl Frost {
         self.links_cache_key = None;
     }
 
+    fn reveal_hidden_search_match(&mut self, target: &SearchRevealTarget) -> Task<Message> {
+        let changed = self.sessions.get_mut(self.active).is_some_and(|session| {
+            let changed = apply_search_reveal(
+                target,
+                &self.search,
+                self.search_dirty,
+                session.id,
+                &session.terminal,
+                &session.projection,
+                &mut session.projection_policy,
+            );
+            if changed {
+                session.refresh();
+            }
+            changed
+        });
+        if changed {
+            self.session_dirty = true;
+            self.recompute_search();
+            self.reveal_current_search_match();
+            self.recompute_links();
+        }
+        if self.search.is_open
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|session| session.id == target.session_id)
+        {
+            iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
+        } else {
+            Task::none()
+        }
+    }
+
     /// Route a keypress into the search bar while it is open. Returns true if
     /// the key was consumed (and must not reach the PTY).
     fn handle_search_key(
@@ -12937,12 +13046,7 @@ impl Frost {
                 return true;
             }
             Key::Named(Named::Enter) => {
-                if mods.shift() {
-                    self.search.prev_match();
-                } else {
-                    self.search.next_match();
-                }
-                self.reveal_current_search_match();
+                self.navigate_search(mods.shift());
                 return true;
             }
             Key::Named(Named::Backspace) => {
@@ -14639,6 +14743,14 @@ impl Frost {
     fn update(&mut self, message: Message) -> Task<Message> {
         self.sync_terminal_pane_owners();
         let task = self.update_message(message);
+        self.organism.observe_agent(
+            self.agent
+                .session
+                .as_ref()
+                .filter(|_| self.agent.is_open)
+                .map(|session| session.state()),
+            self.agent.loading,
+        );
         // Also cover early-return reducers. This runs before the next queued
         // message, not after an Iced message batch or a widget tree redraw.
         self.sync_terminal_pane_owners();
@@ -14757,12 +14869,15 @@ impl Frost {
                                     == block_mode::CompletionProvenance::ShellReported)
                                     .then_some(completed.exit_code)
                                     .flatten();
-                                self.organism.completed(
+                                self.organism.completed_event(
                                     id,
-                                    &completed.command,
-                                    exit,
-                                    completed.duration_ms,
-                                    completed.command_cwd.as_deref(),
+                                    organism::CommandCompletion {
+                                        command: &completed.command,
+                                        exit,
+                                        duration: completed.duration_ms,
+                                        cwd: completed.command_cwd.as_deref(),
+                                        agent_driven: completed.agent_generation.is_some(),
+                                    },
                                 );
                             }
                             self.organism
@@ -15445,6 +15560,32 @@ impl Frost {
             Message::TaskPanelToggle => {
                 self.toggle_task_panel();
             }
+            Message::TaskDashboardOpenResult => {
+                let dashboard = agent_task::DashboardSnapshot::project(
+                    self.task_manager
+                        .tasks()
+                        .iter()
+                        .filter(|task| task.status != agent_task::TaskStatus::Archived),
+                    |id| agent_task::DashboardActivity {
+                        has_active_agent_stream: self
+                            .task_manager
+                            .has_active_agent_event_stream(id),
+                        native_preparing: self.agent_runtime.has_preparing(id),
+                        ..Default::default()
+                    },
+                    agent_task::DashboardFilter {
+                        text: &self.task_panel.dashboard_query,
+                        view: self.task_panel.dashboard_view,
+                        ..Default::default()
+                    },
+                );
+                self.task_panel.open_dashboard_result(&dashboard);
+            }
+            Message::TaskDashboardClear => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_query.clear();
+                self.task_panel.dashboard_view = agent_task::DashboardView::All;
+            }
             Message::TaskDashboardQuery(query) => {
                 self.task_panel.retire_panel_callbacks();
                 self.task_panel.dashboard_query = query.chars().take(256).collect();
@@ -15577,6 +15718,12 @@ impl Frost {
                 }
             }
             Message::TaskTerminalOpen(task_id) => self.task_open_terminal(task_id),
+            Message::TaskFocusTerminal(task_id) => {
+                self.task_focus_terminal(task_id, agent_task::TaskTerminalRole::Agent)
+            }
+            Message::TaskFocusValidation(task_id) => {
+                self.task_focus_terminal(task_id, agent_task::TaskTerminalRole::Validation)
+            }
             Message::TaskTick => self.tasks_tick(),
             Message::AgentInput(value) => self.agent.set_input(value),
             Message::AgentSubmit => {
@@ -17521,6 +17668,7 @@ impl Frost {
                 self.recompute_search();
                 self.reveal_current_search_match();
             }
+            Message::SearchRevealMatch(target) => return self.reveal_hidden_search_match(&target),
             Message::SearchInput(value) => {
                 self.search.set_query(value);
                 self.recompute_search();
@@ -24339,7 +24487,23 @@ impl Frost {
     /// editable `text_input`; Enter/Esc/arrows are still handled at the app level
     /// (the input deliberately has no `on_submit` so Shift+Enter can mean "prev").
     fn search_bar(&self) -> Element<'_, Message> {
-        let status = if let Some(err) = &self.search.error_message {
+        let reveal = self.sessions.get(self.active).and_then(|session| {
+            search_reveal_target(
+                &self.search,
+                self.search_dirty,
+                session.id,
+                &session.terminal,
+                &session.projection,
+                &session.projection_policy,
+            )
+        });
+        let status = if reveal.is_some() {
+            format!(
+                "{}/{}",
+                self.search.current_match_index + 1,
+                self.search.matches.len()
+            )
+        } else if let Some(err) = &self.search.error_message {
             crate::review_text::bound_query_error(err)
         } else if !self.search.matches.is_empty() {
             format!(
@@ -24383,7 +24547,20 @@ impl Frost {
             bar = bar.push(text(status).size(13));
         }
         bar = bar.push(regex_btn).push(case_btn);
-        let inner = container(bar).padding([4, 10]).style(container::dark);
+        let mut content = column![bar].spacing(6);
+        if let Some(target) = reveal {
+            content = content.push(
+                row![
+                    text("Match is hidden in a collapsed block").size(12),
+                    button(text("Reveal match").size(12))
+                        .on_press(Message::SearchRevealMatch(Box::new(target)))
+                        .padding([4, 8]),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        let inner = container(content).padding([4, 10]).style(container::dark);
         container(inner)
             .align_right(Length::Fill)
             .align_top(Length::Fill)
@@ -26849,6 +27026,54 @@ impl Frost {
         self.task_panel.diff.poll();
     }
 
+    fn task_terminal_index(
+        &self,
+        task_id: agent_task::TaskId,
+        role: agent_task::TaskTerminalRole,
+    ) -> Option<usize> {
+        let task = self.task_manager.get(task_id)?;
+        let binding = agent_task_ui::task_terminal_binding(task, role)?;
+        agent_task_ui::resolve_task_terminal(
+            Some(binding),
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.tab_of_session(*index).is_some())
+                .map(|(index, session)| (agent_task_ui::terminal_session_id(session.id), index)),
+        )
+    }
+
+    fn task_focus_terminal(
+        &mut self,
+        task_id: agent_task::TaskId,
+        role: agent_task::TaskTerminalRole,
+    ) {
+        if !agent_task_ui::task_focus_allowed(
+            self.config.experimental_task_sidebar
+                && self.sidebar_open
+                && self.sidebar_panel == SidebarPanel::Tasks,
+            self.task_panel.selected,
+            task_id,
+        ) {
+            return;
+        }
+        let Some(index) = self.task_terminal_index(task_id, role) else {
+            self.push_toast("Task terminal is no longer available", ToastKind::Info);
+            return;
+        };
+        self.native_enter_ownership.lock().claim_pressed();
+        if self.active != index {
+            self.pane_zoomed = false;
+        }
+        if !self.focus_session(index) {
+            self.push_toast("Task terminal is no longer available", ToastKind::Info);
+            return;
+        }
+        self.sidebar_files_focused = false;
+        self.relayout();
+        self.refresh_active_context();
+    }
+
     /// Open the opaque PTY compatibility path: a new terminal tab running the
     /// provider CLI directly inside the task worktree. Also implements the
     /// explicit terminal fallback after an unsuccessful native session and
@@ -27137,28 +27362,13 @@ impl Frost {
         }
         body = body.push(
             text_input(
-                "Search tasks, providers or repositories",
+                "Search tasks, providers or repositories · Enter to open",
                 &self.task_panel.dashboard_query,
             )
             .on_input(Message::TaskDashboardQuery)
+            .on_submit(Message::TaskDashboardOpenResult)
             .size(12),
         );
-        let mut filters = row![].spacing(4);
-        for (view, label) in [
-            (agent_task::DashboardView::All, "All"),
-            (agent_task::DashboardView::NeedsAttention, "Needs you"),
-            (agent_task::DashboardView::Running, "Running"),
-            (agent_task::DashboardView::NotStarted, "Not started"),
-            (agent_task::DashboardView::Review, "Review"),
-            (agent_task::DashboardView::Finished, "Finished"),
-        ] {
-            filters = filters.push(
-                button(text(label).size(10))
-                    .style(self.tab_btn_style(self.task_panel.dashboard_view == view))
-                    .on_press(Message::TaskDashboardView(view)),
-            );
-        }
-        body = body.push(filters.wrap());
         let dashboard = agent_task::DashboardSnapshot::project(
             self.task_manager
                 .tasks()
@@ -27175,16 +27385,57 @@ impl Frost {
                 ..Default::default()
             },
         );
+        let mut filters = row![].spacing(4);
+        for view in [
+            agent_task::DashboardView::All,
+            agent_task::DashboardView::NeedsAttention,
+            agent_task::DashboardView::Running,
+            agent_task::DashboardView::NotStarted,
+            agent_task::DashboardView::Review,
+            agent_task::DashboardView::Finished,
+        ] {
+            filters = filters.push(
+                button(
+                    text(agent_task_ui::dashboard_filter_label(
+                        view,
+                        &dashboard.counts,
+                    ))
+                    .size(10),
+                )
+                .style(self.tab_btn_style(self.task_panel.dashboard_view == view))
+                .on_press(Message::TaskDashboardView(view)),
+            );
+        }
+        body = body.push(filters.wrap());
         body = body.push(
             text(format!(
-                "{} tasks · {} need you · {} awaiting approval",
+                "{} shown · {} search matches · {} need you · {} awaiting approval",
+                dashboard.rows.len(),
                 dashboard.counts.total,
                 dashboard.counts.attention,
-                dashboard.counts.pending_approval
+                dashboard.counts.pending_approval,
             ))
             .size(11)
             .style(text::secondary),
         );
+        if !self.task_panel.dashboard_query.is_empty()
+            || self.task_panel.dashboard_view != agent_task::DashboardView::All
+        {
+            body = body
+                .push(button(text("Clear filters").size(11)).on_press(Message::TaskDashboardClear));
+        }
+        let selected_hidden = self.task_panel.selected.is_some_and(|id| {
+            self.task_manager
+                .get(id)
+                .is_some_and(|task| task.status != agent_task::TaskStatus::Archived)
+                && dashboard.selected_index(Some(id)).is_none()
+        });
+        if selected_hidden {
+            body = body.push(text("Selected task is hidden by filters.").size(11));
+            body = body.push(
+                button(text("Show selected task").size(11)).on_press(Message::TaskDashboardClear),
+            );
+        }
         let tasks: Vec<_> = dashboard
             .rows
             .iter()
@@ -27222,19 +27473,44 @@ impl Frost {
                 .on_press(Message::TaskSelect(task.id))
                 .padding([2, 6])
                 .style(self.tab_btn_style(self.task_panel.selected == Some(task.id)));
-            body = body.push(
-                column![
-                    row_button,
-                    text(format!(
-                        "{} · {}",
-                        crate::review_text::bound_provider_label(task.provider.display_name()),
-                        task.status.label()
-                    ))
-                    .size(10)
-                    .style(text::secondary),
-                ]
-                .spacing(1),
-            );
+            let mut task_row = column![
+                row_button,
+                text(format!(
+                    "{} · {}",
+                    crate::review_text::bound_provider_label(task.provider.display_name()),
+                    task.status.label()
+                ))
+                .size(10)
+                .style(text::secondary),
+            ]
+            .spacing(1);
+            if let Some(reason) = agent_task_ui::task_reason(
+                task.status,
+                task.validation.status,
+                task.status_detail.as_deref(),
+                task.validation.status_detail.as_deref(),
+            ) {
+                let columns = ((self.dock_width - 24.0).max(6.0) / 6.0) as usize;
+                let preview = agent_task_ui::reason_preview(&reason, columns);
+                task_row = task_row.push(tooltip(
+                    container(
+                        text(preview)
+                            .size(10)
+                            .font(iced::Font::MONOSPACE)
+                            .wrapping(text::Wrapping::None)
+                            .style(text::secondary),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                    container(text(reason).size(11).wrapping(text::Wrapping::WordOrGlyph))
+                        .padding(6)
+                        .width(Length::Fixed(320.0))
+                        .max_height(180.0)
+                        .clip(true),
+                    tooltip::Position::Top,
+                ));
+            }
+            body = body.push(task_row);
         }
         if let Some(task_id) = self
             .task_panel
@@ -27390,6 +27666,33 @@ impl Frost {
                 );
             }
         }
+
+        let live_terminals: std::collections::HashSet<_> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.tree.leaves())
+            .filter_map(|index| self.sessions.get(index))
+            .map(|session| agent_task_ui::terminal_session_id(session.id))
+            .collect();
+        let mut agent_terminal = button(text("Agent terminal").size(11)).style(button::secondary);
+        if task
+            .terminal_session_id
+            .as_ref()
+            .is_some_and(|id| live_terminals.contains(id))
+        {
+            agent_terminal = agent_terminal.on_press(Message::TaskFocusTerminal(task.id));
+        }
+        let mut validation_output =
+            button(text("Validation output").size(11)).style(button::secondary);
+        if task
+            .validation
+            .terminal_session_id
+            .as_ref()
+            .is_some_and(|id| live_terminals.contains(id))
+        {
+            validation_output = validation_output.on_press(Message::TaskFocusValidation(task.id));
+        }
+        card = card.push(row![agent_terminal, validation_output].spacing(6).wrap());
 
         // Action rows.
         let provider_name = crate::review_text::bound_provider_label(task.provider.display_name());
@@ -34194,6 +34497,224 @@ mod tests {
         assert_eq!(prompt_jump_target(prompts.into_iter(), 23, false), None);
     }
 
+    struct SearchRevealFixture {
+        terminal: terminal::TerminalState,
+        policy: terminal::ProjectionPolicy,
+        view_state: terminal::ProjectionViewState,
+        projection: std::sync::Arc<terminal::ProjectedViewport>,
+        search: search::SearchState,
+        target: SearchRevealTarget,
+        other_zone: u64,
+    }
+
+    fn search_reveal_fixture() -> SearchRevealFixture {
+        let mut terminal = terminal::TerminalState::new(40, 10);
+        terminal.process_input(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07needle\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07other needle\r\n\x1b]133;D;0\x07",
+        );
+        let ids: Vec<_> = terminal.command_zones.iter().map(|zone| zone.id).collect();
+        assert_eq!(ids.len(), 2);
+        let mut policy = terminal::ProjectionPolicy::new();
+        assert!(policy.collapse(ids[0]));
+        assert!(policy.collapse(ids[1]));
+        let mut view_state = terminal::ProjectionViewState::default();
+        let projection = terminal.get_projected_viewport_with_state(true, &policy, &mut view_state);
+        let mut search = search::SearchState::new();
+        search.toggle();
+        search.set_query("needle");
+        search.refresh_matches(terminal.search_lines(), 7);
+        assert_eq!(search.matches.len(), 2);
+        let target = search_reveal_target(&search, false, 7, &terminal, &projection, &policy)
+            .expect("hidden result exposes its reveal control");
+        assert_eq!(target.zone_id, ids[0]);
+        SearchRevealFixture {
+            terminal,
+            policy,
+            view_state,
+            projection,
+            search,
+            target,
+            other_zone: ids[1],
+        }
+    }
+
+    #[test]
+    fn search_reveal_expands_only_the_matching_block_and_locates_real_output() {
+        let mut fixture = search_reveal_fixture();
+        let raw = fixture.terminal.grid.to_vec();
+        assert!(apply_search_reveal(
+            &fixture.target,
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &mut fixture.policy
+        ));
+        assert!(!fixture.policy.is_collapsed(fixture.target.zone_id));
+        assert!(fixture.policy.is_collapsed(fixture.other_zone));
+        assert_eq!(
+            fixture.terminal.grid.to_vec(),
+            raw,
+            "reveal only changes presentation"
+        );
+        assert!(fixture.terminal.reveal_raw_cell_in_projection(
+            &fixture.policy,
+            &mut fixture.view_state,
+            fixture.target.origin
+        ));
+        let revealed = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(matches!(
+            fixture
+                .terminal
+                .locate_raw_cell_in_projection(&revealed, fixture.target.origin),
+            terminal::ProjectedRawCellLocation::Visible(_)
+        ));
+    }
+
+    #[test]
+    fn search_reveal_declines_stale_query_owner_match_and_projection() {
+        for stale in [
+            "query",
+            "session",
+            "selection",
+            "lost_match",
+            "mode",
+            "case",
+            "closed",
+            "dirty",
+            "policy",
+            "output",
+        ] {
+            let mut fixture = search_reveal_fixture();
+            let mut session_id = 7;
+            let mut dirty = false;
+            match stale {
+                "query" => fixture.search.set_query("changed"),
+                "session" => session_id = 8,
+                "selection" => fixture.search.current_match_index = 1,
+                "lost_match" => fixture.search.matches.clear(),
+                "mode" => fixture.search.use_regex = true,
+                "case" => fixture.search.case_sensitive = true,
+                "closed" => fixture.search.close(),
+                "dirty" => dirty = true,
+                "policy" => {
+                    fixture.policy.expand(fixture.other_zone);
+                }
+                "output" => {
+                    fixture.terminal.process_input(b"\x1b[2;1H\x1b[2Kgone");
+                }
+                _ => unreachable!(),
+            }
+            let revision = fixture.policy.revision();
+            assert!(
+                !apply_search_reveal(
+                    &fixture.target,
+                    &fixture.search,
+                    dirty,
+                    session_id,
+                    &fixture.terminal,
+                    &fixture.projection,
+                    &mut fixture.policy
+                ),
+                "{stale}"
+            );
+            assert!(
+                fixture.policy.is_collapsed(fixture.target.zone_id),
+                "{stale}"
+            );
+            assert_eq!(
+                fixture.policy.revision(),
+                revision,
+                "rejected {stale} click mutates nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn search_reveal_control_only_exists_for_a_current_hidden_match() {
+        let mut fixture = search_reveal_fixture();
+        assert!(search_reveal_target(
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &fixture.policy
+        )
+        .is_some());
+        assert!(search_reveal_target(
+            &fixture.search,
+            true,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &fixture.policy
+        )
+        .is_none());
+        fixture.policy.expand(fixture.target.zone_id);
+        fixture.projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(
+            search_reveal_target(
+                &fixture.search,
+                false,
+                7,
+                &fixture.terminal,
+                &fixture.projection,
+                &fixture.policy
+            )
+            .is_none(),
+            "visible results have no reveal control"
+        );
+        fixture.search.matches.clear();
+        assert!(search_reveal_target(
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &fixture.projection,
+            &fixture.policy
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn search_reveal_control_is_absent_when_chat_keeps_the_output_visible() {
+        let mut fixture = search_reveal_fixture();
+        fixture
+            .terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        fixture.policy.set_chat(true);
+        let projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(!matches!(
+            fixture
+                .terminal
+                .locate_raw_cell_in_projection(&projection, fixture.target.origin),
+            terminal::ProjectedRawCellLocation::Hidden { .. }
+        ));
+        assert!(search_reveal_target(
+            &fixture.search,
+            false,
+            7,
+            &fixture.terminal,
+            &projection,
+            &fixture.policy
+        )
+        .is_none());
+    }
+
     #[test]
     fn search_matches_use_exact_projected_origins_and_fail_closed() {
         let mut terminal = terminal::TerminalState::new(4, 3);
@@ -39596,7 +40117,7 @@ mod tests {
                     .unwrap()
         );
         assert!(
-            output.find("self.organism.completed(").unwrap()
+            output.find("self.organism.completed_event(").unwrap()
                 < output
                     .find("self.organism.poll_live_greeting(Some(id), facts)")
                     .unwrap()

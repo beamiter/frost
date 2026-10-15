@@ -8,6 +8,93 @@
 //! contract. Everything here is either pure or structured so the pure parts
 //! are headless-testable.
 
+/// Resolve the current binding without interpreting its opaque session identity.
+pub(crate) fn task_terminal_binding(
+    task: &crate::agent_task::AgentTask,
+    role: crate::agent_task::TaskTerminalRole,
+) -> Option<&str> {
+    match role {
+        crate::agent_task::TaskTerminalRole::Agent => task.terminal_session_id.as_deref(),
+        crate::agent_task::TaskTerminalRole::Validation => {
+            task.validation.terminal_session_id.as_deref()
+        }
+    }
+}
+
+/// Resolve against live identities, never against an old tab or pane index.
+pub(crate) fn resolve_task_terminal<T>(
+    binding: Option<&str>,
+    terminals: impl IntoIterator<Item = (String, T)>,
+) -> Option<T> {
+    let binding = binding?;
+    terminals
+        .into_iter()
+        .find_map(|(identity, target)| (identity == binding).then_some(target))
+}
+
+pub(crate) fn task_focus_allowed(
+    visible: bool,
+    selected: Option<TaskId>,
+    requested: TaskId,
+) -> bool {
+    visible && selected == Some(requested)
+}
+
+/// Truncate a single-line reason by terminal display cells, leaving room for an ellipsis.
+pub(crate) fn reason_preview(detail: &str, columns: usize) -> String {
+    let width = |text: &str| {
+        text.chars()
+            .map(jterm_core::char_width::cached_char_width)
+            .sum::<usize>()
+    };
+    if width(detail) <= columns {
+        return detail.to_owned();
+    }
+    if columns == 0 {
+        return String::new();
+    }
+    let mut used = 0;
+    let mut preview = String::new();
+    for character in detail.chars() {
+        let next = jterm_core::char_width::cached_char_width(character);
+        if used + next > columns.saturating_sub(1) {
+            break;
+        }
+        preview.push(character);
+        used += next;
+    }
+    preview.push('…');
+    preview
+}
+
+/// A display-only reason, selected from authoritative task/validation details.
+pub(crate) fn task_reason(
+    status: crate::agent_task::TaskStatus,
+    validation: crate::agent_task::TaskValidationStatus,
+    status_detail: Option<&str>,
+    validation_detail: Option<&str>,
+) -> Option<String> {
+    use crate::agent_task::{TaskStatus, TaskValidationStatus};
+    let nonempty = |text: &&str| !text.trim().is_empty();
+    let validation_reason = matches!(
+        validation,
+        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
+    )
+    .then_some(validation_detail)
+    .flatten()
+    .filter(nonempty);
+    let task_reason = matches!(
+        status,
+        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
+    )
+    .then_some(status_detail)
+    .flatten()
+    .filter(nonempty);
+    validation_reason
+        .or(task_reason)
+        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
+}
+
 use crate::agent_task::{
     AgentProvider, ManagedWorktree, NativePromptPolicy, SemanticCommandContext, TaskId,
     WorktreeService, CODEX_APP_SERVER_LIVE_TURN_MAX, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
@@ -24,6 +111,23 @@ use std::thread::JoinHandle;
 pub(crate) const MAX_TASK_TITLE_DISPLAY_BYTES: usize = 112;
 /// Display bound for branch names, status details, and validation details.
 pub(crate) const MAX_TASK_DETAIL_DISPLAY_BYTES: usize = 256;
+
+/// Counts describe current search matches before the selected quick view.
+pub(crate) fn dashboard_filter_label(
+    view: crate::agent_task::DashboardView,
+    counts: &crate::agent_task::DashboardCounts,
+) -> String {
+    use crate::agent_task::DashboardView;
+    let (label, count) = match view {
+        DashboardView::All => ("All", counts.total),
+        DashboardView::NeedsAttention => ("Needs you", counts.attention),
+        DashboardView::Running => ("Running", counts.running),
+        DashboardView::NotStarted => ("Not started", counts.created),
+        DashboardView::Review => ("Review", counts.review),
+        DashboardView::Finished => ("Finished", counts.done + counts.failed + counts.cancelled),
+    };
+    format!("{label} {count}")
+}
 
 /// Visible before starting a print-mode provider; a worktree is not containment.
 pub(crate) fn native_start_notice(provider: AgentProvider) -> Option<&'static str> {
@@ -358,6 +462,17 @@ impl TaskPanel {
         }
     }
 
+    pub(crate) fn open_dashboard_result(
+        &mut self,
+        dashboard: &crate::agent_task::DashboardSnapshot,
+    ) {
+        if let Some(row) = dashboard.rows.first() {
+            if self.selected != Some(row.id) {
+                self.select(Some(row.id));
+            }
+        }
+    }
+
     pub(crate) fn select(&mut self, task_id: Option<TaskId>) {
         self.close_diff();
         self.selected = task_id;
@@ -486,6 +601,181 @@ impl TaskPanel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_reason_preview_fits_single_line_cells() {
+        assert_eq!(super::reason_preview("界界界", 5), "界界…");
+        assert_eq!(super::reason_preview("abcdef", 4), "abc…");
+        assert_eq!(super::reason_preview("abc", 4), "abc");
+        assert_eq!(super::reason_preview("abc", 0), "");
+    }
+
+    #[test]
+    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
+        use crate::agent_task::{TaskStatus as S, TaskValidationStatus as V};
+        assert_eq!(
+            super::task_reason(
+                S::Failed,
+                V::Failed,
+                Some("task failed"),
+                Some("tests failed")
+            )
+            .as_deref(),
+            Some("tests failed")
+        );
+        assert_eq!(
+            super::task_reason(
+                S::Failed,
+                V::Inconclusive,
+                Some("task failed"),
+                Some("no exit status")
+            )
+            .as_deref(),
+            Some("no exit status")
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::Failed, Some("task failed"), Some("  ")).as_deref(),
+            Some("task failed")
+        );
+        for status in [S::WaitingForHuman, S::WaitingForApproval] {
+            assert_eq!(
+                super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
+                Some("needs a decision")
+            );
+        }
+        assert_eq!(
+            super::task_reason(
+                S::Completed,
+                V::Passed,
+                Some("old failure"),
+                Some("old tests")
+            ),
+            None
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some(" \n\t "), None),
+            None
+        );
+        assert_eq!(super::task_reason(S::Failed, V::NotRun, None, None), None);
+        let unsafe_detail = format!("bad\u{1b}\n\u{202e}{}", "界".repeat(800));
+        let reason = super::task_reason(S::Failed, V::NotRun, Some(&unsafe_detail), None).unwrap();
+        assert!(reason.len() <= 1024);
+        assert!(!reason.chars().any(char::is_control));
+        assert!(!reason.contains('\u{202e}'));
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some("updated"), None).as_deref(),
+            Some("updated")
+        );
+    }
+
+    #[test]
+    fn task_terminal_resolution_survives_reorder_and_rejects_replacement() {
+        use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskTerminalRole};
+        let mut manager = TaskManager::new();
+        let mut ids = Vec::new();
+        for title in ["first", "second"] {
+            ids.push(
+                manager
+                    .create(NewTask {
+                        title: title.into(),
+                        provider: AgentProvider::Codex,
+                        repo_root: "/fixture".into(),
+                        worktree_path: "/fixture/worktree".into(),
+                        branch: "test/focus".into(),
+                        base_commit: "a".repeat(40),
+                        source_context: None,
+                    })
+                    .unwrap(),
+            );
+        }
+        manager
+            .bind_terminal_session(ids[0], "terminal-first".into())
+            .unwrap();
+        manager
+            .bind_terminal_session(ids[1], "terminal-second".into())
+            .unwrap();
+        manager
+            .update_status(ids[1], crate::agent_task::TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(ids[1], "validation-second".into())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-second", Some(0));
+        let before = manager.tasks().to_vec();
+        let binding =
+            super::task_terminal_binding(manager.get(ids[1]).unwrap(), TaskTerminalRole::Agent);
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [
+                    ("terminal-first".into(), 11),
+                    ("terminal-second".into(), 22)
+                ]
+            ),
+            Some(22)
+        );
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [
+                    ("terminal-second".into(), 22),
+                    ("terminal-first".into(), 11)
+                ]
+            ),
+            Some(22)
+        );
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [("replacement".into(), 22), ("terminal-first".into(), 11)]
+            ),
+            None
+        );
+        let validation = super::task_terminal_binding(
+            manager.get(ids[1]).unwrap(),
+            TaskTerminalRole::Validation,
+        );
+        assert_eq!(
+            super::resolve_task_terminal(validation, [("validation-second".into(), 33)]),
+            Some(33),
+            "finished validation output stays focusable"
+        );
+        assert!(super::task_focus_allowed(true, Some(ids[1]), ids[1]));
+        assert!(!super::task_focus_allowed(false, Some(ids[1]), ids[1]));
+        assert!(!super::task_focus_allowed(true, Some(ids[0]), ids[1]));
+        assert_eq!(format!("{:?}", manager.tasks()), format!("{before:?}"));
+    }
+
+    #[test]
+    fn dashboard_filter_labels_map_activity_and_finished_counts() {
+        use crate::agent_task::{DashboardCounts, DashboardView};
+        let counts = DashboardCounts {
+            total: 20,
+            attention: 7,
+            running: 9,
+            created: 3,
+            review: 4,
+            done: 2,
+            failed: 5,
+            cancelled: 1,
+            archived: 99,
+            ..Default::default()
+        };
+        for (view, expected) in [
+            (DashboardView::All, "All 20"),
+            (DashboardView::NeedsAttention, "Needs you 7"),
+            (DashboardView::Running, "Running 9"),
+            (DashboardView::NotStarted, "Not started 3"),
+            (DashboardView::Review, "Review 4"),
+            (DashboardView::Finished, "Finished 8"),
+        ] {
+            assert_eq!(super::dashboard_filter_label(view, &counts), expected);
+        }
+        assert_eq!(
+            super::dashboard_filter_label(DashboardView::Running, &DashboardCounts::default()),
+            "Running 0"
+        );
+    }
+
     #[test]
     fn print_provider_notice_discloses_permissions_without_promising_a_sandbox() {
         use super::{native_start_notice, AgentProvider};
@@ -626,6 +916,64 @@ mod tests {
                 .unwrap();
             assert!(body.contains("retire_panel_callbacks()"));
         }
+    }
+
+    #[test]
+    fn dashboard_submit_selects_filtered_identity_without_changing_tasks() {
+        use crate::agent_task::{
+            DashboardFilter, DashboardSnapshot, DashboardView, NewTask, TaskManager,
+        };
+        let mut manager = TaskManager::new();
+        let mut ids = Vec::new();
+        for title in ["first", "review"] {
+            ids.push(
+                manager
+                    .create(NewTask {
+                        title: title.into(),
+                        provider: AgentProvider::Codex,
+                        repo_root: "/fixture".into(),
+                        worktree_path: "/fixture/worktree".into(),
+                        branch: "test/dashboard".into(),
+                        base_commit: "a".repeat(40),
+                        source_context: None,
+                    })
+                    .unwrap(),
+            );
+        }
+        let before: Vec<_> = manager
+            .tasks()
+            .iter()
+            .map(|task| (task.id, task.status, task.title.clone()))
+            .collect();
+        let mut panel = TaskPanel::new();
+        panel.select(Some(ids[0]));
+        panel.dashboard_query = "review".into();
+        let filtered = DashboardSnapshot::project(
+            manager.tasks(),
+            |_| Default::default(),
+            DashboardFilter {
+                text: &panel.dashboard_query,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            panel.selected,
+            Some(ids[0]),
+            "typing must not move selection"
+        );
+        panel.open_dashboard_result(&filtered);
+        assert_eq!(panel.selected, Some(ids[1]));
+        let empty = DashboardSnapshot::filter_rows(&filtered.rows, "missing", DashboardView::All);
+        panel.open_dashboard_result(&empty);
+        assert_eq!(panel.selected, Some(ids[1]), "empty results keep selection");
+        assert_eq!(
+            manager
+                .tasks()
+                .iter()
+                .map(|task| (task.id, task.status, task.title.clone()))
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     #[test]

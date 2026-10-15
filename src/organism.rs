@@ -272,7 +272,54 @@ pub struct PreviewPresentation {
     pub hello: HelloAvailability,
 }
 
+/// Content-free lifecycle edge detector. Disabled observers still advance their
+/// baseline, so enabling a companion never replays an old Agent reward.
+#[derive(Debug, Default)]
+struct AgentPulseTracker {
+    present: bool,
+    last: Option<jterm_core::organism::AgentPulse>,
+}
+
+impl AgentPulseTracker {
+    fn observe(
+        &mut self,
+        state: Option<jterm_core::agent::AgentState>,
+        busy: bool,
+        enabled: bool,
+    ) -> Option<jterm_core::organism::AgentPulse> {
+        let present = state.is_some();
+        let pulse = state.and_then(|state| jterm_core::organism::agent_state_pulse(state, busy));
+        let pulse = if !present && self.present {
+            Some(jterm_core::organism::AgentPulse::Gone)
+        } else {
+            pulse
+        };
+        let changed = pulse != self.last;
+        self.present = present;
+        // Preserve Gone across an absent session to avoid replaying a close.
+        if present || pulse.is_some() {
+            self.last = pulse;
+        }
+        if enabled && changed {
+            pulse
+        } else {
+            None
+        }
+    }
+}
+
+/// Facts from one already validated terminal completion. Agent attribution is
+/// supplied only by the terminal's local one-shot approval generation.
+pub struct CommandCompletion<'a> {
+    pub command: &'a str,
+    pub exit: Option<i32>,
+    pub duration: Option<u64>,
+    pub cwd: Option<&'a str>,
+    pub agent_driven: bool,
+}
+
 pub struct Organism {
+    agent_pulses: AgentPulseTracker,
     enabled: bool,
     sessions: HashMap<usize, SessionLife>,
     born: Instant,
@@ -293,6 +340,7 @@ impl Default for Organism {
     fn default() -> Self {
         let now = Instant::now();
         Self {
+            agent_pulses: Default::default(),
             enabled: false,
             sessions: HashMap::new(),
             born: now,
@@ -311,6 +359,13 @@ impl Default for Organism {
 }
 
 impl Organism {
+    pub fn observe_agent(&mut self, state: Option<jterm_core::agent::AgentState>, busy: bool) {
+        if let Some(pulse) = self.agent_pulses.observe(state, busy, self.enabled) {
+            self.life
+                .replace_state(jterm_core::organism::agent_pulse(self.life.state(), pulse));
+        }
+    }
+
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.enabled != enabled {
             self.sessions.clear();
@@ -382,7 +437,12 @@ impl Organism {
 
     /// Called only from the existing completion drain, never by frame timers.
     /// No command text is retained, logged, sent, or persisted by this adapter.
-    pub fn completed(
+    pub fn completed_event(&mut self, id: usize, event: CommandCompletion<'_>) {
+        self.completed_event_at(id, event, self.born.elapsed());
+    }
+
+    #[cfg(test)]
+    fn completed(
         &mut self,
         id: usize,
         command: &str,
@@ -400,6 +460,7 @@ impl Organism {
         );
     }
 
+    #[cfg(test)]
     fn completed_at(
         &mut self,
         id: usize,
@@ -409,6 +470,27 @@ impl Organism {
         command_cwd: Option<&str>,
         now: Duration,
     ) {
+        self.completed_event_at(
+            id,
+            CommandCompletion {
+                command,
+                exit,
+                duration,
+                cwd: command_cwd,
+                agent_driven: false,
+            },
+            now,
+        );
+    }
+
+    fn completed_event_at(&mut self, id: usize, event: CommandCompletion<'_>, now: Duration) {
+        let CommandCompletion {
+            command,
+            exit,
+            duration,
+            cwd: command_cwd,
+            agent_driven,
+        } = event;
         self.watch.retire_owner(id);
         if !self.enabled {
             return;
@@ -428,6 +510,7 @@ impl Organism {
         self.live_attention.cancel(&id);
         life.set_work_context(command_cwd);
         life.native.sync_state(self.life.state());
+        life.native.set_agent_command(agent_driven);
         let reaction = life
             .native
             .command_finished(classify_command(command), exit, duration);
@@ -1154,6 +1237,53 @@ impl Organism {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_lifecycle_edges_are_deduplicated_and_disabled_edges_are_consumed() {
+        use jterm_core::agent::AgentState;
+        use jterm_core::organism::AgentPulse;
+        let mut tracker = AgentPulseTracker::default();
+        assert_eq!(tracker.observe(None, false, true), None);
+        assert_eq!(tracker.observe(Some(AgentState::Ready), false, true), None);
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), true, true),
+            Some(AgentPulse::Working)
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), true, true),
+            None
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), false, true),
+            Some(AgentPulse::Finished)
+        );
+        assert_eq!(tracker.observe(Some(AgentState::Ready), false, true), None);
+        assert_eq!(
+            tracker.observe(Some(AgentState::Completed), false, true),
+            Some(AgentPulse::Finished)
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::Cancelled), false, true),
+            Some(AgentPulse::Gone)
+        );
+        assert_eq!(tracker.observe(None, false, true), None);
+        assert_eq!(tracker.observe(None, false, true), None);
+        assert_eq!(
+            tracker.observe(Some(AgentState::AwaitingModel), false, false),
+            None
+        );
+        assert_eq!(
+            tracker.observe(Some(AgentState::AwaitingModel), false, true),
+            None
+        );
+        assert_eq!(tracker.observe(None, false, true), Some(AgentPulse::Gone));
+        assert_eq!(tracker.observe(None, false, true), None);
+        let mut first = AgentPulseTracker::default();
+        assert_eq!(
+            first.observe(Some(AgentState::Cancelled), false, true),
+            Some(AgentPulse::Gone)
+        );
+    }
 
     // Native-fact fixtures delegate to the real shared controller. They contain
     // no dwell/hold/cooldown policy; host integration trajectories stay here.
@@ -2914,6 +3044,82 @@ mod tests {
             organism.batch_finished(id, false);
         }
         organism
+    }
+
+    #[test]
+    fn local_agent_completions_keep_recovery_quiet_without_claiming_later_human_work() {
+        let mut terminal = crate::terminal::TerminalState::new(80, 24);
+        let mut organism = completion_fixture(&[1]);
+        for (step, (generation, exit)) in [
+            (Some(1), 101),
+            (Some(2), 101),
+            (Some(3), 101),
+            (Some(4), 0),
+            (None, 101),
+            (None, 101),
+            (None, 101),
+            (None, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            terminal.process_batch(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            if let Some(generation) = generation {
+                terminal
+                    .arm_agent_execution(generation, "cargo test")
+                    .unwrap();
+            }
+            terminal.process_batch(format!(
+                "cargo test\r\n\x1b]133;C;cmdline_url=cargo%20test;cwd=/project\x07\x1b]133;D;{exit};duration_ms=100\x07"
+            ).as_bytes());
+            let completed = terminal.take_completed_commands();
+            assert_eq!(completed.len(), 1);
+            let completed = &completed[0];
+            assert_eq!(completed.agent_generation, generation);
+            let confidence = organism.life.state().confidence;
+            organism.completed_event(
+                1,
+                CommandCompletion {
+                    command: &completed.command,
+                    exit: completed.exit_code,
+                    duration: completed.duration_ms,
+                    cwd: completed.command_cwd.as_deref(),
+                    agent_driven: completed.agent_generation.is_some(),
+                },
+            );
+            if generation.is_some() && exit != 0 {
+                assert_eq!(organism.life.state().confidence, confidence);
+            } else if exit != 0 {
+                assert!(organism.life.state().confidence < confidence);
+            }
+            if step == 3 {
+                assert_eq!(organism.sessions[&1].context.behavior, Behavior::Celebrate);
+            } else if step == 7 {
+                assert_eq!(
+                    organism.sessions[&1].context.behavior,
+                    Behavior::CelebrateBig
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_completion_without_authoritative_outcome_stays_unknown() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed_event(
+            1,
+            CommandCompletion {
+                command: "cargo test",
+                exit: None,
+                duration: Some(60_000),
+                cwd: Some("/project"),
+                agent_driven: true,
+            },
+        );
+        assert_eq!(
+            organism.sessions[&1].context.behavior,
+            Behavior::UnknownOutcome
+        );
     }
 
     #[test]
