@@ -24,6 +24,7 @@ mod command_palette;
 mod config;
 mod config_retry;
 mod debug;
+mod fold_preview;
 mod history_picker;
 mod image_drop;
 mod keybindings;
@@ -22545,6 +22546,7 @@ impl Frost {
             }) = sess.projection.row_kinds().get(view_row)
             {
                 row.header_end_col = 0;
+                row.output_preview = zone.output_preview.clone();
                 row.collapsed_summary = Some(terminal_view::CollapsedSummaryPaint {
                     key: *key,
                     hidden_display_rows: *hidden_display_rows,
@@ -35304,6 +35306,7 @@ mod tests {
             cwd: None,
             captured_output: None,
             captured_output_evicted: false,
+            output_preview: String::new(),
             start_mark_seen: true,
             completion_provenance: block_mode::CompletionProvenance::ShellReported,
             rows_evicted: false,

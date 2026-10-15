@@ -2811,6 +2811,8 @@ pub struct CommandZone {
     /// `None` once the [`TerminalState::MAX_CAPTURED_OUTPUT_BYTES`] budget
     /// evicted it, in which case live extraction is the fallback.
     pub captured_output: Option<(String, bool)>,
+    /// Display-only bounded preview, cached with this stable finalized zone.
+    pub output_preview: String,
     /// A non-blank [`Self::captured_output`] snapshot was actually discarded
     /// by the aggregate byte budget. Scrollback trimming does not set this:
     /// retained snapshots remain authoritative after their live rows vanish.
@@ -5199,6 +5201,7 @@ impl TerminalState {
                         output_start_col,
                     ),
                     captured_output_evicted: false,
+                    output_preview: String::new(),
                     start_mark_seen: true,
                     completion_provenance: crate::block_mode::CompletionProvenance::ShellReported,
                     rows_evicted: false,
@@ -5288,6 +5291,12 @@ impl TerminalState {
             log::error!("OSC 133 block id space exhausted; dropping finalized block");
             return;
         };
+        zone.output_preview = zone
+            .captured_output
+            .as_ref()
+            .map_or_else(String::new, |(text, _)| {
+                crate::fold_preview::from_plain(text)
+            });
         zone.id = self.next_zone_id;
         self.next_zone_id = next_zone_id;
         if let Some(provenance) = provenance.as_mut() {
@@ -5333,6 +5342,7 @@ impl TerminalState {
             if let Some((text, _)) = zone.captured_output.take() {
                 self.captured_output_bytes = self.captured_output_bytes.saturating_sub(text.len());
                 zone.captured_output_evicted = true;
+                zone.output_preview.clear();
             }
         }
     }
@@ -5562,6 +5572,7 @@ impl TerminalState {
                 cwd,
                 captured_output: Some(captured_output),
                 captured_output_evicted: false,
+                output_preview: String::new(),
                 start_mark_seen: false,
                 completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
                 rows_evicted,
@@ -5633,6 +5644,7 @@ impl TerminalState {
             cwd,
             captured_output: self.capture_zone_output(out_start, output_end, output_start_col),
             captured_output_evicted: false,
+            output_preview: String::new(),
             start_mark_seen: true,
             completion_provenance: crate::block_mode::CompletionProvenance::BoundaryInferred,
             rows_evicted: false,
@@ -22284,6 +22296,45 @@ mod block_spacing_tests {
             .as_bytes(),
         );
         terminal
+    }
+
+    #[test]
+    fn collapsed_preview_uses_finalized_zone_identity_and_retires_with_capture() {
+        let mut terminal = fixture(80, 16);
+        assert_eq!(terminal.command_zones[0].output_preview, "LEFT中");
+        assert_eq!(terminal.command_zones[1].output_preview, "RIGHT");
+        let first = terminal.command_zones[0].id;
+        let mut policy = ProjectionPolicy::new();
+        assert!(policy.collapse(first));
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let key = view
+            .row_kinds()
+            .iter()
+            .find_map(|kind| match kind {
+                ProjectedRowKind::CollapsedSummary { key, .. } => Some(*key),
+                _ => None,
+            })
+            .expect("real collapsed summary");
+        assert_eq!(key.zone_id, first);
+        assert_eq!(
+            terminal.zone_by_id(key.zone_id).unwrap().output_preview,
+            "LEFT中"
+        );
+        terminal.enforce_captured_output_budget(0);
+        assert!(terminal
+            .zone_by_id(first)
+            .unwrap()
+            .captured_output
+            .is_none());
+        assert!(terminal
+            .zone_by_id(first)
+            .unwrap()
+            .output_preview
+            .is_empty());
+        assert_eq!(
+            terminal.command_zones.back().unwrap().output_preview,
+            "RIGHT"
+        );
     }
 
     fn normal() -> ProjectionPolicy {

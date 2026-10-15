@@ -421,6 +421,8 @@ pub struct BlockPaintRow {
     /// Host-owned collapse affordance. Summary rows never participate in
     /// links, terminal text selection, cursor placement, or app mouse mode.
     pub collapsed_summary: Option<CollapsedSummaryPaint>,
+    /// Already bounded and sanitized finalized-output preview.
+    pub output_preview: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4117,10 +4119,18 @@ where
                 .get(row_idx)
                 .and_then(|block| block.collapsed_summary)
             {
-                let content = format!(
+                let mut content = format!(
                     "▸ {} output rows hidden — click to expand",
                     summary.hidden_display_rows
                 );
+                if let Some(block) = self
+                    .blocks
+                    .get(row_idx)
+                    .filter(|block| !block.output_preview.is_empty())
+                {
+                    content.push_str("  Preview: ");
+                    content.push_str(&block.output_preview);
+                }
                 let text_left = ox + cw;
                 let text_right = scrollbar_track_left - 8.0;
                 if let Some(label_clip) = summary_label_clip(clip, text_left, text_right) {
