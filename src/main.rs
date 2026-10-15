@@ -49,6 +49,7 @@ mod sidebar;
 mod terminal;
 mod terminal_view;
 mod theme;
+mod ui_typography;
 mod widget_identity_scope;
 mod workflow_focus;
 mod workflow_picker;
@@ -159,8 +160,13 @@ const RESIZE_CORNER: f32 = 12.0;
 
 /// Vertical chrome around the terminal area: the always-present tab bar plus
 /// the bottom bar when the `bottom_bar` toggle is on.
-fn chrome_height(bottom_bar: bool) -> f32 {
-    TAB_BAR_H + if bottom_bar { STATUS_BAR_H } else { 0.0 }
+fn chrome_height(font_size: f32, bottom_bar: bool) -> f32 {
+    ui_typography::row_height(font_size, TAB_BAR_H, 14.0)
+        + if bottom_bar {
+            ui_typography::row_height(font_size, STATUS_BAR_H, 4.0)
+        } else {
+            0.0
+        }
 }
 
 const COMPANION_BODY_WIDTH: f32 = 200.0;
@@ -196,7 +202,7 @@ fn native_status_rows(enabled: bool, expanded: bool, cell_height: f32) -> usize 
     if !expanded {
         return 1;
     }
-    ((3.0 * cell_height * 0.82 + 22.0) / cell_height.max(1.0))
+    ((3.0 * cell_height + 28.0) / cell_height.max(1.0))
         .ceil()
         .clamp(3.0, 8.0) as usize
 }
@@ -375,11 +381,13 @@ fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f3
 
 fn terminal_height_after_chrome(
     window_height: f32,
+    font_size: f32,
     bottom_bar: bool,
     reading_bar_height: f32,
     companion_height: f32,
 ) -> f32 {
-    (window_height - chrome_height(bottom_bar) - reading_bar_height - companion_height).max(0.0)
+    (window_height - chrome_height(font_size, bottom_bar) - reading_bar_height - companion_height)
+        .max(0.0)
 }
 
 /// Whether an existing block selection may consume plain navigation/Enter.
@@ -6202,7 +6210,7 @@ impl Frost {
         let mono = resolve_mono_font(&config.font_family);
         let metrics = Metrics::with_font(
             mono,
-            config.font_size,
+            Config::clamp_font_size(config.font_size),
             config.line_spacing,
             config.padding,
             config.is_card_mode(),
@@ -6474,6 +6482,26 @@ impl Frost {
 
     fn effective_font_size(&self) -> f32 {
         Config::clamp_font_size(self.config.font_size)
+    }
+
+    fn tab_bar_height(&self) -> f32 {
+        ui_typography::row_height(self.effective_font_size(), TAB_BAR_H, 14.0)
+    }
+
+    fn status_bar_height(&self) -> f32 {
+        ui_typography::row_height(self.effective_font_size(), STATUS_BAR_H, 4.0)
+    }
+
+    fn pane_header_height(&self) -> f32 {
+        ui_typography::row_height(self.effective_font_size(), PANE_HEADER_H, 4.0)
+    }
+
+    fn sidebar_row_height(&self) -> f32 {
+        ui_typography::row_height(
+            self.effective_font_size(),
+            sidebar::SIDEBAR_TREE_ROW_HEIGHT,
+            8.0,
+        )
     }
 
     fn set_config_panel_open(&mut self, open: bool) {
@@ -7906,6 +7934,7 @@ impl Frost {
             self.sidebar_tree_offset_y,
             self.sidebar_tree_viewport_h,
             items.len(),
+            self.sidebar_row_height(),
         );
         self.sidebar_tree_offset_y = offset;
         iced::widget::operation::scroll_to(
@@ -8154,30 +8183,40 @@ impl Frost {
     /// content.
     fn block_reading_bar_height(&self) -> f32 {
         if !self.config.is_block_mode() {
-            0.0
-        } else if self.term_width() < 220.0 {
+            return 0.0;
+        }
+        let scale = (self.effective_font_size() / 11.0).max(1.0);
+        let logical_width = self.term_width() / scale;
+        let height = if logical_width < 220.0 {
             116.0
-        } else if self.term_width() < 430.0 {
+        } else if logical_width < 430.0 {
             90.0
         } else {
             64.0
-        }
+        };
+        height * scale
     }
 
     fn organism_strip_height(&self) -> f32 {
         if self.config.is_card_mode() {
             return 0.0;
         }
-        companion_strip_height(
+        let base = companion_strip_height(
             self.config.ascii_organism_enabled,
             self.config.ascii_organism_expanded,
             self.config.bottom_bar,
-        )
+        );
+        if base > 0.0 {
+            base.max(self.effective_font_size() * 4.0 + 16.0)
+        } else {
+            0.0
+        }
     }
 
     fn term_height(&self) -> f32 {
         terminal_height_after_chrome(
             self.win_size.height,
+            self.effective_font_size(),
             self.config.bottom_bar,
             self.block_reading_bar_height(),
             self.organism_strip_height(),
@@ -9648,7 +9687,7 @@ impl Frost {
                     // The header strip sits inside the pane rect, above the
                     // grid. Charging the PTY for those pixels would make the
                     // shell believe it has one row more than it can show.
-                    let h = (pane.rect.height - PANE_HEADER_H).max(0.0);
+                    let h = (pane.rect.height - self.pane_header_height()).max(0.0);
                     targets[pane.session] = self.metrics.grid_size(w, h);
                 }
             }
@@ -19076,7 +19115,7 @@ impl Frost {
         let mut tabs = row![].spacing(2).padding(2);
         // Sidebar/dock toggle button at the far left of the tab bar.
         tabs = tabs.push(
-            button(text("☰").size(13))
+            button(text("☰").size(self.effective_font_size()))
                 .on_press(Message::ToggleSidebar)
                 .padding([3, 8])
                 .style(self.tab_btn_style(self.sidebar_open)),
@@ -19085,7 +19124,7 @@ impl Frost {
         // the dock toggle plus a button to move tabs back to the top.
         if self.config.tab_position == config::TabPosition::Side {
             tabs = tabs.push(
-                button(text("▔").size(13))
+                button(text("▔").size(self.effective_font_size()))
                     .on_press(Message::SetTabPosition(config::TabPosition::Top))
                     .padding([3, 8])
                     .style(self.ghost_btn_style()),
@@ -19101,7 +19140,7 @@ impl Frost {
         }
         // Dock the tab strip into the left sidebar (vertical tab list).
         tabs = tabs.push(
-            button(text("◧").size(13))
+            button(text("◧").size(self.effective_font_size()))
                 .on_press(Message::SetTabPosition(config::TabPosition::Side))
                 .padding([3, 8])
                 .style(self.ghost_btn_style()),
@@ -19123,7 +19162,7 @@ impl Frost {
             let hovered = self.hovered_tab == Some(id);
             let dragging_this = self.dragging_tab == Some(id);
             let label = format!("{}{label}", self.tab_state_prefix(i));
-            let tab_label = container(text(label).size(13)).padding([3, 8]);
+            let tab_label = container(text(label).size(self.effective_font_size())).padding([3, 8]);
             // Drag press/release lives on the label so a press on the close
             // button never starts a tab drag. Right-click opens the context menu.
             let tab: Element<'_, Message> = mouse_area(tab_label)
@@ -19136,7 +19175,7 @@ impl Frost {
             // jump when hovered.
             let show_close = active || hovered;
             let close: Element<'_, Message> = if show_close {
-                button(text("×").size(13))
+                button(text("×").size(self.effective_font_size()))
                     .on_press(Message::CloseTab(id))
                     .padding([3, 6])
                     .style(self.tab_close_btn_style())
@@ -19155,7 +19194,7 @@ impl Frost {
             );
         }
         tabs = tabs.push(
-            button(text("+").size(13))
+            button(text("+").size(self.effective_font_size()))
                 .on_press(Message::NewSession)
                 .padding([3, 8])
                 .style(self.ghost_btn_style()),
@@ -19205,12 +19244,12 @@ impl Frost {
     /// drag-to-move.
     fn top_bar_with_close<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
         let window_btn = |glyph: &str, msg: Message| {
-            button(text(glyph.to_string()).size(13))
+            button(text(glyph.to_string()).size(self.effective_font_size()))
                 .on_press(msg)
                 .padding([3, 9])
                 .style(self.ghost_btn_style())
         };
-        let close = button(text("×").size(14))
+        let close = button(text("×").size(self.effective_font_size()))
             .on_press(Message::WindowClose)
             .padding([3, 9])
             .style(self.close_btn_style());
@@ -19222,12 +19261,19 @@ impl Frost {
             } else {
                 block_mode::running_badge_text(elapsed)
             };
-            bar = bar.push(text(label).size(11).color(self.c_text_dim()));
+            bar = bar.push(
+                text(label)
+                    .size(self.effective_font_size())
+                    .color(self.c_text_dim()),
+            );
             let session = &self.sessions[self.active];
             let token = session
                 .enabled_chat_control(chat_mode::ControlKind::Interrupt, self.chat_input_ready(id));
-            let stop = container(text(if token.is_some() { "Stop" } else { "Ctrl+C" }).size(11))
-                .padding([3, 7]);
+            let stop = container(
+                text(if token.is_some() { "Stop" } else { "Ctrl+C" })
+                    .size(self.effective_font_size()),
+            )
+            .padding([3, 7]);
             bar = bar.push(chat_mode::press_control(
                 stop,
                 token.map(Message::ChatInterrupt),
@@ -19242,7 +19288,7 @@ impl Frost {
             bar = bar.push(
                 container(
                     text(self.title())
-                        .size(13)
+                        .size(self.effective_font_size())
                         .wrapping(text::Wrapping::None)
                         .style(text::secondary),
                 )
@@ -19265,7 +19311,7 @@ impl Frost {
             .on_double_click(Message::WindowToggleMaximize);
         container(bar)
             .width(Length::Fill)
-            .height(Length::Fixed(TAB_BAR_H))
+            .height(Length::Fixed(self.tab_bar_height()))
             .style(self.chrome_bar_style())
             .into()
     }
@@ -19425,7 +19471,7 @@ impl Frost {
             rows,
             iced::Size::new(
                 (self.win_size.width - EDGE_GAP * 2.0).max(1.0),
-                (self.win_size.height - TAB_BAR_H - EDGE_GAP * 2.0).max(1.0),
+                (self.win_size.height - self.tab_bar_height() - EDGE_GAP * 2.0).max(1.0),
             ),
         );
         let x = self
@@ -19437,7 +19483,7 @@ impl Frost {
             .tab_menu_at
             .y
             .min(self.win_size.height - size.height - EDGE_GAP)
-            .max(TAB_BAR_H + EDGE_GAP);
+            .max(self.tab_bar_height() + EDGE_GAP);
 
         let panel = container(scrollable(menu).height(Length::Shrink))
             .width(Length::Fixed(size.width))
@@ -19535,7 +19581,7 @@ impl Frost {
             action_rows,
             iced::Size::new(
                 (self.win_size.width - EDGE_GAP * 2.0).max(1.0),
-                (self.win_size.height - TAB_BAR_H - EDGE_GAP * 2.0).max(1.0),
+                (self.win_size.height - self.tab_bar_height() - EDGE_GAP * 2.0).max(1.0),
             ),
         );
         let x = state
@@ -19547,7 +19593,7 @@ impl Frost {
             .at
             .y
             .min(self.win_size.height - size.height - EDGE_GAP)
-            .max(TAB_BAR_H + EDGE_GAP);
+            .max(self.tab_bar_height() + EDGE_GAP);
         let panel = container(scrollable(menu).height(Length::Shrink))
             .width(Length::Fixed(size.width))
             .max_height(size.height)
@@ -19826,7 +19872,7 @@ impl Frost {
                 },
                 ..Default::default()
             };
-            let body = container(text(t.text.clone()).size(13))
+            let body = container(text(t.text.clone()).size(self.effective_font_size()))
                 .padding([6, 12])
                 .style(style);
             let clickable = mouse_area(body).on_press(Message::ToastDismiss(idx));
@@ -19834,7 +19880,7 @@ impl Frost {
         }
         // Sit just above the bottom bar — or the window edge when it's off.
         let bottom = if self.config.bottom_bar {
-            STATUS_BAR_H + self.organism_strip_height() + 12.0
+            self.status_bar_height() + self.organism_strip_height() + 12.0
         } else {
             12.0
         };
@@ -19849,19 +19895,19 @@ impl Frost {
     /// visible until the user fixes the underlying file (or explicitly resets
     /// the main config), so a fallback can never look like a successful load.
     fn diagnostics_overlay(&self) -> Element<'_, Message> {
-        let mut content = column![text("frost needs attention").size(13)]
+        let mut content = column![text("frost needs attention").size(self.effective_font_size())]
             .spacing(4)
             .width(Length::Fill);
         if let Some(error) = &self.config_diagnostic {
             content = content.push(
                 text(crate::review_text::bound_diagnostic_text(error))
-                    .size(11)
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
                     .style(text::warning),
             );
             content = content.push(
                 text("Auto-save is paused to preserve the file. Fix it externally or use Reset.")
-                    .size(10)
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
                     .style(text::secondary),
             );
@@ -19869,7 +19915,7 @@ impl Frost {
         if let Some(error) = &self.session_diagnostic {
             content = content.push(
                 text(crate::review_text::bound_diagnostic_text(error))
-                    .size(11)
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
                     .style(text::danger),
             );
@@ -19877,7 +19923,7 @@ impl Frost {
         for diagnostic in self.keybindings_diagnostics.iter().take(3) {
             content = content.push(
                 text(crate::review_text::bound_diagnostic_text(diagnostic))
-                    .size(11)
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
                     .style(text::warning),
             );
@@ -19888,7 +19934,7 @@ impl Frost {
                     "…and {} more keybinding issue(s)",
                     self.keybindings_diagnostics.len() - 3
                 ))
-                .size(10)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
         }
@@ -20270,7 +20316,8 @@ impl Frost {
         for (index, arg) in form.workflow().args.iter().enumerate() {
             let name = crate::workflow_picker::bound_workflow_feedback(&arg.name);
             // The first field has a stable focus id; Tab traverses the rest.
-            let input = workflow_argument_input(form.identity(), index, &name, form.value(index));
+            let input = workflow_argument_input(form.identity(), index, &name, form.value(index))
+                .size(self.effective_font_size());
             let label = crate::workflow_picker::bound_workflow_arg_label(
                 &arg.name,
                 &arg.description,
@@ -20572,7 +20619,7 @@ impl Frost {
     fn block_search_view(&self, state: &BlockSearchState) -> Element<'_, Message> {
         let panel_size = block_search_layout::panel_size(self.win_size);
         let compact = block_search_layout::compact(panel_size);
-        let case_toggle = button(text("Aa").size(11))
+        let case_toggle = button(text("Aa").size(self.effective_font_size()))
             .on_press(Message::BlockSearchSetCaseSensitive(!state.case_sensitive))
             .padding([3, 7])
             .style(if state.case_sensitive {
@@ -20580,7 +20627,7 @@ impl Frost {
             } else {
                 button::secondary
             });
-        let regex_toggle = button(text(".*").size(11))
+        let regex_toggle = button(text(".*").size(self.effective_font_size()))
             .on_press(Message::BlockSearchSetRegex(!state.regex))
             .padding([3, 7])
             .style(if state.regex {
@@ -20588,7 +20635,7 @@ impl Frost {
             } else {
                 button::secondary
             });
-        let whole_word_toggle = button(text("W").size(11))
+        let whole_word_toggle = button(text("W").size(self.effective_font_size()))
             .on_press(Message::BlockSearchSetWholeWord(!state.whole_word))
             .padding([3, 7])
             .style(if state.whole_word {
@@ -20596,18 +20643,21 @@ impl Frost {
             } else {
                 button::secondary
             });
-        let reset = button(text("Reset").size(11))
+        let reset = button(text("Reset").size(self.effective_font_size()))
             .on_press(Message::BlockSearchReset)
             .padding([3, 7])
             .style(button::secondary);
         let refresh = tooltip(
-            button(text("Refresh").size(11))
+            button(text("Refresh").size(self.effective_font_size()))
                 .on_press(Message::BlockSearchRefresh)
                 .padding([3, 7])
                 .style(button::secondary),
-            container(text("Rebuild the index from the latest completed blocks (F5)").size(11))
-                .padding(6)
-                .style(container::rounded_box),
+            container(
+                text("Rebuild the index from the latest completed blocks (F5)")
+                    .size(self.effective_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
         // The query stays fixed even when a short window scrolls the controls,
@@ -20615,11 +20665,11 @@ impl Frost {
         // below the former 280 px panel minimum, without shrinking the input.
         let query_line = || {
             row![
-                text("⌕").size(16),
+                text("⌕").size(self.effective_font_size()),
                 text_input("Search command blocks…", &state.query)
                     .id(BLOCK_SEARCH_INPUT_ID.clone())
                     .on_input(Message::BlockSearchInput)
-                    .size(14)
+                    .size(self.effective_font_size())
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -20629,7 +20679,7 @@ impl Frost {
             .align_y(iced::Alignment::Center)
             .wrap();
         let scope_btn = |label: &str, scope: block_mode::BlockSearchScope| {
-            button(text(label.to_string()).size(11))
+            button(text(label.to_string()).size(self.effective_font_size()))
                 .on_press(Message::BlockSearchSetScope(scope))
                 .padding([3, 7])
                 .style(if state.scope == scope {
@@ -20639,7 +20689,7 @@ impl Frost {
                 })
         };
         let scopes = row![
-            text("Scope").size(11),
+            text("Scope").size(self.effective_font_size()),
             scope_btn("All", block_mode::BlockSearchScope::All),
             scope_btn("Cmd", block_mode::BlockSearchScope::Command),
             scope_btn("Out", block_mode::BlockSearchScope::Output),
@@ -20647,7 +20697,7 @@ impl Frost {
         .spacing(4)
         .align_y(iced::Alignment::Center);
         let filter_btn = |label: &str, filter: BlockSearchFilter| {
-            button(text(label.to_string()).size(11))
+            button(text(label.to_string()).size(self.effective_font_size()))
                 .on_press(Message::BlockSearchSetFilter(filter))
                 .padding([3, 7])
                 .style(if state.filter == filter {
@@ -20724,14 +20774,18 @@ impl Frost {
         .spacing(8);
         if state.loading && state.hits.is_empty() {
             body = body.push(
-                container(text("Indexing blocks…").size(13).style(text::secondary))
-                    .id(block_search_layout::FEEDBACK_ID),
+                container(
+                    text("Indexing blocks…")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
             );
         } else if let Some(error) = &state.query_error {
             body = body.push(
                 container(
                     text(crate::review_text::bound_query_error(error))
-                        .size(12)
+                        .size(self.effective_font_size())
                         .style(text::danger),
                 )
                 .id(block_search_layout::FEEDBACK_ID),
@@ -20744,7 +20798,7 @@ impl Frost {
                      reports commands (OSC 133); run \"Install or update jsh\" from the \
                      command palette",
                     )
-                    .size(13)
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
                     .style(text::secondary),
                 )
@@ -20757,8 +20811,12 @@ impl Frost {
                 "Type to search, or choose a filter to browse blocks"
             };
             body = body.push(
-                container(text(hint).size(13).style(text::secondary))
-                    .id(block_search_layout::FEEDBACK_ID),
+                container(
+                    text(hint)
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
             );
         } else if state.hits.is_empty() {
             let has_bookmarked_indexed_text = block_search_bookmarks_have_indexed_text(
@@ -20775,8 +20833,12 @@ impl Frost {
                 state.older_not_indexed,
             );
             body = body.push(
-                container(text(empty).size(13).style(text::secondary))
-                    .id(block_search_layout::FEEDBACK_ID),
+                container(
+                    text(empty)
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                )
+                .id(block_search_layout::FEEDBACK_ID),
             );
         } else {
             // A rebuild in flight leaves the previous hits on screen so the
@@ -20788,7 +20850,7 @@ impl Frost {
                 } else {
                     state.count_label()
                 })
-                .size(12)
+                .size(self.effective_font_size())
                 .style(if state.loading {
                     text::warning
                 } else {
@@ -20828,7 +20890,7 @@ impl Frost {
                 }
                 let info = column![
                     text(block_mode::display_block_search_text(&hit.line_text))
-                        .size(13)
+                        .size(self.effective_font_size())
                         .wrapping(text::Wrapping::None)
                         .style(if stale {
                             text::secondary
@@ -20836,7 +20898,7 @@ impl Frost {
                             text::default
                         }),
                     text(block_mode::display_block_search_text(&context))
-                        .size(11)
+                        .size(self.effective_font_size())
                         .wrapping(text::Wrapping::None)
                         .style(text::secondary),
                 ]
@@ -20844,10 +20906,12 @@ impl Frost {
                 .width(Length::Fill);
                 let bookmarked = bookmarked_zone_ids.contains(&hit.zone_id);
                 let bookmark_help = block_search_bookmark_button_help(bookmarked, stale);
-                let bookmark_button =
-                    button(text(block_search_bookmark_button_text(bookmarked)).size(12))
-                        .padding([5, 8])
-                        .style(button::text);
+                let bookmark_button = button(
+                    text(block_search_bookmark_button_text(bookmarked))
+                        .size(self.effective_font_size()),
+                )
+                .padding([5, 8])
+                .style(button::text);
                 let bookmark_button = if stale {
                     bookmark_button
                 } else {
@@ -20855,7 +20919,7 @@ impl Frost {
                 };
                 let bookmark_button = tooltip(
                     bookmark_button,
-                    container(text(bookmark_help).size(11))
+                    container(text(bookmark_help).size(self.effective_font_size()))
                         .padding(6)
                         .style(container::rounded_box),
                     tooltip::Position::Left,
@@ -20909,14 +20973,18 @@ impl Frost {
         // The overlay owns every key while it is open, so the chips and
         // toggles above are otherwise reachable only with the mouse.
         if let Some(notice) = state.bookmark_notice {
-            body = body.push(text(notice.label()).size(11).style(match notice {
-                BlockSearchBookmarkNotice::Busy | BlockSearchBookmarkNotice::Stale => text::warning,
-                _ => text::secondary,
-            }));
+            body = body.push(text(notice.label()).size(self.effective_font_size()).style(
+                match notice {
+                    BlockSearchBookmarkNotice::Busy | BlockSearchBookmarkNotice::Stale => {
+                        text::warning
+                    }
+                    _ => text::secondary,
+                },
+            ));
         }
         body = body.push(
             text(BLOCK_SEARCH_KEYBOARD_HELP)
-                .size(11)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
                 .style(text::secondary),
         );
@@ -20973,7 +21041,7 @@ impl Frost {
         };
         let control = |label: &'static str, message, enabled: bool| {
             let ghost = self.ghost_btn_style();
-            button(text(label).size(11))
+            button(text(label).size(self.effective_font_size()))
                 .on_press_maybe(enabled.then_some(message))
                 .padding([4, 7])
                 .style(move |theme, status| {
@@ -21008,15 +21076,16 @@ impl Frost {
         .wrap();
         let content: Element<'_, Message> = if sess.terminal.is_alt_buffer_active() {
             column![
-                text("Block review paused · alternate screen").size(12),
-                text("Return to the shell to review retained blocks.").size(11)
+                text("Block review paused · alternate screen").size(self.effective_font_size()),
+                text("Return to the shell to review retained blocks.")
+                    .size(self.effective_font_size())
             ]
             .spacing(4)
             .into()
         } else {
             column![
                 row![
-                    text(status).size(11),
+                    text(status).size(self.effective_font_size()),
                     Space::new().width(Length::Fill),
                     control("Go live", Message::BlockGoLive, reading)
                 ]
@@ -21303,20 +21372,21 @@ impl Frost {
                 .sessions
                 .get(self.active)
                 .is_some_and(|sess| sess.terminal.is_bracketed_paste_enabled() == review.bracketed);
-        let mut actions = row![button(text("Close · Esc").size(12))
+        let mut actions = row![button(text("Close · Esc").size(self.effective_font_size()))
             .on_press(Message::BlockReviewClose)
             .style(self.ghost_btn_style())]
         .spacing(8);
         if review.commands.is_some() || review.command_error.is_some() {
             actions = actions.push(
-                button(text("Copy commands").size(12))
+                button(text("Copy commands").size(self.effective_font_size()))
                     .on_press_maybe(valid_commands.then_some(Message::BlockReviewCopy)),
             );
             let blocker = self
                 .sessions
                 .get(self.active)
                 .and_then(|sess| block_prompt_replace_blocker(sess.terminal.agent_prompt_status()));
-            let mut insert = button(text("Insert into prompt · not run").size(12));
+            let mut insert =
+                button(text("Insert into prompt · not run").size(self.effective_font_size()));
             if live && valid_insertion && blocker.is_none() {
                 insert = insert.on_press(Message::BlockReviewInsert);
             }
@@ -21339,10 +21409,12 @@ impl Frost {
             "Read-only snapshot. Copy/export actions remain available from the block menu."
         };
         let panel_size = block_review_panel_size(self.win_size);
-        let title = text(&review.title).size(18);
-        let status = text(status).size(12).wrapping(text::Wrapping::Word);
+        let title = text(&review.title).size(self.effective_font_size());
+        let status = text(status)
+            .size(self.effective_font_size())
+            .wrapping(text::Wrapping::Word);
         let preview = text(&review.body)
-            .size(13)
+            .size(self.effective_font_size())
             .font(iced::Font::MONOSPACE)
             .wrapping(text::Wrapping::Word)
             .width(Length::Fill);
@@ -21638,7 +21710,7 @@ impl Frost {
         }
 
         let panel_width = (self.win_size.width - 12.0).clamp(1.0, 360.0);
-        let panel_height = (self.win_size.height - TAB_BAR_H - 12.0).clamp(1.0, 520.0);
+        let panel_height = (self.win_size.height - self.tab_bar_height() - 12.0).clamp(1.0, 520.0);
         let panel = container(scrollable(body).height(Length::Shrink))
             .width(Length::Fixed(panel_width))
             .max_height(panel_height)
@@ -21654,7 +21726,7 @@ impl Frost {
             state.anchor,
             self.win_size,
             iced::Size::new(panel_width, panel_height),
-            TAB_BAR_H,
+            self.tab_bar_height(),
         );
         let placed = container(panel)
             .align_left(Length::Fill)
@@ -21874,7 +21946,7 @@ impl Frost {
         // One label per segment, colored by its tone — the renderer contract.
         let segment = |seg: &jterm_core::bottom_bar::Segment| {
             text(crate::review_text::bound_toast_text(seg.text.clone()))
-                .size(11)
+                .size(self.effective_font_size())
                 .color(Theme::rgb_to_color32(seg.tone.color(&self.theme)))
         };
         let mut left = row![].spacing(12).align_y(iced::Alignment::Center);
@@ -21916,28 +21988,32 @@ impl Frost {
                 .color(self.c_accent())
                 .into();
             let detail = layout.explanation.then(|| {
-                let mut header = row![text("ASCII organism").size(12).font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..iced::Font::DEFAULT
-                })]
+                let mut header = row![text("ASCII organism")
+                    .size(self.effective_font_size())
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    })]
                 .spacing(8)
                 .align_y(iced::Alignment::Center);
                 // Frost has no persistent organism memory. Keep that boundary
                 // visible without crowding the narrower body-first card.
                 if layout.glyph {
-                    header = header
-                        .push(Space::new().width(Length::Fill))
-                        .push(text("volatile · no LLM").size(10).color(self.c_text_dim()));
+                    header = header.push(Space::new().width(Length::Fill)).push(
+                        text("volatile · no LLM")
+                            .size(self.effective_font_size())
+                            .color(self.c_text_dim()),
+                    );
                 }
                 column![
                     header,
                     container(
                         text(presentation.explanation.clone().into_owned())
-                            .size(11)
-                            .line_height(iced::widget::text::LineHeight::Absolute(16.0.into()))
+                            .size(self.effective_font_size())
+                            .line_height(iced::widget::text::LineHeight::Relative(1.3))
                             .wrapping(text::Wrapping::WordOrGlyph),
                     )
-                    .height(Length::Fixed(32.0))
+                    .height(Length::Fixed(self.effective_font_size() * 2.6))
                     .clip(true),
                 ]
                 .spacing(3)
@@ -22013,7 +22089,7 @@ impl Frost {
                             container(text(sprite).font(iced::Font::MONOSPACE).size(13))
                                 .width(Length::Fixed(200.0))
                                 .height(Length::Fixed(72.0)),
-                            text(explanation.into_owned()).size(11),
+                            text(explanation.into_owned()).size(self.effective_font_size()),
                         ]
                         .spacing(8),
                     )
@@ -22067,7 +22143,7 @@ impl Frost {
         };
         let bar: Element<'_, Message> = container(bar)
             .width(Length::Fill)
-            .height(Length::Fixed(STATUS_BAR_H))
+            .height(Length::Fixed(self.status_bar_height()))
             .padding([0, 10])
             .align_y(iced::Alignment::Center)
             .style(self.chrome_bar_style())
@@ -22084,7 +22160,7 @@ impl Frost {
         let available = self.focused && self.terminal_input_active();
         let toggle = button(text(if expanded { "v" } else { "^" }).size(11))
             .width(Length::Fixed(20.0))
-            .height(Length::Fixed(STATUS_BAR_H))
+            .height(Length::Fixed(self.status_bar_height()))
             .padding(0)
             .on_press_maybe(available.then_some(Message::SetOrganismExpanded(!expanded)))
             .style(self.ghost_btn_style());
@@ -22096,7 +22172,7 @@ impl Frost {
                 } else {
                     "Keep companion expanded"
                 })
-                .size(11),
+                .size(self.effective_font_size()),
                 tooltip::Position::Top,
             )
             .into()
@@ -22116,14 +22192,14 @@ impl Frost {
         let dim = self.c_text_dim();
         let bar = row![
             text(prompt.banner_title())
-                .size(12)
+                .size(self.effective_font_size())
                 .style(move |_t: &iced::Theme| text::Style { color: Some(dim) }),
             Space::new().width(Length::Fill),
-            button(text(prompt.button_label()).size(12))
+            button(text(prompt.button_label()).size(self.effective_font_size()))
                 .on_press(Message::JshInstall)
                 .padding([3, 9])
                 .style(self.ghost_btn_style()),
-            button(text("×").size(12))
+            button(text("×").size(self.effective_font_size()))
                 .on_press(Message::JshNoticeDismiss)
                 .padding([3, 9])
                 .style(self.ghost_btn_style()),
@@ -23005,7 +23081,7 @@ impl Frost {
         // Panel switcher: highlight the active panel.
         let panel_btn = |label: &str, panel: SidebarPanel| {
             let active = self.sidebar_panel == panel;
-            button(text(label.to_string()).size(12))
+            button(text(label.to_string()).size(self.effective_font_size()))
                 .on_press(Message::SetSidebarPanel(panel))
                 .padding([2, 8])
                 .style(self.tab_btn_style(active))
@@ -23031,7 +23107,7 @@ impl Frost {
         } else {
             header
         };
-        let header = container(header).padding([4, 6]);
+        let header = container(header.wrap()).padding([4, 6]);
 
         let panel: Element<'_, Message> = match self.sidebar_panel {
             SidebarPanel::Tabs => self.sidebar_tabs_view(),
@@ -23172,7 +23248,7 @@ impl Frost {
                 .and_then(|n| n.to_str())
                 .unwrap_or("/"),
         );
-        let mut back_button = button(text("←").size(12))
+        let mut back_button = button(text("←").size(self.effective_font_size()))
             .padding([2, 6])
             .style(self.ghost_btn_style());
         if self.sidebar.can_navigate_back() {
@@ -23180,12 +23256,15 @@ impl Frost {
         }
         let back = tooltip(
             back_button,
-            container(text("Back (Alt+Left over Files or while Files focused)").size(11))
-                .padding(6)
-                .style(container::rounded_box),
+            container(
+                text("Back (Alt+Left over Files or while Files focused)")
+                    .size(self.effective_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
-        let mut forward_button = button(text("→").size(12))
+        let mut forward_button = button(text("→").size(self.effective_font_size()))
             .padding([2, 6])
             .style(self.ghost_btn_style());
         if self.sidebar.can_navigate_forward() {
@@ -23193,12 +23272,15 @@ impl Frost {
         }
         let forward = tooltip(
             forward_button,
-            container(text("Forward (Alt+Right over Files or while Files focused)").size(11))
-                .padding(6)
-                .style(container::rounded_box),
+            container(
+                text("Forward (Alt+Right over Files or while Files focused)")
+                    .size(self.effective_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
-        let mut up_button = button(text("↑").size(12))
+        let mut up_button = button(text("↑").size(self.effective_font_size()))
             .padding([2, 6])
             .style(self.ghost_btn_style());
         if self.sidebar.current_dir.parent().is_some() {
@@ -23206,12 +23288,15 @@ impl Frost {
         }
         let up = tooltip(
             up_button,
-            container(text("Parent directory (Alt+Up over Files or while Files focused)").size(11))
-                .padding(6)
-                .style(container::rounded_box),
+            container(
+                text("Parent directory (Alt+Up over Files or while Files focused)")
+                    .size(self.effective_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
-        let mut home_button = button(text("⌂").size(12))
+        let mut home_button = button(text("⌂").size(self.effective_font_size()))
             .padding([2, 6])
             .style(self.ghost_btn_style());
         if self
@@ -23223,23 +23308,26 @@ impl Frost {
         }
         let home = tooltip(
             home_button,
-            container(text("Location home (Alt+Home over Files or while Files focused)").size(11))
-                .padding(6)
-                .style(container::rounded_box),
+            container(
+                text("Location home (Alt+Home over Files or while Files focused)")
+                    .size(self.effective_font_size()),
+            )
+            .padding(6)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
         let filter_active = self.sidebar_filter.is_some();
-        let filter_btn = button(text("⌕").size(12))
+        let filter_btn = button(text("⌕").size(self.effective_font_size()))
             .on_press(Message::SidebarFilterToggle)
             .padding([2, 6])
             .style(self.tab_btn_style(filter_active));
         let hidden_active = self.sidebar.show_hidden();
         let hidden_btn = tooltip(
-            button(text("Hidden").size(11))
+            button(text("Hidden").size(self.effective_font_size()))
                 .on_press(Message::SidebarShowHidden(!hidden_active))
                 .padding([2, 6])
                 .style(self.tab_btn_style(hidden_active)),
-            container(text("Show or hide dot-prefixed files").size(11))
+            container(text("Show or hide dot-prefixed files").size(self.effective_font_size()))
                 .padding(6)
                 .style(container::rounded_box),
             tooltip::Position::Bottom,
@@ -23257,14 +23345,18 @@ impl Frost {
             lines.join("\n")
         };
         let refresh_btn = tooltip(
-            button(text("↻").size(12))
+            button(text("↻").size(self.effective_font_size()))
                 .on_press(Message::SidebarRefresh)
                 .padding([2, 6])
                 .style(self.ghost_btn_style()),
-            container(text(refresh_help).size(11).wrapping(text::Wrapping::Word))
-                .padding(6)
-                .max_width(360)
-                .style(container::rounded_box),
+            container(
+                text(refresh_help)
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word),
+            )
+            .padding(6)
+            .max_width(360)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
         let nav_row = row![
@@ -23272,10 +23364,14 @@ impl Frost {
             forward,
             up,
             home,
-            button(text(title).size(12).font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..iced::Font::DEFAULT
-            }))
+            button(
+                text(title)
+                    .size(self.effective_font_size())
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    })
+            )
             .on_press(Message::SidebarPathEdit)
             .padding([2, 4])
             .width(Length::Fill)
@@ -23286,18 +23382,22 @@ impl Frost {
         let action_row = row![filter_btn, hidden_btn, refresh_btn]
             .spacing(4)
             .align_y(iced::Alignment::Center);
-        let header = column![nav_row, action_row].spacing(2);
+        let header = column![nav_row.wrap(), action_row.wrap()].spacing(2);
         let (terminal_label, terminal_help) = sidebar_terminal_entry_copy(&self.sidebar.location);
         let terminal_entry = tooltip(
-            button(text(terminal_label).size(11))
+            button(text(terminal_label).size(self.effective_font_size()))
                 .on_press(Message::SidebarOpenTerminal(self.sidebar.generation()))
                 .padding([3, 7])
                 .width(Length::Fill)
                 .style(self.ghost_btn_style()),
-            container(text(terminal_help).size(11).wrapping(text::Wrapping::Word))
-                .padding(6)
-                .max_width(360)
-                .style(container::rounded_box),
+            container(
+                text(terminal_help)
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::Word),
+            )
+            .padding(6)
+            .max_width(360)
+            .style(container::rounded_box),
             tooltip::Position::Bottom,
         );
         let mut rows: Vec<Element<'_, Message>> = vec![
@@ -23316,12 +23416,12 @@ impl Frost {
                             .id(SIDEBAR_PATH_INPUT_ID.clone())
                             .on_input(Message::SidebarPathInput)
                             .on_submit(Message::SidebarPathSubmit)
-                            .size(11),
-                        button(text("Go").size(11))
+                            .size(self.effective_font_size()),
+                        button(text("Go").size(self.effective_font_size()))
                             .on_press(Message::SidebarPathSubmit)
                             .padding([2, 6])
                             .style(self.ghost_btn_style()),
-                        button(text("×").size(11))
+                        button(text("×").size(self.effective_font_size()))
                             .on_press(Message::SidebarPathCancel)
                             .padding([2, 5])
                             .style(self.ghost_btn_style()),
@@ -23339,9 +23439,14 @@ impl Frost {
                 .enumerate()
             {
                 if index > 0 {
-                    crumbs.push(text("›").size(10).style(text::secondary).into());
+                    crumbs.push(
+                        text("›")
+                            .size(self.effective_font_size())
+                            .style(text::secondary)
+                            .into(),
+                    );
                 }
-                let mut crumb = button(text(label).size(10))
+                let mut crumb = button(text(label).size(self.effective_font_size()))
                     .padding([1, 4])
                     .style(self.ghost_btn_style());
                 if path != self.sidebar.current_dir {
@@ -23362,7 +23467,7 @@ impl Frost {
             rows.push(
                 container(
                     text("Opening folder… current files stay available until it succeeds")
-                        .size(10)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                 )
                 .padding([1, 8])
@@ -23379,7 +23484,7 @@ impl Frost {
                     text_input("Filter names…", query)
                         .id(SIDEBAR_FILTER_INPUT_ID.clone())
                         .on_input(Message::SidebarFilterInput)
-                        .size(12),
+                        .size(self.effective_font_size()),
                 )
                 .padding([2, 6])
                 .into(),
@@ -23417,7 +23522,7 @@ impl Frost {
             let picker = pick_list(choices, selected, move |choice| {
                 Message::SidebarSetLocation(hosts_epoch, choice.location)
             })
-            .text_size(12)
+            .text_size(self.effective_font_size())
             .width(Length::Fill);
             rows.push(container(picker).padding([0, 6]).into());
         }
@@ -23429,13 +23534,13 @@ impl Frost {
         if let Some((notice, neutral)) = &self.sidebar_notice {
             let transferring = self.sidebar_transfer.is_some();
             let notice_action: Element<'_, Message> = if transferring {
-                button(text("×").size(11))
+                button(text("×").size(self.effective_font_size()))
                     .on_press(Message::SidebarTransferCancel)
                     .padding([0, 5])
                     .style(self.ghost_btn_style())
                     .into()
             } else if self.sidebar_follow_retry_available.is_some() {
-                button(text("Retry").size(11))
+                button(text("Retry").size(self.effective_font_size()))
                     .on_press(Message::SidebarRemoteFollowRetry)
                     .padding([1, 6])
                     .style(self.ghost_btn_style())
@@ -23447,7 +23552,7 @@ impl Frost {
                 container(
                     row![
                         text(crate::sidebar::bound_sidebar_notice(notice))
-                            .size(11)
+                            .size(self.effective_font_size())
                             .wrapping(text::Wrapping::Word)
                             .width(Length::Fill)
                             .style(if *neutral {
@@ -23475,7 +23580,7 @@ impl Frost {
                             "Loading…"
                         },
                     )
-                    .size(11)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
                 )
                 .padding([4, 8])
@@ -23492,7 +23597,7 @@ impl Frost {
                             "Refreshing…"
                         },
                     )
-                    .size(11)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
                 )
                 .padding([4, 8])
@@ -23502,11 +23607,11 @@ impl Frost {
                 container(
                     row![
                         text(crate::sidebar::bound_sidebar_notice(error.to_string()))
-                            .size(11)
+                            .size(self.effective_font_size())
                             .wrapping(text::Wrapping::Word)
                             .width(Length::Fill)
                             .style(text::danger),
-                        button(text("Retry").size(11))
+                        button(text("Retry").size(self.effective_font_size()))
                             .on_press(Message::SidebarRetry(
                                 self.sidebar.generation(),
                                 self.sidebar.root.path.clone(),
@@ -23526,11 +23631,11 @@ impl Frost {
                         text(crate::sidebar::bound_sidebar_notice(format!(
                             "Refresh failed: {error}"
                         )))
-                        .size(11)
+                        .size(self.effective_font_size())
                         .wrapping(text::Wrapping::Word)
                         .width(Length::Fill)
                         .style(text::danger),
-                        button(text("Retry").size(11))
+                        button(text("Retry").size(self.effective_font_size()))
                             .on_press(Message::SidebarRetry(
                                 self.sidebar.generation(),
                                 self.sidebar.root.path.clone(),
@@ -23545,9 +23650,13 @@ impl Frost {
                 .into(),
             ),
             sidebar::DirectoryState::Loaded if self.sidebar.root.children.is_empty() => rows.push(
-                container(text("Empty directory").size(11).style(text::secondary))
-                    .padding([4, 8])
-                    .into(),
+                container(
+                    text("Empty directory")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
             ),
             _ => {}
         }
@@ -23572,7 +23681,7 @@ impl Frost {
             rows.push(
                 container(
                     text(status_bits.join(" · "))
-                        .size(10)
+                        .size(self.effective_font_size())
                         .style(if status_stale {
                             text::warning
                         } else {
@@ -23592,9 +23701,13 @@ impl Frost {
             .and_then(|query| filter_match_set(&self.sidebar.root, query));
         if filter.as_ref().is_some_and(|set| set.is_empty()) {
             rows.push(
-                container(text("No matches").size(11).style(text::secondary))
-                    .padding([4, 8])
-                    .into(),
+                container(
+                    text("No matches")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
+                )
+                .padding([4, 8])
+                .into(),
             );
         }
         let chrome = mouse_area(iced::widget::Column::with_children(rows).spacing(1))
@@ -23604,6 +23717,7 @@ impl Frost {
             self.sidebar_tree_offset_y,
             self.sidebar_tree_viewport_h,
             items.len(),
+            self.sidebar_row_height(),
         );
         let mut tree_rows: Vec<Element<'_, Message>> = Vec::new();
         if pad_top > 0.0 {
@@ -23615,7 +23729,14 @@ impl Frost {
             None
         };
         for item in items.iter().skip(start).take(count) {
-            tree_rows.push(self.sidebar_render_item(item, drop_target.as_deref()));
+            tree_rows.push(
+                container(self.sidebar_render_item(item, drop_target.as_deref()))
+                    .clip(true)
+                    .height(Length::Fixed(
+                        self.sidebar_row_height() + sidebar::SIDEBAR_TREE_ROW_GAP,
+                    ))
+                    .into(),
+            );
         }
         if pad_bottom > 0.0 {
             tree_rows.push(Space::new().height(Length::Fixed(pad_bottom)).into());
@@ -23653,9 +23774,13 @@ impl Frost {
             let hovered = self.hovered_tab == Some(id);
             let dragging_this = self.dragging_tab == Some(id);
             let label = format!("{}{label}", self.tab_state_prefix(i));
-            let tab_label = container(text(label).size(13).wrapping(text::Wrapping::None))
-                .width(Length::Fill)
-                .padding([4, 8]);
+            let tab_label = container(
+                text(label)
+                    .size(self.effective_font_size())
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .padding([4, 8]);
             // Right-click opens the same tab menu the top strip uses — this is
             // the tab list in Side mode, so it must offer the same actions.
             let tab: Element<'_, Message> = mouse_area(tab_label)
@@ -23666,7 +23791,7 @@ impl Frost {
             // Reveal the close button on the active or hovered tab only.
             let show_close = active || hovered;
             let close_inner: Element<'_, Message> = if show_close {
-                button(text("×").size(13))
+                button(text("×").size(self.effective_font_size()))
                     .on_press(Message::CloseTab(id))
                     .padding([4, 6])
                     .style(self.tab_close_btn_style())
@@ -23675,8 +23800,8 @@ impl Frost {
                 Space::new().into()
             };
             let close = container(close_inner)
-                .width(Length::Fixed(24.0))
-                .center_x(Length::Fixed(24.0));
+                .width(Length::Fixed((self.effective_font_size() * 2.0).max(24.0)))
+                .center_x(Length::Fixed((self.effective_font_size() * 2.0).max(24.0)));
             let cell = container(row![tab, close].align_y(iced::Alignment::Center))
                 .width(Length::Fill)
                 .style(self.tab_container_style(active, hovered, dragging_this));
@@ -23689,7 +23814,7 @@ impl Frost {
         // A compact, flat "+ New" sits apart from the filled tab rows so it does
         // not read as just another tab.
         let new_tab = container(
-            button(text("+ New").size(12))
+            button(text("+ New").size(self.effective_font_size()))
                 .on_press(Message::NewSession)
                 .padding([2, 10])
                 .style(self.ghost_btn_style()),
@@ -23718,10 +23843,14 @@ impl Frost {
         } else {
             "Drop pane here → new tab"
         };
-        container(text(label).size(11).color(self.c_text()))
-            .padding(if compact { [5, 8] } else { [3, 9] })
-            .style(self.split_drop_zone_style())
-            .into()
+        container(
+            text(label)
+                .size(self.effective_font_size())
+                .color(self.c_text()),
+        )
+        .padding(if compact { [5, 8] } else { [3, 9] })
+        .style(self.split_drop_zone_style())
+        .into()
     }
 
     /// Paint one virtualized Files-tree slot (file row, inline error, or cap).
@@ -23763,8 +23892,11 @@ impl Frost {
                 };
                 let mut label = row![
                     Space::new().width(Length::Fixed(indent)),
-                    text(icon).size(12).width(Length::Fixed(14.0)),
-                    text(crate::sidebar::bound_sidebar_filename(name.clone())).size(12),
+                    text(icon)
+                        .size(self.effective_font_size())
+                        .width(Length::Fixed(self.effective_font_size() + 2.0)),
+                    text(crate::sidebar::bound_sidebar_filename(name.clone()))
+                        .size(self.effective_font_size()),
                 ]
                 .spacing(2)
                 .align_y(iced::Alignment::Center);
@@ -23777,7 +23909,11 @@ impl Frost {
                         } else {
                             "Loading…"
                         };
-                        label = label.push(text(copy).size(10).style(text::secondary));
+                        label = label.push(
+                            text(copy)
+                                .size(self.effective_font_size())
+                                .style(text::secondary),
+                        );
                     }
                     sidebar::DirectoryState::Refreshing => {
                         let copy = if self.sidebar.request_phase(path)
@@ -23787,7 +23923,11 @@ impl Frost {
                         } else {
                             "Refreshing…"
                         };
-                        label = label.push(text(copy).size(10).style(text::secondary));
+                        label = label.push(
+                            text(copy)
+                                .size(self.effective_font_size())
+                                .style(text::secondary),
+                        );
                     }
                     _ => {}
                 }
@@ -23797,7 +23937,7 @@ impl Frost {
                 let row_button = button(label)
                     .on_press(Message::SidebarRowClick(generation, path.clone(), *is_dir))
                     .width(Length::Fill)
-                    .height(Length::Fixed(sidebar::SIDEBAR_TREE_ROW_HEIGHT))
+                    .height(Length::Fixed(self.sidebar_row_height()))
                     .padding([1, 2])
                     .style(self.sidebar_row_style(selected, keyboard_focus, is_drop));
                 mouse_area(row_button)
@@ -23837,11 +23977,11 @@ impl Frost {
                 container(
                     row![
                         text(error)
-                            .size(10)
+                            .size(self.effective_font_size())
                             .wrapping(text::Wrapping::Word)
                             .width(Length::Fill)
                             .style(text::danger),
-                        button(text("Retry").size(10))
+                        button(text("Retry").size(self.effective_font_size()))
                             .on_press(Message::SidebarRetry(generation, path.clone()))
                             .padding([1, 6])
                             .style(self.ghost_btn_style()),
@@ -23849,7 +23989,7 @@ impl Frost {
                     .spacing(6)
                     .align_y(iced::Alignment::Center),
                 )
-                .height(Length::Fixed(sidebar::SIDEBAR_TREE_ROW_HEIGHT))
+                .height(Length::Fixed(self.sidebar_row_height()))
                 .padding([2, (20.0 + *depth as f32 * 12.0) as u16])
                 .into()
             }
@@ -23858,10 +23998,10 @@ impl Frost {
                     "Showing first {} entries",
                     remote_fs::MAX_DIRECTORY_ENTRIES
                 ))
-                .size(10)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             )
-            .height(Length::Fixed(sidebar::SIDEBAR_TREE_ROW_HEIGHT))
+            .height(Length::Fixed(self.sidebar_row_height()))
             .padding([2, (20.0 + *depth as f32 * 12.0) as u16])
             .into(),
         }
@@ -23995,7 +24135,9 @@ impl Frost {
     /// the two sessions without disturbing the split geometry.
     fn pane_header(&self, session: usize) -> Element<'_, Message> {
         let Some(sess) = self.sessions.get(session) else {
-            return Space::new().height(Length::Fixed(PANE_HEADER_H)).into();
+            return Space::new()
+                .height(Length::Fixed(self.pane_header_height()))
+                .into();
         };
         let position = self
             .layout()
@@ -24015,9 +24157,9 @@ impl Frost {
 
         let mut line = row![
             text(format!("{}", position + 1))
-                .size(11)
+                .size(self.effective_font_size())
                 .color(self.c_accent()),
-            text(sess.pane_title()).size(11),
+            text(sess.pane_title()).size(self.effective_font_size()),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
@@ -24026,7 +24168,11 @@ impl Frost {
         // its space when it says something the title does not.
         if let Some(cwd) = sess.cwd_display() {
             if cwd != sess.pane_title() {
-                line = line.push(text(cwd).size(11).color(self.c_text_dim()));
+                line = line.push(
+                    text(cwd)
+                        .size(self.effective_font_size())
+                        .color(self.c_text_dim()),
+                );
             }
         }
         // Branch/dirty strip for the pane's repo, straight from the session
@@ -24035,7 +24181,7 @@ impl Frost {
             if let Some(meta) = sess.git_meta_cache.as_ref() {
                 let git =
                     crate::review_text::bound_toast_text(jterm_core::git_meta::format_strip(meta));
-                line = line.push(text(git).size(11).color(blend(
+                line = line.push(text(git).size(self.effective_font_size()).color(blend(
                     self.c_text_dim(),
                     self.c_accent(),
                     0.35,
@@ -24048,23 +24194,31 @@ impl Frost {
                     "▶ {}",
                     session_persistence::bound_tab_title_draft(command)
                 ))
-                .size(11)
+                .size(self.effective_font_size())
                 .color(blend(self.c_text_dim(), self.c_accent(), 0.6)),
             );
         }
         // Held-open task transcript: the child exited, so the pane is
         // read-only. The chip mirrors the hint toast's wording.
         if sess.transcript_read_only() {
-            line = line.push(text("■ exited").size(11).color(self.c_text_dim()));
+            line = line.push(
+                text("■ exited")
+                    .size(self.effective_font_size())
+                    .color(self.c_text_dim()),
+            );
         }
         line = line.push(Space::new().width(Length::Fill));
         if drop_target {
-            line = line.push(text("⇄").size(12).color(self.c_accent()));
+            line = line.push(
+                text("⇄")
+                    .size(self.effective_font_size())
+                    .color(self.c_accent()),
+            );
         }
 
         let strip = container(line)
             .width(Length::Fill)
-            .height(Length::Fixed(PANE_HEADER_H))
+            .height(Length::Fixed(self.pane_header_height()))
             .padding([0, 6])
             .clip(true)
             .style(self.pane_header_style(focused, drag_source, drop_target));
@@ -24140,9 +24294,13 @@ impl Frost {
             PaneDirection::Up => "↑ Split above",
             PaneDirection::Down => "Split below ↓",
         };
-        let zone = container(text(label).size(13).color(self.c_text()))
-            .center(Length::Fill)
-            .style(self.split_drop_zone_style());
+        let zone = container(
+            text(label)
+                .size(self.effective_font_size())
+                .color(self.c_text()),
+        )
+        .center(Length::Fill)
+        .style(self.split_drop_zone_style());
         let overlay: Element<'_, Message> = match direction {
             PaneDirection::Left => row![
                 container(zone).width(Length::FillPortion(28)),
@@ -24202,18 +24360,21 @@ impl Frost {
         background.a = 0.92;
         let accent = self.c_accent();
         let foreground = self.c_text();
-        let chip = container(text("Drop near a pane edge to split · center cancels").size(11))
-            .padding([5, 10])
-            .style(move |_| container::Style {
-                text_color: Some(foreground),
-                background: Some(background.into()),
-                border: iced::Border {
-                    color: accent,
-                    width: 1.0,
-                    radius: 12.0.into(),
-                },
-                ..Default::default()
-            });
+        let chip = container(
+            text("Drop near a pane edge to split · center cancels")
+                .size(self.effective_font_size()),
+        )
+        .padding([5, 10])
+        .style(move |_| container::Style {
+            text_color: Some(foreground),
+            background: Some(background.into()),
+            border: iced::Border {
+                color: accent,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        });
         container(chip)
             .center_x(Length::Fill)
             .align_top(Length::Fill)
@@ -24230,12 +24391,13 @@ impl Frost {
             let panel_width = (self.win_size.width - 48.0).clamp(240.0, 520.0);
             let empty: Element<'_, Message> = container(
                 column![
-                    text("Terminal could not start").size(20),
+                    text("Terminal could not start").size(self.effective_font_size()),
                     text(crate::review_text::bound_diagnostic_text(message))
-                        .size(12)
+                        .size(self.effective_font_size())
                         .wrapping(text::Wrapping::Word)
                         .style(text::danger),
-                    button(text("Retry").size(13)).on_press(Message::NewSession),
+                    button(text("Retry").size(self.effective_font_size()))
+                        .on_press(Message::NewSession),
                 ]
                 .spacing(12)
                 .width(Length::Fixed(panel_width)),
@@ -24519,7 +24681,7 @@ impl Frost {
         };
 
         // Clickable mode toggles (also bound to Ctrl+R / Ctrl+I).
-        let regex_btn = button(text(".*").size(12))
+        let regex_btn = button(text(".*").size(self.effective_font_size()))
             .on_press(Message::SearchToggleRegex)
             .padding([2, 6])
             .style(if self.search.use_regex {
@@ -24527,7 +24689,7 @@ impl Frost {
             } else {
                 button::secondary
             });
-        let case_btn = button(text("Aa").size(12))
+        let case_btn = button(text("Aa").size(self.effective_font_size()))
             .on_press(Message::SearchToggleCase)
             .padding([2, 6])
             .style(if self.search.case_sensitive {
@@ -24539,21 +24701,21 @@ impl Frost {
         let input = text_input("search…", &self.search.query)
             .id(SEARCH_INPUT_ID.clone())
             .on_input(Message::SearchInput)
-            .size(13)
+            .size(self.effective_font_size())
             .width(Length::Fixed(220.0));
-        let mut bar = row![text("Find:").size(13), input]
+        let mut bar = row![text("Find:").size(self.effective_font_size()), input]
             .spacing(8)
             .align_y(iced::Alignment::Center);
         if !status.is_empty() {
-            bar = bar.push(text(status).size(13));
+            bar = bar.push(text(status).size(self.effective_font_size()));
         }
         bar = bar.push(regex_btn).push(case_btn);
         let mut content = column![bar].spacing(6);
         if let Some(target) = reveal {
             content = content.push(
                 row![
-                    text("Match is hidden in a collapsed block").size(12),
-                    button(text("Reveal match").size(12))
+                    text("Match is hidden in a collapsed block").size(self.effective_font_size()),
+                    button(text("Reveal match").size(self.effective_font_size()))
                         .on_press(Message::SearchRevealMatch(Box::new(target)))
                         .padding([4, 8]),
                 ]
@@ -24574,14 +24736,17 @@ impl Frost {
     /// result goes to the clipboard or — without a trailing newline — to the
     /// active pane's prompt.
     fn search_replace_panel(&self) -> Element<'_, Message> {
-        let label = |s: &str| container(text(s.to_string()).size(13)).width(Length::Fixed(64.0));
+        let label = |s: &str| {
+            container(text(s.to_string()).size(self.effective_font_size()))
+                .width(Length::Fixed(64.0))
+        };
         let find_input = text_input("find…", &self.search_replace.search_input)
             .id(SEARCH_REPLACE_FIND_ID.clone())
             .on_input(Message::SearchReplaceFindInput)
-            .size(13);
+            .size(self.effective_font_size());
         let replace_input = text_input("replace with…", &self.search_replace.replace_input)
             .on_input(Message::SearchReplaceReplaceInput)
-            .size(13);
+            .size(self.effective_font_size());
         let inputs = column![
             row![label("Find:"), find_input]
                 .spacing(8)
@@ -24595,37 +24760,41 @@ impl Frost {
         let toggles = row![
             checkbox(self.search_replace.config.use_regex)
                 .label("Regex")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(|_| Message::SearchReplaceToggleRegex),
             checkbox(self.search_replace.config.case_sensitive)
                 .label("Case")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(|_| Message::SearchReplaceToggleCase),
             checkbox(self.search_replace.config.whole_word)
                 .label("Word")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(|_| Message::SearchReplaceToggleWord),
             checkbox(self.search_replace.options.replace_all)
                 .label("All")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(|_| Message::SearchReplaceToggleAll),
         ]
         .spacing(12);
 
         let actions = row![
-            button(text("Replace → Clipboard").size(13)).on_press(Message::SearchReplaceApply(
-                search_replace_panel::SearchReplaceAction::ReplaceToClipboard
-            )),
-            button(text("Type into terminal").size(13)).on_press(Message::SearchReplaceApply(
-                search_replace_panel::SearchReplaceAction::TypeIntoTerminal
-            )),
+            button(text("Replace → Clipboard").size(self.effective_font_size())).on_press(
+                Message::SearchReplaceApply(
+                    search_replace_panel::SearchReplaceAction::ReplaceToClipboard
+                )
+            ),
+            button(text("Type into terminal").size(self.effective_font_size())).on_press(
+                Message::SearchReplaceApply(
+                    search_replace_panel::SearchReplaceAction::TypeIntoTerminal
+                )
+            ),
         ]
         .spacing(8);
 
         let title = row![
-            text("Find & Replace").size(14),
+            text("Find & Replace").size(self.effective_font_size()),
             Space::new().width(Length::Fill),
-            button(text("✕").size(12))
+            button(text("✕").size(self.effective_font_size()))
                 .padding([2, 6])
                 .style(button::text)
                 .on_press(Message::SearchReplaceClose),
@@ -24638,13 +24807,13 @@ impl Frost {
                 text(crate::review_text::bound_query_error(
                     self.search_replace.status.clone(),
                 ))
-                .size(12)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
         }
         body = body.push(
             text("Runs on the current selection · Esc close")
-                .size(10)
+                .size(self.effective_font_size())
                 .style(text::secondary),
         );
 
@@ -24822,26 +24991,33 @@ impl Frost {
         let mut hello_controls = column![hello_button].spacing(4);
         match availability {
             organism::HelloAvailability::Demonstrating => {
-                hello_controls = hello_controls.push(text("Unavailable during demo").size(11));
+                hello_controls = hello_controls
+                    .push(text("Unavailable during demo").size(self.effective_font_size()));
             }
             organism::HelloAvailability::Busy => {
-                hello_controls = hello_controls.push(text("Unavailable for this pose").size(11));
+                hello_controls = hello_controls
+                    .push(text("Unavailable for this pose").size(self.effective_font_size()));
             }
             organism::HelloAvailability::CoolingDown => {
-                hello_controls =
-                    hello_controls.push(text("Wait for the greeting cooldown").size(11));
+                hello_controls = hello_controls
+                    .push(text("Wait for the greeting cooldown").size(self.effective_font_size()));
             }
             organism::HelloAvailability::Available => {}
         }
         let preview_controls = widget_identity_scope::scope(
             self.organism.preview_control_epoch(),
-            column![demo_controls, text(demo_caption).size(11), hello_controls].spacing(8),
+            column![
+                demo_controls,
+                text(demo_caption).size(self.effective_font_size()),
+                hello_controls
+            ]
+            .spacing(8),
         );
         column![
-            checkbox(self.config.ascii_organism_enabled).label("ASCII Organism")
+            checkbox(self.config.ascii_organism_enabled).text_size(self.effective_font_size()).label("ASCII Organism")
                 .on_toggle(Message::SetAsciiOrganism),
-            text("Local companion. Memory is volatile; it resets when disabled or closed.").size(11),
-            checkbox(self.config.ascii_organism_expanded).label("Show expanded companion")
+            text("Local companion. Memory is volatile; it resets when disabled or closed.").size(self.effective_font_size()),
+            checkbox(self.config.ascii_organism_expanded).text_size(self.effective_font_size()).label("Show expanded companion")
                 .on_toggle(Message::SetOrganismExpanded),
             text(if self.config.is_block_mode() && self.config.ascii_organism_enabled {
                 "Block mode keeps the status card between history and current input. Its arrow switches between a full card and one line, independently of the bottom bar. Full wanders in safe blank space; Calm rests; Static shows only this status card."
@@ -24850,24 +25026,24 @@ impl Frost {
                 self.config.ascii_organism_enabled,
                 self.config.ascii_organism_expanded,
                 self.config.bottom_bar,
-            ) }).size(11),
-            text("Organism Motion").size(13),
+            ) }).size(self.effective_font_size()),
+            text("Organism Motion").size(self.effective_font_size()),
             pick_list(organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
-                Message::SetOrganismMotion),
-            text("Automatic currently uses Calm; desktop animation preferences are not available.").size(11),
-            text(motion.description()).size(11),
-            text(motion.interaction_hint()).size(11),
-            text("Output rhythm reflects observed activity, not command progress.").size(11),
-            text("Organism Preview").size(13),
-            text("Pose").size(12),
-            pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose),
+                Message::SetOrganismMotion).text_size(self.effective_font_size()),
+            text("Automatic currently uses Calm; desktop animation preferences are not available.").size(self.effective_font_size()),
+            text(motion.description()).size(self.effective_font_size()),
+            text(motion.interaction_hint()).size(self.effective_font_size()),
+            text("Output rhythm reflects observed activity, not command progress.").size(self.effective_font_size()),
+            text("Organism Preview").size(self.effective_font_size()),
+            text("Pose").size(self.effective_font_size()),
+            pick_list(poses, Some(self.organism.pose), Message::SetOrganismPose).text_size(self.effective_font_size()),
             container(text(preview.sprite)
                 .font(self.mono).size(13))
                 .width(Length::Fixed(200.0)).height(Length::Fixed(72.0)),
-            text(preview.pose.explanation()).size(11),
+            text(preview.pose.explanation()).size(self.effective_font_size()),
             preview_controls,
-            text("Preview is isolated: no command, terminal input, life change, or saved memory.").size(11),
+            text("Preview is isolated: no command, terminal input, life change, or saved memory.").size(self.effective_font_size()),
         ].spacing(8).into()
     }
 
@@ -24892,7 +25068,7 @@ impl Frost {
         // below, so every setting remains reachable in short windows.
         let panel_width = (self.win_size.width - 24.0).clamp(1.0, 520.0);
         let panel_height = (self.win_size.height - 24.0).clamp(1.0, 560.0);
-        let compact = panel_width < 430.0;
+        let compact = panel_width < 430.0 * (self.effective_font_size() / 13.0).max(1.0);
         let panel_padding = if compact || panel_height < 360.0 {
             10.0
         } else {
@@ -24900,26 +25076,33 @@ impl Frost {
         };
 
         let theme_picker = pick_list(themes, current_theme, Message::SetTheme)
-            .text_size(13)
+            .text_size(self.effective_font_size())
             .width(Length::Fill);
         let mut theme_actions =
-            row![button(text("Edit…").size(13)).on_press(Message::ThemeEditOpen),]
-                .spacing(8)
-                .align_y(iced::Alignment::Center);
+            row![button(text("Edit…").size(self.effective_font_size()))
+                .on_press(Message::ThemeEditOpen),]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
         if is_custom {
             theme_actions = theme_actions.push(
-                button(text("Delete").size(13))
+                button(text("Delete").size(self.effective_font_size()))
                     .on_press(Message::ThemeDelete(self.config.theme.clone()))
                     .style(button::danger),
             );
         }
         let theme_row: Element<'_, Message> = if compact {
-            column![text("Theme").size(13), theme_picker, theme_actions]
-                .spacing(6)
-                .into()
+            column![
+                text("Theme").size(self.effective_font_size()),
+                theme_picker,
+                theme_actions
+            ]
+            .spacing(6)
+            .into()
         } else {
             row![
-                text("Theme").size(13).width(Length::Fixed(120.0)),
+                text("Theme")
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(120.0)),
                 theme_picker,
                 theme_actions,
             ]
@@ -24941,15 +25124,17 @@ impl Frost {
             Some(self.config.font_family.clone()),
             Message::SetFontFamily,
         )
-        .text_size(13)
+        .text_size(self.effective_font_size())
         .width(Length::Fill);
         let font_family_row: Element<'_, Message> = if compact {
-            column![text("Font").size(13), font_picker]
+            column![text("Font").size(self.effective_font_size()), font_picker]
                 .spacing(6)
                 .into()
         } else {
             row![
-                text("Font").size(13).width(Length::Fixed(120.0)),
+                text("Font")
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(120.0)),
                 font_picker,
             ]
             .spacing(10)
@@ -24959,6 +25144,7 @@ impl Frost {
 
         fn responsive_slider_row<'a>(
             compact: bool,
+            font_size: f32,
             label: &'static str,
             value: String,
             control: Element<'a, Message>,
@@ -24966,8 +25152,8 @@ impl Frost {
             if compact {
                 column![
                     row![
-                        text(label).size(13).width(Length::Fill),
-                        text(value).size(13),
+                        text(label).size(font_size).width(Length::Fill),
+                        text(value).size(font_size),
                     ]
                     .align_y(iced::Alignment::Center),
                     control,
@@ -24975,12 +25161,13 @@ impl Frost {
                 .spacing(6)
                 .into()
             } else {
-                slider_row(label, value, control)
+                slider_row(label, value, control, font_size)
             }
         }
 
         let font_size = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Font Size",
             format!("{:.0}", self.config.font_size),
             slider(8.0..=72.0, self.config.font_size, Message::SetFontSize)
@@ -24990,6 +25177,7 @@ impl Frost {
         let ui_scale_value = self.config.ui_scale.unwrap_or(1.0);
         let ui_scale = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "UI Scale",
             format!("{:.0}%", ui_scale_value * 100.0),
             slider(0.5..=4.0, ui_scale_value, Message::SetUiScale)
@@ -24998,6 +25186,7 @@ impl Frost {
         );
         let line_spacing = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Line Spacing",
             format!("{:.2}", self.config.line_spacing),
             slider(0.8..=3.0, self.config.line_spacing, Message::SetLineSpacing)
@@ -25006,6 +25195,7 @@ impl Frost {
         );
         let padding = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Padding",
             format!("{:.0}", self.config.padding),
             slider(0.0..=20.0, self.config.padding, Message::SetPadding)
@@ -25014,6 +25204,7 @@ impl Frost {
         );
         let opacity = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Opacity",
             format!("{:.0}%", self.config.opacity * 100.0),
             slider(0.05..=1.0, self.config.opacity, Message::SetOpacity)
@@ -25022,6 +25213,7 @@ impl Frost {
         );
         let scrollback = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Scrollback",
             format!("{}", self.config.scrollback_lines),
             slider(
@@ -25034,6 +25226,7 @@ impl Frost {
         );
         let scroll_speed = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Scroll Speed",
             format!("{}", self.config.scroll_speed),
             slider(1..=10u32, self.config.scroll_speed, Message::SetScrollSpeed)
@@ -25042,53 +25235,62 @@ impl Frost {
         );
         fn responsive_control_row<'a>(
             compact: bool,
+            font_size: f32,
             label: &'static str,
             control: Element<'a, Message>,
         ) -> Element<'a, Message> {
             if compact {
-                column![text(label).size(13), control].spacing(6).into()
-            } else {
-                row![text(label).size(13).width(Length::Fixed(120.0)), control,]
-                    .spacing(10)
-                    .align_y(iced::Alignment::Center)
+                column![text(label).size(font_size), control]
+                    .spacing(6)
                     .into()
+            } else {
+                row![
+                    text(label).size(font_size).width(Length::Fixed(120.0)),
+                    control,
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .into()
             }
         }
 
         let scrollbar_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Scrollbar",
             checkbox(matches!(
                 self.config.scrollbar_visibility,
                 config::ScrollbarVisibility::Always
             ))
             .label("Always show")
-            .text_size(13)
+            .text_size(self.effective_font_size())
             .on_toggle(Message::SetScrollbarAlways)
             .into(),
         );
 
         let alt_screen_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Alt Screen",
             checkbox(self.config.disable_alt_screen)
                 .label("Disable")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetDisableAltScreen)
                 .into(),
         );
 
         let clipboard_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Clipboard",
             row![
                 checkbox(self.config.allow_clipboard_read)
                     .label("Allow PTY reads (unsafe over SSH)")
-                    .text_size(13)
+                    .text_size(self.effective_font_size())
                     .on_toggle(Message::SetAllowClipboardRead),
                 checkbox(self.config.allow_remote_clipboard_write)
                     .label("Allow PTY writes (unsafe over SSH)")
-                    .text_size(13)
+                    .text_size(self.effective_font_size())
                     .on_toggle(Message::SetAllowRemoteClipboardWrite),
             ]
             .spacing(12)
@@ -25098,10 +25300,11 @@ impl Frost {
 
         let tab_position_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Tabs",
             checkbox(self.config.tab_position == config::TabPosition::Side)
                 .label("In sidebar")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(|side| {
                     Message::SetTabPosition(if side {
                         config::TabPosition::Side
@@ -25114,30 +25317,33 @@ impl Frost {
 
         let notify_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Notify",
             checkbox(self.config.notify_long_blocks)
                 .label("Toast when long commands finish unwatched")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetNotifyLongBlocks)
                 .into(),
         );
 
         let repo_strip_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Git",
             checkbox(self.config.show_repo_strip)
                 .label("Branch/dirty in pane headers")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetShowRepoStrip)
                 .into(),
         );
 
         let bottom_bar_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Bar",
             checkbox(self.config.bottom_bar)
                 .label("Bottom status bar (cwd, git, last command)")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetBottomBar)
                 .into(),
         );
@@ -25146,6 +25352,7 @@ impl Frost {
 
         let block_mode_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Terminal",
             pick_list(
                 [
@@ -25156,28 +25363,30 @@ impl Frost {
                 Some(self.config.effective_terminal_mode()),
                 Message::SetTerminalMode,
             )
-            .text_size(13)
+            .text_size(self.effective_font_size())
             .into(),
         );
 
         let block_compact_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Block spacing",
             checkbox(self.config.block_compact)
                 .label("Compact Block Spacing")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetBlockCompact)
                 .into(),
         );
 
         // ── AI & Agent ────────────────────────────────────────────────────
-        let ai_header = text("AI & Agent").size(15);
+        let ai_header = text("AI & Agent").size(self.effective_font_size());
         let ai_enable_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "AI",
             checkbox(self.config.ai_enabled)
                 .label("Enable AI features")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetAiEnabled)
                 .into(),
         );
@@ -25188,34 +25397,38 @@ impl Frost {
         ];
         let ai_provider_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Provider",
             pick_list(
                 ai_providers,
                 Some(self.config.ai_provider.clone()),
                 Message::SetAiProvider,
             )
-            .text_size(13)
+            .text_size(self.effective_font_size())
             .width(Length::Fill)
             .into(),
         );
         let ai_model_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Model",
             text_input("claude-sonnet-4-6", &self.config.ai_model)
                 .on_input(Message::SetAiModel)
-                .size(13)
+                .size(self.effective_font_size())
                 .into(),
         );
         let ai_base_url_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Base URL",
             text_input("https://api.anthropic.com", &self.config.ai_base_url)
                 .on_input(Message::SetAiBaseUrl)
-                .size(13)
+                .size(self.effective_font_size())
                 .into(),
         );
         let ai_tokens_row = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Max tokens",
             format!("{}", self.config.ai_max_tokens),
             slider(
@@ -25227,25 +25440,28 @@ impl Frost {
         );
         let ai_temperature_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Temperature",
             text_input("provider default (0.0-2.0)", &self.ai_temperature_draft)
                 .on_input(Message::SetAiTemperature)
-                .size(13)
+                .size(self.effective_font_size())
                 .into(),
         );
         let ai_key_file_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Key file",
             text_input(
                 "~/.config/frost/ai.key (chmod 600)",
                 self.config.ai_api_key_file.as_deref().unwrap_or(""),
             )
             .on_input(Message::SetAiKeyFile)
-            .size(13)
+            .size(self.effective_font_size())
             .into(),
         );
         let ai_key_store_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "API Key",
             text_input(
                 "paste key, Enter stores it as a 600 file",
@@ -25254,51 +25470,56 @@ impl Frost {
             .secure(true)
             .on_input(Message::SetAiKeyDraft)
             .on_submit(Message::StoreAiKey)
-            .size(13)
+            .size(self.effective_font_size())
             .into(),
         );
         let ai_redact_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Privacy",
             checkbox(self.config.ai_redact_secrets)
                 .label("Redact secrets in AI-bound text")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetAiRedactSecrets)
                 .into(),
         );
         let ai_stream_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Streaming",
             checkbox(self.config.ai_stream)
                 .label("Stream agent replies as they arrive")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetAiStream)
                 .into(),
         );
         let ai_share_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Cloud context",
             checkbox(self.config.ai_share_command_context)
                 .label("Share command context with non-local AI")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetAiShareCommandContext)
                 .into(),
         );
         let ai_correction_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Corrections",
             checkbox(self.config.command_correction_enabled)
                 .label("Suggest corrections for failed commands (reviewed before running)")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetCommandCorrectionEnabled)
                 .into(),
         );
         let task_sidebar_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Tasks",
             checkbox(self.config.experimental_task_sidebar)
                 .label("Experimental Tasks dashboard (Codex/Claude/OpenCode/Kimi)")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(Message::SetExperimentalTaskSidebar)
                 .into(),
         );
@@ -25308,17 +25529,19 @@ impl Frost {
             .collect();
         let preferred_agent_row = responsive_control_row(
             compact,
+            self.effective_font_size(),
             "Preferred Agent",
             pick_list(
                 preferred_agent_choices,
                 Some(self.config.preferred_agent_provider.clone()),
                 Message::SetPreferredAgentProvider,
             )
-            .text_size(13)
+            .text_size(self.effective_font_size())
             .into(),
         );
         let agent_turns_row = responsive_slider_row(
             compact,
+            self.effective_font_size(),
             "Agent turns",
             format!("{}", self.config.agent_max_turns),
             slider(
@@ -25334,11 +25557,12 @@ impl Frost {
         // setting. Validation is live but advisory — editing and saving are
         // never blocked, and the Ctrl+Shift+S picker shows the same reason
         // for an entry it refuses to open.
-        let mut remote_hosts_section = column![text("Remote hosts").size(15)].spacing(8);
+        let mut remote_hosts_section =
+            column![text("Remote hosts").size(self.effective_font_size())].spacing(8);
         if self.config.remote_hosts.is_empty() {
             remote_hosts_section = remote_hosts_section.push(
                 text("None configured. Ctrl+Shift+S opens the picker once a host is added.")
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
             );
         }
@@ -25360,12 +25584,12 @@ impl Frost {
             let deploy_label = jterm_core::review_input::safe_inline_display(deploy, 64);
             let display_name = config::remote_host_display_name(host, i);
             let header = row![
-                text(display_name).size(13),
+                text(display_name).size(self.effective_font_size()),
                 Space::new().width(Length::Fill),
                 text(format!("{transport} · deploy {deploy_label}"))
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
-                button(text("Delete").size(12))
+                button(text("Delete").size(self.effective_font_size()))
                     .on_press(Message::RemoteHostRemove(target.clone()))
                     .style(button::danger),
             ]
@@ -25375,7 +25599,7 @@ impl Frost {
             let name_target = target.clone();
             let name_input = text_input("display name", &host.name)
                 .on_input(move |s| Message::RemoteHostName(name_target.clone(), s))
-                .size(13);
+                .size(self.effective_font_size());
             let host_placeholder = if host.docker {
                 "container name"
             } else {
@@ -25384,15 +25608,15 @@ impl Frost {
             let host_target = target.clone();
             let host_input = text_input(host_placeholder, &host.host)
                 .on_input(move |s| Message::RemoteHostHost(host_target.clone(), s))
-                .size(13);
+                .size(self.effective_font_size());
             let user_target = target.clone();
             let user_input = text_input("user (optional)", host.user.as_deref().unwrap_or(""))
                 .on_input(move |s| Message::RemoteHostUser(user_target.clone(), s))
-                .size(13);
+                .size(self.effective_font_size());
             let docker_target = target.clone();
             let docker_box = checkbox(host.docker)
                 .label("docker")
-                .text_size(13)
+                .text_size(self.effective_font_size())
                 .on_toggle(move |v| Message::RemoteHostDocker(docker_target.clone(), v));
             let deploy_target = target.clone();
             let deploy_pick = pick_list(
@@ -25404,7 +25628,7 @@ impl Frost {
                 Some(deploy_label),
                 move |v| Message::RemoteHostDeploy(deploy_target.clone(), v),
             )
-            .text_size(13)
+            .text_size(self.effective_font_size())
             .width(Length::Fixed(110.0));
             let toggles = row![docker_box, deploy_pick]
                 .spacing(10)
@@ -25423,7 +25647,11 @@ impl Frost {
             };
             let mut entry = column![header, fields].spacing(6);
             if let Err(problem) = validation {
-                entry = entry.push(text(problem).size(11).style(text::danger));
+                entry = entry.push(
+                    text(problem)
+                        .size(self.effective_font_size())
+                        .style(text::danger),
+                );
             }
             remote_hosts_section = remote_hosts_section.push(
                 container(entry)
@@ -25439,12 +25667,12 @@ impl Frost {
                     self.config.remote_hosts.len() - config::MAX_REMOTE_HOST_UI_ROWS,
                     config::MAX_REMOTE_HOST_UI_ROWS
                 ))
-                .size(11)
+                .size(self.effective_font_size())
                 .style(text::danger),
             );
         }
         let at_remote_host_capacity = self.config.remote_hosts.len() >= config::MAX_REMOTE_HOSTS;
-        let add_host = button(text("Add host").size(13));
+        let add_host = button(text("Add host").size(self.effective_font_size()));
         let add_host = if at_remote_host_capacity {
             add_host
         } else {
@@ -25464,32 +25692,37 @@ impl Frost {
                     config::MAX_REMOTE_HOSTS
                 )
             };
-            remote_hosts_section =
-                remote_hosts_section.push(text(message).size(11).style(text::danger));
+            remote_hosts_section = remote_hosts_section.push(
+                text(message)
+                    .size(self.effective_font_size())
+                    .style(text::danger),
+            );
         }
 
         let buttons = row![
-            button(text("Save").size(13)).on_press(Message::ConfigSave),
-            button(text("Reset").size(13))
+            button(text("Save").size(self.effective_font_size())).on_press(Message::ConfigSave),
+            button(text("Reset").size(self.effective_font_size()))
                 .on_press(Message::ConfigReset)
                 .style(button::danger),
-            button(text("Close").size(13))
+            button(text("Close").size(self.effective_font_size()))
                 .on_press(Message::ToggleConfigPanel)
                 .style(button::secondary),
         ]
         .spacing(8);
 
+        let buttons = buttons.wrap();
+
         let footer = text(format!(
             "{} · Ctrl+Shift+O toggles · Esc closes",
             config_save_feedback(self.config_dirty, self.config_write_blocked)
         ))
-        .size(10)
+        .size(self.effective_font_size())
         .width(Length::Fill)
         .wrapping(text::Wrapping::Word)
         .style(text::secondary);
 
         let content = column![
-            text("Settings").size(18),
+            text("Settings").size(self.effective_font_size()),
             theme_row,
             font_family_row,
             font_size,
@@ -25530,13 +25763,25 @@ impl Frost {
             footer,
         ]
         .spacing(12)
-        .width(Length::Fill);
+        // Keep controls at readable size; tiny windows can pan horizontally as
+        // well as scroll down instead of making the controls unreachable.
+        .width(Length::Fixed(
+            (panel_width - 2.0 * panel_padding).max(self.effective_font_size() * 10.0 + 32.0),
+        ));
 
-        let inner = container(scrollable(content).width(Length::Fill).height(Length::Fill))
-            .width(Length::Fixed(panel_width))
-            .height(Length::Fixed(panel_height))
-            .padding(panel_padding)
-            .style(container::dark);
+        let inner = container(
+            scrollable(content)
+                .direction(scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                })
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fixed(panel_width))
+        .height(Length::Fixed(panel_height))
+        .padding(panel_padding)
+        .style(container::dark);
         container(inner)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -25553,10 +25798,12 @@ impl Frost {
         let labels = Theme::editable_color_labels();
 
         let name_row = row![
-            text("Name").size(13).width(Length::Fixed(150.0)),
+            text("Name")
+                .size(self.effective_font_size())
+                .width(Length::Fixed(150.0)),
             text_input("theme name", &ed.name)
                 .on_input(Message::ThemeEditName)
-                .size(13),
+                .size(self.effective_font_size()),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -25581,11 +25828,13 @@ impl Frost {
                     ..Default::default()
                 });
             let r = row![
-                text(*label).size(12).width(Length::Fixed(150.0)),
+                text(*label)
+                    .size(self.effective_font_size())
+                    .width(Length::Fixed(150.0)),
                 swatch,
                 text_input("#RRGGBB", &hex)
                     .on_input(move |s| Message::ThemeEditColor(i, s))
-                    .size(12)
+                    .size(self.effective_font_size())
                     .width(Length::Fixed(110.0)),
             ]
             .spacing(10)
@@ -25594,15 +25843,15 @@ impl Frost {
         }
 
         let buttons = row![
-            button(text("Save").size(13)).on_press(Message::ThemeEditSave),
-            button(text("Cancel").size(13))
+            button(text("Save").size(self.effective_font_size())).on_press(Message::ThemeEditSave),
+            button(text("Cancel").size(self.effective_font_size()))
                 .on_press(Message::ThemeEditClose)
                 .style(button::secondary),
         ]
         .spacing(8);
 
         let mut content = column![
-            text("Theme Editor").size(18),
+            text("Theme Editor").size(self.effective_font_size()),
             name_row,
             scrollable(list).height(Length::Fixed(300.0)),
         ]
@@ -25610,7 +25859,7 @@ impl Frost {
         if let Some(err) = &ed.error {
             content = content.push(
                 text(crate::theme::bound_theme_editor_error(err))
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::danger),
             );
         }
@@ -25631,13 +25880,22 @@ impl Frost {
     /// combine Ctrl with Alt so JWM's bare-Alt shortcuts remain untouched.
     fn help_panel(&self) -> Element<'_, Message> {
         let section = |title: &str| -> Element<'_, Message> {
-            text(title.to_string()).size(13).style(text::primary).into()
+            text(title.to_string())
+                .size(self.effective_font_size())
+                .style(text::primary)
+                .into()
         };
         let kb = |key: &str, desc: &str| -> Element<'_, Message> {
             row![
-                container(text(key.to_string()).size(12).font(iced::Font::MONOSPACE))
-                    .width(Length::Fixed(190.0)),
-                text(desc.to_string()).size(12).style(text::secondary),
+                container(
+                    text(key.to_string())
+                        .size(self.effective_font_size())
+                        .font(iced::Font::MONOSPACE)
+                )
+                .width(Length::Fixed(190.0)),
+                text(desc.to_string())
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
             ]
             .spacing(8)
             .into()
@@ -25672,7 +25930,7 @@ impl Frost {
         };
 
         let body = column![
-            text("Keyboard Shortcuts").size(18),
+            text("Keyboard Shortcuts").size(self.effective_font_size()),
             section("Tabs / Sessions"),
             bound("session:new", "New tab"),
             bound("session:close", "Close current tab"),
@@ -25848,15 +26106,21 @@ impl Frost {
     fn debug_panel(&self) -> Element<'_, Message> {
         let stat = |label: &str, value: String| -> Element<'_, Message> {
             row![
-                container(text(label.to_string()).size(11).style(text::primary))
-                    .width(Length::Fixed(110.0)),
-                text(value).size(11).font(iced::Font::MONOSPACE),
+                container(
+                    text(label.to_string())
+                        .size(self.effective_font_size())
+                        .style(text::primary)
+                )
+                .width(Length::Fixed(110.0)),
+                text(value)
+                    .size(self.effective_font_size())
+                    .font(iced::Font::MONOSPACE),
             ]
             .spacing(8)
             .into()
         };
 
-        let mut lines = column![text("Diagnostics").size(13)].spacing(3);
+        let mut lines = column![text("Diagnostics").size(self.effective_font_size())].spacing(3);
         lines = lines
             .push(stat("Grid", format!("{}x{}", self.cols, self.rows)))
             .push(stat("Sessions", format!("{}", self.sessions.len())))
@@ -27301,7 +27565,7 @@ impl Frost {
     fn sidebar_tasks_view(&self) -> Element<'_, Message> {
         if !self.config.experimental_task_sidebar {
             return text("Enable the experimental Tasks dashboard in Settings")
-                .size(12)
+                .size(self.effective_font_size())
                 .style(text::secondary)
                 .into();
         }
@@ -27310,13 +27574,13 @@ impl Frost {
             let context = &picker.context;
             let reference = picker.reference();
             let command = context.command.as_deref().unwrap_or("failed command");
-            body = body.push(text("Create task with").size(13));
+            body = body.push(text("Create task with").size(self.effective_font_size()));
             body = body.push(
                 text(crate::review_text::visible_bounded(
                     command,
                     agent_task_ui::MAX_TASK_TITLE_DISPLAY_BYTES,
                 ))
-                .size(11)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
             let preferred =
@@ -27341,7 +27605,7 @@ impl Frost {
                         text(crate::review_text::bound_provider_label(
                             provider.display_name(),
                         ))
-                        .size(11),
+                        .size(self.effective_font_size()),
                     )
                     .style(style)
                     .on_press(Message::TaskCreateWithProvider(reference.clone(), provider)),
@@ -27349,7 +27613,7 @@ impl Frost {
             }
             body = body.push(providers);
             body = body.push(
-                button(text("Cancel").size(11))
+                button(text("Cancel").size(self.effective_font_size()))
                     .style(button::secondary)
                     .on_press(Message::TaskCreateProviderCancel(reference)),
             );
@@ -27357,7 +27621,7 @@ impl Frost {
         if self.task_panel.pending_creation.is_some() {
             body = body.push(
                 text("Creating isolated worktree…")
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
             );
         }
@@ -27368,7 +27632,7 @@ impl Frost {
             )
             .on_input(Message::TaskDashboardQuery)
             .on_submit(Message::TaskDashboardOpenResult)
-            .size(12),
+            .size(self.effective_font_size()),
         );
         let dashboard = agent_task::DashboardSnapshot::project(
             self.task_manager
@@ -27401,7 +27665,7 @@ impl Frost {
                         view,
                         &dashboard.counts,
                     ))
-                    .size(10),
+                    .size(self.effective_font_size()),
                 )
                 .style(self.tab_btn_style(self.task_panel.dashboard_view == view))
                 .on_press(Message::TaskDashboardView(view)),
@@ -27416,14 +27680,16 @@ impl Frost {
                 dashboard.counts.attention,
                 dashboard.counts.pending_approval,
             ))
-            .size(11)
+            .size(self.effective_font_size())
             .style(text::secondary),
         );
         if !self.task_panel.dashboard_query.is_empty()
             || self.task_panel.dashboard_view != agent_task::DashboardView::All
         {
-            body = body
-                .push(button(text("Clear filters").size(11)).on_press(Message::TaskDashboardClear));
+            body = body.push(
+                button(text("Clear filters").size(self.effective_font_size()))
+                    .on_press(Message::TaskDashboardClear),
+            );
         }
         let selected_hidden = self.task_panel.selected.is_some_and(|id| {
             self.task_manager
@@ -27432,9 +27698,11 @@ impl Frost {
                 && dashboard.selected_index(Some(id)).is_none()
         });
         if selected_hidden {
-            body = body.push(text("Selected task is hidden by filters.").size(11));
+            body = body
+                .push(text("Selected task is hidden by filters.").size(self.effective_font_size()));
             body = body.push(
-                button(text("Show selected task").size(11)).on_press(Message::TaskDashboardClear),
+                button(text("Show selected task").size(self.effective_font_size()))
+                    .on_press(Message::TaskDashboardClear),
             );
         }
         let tasks: Vec<_> = dashboard
@@ -27448,17 +27716,18 @@ impl Frost {
             .iter()
             .any(|task| task.status != agent_task::TaskStatus::Archived);
         if tasks.is_empty() && has_tasks {
-            body = body.push(text("No tasks match these filters.").size(12));
+            body =
+                body.push(text("No tasks match these filters.").size(self.effective_font_size()));
         }
         if tasks.is_empty()
             && !has_tasks
             && self.task_panel.pending_creation.is_none()
             && self.task_panel.provider_picker.is_none()
         {
-            body = body.push(text("No Agent tasks yet").size(13));
+            body = body.push(text("No Agent tasks yet").size(self.effective_font_size()));
             body = body.push(
                 text("Create one from a failed command block's menu (Create task). Pick Codex, Claude, OpenCode, or Kimi; each task gets its own Git worktree.")
-                    .size(11)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
             );
         }
@@ -27470,7 +27739,7 @@ impl Frost {
             if self.task_manager.task_needs_attention(task.id) {
                 label = format!("● {label}");
             }
-            let row_button = button(text(label).size(12))
+            let row_button = button(text(label).size(self.effective_font_size()))
                 .on_press(Message::TaskSelect(task.id))
                 .padding([2, 6])
                 .style(self.tab_btn_style(self.task_panel.selected == Some(task.id)));
@@ -27481,7 +27750,7 @@ impl Frost {
                     crate::review_text::bound_provider_label(task.provider.display_name()),
                     task.status.label()
                 ))
-                .size(10)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             ]
             .spacing(1);
@@ -27496,18 +27765,22 @@ impl Frost {
                 task_row = task_row.push(tooltip(
                     container(
                         text(preview)
-                            .size(10)
+                            .size(self.effective_font_size())
                             .font(iced::Font::MONOSPACE)
                             .wrapping(text::Wrapping::None)
                             .style(text::secondary),
                     )
                     .width(Length::Fill)
                     .clip(true),
-                    container(text(reason).size(11).wrapping(text::Wrapping::WordOrGlyph))
-                        .padding(6)
-                        .width(Length::Fixed(320.0))
-                        .max_height(180.0)
-                        .clip(true),
+                    container(
+                        text(reason)
+                            .size(self.effective_font_size())
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    )
+                    .padding(6)
+                    .width(Length::Fixed(320.0))
+                    .max_height(180.0)
+                    .clip(true),
                     tooltip::Position::Top,
                 ));
             }
@@ -27531,14 +27804,17 @@ impl Frost {
         use agent_task::{TaskRuntimeKind, TaskStatus, TaskValidationStatus};
 
         let mut card = column![].spacing(6);
-        card = card.push(text(crate::review_text::visible_bounded(&task.title, 200)).size(13));
+        card = card.push(
+            text(crate::review_text::visible_bounded(&task.title, 200))
+                .size(self.effective_font_size()),
+        );
         card = card.push(
             text(format!(
                 "Status: {} · Runtime: {:?}",
                 task.status.label(),
                 task.runtime_kind
             ))
-            .size(11)
+            .size(self.effective_font_size())
             .style(text::secondary),
         );
         card = card.push(
@@ -27547,7 +27823,7 @@ impl Frost {
                 crate::review_text::visible_bounded(&task.branch, 128),
                 agent_task::diff::visible_diff_cwd(&task.worktree_path),
             ))
-            .size(10)
+            .size(self.effective_font_size())
             .style(text::secondary),
         );
         if let Some(detail) = task.status_detail.as_deref() {
@@ -27556,7 +27832,7 @@ impl Frost {
                     detail,
                     agent_task_ui::MAX_TASK_DETAIL_DISPLAY_BYTES,
                 ))
-                .size(11)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
         }
@@ -27573,7 +27849,7 @@ impl Frost {
                     "Native session: {:?}",
                     snapshot.phase
                 )))
-                .size(11)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
             if !snapshot.agent_text.is_empty() {
@@ -27593,7 +27869,7 @@ impl Frost {
                                 ),
                                 truncated
                             ))
-                            .size(11)
+                            .size(self.effective_font_size())
                             .font(iced::Font::MONOSPACE),
                         )
                         .height(Length::Fixed(160.0)),
@@ -27609,7 +27885,7 @@ impl Frost {
                         crate::review_text::visible_bounded(&command.command, 512),
                         crate::review_text::visible_bounded(&command.status.to_string(), 64)
                     ))
-                    .size(10)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
                 );
             }
@@ -27620,32 +27896,32 @@ impl Frost {
                         "Managed approval request ({:?}); accepting is disabled",
                         approval.kind
                     )))
-                    .size(11)
+                    .size(self.effective_font_size())
                     .style(text::danger),
                 );
                 if let Some(command) = approval.command.as_deref() {
                     approval_card = approval_card.push(
                         text(crate::review_text::visible_bounded(command, 1024))
-                            .size(10)
+                            .size(self.effective_font_size())
                             .font(iced::Font::MONOSPACE),
                     );
                 }
                 for path in &approval.file_paths {
                     approval_card = approval_card.push(
                         text(crate::review_text::visible_bounded(path, 512))
-                            .size(10)
+                            .size(self.effective_font_size())
                             .font(iced::Font::MONOSPACE),
                     );
                 }
                 if let Some(reason) = approval.reason.as_deref() {
                     approval_card = approval_card.push(
                         text(crate::review_text::visible_bounded(reason, 512))
-                            .size(10)
+                            .size(self.effective_font_size())
                             .style(text::secondary),
                     );
                 }
                 approval_card = approval_card.push(
-                    button(text("Deny").size(11))
+                    button(text("Deny").size(self.effective_font_size()))
                         .style(button::danger)
                         .on_press(Message::TaskApprovalDeny(task.id, approval.id)),
                 );
@@ -27662,7 +27938,7 @@ impl Frost {
                         snapshot.completed_turns,
                         snapshot.turn_history.len()
                     ))
-                    .size(10)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
                 );
             }
@@ -27675,7 +27951,8 @@ impl Frost {
             .filter_map(|index| self.sessions.get(index))
             .map(|session| agent_task_ui::terminal_session_id(session.id))
             .collect();
-        let mut agent_terminal = button(text("Agent terminal").size(11)).style(button::secondary);
+        let mut agent_terminal = button(text("Agent terminal").size(self.effective_font_size()))
+            .style(button::secondary);
         if task
             .terminal_session_id
             .as_ref()
@@ -27684,7 +27961,8 @@ impl Frost {
             agent_terminal = agent_terminal.on_press(Message::TaskFocusTerminal(task.id));
         }
         let mut validation_output =
-            button(text("Validation output").size(11)).style(button::secondary);
+            button(text("Validation output").size(self.effective_font_size()))
+                .style(button::secondary);
         if task
             .validation
             .terminal_session_id
@@ -27698,14 +27976,22 @@ impl Frost {
         // Action rows.
         let provider_name = crate::review_text::bound_provider_label(task.provider.display_name());
         if let Some(notice) = agent_task_ui::native_start_notice(task.provider) {
-            card = card.push(text(notice).size(11).style(text::danger));
+            card = card.push(
+                text(notice)
+                    .size(self.effective_font_size())
+                    .style(text::danger),
+            );
         }
         let share_context = agent_task_ui::prompt_policy(&self.config).share_command_context;
         let mut actions = row![].spacing(6);
         if preparing {
-            actions = actions.push(text("Preparing…").size(11).style(text::secondary));
             actions = actions.push(
-                button(text("Cancel").size(11))
+                text("Preparing…")
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+            );
+            actions = actions.push(
+                button(text("Cancel").size(self.effective_font_size()))
                     .style(button::secondary)
                     .on_press(Message::TaskCancelNative(task.id)),
             );
@@ -27713,7 +27999,8 @@ impl Frost {
             && task.runtime_kind == TaskRuntimeKind::Unassigned
         {
             let start_label = format!("Start {provider_name}");
-            let mut start = button(text(start_label).size(11)).style(button::primary);
+            let mut start =
+                button(text(start_label).size(self.effective_font_size())).style(button::primary);
             if task.provider.supports_native_driver() {
                 if share_context {
                     start = start.on_press(Message::TaskStartNative(task.id));
@@ -27723,14 +28010,14 @@ impl Frost {
             }
             actions = actions.push(start);
             actions = actions.push(
-                button(text(format!("Open {provider_name}")).size(11))
+                button(text(format!("Open {provider_name}")).size(self.effective_font_size()))
                     .style(button::secondary)
                     .on_press(Message::TaskTerminalOpen(task.id)),
             );
         }
         if running && stream_active {
             actions = actions.push(
-                button(text(format!("Cancel {provider_name}")).size(11))
+                button(text(format!("Cancel {provider_name}")).size(self.effective_font_size()))
                     .style(button::danger)
                     .on_press(Message::TaskCancelNative(task.id)),
             );
@@ -27738,9 +28025,11 @@ impl Frost {
                 && matches!(task.provider, agent_task::AgentProvider::Codex)
             {
                 actions = actions.push(
-                    button(text(format!("Finish {provider_name}")).size(11))
-                        .style(button::primary)
-                        .on_press(Message::TaskFinishNative(task.id)),
+                    button(
+                        text(format!("Finish {provider_name}")).size(self.effective_font_size()),
+                    )
+                    .style(button::primary)
+                    .on_press(Message::TaskFinishNative(task.id)),
                 );
             }
         }
@@ -27754,7 +28043,7 @@ impl Frost {
                 text(format!(
                     "Start {provider_name} needs AI enabled and command-context sharing in Settings. Open {provider_name} still works in a terminal."
                 ))
-                .size(10)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
         }
@@ -27781,8 +28070,8 @@ impl Frost {
                 &self.task_panel.follow_up,
             )
             .on_input(move |value| Message::TaskFollowUpInput(input_reference.clone(), value))
-            .size(12);
-            let mut send = button(text("Send turn").size(11));
+            .size(self.effective_font_size());
+            let mut send = button(text("Send turn").size(self.effective_font_size()));
             if agent_task_ui::native_follow_up_can_send(&self.task_panel.follow_up, completed_turns)
             {
                 send = send.on_press(Message::TaskFollowUpSend(reference));
@@ -27795,18 +28084,19 @@ impl Frost {
         if task.status == TaskStatus::ReadyForReview && !stream_active {
             let mut review = row![].spacing(6);
             review = review.push(
-                button(text("Review diff").size(11))
+                button(text("Review diff").size(self.effective_font_size()))
                     .style(button::secondary)
                     .on_press(Message::TaskDiffOpen(task.id)),
             );
             if task.validation.status != TaskValidationStatus::Running {
                 review = review.push(
-                    button(text("Run validation").size(11))
+                    button(text("Run validation").size(self.effective_font_size()))
                         .style(button::secondary)
                         .on_press(Message::TaskValidationStart(task.id)),
                 );
             }
-            let mut complete = button(text("Mark complete").size(11)).style(button::primary);
+            let mut complete = button(text("Mark complete").size(self.effective_font_size()))
+                .style(button::primary);
             if task.validation.status == TaskValidationStatus::Passed {
                 complete = complete.on_press(Message::TaskMarkComplete(task.id));
             }
@@ -27828,7 +28118,7 @@ impl Frost {
                         ))
                         .unwrap_or_default()
                 ))
-                .size(10)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
         }
@@ -27849,7 +28139,7 @@ impl Frost {
                     } else {
                         "Retry terminal Agent"
                     })
-                    .size(11),
+                    .size(self.effective_font_size()),
                 )
                 .style(button::secondary)
                 .on_press(Message::TaskTerminalOpen(task.id)),
@@ -27858,7 +28148,7 @@ impl Frost {
 
         if !task.status.is_running() && task.validation.status != TaskValidationStatus::Running {
             card = card.push(
-                button(text("Hide task").size(11))
+                button(text("Hide task").size(self.effective_font_size()))
                     .style(button::secondary)
                     .on_press(Message::TaskHide(task.id)),
             );
@@ -27872,10 +28162,10 @@ impl Frost {
             diff_card = diff_card.push(
                 row![
                     text(self.task_panel.diff.display_requested_base())
-                        .size(10)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                     Space::new().width(Length::Fill),
-                    button(text("✕").size(10))
+                    button(text("✕").size(self.effective_font_size()))
                         .style(button::secondary)
                         .padding(2)
                         .on_press(Message::TaskDiffClose(self.task_panel.diff_reference())),
@@ -27885,21 +28175,21 @@ impl Frost {
             if state.loading {
                 diff_card = diff_card.push(
                     text("Loading tracked changes…")
-                        .size(11)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                 );
             }
             if let Some(error) = &state.error {
                 diff_card = diff_card.push(
                     text(crate::review_text::visible_bounded(error, 1024))
-                        .size(11)
+                        .size(self.effective_font_size())
                         .style(text::danger),
                 );
             }
             if state.truncated {
                 diff_card = diff_card.push(
                     text("Diff exceeded the retained display limits")
-                        .size(10)
+                        .size(self.effective_font_size())
                         .style(text::danger),
                 );
             }
@@ -27911,8 +28201,12 @@ impl Frost {
                 };
                 diff_card = diff_card.push(
                     container(
-                        scrollable(text(body_text).size(10).font(iced::Font::MONOSPACE))
-                            .height(Length::Fixed(240.0)),
+                        scrollable(
+                            text(body_text)
+                                .size(self.effective_font_size())
+                                .font(iced::Font::MONOSPACE),
+                        )
+                        .height(Length::Fixed(240.0)),
                     )
                     .padding(6)
                     .style(container::bordered_box),
@@ -27934,7 +28228,11 @@ impl Frost {
 
         let mut transcript = column![].spacing(8);
         if let Some(notice) = self.agent.restored_history_notice {
-            transcript = transcript.push(text(notice).size(12).style(text::secondary));
+            transcript = transcript.push(
+                text(notice)
+                    .size(self.effective_font_size())
+                    .style(text::secondary),
+            );
         }
         let session = self.agent.session.as_ref();
         if let Some(session) = session {
@@ -27943,23 +28241,23 @@ impl Frost {
                     AgentTurn::User(message) => text(crate::agent::bound_transcript_text(format!(
                         "You: {message}"
                     )))
-                    .size(13)
+                    .size(self.effective_font_size())
                     .into(),
                     AgentTurn::AssistantThought(thought) => text(
                         crate::agent::bound_transcript_text(format!("thought: {thought}")),
                     )
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::secondary)
                     .into(),
                     AgentTurn::AssistantSay(message) => text(crate::agent::bound_transcript_text(
                         format!("Agent: {message}"),
                     ))
-                    .size(13)
+                    .size(self.effective_font_size())
                     .into(),
                     AgentTurn::ProtocolError(message) => text(crate::agent::bound_transcript_text(
                         format!("protocol: {message}"),
                     ))
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::danger)
                     .into(),
                     AgentTurn::Observation {
@@ -27971,14 +28269,14 @@ impl Frost {
                             "Output (exit {exit_code}, {} bytes)",
                             output_sample.len()
                         ))
-                        .size(12)
+                        .size(self.effective_font_size())
                         .style(if *exit_code == 0 {
                             text::secondary
                         } else {
                             text::danger
                         });
                         let body = text(crate::agent::bound_transcript_text(output_sample.clone()))
-                            .size(12)
+                            .size(self.effective_font_size())
                             .font(iced::Font::MONOSPACE);
                         container(column![head, body].spacing(4))
                             .padding(6)
@@ -28008,7 +28306,7 @@ impl Frost {
                                     "⚠ destructive: {}",
                                     crate::agent::bound_transcript_text(reason)
                                 ))
-                                .size(12)
+                                .size(self.effective_font_size())
                                 .style(text::danger),
                             );
                         }
@@ -28029,14 +28327,14 @@ impl Frost {
                                         Message::AgentEditInput(reference, value)
                                     })
                                     .on_submit(Message::AgentEditApprove(*edit_reference))
-                                    .size(13)
+                                    .size(self.effective_font_size())
                                     .font(iced::Font::MONOSPACE),
                             );
                             card = card.push(
                                 row![
-                                    button(text("Approve edited").size(12))
+                                    button(text("Approve edited").size(self.effective_font_size()))
                                         .on_press(Message::AgentEditApprove(*edit_reference)),
-                                    button(text("Cancel").size(12))
+                                    button(text("Cancel").size(self.effective_font_size()))
                                         .style(button::secondary)
                                         .on_press(Message::AgentEditCancel(*edit_reference)),
                                 ]
@@ -28048,7 +28346,7 @@ impl Frost {
                                     command,
                                     crate::review_text::MAX_AGENT_COMMAND_BYTES,
                                 ))
-                                .size(13)
+                                .size(self.effective_font_size())
                                 .font(iced::Font::MONOSPACE),
                             );
                             let status_row: Element<'_, Message> = match status {
@@ -28058,39 +28356,44 @@ impl Frost {
                                     } else {
                                         "Approve & Run"
                                     };
-                                    let approve = button(text(approve_label).size(12))
-                                        .style(if danger.is_some() {
-                                            button::danger
-                                        } else {
-                                            button::primary
-                                        })
-                                        .on_press(Message::AgentApprove(reference));
+                                    let approve = button(
+                                        text(approve_label).size(self.effective_font_size()),
+                                    )
+                                    .style(if danger.is_some() {
+                                        button::danger
+                                    } else {
+                                        button::primary
+                                    })
+                                    .on_press(Message::AgentApprove(reference));
                                     row![
                                         approve,
-                                        button(text("Edit").size(12))
+                                        button(text("Edit").size(self.effective_font_size()))
                                             .style(button::secondary)
                                             .on_press(Message::AgentEditStart(
                                                 reference,
                                                 command.clone()
                                             )),
-                                        button(text("Reject").size(12))
+                                        button(text("Reject").size(self.effective_font_size()))
                                             .style(button::secondary)
                                             .on_press(Message::AgentReject(reference)),
                                     ]
                                     .spacing(6)
                                     .into()
                                 }
-                                ProposalStatus::Pending => {
-                                    text("pending").size(12).style(text::secondary).into()
-                                }
-                                ProposalStatus::Approved => {
-                                    text("✓ ran").size(12).style(text::secondary).into()
-                                }
-                                ProposalStatus::Rejected => {
-                                    text("✗ rejected").size(12).style(text::secondary).into()
-                                }
+                                ProposalStatus::Pending => text("pending")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
+                                ProposalStatus::Approved => text("✓ ran")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
+                                ProposalStatus::Rejected => text("✗ rejected")
+                                    .size(self.effective_font_size())
+                                    .style(text::secondary)
+                                    .into(),
                                 ProposalStatus::ManualReview => text("moved to manual review")
-                                    .size(12)
+                                    .size(self.effective_font_size())
                                     .style(text::secondary)
                                     .into(),
                             };
@@ -28118,7 +28421,7 @@ impl Frost {
                         text(crate::agent::bound_transcript_text(format!(
                             "thought: {thought}"
                         )))
-                        .size(12)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                     );
                 }
@@ -28127,7 +28430,7 @@ impl Frost {
                         text(crate::agent::bound_transcript_text(format!(
                             "proposing: {command}"
                         )))
-                        .size(13)
+                        .size(self.effective_font_size())
                         .font(iced::Font::MONOSPACE),
                     );
                 }
@@ -28136,18 +28439,21 @@ impl Frost {
                         text(crate::agent::bound_transcript_text(format!(
                             "Agent: {message}"
                         )))
-                        .size(13),
+                        .size(self.effective_font_size()),
                     );
                 }
                 if !self.agent.loading {
-                    transcript =
-                        transcript.push(text("reply interrupted").size(11).style(text::secondary));
+                    transcript = transcript.push(
+                        text("reply interrupted")
+                            .size(self.effective_font_size())
+                            .style(text::secondary),
+                    );
                 }
             }
             None if self.agent.loading => {
                 transcript = transcript.push(
                     text("waiting for the model…")
-                        .size(12)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                 );
             }
@@ -28175,19 +28481,19 @@ impl Frost {
         };
 
         let header = row![
-            text("AI Agent").size(14),
+            text("AI Agent").size(self.effective_font_size()),
             text(if self.agent.provider_label.is_empty() {
                 "not configured".to_string()
             } else {
                 self.agent.provider_label.clone()
             })
-            .size(12)
+            .size(self.effective_font_size())
             .style(text::secondary),
             Space::new().width(Length::Fill),
             text(format!("turns {turns_used}/{max_turns}"))
-                .size(12)
+                .size(self.effective_font_size())
                 .style(text::secondary),
-            button(text("✕").size(12))
+            button(text("✕").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AgentClose),
         ]
@@ -28195,10 +28501,13 @@ impl Frost {
         .align_y(iced::Alignment::Center);
 
         let status_line: Element<'_, Message> = if self.agent.status.is_empty() {
-            text(state_line).size(11).style(text::secondary).into()
+            text(state_line)
+                .size(self.effective_font_size())
+                .style(text::secondary)
+                .into()
         } else {
             text(self.agent.status.clone())
-                .size(11)
+                .size(self.effective_font_size())
                 .style(text::danger)
                 .into()
         };
@@ -28210,9 +28519,9 @@ impl Frost {
                         "attached context: `{}` ({status})",
                         crate::agent::bound_attached_context_cmd(context.cmd.clone())
                     ))
-                    .size(10)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
-                    button(text("✕").size(10))
+                    button(text("✕").size(self.effective_font_size()))
                         .style(button::secondary)
                         .padding(2)
                         .on_press(Message::AgentClearContext),
@@ -28238,12 +28547,13 @@ impl Frost {
             let mut buttons = row![].spacing(6);
             if can_continue {
                 buttons = buttons.push(
-                    button(text("Continue task").size(12)).on_press(Message::AgentContinueTask),
+                    button(text("Continue task").size(self.effective_font_size()))
+                        .on_press(Message::AgentContinueTask),
                 );
             }
             if can_restart {
                 buttons = buttons.push(
-                    button(text("New task").size(12))
+                    button(text("New task").size(self.effective_font_size()))
                         .style(button::secondary)
                         .on_press(Message::AgentNewTask),
                 );
@@ -28258,13 +28568,13 @@ impl Frost {
             &self.agent.input,
         )
         .id(AGENT_INPUT_ID.clone())
-        .size(13);
+        .size(self.effective_font_size());
         if can_submit {
             input = input
                 .on_input(Message::AgentInput)
                 .on_submit(Message::AgentSubmit);
         }
-        let mut send = button(text("Send").size(12));
+        let mut send = button(text("Send").size(self.effective_font_size()));
         if can_submit {
             send = send.on_press(Message::AgentSubmit);
         }
@@ -28315,14 +28625,14 @@ impl Frost {
             text(crate::command_correction::bound_correction_feedback(
                 candidate.display_title()
             ))
-            .size(14),
+            .size(self.effective_font_size()),
             Space::new().width(Length::Fill),
             text(crate::command_correction::bound_correction_feedback(
                 candidate.display_badge(session.exit_code)
             ))
-            .size(11)
+            .size(self.effective_font_size())
             .style(text::secondary),
-            button(text("✕").size(12))
+            button(text("✕").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::CommandCorrectionDismiss(reference)),
         ]
@@ -28336,7 +28646,7 @@ impl Frost {
         let description = text(crate::command_correction::bound_correction_feedback(
             candidate.display_description(&session.original_command),
         ))
-        .size(12)
+        .size(self.effective_font_size())
         .wrapping(text::Wrapping::Word)
         .style(text::secondary);
 
@@ -28344,7 +28654,7 @@ impl Frost {
             .id(CORRECTION_INPUT_ID.clone())
             .on_input(move |draft| Message::CommandCorrectionInput(reference, draft))
             .on_submit(Message::CommandCorrectionAccept(reference))
-            .size(13)
+            .size(self.effective_font_size())
             .font(iced::Font::MONOSPACE);
 
         let actions = row![
@@ -28354,7 +28664,7 @@ impl Frost {
                 } else {
                     "Insert for review"
                 })
-                .size(12)
+                .size(self.effective_font_size())
             )
             .style(if direct_run {
                 button::primary
@@ -28362,7 +28672,7 @@ impl Frost {
                 button::secondary
             })
             .on_press(Message::CommandCorrectionAccept(reference)),
-            button(text("Dismiss").size(12))
+            button(text("Dismiss").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::CommandCorrectionDismiss(reference)),
         ]
@@ -28380,7 +28690,7 @@ impl Frost {
                     "⚠ destructive: {}",
                     crate::command_correction::bound_correction_feedback(reason)
                 ))
-                .size(12)
+                .size(self.effective_font_size())
                 .style(text::danger),
             );
         }
@@ -28393,7 +28703,7 @@ impl Frost {
                 text(crate::command_correction::bound_correction_feedback(
                     feedback,
                 ))
-                .size(11)
+                .size(self.effective_font_size())
                 .style(text::danger),
             );
         }
@@ -28421,22 +28731,22 @@ impl Frost {
 
         let chats = &self.ai_chats;
         let header = row![
-            text("AI Chats").size(14),
+            text("AI Chats").size(self.effective_font_size()),
             text(if chats.provider_label.is_empty() {
                 "not configured".to_string()
             } else {
                 chats.provider_label.clone()
             })
-            .size(12)
+            .size(self.effective_font_size())
             .style(text::secondary),
             Space::new().width(Length::Fill),
-            button(text("Chats").size(12))
+            button(text("Chats").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiChatsShowLibrary),
-            button(text("+ New").size(12))
+            button(text("+ New").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiChatsNewChat),
-            button(text("✕").size(12))
+            button(text("✕").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiChatsClose),
         ]
@@ -28472,7 +28782,7 @@ impl Frost {
 
         let title = text_input("Chat title", &chats.title_draft)
             .on_input(Message::AiChatsTitleInput)
-            .size(13);
+            .size(self.effective_font_size());
 
         let mut transcript = column![].spacing(8);
         // Every row borrows the store's text rather than cloning it: `view()`
@@ -28486,20 +28796,22 @@ impl Frost {
                 jterm_core::ai::Role::User => (
                     "You",
                     text(crate::ai_chats::display_chat_turn(turn.text.as_str()))
-                        .size(13)
+                        .size(self.effective_font_size())
                         .into(),
                 ),
                 jterm_core::ai::Role::Assistant => (
                     "Assistant",
                     text(crate::ai_chats::display_chat_turn(turn.text.as_str()))
-                        .size(13)
+                        .size(self.effective_font_size())
                         .wrapping(text::Wrapping::Word)
                         .into(),
                 ),
             };
             transcript = transcript.push(
                 column![
-                    text(label).size(11).style(text::secondary),
+                    text(label)
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
                     container(body)
                         .padding(6)
                         .style(container::bordered_box)
@@ -28514,10 +28826,12 @@ impl Frost {
         if !partial.is_empty() {
             transcript = transcript.push(
                 column![
-                    text("Assistant").size(11).style(text::secondary),
+                    text("Assistant")
+                        .size(self.effective_font_size())
+                        .style(text::secondary),
                     container(
                         text(crate::ai_chats::display_chat_turn(partial))
-                            .size(13)
+                            .size(self.effective_font_size())
                             .wrapping(text::Wrapping::Word),
                     )
                     .padding(6)
@@ -28533,11 +28847,11 @@ impl Frost {
             transcript = transcript.push(
                 column![
                     text("Assistant (reply interrupted)")
-                        .size(11)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                     container(
                         text(crate::ai_chats::display_chat_turn(partial))
-                            .size(13)
+                            .size(self.effective_font_size())
                             .wrapping(text::Wrapping::Word),
                     )
                     .padding(6)
@@ -28550,7 +28864,7 @@ impl Frost {
         if store.active_history().is_empty() && partial.is_empty() {
             transcript = transcript.push(
                 text("Ask anything about the shell; every conversation is saved.")
-                    .size(12)
+                    .size(self.effective_font_size())
                     .style(text::secondary),
             );
         }
@@ -28559,7 +28873,7 @@ impl Frost {
             Space::new().into()
         } else {
             text(chats.status_line())
-                .size(11)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
                 .style(if chats.status_is_error() {
                     text::danger
@@ -28571,19 +28885,19 @@ impl Frost {
 
         let include_recent = checkbox(chats.include_recent(store.active_id()))
             .label("Include recent shell context")
-            .text_size(12)
+            .text_size(self.effective_font_size())
             .on_toggle(Message::AiChatsIncludeRecent);
 
         let mut composer = text_input("Ask a question…", store.active_draft())
             .id(AI_CHATS_INPUT_ID.clone())
-            .size(13);
+            .size(self.effective_font_size());
         if !busy && !archived {
             composer = composer
                 .on_input(Message::AiChatsInput)
                 .on_submit(Message::AiChatsSubmit);
         }
         let action: Element<'_, Message> = if busy {
-            button(text("Stop").size(12))
+            button(text("Stop").size(self.effective_font_size()))
                 .style(button::danger)
                 .on_press(Message::AiChatsStop)
                 .into()
@@ -28591,12 +28905,13 @@ impl Frost {
             let mut row = row![].spacing(6);
             if chats.has_retry() {
                 row = row.push(
-                    button(text("Retry").size(12))
+                    button(text("Retry").size(self.effective_font_size()))
                         .style(button::secondary)
                         .on_press(Message::AiChatsRetry),
                 );
             }
-            let mut send = button(text("Send").size(12)).style(button::primary);
+            let mut send =
+                button(text("Send").size(self.effective_font_size())).style(button::primary);
             if !archived {
                 send = send.on_press(Message::AiChatsSubmit);
             }
@@ -28605,7 +28920,7 @@ impl Frost {
 
         let archive_label = if archived { "Unarchive" } else { "Archive" };
         let manage = row![
-            button(text(archive_label).size(12))
+            button(text(archive_label).size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiChatsToggleArchive),
             button(
@@ -28614,7 +28929,7 @@ impl Frost {
                 } else {
                     "Delete"
                 })
-                .size(12)
+                .size(self.effective_font_size())
             )
             .style(button::danger)
             .on_press(Message::AiChatsDelete),
@@ -28638,13 +28953,13 @@ impl Frost {
     fn ai_chats_library_page(&self) -> Element<'_, Message> {
         let chats = &self.ai_chats;
         let back_and_search = row![
-            button(text("←").size(13))
+            button(text("←").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiChatsShowChat),
             text_input("Search chats", &chats.search)
                 .id(AI_CHATS_SEARCH_ID.clone())
                 .on_input(Message::AiChatsSearchInput)
-                .size(13),
+                .size(self.effective_font_size()),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
@@ -28658,7 +28973,7 @@ impl Frost {
                 } else {
                     "No chats match"
                 })
-                .size(13)
+                .size(self.effective_font_size())
                 .style(text::secondary),
             );
         }
@@ -28689,10 +29004,10 @@ impl Frost {
             let row_body = container(
                 column![
                     text(crate::ai_chats::bound_title_draft(summary.title))
-                        .size(13)
+                        .size(self.effective_font_size())
                         .style(title_style),
                     text(crate::review_text::bound_toast_text(meta))
-                        .size(11)
+                        .size(self.effective_font_size())
                         .style(text::secondary),
                 ]
                 .spacing(2),
@@ -28720,15 +29035,15 @@ impl Frost {
         let generation = session.generation();
 
         let header = row![
-            text("AI command suggestion").size(14),
+            text("AI command suggestion").size(self.effective_font_size()),
             Space::new().width(Length::Fill),
             text(format!(
                 "{} · review only",
                 crate::review_text::bound_provider_label(&session.provider)
             ))
-            .size(11)
+            .size(self.effective_font_size())
             .style(text::secondary),
-            button(text("✕").size(12))
+            button(text("✕").size(self.effective_font_size()))
                 .style(button::secondary)
                 .on_press(Message::AiSuggestionDismiss(generation)),
         ]
@@ -28742,7 +29057,7 @@ impl Frost {
                 180
             ))
         ))
-        .size(12)
+        .size(self.effective_font_size())
         .wrapping(text::Wrapping::Word)
         .style(text::secondary);
 
@@ -28759,14 +29074,14 @@ impl Frost {
                     },
                     command_correction::compact_one_line(&context.cmd, 72)
                 ))
-                .size(11)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
                 .style(text::secondary),
             );
         }
         card = card.push(
             text(session.status())
-                .size(11)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
                 .style(text::secondary),
         );
@@ -28774,7 +29089,7 @@ impl Frost {
         match session.phase() {
             ai_command::SuggestionPhase::Drafting => {
                 card = card.push(
-                    row![button(text("Stop").size(12))
+                    row![button(text("Stop").size(self.effective_font_size()))
                         .style(button::danger)
                         .on_press(Message::AiSuggestionDismiss(generation))]
                     .spacing(6),
@@ -28786,18 +29101,18 @@ impl Frost {
                         .id(AI_SUGGESTION_INPUT_ID.clone())
                         .on_input(move |draft| Message::AiSuggestionInput(generation, draft))
                         .on_submit(Message::AiSuggestionInsert(generation))
-                        .size(13)
+                        .size(self.effective_font_size())
                         .font(iced::Font::MONOSPACE),
                 );
                 card = card.push(
                     row![
-                        button(text("Insert for review").size(12))
+                        button(text("Insert for review").size(self.effective_font_size()))
                             .style(button::primary)
                             .on_press(Message::AiSuggestionInsert(generation)),
-                        button(text("Regenerate").size(12))
+                        button(text("Regenerate").size(self.effective_font_size()))
                             .style(button::secondary)
                             .on_press(Message::AiSuggestionRegenerate(generation)),
-                        button(text("Dismiss").size(12))
+                        button(text("Dismiss").size(self.effective_font_size()))
                             .style(button::secondary)
                             .on_press(Message::AiSuggestionDismiss(generation)),
                     ]
@@ -28807,10 +29122,10 @@ impl Frost {
             ai_command::SuggestionPhase::Failed => {
                 card = card.push(
                     row![
-                        button(text("Retry").size(12))
+                        button(text("Retry").size(self.effective_font_size()))
                             .style(button::secondary)
                             .on_press(Message::AiSuggestionRegenerate(generation)),
-                        button(text("Dismiss").size(12))
+                        button(text("Dismiss").size(self.effective_font_size()))
                             .style(button::secondary)
                             .on_press(Message::AiSuggestionDismiss(generation)),
                     ]
@@ -28821,7 +29136,7 @@ impl Frost {
         if let Some(feedback) = session.feedback.as_deref() {
             card = card.push(
                 text(crate::review_text::bound_toast_text(feedback))
-                    .size(11)
+                    .size(self.effective_font_size())
                     .wrapping(text::Wrapping::Word)
                     .style(text::danger),
             );
@@ -28829,7 +29144,7 @@ impl Frost {
         // The sources' invariant, shown verbatim on the card.
         card = card.push(
             text("Enter uses the labelled action · generated commands never run automatically")
-                .size(11)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
                 .style(text::secondary),
         );
@@ -28860,14 +29175,14 @@ impl Frost {
         .id(AI_ASK_INPUT_ID.clone())
         .on_input(Message::AiAskInput)
         .on_submit(Message::AiAskSubmit)
-        .size(14)
+        .size(self.effective_font_size())
         .into();
         let body = column![
-            row![text("?").size(16), input]
+            row![text("?").size(self.effective_font_size()), input]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
             text("AI drafts one shell command for your review. It is typed at the prompt only after you approve it and never runs automatically.")
-                .size(11)
+                .size(self.effective_font_size())
                 .wrapping(text::Wrapping::Word)
                 .style(text::secondary),
         ]
@@ -29239,11 +29554,14 @@ fn slider_row<'a>(
     label: &'static str,
     value: String,
     control: Element<'a, Message>,
+    font_size: f32,
 ) -> Element<'a, Message> {
     row![
-        text(label).size(13).width(Length::Fixed(120.0)),
+        text(label).size(font_size).width(Length::Fixed(120.0)),
         control,
-        text(value).size(13).width(Length::Fixed(64.0)),
+        text(value)
+            .size(font_size)
+            .width(Length::Fixed((font_size * 5.0).max(64.0))),
     ]
     .spacing(10)
     .align_y(iced::Alignment::Center)
@@ -32048,9 +32366,10 @@ mod tests {
             .split_once("    fn companion_toggle(")
             .unwrap()
             .0;
-        assert!(bar.contains("text(\"volatile · no LLM\").size(10).color(self.c_text_dim())"));
+        assert!(bar.contains("text(\"volatile · no LLM\")"));
+        assert!(bar.contains(".size(self.effective_font_size())"));
         assert!(bar.contains("weight: iced::font::Weight::Bold"));
-        assert!(bar.contains(".height(Length::Fixed(32.0))"));
+        assert!(bar.contains(".height(Length::Fixed(self.effective_font_size() * 2.6))"));
         assert!(
             bar.contains("companion_status_with_slot(bar.into(), self.companion_toggle(false), 8)")
         );
@@ -32098,7 +32417,7 @@ mod tests {
                             assert!(!layout.glyph, "Block mode never duplicates the footer slot");
                             assert_eq!(
                                 native_status_rows(true, expanded, 18.0),
-                                if expanded { 4 } else { 1 }
+                                if expanded { 5 } else { 1 }
                             );
                             let moving = motion == organism::Motion::Full;
                             let body = motion != organism::Motion::Static;
@@ -32422,12 +32741,17 @@ mod tests {
         for window_height in [0.0, 1.0, 40.0, 88.0, 100.0, 800.0] {
             for reading_height in [0.0, 64.0, 116.0] {
                 let compact =
-                    terminal_height_after_chrome(window_height, true, reading_height, 0.0);
-                let expanded =
-                    terminal_height_after_chrome(window_height, true, reading_height, reserved);
+                    terminal_height_after_chrome(window_height, 14.0, true, reading_height, 0.0);
+                let expanded = terminal_height_after_chrome(
+                    window_height,
+                    14.0,
+                    true,
+                    reading_height,
+                    reserved,
+                );
                 assert_eq!(
                     compact,
-                    (window_height - chrome_height(true) - reading_height).max(0.0)
+                    (window_height - chrome_height(14.0, true) - reading_height).max(0.0)
                 );
                 assert_eq!(expanded, (compact - 88.0).max(0.0));
                 assert!(expanded >= 0.0);
@@ -32448,7 +32772,7 @@ mod tests {
         let term = source.split_once("    fn term_height(&self)").unwrap().1;
         let term = term.split_once("    fn term_width(&self)").unwrap().0;
         assert!(term.contains("self.organism_strip_height()"));
-        assert!(source.contains("STATUS_BAR_H + self.organism_strip_height() + 12.0"));
+        assert!(source.contains("self.status_bar_height() + self.organism_strip_height() + 12.0"));
         let bar = source.split_once("    fn status_bar(&self)").unwrap().1;
         let bar = bar.split_once("    fn jsh_notice(&self)").unwrap().0;
         assert_eq!(bar.matches(".presentation_with_attention(").count(), 1);
@@ -36308,11 +36632,11 @@ mod tests {
         let metrics = Metrics::new(10.0, 1.0, 0.0, false);
         let old_grid = metrics.grid_size(
             old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-            old_viewport.height - chrome_height(true),
+            old_viewport.height - chrome_height(14.0, true),
         );
         let new_grid = metrics.grid_size(
             new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-            new_viewport.height - chrome_height(true),
+            new_viewport.height - chrome_height(14.0, true),
         );
         assert!(new_grid.0 < old_grid.0);
         assert!(new_grid.1 < old_grid.1);
@@ -36324,8 +36648,8 @@ mod tests {
         let metrics = Metrics::new(10.0, 1.0, 0.0, false);
         let viewport = Size::new(1200.0, 800.0);
         let width = viewport.width - terminal_view::SCROLLBAR_WIDTH;
-        let with_bar = metrics.grid_size(width, viewport.height - chrome_height(true));
-        let without_bar = metrics.grid_size(width, viewport.height - chrome_height(false));
+        let with_bar = metrics.grid_size(width, viewport.height - chrome_height(14.0, true));
+        let without_bar = metrics.grid_size(width, viewport.height - chrome_height(14.0, false));
         assert_eq!(with_bar.0, without_bar.0);
         assert!(without_bar.1 > with_bar.1);
     }

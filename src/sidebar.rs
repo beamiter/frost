@@ -1929,6 +1929,7 @@ pub const SIDEBAR_TREE_ROW_GAP: f32 = 1.0;
 /// Extra rows built above and below the viewport so wheel scrolling stays smooth.
 pub const SIDEBAR_TREE_OVERSCAN: usize = 8;
 
+#[cfg(test)]
 pub fn sidebar_tree_stride() -> f32 {
     SIDEBAR_TREE_ROW_HEIGHT + SIDEBAR_TREE_ROW_GAP
 }
@@ -2045,11 +2046,13 @@ pub fn sidebar_tree_window(
     offset_y: f32,
     viewport_h: f32,
     item_count: usize,
+    row_height: f32,
 ) -> (usize, usize, f32, f32) {
     if item_count == 0 {
         return (0, 0, 0.0, 0.0);
     }
-    let stride = sidebar_tree_stride();
+    let row_height = row_height.max(1.0);
+    let stride = row_height + SIDEBAR_TREE_ROW_GAP;
     let offset_y = offset_y.max(0.0);
     let first = (offset_y / stride).floor().max(0.0) as usize;
     let start = first.saturating_sub(SIDEBAR_TREE_OVERSCAN);
@@ -2075,20 +2078,22 @@ pub fn sidebar_tree_reveal_offset(
     offset_y: f32,
     viewport_h: f32,
     item_count: usize,
+    row_height: f32,
 ) -> f32 {
     if item_count == 0 {
         return 0.0;
     }
-    let stride = sidebar_tree_stride();
+    let row_height = row_height.max(1.0);
+    let stride = row_height + SIDEBAR_TREE_ROW_GAP;
     let max_offset = ((item_count as f32 * stride) - viewport_h.max(0.0)).max(0.0);
     let row_top = index as f32 * stride;
-    let row_bottom = row_top + SIDEBAR_TREE_ROW_HEIGHT;
+    let row_bottom = row_top + row_height;
     let offset_y = offset_y.clamp(0.0, max_offset);
-    let view_bottom = offset_y + viewport_h.max(SIDEBAR_TREE_ROW_HEIGHT);
+    let view_bottom = offset_y + viewport_h.max(row_height);
     if row_top < offset_y {
         row_top.min(max_offset)
     } else if row_bottom > view_bottom {
-        (row_bottom - viewport_h.max(SIDEBAR_TREE_ROW_HEIGHT)).clamp(0.0, max_offset)
+        (row_bottom - viewport_h.max(row_height)).clamp(0.0, max_offset)
     } else {
         offset_y
     }
@@ -3747,32 +3752,61 @@ mod tests {
 
     #[test]
     fn tree_window_overscans_and_pads_to_the_full_height() {
-        assert_eq!(sidebar_tree_window(0.0, 100.0, 0), (0, 0, 0.0, 0.0));
+        assert_eq!(
+            sidebar_tree_window(0.0, 100.0, 0, SIDEBAR_TREE_ROW_HEIGHT),
+            (0, 0, 0.0, 0.0)
+        );
         let stride = sidebar_tree_stride();
-        let (start, count, pad_top, pad_bottom) = sidebar_tree_window(0.0, stride * 4.0, 4);
+        let (start, count, pad_top, pad_bottom) =
+            sidebar_tree_window(0.0, stride * 4.0, 4, SIDEBAR_TREE_ROW_HEIGHT);
         assert_eq!(start, 0);
         assert_eq!(count, 4);
         assert_eq!(pad_top, 0.0);
         assert_eq!(pad_bottom, 0.0);
         let (start, count, pad_top, pad_bottom) =
-            sidebar_tree_window(stride * 20.0, stride * 5.0, 80);
+            sidebar_tree_window(stride * 20.0, stride * 5.0, 80, SIDEBAR_TREE_ROW_HEIGHT);
         assert_eq!(start, 20 - SIDEBAR_TREE_OVERSCAN);
         assert!(count > 5);
         assert_eq!(pad_top, start as f32 * stride);
         assert_eq!(pad_bottom, (80 - start - count) as f32 * stride);
-        let (start, count, _, pad_bottom) = sidebar_tree_window(stride * 200.0, stride * 5.0, 80);
+        let (start, count, _, pad_bottom) =
+            sidebar_tree_window(stride * 200.0, stride * 5.0, 80, SIDEBAR_TREE_ROW_HEIGHT);
         assert!(start + count <= 80);
         assert_eq!(pad_bottom, 0.0);
+    }
+
+    #[test]
+    fn zoomed_tree_virtualization_and_keyboard_reveal_share_row_geometry() {
+        for row_height in [22.0, 27.0, 40.0, 102.0] {
+            let stride = row_height + SIDEBAR_TREE_ROW_GAP;
+            let viewport = stride * 5.0;
+            let offset = sidebar_tree_reveal_offset(50, 0.0, viewport, 100, row_height);
+            assert_eq!(offset, 50.0 * stride + row_height - viewport);
+            let (start, count, top, bottom) =
+                sidebar_tree_window(offset, viewport, 100, row_height);
+            assert!(start <= 50 && 50 < start + count);
+            assert_eq!(top, start as f32 * stride);
+            assert_eq!(top + count as f32 * stride + bottom, 100.0 * stride);
+            assert_eq!(
+                sidebar_tree_reveal_offset(0, offset, viewport, 100, row_height),
+                0.0
+            );
+            let (_, _, _, bottom) = sidebar_tree_window(1_000_000.0, viewport, 100, row_height);
+            assert_eq!(bottom, 0.0);
+        }
     }
 
     #[test]
     fn tree_reveal_offset_brings_the_row_into_the_viewport() {
         let stride = sidebar_tree_stride();
         let viewport = stride * 5.0;
-        assert_eq!(sidebar_tree_reveal_offset(0, 0.0, viewport, 20), 0.0);
-        let down = sidebar_tree_reveal_offset(10, 0.0, viewport, 20);
+        assert_eq!(
+            sidebar_tree_reveal_offset(0, 0.0, viewport, 20, SIDEBAR_TREE_ROW_HEIGHT),
+            0.0
+        );
+        let down = sidebar_tree_reveal_offset(10, 0.0, viewport, 20, SIDEBAR_TREE_ROW_HEIGHT);
         assert!(down > 0.0);
-        let up = sidebar_tree_reveal_offset(0, stride * 8.0, viewport, 20);
+        let up = sidebar_tree_reveal_offset(0, stride * 8.0, viewport, 20, SIDEBAR_TREE_ROW_HEIGHT);
         assert_eq!(up, 0.0);
     }
 

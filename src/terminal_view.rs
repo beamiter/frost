@@ -4128,7 +4128,7 @@ where
                         Text {
                             content,
                             bounds: Size::new(f32::INFINITY, ch),
-                            size: Pixels((font_size * 0.9).max(8.0)),
+                            size: Pixels(font_size),
                             line_height: text::LineHeight::Absolute(Pixels(ch)),
                             font,
                             align_x: text::Alignment::Left,
@@ -4189,12 +4189,12 @@ where
                 },
                 Rectangle {
                     x: ox + 6.0,
-                    y: rect.y,
+                    y: rect.y - 1.0,
                     width: (rect.x - ox - 18.0).max(0.0),
-                    height: rect.height,
+                    height: ch,
                 },
                 self.mono,
-                self.metrics.font_size * 0.72,
+                self.metrics.font_size,
                 alpha(default_fg, 0.45),
                 clip,
             );
@@ -4388,9 +4388,9 @@ where
             if let Some(header) = &block.native_header {
                 let area = Rectangle {
                     x: bounds.x + BLOCK_CARD_INSET,
-                    y: y + 1.0,
+                    y,
                     width: (scrollbar_track_left - bounds.x - 2.0 * BLOCK_CARD_INSET).max(0.0),
-                    height: ch - 1.0,
+                    height: ch,
                 };
                 renderer.fill_quad(
                     solid_quad(area),
@@ -4437,7 +4437,7 @@ where
                         ..area
                     },
                     self.mono,
-                    self.metrics.font_size * 0.82,
+                    self.metrics.font_size,
                     alpha(default_fg, 0.6),
                     clip,
                 );
@@ -4522,7 +4522,7 @@ where
                                 ..area
                             },
                             self.mono,
-                            self.metrics.font_size * 0.82,
+                            self.metrics.font_size,
                             alpha(default_fg, 0.7),
                             clip,
                         );
@@ -4567,7 +4567,7 @@ where
                                 height: text_h,
                             },
                             bold,
-                            self.metrics.font_size * 0.9,
+                            self.metrics.font_size,
                             default_fg,
                             clip,
                         );
@@ -4581,7 +4581,7 @@ where
                                 height: text_h,
                             },
                             self.mono,
-                            self.metrics.font_size * 0.9,
+                            self.metrics.font_size,
                             if matches!(
                                 presentation.tone,
                                 Some(
@@ -4605,12 +4605,12 @@ where
                                 height: text_h,
                             },
                             self.mono,
-                            self.metrics.font_size * 0.82,
+                            self.metrics.font_size,
                             alpha(default_fg, 0.5),
                             clip,
                         );
-                        let badge_w = 19.0 * cw * 0.82;
-                        if detail_w > 330.0 + badge_w {
+                        let badge_w = 19.0 * cw;
+                        if detail_w > 14.0 * cw + 12.0 + badge_w {
                             chrome_text(
                                 renderer,
                                 "volatile · no LLM",
@@ -4621,7 +4621,7 @@ where
                                     height: text_h,
                                 },
                                 self.mono,
-                                self.metrics.font_size * 0.82,
+                                self.metrics.font_size,
                                 alpha(default_fg, 0.5),
                                 clip,
                             );
