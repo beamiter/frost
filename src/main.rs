@@ -3954,6 +3954,8 @@ enum Message {
     AiSuggestionDismiss(u64),
     // Experimental Tasks dashboard (native Codex/Claude runtime + isolated worktrees).
     TaskPanelToggle,
+    TaskDashboardQuery(String),
+    TaskDashboardView(agent_task::DashboardView),
     TaskSelect(agent_task::TaskId),
     TaskHide(agent_task::TaskId),
     TaskCreateWithProvider(std::sync::Arc<()>, agent_task::AgentProvider),
@@ -15442,6 +15444,14 @@ impl Frost {
             }
             Message::TaskPanelToggle => {
                 self.toggle_task_panel();
+            }
+            Message::TaskDashboardQuery(query) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_query = query.chars().take(256).collect();
+            }
+            Message::TaskDashboardView(view) => {
+                self.task_panel.retire_panel_callbacks();
+                self.task_panel.dashboard_view = view;
             }
             Message::TaskSelect(task_id) => {
                 self.task_panel.select(Some(task_id));
@@ -27125,14 +27135,71 @@ impl Frost {
                     .style(text::secondary),
             );
         }
-        let mut tasks: Vec<&agent_task::AgentTask> = self
+        body = body.push(
+            text_input(
+                "Search tasks, providers or repositories",
+                &self.task_panel.dashboard_query,
+            )
+            .on_input(Message::TaskDashboardQuery)
+            .size(12),
+        );
+        let mut filters = row![].spacing(4);
+        for (view, label) in [
+            (agent_task::DashboardView::All, "All"),
+            (agent_task::DashboardView::NeedsAttention, "Needs you"),
+            (agent_task::DashboardView::Running, "Running"),
+            (agent_task::DashboardView::NotStarted, "Not started"),
+            (agent_task::DashboardView::Review, "Review"),
+            (agent_task::DashboardView::Finished, "Finished"),
+        ] {
+            filters = filters.push(
+                button(text(label).size(10))
+                    .style(self.tab_btn_style(self.task_panel.dashboard_view == view))
+                    .on_press(Message::TaskDashboardView(view)),
+            );
+        }
+        body = body.push(filters.wrap());
+        let dashboard = agent_task::DashboardSnapshot::project(
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != agent_task::TaskStatus::Archived),
+            |id| agent_task::DashboardActivity {
+                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
+                native_preparing: self.agent_runtime.has_preparing(id),
+                ..Default::default()
+            },
+            agent_task::DashboardFilter {
+                text: &self.task_panel.dashboard_query,
+                view: self.task_panel.dashboard_view,
+                ..Default::default()
+            },
+        );
+        body = body.push(
+            text(format!(
+                "{} tasks · {} need you · {} awaiting approval",
+                dashboard.counts.total,
+                dashboard.counts.attention,
+                dashboard.counts.pending_approval
+            ))
+            .size(11)
+            .style(text::secondary),
+        );
+        let tasks: Vec<_> = dashboard
+            .rows
+            .iter()
+            .filter_map(|row| self.task_manager.get(row.id))
+            .collect();
+        let has_tasks = self
             .task_manager
             .tasks()
             .iter()
-            .filter(|task| task.status != agent_task::TaskStatus::Archived)
-            .collect();
-        tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
+            .any(|task| task.status != agent_task::TaskStatus::Archived);
+        if tasks.is_empty() && has_tasks {
+            body = body.push(text("No tasks match these filters.").size(12));
+        }
         if tasks.is_empty()
+            && !has_tasks
             && self.task_panel.pending_creation.is_none()
             && self.task_panel.provider_picker.is_none()
         {
@@ -27169,7 +27236,11 @@ impl Frost {
                 .spacing(1),
             );
         }
-        if let Some(task_id) = self.task_panel.selected {
+        if let Some(task_id) = self
+            .task_panel
+            .selected
+            .filter(|id| dashboard.selected_index(Some(*id)).is_some())
+        {
             if let Some(task) = self.task_manager.get(task_id) {
                 body = body.push(self.task_card(task));
             }

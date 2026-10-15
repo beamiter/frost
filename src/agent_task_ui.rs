@@ -327,6 +327,8 @@ pub(crate) struct TaskFollowUpRef {
 
 pub(crate) struct TaskPanel {
     pub(crate) selected: Option<TaskId>,
+    pub(crate) dashboard_query: String,
+    pub(crate) dashboard_view: crate::agent_task::DashboardView,
     /// Draft review feedback for the selected task's next native turn.
     pub(crate) follow_up: String,
     follow_up_epoch: Arc<()>,
@@ -344,6 +346,8 @@ impl TaskPanel {
     pub(crate) fn new() -> Self {
         Self {
             selected: None,
+            dashboard_query: String::new(),
+            dashboard_view: crate::agent_task::DashboardView::All,
             follow_up: String::new(),
             follow_up_epoch: Arc::new(()),
             pending_creation: None,
