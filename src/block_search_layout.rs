@@ -21,11 +21,28 @@ pub(crate) fn compact(panel: Size) -> bool {
 /// Run only after an explicit query, navigation, filter, rebuild or resize.
 /// Manual scrolling and ordinary redraws never schedule this operation.
 pub(crate) fn reveal<T: Send + 'static>() -> Task<T> {
-    widget::operate(operation::scope(Id::new(PANEL_ID), Reveal::default()))
+    reveal_target(PANEL_ID, SCROLL_ID, SELECTED_ID)
+}
+
+pub(crate) fn reveal_target<T: Send + 'static>(
+    panel: &'static str,
+    scroll: &'static str,
+    selected: &'static str,
+) -> Task<T> {
+    widget::operate(operation::scope(
+        Id::new(panel),
+        Reveal {
+            scroll_id: Some(scroll),
+            selected_id: Some(selected),
+            ..Reveal::default()
+        },
+    ))
 }
 
 #[derive(Default)]
 struct Reveal {
+    scroll_id: Option<&'static str>,
+    selected_id: Option<&'static str>,
     viewport: Option<(Rectangle, Vector)>,
     selected: Option<Rectangle>,
     feedback: Option<Rectangle>,
@@ -37,7 +54,7 @@ impl<T: 'static> Operation<T> for Reveal {
     }
 
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if id == Some(&Id::new(SELECTED_ID)) {
+        if id == Some(&Id::new(self.selected_id.unwrap_or(SELECTED_ID))) {
             self.selected = Some(bounds);
         } else if id == Some(&Id::new(FEEDBACK_ID)) {
             self.feedback = Some(bounds);
@@ -52,7 +69,7 @@ impl<T: 'static> Operation<T> for Reveal {
         translation: Vector,
         _state: &mut dyn operation::Scrollable,
     ) {
-        if id == Some(&Id::new(SCROLL_ID)) {
+        if id == Some(&Id::new(self.scroll_id.unwrap_or(SCROLL_ID))) {
             self.viewport = Some((bounds, translation));
         }
     }
@@ -66,7 +83,7 @@ impl<T: 'static> Operation<T> for Reveal {
         };
         match reveal_offset(viewport, translation.y, target) {
             Some(y) => operation::Outcome::Chain(Box::new(operation::scrollable::scroll_to(
-                Id::new(SCROLL_ID),
+                Id::new(self.scroll_id.unwrap_or(SCROLL_ID)),
                 operation::scrollable::AbsoluteOffset {
                     x: None,
                     y: Some(y),
@@ -138,7 +155,16 @@ mod tests {
         use iced::widget::{column, container, scrollable, Space};
         use iced::Length;
 
-        for target_id in [SELECTED_ID, FEEDBACK_ID] {
+        for (panel_id, scroll_id, selected_id, target_id) in [
+            (PANEL_ID, SCROLL_ID, SELECTED_ID, SELECTED_ID),
+            (PANEL_ID, SCROLL_ID, SELECTED_ID, FEEDBACK_ID),
+            (
+                "block-menu-panel",
+                "block-menu-scroll",
+                "block-menu-selected",
+                "block-menu-selected",
+            ),
+        ] {
             let mut element: iced::Element<'_, (), iced::Theme, ()> = container(
                 column![
                     container(Space::new().height(28)).id("query"),
@@ -147,12 +173,12 @@ mod tests {
                         container(Space::new().height(40)).id(target_id),
                         Space::new().height(200),
                     ])
-                    .id(SCROLL_ID)
+                    .id(scroll_id)
                     .height(Length::Fill),
                 ]
                 .spacing(8),
             )
-            .id(PANEL_ID)
+            .id(panel_id)
             .padding(12)
             .width(248)
             .height(168)
@@ -173,10 +199,18 @@ mod tests {
                 }
             };
             apply(Box::new(operation::scope(
-                Id::new(PANEL_ID),
-                Reveal::default(),
+                Id::new(panel_id),
+                Reveal {
+                    scroll_id: Some(scroll_id),
+                    selected_id: Some(selected_id),
+                    ..Reveal::default()
+                },
             )));
-            let mut measured = Reveal::default();
+            let mut measured = Reveal {
+                scroll_id: Some(scroll_id),
+                selected_id: Some(selected_id),
+                ..Reveal::default()
+            };
             element
                 .as_widget_mut()
                 .operate(&mut tree, Layout::new(&node), &(), &mut measured);

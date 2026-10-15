@@ -2370,6 +2370,7 @@ struct BlockMenuState {
     session_id: usize,
     zone_id: u64,
     anchor: iced::Point,
+    focused_action: Option<BlockMenuAction>,
 }
 
 /// Review snapshots never own executable actions. Insert revalidates the live pane,
@@ -2434,6 +2435,7 @@ where
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockMenuAction {
+    Close,
     Details,
     CopyCommand,
     AskAi,
@@ -2456,6 +2458,79 @@ enum BlockMenuAction {
     Retry,
     Clear,
     UndoClear,
+}
+
+/// The same available actions gate pointer buttons and keyboard activation.
+fn block_menu_actions(
+    collapsed: Option<bool>,
+    selected_commands: bool,
+    clicked_command: bool,
+    failed: bool,
+    tasks_enabled: bool,
+) -> Vec<BlockMenuAction> {
+    use BlockMenuAction::*;
+    let mut actions = vec![Details, Close];
+    if let Some(collapsed) = collapsed {
+        actions.push(if collapsed {
+            ExpandOutput
+        } else {
+            CollapseOutput
+        });
+    }
+    if selected_commands {
+        actions.push(CopyCommand);
+    }
+    actions.push(AskAi);
+    if failed {
+        actions.extend([FixWithAgent, ExplainWithAgent, Retry]);
+        if tasks_enabled {
+            actions.push(CreateTask);
+        }
+    }
+    actions.extend([CopyOutput, CopyBlock, CopyMarkdown]);
+    if clicked_command {
+        actions.push(RecallCommand);
+    }
+    if selected_commands {
+        actions.push(ReinputSelected);
+    }
+    actions.extend([
+        ToggleBookmark,
+        Search,
+        JumpTop,
+        JumpBottom,
+        ExportMarkdown,
+        ExportJson,
+        Clear,
+        UndoClear,
+    ]);
+    actions
+}
+
+fn block_menu_navigation(
+    actions: &[BlockMenuAction],
+    focused: Option<BlockMenuAction>,
+    key: &keyboard::Key,
+) -> Option<BlockMenuAction> {
+    use keyboard::{key::Named, Key};
+    if actions.is_empty() {
+        return None;
+    }
+    let index = focused.and_then(|action| actions.iter().position(|item| *item == action));
+    let index = match key {
+        Key::Named(Named::Home) => 0,
+        Key::Named(Named::End) => actions.len().checked_sub(1)?,
+        Key::Named(Named::ArrowDown) => index.map_or(0, |index| (index + 1) % actions.len()),
+        Key::Named(Named::ArrowUp) => index.map_or(actions.len().checked_sub(1)?, |index| {
+            if index == 0 {
+                actions.len() - 1
+            } else {
+                index - 1
+            }
+        }),
+        _ => return focused.filter(|action| actions.contains(action)),
+    };
+    actions.get(index).copied()
 }
 
 /// Menu labels teach only the real equivalent keyboard action, never a default.
@@ -10958,6 +11033,9 @@ impl Frost {
         let Some(menu) = self.block_menu.take() else {
             return Task::none();
         };
+        if action == BlockMenuAction::Close {
+            return Task::none();
+        }
         // Fix/Explain/Retry look the source session up by its stable id rather
         // than through the focused pane: the Agent task or replay stays bound
         // to the terminal that produced the block even when focus moved after
@@ -11054,7 +11132,8 @@ impl Frost {
             BlockMenuAction::UndoClear => self.undo_block_clear(),
             // Returned by the stable-id dispatch above, before the focus-bound
             // liveness check these remaining actions require.
-            BlockMenuAction::FixWithAgent
+            BlockMenuAction::Close
+            | BlockMenuAction::FixWithAgent
             | BlockMenuAction::ExplainWithAgent
             | BlockMenuAction::CreateTask
             | BlockMenuAction::Retry => Task::none(),
@@ -12548,6 +12627,7 @@ impl Frost {
                         session_id: sess.id,
                         zone_id: id,
                         anchor: iced::Point::new(x, y),
+                        focused_action: None,
                     });
                 }
             }
@@ -16103,7 +16183,8 @@ impl Frost {
                 let recall_surface_open = self.history_picker.is_some()
                     || self.palette.is_open
                     || self.workflow_overlay.is_some()
-                    || self.block_review.is_some();
+                    || self.block_review.is_some()
+                    || self.block_menu.is_some();
                 if recall_surface_open {
                     self.native_enter_ownership.lock().claim_held();
                 }
@@ -16164,10 +16245,7 @@ impl Frost {
                         return Task::none();
                     }
                     if self.block_menu.is_some() {
-                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                            self.block_menu = None;
-                        }
-                        return Task::none();
+                        return self.handle_block_menu_key(&key, modifiers);
                     }
                     // The sidebar's file dialogs are modal over the terminal:
                     // Enter submits (the focused input also reports it via
@@ -21470,6 +21548,82 @@ impl Frost {
         .into()
     }
 
+    fn available_block_menu_actions(&self, state: BlockMenuState) -> Vec<BlockMenuAction> {
+        let Some(sess) = self
+            .sessions
+            .iter()
+            .find(|sess| sess.id == state.session_id)
+        else {
+            return vec![BlockMenuAction::Close];
+        };
+        let Some(zone) = sess.terminal.zone_by_id(state.zone_id) else {
+            return vec![BlockMenuAction::Close];
+        };
+        let selection = block_menu_selection_summary(
+            sess.terminal
+                .command_zones
+                .iter()
+                .map(|zone| (zone.id, zone.command.as_deref())),
+            &sess.block_selection,
+            zone.id,
+        );
+        let collapsed = sess.projection_policy.is_collapsed(zone.id);
+        block_menu_actions(
+            (collapsed || sess.terminal.finished_output_range(zone.id).is_some())
+                .then_some(collapsed),
+            selection.has_selected_commands,
+            selection.clicked_has_command,
+            matches!(
+                block_mode::classify(zone.command.as_deref(), zone.exit_code),
+                block_mode::BlockOutcome::Failed(_)
+            ),
+            self.config.experimental_task_sidebar,
+        )
+    }
+
+    fn handle_block_menu_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+    ) -> Task<Message> {
+        use keyboard::{key::Named, Key};
+        if matches!(key, Key::Named(Named::Escape)) {
+            self.block_menu = None;
+            return Task::none();
+        }
+        let Some(menu) = self.block_menu else {
+            return Task::none();
+        };
+        if modifiers.shift() || modifiers.control() || modifiers.alt() || modifiers.logo() {
+            return Task::none();
+        }
+        let actions = self.available_block_menu_actions(menu);
+        if matches!(key, Key::Named(Named::Enter)) {
+            if let Some(action) = menu
+                .focused_action
+                .filter(|action| actions.contains(action))
+            {
+                return self.execute_block_menu_action(action);
+            }
+            return Task::none();
+        }
+        if matches!(
+            key,
+            Key::Named(Named::ArrowUp | Named::ArrowDown | Named::Home | Named::End)
+        ) {
+            if let Some(state) = self.block_menu.as_mut() {
+                state.focused_action = block_menu_navigation(&actions, menu.focused_action, key);
+            }
+            return block_search_layout::reveal_target(
+                "block-menu-panel",
+                "block-menu-scroll",
+                "block-menu-selected",
+            );
+        }
+        // Text, shortcuts, and all other keys remain owned by the menu.
+        Task::none()
+    }
+
     fn block_menu_view(&self, state: BlockMenuState) -> Element<'_, Message> {
         let target = self
             .sessions
@@ -21480,7 +21634,9 @@ impl Frost {
                     .zone_by_id(state.zone_id)
                     .map(|zone| (sess, zone))
             });
-        let row_btn = |label: &str, action: BlockMenuAction| {
+        let actions = self.available_block_menu_actions(state);
+        let row_btn = |label: &str, action: BlockMenuAction| -> Element<'_, Message> {
+            let focused = state.focused_action == Some(action) && actions.contains(&action);
             let mut content = column![self.popup_text(label.to_string())].spacing(2);
             if let Some(shortcut) = block_menu_shortcut_command(action)
                 .and_then(|command| self.keybindings.shortcut_label(command))
@@ -21492,11 +21648,29 @@ impl Frost {
                         .wrapping(text::Wrapping::Word),
                 );
             }
-            button(content)
-                .on_press(Message::BlockMenuAction(action))
+            let button = button(content)
+                .on_press_maybe(
+                    actions
+                        .contains(&action)
+                        .then_some(Message::BlockMenuAction(action)),
+                )
                 .padding([5, 9])
                 .width(Length::Fill)
-                .style(self.ghost_btn_style())
+                .style(move |theme, status| {
+                    if focused {
+                        button::primary(theme, status)
+                    } else if action == BlockMenuAction::Clear {
+                        button::danger(theme, status)
+                    } else {
+                        self.ghost_btn_style()(theme, status)
+                    }
+                });
+            let item = container(button).width(Length::Fill);
+            if focused {
+                item.id("block-menu-selected").into()
+            } else {
+                item.into()
+            }
         };
 
         let mut body = column![].spacing(7);
@@ -21552,10 +21726,7 @@ impl Frost {
                     row![
                         self.popup_text(format!("Command Block #{}", zone.id)),
                         Space::new().width(Length::Fill),
-                        button(self.popup_text("×"))
-                            .on_press(Message::BlockMenuClose)
-                            .padding([2, 7])
-                            .style(self.ghost_btn_style()),
+                        container(row_btn("Close", BlockMenuAction::Close)).width(72),
                     ]
                     .align_y(iced::Alignment::Center),
                 )
@@ -21713,37 +21884,29 @@ impl Frost {
                     ]
                     .spacing(6),
                 )
-                .push(
-                    button(self.popup_text("Clear all completed blocks…"))
-                        .on_press(Message::BlockMenuAction(BlockMenuAction::Clear))
-                        .padding([5, 9])
-                        .width(Length::Fill)
-                        .style(button::danger),
-                )
-                .push(
-                    button(self.popup_text("Undo clear blocks"))
-                        .on_press(Message::BlockMenuAction(BlockMenuAction::UndoClear))
-                        .padding([5, 9])
-                        .width(Length::Fill)
-                        .style(self.ghost_btn_style()),
-                );
+                .push(row_btn(
+                    "Clear all completed blocks…",
+                    BlockMenuAction::Clear,
+                ))
+                .push(row_btn("Undo clear blocks", BlockMenuAction::UndoClear));
         } else {
             body = body
                 .push(self.popup_text("Command block is no longer available"))
-                .push(
-                    button(self.popup_text("Close"))
-                        .on_press(Message::BlockMenuClose)
-                        .style(self.ghost_btn_style()),
-                );
+                .push(row_btn("Close", BlockMenuAction::Close));
         }
 
         let panel_width = (self.win_size.width - 12.0).clamp(1.0, 360.0);
         let panel_height = (self.win_size.height - self.tab_bar_height() - 12.0).clamp(1.0, 520.0);
-        let panel = container(scrollable(body).height(Length::Shrink))
-            .width(Length::Fixed(panel_width))
-            .max_height(panel_height)
-            .padding(12)
-            .style(self.popup_style());
+        let panel = container(
+            scrollable(body)
+                .id("block-menu-scroll")
+                .height(Length::Shrink),
+        )
+        .id("block-menu-panel")
+        .width(Length::Fixed(panel_width))
+        .max_height(panel_height)
+        .padding(12)
+        .style(self.popup_style());
         let dismiss = mouse_area(
             container(Space::new())
                 .width(Length::Fill)
@@ -41923,5 +42086,152 @@ mod tests {
         assert_ne!(bindings.shortcut_label(command).unwrap(), first);
         bindings.bindings.clear();
         assert_eq!(bindings.shortcut_label(command), None);
+    }
+    #[test]
+    fn block_menu_keyboard_traverses_only_renderable_actions_in_order() {
+        use keyboard::{key::Named, Key};
+        for collapsed in [None, Some(false), Some(true)] {
+            for selected in [false, true] {
+                for clicked in [false, true] {
+                    for failed in [false, true] {
+                        for tasks in [false, true] {
+                            let actions =
+                                block_menu_actions(collapsed, selected, clicked, failed, tasks);
+                            assert_eq!(actions.contains(&BlockMenuAction::CopyCommand), selected);
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::ReinputSelected),
+                                selected
+                            );
+                            assert_eq!(actions.contains(&BlockMenuAction::RecallCommand), clicked);
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::CreateTask),
+                                failed && tasks
+                            );
+                            assert_eq!(actions.contains(&BlockMenuAction::Retry), failed);
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::CollapseOutput),
+                                collapsed == Some(false)
+                            );
+                            assert_eq!(
+                                actions.contains(&BlockMenuAction::ExpandOutput),
+                                collapsed == Some(true)
+                            );
+                            let mut focused = None;
+                            for action in &actions {
+                                focused = block_menu_navigation(
+                                    &actions,
+                                    focused,
+                                    &Key::Named(Named::ArrowDown),
+                                );
+                                assert_eq!(focused, Some(*action));
+                            }
+                            assert_eq!(
+                                block_menu_navigation(
+                                    &actions,
+                                    focused,
+                                    &Key::Named(Named::ArrowDown)
+                                ),
+                                actions.first().copied()
+                            );
+                            assert_eq!(
+                                block_menu_navigation(&actions, None, &Key::Named(Named::ArrowUp)),
+                                actions.last().copied()
+                            );
+                            assert_eq!(
+                                block_menu_navigation(&actions, focused, &Key::Named(Named::Home)),
+                                actions.first().copied()
+                            );
+                            assert_eq!(
+                                block_menu_navigation(&actions, None, &Key::Named(Named::End)),
+                                actions.last().copied()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_menu_focus_never_retargets_a_removed_action() {
+        use keyboard::{key::Named, Key};
+        let actions = [
+            BlockMenuAction::Details,
+            BlockMenuAction::ExpandOutput,
+            BlockMenuAction::Close,
+        ];
+        assert_eq!(
+            block_menu_navigation(
+                &actions,
+                Some(BlockMenuAction::CollapseOutput),
+                &Key::Named(Named::Enter)
+            ),
+            None
+        );
+        assert_eq!(
+            block_menu_navigation(&[], None, &Key::Named(Named::ArrowDown)),
+            None
+        );
+        assert_eq!(
+            block_menu_navigation(&[BlockMenuAction::Close], None, &Key::Named(Named::End)),
+            Some(BlockMenuAction::Close)
+        );
+    }
+
+    #[test]
+    fn block_menu_enter_cannot_repeat_into_the_shell_or_a_confirmation() {
+        let mut latch = PromptRecallEnterLatch::default();
+        let press = history_enter_event(true, false, keyboard::Location::Standard);
+        let repeat = history_enter_event(true, true, keyboard::Location::Standard);
+        let release = history_enter_event(false, false, keyboard::Location::Standard);
+        assert!(!latch.consume(&press, true));
+        assert!(latch.consume(&repeat, false));
+        assert!(latch.consume(&press, true));
+        assert!(latch.consume(&release, false));
+        assert!(!latch.consume(&press, false));
+    }
+
+    #[test]
+    fn block_menu_keyboard_dispatch_and_render_share_availability_and_modal_ownership() {
+        let source = include_str!("main.rs");
+        let handle = source
+            .split_once("    fn handle_block_menu_key(")
+            .unwrap()
+            .1
+            .split_once("    fn block_menu_view(")
+            .unwrap()
+            .0;
+        assert!(handle.contains("self.available_block_menu_actions(menu)"));
+        let compact: String = handle.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("menu.focused_action.filter(|action|actions.contains(action))"));
+        assert!(handle.contains("self.execute_block_menu_action(action)"));
+        assert!(handle.contains("self.block_menu = None"));
+        assert!(!handle.contains("set_focus("));
+        let view = source
+            .split_once("    fn block_menu_view(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_layout(")
+            .unwrap()
+            .0;
+        assert!(view.contains("self.available_block_menu_actions(state)"));
+        assert!(view.contains(".on_press_maybe("));
+        assert!(view.contains("block-menu-selected"));
+        assert!(view.contains("block-menu-scroll"));
+        let ownership = source
+            .split_once("let recall_surface_open =")
+            .unwrap()
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        assert!(ownership.contains("self.block_menu.is_some()"));
+        let gate = source
+            .split_once("if self.block_menu.is_some() {")
+            .unwrap()
+            .1;
+        assert!(gate.starts_with(
+            "\n                        return self.handle_block_menu_key(&key, modifiers);"
+        ));
     }
 }
