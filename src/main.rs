@@ -2533,6 +2533,22 @@ fn block_menu_navigation(
     actions.get(index).copied()
 }
 
+fn review_commands_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Review commands…"
+    } else {
+        "Review command…"
+    }
+}
+
+fn block_menu_command_hint(action: BlockMenuAction) -> Option<&'static str> {
+    match action {
+        BlockMenuAction::RecallCommand => Some("Fill prompt without running"),
+        BlockMenuAction::ReinputSelected => Some("Review first; insert only after confirmation"),
+        _ => None,
+    }
+}
+
 /// Menu labels teach only the real equivalent keyboard action, never a default.
 fn block_menu_shortcut_command(action: BlockMenuAction) -> Option<&'static str> {
     Some(match action {
@@ -21638,6 +21654,13 @@ impl Frost {
         let row_btn = |label: &str, action: BlockMenuAction| -> Element<'_, Message> {
             let focused = state.focused_action == Some(action) && actions.contains(&action);
             let mut content = column![self.popup_text(label.to_string())].spacing(2);
+            if let Some(hint) = block_menu_command_hint(action) {
+                content = content.push(
+                    self.popup_text(hint)
+                        .color(self.c_text_dim())
+                        .wrapping(text::Wrapping::Word),
+                );
+            }
             if let Some(shortcut) = block_menu_shortcut_command(action)
                 .and_then(|command| self.keybindings.shortcut_label(command))
             {
@@ -21844,11 +21867,7 @@ impl Frost {
             }
             if selection.has_selected_commands {
                 body = body.push(row_btn(
-                    if selection.selected_count > 1 {
-                        "Reinput selected commands"
-                    } else {
-                        "Reinput command"
-                    },
+                    review_commands_menu_label(selection.selected_count),
                     BlockMenuAction::ReinputSelected,
                 ));
             }
@@ -42233,5 +42252,31 @@ mod tests {
         assert!(gate.starts_with(
             "\n                        return self.handle_block_menu_key(&key, modifiers);"
         ));
+    }
+    #[test]
+    fn review_and_recall_menu_labels_distinguish_confirmation_from_direct_fill() {
+        assert_eq!(review_commands_menu_label(1), "Review command…");
+        assert_eq!(review_commands_menu_label(2), "Review commands…");
+        assert_eq!(
+            block_menu_command_hint(BlockMenuAction::RecallCommand),
+            Some("Fill prompt without running")
+        );
+        assert_eq!(
+            block_menu_command_hint(BlockMenuAction::ReinputSelected),
+            Some("Review first; insert only after confirmation")
+        );
+        assert_eq!(block_menu_command_hint(BlockMenuAction::Retry), None);
+        let source = include_str!("main.rs");
+        let view = source
+            .split_once("    fn block_menu_view(")
+            .unwrap()
+            .1
+            .split_once("    fn organism_layout(")
+            .unwrap()
+            .0;
+        assert!(view.contains("review_commands_menu_label(selection.selected_count)"));
+        assert!(view.contains("block_menu_command_hint(action)"));
+        assert!(view.contains("Recall this command"));
+        assert!(view.contains("BlockMenuAction::ReinputSelected"));
     }
 }
