@@ -29441,13 +29441,15 @@ impl Frost {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(1500)).map(|_| Message::ConfigTick),
         );
-        // Tasks dashboard pump: fast while a provider is starting/running or a
-        // worktree is being created, slow while the panel merely shows parked
-        // review state. With the flag off and no activity there is no tick.
-        let tasks_open = self.sidebar_open && self.sidebar_panel == SidebarPanel::Tasks;
+        // Background work must drain even while hidden. Parked review state
+        // only needs display refreshes in the focused, visible Tasks panel;
+        // an already loaded diff must not keep a hidden panel polling forever.
+        let tasks_open = self.focused
+            && self.config.experimental_task_sidebar
+            && self.dock_open()
+            && self.sidebar_panel == SidebarPanel::Tasks;
         if self.agent_runtime.has_any_activity()
             || self.task_panel.pending_creation.is_some()
-            || self.task_panel.diff.is_open
             || self.task_panel.diff.state().loading
             || tasks_open
         {
