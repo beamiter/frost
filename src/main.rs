@@ -1326,6 +1326,7 @@ fn command_requires_block_context(command: &keybindings::Command) -> bool {
             | C::BlockExplainWithAgent
             | C::BlockRetryFailed
             | C::BlockToggleCollapse
+            | C::BlockMenu
     )
 }
 
@@ -2505,6 +2506,19 @@ fn block_menu_actions(
         UndoClear,
     ]);
     actions
+}
+
+fn block_menu_keyboard_target(
+    available: bool,
+    preedit: &str,
+    selected: Option<u64>,
+    retained: bool,
+) -> Option<u64> {
+    if available && preedit.is_empty() && retained {
+        selected
+    } else {
+        None
+    }
 }
 
 fn block_menu_navigation(
@@ -10261,6 +10275,7 @@ impl Frost {
                 self.block_export_session_task(block_export::SessionExportFormat::Json)
             }
             C::BlockSearch => self.toggle_block_search(),
+            C::BlockMenu => return self.open_selected_block_menu(),
             C::BlockToggleBookmark => {
                 let target = {
                     let sess = self.sessions.get_mut(self.active)?;
@@ -21564,6 +21579,39 @@ impl Frost {
         .into()
     }
 
+    /// Selected-block shortcut only: never choose history implicitly or edit the prompt.
+    /// Returning None on any failed guard preserves the ordinary key/PTY path.
+    fn open_selected_block_menu(&mut self) -> Option<Task<Message>> {
+        let sess = self.sessions.get(self.active)?;
+        // Fail closed on missing foreground proof as well as OSC busy state.
+        // A primary-screen child must retain its keys even with stale shell marks.
+        if jterm_core::process::tty_foreground_pgid(sess.master_fd)
+            != Some(sess.pty.get_child_pid())
+        {
+            return None;
+        }
+        let selected = sess.block_selection.active();
+        let zone_id = block_menu_keyboard_target(
+            self.terminal_input_active() && self.block_binding_available(),
+            &sess.terminal.preedit_text,
+            selected,
+            selected.is_some_and(|id| sess.terminal.zone_by_id(id).is_some()),
+        )?;
+        let session_id = sess.id;
+        let rect = self
+            .pane_rects()
+            .into_iter()
+            .find(|pane| pane.session == self.active)?
+            .rect;
+        self.block_menu = Some(BlockMenuState {
+            session_id,
+            zone_id,
+            anchor: iced::Point::new(rect.x + 12.0, rect.y + self.pane_header_height() + 12.0),
+            focused_action: Some(BlockMenuAction::Details),
+        });
+        Some(Task::none())
+    }
+
     fn available_block_menu_actions(&self, state: BlockMenuState) -> Vec<BlockMenuAction> {
         let Some(sess) = self
             .sessions
@@ -26244,6 +26292,10 @@ impl Frost {
             bound(
                 "block:toggle_collapse",
                 "Collapse / expand the selected block's output"
+            ),
+            bound(
+                "block:menu",
+                "Open selected block actions (Block mode, idle terminal, outside IME)"
             ),
             kb("Ctrl+Shift+↑ / ↓", "Reveal selected block top / bottom"),
             kb("Command palette", "Block copy, search, export, navigation"),
@@ -42278,5 +42330,111 @@ mod tests {
         assert!(view.contains("block_menu_command_hint(action)"));
         assert!(view.contains("Recall this command"));
         assert!(view.contains("BlockMenuAction::ReinputSelected"));
+    }
+    #[test]
+    fn keyboard_menu_requires_a_retained_selection_and_never_claims_composition() {
+        for available in [false, true] {
+            for preedit in ["", " composing ", "中"] {
+                for selected in [None, Some(0), Some(42)] {
+                    for retained in [false, true] {
+                        assert_eq!(
+                            block_menu_keyboard_target(available, preedit, selected, retained),
+                            if available && preedit.is_empty() && retained {
+                                selected
+                            } else {
+                                None
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_menu_open_preserves_selection_prompt_and_normal_key_fallback() {
+        let source = include_str!("main.rs");
+        let open = source
+            .split_once("    fn open_selected_block_menu(")
+            .unwrap()
+            .1
+            .split_once("    fn available_block_menu_actions(")
+            .unwrap()
+            .0;
+        for required in [
+            "self.terminal_input_active() && self.block_binding_available()",
+            "&sess.terminal.preedit_text",
+            "sess.block_selection.active()",
+            "sess.terminal.zone_by_id(id)",
+            "session_id = sess.id",
+            "jterm_core::process::tty_foreground_pgid(sess.master_fd)",
+            "Some(sess.pty.get_child_pid())",
+            "pane.session == self.active",
+            "focused_action: Some(BlockMenuAction::Details)",
+        ] {
+            assert!(open.contains(required), "missing gate: {required}");
+        }
+        for forbidden in [
+            "write_pty",
+            "block_selection.replace",
+            "block_selection.clear",
+            "scroll_to_bottom",
+            "recall_into",
+        ] {
+            assert!(!open.contains(forbidden));
+        }
+        let dispatch = source
+            .split_once("    fn dispatch_command(")
+            .unwrap()
+            .1
+            .split_once("C::BlockToggleBookmark =>")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("C::BlockMenu => return self.open_selected_block_menu()"));
+        assert!(dispatch
+            .contains("command_requires_block_context(&cmd) && !self.block_binding_available()"));
+    }
+    #[test]
+    fn keyboard_menu_mode_matrix_keeps_chat_and_normal_on_the_terminal_path() {
+        for mode in [
+            config::TerminalMode::Normal,
+            config::TerminalMode::Block,
+            config::TerminalMode::Chat,
+        ] {
+            let config = config::Config {
+                terminal_mode: Some(mode),
+                ..config::Config::default()
+            };
+            for alt in [false, true] {
+                for running in [false, true] {
+                    // These are the production block_action_available and
+                    // block_binding_available predicates, with real Config mode semantics.
+                    let available = config.is_block_mode() && !alt && !running;
+                    let target = block_menu_keyboard_target(available, "", Some(42), true);
+                    assert_eq!(
+                        target,
+                        if mode == config::TerminalMode::Block && !alt && !running {
+                            Some(42)
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+        }
+        assert!(command_requires_block_context(
+            &keybindings::Command::BlockMenu
+        ));
+        let source = include_str!("main.rs");
+        let gate = source
+            .split_once("    fn block_action_available(")
+            .unwrap()
+            .1
+            .split_once("    fn ensure_block_action_available(")
+            .unwrap()
+            .0;
+        assert!(gate.contains("self.config.is_block_mode()"));
+        assert!(gate.contains("!session.terminal.is_alt_buffer_active()"));
+        assert!(gate.contains("!session.terminal.is_command_running()"));
     }
 }

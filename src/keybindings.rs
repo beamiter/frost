@@ -86,6 +86,7 @@ pub enum Command {
     /// Fold/unfold the selected block's output. Ctrl+Alt+Z keeps it in the
     /// same free Ctrl+Alt letter family as the other block chords.
     BlockToggleCollapse,
+    BlockMenu,
 
     // === 分屏操作 ===
     TerminalSplitVertical,   // Ctrl+Shift+E (left/right)
@@ -200,6 +201,7 @@ impl std::fmt::Display for Command {
             Command::BlockExplainWithAgent => write!(f, "block:explain_with_agent"),
             Command::BlockRetryFailed => write!(f, "block:retry_failed"),
             Command::BlockToggleCollapse => write!(f, "block:toggle_collapse"),
+            Command::BlockMenu => write!(f, "block:menu"),
             Command::TerminalSplitVertical => write!(f, "terminal:split_vertical"),
             Command::TerminalSplitHorizontal => write!(f, "terminal:split_horizontal"),
             Command::TerminalClosePane => write!(f, "terminal:close_pane"),
@@ -289,6 +291,7 @@ impl std::str::FromStr for Command {
             "block:explain_with_agent" => Ok(Command::BlockExplainWithAgent),
             "block:retry_failed" => Ok(Command::BlockRetryFailed),
             "block:toggle_collapse" => Ok(Command::BlockToggleCollapse),
+            "block:menu" => Ok(Command::BlockMenu),
             "terminal:split_vertical" => Ok(Command::TerminalSplitVertical),
             "terminal:split_horizontal" => Ok(Command::TerminalSplitHorizontal),
             "terminal:close_pane" => Ok(Command::TerminalClosePane),
@@ -539,6 +542,11 @@ impl KeyBindings {
             "ctrl+alt+z".to_string(),
             "block:toggle_collapse".to_string(),
         );
+
+        // Selected-block scope only; inactive guards let the chord reach the PTY.
+        bindings
+            .bindings
+            .insert("shift+f10".to_string(), "block:menu".to_string());
 
         // 配置操作
         bindings
@@ -1074,6 +1082,7 @@ mod tests {
             ("block:explain_with_agent", Command::BlockExplainWithAgent),
             ("block:retry_failed", Command::BlockRetryFailed),
             ("block:toggle_collapse", Command::BlockToggleCollapse),
+            ("block:menu", Command::BlockMenu),
         ] {
             assert_eq!(name.parse::<Command>().as_ref(), Ok(&expected), "{name}");
             assert_eq!(expected.to_string(), name);
@@ -1148,6 +1157,7 @@ mod tests {
                 "block:fix_with_agent",
                 "block:jump_next_bookmark",
                 "block:jump_prev_bookmark",
+                "block:menu",
                 "block:reinput_selected_commands",
                 "block:retry_failed",
                 "block:search",
@@ -1434,5 +1444,17 @@ mod tests {
             "agent:launch:kimi".parse::<Command>().unwrap(),
             Command::AgentLaunchKimi
         );
+    }
+    #[test]
+    fn block_menu_binding_can_be_rebound_or_removed() {
+        let mut keys = KeyBindings::default_bindings();
+        assert_eq!(keys.get_command("shift+f10"), Some(Command::BlockMenu));
+        keys.bindings.remove("shift+f10");
+        assert_eq!(keys.shortcut_label("block:menu"), None);
+        keys.bindings
+            .insert("ctrl+alt+m".into(), "block:menu".into());
+        assert_eq!(keys.get_command("ctrl+alt+m"), Some(Command::BlockMenu));
+        assert_eq!(keys.get_command("shift+f10"), None);
+        assert_eq!(Command::BlockMenu.to_string(), "block:menu");
     }
 }

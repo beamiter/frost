@@ -1063,3 +1063,17 @@ left unchanged. `--dry-run` does not write binaries, configs, or backups.
 An already-running terminal keeps its current process; restart it to use the new
 binary and configuration. If an older copy comes first in PATH, the installer
 prints the conflicting path.
+
+### Keyboard block actions
+
+In Block mode, select a retained block (for example with `Ctrl+Up`), then
+press `Shift+F10` to open its actions. Use Up/Down, Home/End, Enter and Escape in
+the menu. Opening preserves the selected range and the current prompt draft;
+commands are not inserted or run merely by opening the menu.
+
+The chord is configurable as `block:menu` in the keymap, and Help shows its current
+binding. Rebinding or removing it removes the default shortcut. It applies only
+to an existing selection in an idle primary-screen terminal whose shell still owns
+the foreground process group, outside IME preedit;
+in Chat/Normal mode or without that context the key continues through normal terminal input. Files keeps
+its own focused `Shift+F10` menu behavior.
