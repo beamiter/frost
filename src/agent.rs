@@ -1188,10 +1188,16 @@ mod tests {
         panel.set_status("provider failed");
         panel.status.clear();
         assert_eq!(panel.restored_history_notice, Some(notice));
-        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
         assert!(panel.session.as_ref().unwrap().snapshot().is_none());
         panel.continue_task(); // Review-only history cannot resume an old turn.
-        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
         assert_eq!(panel.restored_history_notice, Some(notice));
         panel.new_task();
         assert!(panel.restored_history_notice.is_none());
@@ -1207,7 +1213,10 @@ mod tests {
         let mut panel = AgentUi::new();
         panel.install_restored_session(session);
         assert!(panel.restored_history_notice.is_none());
-        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
     }
 
     #[test]
@@ -1233,7 +1242,10 @@ mod tests {
         panel.bound_session_id = Some(42);
         panel.install_restored_session(restored);
 
-        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+        assert_eq!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::Cancelled
+        );
         assert!(!panel.session.as_ref().unwrap().transcript().is_empty());
         assert!(!panel.proposal_is_current(reference));
         assert!(panel.approve(reference, None).is_none());
