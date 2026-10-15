@@ -2457,6 +2457,22 @@ enum BlockMenuAction {
     UndoClear,
 }
 
+/// Menu labels teach only the real equivalent keyboard action, never a default.
+fn block_menu_shortcut_command(action: BlockMenuAction) -> Option<&'static str> {
+    Some(match action {
+        BlockMenuAction::CopyCommand => "block:copy_command",
+        BlockMenuAction::CopyOutput => "block:copy_output",
+        BlockMenuAction::CopyBlock => "block:copy_block",
+        BlockMenuAction::CopyMarkdown => "block:copy_markdown",
+        BlockMenuAction::RecallCommand => "block:recall_command",
+        BlockMenuAction::ReinputSelected => "block:reinput_selected_commands",
+        BlockMenuAction::ToggleBookmark => "block:toggle_bookmark",
+        BlockMenuAction::Search => "block:search",
+        BlockMenuAction::CollapseOutput | BlockMenuAction::ExpandOutput => "block:toggle_collapse",
+        _ => return None,
+    })
+}
+
 /// Which fresh Agent task a failed block starts (ember's Fix/Explain).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailedBlockAgentIntent {
@@ -21464,7 +21480,18 @@ impl Frost {
                     .map(|zone| (sess, zone))
             });
         let row_btn = |label: &str, action: BlockMenuAction| {
-            button(self.popup_text(label.to_string()))
+            let mut content = column![self.popup_text(label.to_string())].spacing(2);
+            if let Some(shortcut) = block_menu_shortcut_command(action)
+                .and_then(|command| self.keybindings.shortcut_label(command))
+            {
+                // A second wrapping line keeps paired actions usable in narrow menus.
+                content = content.push(
+                    self.popup_text(shortcut)
+                        .color(self.c_text_dim())
+                        .wrapping(text::Wrapping::Word),
+                );
+            }
+            button(content)
                 .on_press(Message::BlockMenuAction(action))
                 .padding([5, 9])
                 .width(Length::Fill)
@@ -41844,5 +41871,54 @@ mod tests {
                 < callback.find("self.connect_remote_host(index)").unwrap()
         );
         assert!(callback.contains("return Task::none();"));
+    }
+    #[test]
+    fn block_menu_shortcut_commands_match_equivalent_actions_only() {
+        for (action, command) in [
+            (BlockMenuAction::CopyCommand, "block:copy_command"),
+            (BlockMenuAction::CopyOutput, "block:copy_output"),
+            (BlockMenuAction::CopyBlock, "block:copy_block"),
+            (BlockMenuAction::CopyMarkdown, "block:copy_markdown"),
+            (BlockMenuAction::RecallCommand, "block:recall_command"),
+            (
+                BlockMenuAction::ReinputSelected,
+                "block:reinput_selected_commands",
+            ),
+            (BlockMenuAction::ToggleBookmark, "block:toggle_bookmark"),
+            (BlockMenuAction::Search, "block:search"),
+            (BlockMenuAction::CollapseOutput, "block:toggle_collapse"),
+            (BlockMenuAction::ExpandOutput, "block:toggle_collapse"),
+        ] {
+            assert_eq!(block_menu_shortcut_command(action), Some(command));
+            assert!(command.parse::<keybindings::Command>().is_ok());
+        }
+        for action in [
+            BlockMenuAction::Details,
+            BlockMenuAction::Retry,
+            BlockMenuAction::ExportMarkdown,
+            BlockMenuAction::ExportJson,
+            BlockMenuAction::CreateTask,
+        ] {
+            assert_eq!(block_menu_shortcut_command(action), None);
+        }
+    }
+
+    #[test]
+    fn block_menu_shortcut_labels_use_live_bindings_without_default_fallback() {
+        let command = block_menu_shortcut_command(BlockMenuAction::CopyOutput).unwrap();
+        let mut bindings = keybindings::KeyBindings::default_bindings();
+        bindings.bindings.clear();
+        assert_eq!(bindings.shortcut_label(command), None);
+        bindings
+            .bindings
+            .insert("ctrl+alt+o".into(), command.into());
+        let first = bindings.shortcut_label(command).unwrap();
+        bindings.bindings.clear();
+        bindings
+            .bindings
+            .insert("ctrl+shift+y".into(), command.into());
+        assert_ne!(bindings.shortcut_label(command).unwrap(), first);
+        bindings.bindings.clear();
+        assert_eq!(bindings.shortcut_label(command), None);
     }
 }
