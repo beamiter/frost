@@ -36629,29 +36629,47 @@ mod tests {
             old_viewport.height * old_scale
         );
 
-        let metrics = Metrics::new(10.0, 1.0, 0.0, false);
-        let old_grid = metrics.grid_size(
-            old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-            old_viewport.height - chrome_height(14.0, true),
-        );
-        let new_grid = metrics.grid_size(
-            new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
-            new_viewport.height - chrome_height(14.0, true),
-        );
-        assert!(new_grid.0 < old_grid.0);
-        assert!(new_grid.1 < old_grid.1);
-        assert_eq!(new_grid, (98, 29));
+        // The terminal and chrome use one configured size in production.
+        // Keep exact grid expectations at small, default and enlarged fonts so
+        // a stale fixed-height reservation cannot silently return extra rows.
+        for (font_size, expected_grid) in [
+            (10.0, (98, 29)),
+            (14.0, (70, 20)),
+            (24.0, (40, 11)),
+            (72.0, (13, 2)),
+        ] {
+            let metrics = Metrics::new(font_size, 1.0, 0.0, false);
+            let old_grid = metrics.grid_size(
+                old_viewport.width - terminal_view::SCROLLBAR_WIDTH,
+                old_viewport.height - chrome_height(metrics.font_size, true),
+            );
+            let new_grid = metrics.grid_size(
+                new_viewport.width - terminal_view::SCROLLBAR_WIDTH,
+                new_viewport.height - chrome_height(metrics.font_size, true),
+            );
+            assert!(new_grid.0 < old_grid.0);
+            assert!(new_grid.1 < old_grid.1);
+            assert_eq!(new_grid, expected_grid, "font size {font_size}");
+        }
     }
 
     #[test]
     fn disabling_the_bottom_bar_returns_its_rows_to_the_grid() {
-        let metrics = Metrics::new(10.0, 1.0, 0.0, false);
         let viewport = Size::new(1200.0, 800.0);
         let width = viewport.width - terminal_view::SCROLLBAR_WIDTH;
-        let with_bar = metrics.grid_size(width, viewport.height - chrome_height(14.0, true));
-        let without_bar = metrics.grid_size(width, viewport.height - chrome_height(14.0, false));
-        assert_eq!(with_bar.0, without_bar.0);
-        assert!(without_bar.1 > with_bar.1);
+        for font_size in [10.0, 14.0, 24.0, 72.0] {
+            let metrics = Metrics::new(font_size, 1.0, 0.0, false);
+            let with_bar = metrics.grid_size(
+                width,
+                viewport.height - chrome_height(metrics.font_size, true),
+            );
+            let without_bar = metrics.grid_size(
+                width,
+                viewport.height - chrome_height(metrics.font_size, false),
+            );
+            assert_eq!(with_bar.0, without_bar.0);
+            assert!(without_bar.1 > with_bar.1);
+        }
     }
 
     #[test]
