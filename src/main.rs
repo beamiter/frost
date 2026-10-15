@@ -881,6 +881,44 @@ fn finalized_block_at_viewport_row(
         .map(|(zone, _)| zone.id)
 }
 
+/// Only proven completed transcript cells can expose Chat card actions.
+/// Live/composer and host-owned rows never acquire a synthetic zone identity.
+fn chat_completed_zone_at_row(
+    terminal: &terminal::TerminalState,
+    projection: &ProjectedViewport,
+    row: usize,
+) -> Option<u64> {
+    let chat = projection.chat_rows().get(row)?;
+    if !matches!(
+        chat.role,
+        chat_mode::ChatRole::Command | chat_mode::ChatRole::Output
+    ) || !matches!(
+        projection.row_kinds().get(row),
+        Some(terminal::ProjectedRowKind::Raw)
+    ) {
+        return None;
+    }
+    if terminal.is_alt_buffer_active() {
+        return None;
+    }
+    let absolute = projection.view_row_absolute(row)?;
+    let live_boundary = terminal
+        .running_zone_start()
+        .or(terminal.live_prompt_row())?;
+    if absolute >= live_boundary {
+        return None;
+    }
+    // Walk newest-first without allocating a second zone/span list per painted
+    // row. An evicted zone remains a boundary; never borrow its predecessor.
+    terminal
+        .command_zones
+        .iter()
+        .rev()
+        .find(|zone| zone.prompt_start <= absolute)
+        .filter(|zone| !zone.rows_evicted)
+        .map(|zone| zone.id)
+}
+
 /// Map one raw-buffer search match through the exact immutable projection.
 /// A match split across display rows, trimmed origin, or structural padding is
 /// not guessed onto a nearby cell.
@@ -2372,6 +2410,7 @@ struct BlockMenuState {
     zone_id: u64,
     anchor: iced::Point,
     focused_action: Option<BlockMenuAction>,
+    chat_read_only: bool,
 }
 
 /// Review snapshots never own executable actions. Insert revalidates the live pane,
@@ -2459,6 +2498,26 @@ enum BlockMenuAction {
     Retry,
     Clear,
     UndoClear,
+}
+
+fn chat_read_only_menu_actions(has_command: bool) -> Vec<BlockMenuAction> {
+    use BlockMenuAction::*;
+    let mut actions = vec![Details, Close];
+    if has_command {
+        actions.push(CopyCommand);
+    }
+    actions.extend([CopyOutput, CopyBlock, CopyMarkdown]);
+    actions
+}
+
+fn chat_menu_target_is_current(
+    menu: BlockMenuState,
+    active_session_id: usize,
+    chat: bool,
+    alt: bool,
+    retained: bool,
+) -> bool {
+    menu.chat_read_only && menu.session_id == active_session_id && chat && !alt && retained
 }
 
 /// The same available actions gate pointer buttons and keyboard activation.
@@ -11067,6 +11126,9 @@ impl Frost {
         if action == BlockMenuAction::Close {
             return Task::none();
         }
+        if menu.chat_read_only {
+            return self.execute_chat_read_only_menu_action(menu, action);
+        }
         // Fix/Explain/Retry look the source session up by its stable id rather
         // than through the focused pane: the Agent task or replay stays bound
         // to the terminal that produced the block even when focus moved after
@@ -11168,6 +11230,110 @@ impl Frost {
             | BlockMenuAction::ExplainWithAgent
             | BlockMenuAction::CreateTask
             | BlockMenuAction::Retry => Task::none(),
+        }
+    }
+
+    fn chat_card_copy_text(
+        terminal: &terminal::TerminalState,
+        id: u64,
+        action: BlockMenuAction,
+    ) -> Result<String, block_mode::SelectedClipboardError> {
+        use block_mode::{
+            ClipboardOutput, SelectedClipboardError as Error, SelectedClipboardMode as Mode,
+        };
+        let zone = terminal
+            .zone_by_id(id)
+            .filter(|zone| !zone.rows_evicted)
+            .ok_or(Error::Empty)?;
+        let mut selection = block_mode::BlockSelection::default();
+        selection.replace(Some(id));
+        if action == BlockMenuAction::CopyMarkdown {
+            return block_mode::selected_markdown_text(
+                [(id, Self::block_markdown(terminal, zone))],
+                &selection,
+                block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+            )
+            .map(|copied| copied.text);
+        }
+        let mode = match action {
+            BlockMenuAction::CopyCommand => Mode::Commands,
+            BlockMenuAction::CopyOutput => Mode::Outputs,
+            BlockMenuAction::CopyBlock => Mode::Blocks,
+            _ => return Err(Error::Empty),
+        };
+        let output = if mode == Mode::Commands {
+            ClipboardOutput::Empty
+        } else {
+            match terminal.zone_output_export_capped(id) {
+                Some(terminal::ZoneOutputExport::Available { text, .. }) => {
+                    ClipboardOutput::Available(text)
+                }
+                Some(terminal::ZoneOutputExport::Empty) => ClipboardOutput::Empty,
+                _ => ClipboardOutput::Unavailable,
+            }
+        };
+        block_mode::selected_clipboard_text(
+            [(id, zone.command.as_deref(), output)],
+            &selection,
+            mode,
+            block_mode::SELECTED_CLIPBOARD_MAX_BYTES,
+        )
+        .map(|copied| copied.text)
+    }
+
+    fn execute_chat_read_only_menu_action(
+        &mut self,
+        menu: BlockMenuState,
+        action: BlockMenuAction,
+    ) -> Task<Message> {
+        let Some(sess) = self.sessions.get(self.active) else {
+            return Task::none();
+        };
+        let zone = sess
+            .terminal
+            .zone_by_id(menu.zone_id)
+            .filter(|zone| !zone.rows_evicted);
+        if !chat_menu_target_is_current(
+            menu,
+            sess.id,
+            self.config.is_chat_mode(),
+            sess.terminal.is_alt_buffer_active(),
+            zone.is_some(),
+        ) {
+            self.push_toast("Chat card is no longer available", ToastKind::Info);
+            return Task::none();
+        }
+        let allowed = chat_read_only_menu_actions(
+            zone.and_then(|zone| zone.command.as_deref())
+                .is_some_and(|command| !command.trim().is_empty()),
+        );
+        if !allowed.contains(&action) {
+            return Task::none();
+        }
+        if action == BlockMenuAction::Details {
+            return self.open_block_review(Some(menu.zone_id));
+        }
+        match Self::chat_card_copy_text(&sess.terminal, menu.zone_id, action) {
+            Ok(text) => {
+                self.push_toast("Copied Chat card text", ToastKind::Success);
+                iced::clipboard::write(text)
+            }
+            Err(error) => {
+                let message = match error {
+                    block_mode::SelectedClipboardError::Empty => "No retained text to copy",
+                    block_mode::SelectedClipboardError::OutputUnavailable => {
+                        "Output is no longer retained"
+                    }
+                    block_mode::SelectedClipboardError::TooLarge => {
+                        "Card text exceeds the clipboard limit"
+                    }
+                    block_mode::SelectedClipboardError::Unsafe => {
+                        "Card text cannot be copied safely"
+                    }
+                };
+                self.push_toast(message, ToastKind::Warning);
+                Task::none()
+            }
         }
     }
 
@@ -12521,6 +12687,9 @@ impl Frost {
     /// no target. Mouse events retain this stable identity across focus moves.
     fn block_at_viewport_row(&self, session_id: usize, row: usize) -> Option<u64> {
         let sess = self.sessions.iter().find(|sess| sess.id == session_id)?;
+        if self.config.is_chat_mode() {
+            return chat_completed_zone_at_row(&sess.terminal, &sess.projection, row);
+        }
         finalized_block_at_viewport_row(
             self.config.is_block_mode(),
             &sess.terminal,
@@ -12613,6 +12782,9 @@ impl Frost {
         } = input
         {
             self.terminal_mouse_gestures[button.slot()] = None;
+            if self.config.is_chat_mode() && action != BlockMouseAction::Menu {
+                return Task::none();
+            }
             let Some(source) = self.session_index_by_id(source_session_id) else {
                 return Task::none();
             };
@@ -12659,6 +12831,7 @@ impl Frost {
                         zone_id: id,
                         anchor: iced::Point::new(x, y),
                         focused_action: None,
+                        chat_read_only: self.config.is_chat_mode(),
                     });
                 }
             }
@@ -21229,21 +21402,12 @@ impl Frost {
             .into()
     }
 
-    fn open_block_review(&mut self, target: Option<u64>) -> Task<Message> {
-        if !self.ensure_block_action_available("Block details") {
-            return Task::none();
-        }
-        let Some(sess) = self.sessions.get_mut(self.active) else {
-            return Task::none();
-        };
-        let id = target
-            .or(sess.block_selection.active())
-            .or_else(|| sess.terminal.command_zones.back().map(|z| z.id));
-        let Some(zone) = id.and_then(|id| sess.terminal.zone_by_id(id)) else {
-            self.push_toast("No retained block to review", ToastKind::Info);
-            return Task::none();
-        };
-        let id = zone.id;
+    fn block_details_snapshot(
+        terminal: &terminal::TerminalState,
+        session_id: usize,
+        id: u64,
+    ) -> Option<BlockReview> {
+        let zone = terminal.zone_by_id(id)?;
         let status = block_mode::badge_text_with_lifecycle(
             block_mode::classify(zone.command.as_deref(), zone.exit_code),
             zone.duration_ms,
@@ -21272,25 +21436,48 @@ impl Frost {
             if zone.command_truncated { "; TRUNCATED or unavailable, cannot recall" } else { "" },
             if zone.rows_evicted { "Evicted; retained snapshot may still be available" } else { "Retained" },
             if zone.captured_output.is_some() { "Finalization snapshot" } else if zone.captured_output_evicted { "Snapshot evicted; live rows used only if retained" } else { "Live retained rows / no text capture" },
-            match sess.terminal.zone_output_export_capped(id) {
+            match terminal.zone_output_export_capped(id) {
                 Some(terminal::ZoneOutputExport::Available { text, truncated }) => format!("Capture: {}\nPreview: {}\n\n{}", if truncated { "TRUNCATED by terminal budget" } else { "Available retained text" }, if text.len() > 65536 { "Clipped to 64 KiB; copy/export retains the available capture" } else { "Retained text shown below" }, block_review::preview(&text, 65536)),
                 Some(terminal::ZoneOutputExport::Unavailable) => "Unavailable: captured output was evicted".into(),
                 _ => "No non-blank text output captured".into(),
             }
         );
-        sess.block_selection.replace(Some(id));
-        sess.projection_view_state
-            .hold_reading_position(&sess.projection);
-        sess.block_reading.visit(id);
-        self.block_review = Some(BlockReview {
-            session_id: sess.id,
+        Some(BlockReview {
+            session_id,
             ids: vec![id],
             title: format!("Block #{id} · details"),
             body,
             commands: None,
             command_error: None,
             bracketed: false,
-        });
+        })
+    }
+
+    fn open_block_review(&mut self, target: Option<u64>) -> Task<Message> {
+        let chat_details = self.config.is_chat_mode() && target.is_some();
+        if !chat_details && !self.ensure_block_action_available("Block details") {
+            return Task::none();
+        }
+        let Some(sess) = self.sessions.get_mut(self.active) else {
+            return Task::none();
+        };
+        if sess.terminal.is_alt_buffer_active() {
+            return Task::none();
+        }
+        let id = target
+            .or(sess.block_selection.active())
+            .or_else(|| sess.terminal.command_zones.back().map(|z| z.id));
+        let Some(zone) = id.and_then(|id| sess.terminal.zone_by_id(id)) else {
+            self.push_toast("No retained block to review", ToastKind::Info);
+            return Task::none();
+        };
+        let id = zone.id;
+        let review = Self::block_details_snapshot(&sess.terminal, sess.id, id);
+        sess.block_selection.replace(Some(id));
+        sess.projection_view_state
+            .hold_reading_position(&sess.projection);
+        sess.block_reading.visit(id);
+        self.block_review = review;
         Task::none()
     }
 
@@ -21482,7 +21669,8 @@ impl Frost {
         let live = self.sessions.get(self.active).is_some_and(|sess| {
             sess.id == review.session_id
                 && !sess.terminal.is_alt_buffer_active()
-                && self.config.is_block_mode()
+                && (self.config.is_block_mode()
+                    || (self.config.is_chat_mode() && review.commands.is_none()))
                 && review
                     .ids
                     .iter()
@@ -21608,6 +21796,7 @@ impl Frost {
             zone_id,
             anchor: iced::Point::new(rect.x + 12.0, rect.y + self.pane_header_height() + 12.0),
             focused_action: Some(BlockMenuAction::Details),
+            chat_read_only: false,
         });
         Some(Task::none())
     }
@@ -21623,6 +21812,22 @@ impl Frost {
         let Some(zone) = sess.terminal.zone_by_id(state.zone_id) else {
             return vec![BlockMenuAction::Close];
         };
+        if state.chat_read_only {
+            if !chat_menu_target_is_current(
+                state,
+                self.sessions[self.active].id,
+                self.config.is_chat_mode(),
+                sess.terminal.is_alt_buffer_active(),
+                !zone.rows_evicted,
+            ) {
+                return vec![BlockMenuAction::Close];
+            }
+            return chat_read_only_menu_actions(
+                zone.command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty()),
+            );
+        }
         let selection = block_menu_selection_summary(
             sess.terminal
                 .command_zones
@@ -21709,7 +21914,9 @@ impl Frost {
                         .wrapping(text::Wrapping::Word),
                 );
             }
-            if let Some(shortcut) = block_menu_shortcut_command(action)
+            if let Some(shortcut) = (!state.chat_read_only)
+                .then(|| block_menu_shortcut_command(action))
+                .flatten()
                 .and_then(|command| self.keybindings.shortcut_label(command))
             {
                 // A second wrapping line keeps paired actions usable in narrow menus.
@@ -21826,136 +22033,153 @@ impl Frost {
                     .style(text::warning),
                 );
             }
-            if sess.projection_policy.is_collapsed(zone.id) {
-                body = body.push(row_btn("Expand output", BlockMenuAction::ExpandOutput));
-            } else if !sess.projection_policy.is_collapsed(zone.id)
-                && sess.terminal.finished_output_range(zone.id).is_some()
-            {
-                body = body.push(row_btn("Collapse output", BlockMenuAction::CollapseOutput));
-            }
-            let selection = block_menu_selection_summary(
-                sess.terminal
-                    .command_zones
-                    .iter()
-                    .map(|zone| (zone.id, zone.command.as_deref())),
-                &sess.block_selection,
-                zone.id,
-            );
-            body = if selection.has_selected_commands {
-                body.push(
+            if state.chat_read_only {
+                body = body.push(
+                    self.popup_text("Read-only Chat card actions")
+                        .color(self.c_text_dim()),
+                );
+                for (label, action) in [
+                    ("Copy command", BlockMenuAction::CopyCommand),
+                    ("Copy output", BlockMenuAction::CopyOutput),
+                    ("Copy block", BlockMenuAction::CopyBlock),
+                    ("Copy block as Markdown", BlockMenuAction::CopyMarkdown),
+                ] {
+                    if actions.contains(&action) {
+                        body = body.push(row_btn(label, action));
+                    }
+                }
+            } else {
+                if sess.projection_policy.is_collapsed(zone.id) {
+                    body = body.push(row_btn("Expand output", BlockMenuAction::ExpandOutput));
+                } else if !sess.projection_policy.is_collapsed(zone.id)
+                    && sess.terminal.finished_output_range(zone.id).is_some()
+                {
+                    body = body.push(row_btn("Collapse output", BlockMenuAction::CollapseOutput));
+                }
+                let selection = block_menu_selection_summary(
+                    sess.terminal
+                        .command_zones
+                        .iter()
+                        .map(|zone| (zone.id, zone.command.as_deref())),
+                    &sess.block_selection,
+                    zone.id,
+                );
+                body = if selection.has_selected_commands {
+                    body.push(
+                        row![
+                            row_btn(
+                                if selection.selected_count > 1 {
+                                    "Copy commands"
+                                } else {
+                                    "Copy command"
+                                },
+                                BlockMenuAction::CopyCommand,
+                            ),
+                            row_btn("Ask AI about block", BlockMenuAction::AskAi),
+                        ]
+                        .spacing(6),
+                    )
+                } else {
+                    body.push(row_btn("Ask AI about block", BlockMenuAction::AskAi))
+                };
+                // Failed completed blocks expose the ember-style action chain:
+                // fresh Fix/Explain Agent tasks and a guarded semantic Retry.
+                if matches!(outcome, block_mode::BlockOutcome::Failed(_)) {
+                    body = body.push(
+                        row![
+                            row_btn("Fix with Agent", BlockMenuAction::FixWithAgent),
+                            row_btn("Explain with Agent", BlockMenuAction::ExplainWithAgent),
+                            row_btn("Retry", BlockMenuAction::Retry),
+                        ]
+                        .spacing(6),
+                    );
+                    // The experimental dashboard adds worktree task creation for
+                    // the same failed block (ember's Create task).
+                    if self.config.experimental_task_sidebar {
+                        body = body.push(row_btn("Create task", BlockMenuAction::CreateTask));
+                    }
+                }
+                body = body.push(
                     row![
                         row_btn(
                             if selection.selected_count > 1 {
-                                "Copy commands"
+                                "Copy outputs"
+                            } else if selection.clicked_has_command {
+                                "Copy output"
                             } else {
-                                "Copy command"
+                                "Copy background output"
                             },
-                            BlockMenuAction::CopyCommand,
+                            BlockMenuAction::CopyOutput,
                         ),
-                        row_btn("Ask AI about block", BlockMenuAction::AskAi),
-                    ]
-                    .spacing(6),
-                )
-            } else {
-                body.push(row_btn("Ask AI about block", BlockMenuAction::AskAi))
-            };
-            // Failed completed blocks expose the ember-style action chain:
-            // fresh Fix/Explain Agent tasks and a guarded semantic Retry.
-            if matches!(outcome, block_mode::BlockOutcome::Failed(_)) {
-                body = body.push(
-                    row![
-                        row_btn("Fix with Agent", BlockMenuAction::FixWithAgent),
-                        row_btn("Explain with Agent", BlockMenuAction::ExplainWithAgent),
-                        row_btn("Retry", BlockMenuAction::Retry),
+                        row_btn(
+                            if selection.selected_count > 1 {
+                                "Copy blocks"
+                            } else {
+                                "Copy block"
+                            },
+                            BlockMenuAction::CopyBlock,
+                        ),
                     ]
                     .spacing(6),
                 );
-                // The experimental dashboard adds worktree task creation for
-                // the same failed block (ember's Create task).
-                if self.config.experimental_task_sidebar {
-                    body = body.push(row_btn("Create task", BlockMenuAction::CreateTask));
+                body = body.push(row_btn(
+                    if selection.selected_count > 1 {
+                        "Copy blocks as Markdown"
+                    } else {
+                        "Copy block as Markdown"
+                    },
+                    BlockMenuAction::CopyMarkdown,
+                ));
+                if selection.clicked_has_command {
+                    body = body.push(row_btn(
+                        "Recall this command",
+                        BlockMenuAction::RecallCommand,
+                    ));
                 }
+                if selection.has_selected_commands {
+                    body = body.push(row_btn(
+                        review_commands_menu_label(selection.selected_count),
+                        BlockMenuAction::ReinputSelected,
+                    ));
+                }
+                body = body
+                    .push(
+                        row![
+                            row_btn(
+                                if bookmarked {
+                                    "Remove bookmark"
+                                } else {
+                                    "Bookmark block"
+                                },
+                                BlockMenuAction::ToggleBookmark,
+                            ),
+                            row_btn("Search blocks", BlockMenuAction::Search),
+                        ]
+                        .spacing(6),
+                    )
+                    .push(
+                        row![
+                            row_btn("Jump to top", BlockMenuAction::JumpTop),
+                            row_btn("Jump to bottom", BlockMenuAction::JumpBottom),
+                        ]
+                        .spacing(6),
+                    )
+                    .push(
+                        row![
+                            row_btn(
+                                "Export this block · Markdown",
+                                BlockMenuAction::ExportMarkdown
+                            ),
+                            row_btn("Export this block · JSON", BlockMenuAction::ExportJson),
+                        ]
+                        .spacing(6),
+                    )
+                    .push(row_btn(
+                        "Clear all completed blocks…",
+                        BlockMenuAction::Clear,
+                    ))
+                    .push(row_btn("Undo clear blocks", BlockMenuAction::UndoClear));
             }
-            body = body.push(
-                row![
-                    row_btn(
-                        if selection.selected_count > 1 {
-                            "Copy outputs"
-                        } else if selection.clicked_has_command {
-                            "Copy output"
-                        } else {
-                            "Copy background output"
-                        },
-                        BlockMenuAction::CopyOutput,
-                    ),
-                    row_btn(
-                        if selection.selected_count > 1 {
-                            "Copy blocks"
-                        } else {
-                            "Copy block"
-                        },
-                        BlockMenuAction::CopyBlock,
-                    ),
-                ]
-                .spacing(6),
-            );
-            body = body.push(row_btn(
-                if selection.selected_count > 1 {
-                    "Copy blocks as Markdown"
-                } else {
-                    "Copy block as Markdown"
-                },
-                BlockMenuAction::CopyMarkdown,
-            ));
-            if selection.clicked_has_command {
-                body = body.push(row_btn(
-                    "Recall this command",
-                    BlockMenuAction::RecallCommand,
-                ));
-            }
-            if selection.has_selected_commands {
-                body = body.push(row_btn(
-                    review_commands_menu_label(selection.selected_count),
-                    BlockMenuAction::ReinputSelected,
-                ));
-            }
-            body = body
-                .push(
-                    row![
-                        row_btn(
-                            if bookmarked {
-                                "Remove bookmark"
-                            } else {
-                                "Bookmark block"
-                            },
-                            BlockMenuAction::ToggleBookmark,
-                        ),
-                        row_btn("Search blocks", BlockMenuAction::Search),
-                    ]
-                    .spacing(6),
-                )
-                .push(
-                    row![
-                        row_btn("Jump to top", BlockMenuAction::JumpTop),
-                        row_btn("Jump to bottom", BlockMenuAction::JumpBottom),
-                    ]
-                    .spacing(6),
-                )
-                .push(
-                    row![
-                        row_btn(
-                            "Export this block · Markdown",
-                            BlockMenuAction::ExportMarkdown
-                        ),
-                        row_btn("Export this block · JSON", BlockMenuAction::ExportJson),
-                    ]
-                    .spacing(6),
-                )
-                .push(row_btn(
-                    "Clear all completed blocks…",
-                    BlockMenuAction::Clear,
-                ))
-                .push(row_btn("Undo clear blocks", BlockMenuAction::UndoClear));
         } else {
             body = body
                 .push(self.popup_text("Command block is no longer available"))
@@ -23080,7 +23304,7 @@ impl Frost {
     }
 
     /// Chat chrome follows the independent projection's actual raw/synthetic
-    /// ownership. It does not activate Block selection or replay actions.
+    /// ownership. Completed raw transcript rows expose read-only card actions.
     fn chat_paint_rows(&self, sess: &Session) -> Vec<terminal_view::BlockPaintRow> {
         use chat_mode::ChatRole;
         sess.projection
@@ -23092,7 +23316,13 @@ impl Frost {
                     sess.projection.row_kinds().get(index),
                     Some(terminal::ProjectedRowKind::Raw)
                 );
+                let zone_id = chat_completed_zone_at_row(&sess.terminal, &sess.projection, index);
                 terminal_view::BlockPaintRow {
+                    selectable: zone_id.is_some(),
+                    zone_id,
+                    card_selected: zone_id.is_some_and(|id| sess.block_selection.contains(id)),
+                    card_selection_active: zone_id == sess.block_selection.active()
+                        && zone_id.is_some(),
                     host_spacer: !raw,
                     app_eligible: raw && chat.app_eligible,
                     organism_status: chat.status_line,
@@ -31434,6 +31664,170 @@ fn xterm_modify_other_keys_encode(
 
 #[cfg(test)]
 mod tests {
+    fn chat_card_fixture(output: &str) -> terminal::TerminalState {
+        let mut terminal = terminal::TerminalState::new(80, 20);
+        terminal.process_input(format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07printf example\r\n\x1b]133;C\x07{output}\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07draft stays"
+        ).as_bytes());
+        terminal
+    }
+
+    #[test]
+    fn chat_completed_projection_hits_copy_only_the_proven_card() {
+        let mut terminal = chat_card_fixture("first\r\nsecond\r\n");
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_chat(true);
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        let id = terminal.command_zones.front().unwrap().id;
+        let mut hits = 0;
+        for (row, chat) in view.chat_rows().iter().enumerate() {
+            if let Some(hit) = chat_completed_zone_at_row(&terminal, &view, row) {
+                hits += 1;
+                assert_eq!(hit, id);
+                assert!(matches!(
+                    chat.role,
+                    chat_mode::ChatRole::Command | chat_mode::ChatRole::Output
+                ));
+                assert!(matches!(
+                    view.row_kinds()[row],
+                    terminal::ProjectedRowKind::Raw
+                ));
+                let actions = chat_read_only_menu_actions(true);
+                assert!(actions.contains(&BlockMenuAction::Details));
+                assert!(actions.contains(&BlockMenuAction::CopyOutput));
+                assert!(!actions.contains(&BlockMenuAction::ReinputSelected));
+                assert!(!actions.contains(&BlockMenuAction::CollapseOutput));
+                let output =
+                    Frost::chat_card_copy_text(&terminal, hit, BlockMenuAction::CopyOutput)
+                        .unwrap();
+                assert!(output.contains("first") && output.contains("second"));
+                assert!(!output.contains("draft stays"));
+                let details = Frost::block_details_snapshot(&terminal, 17, hit).unwrap();
+                assert_eq!(details.session_id, 17);
+                assert_eq!(details.ids, vec![hit]);
+                assert!(details.body.contains("first") && details.body.contains("second"));
+                assert!(!details.body.contains("draft stays"));
+                assert!(details.commands.is_none() && details.command_error.is_none());
+                assert!(!details.bracketed);
+            } else if !matches!(
+                chat.role,
+                chat_mode::ChatRole::Command | chat_mode::ChatRole::Output
+            ) {
+                assert_eq!(chat_completed_zone_at_row(&terminal, &view, row), None);
+            }
+        }
+        assert!(
+            hits > 0,
+            "real Chat projection must expose completed raw cells"
+        );
+        let cursor = terminal.get_cursor_pos();
+        for action in [
+            BlockMenuAction::CopyCommand,
+            BlockMenuAction::CopyBlock,
+            BlockMenuAction::CopyMarkdown,
+        ] {
+            let text = Frost::chat_card_copy_text(&terminal, id, action).unwrap();
+            assert!(text.contains("printf example"));
+            assert!(!text.contains("draft stays"));
+        }
+        assert_eq!(terminal.get_cursor_pos(), cursor);
+    }
+
+    #[test]
+    fn chat_card_actions_reject_stale_sessions_eviction_and_alt_screen() {
+        let mut terminal = chat_card_fixture("saved\r\n");
+        let other = chat_card_fixture("other session\r\n");
+        let id = terminal.command_zones.front().unwrap().id;
+        assert_eq!(other.command_zones.front().unwrap().id, id);
+        let menu = BlockMenuState {
+            session_id: 17,
+            zone_id: id,
+            anchor: iced::Point::ORIGIN,
+            focused_action: None,
+            chat_read_only: true,
+        };
+        assert!(chat_menu_target_is_current(menu, 17, true, false, true));
+        for (session, chat, alt, retained) in [
+            (18, true, false, true),
+            (17, false, false, true),
+            (17, true, true, true),
+            (17, true, false, false),
+        ] {
+            assert!(!chat_menu_target_is_current(
+                menu, session, chat, alt, retained
+            ));
+        }
+        terminal.command_zones.front_mut().unwrap().rows_evicted = true;
+        assert!(Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::CopyOutput).is_err());
+        let mut policy = terminal::ProjectionPolicy::new();
+        policy.set_chat(true);
+        let view = terminal.get_projected_viewport_with_policy(true, &policy, usize::MAX);
+        assert!((0..view.chat_rows().len())
+            .all(|row| chat_completed_zone_at_row(&terminal, &view, row).is_none()));
+        terminal.clear_completed_blocks();
+        assert!(Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::CopyCommand).is_err());
+    }
+
+    #[test]
+    fn chat_empty_output_does_not_copy_live_draft_or_execute() {
+        let terminal = chat_card_fixture("");
+        let id = terminal.command_zones.front().unwrap().id;
+        assert_eq!(
+            Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::CopyOutput),
+            Err(block_mode::SelectedClipboardError::Empty)
+        );
+        assert!(
+            Frost::chat_card_copy_text(&terminal, id, BlockMenuAction::ReinputSelected).is_err()
+        );
+        assert!(!chat_read_only_menu_actions(false).contains(&BlockMenuAction::CopyCommand));
+    }
+
+    #[test]
+    fn chat_read_only_dispatch_and_details_never_insert_into_prompt() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let dispatch = source
+            .split_once("    fn execute_chat_read_only_menu_action(")
+            .unwrap()
+            .1
+            .split_once("    /// Attach one stable")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("chat_menu_target_is_current("));
+        assert!(dispatch.contains("allowed.contains(&action)"));
+        assert!(dispatch.contains("self.open_block_review(Some(menu.zone_id))"));
+        for forbidden in [
+            "write_pty",
+            "insert_command",
+            "reinput_selected",
+            "block_ask_ai",
+        ] {
+            assert!(!dispatch.contains(forbidden));
+        }
+        let details = source
+            .split_once("    fn block_details_snapshot(")
+            .unwrap()
+            .1
+            .split_once("    fn block_reinput_selected_commands_task")
+            .unwrap()
+            .0;
+        assert!(details.contains("commands: None"));
+        assert!(details.contains("bracketed: false"));
+        assert!(!details.contains("write_pty"));
+        let execute = source
+            .split_once("    fn execute_block_menu_action(")
+            .unwrap()
+            .1
+            .split_once("    fn chat_card_copy_text(")
+            .unwrap()
+            .0;
+        assert!(
+            execute.find("BlockMenuAction::Close").unwrap()
+                < execute.find("menu.chat_read_only").unwrap()
+        );
+    }
     #[test]
     fn chat_running_controls_share_visible_timer_and_validate_generation() {
         let source = include_str!("main.rs")

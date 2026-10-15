@@ -321,6 +321,11 @@ pub enum BlockCardKind {
     Active,
 }
 
+/// Chat exposes only read-only context actions; Shift-drag remains text selection.
+fn chat_card_mouse_action(button: MouseButton, completed: bool) -> Option<BlockMouseAction> {
+    (completed && button == MouseButton::Right).then_some(BlockMouseAction::Menu)
+}
+
 fn block_mouse_action(
     button: MouseButton,
     row_has_selectable_block: bool,
@@ -3440,8 +3445,9 @@ where
                         return;
                     }
                 }
-                let block = if finalized && block_row.is_some_and(|row| row.native_header.is_some())
-                {
+                let block = if !self.chat_rows.is_empty() {
+                    chat_card_mouse_action(button, finalized)
+                } else if finalized && block_row.is_some_and(|row| row.native_header.is_some()) {
                     native_header_action(button, pos.x, bounds, self.metrics, shift, ctrl)
                 } else {
                     block_mouse_action(button, finalized, row_is_header, shift, ctrl, count)
@@ -6133,5 +6139,22 @@ mod mode_gesture_tests {
         let mut after = crate::Tab::new(3, 0);
         after.tree = trees[2].clone();
         assert!(saved.matches(Some(&after), false, 0, &|i| [17, 29].get(i).copied()));
+    }
+}
+
+#[cfg(test)]
+mod chat_card_action_tests {
+    use super::*;
+
+    #[test]
+    fn chat_cards_only_claim_right_click_on_completed_cells() {
+        for completed in [false, true] {
+            for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                assert_eq!(
+                    chat_card_mouse_action(button, completed),
+                    (completed && button == MouseButton::Right).then_some(BlockMouseAction::Menu)
+                );
+            }
+        }
     }
 }

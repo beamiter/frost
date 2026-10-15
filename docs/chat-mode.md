@@ -85,3 +85,18 @@ stale action/session/foreground, enhanced-key rejection, press/release ownership
 and acceptance only after an actual one-byte write.
 Actual desktop appearance, IME and pointer end-to-end testing require a GUI
 session; passing these tests alone is not a claim of GUI verification.
+
+## Completed card actions
+
+Right-click a retained completed command or output cell to open its read-only
+card menu: **Block details**, **Copy command** (when available), **Copy output**,
+**Copy block**, and **Copy as Markdown**. Copies target that one card, regardless
+of an older Block selection. Details show retained output and lifecycle metadata;
+missing or evicted text is reported instead of borrowing another card's output.
+
+Use Up/Down, Home/End, Enter, and Escape within the menu. Closing it returns to
+the terminal without changing the live draft. Ordinary and Shift-drag selection
+remain text selection. Composer cells, running output, and decorative spacing
+do not open card menus. Chat does not expose collapse, recall, command review,
+rerun, deletion, or agent dispatch here. The configurable **block:menu** shortcut
+(default Shift+F10) remains Block-only.
