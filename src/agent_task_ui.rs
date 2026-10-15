@@ -1024,7 +1024,7 @@ mod tests {
                 < open.find("request_diff(").unwrap()
         );
         let pump = source
-            .split("// Tasks dashboard pump:")
+            .split("let tasks_open =")
             .nth(1)
             .unwrap()
             .split("let interval =")
