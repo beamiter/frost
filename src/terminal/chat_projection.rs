@@ -1138,4 +1138,107 @@ mod tests {
             == output));
         assert_eq!(terminal.grid.cols(), 40);
     }
+    #[test]
+    fn shared_session_parity_corpus_uses_native_owner_and_projection() {
+        use jterm_core::session_parity::{chunks, fixtures, Completion, Expected, CHUNKINGS};
+        for fixture in fixtures() {
+            for chunking in CHUNKINGS {
+                let mut terminal = TerminalState::new(80, 24);
+                let mut completed = Vec::new();
+                let mut identities = std::collections::HashMap::new();
+                let mut view_state = ProjectionViewState::new();
+                for (step_index, step) in fixture.steps.iter().enumerate() {
+                    let context = format!("{} {chunking:?} checkpoint {step_index}", fixture.id);
+                    for bytes in chunks(step.pty.as_bytes(), chunking) {
+                        terminal.process_input(bytes);
+                    }
+                    completed.extend(terminal.take_completed_commands().into_iter().map(|event| {
+                        Completion {
+                            id: event.id.expect("fixture supplies execution identity"),
+                            command: event.command,
+                            exit_code: event.exit_code,
+                        }
+                    }));
+                    let running_id = terminal
+                        .is_command_running()
+                        .then(|| terminal.current_command_id.clone())
+                        .flatten();
+                    if let Some(id) = &running_id {
+                        let generation = terminal.watch_generation().expect("running generation");
+                        if let Some(previous) = identities.insert(id.clone(), generation) {
+                            assert_eq!(previous, generation, "{context}: local identity changed");
+                        }
+                    }
+                    let draft_text = step.expected.draft_text.as_ref().map(|draft| {
+                        let row: String = terminal.grid.to_vec()[terminal.cursor_row]
+                            .iter()
+                            .filter(|cell| !cell.flags.wide_continuation())
+                            .map(|cell| cell.character)
+                            .collect();
+                        // Ignore only native grid padding; the corpus retains the prompt space.
+                        assert_eq!(
+                            terminal.cursor_col,
+                            draft
+                                .chars()
+                                .map(crate::char_width::cached_char_width)
+                                .sum::<usize>(),
+                            "{context}: draft cursor"
+                        );
+                        row.trim_end().to_owned()
+                    });
+                    let mut expected = step.expected.clone();
+                    expected.draft_text =
+                        expected.draft_text.map(|text| text.trim_end().to_owned());
+                    let observed = Expected {
+                        draft_text,
+                        surface: format!("{:?}", terminal.chat_surface()).to_lowercase(),
+                        completed: completed.clone(),
+                        running_id,
+                    };
+                    assert_eq!(observed, expected, "{context}");
+                    // Project the same native model in all modes. No recorder,
+                    // command execution, or shell editor is introduced by Chat.
+                    let grid = terminal.grid.to_vec();
+                    let cursor = (terminal.cursor_row, terminal.cursor_col);
+                    let zones = format!("{:?}", terminal.command_zones);
+                    let command = (
+                        terminal.current_command_id.clone(),
+                        terminal.current_command_text.clone(),
+                    );
+                    let generation = terminal.watch_generation();
+                    for mode in [2, 0, 1, 2] {
+                        let mut policy = ProjectionPolicy::new();
+                        policy.set_native_chrome(mode == 1, 3);
+                        policy.set_chat(mode == 2);
+                        let _view = terminal.get_projected_viewport_with_state(
+                            mode != 0,
+                            &policy,
+                            &mut view_state,
+                        );
+                        assert_eq!(
+                            terminal.grid.to_vec(),
+                            grid,
+                            "{context}: mode {mode} changed cells"
+                        );
+                        assert_eq!(
+                            (terminal.cursor_row, terminal.cursor_col),
+                            cursor,
+                            "{context}"
+                        );
+                        assert_eq!(format!("{:?}", terminal.command_zones), zones, "{context}");
+                        assert_eq!(
+                            (
+                                terminal.current_command_id.clone(),
+                                terminal.current_command_text.clone()
+                            ),
+                            command,
+                            "{context}"
+                        );
+                        assert_eq!(terminal.watch_generation(), generation, "{context}");
+                        assert!(terminal.take_completed_commands().is_empty(), "{context}");
+                    }
+                }
+            }
+        }
+    }
 }
