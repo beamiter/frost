@@ -17765,7 +17765,8 @@ impl Frost {
                         && (normalized_any || self.search_dirty)
                     {
                         self.recompute_search();
-                        self.reveal_current_search_match();
+                        // Reflow is maintenance, not a new navigation request.
+                        // Preserve any newer manual scroll or Go live intent.
                     }
                     self.links_cache_key = None;
                 }
@@ -31621,6 +31622,23 @@ mod tests {
         assert!(!last_save.contains("save_force"));
         assert!(!last_save.contains("loop"));
         assert!(last_save.contains("not confirmed before exit"));
+    }
+
+    #[test]
+    fn delayed_history_reflow_refreshes_search_without_revealing_an_old_match() {
+        let source = include_str!("main.rs");
+        let reflow = source
+            .split_once("            Message::HistoryReflowTick => {")
+            .unwrap()
+            .1
+            .split_once("            Message::SetTheme")
+            .unwrap()
+            .0;
+        assert!(reflow.contains("session.terminal.normalize_scrollback_width()"));
+        assert!(reflow.contains("session.refresh();"));
+        assert!(reflow.contains("self.recompute_search();"));
+        assert!(!reflow.contains("self.reveal_current_search_match()"));
+        assert!(!reflow.contains("scroll_to_bottom()"));
     }
 
     #[test]
