@@ -427,10 +427,14 @@ impl AgentUi {
         }
     }
 
-    fn install_restored_session(&mut self, session: AgentSession) {
+    fn install_restored_session(&mut self, mut session: AgentSession) {
+        // Legacy snapshots carry no stable terminal/cwd provenance. Capture
+        // the omission notice before cancellation retires the snapshot, then
+        // retain only reviewable history, never an actionable old proposal.
         self.restored_history_notice = restored_history_notice(&session);
+        session.cancel();
         self.session = Some(session);
-        self.set_status("restored the previous agent session".to_string());
+        self.set_status("restored the previous Agent transcript for review only; start a new task to bind this terminal".to_string());
     }
 
     /// Start a fresh Agent task from one failed block's captured context
@@ -959,10 +963,27 @@ impl AgentUi {
         }
     }
 
+    pub fn can_start_new_task(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            matches!(
+                session.state(),
+                AgentState::Completed | AgentState::Cancelled | AgentState::TurnLimitReached
+            )
+        })
+    }
+
     /// Drop the finished transcript and start fresh in the same binding.
     pub fn new_task(&mut self) {
         if let Some(session) = self.session.as_mut() {
-            match session.start_new_task() {
+            // A cancellation token is permanent. Review-only restores need a
+            // fresh session/epoch, not a reset of their cancelled protocol.
+            let result = if session.state() == AgentState::Cancelled {
+                *session = AgentSession::new(session.max_turns());
+                Ok(())
+            } else {
+                session.start_new_task()
+            };
+            match result {
                 Ok(()) => {
                     self.restored_history_notice = None;
                     self.edit = None;
@@ -1167,28 +1188,11 @@ mod tests {
         panel.set_status("provider failed");
         panel.status.clear();
         assert_eq!(panel.restored_history_notice, Some(notice));
-        panel.new_task(); // AwaitingModel cannot be replaced by this transition.
+        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+        assert!(panel.session.as_ref().unwrap().snapshot().is_none());
+        panel.continue_task(); // Review-only history cannot resume an old turn.
+        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
         assert_eq!(panel.restored_history_notice, Some(notice));
-        panel
-            .session
-            .as_mut()
-            .unwrap()
-            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
-            .unwrap();
-        panel.continue_task();
-        assert_eq!(panel.restored_history_notice, Some(notice));
-        panel
-            .session
-            .as_mut()
-            .unwrap()
-            .submit_user("follow up")
-            .unwrap();
-        panel
-            .session
-            .as_mut()
-            .unwrap()
-            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
-            .unwrap();
         panel.new_task();
         assert!(panel.restored_history_notice.is_none());
         panel.install_restored_session(legacy_omitted_history_session());
@@ -1203,6 +1207,70 @@ mod tests {
         let mut panel = AgentUi::new();
         panel.install_restored_session(session);
         assert!(panel.restored_history_notice.is_none());
+        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+    }
+
+    #[test]
+    fn restored_proposal_cannot_execute_in_the_new_terminal_binding() {
+        let mut session = AgentSession::new(10);
+        session
+            .submit_user("list files in the original terminal")
+            .unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let restored = AgentSession::restore(snapshot).unwrap();
+        let AgentState::AwaitingApproval { proposal_id } = restored.state() else {
+            panic!("fixture must contain an actionable saved proposal");
+        };
+        let reference = ProposalRef {
+            epoch: restored.epoch(),
+            id: proposal_id,
+        };
+        let mut panel = AgentUi::new();
+        panel.is_open = true;
+        panel.bound_session_id = Some(42);
+        panel.install_restored_session(restored);
+
+        assert_eq!(panel.session.as_ref().unwrap().state(), AgentState::Cancelled);
+        assert!(!panel.session.as_ref().unwrap().transcript().is_empty());
+        assert!(!panel.proposal_is_current(reference));
+        assert!(panel.approve(reference, None).is_none());
+        panel.start_edit(reference, "pwd".into());
+        assert!(panel.edit.is_none());
+        assert!(panel
+            .next_model_request(&Config::default(), Some("/different/repo"))
+            .is_none());
+        assert!(panel.status.contains("review only"));
+        assert!(panel.can_start_new_task());
+
+        panel.new_task();
+        let fresh = panel.session.as_ref().unwrap();
+        assert_eq!(fresh.state(), AgentState::Ready);
+        assert!(fresh.transcript().is_empty());
+        assert!(!fresh.is_current_epoch(reference.epoch));
+        assert_eq!(panel.bound_session_id, Some(42));
+        assert!(panel.approve(reference, None).is_none());
+        assert!(!panel.can_start_new_task());
+        let fresh = panel.session.as_mut().unwrap();
+        fresh.submit_user("new task in this terminal").unwrap();
+        fresh
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap();
+        let AgentState::AwaitingApproval { proposal_id } = fresh.state() else {
+            panic!("new task must remain actionable");
+        };
+        let fresh_reference = panel.proposal_ref(proposal_id).unwrap();
+        assert!(panel.approve(reference, None).is_none());
+        assert_eq!(panel.approve(fresh_reference, None).unwrap().command, "pwd");
+        let running_epoch = panel.session.as_ref().unwrap().epoch();
+        panel.new_task();
+        assert_eq!(panel.session.as_ref().unwrap().epoch(), running_epoch);
+        assert!(matches!(
+            panel.session.as_ref().unwrap().state(),
+            AgentState::AwaitingObservation { .. }
+        ));
     }
 
     #[test]

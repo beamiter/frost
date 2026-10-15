@@ -28224,14 +28224,12 @@ impl Frost {
         };
 
         // A finished task can be followed up (same transcript, budget
-        // permitting) or replaced by a fresh one in the same binding.
+        // permitting). Cancelled/restored review-only history can only be
+        // replaced by a fresh task in the current binding.
         let (can_continue, can_restart) = match session {
             Some(session) => (
                 session.can_continue_after_completion(),
-                matches!(
-                    session.state(),
-                    AgentState::Completed | AgentState::TurnLimitReached
-                ),
+                self.agent.can_start_new_task(),
             ),
             None => (false, false),
         };
