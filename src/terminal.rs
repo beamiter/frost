@@ -5291,9 +5291,12 @@ impl TerminalState {
             log::error!("OSC 133 block id space exhausted; dropping finalized block");
             return;
         };
+        // A capped snapshot contains a prefix, not the final output row.
+        // Keep it for copy/search, but never mislabel its end as a tail preview.
         zone.output_preview = zone
             .captured_output
             .as_ref()
+            .filter(|(_, capped)| !capped)
             .map_or_else(String::new, |(text, _)| {
                 crate::fold_preview::from_plain(text)
             });
@@ -22335,6 +22338,42 @@ mod block_spacing_tests {
             terminal.command_zones.back().unwrap().output_preview,
             "RIGHT"
         );
+    }
+
+    #[test]
+    fn capped_prefix_never_becomes_a_folded_tail_preview() {
+        let template = fixture(80, 16).command_zones[0].clone();
+        for last in ['x', 'é', '界', '🦀'] {
+            let mut terminal = TerminalState::new(1024, 1024);
+            for row in 0..1023 {
+                for cell in &mut terminal.grid[row] {
+                    cell.character = 'x';
+                }
+            }
+            terminal.grid[1023][0].character = last;
+            // 1023 full rows plus their newlines occupy CAP - 1 bytes.
+            // One ASCII scalar fits exactly; a multibyte final scalar does not.
+            let capture = terminal
+                .capture_zone_output(0, 1024, 0)
+                .expect("nonempty normalized output");
+            assert_eq!(capture.1, last != 'x');
+            if last == 'x' {
+                assert_eq!(capture.0.len(), TerminalState::ZONE_OUTPUT_CAP_BYTES);
+            } else {
+                assert!(!capture.0.ends_with(last));
+                assert!(!crate::fold_preview::from_plain(&capture.0).is_empty());
+            }
+            let mut zone = template.clone();
+            zone.captured_output = Some(capture.clone());
+            terminal.push_command_zone(zone);
+            let stored = terminal.command_zones.back().unwrap();
+            assert_eq!(
+                stored.captured_output.as_ref(),
+                Some(&capture),
+                "copy/search data is unchanged"
+            );
+            assert_eq!(stored.output_preview, if capture.1 { "" } else { "x" });
+        }
     }
 
     fn normal() -> ProjectionPolicy {

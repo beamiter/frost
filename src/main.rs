@@ -2377,6 +2377,29 @@ fn block_search_reveal_row(
         .or_else(|| terminal.zone_output_line_row(hit.zone_id, hit.line_no))
 }
 
+/// Explicitly accepting an output hit may unfold only the block proven to
+/// hide its retained row. Query edits and selection movement never call this.
+fn expand_block_search_hit(
+    terminal: &terminal::TerminalState,
+    projection: &terminal::ProjectedViewport,
+    policy: &mut terminal::ProjectionPolicy,
+    hit: &block_mode::BlockSearchHit,
+) -> bool {
+    if projection.policy_revision() != policy.revision() {
+        return false;
+    }
+    let Some(row) = block_search_reveal_row(terminal, hit) else {
+        return false;
+    };
+    let Some(origin) = terminal.raw_cell_origin_at_absolute(row, 0) else {
+        return false;
+    };
+    matches!(
+        terminal.locate_raw_cell_in_projection(projection, origin),
+        terminal::ProjectedRawCellLocation::Hidden { zone_id } if zone_id == hit.zone_id
+    ) && policy.expand(hit.zone_id)
+}
+
 /// Place a pointer-anchored overlay inside the visible window. Prefer below
 /// the pointer; flip above when the estimated panel height would cross the
 /// bottom edge. Tiny windows keep the panel's top-left reachable.
@@ -14022,6 +14045,17 @@ impl Frost {
             .and_then(|sess| block_search_reveal_row(&sess.terminal, hit));
         if let Some(row) = row {
             if let Some(sess) = self.sessions.get_mut(self.active) {
+                if expand_block_search_hit(
+                    &sess.terminal,
+                    &sess.projection,
+                    &mut sess.projection_policy,
+                    hit,
+                ) {
+                    // Rebuild before resolving the same raw output row. Do
+                    // not send input or change the active prompt's draft.
+                    sess.refresh();
+                    self.session_dirty = true;
+                }
                 sess.reveal_absolute_cell(row, 0);
             }
         }
@@ -40262,6 +40296,116 @@ mod tests {
 
         terminal.command_zones.back_mut().unwrap().rows_evicted = true;
         assert_eq!(block_search_reveal_row(&terminal, &stale), None);
+    }
+
+    #[test]
+    fn accepted_block_search_output_unfolds_only_its_owner_without_editing_prompt() {
+        let mut fixture = search_reveal_fixture();
+        fixture
+            .terminal
+            .process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07draft untouched\x1b[3D");
+        fixture.projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        let zone = fixture.terminal.zone_by_id(fixture.target.zone_id).unwrap();
+        let cache = [block_mode::CachedBlockSearchZone::new(
+            zone.id,
+            zone.command.as_deref(),
+            fixture.terminal.zone_output_text(zone.id),
+        )];
+        let hit = block_mode::search_blocks(&cache, "needle")
+            .hits
+            .into_iter()
+            .find(|hit| hit.is_output_line)
+            .unwrap();
+        let row = block_search_reveal_row(&fixture.terminal, &hit).unwrap();
+        let origin = fixture
+            .terminal
+            .raw_cell_origin_at_absolute(row, 0)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .terminal
+                .locate_raw_cell_in_projection(&fixture.projection, origin,),
+            terminal::ProjectedRawCellLocation::Hidden { .. }
+        ));
+        let grid = fixture.terminal.grid.to_vec();
+        let cursor = fixture.terminal.get_cursor_pos();
+        assert!(expand_block_search_hit(
+            &fixture.terminal,
+            &fixture.projection,
+            &mut fixture.policy,
+            &hit,
+        ));
+        assert!(!fixture.policy.is_collapsed(hit.zone_id));
+        assert!(fixture.policy.is_collapsed(fixture.other_zone));
+        fixture.projection = fixture.terminal.get_projected_viewport_with_state(
+            true,
+            &fixture.policy,
+            &mut fixture.view_state,
+        );
+        assert!(fixture.terminal.reveal_raw_cell_in_projection(
+            &fixture.policy,
+            &mut fixture.view_state,
+            origin,
+        ));
+        assert_eq!(fixture.terminal.grid.to_vec(), grid);
+        assert_eq!(fixture.terminal.get_cursor_pos(), cursor);
+        assert!(
+            !expand_block_search_hit(
+                &fixture.terminal,
+                &fixture.projection,
+                &mut fixture.policy,
+                &hit,
+            ),
+            "repeated acceptance does not change the fold policy again"
+        );
+    }
+
+    #[test]
+    fn block_search_unfold_rejects_non_output_removed_evicted_and_stale_projection() {
+        for invalid in ["command", "zero line", "removed", "evicted", "projection"] {
+            let mut fixture = search_reveal_fixture();
+            let mut hit = block_mode::BlockSearchHit {
+                zone_id: fixture.target.zone_id,
+                line_no: 1,
+                line_text: "needle".into(),
+                is_output_line: true,
+                match_span: Some(0..6),
+                command_preview: "first".into(),
+            };
+            match invalid {
+                "command" => hit.is_output_line = false,
+                "zero line" => hit.line_no = 0,
+                "removed" => hit.zone_id = u64::MAX,
+                "evicted" => {
+                    fixture
+                        .terminal
+                        .command_zones
+                        .front_mut()
+                        .unwrap()
+                        .rows_evicted = true
+                }
+                "projection" => {
+                    fixture.policy.expand(fixture.other_zone);
+                }
+                _ => unreachable!(),
+            }
+            let revision = fixture.policy.revision();
+            assert!(
+                !expand_block_search_hit(
+                    &fixture.terminal,
+                    &fixture.projection,
+                    &mut fixture.policy,
+                    &hit,
+                ),
+                "{invalid}"
+            );
+            assert_eq!(fixture.policy.revision(), revision);
+            assert!(fixture.policy.is_collapsed(fixture.target.zone_id));
+        }
     }
 
     #[test]
