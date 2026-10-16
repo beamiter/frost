@@ -39,6 +39,8 @@ mod organism_preview;
 mod organism_watch;
 mod persistence;
 mod pty;
+#[cfg(all(test, unix))]
+mod readline_preservation_tests;
 mod remote_fs;
 mod remote_host_editor;
 mod review_text;
