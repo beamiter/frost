@@ -42,7 +42,7 @@ class Smoke:
                             ('XDG_CACHE_HOME', '.cache')]:
             self.env[key] = str(home / suffix)
         self.env.update(FROST_SMOKE_SHELL_TRACE=str(out / 'synthetic-shell-trace.log'), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE='1',
-                        WGPU_BACKEND='vulkan', RUST_LOG='warn')
+                        WGPU_BACKEND='vulkan', RUST_LOG='warn,iced_wgpu::window::compositor=info')
         config = home / '.config/frost'
         config.mkdir(parents=True)
         self.config = config / 'config.toml'
