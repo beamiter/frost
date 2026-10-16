@@ -63,6 +63,9 @@ jobs:
         if: steps.install.outcome == 'success'
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11
       - name: Exercise Wayland production input
+        timeout-minutes: 10
+        env:
+          FROST_SMOKE_WAYLAND_DEBUG: "1"
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: python3 scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --output native-smoke-artifacts/wayland
       - name: Exercise X11 restart and recovery
@@ -97,6 +100,9 @@ jobs:
           cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-clipboard" scripts/native-clipboard-owner.c "$RUNNER_TEMP/frost-clipboard/wlr-data-control-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-clipboard/native-clipboard-owner"
           cc -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I"$RUNNER_TEMP/frost-clipboard" scripts/native-pointer.c "$RUNNER_TEMP/frost-clipboard/wlr-virtual-pointer-unstable-v1-protocol.c" $(pkg-config --libs wayland-client) -o "$RUNNER_TEMP/frost-clipboard/native-pointer"
       - name: Exercise actual Wayland bounded clipboard transfers
+        timeout-minutes: 10
+        env:
+          FROST_SMOKE_WAYLAND_DEBUG: "1"
         if: ${{ !cancelled() && steps.clipboard_owner.outcome == 'success' }}
         run: python3 scripts/native-wayland-clipboard.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --owner "$RUNNER_TEMP/frost-clipboard/native-clipboard-owner" --output native-smoke-artifacts/wayland-clipboard
       - name: Exercise actual clipboard widgets PRIMARY and idle ownership

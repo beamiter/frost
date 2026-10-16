@@ -69,7 +69,13 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
     def spawn(self, args, label):
         log = open(self.out / (label + '.log'), 'w')
         self.logs.append(log)
-        proc = subprocess.Popen(args, env=self.env, stdout=log, stderr=log)
+        # Opt-in protocol metadata from the actual Frost child only.
+        env = self.env.copy()
+        env.pop('WAYLAND_DEBUG', None)
+        if (self.backend == 'wayland' and env.get('FROST_SMOKE_WAYLAND_DEBUG') == '1'
+                and args and args[0] == str(self.binary)):
+            env['WAYLAND_DEBUG'] = 'client'
+        proc = subprocess.Popen(args, env=env, stdout=log, stderr=log)
         self.processes.append(proc)
         return proc
 
