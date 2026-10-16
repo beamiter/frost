@@ -16356,15 +16356,17 @@ impl Frost {
                         .task_for_terminal_session(&session_key)
                         .is_some();
                     let exit_code = self.sessions[index].pty.exited_code();
-                    self.task_manager
-                        .handle_terminal_session_exit(&session_key, exit_code);
+                    let feedback = agent_task_ui::task_terminal_exit_feedback(
+                        &mut self.task_manager,
+                        &session_key,
+                        exit_code,
+                    );
                     if task_bound {
                         self.organism.forget_session(id);
                         self.sessions[index].hold_after_exit = true;
-                        self.push_toast(
-                            "Task terminal exited; its transcript stays open for review",
-                            ToastKind::Info,
-                        );
+                        if let Some(message) = feedback {
+                            self.push_toast(message, ToastKind::Info);
+                        }
                         return Task::none();
                     }
                     return self.close_session(index);
@@ -27802,26 +27804,15 @@ impl Frost {
                     ToastKind::Warning,
                 );
             }
-            for completion in report.completions {
-                let outcome = match completion.outcome {
-                    agent_task::AgentSessionOutcome::Clean => "finished",
-                    agent_task::AgentSessionOutcome::Failed => "failed",
-                    agent_task::AgentSessionOutcome::Cancelled => "was cancelled",
-                };
-                self.push_toast(
-                    format!(
-                        "{} session {outcome}",
-                        self.task_manager
-                            .get(completion.task_id)
-                            .map(|task| {
-                                crate::review_text::bound_provider_label(
-                                    task.provider.display_name(),
-                                )
-                            })
-                            .unwrap_or_else(|| "Agent".to_string())
-                    ),
-                    ToastKind::Info,
-                );
+            if let Some(message) = agent_task_ui::task_completion_feedback(
+                &self.task_manager,
+                report
+                    .completions
+                    .into_iter()
+                    .map(|completion| (completion.task_id, completion.outcome)),
+            ) {
+                // Passive feedback must not select a task or move terminal focus.
+                self.push_toast(message, ToastKind::Info);
             }
         }
 
