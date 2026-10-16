@@ -293,9 +293,10 @@ const BLOCK_CARD_INSET: f32 = 8.0;
 const BLOCK_CARD_COMPACT_INSET: f32 = 4.0;
 const BLOCK_CARD_RADIUS: f32 = 10.0;
 const BLOCK_CARD_COMPACT_RADIUS: f32 = 6.0;
-/// A one-pixel breathing gap at real card edges gives adjacent single-grid
-/// blocks separation without inserting synthetic terminal rows.
-const BLOCK_CARD_EDGE_GAP: f32 = 1.0;
+/// Match the other Block surfaces: adjacent real edges form a 4px seam
+/// (2px compact), without inserting synthetic terminal rows.
+const BLOCK_CARD_EDGE_GAP: f32 = 2.0;
+const BLOCK_CARD_COMPACT_EDGE_GAP: f32 = 1.0;
 /// Width of the reserved card gutter. Ties to the stripe widths above: it must
 /// cover the widest stripe
 /// (`BLOCK_STRIPE_SELECTED_WIDTH` = 5px, plus 1px slack) so a press anywhere
@@ -522,11 +523,19 @@ fn block_card_geometry(
     };
     let mut top = grid_origin_y + segment.start_row as f32 * cell_height;
     let mut bottom = grid_origin_y + segment.end_row as f32 * cell_height;
+    // Bound edge insets for tiny rows, as Ember does, so density cannot
+    // invert a short card or move its top beyond the original row span.
+    let gap = (if compact {
+        BLOCK_CARD_COMPACT_EDGE_GAP
+    } else {
+        BLOCK_CARD_EDGE_GAP
+    })
+    .min(((bottom - top) * 0.25).max(0.0));
     if segment.real_top {
-        top += BLOCK_CARD_EDGE_GAP;
+        top += gap;
     }
     if segment.real_bottom {
-        bottom -= BLOCK_CARD_EDGE_GAP;
+        bottom -= gap;
     }
     bottom = bottom.max(top);
     let left = bounds.x + inset;
@@ -2724,6 +2733,38 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_block_cards_share_four_and_two_pixel_seams_at_every_font_scale() {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        for cell_height in [8.0, 14.0, 20.0, 32.0, 48.0] {
+            for (compact, expected) in [(false, 4.0), (true, 2.0)] {
+                let first_segment = segment(true, true);
+                let next_segment = BlockCardSegment {
+                    start_row: first_segment.end_row,
+                    end_row: first_segment.end_row + 3,
+                    ..first_segment
+                };
+                let first =
+                    block_card_geometry(bounds, 620.0, 0.0, cell_height, first_segment, compact);
+                let next =
+                    block_card_geometry(bounds, 620.0, 0.0, cell_height, next_segment, compact);
+                assert_eq!(next.body.y - (first.body.y + first.body.height), expected);
+                assert_eq!(first.body.x, next.body.x);
+                assert_eq!(first.body.width, next.body.width);
+            }
+        }
+        // Tiny rows still keep positive paint inside their source span.
+        let tiny = block_card_geometry(bounds, 620.0, 0.0, 0.5, segment(true, true), false);
+        assert!(tiny.body.height > 0.0);
+        assert!(tiny.body.y >= 1.0);
+        assert!(tiny.body.y + tiny.body.height <= 2.5);
+    }
+
+    #[test]
     fn card_geometry_is_paint_only_clipped_and_clear_of_scrollbar() {
         let bounds = Rectangle {
             x: 10.0,
@@ -2735,7 +2776,7 @@ mod tests {
         let normal = block_card_geometry(bounds, 288.0, 6.0, 10.0, segment(false, true), false);
         assert_eq!(normal.body.x, bounds.x + BLOCK_CARD_INSET);
         assert_eq!(normal.body.y, 26.0, "clipped top gets no synthetic gap");
-        assert_eq!(normal.body.y + normal.body.height, 55.0);
+        assert_eq!(normal.body.y + normal.body.height, 54.0);
         assert_eq!(normal.body.x + normal.body.width, 288.0 - BLOCK_CARD_INSET);
         assert!(normal.body.x + normal.body.width <= 288.0);
         assert_eq!(normal.radius.top_left, 0.0);
