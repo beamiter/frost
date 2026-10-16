@@ -41,12 +41,15 @@ class Smoke:
                             ('XDG_DATA_HOME', '.local/share'), ('XDG_STATE_HOME', '.local/state'),
                             ('XDG_CACHE_HOME', '.cache')]:
             self.env[key] = str(home / suffix)
-        self.env.update(XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE='1',
+        self.env.update(FROST_SMOKE_SHELL_TRACE=str(out / 'synthetic-shell-trace.log'), XDG_RUNTIME_DIR=str(runtime), LIBGL_ALWAYS_SOFTWARE='1',
                         WGPU_BACKEND='vulkan', RUST_LOG='warn')
         config = home / '.config/frost'
         config.mkdir(parents=True)
         self.config = config / 'config.toml'
         (home / '.bash_profile').write_text(r"""export HISTFILE=/dev/null
+exec 9>>"$FROST_SMOKE_SHELL_TRACE"
+BASH_XTRACEFD=9
+set -x
 # Public OSC 133 bash integration documented in Frost's README. No private
 # authentication token or foreground guard is overridden by this fixture.
 __frost_smoke_prompt() {
@@ -138,6 +141,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             self.key('v', ('ctrl', 'shift'))
         else:
             self.text(command)
+        self.screenshot(sentinel + '-before-enter')
         self.key('Return')
         wait_for(lambda: self.transcript.exists() and any(line.startswith(sentinel + ':') for line in self.transcript.read_text().splitlines()),
                  'PTY sentinel ' + sentinel)
@@ -191,6 +195,9 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
             returned_identity = self.command(mode + '-focus-returned')
             assert returned_identity == first_identity, 'Previous session shortcut did not restore PTY identity'
             self.screenshot(mode + '-completed')
+        except Exception:
+            self.screenshot(mode + '-failure-before-cleanup')
+            raise
         finally:
             if app.poll() is None:
                 app.terminate()
