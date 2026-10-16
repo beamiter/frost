@@ -24,6 +24,10 @@ result = {'status': 'running', 'mechanism': 'real Sway input-method-v2 -> text-i
           'excluded': ['full fcitx/IBus engine behavior', 'X11 XIM', 'physical keyboard IME toggles']}
 try:
     s.start_desktop()
+    # Keep a keyboard on the headless seat while the IME composes. The ten-minute
+    # hold exceeds the bounded test stages; tracked cleanup stops it before F24.
+    s.spawn(["wtype", "-s", "600000", "-k", "F24"], "ime-seat-keyboard")
+    time.sleep(0.5)
     control = out / 'ime-control'
     control.mkdir()
     ime = s.spawn([str(a.ime_client.resolve(strict=True)), str(control)], 'ime-client')

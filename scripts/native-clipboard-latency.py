@@ -58,6 +58,14 @@ try:
     result['slow_minus_fast_seconds'] = result['measurements'][1]['queued_input_to_shell_seconds'] - result['measurements'][0]['queued_input_to_shell_seconds']
 except Exception as error:
     result.update(status='failed', error=str(error))
+    result['provider_events_on_failure'] = {
+        path.name: [json.loads(line) for line in path.read_text().splitlines()]
+        for path in out.glob('owner-*.jsonl')
+    }
+    try:
+        s.screenshot('clipboard-failure')
+    except Exception as screenshot_error:
+        result['screenshot_error'] = str(screenshot_error)
     raise
 finally:
     s.close()
