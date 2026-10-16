@@ -37,6 +37,7 @@ mod organism_block;
 mod organism_hover;
 mod organism_preview;
 mod organism_watch;
+mod paste_feedback;
 mod persistence;
 mod pty;
 #[cfg(all(test, unix))]
@@ -11572,7 +11573,10 @@ impl Frost {
             self.push_toast(format!("Command not retried: {reason}"), ToastKind::Warning);
             return Task::none();
         }
-        if self.write_paste_to_session(session_id, &command, block_retry_policy(), true) {
+        if self
+            .write_paste_to_session(session_id, &command, block_retry_policy(), true)
+            .written()
+        {
             self.push_toast("Command queued to run", ToastKind::Success);
         }
         Task::none()
@@ -12307,7 +12311,7 @@ impl Frost {
         text: &str,
         policy: PastePolicy,
         clear_line_first: bool,
-    ) -> bool {
+    ) -> paste_feedback::PasteOutcome {
         if clear_line_first {
             self.native_enter_ownership.lock().claim_pressed();
             self.prompt_recall_enter_latch.begin_recall();
@@ -12319,8 +12323,7 @@ impl Frost {
             self.sessions.get(self.active).map(|session| session.id),
             self.focused && self.terminal_input_active(),
         );
-        let mut rejected = false;
-        let mut written = false;
+        let mut outcome = paste_feedback::PasteOutcome::Empty;
         let mut dead_input = false;
         if let Some(sess) = self.sessions.iter_mut().find(|session| session.id == id) {
             if sess.transcript_read_only() {
@@ -12330,33 +12333,32 @@ impl Frost {
                 let modes = PasteModes {
                     bracketed: sess.terminal.is_bracketed_paste_enabled(),
                 };
-                let paste = pty_input::encode_prompt_insert(text, modes, policy, clear_line_first);
-                // A clipboard that was nothing but paste markers normalizes away
-                // entirely; writing zero bytes would toast about a full queue.
-                if paste.is_empty() {
-                    return false;
-                }
-                // Size-check the *encoded* bytes: framing and control stripping have
-                // already changed the length the queue must accept.
-                if !sess.can_queue_user_bytes(paste.bytes.len()) {
-                    rejected = true;
-                } else {
-                    // PTY-bound input dismisses the block selection, same as
-                    // `encode_key` and IME commit. Covers every paste flavor
-                    // (clipboard, middle-click primary, prompt insert/recall).
-                    sess.block_selection.clear();
-                    sess.terminal.scroll_to_bottom();
-                    sess.projection_view_state.scroll_to_bottom();
-                    written = sess.write_pty(&paste.bytes);
-                    rejected = !written;
-                    sess.refresh();
-                }
+                outcome = paste_feedback::encode_and_write(
+                    text,
+                    modes,
+                    policy,
+                    clear_line_first,
+                    |bytes| {
+                        // Check encoded bytes after framing and control stripping.
+                        if !sess.can_queue_user_bytes(bytes.len()) {
+                            return false;
+                        }
+                        // Preserve the same selection, scrolling and refresh effects.
+                        sess.block_selection.clear();
+                        sess.terminal.scroll_to_bottom();
+                        sess.projection_view_state.scroll_to_bottom();
+                        let written = sess.write_pty(bytes);
+                        sess.refresh();
+                        written
+                    },
+                );
             }
         }
         if dead_input {
             self.hint_read_only_transcript();
-            return false;
+            return outcome;
         }
+        let written = outcome.written();
         if written
             && self.organism.is_local(id)
             && self.sessions.get(self.active).is_some_and(|s| {
@@ -12367,13 +12369,16 @@ impl Frost {
         {
             self.organism.accepted_input();
         }
-        if rejected {
+        if outcome == paste_feedback::PasteOutcome::Rejected {
             self.push_toast(
                 "Paste rejected: terminal input queue is full",
                 ToastKind::Warning,
             );
         }
-        written
+        if let Some(message) = outcome.feedback() {
+            self.push_toast(message, ToastKind::Info);
+        }
+        outcome
     }
 
     /// History picker key handling. Mirrors `handle_tab_switcher_key`: typed
@@ -12629,7 +12634,7 @@ impl Frost {
         // A false result after attempting the shared writer can include partial
         // PTY delivery. Retire on either result; never expose one-click retry.
         self.workflow_overlay = None;
-        if !accepted {
+        if !accepted.written() {
             self.push_toast(
                 "Workflow insertion may be incomplete. Some text may have reached the terminal; inspect the prompt before retrying.",
                 ToastKind::Warning,
@@ -14622,7 +14627,7 @@ impl Frost {
             return Task::none();
         }
 
-        let (session_id, bracketed, commands) = {
+        let (session_id, commands) = {
             let sess = &mut self.sessions[self.active];
             let ids: Vec<u64> = sess
                 .terminal
@@ -14639,11 +14644,7 @@ impl Frost {
                 &sess.block_selection,
                 crate::review_text::MAX_PROMPT_INSERT_BYTES,
             );
-            (
-                sess.id,
-                sess.terminal.is_bracketed_paste_enabled(),
-                commands,
-            )
+            (sess.id, commands)
         };
         let selected_commands = match commands {
             Ok(commands) => commands,
@@ -14697,7 +14698,6 @@ impl Frost {
             );
             return Task::none();
         }
-        let multiline_fallback = !bracketed && commands.contains('\n');
         if let Err(reason) = self.session_prompt_replace_ready(session_id) {
             self.push_toast(
                 format!("Commands not reinput: {reason}"),
@@ -14705,22 +14705,16 @@ impl Frost {
             );
             return Task::none();
         }
-        if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true) {
-            if multiline_fallback {
-                self.push_toast(
-                    "Reinput only the first logical line because bracketed paste is disabled"
-                        .to_string(),
-                    ToastKind::Info,
-                );
-            } else {
-                self.push_toast(
-                    format!(
-                        "Reinput {command_count} selected block{} (not run)",
-                        if command_count == 1 { "" } else { "s" }
-                    ),
-                    ToastKind::Success,
-                );
-            }
+        if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true)
+            == paste_feedback::PasteOutcome::Written
+        {
+            self.push_toast(
+                format!(
+                    "Reinput {command_count} selected block{} (not run)",
+                    if command_count == 1 { "" } else { "s" }
+                ),
+                ToastKind::Success,
+            );
         }
         Task::none()
     }
@@ -27039,7 +27033,9 @@ impl Frost {
         } else {
             block_reinput_policy()
         };
-        let written = self.write_paste_to_session(session_id, &accepted.command, policy, true);
+        let written = self
+            .write_paste_to_session(session_id, &accepted.command, policy, true)
+            .written();
         if written {
             self.command_corrections
                 .dismiss(session_id, reference.generation);
@@ -27379,7 +27375,10 @@ impl Frost {
             }
             return Task::none();
         }
-        if self.write_paste_to_session(session_id, &command, block_reinput_policy(), true) {
+        if self
+            .write_paste_to_session(session_id, &command, block_reinput_policy(), true)
+            .written()
+        {
             self.ai_suggestion = None;
         } else if let Some(session) = self.ai_suggestion.as_mut() {
             session.reject_insert("the target prompt changed before the command could be queued");
@@ -41395,6 +41394,29 @@ mod tests {
             .0;
         let subs = source.split_once("    fn subscription(&self)").unwrap().1;
         assert!(subs.contains("if organism_pointer_observation_needed(\n            live_visible,"));
+    }
+
+    #[test]
+    fn paste_feedback_uses_writer_outcome_and_does_not_double_report_reinput() {
+        let source = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let writer = source
+            .split_once("    fn write_paste_to_session(")
+            .unwrap()
+            .1
+            .split_once("    /// History picker key handling.")
+            .unwrap()
+            .0;
+        assert!(writer.contains("paste_feedback::encode_and_write("));
+        assert!(writer.contains("sess.can_queue_user_bytes(bytes.len())"));
+        assert!(writer.contains("sess.write_pty(bytes)"));
+        assert!(writer.contains("if let Some(message) = outcome.feedback()"));
+        assert!(source.contains(
+            "if self.write_paste_to_session(session_id, &commands, block_reinput_policy(), true)\n            == paste_feedback::PasteOutcome::Written"
+        ));
+        assert!(!source.contains("let multiline_fallback ="));
     }
 
     #[test]
