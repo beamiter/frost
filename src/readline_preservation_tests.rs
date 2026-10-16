@@ -45,11 +45,11 @@ impl Drop for TestApp {
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let any_alive = self
-                .0
-                .sessions
-                .iter_mut()
-                .fold(false, |live, session| session.pty.is_alive() || live);
+            let mut any_alive = false;
+            for session in &mut self.0.sessions {
+                // Do not short-circuit: every Pty must observe/reap its child.
+                any_alive |= session.pty.is_alive();
+            }
             if !any_alive || Instant::now() >= deadline {
                 break;
             }
