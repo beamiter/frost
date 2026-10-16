@@ -322,6 +322,46 @@ pub enum BlockCardKind {
     Active,
 }
 
+/// Paint-only Chat silhouette. Keep open fragment edges square and clamp all
+/// corners, including the tail, before passing tiny rectangles to the renderer.
+fn chat_card_radius(
+    role: crate::chat_mode::ChatRole,
+    width: f32,
+    height: f32,
+    real_top: bool,
+    real_bottom: bool,
+) -> border::Radius {
+    use crate::chat_mode::ChatRole;
+    let command = role == ChatRole::Command;
+    let composer = role == ChatRole::Composer;
+    let limit = (width.min(height) * 0.5).max(0.0);
+    let rounded = (if command || composer {
+        18.0_f32
+    } else {
+        16.0_f32
+    })
+    .min(limit);
+    let tail = 5.0_f32.min(limit);
+    border::Radius {
+        top_left: if !real_top {
+            0.0
+        } else if !command && !composer {
+            tail
+        } else {
+            rounded
+        },
+        top_right: if real_top { rounded } else { 0.0 },
+        bottom_left: if real_bottom { rounded } else { 0.0 },
+        bottom_right: if !real_bottom {
+            0.0
+        } else if command {
+            tail
+        } else {
+            rounded
+        },
+    }
+}
+
 /// Chat exposes only read-only context actions; Shift-drag remains text selection.
 fn chat_card_mouse_action(button: MouseButton, completed: bool) -> Option<BlockMouseAction> {
     (completed && button == MouseButton::Right).then_some(BlockMouseAction::Menu)
@@ -1202,11 +1242,7 @@ impl<'a, Message> TermWidget<'a, Message> {
         let left = (ox + chat.left_col as f32 * self.metrics.cell_w - 7.0).max(bounds.x + 2.0);
         let top = oy + segment.start_row as f32 * self.metrics.cell_h;
         let bottom = oy + segment.end_row as f32 * self.metrics.cell_h;
-        let radius = if chat.role == crate::chat_mode::ChatRole::Command {
-            18.0
-        } else {
-            14.0
-        };
+
         BlockCardGeometry {
             body: Rectangle {
                 x: left,
@@ -1214,12 +1250,13 @@ impl<'a, Message> TermWidget<'a, Message> {
                 width: (right - left).max(0.0),
                 height: bottom - top,
             },
-            radius: border::Radius {
-                top_left: if segment.real_top { radius } else { 0.0 },
-                top_right: if segment.real_top { radius } else { 0.0 },
-                bottom_left: if segment.real_bottom { radius } else { 0.0 },
-                bottom_right: if segment.real_bottom { radius } else { 0.0 },
-            },
+            radius: chat_card_radius(
+                chat.role,
+                (right - left).max(0.0),
+                bottom - top,
+                segment.real_top,
+                segment.real_bottom,
+            ),
         }
     }
 
@@ -6195,6 +6232,55 @@ mod chat_card_action_tests {
                     chat_card_mouse_action(button, completed),
                     (completed && button == MouseButton::Right).then_some(BlockMouseAction::Menu)
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_capsule_geometry_tests {
+    use super::*;
+    #[test]
+    fn chat_capsule_corners_share_native_contract_at_all_scales_and_clips() {
+        use crate::chat_mode::ChatRole;
+        for height in [0.0, 1.0, 8.0, 18.0, 32.0, 64.0] {
+            for width in [0.0, 1.0, 8.0, 160.0] {
+                for (role, radius) in [
+                    (ChatRole::Command, 18.0_f32),
+                    (ChatRole::Output, 16.0),
+                    (ChatRole::Composer, 18.0),
+                ] {
+                    for top in [false, true] {
+                        for bottom in [false, true] {
+                            let r = chat_card_radius(role, width, height, top, bottom);
+                            let limit = width.min(height) * 0.5;
+                            let round = radius.min(limit);
+                            let tail = 5.0_f32.min(limit);
+                            assert_eq!(
+                                r.top_left,
+                                if !top {
+                                    0.0
+                                } else if role == ChatRole::Output {
+                                    tail
+                                } else {
+                                    round
+                                }
+                            );
+                            assert_eq!(r.top_right, if top { round } else { 0.0 });
+                            assert_eq!(r.bottom_left, if bottom { round } else { 0.0 });
+                            assert_eq!(
+                                r.bottom_right,
+                                if !bottom {
+                                    0.0
+                                } else if role == ChatRole::Command {
+                                    tail
+                                } else {
+                                    round
+                                }
+                            );
+                        }
+                    }
+                }
             }
         }
     }
