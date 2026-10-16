@@ -99,7 +99,7 @@ def command(text, filename, timeout=3):
 
 try:
     s.start_desktop()
-    # Keep keyboard capability stable across asynchronous clipboard delivery.
+    # Keep seat capability stable; each additional wtype still changes focus/offer.
     s.spawn(['wtype', '-s', '600000', '-k', 'F24'], 'clipboard-seat-keyboard')
     cases = [('small', 'finite', b"printf ok > small-result", 0),
              ('delayed', 'finite', b'', 2000),
@@ -107,7 +107,8 @@ try:
              ('oversized', 'finite', b'X' * (1024 * 1024 + 1), 0),
              ('continuous', 'continuous', b'', 0),
              ('revoked', 'finite', b'REVOKED_POISON', 2000),
-             ('teardown', 'stalled', b'', 0)]
+             ('teardown', 'stalled', b'', 0),
+             ('hotplug-cancel', 'finite', b'HOTPLUG_POISON', 2000)]
     for case, scenario, payload, delay in cases:
         entry = {'name': case, 'status': 'running'}
         result['cases'].append(entry)
@@ -120,8 +121,36 @@ try:
         identity = s.command(case + '-ready')
         proc, control, log = owner(case, scenario, payload, delay)
         started = time.monotonic()
-        s.key('v', ('ctrl', 'shift'))
+        keyboard = None
+        marker = case + '-responsive'
+        if case != 'small':
+            # One virtual keyboard owns paste AND queued input. Creating another
+            # wtype while pending emits leave/enter and replaces the offer.
+            keys = ['wtype', '-s', '250', '-M', 'ctrl', '-M', 'shift', '-k', 'v',
+                    '-m', 'shift', '-m', 'ctrl', '-']
+            if case not in ('teardown', 'hotplug-cancel'):
+                keys += ['-d', '8', 'printf ok > ' + marker, '-k', 'Return']
+            # Parent owns termination after every transfer/input oracle; no key
+            # follows this finite hold. An early exit is a test failure.
+            keys += ['-s', '30000']
+            # wtype 0.4's empty stdin operand blocks without changing keymap.
+            # Close it only after request evidence (and revoke acknowledgement).
+            keyboard_log = open(out / (case + '-persistent-keyboard.log'), 'w')
+            s.logs.append(keyboard_log)
+            keyboard_env = s.env.copy()
+            keyboard_env.pop('WAYLAND_DEBUG', None)
+            keyboard = subprocess.Popen(keys, env=keyboard_env, stdin=subprocess.PIPE,
+                                        stdout=keyboard_log, stderr=keyboard_log)
+            s.processes.append(keyboard)
+        else:
+            s.key('v', ('ctrl', 'shift'))
         request = wait_event(log, 'request')
+        request_observed = time.monotonic()
+        entry['request_observed_monotonic'] = request_observed
+        if keyboard is not None:
+            assert keyboard.poll() is None, 'persistent keyboard exited before request'
+            assert not (out / marker).exists(), 'queued input preceded observed owner request'
+
         if case == 'small':
             wait_event(log, 'complete')
             exact_pending_line(payload, 'small-pasted-before-enter')
@@ -130,6 +159,7 @@ try:
             assert (out / 'small-result').read_bytes() == b'ok'
             wait_event(log, 'complete')
         elif case == 'teardown':
+            keyboard.stdin.close()
             closing = time.monotonic()
             s.run(['swaymsg', '[app_id="io.github.beamiter.frost"]', 'kill'])
             app.wait(timeout=5)
@@ -144,10 +174,28 @@ try:
                 (control / 'revoke').touch()
                 revoke_ack = wait_event(log, 'revoked')
             # This short command must execute before a delayed owner responds.
-            marker = case + '-responsive'
-            command('printf ok > ' + marker, marker)
+            if case == 'hotplug-cancel':
+                # Deliberate replacement of the virtual keyboard must invalidate
+                # the old offer. Keep this negative separate from latency cases.
+                assert not any(e['phase'] == 'reader-closed' for e in events(log)), 'offer retired before deliberate hotplug'
+                keyboard.stdin.close()
+                entry['input_released_monotonic'] = time.monotonic()
+                entry['replacement_started_monotonic'] = entry['input_released_monotonic']
+                command('printf ok > ' + marker, marker)
+            else:
+                entry['input_released_monotonic'] = time.monotonic()
+                keyboard.stdin.close()  # EOF only: no stdin text/keymap replacement.
+                m.wait_for((out / marker).exists, 'exact shell command ' + marker, 3)
+                assert (out / marker).read_bytes() == b'ok'
+                assert keyboard.poll() is None, 'keyboard disappeared during transfer'
+
             observed = time.monotonic()
+            entry['shell_observed_monotonic'] = observed
             entry['request_to_shell_seconds'] = observed - request['monotonic']
+            assert request['monotonic'] <= request_observed <= observed
+            if keyboard is not None:
+                assert request_observed <= entry['input_released_monotonic'] <= observed
+                entry['queued_input_to_shell_seconds'] = observed - entry['input_released_monotonic']
             if case in ('delayed', 'stalled', 'revoked'):
                 assert observed - request['monotonic'] < 1.5, entry
             if case == 'delayed':
@@ -163,11 +211,23 @@ try:
                 if case == 'revoked':
                     assert closed['monotonic'] < request['monotonic'] + 2, 'old pipe survived until payload/deadline'
                     assert closed['monotonic'] - revoke_ack['monotonic'] < 1, 'revocation did not promptly close old pipe'
+                if case == 'stalled':
+                    assert closed['monotonic'] - request['monotonic'] >= 2.5, 'stalled read cancelled before deadline'
+                if case == 'hotplug-cancel':
+                    assert closed['monotonic'] >= entry['replacement_started_monotonic'], 'offer retired before deliberate hotplug'
+                    assert closed['monotonic'] - request['monotonic'] < 2, 'stale offer survived until provider reply'
+                    assert not any(e['phase'] == 'complete' for e in events(log)), 'old offer unexpectedly completed'
                 if case == 'continuous':
                     assert closed['bytes'] <= 1024 * 1024 + 262144, closed
+            if keyboard is not None:
+                assert keyboard.poll() is None, 'keyboard disappeared before transfer oracle'
             # No rejected/revoked prefix may leak into a later shell command.
             marker = case + '-clean'
             command('printf ok > ' + marker, marker)
+        if keyboard is not None:
+            assert keyboard.poll() is None, 'keyboard disappeared before all transfer/input oracles'
+            keyboard.terminate()
+            keyboard.wait(timeout=3)
         entry['events'] = events(log)
         entry['elapsed_seconds'] = time.monotonic() - started
         if case != 'teardown':
