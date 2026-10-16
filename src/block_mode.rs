@@ -2228,7 +2228,14 @@ fn search_blocks_with_matcher(
                     .find(command, Some(lowercase))
                     .map(|span| (false, 0usize, command, span))
             });
-        let output_lines = zone.output.as_deref().into_iter().flat_map(str::lines);
+        // Gate before constructing the line iterator: filtering inside
+        // `filter_map` still walks the entire cached output in Command scope.
+        let output_lines = zone
+            .output
+            .as_deref()
+            .filter(|_| scope.includes_output())
+            .into_iter()
+            .flat_map(str::lines);
         let lowercase_lines = zone
             .output_lowercase
             .as_deref()
@@ -2236,9 +2243,6 @@ fn search_blocks_with_matcher(
             .flat_map(str::lines);
         let output_hits = output_lines.zip(lowercase_lines).enumerate().filter_map(
             |(index, (line, lowercase))| {
-                if !scope.includes_output() {
-                    return None;
-                }
                 matcher
                     .find(line, Some(lowercase))
                     .map(|span| (true, index + 1, line, span))
@@ -3771,6 +3775,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(regex.hits[0].match_span, Some(22..26));
+    }
+
+    #[test]
+    fn command_scope_large_output_keeps_command_hits_uncapped() {
+        let output = "界 🦀 needle\n".repeat(100_000);
+        let cache = [source(7, Some("printf needle"), Some(&output))];
+        for regex in [false, true] {
+            let options = BlockSearchOptions {
+                regex,
+                ..BlockSearchOptions::default()
+            };
+            let command = search_blocks_with_options_filtered_in_scope(
+                &cache,
+                "needle",
+                options,
+                BlockSearchScope::Command,
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(command.hits.len(), 1);
+            assert!(!command.capped);
+            assert_eq!(command.hits[0].line_no, 0);
+            assert_eq!(command.hits[0].match_span, Some(7..13));
+
+            let output = search_blocks_with_options_filtered_in_scope(
+                &cache,
+                "needle",
+                options,
+                BlockSearchScope::Output,
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(output.hits.len(), BLOCK_SEARCH_HIT_CAP);
+            assert!(output.capped);
+            assert_eq!(output.hits[0].line_no, 1);
+            assert_eq!(output.hits[0].match_span, Some(4..10));
+            assert!(output.hits.iter().all(|hit| hit.is_output_line));
+        }
     }
 
     #[test]
