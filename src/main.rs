@@ -34251,6 +34251,63 @@ mod tests {
         );
     }
 
+    /// Execute the real callback arm and owner methods with synthetic platform
+    /// sinks. The harness also rejects deliberate identity/permission/cap bugs.
+    #[test]
+    fn osc52_async_callback_ownership_regressions() {
+        let status = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/test-osc52-ownership.py"
+            ))
+            .status()
+            .expect("python3 must run the OSC52 ownership regression harness");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn osc52_response_byte_cap_is_checked_before_real_base64_encoding() {
+        for size in [
+            MAX_CLIPBOARD_RESPONSE_BYTES,
+            MAX_CLIPBOARD_RESPONSE_BYTES + 1,
+        ] {
+            let mut terminal = TerminalState::new(80, 24);
+            let mut pending = Some(Default::default());
+            let content = "x".repeat(size);
+            complete_osc52_read(&mut terminal, &mut pending, true, &content, b"\x07");
+            if size > MAX_CLIPBOARD_RESPONSE_BYTES {
+                assert_eq!(terminal.output_buffer, b"\x1b]52;c;\x07");
+            } else {
+                assert_eq!(terminal.output_buffer.len(), 7 + size.div_ceil(3) * 4 + 1);
+                assert!(terminal.output_buffer.starts_with(b"\x1b]52;c;eHh4"));
+                assert_eq!(terminal.output_buffer.last(), Some(&7));
+            }
+            assert!(pending.is_none());
+        }
+    }
+
+    #[test]
+    fn osc52_real_parser_and_encoder_bound_query_bursts_without_private_text() {
+        let mut terminal = TerminalState::new(80, 24);
+        for _ in 0..100 {
+            terminal.process_input(b"\x1b]52;c;?\x07");
+        }
+        let queries: Vec<_> =
+            std::iter::from_fn(|| terminal.take_osc52_clipboard_query()).collect();
+        assert_eq!(queries.len(), 8);
+        for terminator in queries {
+            let mut pending = Some(Default::default());
+            complete_osc52_read(
+                &mut terminal,
+                &mut pending,
+                false,
+                "synthetic-private",
+                terminator,
+            );
+        }
+        assert_eq!(terminal.output_buffer, b"\x1b]52;c;\x07".repeat(8));
+    }
+
     #[test]
     fn osc52_slow_read_keeps_cross_batch_refusals_in_request_order() {
         let mut terminal = TerminalState::new(80, 24);
