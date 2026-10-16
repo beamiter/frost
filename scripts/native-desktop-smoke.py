@@ -98,12 +98,15 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         if self.backend == 'x11':
             self.run(['xdotool', 'key', '--clearmodifiers', '+'.join((*modifiers, key))])
         else:
-            args = ['wtype']
+            # Each wtype invocation hotplugs a new virtual keyboard. Allow
+            # compositor capability/focus events to reach the app before input.
+            args = ['wtype', '-s', '250']
             for mod in modifiers:
                 args += ['-M', mod]
             args += ['-k', key]
             for mod in reversed(modifiers):
                 args += ['-m', mod]
+            args += ['-s', '50']
             self.run(args)
         time.sleep(0.15)
 
@@ -111,7 +114,7 @@ PS1='\[\e]133;A\a\]FROST_SMOKE> \[\e]133;B\a\]'
         if self.backend == 'x11':
             self.run(['xdotool', 'type', '--clearmodifiers', '--delay', '8', '--', text])
         else:
-            self.run(['wtype', '-d', '8', '--', text])
+            self.run(['wtype', '-s', '250', '-d', '8', '--', text])
 
     def screenshot(self, name):
         target = str(self.out / (name + '.png'))
