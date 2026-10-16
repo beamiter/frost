@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import shlex
+import subprocess
 import time
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -22,6 +23,51 @@ s.env.pop('WAYLAND_SOCKET', None)
 result = {'status': 'running', 'cases': [], 'excluded': ['allocation accounting', 'eight concurrent provider admissions', 'PRIMARY', 'idle owned-source write', 'legacy synchronous widget read']}
 
 
+# A public Bash readline binding observes the real foreground shell buffer.
+# It does not insert, execute, consume, or repair clipboard text.
+line_capture = out / 'readline-bytes.bin'
+s.env['FROST_SMOKE_LINE_CAPTURE'] = str(line_capture)
+with (Path(s.env['HOME']) / '.bash_profile').open('a') as profile:
+    profile.write(r"""
+__frost_capture_line() {
+    local __frost_capture_trace=0
+    [[ $- == *x* ]] && __frost_capture_trace=1
+    set +x
+    printf %s "$READLINE_LINE" > "$FROST_SMOKE_LINE_CAPTURE.tmp"
+    mv "$FROST_SMOKE_LINE_CAPTURE.tmp" "$FROST_SMOKE_LINE_CAPTURE"
+    if (( __frost_capture_trace )); then set -x; fi
+}
+bind -x '"\C-x\C-g":__frost_capture_line'
+""")
+
+
+def exact_pending_line(expected, label):
+    deadline = time.monotonic() + 5
+    attempts = 0
+    observed = b''
+    while time.monotonic() < deadline:
+        # Retry only this read-only observation chord, never paste or Return.
+        line_capture.unlink(missing_ok=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        subprocess.run(['wtype', '-s', '250', '-M', 'ctrl', '-k', 'x', '-k', 'g', '-m', 'ctrl', '-s', '50'],
+                       env=s.env, check=True, timeout=remaining)
+        attempts += 1
+        until = min(deadline, time.monotonic() + 0.3)
+        while not line_capture.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        if line_capture.exists():
+            observed = line_capture.read_bytes()
+            (out / (label + '.bin')).write_bytes(observed)
+            if observed == expected:
+                (out / (label + '.json')).write_text(json.dumps({'exact_bytes': len(observed), 'observation_chords': attempts}))
+                s.screenshot(label)
+                return
+    raise AssertionError({'pending_line_expected_hex': expected.hex(), 'observed_hex': observed.hex()})
+
+
+
 def events(log, complete=False):
     lines = log.read_text().splitlines(keepends=True)
     if lines and not lines[-1].endswith('\n'):
@@ -32,15 +78,6 @@ def events(log, complete=False):
 
 def wait_event(log, phase, timeout=5):
     return m.wait_for(lambda: next((e for e in events(log) if e['phase'] == phase), None), 'owner ' + phase, timeout)
-
-
-def visible_command(command, label):
-    def visible():
-        s.screenshot(label)
-        text = s.run(['tesseract', str(out / (label + '.png')), 'stdout', '--psm', '6'], text=True, capture_output=True).stdout
-        (out / (label + '.txt')).write_text(text)
-        return command in ' '.join(text.split())
-    m.wait_for(visible, 'paste visibly applied before Enter', 5)
 
 
 def owner(case, scenario, payload, delay=0):
@@ -87,7 +124,7 @@ try:
         request = wait_event(log, 'request')
         if case == 'small':
             wait_event(log, 'complete')
-            visible_command('printf ok > small-result', 'small-pasted-before-enter')
+            exact_pending_line(payload, 'small-pasted-before-enter')
             s.key('Return')
             m.wait_for((out / 'small-result').exists, 'small payload executed')
             assert (out / 'small-result').read_bytes() == b'ok'
