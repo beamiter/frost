@@ -24,6 +24,7 @@ mod command_palette;
 mod config;
 mod config_retry;
 mod debug;
+mod find_focus;
 mod fold_preview;
 mod history_picker;
 mod image_drop;
@@ -13408,7 +13409,7 @@ impl Frost {
                 .get(self.active)
                 .is_some_and(|session| session.id == target.session_id)
         {
-            iced::widget::operation::focus(SEARCH_INPUT_ID.clone())
+            find_focus::refocus(SEARCH_INPUT_ID.clone())
         } else {
             Task::none()
         }
@@ -15155,6 +15156,8 @@ impl Frost {
     }
 
     fn update_message(&mut self, message: Message) -> Task<Message> {
+        // Defer focus operations until normal viewport/cache bookkeeping finishes.
+        let mut post_update_task = Task::none();
         // Reject output provenance before generic synchronization can touch Watch.
         // Invalid/old source metadata never prevents valid native bytes from being
         // parsed and displayed by the original id/fd route below.
@@ -18074,11 +18077,17 @@ impl Frost {
                 self.search.toggle_regex();
                 self.recompute_search();
                 self.reveal_current_search_match();
+                if self.search.is_open {
+                    post_update_task = find_focus::refocus(SEARCH_INPUT_ID.clone());
+                }
             }
             Message::SearchToggleCase => {
                 self.search.toggle_case_sensitive();
                 self.recompute_search();
                 self.reveal_current_search_match();
+                if self.search.is_open {
+                    post_update_task = find_focus::refocus(SEARCH_INPUT_ID.clone());
+                }
             }
             Message::SearchRevealMatch(target) => return self.reveal_hidden_search_match(&target),
             Message::SearchInput(value) => {
@@ -19069,7 +19078,7 @@ impl Frost {
         }
         self.recompute_links();
         self.refresh_kitty_handles();
-        Task::none()
+        post_update_task
     }
 
     /// Cache crops in the active pane with an aggregate pixel
@@ -25261,11 +25270,14 @@ impl Frost {
                 button::secondary
             });
 
-        let input = text_input("search…", &self.search.query)
-            .id(SEARCH_INPUT_ID.clone())
-            .on_input(Message::SearchInput)
-            .size(self.effective_font_size())
-            .width(Length::Fixed(220.0));
+        let input = find_focus::input(
+            SEARCH_INPUT_ID.clone(),
+            &self.search.query,
+            text_input("search…", &self.search.query)
+                .on_input(Message::SearchInput)
+                .size(self.effective_font_size())
+                .width(Length::Fixed(220.0)),
+        );
         let mut bar = row![text("Find:").size(self.effective_font_size()), input]
             .spacing(8)
             .align_y(iced::Alignment::Center);
