@@ -44,13 +44,24 @@ try:
         m.wait_for(marker.exists, 'input after clipboard request', timeout=10)
         observed = time.monotonic()
         assert marker.read_text() == 'received\n'
-        events = [json.loads(line) for line in log.read_text().splitlines()]
-        replies = [e for e in events if e.get('phase') == 'reply' and e.get('accepted') and e.get('text_transfer') and start <= e.get('started_monotonic', 0) <= observed and e.get('completed_monotonic', 0) - e.get('started_monotonic', 0) >= delay]
-        assert replies, events
+        measurement = {'provider_delay_seconds': delay, 'trigger_to_shell_seconds': observed - start,
+                       'queued_input_to_shell_seconds': observed - injection, 'observed_monotonic': observed}
+        result['measurements'].append(measurement)
+        def completed_replies():
+            lines = log.read_text().splitlines(keepends=True)
+            # The provider may still be appending the trailing JSON record.
+            current = [json.loads(line) for line in lines if line.endswith('\n')]
+            measurement['events'] = current
+            return [e for e in current if e.get('phase') == 'reply' and e.get('accepted') and e.get('text_transfer') and start <= e.get('started_monotonic', 0) <= observed and e.get('completed_monotonic', 0) - e.get('started_monotonic', 0) >= delay]
+        # An asynchronous read permits shell input before the provider completes.
+        # Keep the original input timestamp; provider waiting is not UI latency.
+        replies = m.wait_for(completed_replies, 'matching clipboard provider completion', timeout=delay + 3)
+        events = measurement['events']
+        if delay:
+            assert observed < min(reply['completed_monotonic'] for reply in replies), measurement
+            assert observed - injection < 1.5, measurement
         for reply in replies:
             assert any(request.get('phase') == 'request' and request.get('request_id') == reply['request_id'] and request.get('text_transfer') for request in events)
-        result['measurements'].append({'provider_delay_seconds': delay, 'trigger_to_shell_seconds': observed - start,
-                                       'queued_input_to_shell_seconds': observed - injection, 'events': events})
         s.screenshot(f'clipboard-{index}')
         owner.terminate()
         owner.wait(timeout=5)
@@ -58,10 +69,14 @@ try:
     result['slow_minus_fast_seconds'] = result['measurements'][1]['queued_input_to_shell_seconds'] - result['measurements'][0]['queued_input_to_shell_seconds']
 except Exception as error:
     result.update(status='failed', error=str(error))
-    result['provider_events_on_failure'] = {
-        path.name: [json.loads(line) for line in path.read_text().splitlines()]
-        for path in out.glob('owner-*.jsonl')
-    }
+    result['provider_events_on_failure'] = {}
+    for path in out.glob('owner-*.jsonl'):
+        try:
+            lines = path.read_text().splitlines(keepends=True)
+            result['provider_events_on_failure'][path.name] = [json.loads(line) for line in lines if line.endswith('\n')]
+        except Exception as evidence_error:
+            result.setdefault('provider_evidence_errors', {})[path.name] = str(evidence_error)
+    # Diagnostic parsing must never replace the original failure or skip its screenshot.
     try:
         s.screenshot('clipboard-failure')
     except Exception as screenshot_error:

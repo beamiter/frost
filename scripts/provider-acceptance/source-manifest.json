@@ -1,0 +1,285 @@
+{
+  "production_manifest_sha256": "de186e22c8eb3a70b9cbb709875fea6ef324c48781df336674fc28da3bdf9714",
+  "files": [
+    {
+      "path": "vendor/window_clipboard/.cargo_vcs_info.json",
+      "sha256": "028f10149852a14816c7506643c26da6a7eeb81cc50a6e57c3050918737dfb99"
+    },
+    {
+      "path": "vendor/window_clipboard/.github/workflows/test.yml",
+      "sha256": "706828e8274a6c7d16b9c5ed86aae8d3b3882d5f0db783a6da18d5d272964caa"
+    },
+    {
+      "path": "vendor/window_clipboard/.gitignore",
+      "sha256": "6b937008e0a58a438c32574627db6961a4d2aff4bf5c703d4e45cb56ef3b168a"
+    },
+    {
+      "path": "vendor/window_clipboard/Cargo.lock",
+      "sha256": "7eb91904452ec34dde8313863abeec23b42983705657e0b0c1930cc140796246"
+    },
+    {
+      "path": "vendor/window_clipboard/Cargo.toml",
+      "sha256": "1722786340ce8d82b0b6c50d38aff8c850ae180a2d0f1f47d3014e994cc27602"
+    },
+    {
+      "path": "vendor/window_clipboard/Cargo.toml.orig",
+      "sha256": "e232f34e8a0eda21d131c68e62a89c44fa8a83d7f55fc859dbdcfc61cf3471c4"
+    },
+    {
+      "path": "vendor/window_clipboard/LICENSE",
+      "sha256": "7faec985f3e9b1c4a1df646bfedc304ba67e409447f7ab7f4f591f68708d85dc"
+    },
+    {
+      "path": "vendor/window_clipboard/README.md",
+      "sha256": "4cad722cceb0b4a93fc963372e60b091f534595f3002db1f14c7038b3ce34009"
+    },
+    {
+      "path": "vendor/window_clipboard/examples/big_file.rs",
+      "sha256": "f9e27088e84857802fad5378b328afe1ff10e67e230c7a5ccbe25b2b3e97c044"
+    },
+    {
+      "path": "vendor/window_clipboard/examples/read.rs",
+      "sha256": "e61d5b32e98a9565b8a24fe4e0fc0964ef5ecc4c41567e0bee120b5b5663f998"
+    },
+    {
+      "path": "vendor/window_clipboard/examples/write.rs",
+      "sha256": "e58be556d7440656a209c3ec42901dc38db170924b8507728d6332e5650936f7"
+    },
+    {
+      "path": "vendor/window_clipboard/rustfmt.toml",
+      "sha256": "a93fb86040c045a6e7bcd4a0d4c115adafffc7c3830851c7cfb8d2a602bb565c"
+    },
+    {
+      "path": "vendor/window_clipboard/src/lib.rs",
+      "sha256": "bb7ae86a88e622eb3066115c31287514dfffeb103926beeb15f30f2140206bca"
+    },
+    {
+      "path": "vendor/window_clipboard/src/platform/android.rs",
+      "sha256": "d46fd55505a025a8c9addd935696f5c275a3830006fb391215ee5cc888028951"
+    },
+    {
+      "path": "vendor/window_clipboard/src/platform/dummy.rs",
+      "sha256": "374ffaaeb1c058f74d9ee90d5830187fc033172ba9a4bba9e21f4791f292735e"
+    },
+    {
+      "path": "vendor/window_clipboard/src/platform/ios.rs",
+      "sha256": "a67f236b77d5257dc21a238f98545a678ea8075e024cf952dbc7ba1221fa10ff"
+    },
+    {
+      "path": "vendor/window_clipboard/src/platform/linux.rs",
+      "sha256": "4b22b2760c2a2474936f70b1baaeec3b38e23a2826b83e1c9f6d8f21ccf99781"
+    },
+    {
+      "path": "vendor/window_clipboard/src/platform/macos.rs",
+      "sha256": "b291b4a4eef30a4d8149e17799d21532135e845ca9878d9e0fc2428d82dbaf88"
+    },
+    {
+      "path": "vendor/window_clipboard/src/platform/windows.rs",
+      "sha256": "43a20b96a762f9dae5e37431584930b65714c10e311ac93a65a7cfe5db827c77"
+    },
+    {
+      "path": "vendor/clipboard_x11/.cargo_vcs_info.json",
+      "sha256": "d25c9b612d714b0a20aab11e2b6b14073d16b0dfc47170f94a30f6caacac0093"
+    },
+    {
+      "path": "vendor/clipboard_x11/BOUNDED_READS.md",
+      "sha256": "10fa915f3aad92f6aea966aab733656f3c4b8fe32f83b4da84183a9906f41962"
+    },
+    {
+      "path": "vendor/clipboard_x11/Cargo.lock",
+      "sha256": "8bdd797e584214d7794e7462730c063303bd6f9800c4c25f5a1d2652fe4b911a"
+    },
+    {
+      "path": "vendor/clipboard_x11/Cargo.toml",
+      "sha256": "ae33478b6d2df1e26f39c5dab682b03e6053c6a9ab804e6cbf9c975192abb48a"
+    },
+    {
+      "path": "vendor/clipboard_x11/Cargo.toml.orig",
+      "sha256": "724347d770658595226df9db78622119e3a874d6a525bee46db6f027b910e3aa"
+    },
+    {
+      "path": "vendor/clipboard_x11/LICENSE",
+      "sha256": "62a2ae7223731ef15c5c1060bf97f4874a955303acb1639d31272e27c369536d"
+    },
+    {
+      "path": "vendor/clipboard_x11/src/bounded.rs",
+      "sha256": "f794b172dc533516bb5b88f67b8b4d3b64005da57c63a5558547c453d63c0c40"
+    },
+    {
+      "path": "vendor/clipboard_x11/src/error.rs",
+      "sha256": "9c13e72788cf96bad5abc230bd69c043fad51cbf0d91a0f8ddb73b3c70703870"
+    },
+    {
+      "path": "vendor/clipboard_x11/src/lib.rs",
+      "sha256": "ae43afbf4be402d8ce6d5c48ef28442bf52b183a61d15d6bcbaa7475af32043a"
+    },
+    {
+      "path": "vendor/clipboard_wayland/.cargo_vcs_info.json",
+      "sha256": "3220fd9e2064abc39b8833fa3d8fb61abe93873df3948bcb738264736b18dfb4"
+    },
+    {
+      "path": "vendor/clipboard_wayland/Cargo.toml",
+      "sha256": "65222b9781dece1a1f6a44ecc81bb5ce4154145395d0786b5735bd6a2a485234"
+    },
+    {
+      "path": "vendor/clipboard_wayland/Cargo.toml.orig",
+      "sha256": "2d2f3630018f466f55a613127637a88d1495315b278605cf61fb6db5e702c8e9"
+    },
+    {
+      "path": "vendor/clipboard_wayland/LICENSE",
+      "sha256": "a8ad31b1c3f40dca5a84119351b8fa8ddc868edd77fad8a8ebf6d8f2d16fa4ae"
+    },
+    {
+      "path": "vendor/clipboard_wayland/src/lib.rs",
+      "sha256": "f457f46d3a25ac6c46a8550b89a1981e80d053cfa847a3c9a87f4042c7b1a34c"
+    },
+    {
+      "path": "vendor/smithay-clipboard/.cargo_vcs_info.json",
+      "sha256": "b2e4f63f101101fbe47f79e4bc4cc2fe549184a70be3af61db33be5beaa8e8d8"
+    },
+    {
+      "path": "vendor/smithay-clipboard/.github/workflows/ci.yml",
+      "sha256": "10a99bc4f48216111ccd6d442b1e6c6c76ba09608c1e057ee19ecf7917053873"
+    },
+    {
+      "path": "vendor/smithay-clipboard/.github/workflows/docs.yml",
+      "sha256": "f40e3e73a8a278e252c7a2e936bfab35a95709b8eb65c78cec3473df68b411f9"
+    },
+    {
+      "path": "vendor/smithay-clipboard/.gitignore",
+      "sha256": "6b937008e0a58a438c32574627db6961a4d2aff4bf5c703d4e45cb56ef3b168a"
+    },
+    {
+      "path": "vendor/smithay-clipboard/CHANGELOG.md",
+      "sha256": "a61e4a55886233d02e4855bba024e584ad8119abee636cbeb32927817215615e"
+    },
+    {
+      "path": "vendor/smithay-clipboard/Cargo.lock",
+      "sha256": "67e58ea42a92f2ea5e182ee7644b4ed640839a03966aae39421f8f254d52f118"
+    },
+    {
+      "path": "vendor/smithay-clipboard/Cargo.toml",
+      "sha256": "9f7a1d198a1385bfe35775e3c8d335d93cc31ea8d2ce15f189bebb0c42a99c98"
+    },
+    {
+      "path": "vendor/smithay-clipboard/Cargo.toml.orig",
+      "sha256": "976fb6f80a01f50e67cf8a7f6aa601246020ddb5e9476cf47d141030f590c481"
+    },
+    {
+      "path": "vendor/smithay-clipboard/LICENSE",
+      "sha256": "21c2bc064d4ad1bba2a66c6b6d111b859a616283687a11f7a32c1350814542c9"
+    },
+    {
+      "path": "vendor/smithay-clipboard/README.md",
+      "sha256": "0e1ce2826c6c74cb98922009fa2dfb6bcd142c774610c6603b9ae7f0c275fde1"
+    },
+    {
+      "path": "vendor/smithay-clipboard/doc_index.html",
+      "sha256": "9191616fd8ecaef1615eda8a0f9cd36bf75eb4e5f20e24db8852faf07123dfcc"
+    },
+    {
+      "path": "vendor/smithay-clipboard/examples/clipboard.rs",
+      "sha256": "771a50a8458fc4bb74dd0895220e3b7ed8ce95dae601a342a2ae273fcbb2c09a"
+    },
+    {
+      "path": "vendor/smithay-clipboard/rustfmt.toml",
+      "sha256": "a0b3513964ccc1f72d7671376c1a2f073df01aad4b91bf99f0060fbe9dc88034"
+    },
+    {
+      "path": "vendor/smithay-clipboard/src/bounded.rs",
+      "sha256": "0b2b5fa01a4ac8d6840ff24472361371ba76329b3c613f7c9fc13c510329e751"
+    },
+    {
+      "path": "vendor/smithay-clipboard/src/lib.rs",
+      "sha256": "f4683c76220c33e721e3ee512261ea4954a65d9785760eaa141275dd30dedcf0"
+    },
+    {
+      "path": "vendor/smithay-clipboard/src/mime.rs",
+      "sha256": "2d42f2c147d6ae93d53197f1eda57335f64e9af71e507415c3e89369a22cf0ce"
+    },
+    {
+      "path": "vendor/smithay-clipboard/src/state.rs",
+      "sha256": "a063b4350c6059aea1b0d31019d321479c8567a9e123cdd5aff71930a184624d"
+    },
+    {
+      "path": "vendor/smithay-clipboard/src/worker.rs",
+      "sha256": "8b7a2fdc1f21c6675852dd34eeae52cbfe52cb2f7718b6e1c964b389b4e169b9"
+    },
+    {
+      "path": "vendor/wayland-client/.cargo_vcs_info.json",
+      "sha256": "761743ce270784e2e49420385af357b3c23372b145b7f6b1171ac6cc98e30a1e"
+    },
+    {
+      "path": "vendor/wayland-client/CHANGELOG.md",
+      "sha256": "7ee6d69bf67a48f793ad26277e793b92869878f56ae96ddc0488dc32795f8e71"
+    },
+    {
+      "path": "vendor/wayland-client/Cargo.lock",
+      "sha256": "74804d2dae5953bda810645a487dc6516d0602812556c0d10fde481efbb5673f"
+    },
+    {
+      "path": "vendor/wayland-client/Cargo.toml",
+      "sha256": "955074bf4c108dc8ba7bf56a3b4609e9594554ffbff3937ea1032489a5bd81c2"
+    },
+    {
+      "path": "vendor/wayland-client/Cargo.toml.orig",
+      "sha256": "18f154a5d23a0cb85291a9d5b02d5206b3808d944655aaf3f901fc9a0a225354"
+    },
+    {
+      "path": "vendor/wayland-client/LICENSE.txt",
+      "sha256": "1cb6f4dee8c649f175736380495f0af0c753c87f22d50931692968bb24bf2161"
+    },
+    {
+      "path": "vendor/wayland-client/README.md",
+      "sha256": "bcf614a57e6d870ffb1ede37a743376a36d3c50b0530e6a36e7978952f52a359"
+    },
+    {
+      "path": "vendor/wayland-client/build.rs",
+      "sha256": "410d744cfb89f086db6c5b955e8f5c09fe3dc578acb1aeae9ad0260f105f5ea9"
+    },
+    {
+      "path": "vendor/wayland-client/examples/list_globals.rs",
+      "sha256": "12faddd0b7b4533396674f4a9254a57b44f37631fe256e4c440ac7336a7812a7"
+    },
+    {
+      "path": "vendor/wayland-client/examples/list_globals_no_dispatch.rs",
+      "sha256": "6fe6a5ed0ceaaffc1e803fcf7ecd9c1b0fc97a8f162d7df4c83b4015ff129969"
+    },
+    {
+      "path": "vendor/wayland-client/examples/simple_window.rs",
+      "sha256": "0a683bf8abe3677f5bc6018ec642adc26314955974281d055bef6f306904d60f"
+    },
+    {
+      "path": "vendor/wayland-client/src/conn.rs",
+      "sha256": "bb456d6f0b371e1491d301527ece1ff77f49dd527f5134c77b03dc54fc0a72ca"
+    },
+    {
+      "path": "vendor/wayland-client/src/event_queue.rs",
+      "sha256": "ac877063786064b4192afd093556bd002ff9eebea07db54caec816c1eae93452"
+    },
+    {
+      "path": "vendor/wayland-client/src/globals.rs",
+      "sha256": "1d7b1d9cc6e0d65c6fa703a53383c3ebf4759a14a85254a164606126d54fade8"
+    },
+    {
+      "path": "vendor/wayland-client/src/lib.rs",
+      "sha256": "dd32fa9e02a7a395d865dedd6834052c5d9af20996df9b2718ee58e40810c663"
+    },
+    {
+      "path": "vendor/wayland-client/wayland.xml",
+      "sha256": "cc860987e54f8d85c940e97fa1270c69b6e4ad31fbcf5a7f00107ce1157f5e07"
+    },
+    {
+      "path": "scripts/native-desktop-smoke.py",
+      "sha256": "3d6c9a26a3649e029fe20216881fb524e00dbbfaac25ea65b48a952120825a92"
+    },
+    {
+      "path": "scripts/native-clipboard-owner.c",
+      "sha256": "f9b7f9b0ed5b344cbbe0d780845e41dbbdb9c698f9cd0d7d2a2a7bf720851db1"
+    },
+    {
+      "path": "scripts/protocols/wlr-data-control-unstable-v1.xml",
+      "sha256": "5f10d6bf9bfa9d12266a6f423fb77bbb98e415f6d64fe24680710ffb362a7082"
+    }
+  ]
+}

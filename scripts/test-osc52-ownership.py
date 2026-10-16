@@ -23,15 +23,17 @@ def item(source, marker):
     return source[start:end]
 
 helpers = '\n'.join(item(source, 'fn ' + name + '(') for name in (
-    'defer_osc52_refusal', 'complete_osc52_read'))
+    'defer_osc52_refusal', 'complete_osc52_read',
+    'host_clipboard_completion_matches', 'release_host_clipboard_state'))
 methods = '\n'.join(item(source, 'fn ' + name + '(') for name in (
     'host_clipboard_read_blocked_for', 'try_begin_host_clipboard_read',
     'finish_host_clipboard_read', 'release_host_clipboard_read', 'session_by_identity'))
-callback = item(source, 'Message::Osc52Query(id, fd, terminator, content) =>')
+callback = item(source, 'Message::Osc52Query(id, fd, generation, terminator, content) =>')
 cap = source.split('const MAX_CLIPBOARD_RESPONSE_BYTES:', 1)[1].split(';', 1)[0]
 query = item(terminal, 'if data == "?"')
 # Bind the actual async message producer and close path to the tested gates.
-assert '.map(move |c| Message::Osc52Query(id, fd, terminator, c))' in source
+compact = ''.join(source.split())
+assert '.map(move|c|{Message::Osc52Query(id,fd,generation,terminator,c)}).abortable()' in compact
 close = item(source, 'fn close_session(')
 assert 'self.sessions.remove(index)' in close
 assert 'self.release_host_clipboard_read(closed_id, closed_fd)' in close
@@ -47,7 +49,8 @@ variants = [('current', fixture),
     ('fd-only regression', fixture.replace('session.id == id && session.master_fd == fd', 'session.master_fd == fd')),
     ('revocation regression', fixture.replace('if allow_clipboard_read && content.len()', 'if content.len()')),
     ('size regression', fixture.replace('content.len() <= MAX_CLIPBOARD_RESPONSE_BYTES', 'true')),
-    ('owner-release regression', fixture.replace('owner_id == id && owner_fd == fd', 'true'))]
+    ('owner-release regression', fixture.replace('*owner == Some((id, fd))', 'owner.is_some()')),
+    ('generation regression', fixture.replace('current_generation == generation', 'true'))]
 with tempfile.TemporaryDirectory(prefix='frost-osc52-') as temp:
     path = Path(temp)
     for name, code in variants:
@@ -57,4 +60,4 @@ with tempfile.TemporaryDirectory(prefix='frost-osc52-') as temp:
         result = subprocess.run([str(path / 'tests')], capture_output=True, text=True)
         print(name + ':\n' + result.stdout)
         assert (result.returncode == 0) == (name == 'current'), result.stderr
-print('Production OSC52 ownership checks passed; four deliberate regressions rejected.')
+print('Production OSC52 ownership checks passed; five deliberate regressions rejected.')

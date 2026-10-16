@@ -1,0 +1,15 @@
+[package]
+name = "frost-provider-acceptance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+winit = "=0.30.13"
+softbuffer = { version = "=0.4.8", default-features = false, features = ["wayland", "wayland-dlopen", "x11", "x11-dlopen"] }
+window_clipboard = { path = "../../vendor/window_clipboard" }
+[patch.crates-io]
+clipboard_wayland = { path = "../../vendor/clipboard_wayland" }
+clipboard_x11 = { path = "../../vendor/clipboard_x11" }
+smithay-clipboard = { path = "../../vendor/smithay-clipboard" }
+wayland-client = { path = "../../vendor/wayland-client" }
