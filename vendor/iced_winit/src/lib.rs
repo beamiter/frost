@@ -1383,7 +1383,7 @@ fn run_action<'a, P, C>(
         }
         Action::Clipboard(action) => match action {
             clipboard::Action::Read { target, channel } => {
-                let _ = channel.send(clipboard.read(target));
+                clipboard.read_async(target, channel);
             }
             clipboard::Action::Write { target, contents } => {
                 clipboard.write(target, contents);

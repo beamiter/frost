@@ -1,0 +1,16 @@
+[package]
+name = "clipboard_x11"
+version = "0.4.3"
+authors = ["Héctor Ramón Jiménez <hector0193@gmail.com>"]
+edition = "2018"
+description = "A library to obtain access to the X11 clipboard"
+license = "MIT"
+repository = "https://github.com/hecrj/window_clipboard"
+documentation = "https://docs.rs/clipboard_x11"
+keywords = ["clipboard", "x11"]
+
+[dependencies]
+x11rb = "0.13"
+thiserror = "2.0"
+rustix = { version = "=1.1.4", features = ["event"] }
+x11rb-protocol = "=0.13.2"

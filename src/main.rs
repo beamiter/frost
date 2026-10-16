@@ -4331,10 +4331,10 @@ enum Message {
     PromptRecall(usize, String),
     /// System clipboard contents read in response to an OSC 52 query from the
     /// app running in the session identified by the file descriptor.
-    Osc52Query(usize, RawFd, &'static [u8], Option<String>),
+    Osc52Query(usize, RawFd, u64, &'static [u8], Option<String>),
     /// System clipboard contents read in response to an OSC 5522 MIME-data read
     /// request. Carries the requesting fd and the MIME type that was requested.
-    Osc5522Data(usize, RawFd, String, Option<String>),
+    Osc5522Data(usize, RawFd, u64, String, Option<String>),
     Resized(Size),
     Focus(bool),
     NewSession,
@@ -4776,6 +4776,57 @@ struct Session {
     /// automatic Files follower targets SSH typed inside an ordinary local
     /// shell and must not open a duplicate sidecar for managed remote tabs.
     managed_remote: bool,
+}
+
+/// The first response metadata retained until completion or explicit revocation.
+enum HostClipboardReply {
+    Osc52(&'static [u8]),
+    Osc5522(String),
+}
+
+fn release_host_clipboard_state(
+    owner: &mut Option<(usize, RawFd)>,
+    task: &mut Option<iced::task::Handle>,
+    reply: &mut Option<HostClipboardReply>,
+    id: usize,
+    fd: RawFd,
+) {
+    if *owner == Some((id, fd)) {
+        if let Some(handle) = task.take() {
+            handle.abort();
+        }
+        *owner = None;
+        *reply = None;
+    }
+}
+
+fn refuse_host_clipboard_reply(
+    reply: Option<HostClipboardReply>,
+    terminal: &mut TerminalState,
+    in_flight: &mut bool,
+    osc52_pending: &mut Option<std::collections::VecDeque<&'static [u8]>>,
+    osc5522_pending: &mut Option<usize>,
+) {
+    *in_flight = false;
+    match reply {
+        Some(HostClipboardReply::Osc52(terminator)) => {
+            complete_osc52_read(terminal, osc52_pending, false, "", terminator)
+        }
+        Some(HostClipboardReply::Osc5522(mime)) => {
+            complete_osc5522_read(terminal, in_flight, osc5522_pending, false, &mime, "")
+        }
+        None => {}
+    }
+}
+
+fn host_clipboard_completion_matches(
+    owner: Option<(usize, RawFd)>,
+    current_generation: u64,
+    id: usize,
+    fd: RawFd,
+    generation: u64,
+) -> bool {
+    owner == Some((id, fd)) && current_generation == generation
 }
 
 /// An OSC 52 query has no correlation ID. Retain at most eight refusal
@@ -6133,6 +6184,9 @@ struct Frost {
     /// iced's clipboard read is process-global. PTY-originated OSC 52/5522 reads
     /// must share one in-flight host read across every session.
     host_clipboard_read_owner: Option<(usize, RawFd)>,
+    host_clipboard_read_generation: u64,
+    host_clipboard_read_task: Option<iced::task::Handle>,
+    host_clipboard_read_reply: Option<HostClipboardReply>,
     /// Rolling window for OSC 52 SET rate limiting (two writes per second).
     osc52_write_window_started: std::time::Instant,
     osc52_writes_in_window: usize,
@@ -6502,6 +6556,9 @@ impl Frost {
             palette: command_palette::PaletteState::new(),
             block_export_in_flight: false,
             host_clipboard_read_owner: None,
+            host_clipboard_read_generation: 0,
+            host_clipboard_read_task: None,
+            host_clipboard_read_reply: None,
             osc52_write_window_started: std::time::Instant::now(),
             osc52_writes_in_window: 0,
             agent: agent::AgentUi::new(),
@@ -6891,6 +6948,7 @@ impl Frost {
         let candidate = self.config.clone().normalized();
         match candidate.save_if_unchanged(self.config_revision.as_ref()) {
             Ok(revision) => {
+                self.before_clipboard_permission_change(candidate.allow_clipboard_read);
                 self.config = candidate;
                 self.config_revision = Some(revision);
                 self.config_dirty = false;
@@ -6903,6 +6961,7 @@ impl Frost {
                 // the state dirty so the next tick retries durability instead
                 // of misclassifying our own write as an external conflict.
                 if let Some(revision) = error.committed_revision().cloned() {
+                    self.before_clipboard_permission_change(candidate.allow_clipboard_read);
                     self.config = candidate;
                     self.config_revision = Some(revision);
                     self.config_dirty = true;
@@ -7007,6 +7066,7 @@ impl Frost {
                     config.ascii_organism_motion,
                 );
                 self.remote_host_editor.retire();
+                self.before_clipboard_permission_change(config.allow_clipboard_read);
                 self.config = config;
                 self.win_size =
                     logical_viewport_after_scale(self.win_size, old_scale, self.scale_factor());
@@ -8479,21 +8539,63 @@ impl Frost {
         if self.host_clipboard_read_owner.is_some() {
             return false;
         }
+        let Some(generation) = self.host_clipboard_read_generation.checked_add(1) else {
+            return false;
+        };
+        self.host_clipboard_read_generation = generation;
         self.host_clipboard_read_owner = Some((id, fd));
         true
     }
 
-    fn finish_host_clipboard_read(&mut self, id: usize, fd: RawFd) {
-        if self
-            .host_clipboard_read_owner
-            .is_some_and(|(owner_id, owner_fd)| owner_id == id && owner_fd == fd)
-        {
-            self.host_clipboard_read_owner = None;
+    fn finish_host_clipboard_read(&mut self, id: usize, fd: RawFd, generation: u64) -> bool {
+        if !host_clipboard_completion_matches(
+            self.host_clipboard_read_owner,
+            self.host_clipboard_read_generation,
+            id,
+            fd,
+            generation,
+        ) {
+            return false;
         }
+        self.host_clipboard_read_owner = None;
+        self.host_clipboard_read_task = None;
+        self.host_clipboard_read_reply = None;
+        true
     }
 
     fn release_host_clipboard_read(&mut self, id: usize, fd: RawFd) {
-        self.finish_host_clipboard_read(id, fd);
+        release_host_clipboard_state(
+            &mut self.host_clipboard_read_owner,
+            &mut self.host_clipboard_read_task,
+            &mut self.host_clipboard_read_reply,
+            id,
+            fd,
+        );
+    }
+
+    fn before_clipboard_permission_change(&mut self, allow: bool) {
+        if !allow {
+            self.revoke_host_clipboard_read();
+        }
+    }
+
+    fn revoke_host_clipboard_read(&mut self) {
+        let Some((id, fd)) = self.host_clipboard_read_owner else {
+            return;
+        };
+        let reply = self.host_clipboard_read_reply.take();
+        self.release_host_clipboard_read(id, fd);
+        if let Some(session) = self.session_by_identity(id, fd) {
+            refuse_host_clipboard_reply(
+                reply,
+                &mut session.terminal,
+                &mut session.clipboard_read_in_flight,
+                &mut session.osc52_pending_refusals,
+                &mut session.osc5522_pending_refusals,
+            );
+            session.flush_responses();
+            session.refresh();
+        }
     }
 
     fn session_by_identity(&mut self, id: usize, fd: RawFd) -> Option<&mut Session> {
@@ -9177,6 +9279,9 @@ impl Frost {
     /// because a stalled state filesystem must not turn quitting into a hang;
     /// a missed deadline is logged and the exit continues.
     fn exit_flushing_durable_state(&mut self) -> Task<Message> {
+        if let Some((id, fd)) = self.host_clipboard_read_owner {
+            self.release_host_clipboard_read(id, fd);
+        }
         self.organism.set_enabled(false);
         self.organism.close_preview();
         const EXIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -15472,10 +15577,16 @@ impl Frost {
                                 sess.clipboard_read_in_flight = true;
                                 sess.osc52_pending_refusals = Some(Default::default());
                             }
-                            tasks.push(
-                                iced::clipboard::read()
-                                    .map(move |c| Message::Osc52Query(id, fd, terminator, c)),
-                            );
+                            let generation = self.host_clipboard_read_generation;
+                            self.host_clipboard_read_reply =
+                                Some(HostClipboardReply::Osc52(terminator));
+                            let (task, handle) = iced::clipboard::read()
+                                .map(move |c| {
+                                    Message::Osc52Query(id, fd, generation, terminator, c)
+                                })
+                                .abortable();
+                            self.host_clipboard_read_task = Some(handle.abort_on_drop());
+                            tasks.push(task);
                         } else if let Some(index) = session_index {
                             let sess = &mut self.sessions[index];
                             // OSC 52 has no structured busy status; an empty response
@@ -15512,10 +15623,16 @@ impl Frost {
                     });
                     if let Some(mime) = mime {
                         if self.try_begin_host_clipboard_read(id, fd) {
-                            tasks.push(
-                                iced::clipboard::read()
-                                    .map(move |c| Message::Osc5522Data(id, fd, mime.clone(), c)),
-                            );
+                            let generation = self.host_clipboard_read_generation;
+                            self.host_clipboard_read_reply =
+                                Some(HostClipboardReply::Osc5522(mime.clone()));
+                            let (task, handle) = iced::clipboard::read()
+                                .map(move |c| {
+                                    Message::Osc5522Data(id, fd, generation, mime.clone(), c)
+                                })
+                                .abortable();
+                            self.host_clipboard_read_task = Some(handle.abort_on_drop());
+                            tasks.push(task);
                         } else if let Some(index) = session_index {
                             let sess = &mut self.sessions[index];
                             sess.clipboard_read_in_flight = false;
@@ -16295,6 +16412,9 @@ impl Frost {
                                 self.config_save_retry.reset();
                                 match candidate.save_if_unchanged(self.config_revision.as_ref()) {
                                     Ok(revision) => {
+                                        self.before_clipboard_permission_change(
+                                            candidate.allow_clipboard_read,
+                                        );
                                         self.config = candidate;
                                         self.config_revision = Some(revision);
                                         self.config_dirty = false;
@@ -16312,6 +16432,9 @@ impl Frost {
                                             // already visible. Keep memory in
                                             // lockstep with it and retry the
                                             // uncertain durability boundary.
+                                            self.before_clipboard_permission_change(
+                                                candidate.allow_clipboard_read,
+                                            );
                                             self.config = candidate;
                                             self.config_revision = Some(revision);
                                             self.config_dirty = true;
@@ -16338,9 +16461,11 @@ impl Frost {
                 self.config.agent_max_turns = turns.clamp(1, 100);
                 self.config_dirty = true;
             }
-            Message::Osc52Query(id, fd, terminator, content) => {
+            Message::Osc52Query(id, fd, generation, terminator, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
-                self.finish_host_clipboard_read(id, fd);
+                if !self.finish_host_clipboard_read(id, fd, generation) {
+                    return Task::none();
+                }
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     sess.clipboard_read_in_flight = false;
                     let content = content.as_deref().unwrap_or("");
@@ -16355,9 +16480,11 @@ impl Frost {
                     sess.refresh();
                 }
             }
-            Message::Osc5522Data(id, fd, mime, content) => {
+            Message::Osc5522Data(id, fd, generation, mime, content) => {
                 let allow_clipboard_read = self.config.allow_clipboard_read;
-                self.finish_host_clipboard_read(id, fd);
+                if !self.finish_host_clipboard_read(id, fd, generation) {
+                    return Task::none();
+                }
                 if let Some(sess) = self.session_by_identity(id, fd) {
                     complete_osc5522_read(
                         &mut sess.terminal,
@@ -18261,6 +18388,7 @@ impl Frost {
                 self.apply_config();
             }
             Message::SetAllowClipboardRead(allow) => {
+                self.before_clipboard_permission_change(allow);
                 self.config.allow_clipboard_read = allow;
                 self.config_dirty = true;
             }
@@ -18581,6 +18709,7 @@ impl Frost {
                             reset.ascii_organism_motion,
                         );
                         self.remote_host_editor.retire();
+                        self.before_clipboard_permission_change(reset.allow_clipboard_read);
                         self.config = reset;
                         self.config_revision = Some(revision);
                         self.win_size = logical_viewport_after_scale(
@@ -18610,6 +18739,7 @@ impl Frost {
                                 reset.ascii_organism_motion,
                             );
                             self.remote_host_editor.retire();
+                            self.before_clipboard_permission_change(reset.allow_clipboard_read);
                             self.config = reset;
                             self.config_revision = Some(revision);
                             self.win_size = logical_viewport_after_scale(
@@ -43168,5 +43298,141 @@ mod tests {
         assert!(gate.contains("self.config.is_block_mode()"));
         assert!(gate.contains("!session.terminal.is_alt_buffer_active()"));
         assert!(gate.contains("!session.terminal.is_command_running()"));
+    }
+}
+
+#[cfg(test)]
+mod bounded_clipboard_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn revoke_aborts_task_clears_owner_and_preserves_ordered_refusals() {
+        for osc52 in [true, false] {
+            let (_task, handle) = Task::done(()).abortable();
+            let observed = handle.clone();
+            let mut task = Some(handle);
+            let mut owner = Some((7, 12));
+            let mut reply = Some(if osc52 {
+                HostClipboardReply::Osc52(b"\x1b\\")
+            } else {
+                HostClipboardReply::Osc5522("text/plain".into())
+            });
+            let first_reply = reply.take();
+            release_host_clipboard_state(&mut owner, &mut task, &mut reply, 7, 12);
+            assert!(observed.is_aborted());
+            assert!(owner.is_none() && task.is_none() && reply.is_none());
+            let mut terminal = TerminalState::new(80, 24);
+            let mut in_flight = true;
+            let mut pending52 = Some(std::collections::VecDeque::from([b"\x07".as_slice()]));
+            let mut pending5522 = Some(2);
+            refuse_host_clipboard_reply(
+                first_reply,
+                &mut terminal,
+                &mut in_flight,
+                &mut pending52,
+                &mut pending5522,
+            );
+            assert!(!in_flight);
+            if osc52 {
+                assert_eq!(terminal.output_buffer, b"\x1b]52;c;\x1b\\\x1b]52;c;\x07");
+                assert!(pending52.is_none());
+            } else {
+                let mut expected = osc_5522_packet("type=read:status=EPERM", None);
+                expected.extend(osc_5522_packet("type=read:status=EBUSY", None).repeat(2));
+                assert_eq!(terminal.output_buffer, expected);
+                assert!(pending5522.is_none());
+            }
+            assert!(!host_clipboard_completion_matches(owner, 4, 7, 12, 4));
+            owner = Some((7, 12)); // A newly granted read uses a new generation.
+            assert!(!host_clipboard_completion_matches(owner, 5, 7, 12, 4));
+            assert!(host_clipboard_completion_matches(owner, 5, 7, 12, 5));
+        }
+    }
+
+    #[test]
+    fn every_config_replacement_revokes_before_permission_change() {
+        let source = include_str!("main.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let compact: String = production
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let compact = compact.replace(",)", ")");
+        let marker = "self.config=";
+        let mut remaining = compact.as_str();
+        let mut replacements = 0;
+        while let Some((before, after)) = remaining.split_once(marker) {
+            let (value, rest) = after.split_once(';').unwrap();
+            let expected =
+                format!("self.before_clipboard_permission_change({value}.allow_clipboard_read);");
+            assert!(
+                before.ends_with(&expected),
+                "missing pre-replacement permission gate"
+            );
+            replacements += 1;
+            remaining = rest;
+        }
+        assert_eq!(replacements, 7);
+    }
+
+    #[test]
+    fn revoke_regrant_rejects_already_queued_old_generation() {
+        assert!(host_clipboard_completion_matches(
+            Some((7, 12)),
+            4,
+            7,
+            12,
+            4
+        ));
+        assert!(!host_clipboard_completion_matches(None, 4, 7, 12, 4));
+        assert!(!host_clipboard_completion_matches(
+            Some((7, 12)),
+            5,
+            7,
+            12,
+            4
+        ));
+        assert!(host_clipboard_completion_matches(
+            Some((7, 12)),
+            5,
+            7,
+            12,
+            5
+        ));
+    }
+
+    #[test]
+    fn close_replacement_and_reused_fd_never_match_another_session() {
+        assert!(!host_clipboard_completion_matches(
+            Some((8, 12)),
+            4,
+            7,
+            12,
+            4
+        ));
+        assert!(!host_clipboard_completion_matches(
+            Some((7, 13)),
+            4,
+            7,
+            12,
+            4
+        ));
+        assert!(!host_clipboard_completion_matches(None, 4, 7, 12, 4));
+    }
+
+    #[test]
+    fn source_keeps_ownership_check_before_both_completion_side_effects() {
+        let source = include_str!("main.rs");
+        for marker in [
+            "            Message::Osc52Query(id, fd, generation, terminator, content) => {",
+            "            Message::Osc5522Data(id, fd, generation, mime, content) => {",
+        ] {
+            let body = source.split_once(marker).unwrap().1;
+            assert!(
+                body.find("finish_host_clipboard_read(id, fd, generation)")
+                    .unwrap()
+                    < body.find("session_by_identity(id, fd)").unwrap()
+            );
+        }
     }
 }

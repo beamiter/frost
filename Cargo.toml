@@ -59,6 +59,11 @@ opt-level = 3
 [patch.crates-io]
 cryoglyph = { path = "vendor/cryoglyph" }
 iced_winit = { path = "vendor/iced_winit" }
+window_clipboard = { path = "vendor/window_clipboard" }
+clipboard_wayland = { path = "vendor/clipboard_wayland" }
+clipboard_x11 = { path = "vendor/clipboard_x11" }
+smithay-clipboard = { path = "vendor/smithay-clipboard" }
+wayland-client = { path = "vendor/wayland-client" }
 
 
 [dev-dependencies]

@@ -1,7 +1,8 @@
 //! Access the clipboard.
 
 use crate::core::clipboard::Kind;
-use std::sync::Arc;
+use crate::futures::futures::channel::oneshot;
+use std::sync::{Arc, Mutex};
 use winit::window::{Window, WindowId};
 
 /// A buffer for short-term storage and transfer within and between
@@ -31,8 +32,16 @@ impl Clipboard {
         // the `Arc<Window>` together with `State`, and enum variant fields
         // get dropped in declaration order.
         #[allow(unsafe_code)]
-        let clipboard =
-            unsafe { window_clipboard::Clipboard::connect(&window) };
+        let clipboard = unsafe {
+            #[cfg(target_os = "linux")]
+            {
+                window_clipboard::Clipboard::connect_bounded(&window)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                window_clipboard::Clipboard::connect(&window)
+            }
+        };
 
         let state = match clipboard {
             Ok(clipboard) => State::Connected { clipboard, window },
@@ -61,15 +70,54 @@ impl Clipboard {
         }
     }
 
+    /// Resolves an Action read without waiting on the Linux clipboard owner.
+    /// Synchronous core-widget reads intentionally retain their separate API.
+    pub fn read_async(&self, kind: Kind, channel: oneshot::Sender<Option<String>>) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = channel.send(self.read(kind));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let State::Connected { clipboard, .. } = &self.state else {
+                let _ = channel.send(None);
+                return;
+            };
+            let sender = Arc::new(Mutex::new(Some(channel)));
+            let cancelled = sender.clone();
+            let completed = sender.clone();
+            let result = clipboard.read_async(
+                matches!(kind, Kind::Primary),
+                1024 * 1024,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+                Box::new(move || match cancelled.lock() {
+                    Ok(sender) => sender.as_ref().is_none_or(oneshot::Sender::is_canceled),
+                    Err(_) => true,
+                }),
+                Box::new(move |result| {
+                    // Take under lock, invoke send only after releasing it.
+                    let channel = completed.lock().ok().and_then(|mut sender| sender.take());
+                    if let Some(channel) = channel {
+                        let _ = channel.send(result.ok());
+                    }
+                }),
+            );
+            if result.is_err() {
+                let channel = sender.lock().ok().and_then(|mut sender| sender.take());
+                if let Some(channel) = channel {
+                    let _ = channel.send(None);
+                }
+            }
+        }
+    }
+
     /// Writes the given text contents to the [`Clipboard`].
     pub fn write(&mut self, kind: Kind, contents: String) {
         match &mut self.state {
             State::Connected { clipboard, .. } => {
                 let result = match kind {
                     Kind::Standard => clipboard.write(contents),
-                    Kind::Primary => {
-                        clipboard.write_primary(contents).unwrap_or(Ok(()))
-                    }
+                    Kind::Primary => clipboard.write_primary(contents).unwrap_or(Ok(())),
                 };
 
                 match result {
