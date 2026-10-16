@@ -22344,17 +22344,23 @@ mod block_spacing_tests {
     fn capped_prefix_never_becomes_a_folded_tail_preview() {
         let template = fixture(80, 16).command_zones[0].clone();
         for last in ['x', 'é', '界', '🦀'] {
-            let mut terminal = TerminalState::new(1024, 1024);
-            for row in 0..1023 {
+            // Stay within the terminal's 512-row allocation limit. Two-byte
+            // cells let the fixture reach the byte cap without oversized grids.
+            let mut terminal = TerminalState::new(1024, 512);
+            assert_eq!(terminal.grid.rows(), 512);
+            for row in 0..511 {
                 for cell in &mut terminal.grid[row] {
-                    cell.character = 'x';
+                    cell.character = 'é';
                 }
             }
-            terminal.grid[1023][0].character = last;
-            // 1023 full rows plus their newlines occupy CAP - 1 bytes.
+            for cell in &mut terminal.grid[511][..768] {
+                cell.character = 'é';
+            }
+            terminal.grid[511][768].character = last;
+            // 511 * (2048 + newline) + 768 * 2 == CAP - 1 bytes.
             // One ASCII scalar fits exactly; a multibyte final scalar does not.
             let capture = terminal
-                .capture_zone_output(0, 1024, 0)
+                .capture_zone_output(0, 512, 0)
                 .expect("nonempty normalized output");
             assert_eq!(capture.1, last != 'x');
             if last == 'x' {
@@ -22372,7 +22378,14 @@ mod block_spacing_tests {
                 Some(&capture),
                 "copy/search data is unchanged"
             );
-            assert_eq!(stored.output_preview, if capture.1 { "" } else { "x" });
+            assert_eq!(
+                stored.output_preview,
+                if capture.1 {
+                    String::new()
+                } else {
+                    crate::fold_preview::from_plain(&capture.0)
+                }
+            );
         }
     }
 
