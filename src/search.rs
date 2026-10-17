@@ -1585,7 +1585,7 @@ mod tests {
     #[test]
     fn streamed_scrollback_matches_decompressed_unicode_search() {
         use crate::terminal::ScrollbackLine;
-        let mut seed = 0x5eed_f05_u64;
+        let mut seed = 0x05ee_df05_u64;
         let alphabet = [
             ' ', 'a', 'A', 'İ', 'Σ', 'ß', '中', '🦀', '\u{301}', 'i', 'x',
         ];
@@ -1714,7 +1714,7 @@ mod tests {
                     [plain, cells]
                 };
                 let mut requested = 0;
-                let rows = std::iter::once(first).chain(tail).map(|line| {
+                let rows = std::iter::once(first).chain(tail).inspect(|_| {
                     if requested > 0 {
                         let (text, columns) = super::OBSERVED_SEARCH_SCRATCH
                             .with(|observed| observed.get().unwrap());
@@ -1725,7 +1725,6 @@ mod tests {
                         );
                     }
                     requested += 1;
-                    line
                 });
                 let (matches, error) = SearchEngine::search_lines(
                     rows,
