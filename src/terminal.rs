@@ -1,6 +1,10 @@
 mod chat_projection;
 #[cfg(all(test, target_os = "linux"))]
 mod chat_pty_tests;
+#[cfg(test)]
+mod projection_properties;
+#[cfg(test)]
+mod projection_state_properties;
 
 /// Locate cancellation before the first real string terminator. A fresh ESC
 /// abandons the string and is parsed again; CAN/SUB are consumed. The bool says
@@ -51,6 +55,13 @@ thread_local! {
         std::cell::Cell::new(0)
     };
     static PROJECTION_PLAN_BUILD_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// Actual rows and source slices visited by viewport materialization.
+    static PROJECTION_MATERIALIZED_ROWS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static PROJECTION_MATERIALIZED_SLICES: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     /// Times a row trim or reflow rescanned `finished_output_provenance`
@@ -2091,7 +2102,24 @@ impl ProjectionPlan {
         match anchor {
             ProjectedSelectionAnchor::Cell(origin) => {
                 if let Some(row) = self.raw_cell_document_row(origin) {
-                    return Some((row, origin.col));
+                    // A reflowed row may start midway through a raw row, or
+                    // join several raw rows. Raw columns are not view columns.
+                    let slice = self.rows[row].raw_slices.iter().find(|slice| {
+                        slice.origin.is_some_and(|start| {
+                            start.row == origin.row
+                                && origin.col >= start.col_start
+                                && origin.col - start.col_start < slice.len
+                        })
+                    })?;
+                    return Some((
+                        row,
+                        slice.view_col_start + origin.col - slice.origin?.col_start,
+                    ));
+                }
+                // Hidden cells are not trailing whitespace. In particular a
+                // collapsed prefix can leave just one visible suffix row.
+                if self.summary_owning_raw_cell(origin).is_some() {
+                    return None;
                 }
                 // A live grid row carries an origin for every column, blanks
                 // included, but the same row in scrollback keeps slices only up
@@ -2748,6 +2776,117 @@ impl OriginSpan {
             col: self.view_col_start + origin.col - self.raw_col_start,
         })
     }
+}
+
+/// Pure projection-to-text core. The caller validates the selection/cache revision
+/// before entering; host chrome and collapsed cells never become selected text.
+fn copy_projected_cells(
+    plan: &ProjectionPlan,
+    selection: &ProjectedSelection,
+    scrollback: &VecDeque<ScrollbackLine>,
+    grid: &TerminalGrid,
+) -> Option<String> {
+    let (start, end) = if selection.anchor.point <= selection.active.point {
+        (selection.anchor.point, selection.active.point)
+    } else {
+        (selection.active.point, selection.anchor.point)
+    };
+    if start.0 >= plan.rows.len() || end.0 >= plan.rows.len() {
+        return None;
+    }
+
+    let mut result = String::new();
+    let mut history_cache: Option<(usize, Vec<TerminalCell>)> = None;
+    let mut hard_break_pending = false;
+    for document_row in start.0..=end.0 {
+        let planned = &plan.rows[document_row];
+        let (selected_left, selected_right) = if selection.mode == SelectionMode::Block {
+            (
+                selection.anchor.point.1.min(selection.active.point.1),
+                selection.anchor.point.1.max(selection.active.point.1),
+            )
+        } else {
+            (
+                if document_row == start.0 { start.1 } else { 0 },
+                if document_row == end.0 {
+                    end.1
+                } else {
+                    plan.cols.saturating_sub(1)
+                },
+            )
+        };
+
+        if matches!(
+            planned.kind,
+            ProjectedRowKind::BlockSpacer { .. } | ProjectedRowKind::BlockChrome { .. }
+        ) {
+            continue;
+        }
+        if matches!(planned.kind, ProjectedRowKind::CollapsedSummary { .. }) {
+            hard_break_pending = !result.ends_with('\n');
+            continue;
+        }
+        if matches!(planned.kind, ProjectedRowKind::Raw) {
+            if hard_break_pending {
+                result.push('\n');
+                hard_break_pending = false;
+            }
+            if planned.raw_slices.is_empty()
+                && planned.row_source.is_some()
+                && selected_left <= selected_right
+            {
+                result.extend(std::iter::repeat_n(
+                    ' ',
+                    selected_right
+                        .min(plan.cols.saturating_sub(1))
+                        .saturating_sub(selected_left)
+                        .saturating_add(1),
+                ));
+            }
+            for slice in &planned.raw_slices {
+                let slice_start = slice.view_col_start;
+                let slice_end = slice_start.saturating_add(slice.len);
+                let overlap_start = slice_start.max(selected_left);
+                let overlap_end = slice_end.min(selected_right.saturating_add(1));
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                let source = if slice.source.absolute_row < scrollback.len() {
+                    if history_cache.as_ref().map(|(row, _)| *row)
+                        != Some(slice.source.absolute_row)
+                    {
+                        history_cache = Some((
+                            slice.source.absolute_row,
+                            scrollback[slice.source.absolute_row].decompress(),
+                        ));
+                    }
+                    history_cache.as_ref()?.1.as_slice()
+                } else {
+                    let grid_row = slice.source.absolute_row.checked_sub(scrollback.len())?;
+                    if grid_row >= grid.rows() {
+                        return None;
+                    }
+                    &grid[grid_row]
+                };
+                let source_start = slice
+                    .source
+                    .col_start
+                    .saturating_add(overlap_start - slice_start);
+                let source_end = source_start.saturating_add(overlap_end - overlap_start);
+                for cell in source.get(source_start..source_end)? {
+                    if !cell.flags.wide_continuation() {
+                        result.push(cell.character);
+                    }
+                }
+            }
+            if document_row < end.0 && (selection.mode == SelectionMode::Block || !planned.wrapped)
+            {
+                result.push('\n');
+                hard_break_pending = false;
+            }
+        }
+    }
+    Some(result)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11787,6 +11926,8 @@ impl TerminalState {
 
         let mut history_cache: HashMap<usize, Vec<TerminalCell>> = HashMap::new();
         for document_row in visible_indices {
+            #[cfg(test)]
+            PROJECTION_MATERIALIZED_ROWS.with(|count| count.set(count.get() + 1));
             let planned = &plan.rows[document_row];
             chat_rows.push(
                 plan.chat_rows
@@ -11799,6 +11940,8 @@ impl TerminalState {
             let mut line = vec![TerminalCell::default(); cols];
             if matches!(planned.kind, ProjectedRowKind::Raw) {
                 for slice in &planned.raw_slices {
+                    #[cfg(test)]
+                    PROJECTION_MATERIALIZED_SLICES.with(|count| count.set(count.get() + 1));
                     let source = if slice.source.absolute_row < self.scrollback.len() {
                         history_cache
                             .entry(slice.source.absolute_row)
@@ -13309,111 +13452,7 @@ impl TerminalState {
         {
             return None;
         }
-        let (start, end) = if selection.anchor.point <= selection.active.point {
-            (selection.anchor.point, selection.active.point)
-        } else {
-            (selection.active.point, selection.anchor.point)
-        };
-        if start.0 >= plan.rows.len() || end.0 >= plan.rows.len() {
-            return None;
-        }
-
-        let mut result = String::new();
-        let mut history_cache: Option<(usize, Vec<TerminalCell>)> = None;
-        let mut hard_break_pending = false;
-        for document_row in start.0..=end.0 {
-            let planned = &plan.rows[document_row];
-            let (selected_left, selected_right) = if selection.mode == SelectionMode::Block {
-                (
-                    selection.anchor.point.1.min(selection.active.point.1),
-                    selection.anchor.point.1.max(selection.active.point.1),
-                )
-            } else {
-                (
-                    if document_row == start.0 { start.1 } else { 0 },
-                    if document_row == end.0 {
-                        end.1
-                    } else {
-                        plan.cols.saturating_sub(1)
-                    },
-                )
-            };
-
-            if matches!(
-                planned.kind,
-                ProjectedRowKind::BlockSpacer { .. } | ProjectedRowKind::BlockChrome { .. }
-            ) {
-                continue;
-            }
-            if matches!(planned.kind, ProjectedRowKind::CollapsedSummary { .. }) {
-                hard_break_pending = !result.ends_with('\n');
-                continue;
-            }
-            if matches!(planned.kind, ProjectedRowKind::Raw) {
-                if hard_break_pending {
-                    result.push('\n');
-                    hard_break_pending = false;
-                }
-                if planned.raw_slices.is_empty()
-                    && planned.row_source.is_some()
-                    && selected_left <= selected_right
-                {
-                    result.extend(std::iter::repeat_n(
-                        ' ',
-                        selected_right
-                            .min(plan.cols.saturating_sub(1))
-                            .saturating_sub(selected_left)
-                            .saturating_add(1),
-                    ));
-                }
-                for slice in &planned.raw_slices {
-                    let slice_start = slice.view_col_start;
-                    let slice_end = slice_start.saturating_add(slice.len);
-                    let overlap_start = slice_start.max(selected_left);
-                    let overlap_end = slice_end.min(selected_right.saturating_add(1));
-                    if overlap_start >= overlap_end {
-                        continue;
-                    }
-                    let source = if slice.source.absolute_row < self.scrollback.len() {
-                        if history_cache.as_ref().map(|(row, _)| *row)
-                            != Some(slice.source.absolute_row)
-                        {
-                            history_cache = Some((
-                                slice.source.absolute_row,
-                                self.scrollback[slice.source.absolute_row].decompress(),
-                            ));
-                        }
-                        history_cache.as_ref()?.1.as_slice()
-                    } else {
-                        let grid_row = slice
-                            .source
-                            .absolute_row
-                            .checked_sub(self.scrollback.len())?;
-                        if grid_row >= self.grid.rows() {
-                            return None;
-                        }
-                        &self.grid[grid_row]
-                    };
-                    let source_start = slice
-                        .source
-                        .col_start
-                        .saturating_add(overlap_start - slice_start);
-                    let source_end = source_start.saturating_add(overlap_end - overlap_start);
-                    for cell in source.get(source_start..source_end)? {
-                        if !cell.flags.wide_continuation() {
-                            result.push(cell.character);
-                        }
-                    }
-                }
-                if document_row < end.0
-                    && (selection.mode == SelectionMode::Block || !planned.wrapped)
-                {
-                    result.push('\n');
-                    hard_break_pending = false;
-                }
-            }
-        }
-        Some(result)
+        copy_projected_cells(plan, selection, &self.scrollback, &self.grid)
     }
 
     pub fn copy_selection(&self) -> Option<String> {

@@ -66,6 +66,9 @@ jobs:
       - name: Check Files cancellation ownership
         run: python3 scripts/test-sidebar-cancellation.py
 
+      - name: Check projection properties without desktop services
+        run: python3 scripts/test-projection-properties.py
+
       - name: Check font group routing and reload
         run: |
           python3 scripts/test-font-sync.py
