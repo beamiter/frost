@@ -43,7 +43,7 @@ fn seeded_terminal_resize_collapse_and_mode_entry_points() {
                     row_ids: raw[start..=end].iter().map(|r| r.id).collect(),
                 },
             );
-            terminal.spacing_prompt_rows.insert(raw[start].id);
+            terminal.spacing_prompt_rows.push_back(raw[start].id);
         }
         terminal.next_zone_id = 100;
         terminal.bump_history_revision();
