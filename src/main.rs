@@ -25258,7 +25258,7 @@ impl Frost {
         } else if self.search.is_open {
             stack![body, self.search_bar()].into()
         } else {
-            body.into()
+            body
         };
         // Help and the debug panel float above any other overlay so they can be
         // summoned at any time (and the debug panel can sit alongside others).
