@@ -1037,11 +1037,36 @@ mod unix_pty {
         /// (POLLHUP) — or the PTY fd became invalid because the session was
         /// dropped — this returns `Shutdown` WITHOUT reporting data, so the
         /// caller never reads from a PTY fd whose number may have been reused.
+        /// `timeout_ms` is a total monotonic wait budget, including EINTR
+        /// retries. Zero performs an immediate poll; negative values wait
+        /// indefinitely. A timeout is not EOF and does not consume PTY data.
         pub fn wait_fd_or_shutdown(
             fd: RawFd,
             shutdown_fd: RawFd,
             timeout_ms: i32,
         ) -> Result<ReaderPoll> {
+            Self::wait_fd_or_shutdown_with(fd, shutdown_fd, timeout_ms, Instant::now, |fds, ms| {
+                // SAFETY: fds is a valid 2-element array for the duration of poll.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) };
+                if ready < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(ready)
+                }
+            })
+        }
+
+        fn wait_fd_or_shutdown_with(
+            fd: RawFd,
+            shutdown_fd: RawFd,
+            timeout_ms: i32,
+            mut now: impl FnMut() -> Instant,
+            mut poll: impl FnMut(&mut [libc::pollfd; 2], i32) -> std::io::Result<i32>,
+        ) -> Result<ReaderPoll> {
+            // Infinite waits retain their old behavior and avoid clock reads.
+            let budget =
+                (timeout_ms >= 0).then(|| (now(), Duration::from_millis(timeout_ms as u64)));
+            let mut remaining_ms = timeout_ms;
             let mut fds = [
                 libc::pollfd {
                     fd,
@@ -1054,15 +1079,21 @@ mod unix_pty {
                     revents: 0,
                 },
             ];
-            // SAFETY: fds is a valid 2-element array on the stack.
             let ready = loop {
-                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
-                if ready >= 0 {
-                    break ready;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(anyhow!("Failed to poll PTY: {error}"));
+                match poll(&mut fds, remaining_ms) {
+                    Ok(ready) => break ready,
+                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                        if let Some((started, timeout)) = budget {
+                            let elapsed = now().duration_since(started);
+                            if elapsed >= timeout {
+                                return Ok(ReaderPoll::Timeout);
+                            }
+                            // Round up: a positive sub-millisecond remainder
+                            // must not turn into repeated nonblocking polls.
+                            remaining_ms = startup_timeout_ms(timeout - elapsed);
+                        }
+                    }
+                    Err(error) => return Err(anyhow!("Failed to poll PTY: {error}")),
                 }
             };
             if ready == 0 {
@@ -1351,6 +1382,282 @@ mod unix_pty {
     #[inline]
     fn pty_dimension(value: usize) -> u16 {
         value.clamp(1, u16::MAX as usize) as u16
+    }
+
+    #[cfg(test)]
+    mod reader_poll_tests {
+        use super::*;
+        use std::cell::Cell;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        fn interrupted() -> std::io::Result<i32> {
+            Err(std::io::Error::from_raw_os_error(libc::EINTR))
+        }
+
+        #[test]
+        fn reader_poll_100_interruptions_share_one_50ms_budget() {
+            let start = Instant::now();
+            let ticks = Cell::new(0);
+            let mut waits = Vec::new();
+            let result = Pty::wait_fd_or_shutdown_with(
+                -1,
+                -1,
+                50,
+                || start + Duration::from_micros(ticks.get() * 500),
+                |_, ms| {
+                    waits.push(ms);
+                    ticks.set(ticks.get() + 1);
+                    assert!(ticks.get() <= 100, "EINTR reset the original budget");
+                    interrupted()
+                },
+            )
+            .unwrap();
+            assert!(matches!(result, ReaderPoll::Timeout));
+            assert_eq!(waits.len(), 100);
+            assert_eq!(&waits[..4], &[50, 50, 49, 49]);
+            assert_eq!(waits.last(), Some(&1));
+            assert!(waits.iter().all(|&ms| ms > 0));
+        }
+
+        #[test]
+        fn reader_poll_zero_still_polls_once_and_does_not_spin_on_eintr() {
+            let mut calls = 0;
+            let result = Pty::wait_fd_or_shutdown_with(-1, -1, 0, Instant::now, |_, ms| {
+                calls += 1;
+                assert_eq!(calls, 1);
+                assert_eq!(ms, 0);
+                interrupted()
+            })
+            .unwrap();
+            assert!(matches!(result, ReaderPoll::Timeout));
+        }
+
+        #[test]
+        fn reader_poll_negative_waits_retry_without_reading_clock() {
+            for timeout in [-1, -17, i32::MIN] {
+                let mut calls = 0;
+                let result = Pty::wait_fd_or_shutdown_with(
+                    -1,
+                    -1,
+                    timeout,
+                    || panic!("infinite wait must not read the clock"),
+                    |fds, ms| {
+                        assert_eq!(ms, timeout);
+                        calls += 1;
+                        if calls <= 100 {
+                            interrupted()
+                        } else {
+                            fds[1].revents = libc::POLLHUP;
+                            Ok(1)
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(matches!(result, ReaderPoll::Shutdown));
+                assert_eq!(calls, 101);
+            }
+        }
+
+        #[test]
+        fn reader_poll_rounds_positive_remainder_up_and_preserves_ready_result() {
+            let start = Instant::now();
+            let elapsed = Cell::new(Duration::ZERO);
+            let mut waits = Vec::new();
+            let result = Pty::wait_fd_or_shutdown_with(
+                -1,
+                -1,
+                50,
+                || start + elapsed.get(),
+                |fds, ms| {
+                    waits.push(ms);
+                    if waits.len() == 1 {
+                        elapsed.set(Duration::from_micros(49_999));
+                        interrupted()
+                    } else {
+                        assert_eq!(waits.len(), 2);
+                        elapsed.set(Duration::from_secs(1));
+                        fds[0].revents = libc::POLLIN;
+                        fds[1].revents = libc::POLLHUP;
+                        Ok(2)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(waits, [50, 1]);
+            assert!(matches!(result, ReaderPoll::Shutdown));
+        }
+
+        #[test]
+        fn reader_poll_non_eintr_errors_are_not_timeout_or_eof() {
+            let error = match Pty::wait_fd_or_shutdown_with(-1, -1, 50, Instant::now, |_, _| {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }) {
+                Err(error) => error,
+                Ok(_) => panic!("poll failure must propagate"),
+            };
+            assert!(error.to_string().contains("Failed to poll PTY"));
+        }
+
+        fn pipe() -> (OwnedFd, OwnedFd) {
+            let (r, w) = Pty::make_shutdown_pipe().unwrap();
+            // SAFETY: make_shutdown_pipe transfers two distinct owned descriptors.
+            unsafe { (OwnedFd::from_raw_fd(r), OwnedFd::from_raw_fd(w)) }
+        }
+
+        fn write_byte(fd: &OwnedFd) {
+            let byte = b'x';
+            // SAFETY: fd is live and the byte is valid for this write.
+            assert_eq!(
+                unsafe { libc::write(fd.as_raw_fd(), (&byte as *const u8).cast(), 1) },
+                1
+            );
+        }
+
+        #[test]
+        fn reader_poll_kernel_idle_blocks_and_timeout_does_not_consume_data() {
+            let (data, writer) = pipe();
+            let (shutdown, _keep_open) = pipe();
+            let start = Instant::now();
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 50).unwrap(),
+                ReaderPoll::Timeout
+            ));
+            assert!(
+                start.elapsed() >= Duration::from_millis(40),
+                "idle poll must block"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "idle wait exceeded budget tolerance"
+            );
+            write_byte(&writer);
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
+                ReaderPoll::Data
+            ));
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe { libc::read(data.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+                1
+            );
+            assert_eq!(byte, b'x');
+            drop(writer);
+            assert!(
+                matches!(
+                    Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
+                    ReaderPoll::Data
+                ),
+                "HUP remains readable EOF, not timeout/shutdown"
+            );
+            assert_eq!(
+                unsafe { libc::read(data.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+                0
+            );
+        }
+
+        #[test]
+        fn reader_poll_kernel_finite_and_infinite_waits_are_cancellable() {
+            for timeout in [5000, -1] {
+                let (data, _writer) = pipe();
+                let (shutdown, close_to_cancel) = pipe();
+                std::thread::scope(|scope| {
+                    let cancel = scope.spawn(move || {
+                        std::thread::sleep(Duration::from_millis(20));
+                        drop(close_to_cancel);
+                    });
+                    let start = Instant::now();
+                    assert!(matches!(
+                        Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), timeout)
+                            .unwrap(),
+                        ReaderPoll::Shutdown
+                    ));
+                    assert!(start.elapsed() < Duration::from_secs(2));
+                    cancel.join().unwrap();
+                });
+            }
+        }
+
+        #[test]
+        fn reader_poll_kernel_shutdown_wins_simultaneous_readiness() {
+            let (data, writer) = pipe();
+            let (shutdown, cancel) = pipe();
+            write_byte(&writer);
+            write_byte(&cancel);
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
+                ReaderPoll::Shutdown
+            ));
+            drop(cancel);
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(data.as_raw_fd(), shutdown.as_raw_fd(), 0).unwrap(),
+                ReaderPoll::Shutdown
+            ));
+        }
+
+        #[test]
+        fn reader_poll_kernel_invalid_fd_is_shutdown() {
+            let (shutdown, _writer) = pipe();
+            // F_DUPFD cannot allocate at RLIMIT_NOFILE; using the limit itself
+            // is an invalid positive fd without racing descriptor reuse.
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                0
+            );
+            let limit = unsafe { limit.assume_init() }.rlim_cur;
+            let invalid = i32::try_from(limit).unwrap_or(i32::MAX);
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(invalid, shutdown.as_raw_fd(), 0).unwrap(),
+                ReaderPoll::Shutdown
+            ));
+        }
+
+        #[test]
+        fn reader_poll_kernel_real_pty_data_and_hangup_remain_data() {
+            let (mut master, mut slave) = (-1, -1);
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            // SAFETY: successful openpty transfers ownership of these descriptors.
+            let (master, slave) =
+                unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+            // Avoid retaining the slave across unrelated concurrent execs,
+            // which would postpone the hangup this test is about to observe.
+            for fd in [&master, &slave] {
+                let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+                assert!(flags >= 0);
+                assert_eq!(
+                    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            let (shutdown, _keep_open) = pipe();
+            write_byte(&slave);
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(master.as_raw_fd(), shutdown.as_raw_fd(), 1000).unwrap(),
+                ReaderPoll::Data
+            ));
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe { libc::read(master.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+                1
+            );
+            assert_eq!(byte, b'x');
+            drop(slave);
+            assert!(matches!(
+                Pty::wait_fd_or_shutdown(master.as_raw_fd(), shutdown.as_raw_fd(), 1000).unwrap(),
+                ReaderPoll::Data
+            ));
+        }
     }
 
     #[cfg(test)]
