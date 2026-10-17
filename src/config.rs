@@ -233,6 +233,11 @@ pub struct Config {
     #[serde(default = "default_font_size")]
     pub font_size: f32,
 
+    /// Top bar and sidebar share this size. Missing legacy values are resolved
+    /// once during normalization, before either group can be edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_font_size: Option<f32>,
+
     #[serde(default = "default_font_family")]
     pub font_family: String,
 
@@ -672,6 +677,7 @@ impl Default for Config {
             experimental_task_sidebar: false,
             preferred_agent_provider: default_preferred_agent_provider(),
             font_size: default_font_size(),
+            chrome_font_size: Some(default_font_size()),
             font_family: default_font_family(),
             font_weight: default_font_weight(),
             font_sharpness: default_font_sharpness(),
@@ -742,6 +748,9 @@ impl Config {
 
     pub(crate) fn normalized(mut self) -> Self {
         self.font_size = Self::clamp_font_size(self.font_size);
+        self.chrome_font_size = Some(Self::clamp_font_size(
+            self.chrome_font_size.unwrap_or(self.font_size),
+        ));
         self.line_spacing = Self::clamp_line_spacing(self.line_spacing);
         self.padding = Self::clamp_padding(self.padding);
         self.scrollback_lines = Self::clamp_scrollback_lines(self.scrollback_lines);
@@ -997,6 +1006,17 @@ impl Config {
     }
 
     // 配置值约束方法
+    pub fn effective_chrome_font_size(&self) -> f32 {
+        Self::clamp_font_size(self.chrome_font_size.unwrap_or(self.font_size))
+    }
+
+    /// Freeze the legacy fallback before changing the content size, including
+    /// callers constructing Config directly instead of loading TOML.
+    pub fn set_content_font_size(&mut self, size: f32) {
+        self.chrome_font_size = Some(self.effective_chrome_font_size());
+        self.font_size = Self::clamp_font_size(size);
+    }
+
     pub fn clamp_font_size(size: f32) -> f32 {
         finite_clamp(size, default_font_size(), 8.0, 72.0)
     }
@@ -1277,6 +1297,53 @@ pub fn create_default_config() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_font_groups_split_before_first_edit_and_survive_reload() {
+        for edit_chrome in [false, true] {
+            let mut config = super::Config::from_toml("font_size = 23.0\n").unwrap();
+            assert_eq!(config.effective_chrome_font_size(), 23.0);
+            if edit_chrome {
+                config.chrome_font_size = Some(31.0);
+            } else {
+                config.set_content_font_size(31.0);
+            }
+            let saved = toml::to_string(&config).unwrap();
+            let reloaded = super::Config::from_toml(&saved).unwrap();
+            assert_eq!(reloaded.font_size, if edit_chrome { 23.0 } else { 31.0 });
+            assert_eq!(
+                reloaded.effective_chrome_font_size(),
+                if edit_chrome { 31.0 } else { 23.0 }
+            );
+        }
+    }
+
+    #[test]
+    fn font_groups_clamp_independently_and_direct_legacy_setter_freezes_fallback() {
+        let mut config = super::Config {
+            font_size: 27.0,
+            chrome_font_size: None,
+            ..super::Config::default()
+        };
+        config.set_content_font_size(1000.0);
+        assert_eq!(config.font_size, 72.0);
+        assert_eq!(config.chrome_font_size, Some(27.0));
+        config.set_content_font_size(-1.0);
+        assert_eq!(config.font_size, 8.0);
+        assert_eq!(config.chrome_font_size, Some(27.0));
+        for (input, expected) in [
+            ("font_size = 21.0\nchrome_font_size = 1000.0", 72.0),
+            ("font_size = 21.0\nchrome_font_size = -1.0", 8.0),
+            (
+                "font_size = 21.0\nchrome_font_size = nan",
+                super::default_font_size(),
+            ),
+        ] {
+            let parsed = super::Config::from_toml(input).unwrap();
+            assert_eq!(parsed.font_size, 21.0);
+            assert_eq!(parsed.effective_chrome_font_size(), expected);
+        }
+    }
+
     use super::*;
 
     fn write_private(path: &std::path::Path, contents: impl AsRef<[u8]>) {

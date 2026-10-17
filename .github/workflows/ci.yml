@@ -66,6 +66,11 @@ jobs:
       - name: Check Files cancellation ownership
         run: python3 scripts/test-sidebar-cancellation.py
 
+      - name: Check font group routing and reload
+        run: |
+          python3 scripts/test-font-sync.py
+          python3 scripts/test-font-groups.py
+
   shell:
     name: Installer scripts
     runs-on: ubuntu-24.04

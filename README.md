@@ -349,7 +349,7 @@ install -Dm755 target/release/frost "$HOME/.local/bin/frost"
 | 文件/标签侧栏 | `Ctrl+\`（打开 Files 时侧栏获得键盘焦点；Esc 交还终端） |
 | Shell Agent | `Ctrl+Alt+G` |
 | 设置 | `Ctrl+Shift+O` |
-| 临时放大 / 缩小 / 恢复配置字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| 主内容放大 / 缩小 / 恢复默认字号 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
 | 窗口透明度增 / 减 | `Ctrl+Alt+=` / `Ctrl+Alt+-`（写回配置 `opacity`，设置面板也有滑块） |
 
 Block mode 的命令首行支持普通单击；`Shift+单击` 可从卡片任意行选择连续范围，
@@ -758,7 +758,9 @@ pane 头部显示 `■ exited`，键盘与粘贴输入不再写入已死的 PTY�
 也不会进入会话快照，重启后不会恢复成恰好落在任务 worktree 里的普通 shell。
 
 
-`Ctrl+=`、`Ctrl+-` 和 `Ctrl+滚轮` 只调整当前运行时字号，不再改写配置；`Ctrl+0` 回到 `font_size`。`ui_scale` 会统一缩放标签栏、状态栏、设置面板和命中区域。设置面板中的持久修改仍会自动保存。
+字号分成两组：顶部栏与侧边栏共用 `chrome_font_size`，主内容（Block / Chat / VTE、分屏标题与底部状态栏）使用 `font_size`。`Ctrl+滚轮` 按鼠标实际所在区域只调整对应组，并自动保存；普通滚轮保持原来的滚动行为。弹层打开时暂停区域字号缩放，避免误改背后的界面。`Ctrl+=`、`Ctrl+-` 只调整主内容，`Ctrl+0` 将主内容恢复默认字号。设置面板可分别调整两组，范围均为 8–72。
+
+旧配置未设置 `chrome_font_size` 时首次加载继承原 `font_size`，保留原外观；之后任一组的修改和重启不会改变另一组。`ui_scale` 仍统一缩放整个界面和命中区域。
 
 设置中的 **Compact Block Spacing** 与 `block_compact` 是同一开关，并会立即更新所有当前 pane。普通模式在已确认独占行的相邻 Block 之间加入一行展示留白；Compact 移除这行留白并收紧卡片内缩与圆角。留白只属于展示投影，不进入复制、搜索、鼠标上报或原始输出，也不改变 PTY 行列和 OSC 133 原始区域坐标。滚动与折叠仍锚定原始内容；全屏应用和非 Block 模式不加留白。
 

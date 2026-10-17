@@ -27,17 +27,22 @@ for name in ['adjust_font_size', 'reset_font_size']:
 apply = function(main, 'apply_config')
 assert 'self.effective_font_size()' in apply and 'self.relayout()' in apply
 assert 'self.pane_header_height()' in function(main, 'relayout')
-for name in ['tab_bar', 'top_bar_with_close', 'sidebar_files_view', 'sidebar_tabs_view',
-             'sidebar_render_item', 'pane_header', 'status_bar', 'config_panel', 'agent_panel']:
+for name in ['pane_header', 'status_bar', 'config_panel', 'agent_panel']:
     # Generic functions have lifetimes before their parentheses.
     source = re.split(r'fn ' + name + r'(?=[(<])', main, maxsplit=1)[1].split('\n    fn ', 1)[0]
     assert 'self.effective_font_size()' in source, name
-for size in ['tab_bar_height', 'status_bar_height', 'pane_header_height', 'sidebar_row_height']:
+for name in ['tab_bar', 'top_bar_with_close', 'sidebar_view', 'sidebar_files_view',
+             'sidebar_tabs_view', 'sidebar_render_item', 'sidebar_tasks_view', 'task_card',
+             'pane_to_tab_drop_hint', 'tab_bar_height', 'sidebar_row_height']:
+    source = re.split(r'fn ' + name + r'(?=[(<])', main, maxsplit=1)[1].split('\n    fn ', 1)[0]
+    assert 'self.chrome_font_size()' in source, name
+    assert 'self.effective_font_size()' not in source, name
+for size in ['status_bar_height', 'pane_header_height']:
     assert 'self.effective_font_size()' in function(main, size), size
 assert main.count('self.sidebar_row_height(),') >= 2
 assert 'self.sidebar_row_height() + sidebar::SIDEBAR_TREE_ROW_GAP' in main
 assert 'self.effective_font_size()' in function(main, 'term_height')
-assert 'chrome_height(font_size, bottom_bar)' in function(main, 'terminal_height_after_chrome')
+assert 'chrome_height(font_size, chrome_font_size, bottom_bar)' in function(main, 'terminal_height_after_chrome')
 
 terminal = (ROOT / 'src/terminal_view.rs').read_text()
 # The only reduced scales left in native chrome belong to the status icon,
