@@ -392,6 +392,107 @@ impl SearchState {
     }
 }
 
+/// Per-query scratch only: no text or cell cache survives a search. Between
+/// rows, retain at most 64 KiB of text and 64 KiB of column spans. A larger
+/// row is processed normally, then its oversized buffers are released before
+/// the next row (or when this search returns). Compressed rows are limited to
+/// u16::MAX cells. Budget-eligible compressed rows avoid a full cell vector;
+/// oversized rows retain the original bulk decode/search path.
+#[derive(Default)]
+struct SearchScratch {
+    text: String,
+    columns: Vec<(usize, usize)>,
+    meaningful_text_len: usize,
+    meaningful_columns_len: usize,
+}
+
+// Observe actual capacities without a global allocator or cross-test interference.
+// Only the row-boundary regression enables this thread-local test hook.
+#[cfg(test)]
+thread_local! {
+    static OBSERVED_SEARCH_SCRATCH: std::cell::Cell<Option<(usize, usize)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+impl SearchScratch {
+    const MAX_TEXT_CAPACITY: usize = 64 * 1024;
+    const MAX_COLUMN_CAPACITY: usize = (64 * 1024) / std::mem::size_of::<(usize, usize)>();
+
+    #[cfg(test)]
+    fn observe_capacities(&self) {
+        OBSERVED_SEARCH_SCRATCH.with(|observed| {
+            if observed.get().is_some() {
+                observed.set(Some((self.text.capacity(), self.columns.capacity())));
+            }
+        });
+    }
+
+    fn release_oversized(&mut self) {
+        if self.text.capacity() > Self::MAX_TEXT_CAPACITY {
+            self.text = String::new();
+        }
+        if self.columns.capacity() > Self::MAX_COLUMN_CAPACITY {
+            self.columns = Vec::new();
+        }
+        #[cfg(test)]
+        self.observe_capacities();
+    }
+
+    fn clear(&mut self) {
+        self.release_oversized();
+        self.text.clear();
+        self.columns.clear();
+        self.meaningful_text_len = 0;
+        self.meaningful_columns_len = 0;
+    }
+
+    #[inline]
+    fn push(&mut self, column: usize, cell: TerminalCell, fold_case: bool) {
+        if !cell.flags.wide_continuation() {
+            let end = column + usize::from(cell.flags.wide()) + 1;
+            if fold_case && !cell.character.is_ascii() {
+                for ch in cell.character.to_lowercase() {
+                    self.text.push(ch);
+                    self.columns.push((column, end));
+                }
+            } else {
+                self.text.push(if fold_case {
+                    cell.character.to_ascii_lowercase()
+                } else {
+                    cell.character
+                });
+                self.columns.push((column, end));
+            }
+        }
+        // Keep exactly line_text_and_columns' trim policy. In particular,
+        // style-only and hyperlink-only trailing spaces remain unsearchable.
+        if cell.character != ' '
+            || cell.background != Color::Default
+            || cell.foreground != Color::Default
+            || cell.flags.wide()
+            || cell.flags.wide_continuation()
+        {
+            self.meaningful_text_len = self.text.len();
+            self.meaningful_columns_len = self.columns.len();
+        }
+    }
+
+    fn scrollback(&mut self, line: &crate::terminal::ScrollbackLine, fold_case: bool) {
+        self.clear();
+        // Reserve once even for an oversized row whose buffers were released.
+        // Unicode lowercase expansions can still grow the span vector.
+        let columns = line.search_column_count();
+        self.text.reserve(columns);
+        self.columns.reserve(columns);
+        line.visit_search_cells(|column, cell| self.push(column, cell, fold_case));
+        self.text.truncate(self.meaningful_text_len);
+        self.columns.truncate(self.meaningful_columns_len);
+        #[cfg(test)]
+        self.observe_capacities();
+    }
+}
+
 /// 搜索引擎（用于在可见网格中进行搜索）
 pub struct SearchEngine;
 
@@ -417,7 +518,8 @@ impl SearchEngine {
 
     /// Search an arbitrary terminal buffer without first cloning every row.
     /// Plain scrollback rows arrive as borrowed text with an identity
-    /// character→column map; everything else arrives as cells. Match row
+    /// character→column map; budget-eligible styled history is streamed, wider
+    /// history uses bulk decoding, and live rows borrow their cells. Match row
     /// indices follow iterator order.
     pub fn search_lines<'a>(
         lines: impl IntoIterator<Item = SearchLine<'a>>,
@@ -462,6 +564,7 @@ impl SearchEngine {
         };
 
         let query_chars = search_query.chars().count();
+        let mut scratch = SearchScratch::default();
         'lines: for (line_idx, line) in lines.into_iter().enumerate() {
             let hit_cap = match line {
                 SearchLine::Text(text) if case_sensitive => Self::collect_plaintext_line(
@@ -496,6 +599,17 @@ impl SearchEngine {
                         &mut matches,
                     )
                 }
+                SearchLine::Scrollback(line) => {
+                    scratch.scrollback(line, !case_sensitive);
+                    Self::collect_plaintext_line(
+                        line_idx,
+                        &scratch.text,
+                        &search_query,
+                        query_chars,
+                        |char_index| scratch.columns.get(char_index).copied(),
+                        &mut matches,
+                    )
+                }
                 SearchLine::Cells(cells) => {
                     let (search_line, columns) =
                         Self::line_text_and_columns(&cells, !case_sensitive);
@@ -509,6 +623,8 @@ impl SearchEngine {
                     )
                 }
             };
+            // Release large rows even when the next row is plain or live.
+            scratch.release_oversized();
             if hit_cap {
                 truncated = true;
                 break 'lines;
@@ -599,6 +715,7 @@ impl SearchEngine {
         };
         let mut truncated = false;
 
+        let mut scratch = SearchScratch::default();
         'lines: for (line_idx, line) in lines.into_iter().enumerate() {
             let hit_cap = match line {
                 SearchLine::Text(text) => Self::collect_regex_line(
@@ -608,6 +725,16 @@ impl SearchEngine {
                     Self::identity_span,
                     &mut matches,
                 ),
+                SearchLine::Scrollback(line) => {
+                    scratch.scrollback(line, false);
+                    Self::collect_regex_line(
+                        line_idx,
+                        &scratch.text,
+                        regex,
+                        |char_index| scratch.columns.get(char_index).copied(),
+                        &mut matches,
+                    )
+                }
                 SearchLine::Cells(cells) => {
                     let (line_str, columns) = Self::line_text_and_columns(&cells, false);
                     Self::collect_regex_line(
@@ -619,6 +746,8 @@ impl SearchEngine {
                     )
                 }
             };
+            // Release large rows even when the next row is plain or live.
+            scratch.release_oversized();
             if hit_cap {
                 truncated = true;
                 break 'lines;
@@ -1452,5 +1581,383 @@ mod tests {
             .error_message
             .as_deref()
             .is_some_and(|message| message.contains("not restored")));
+    }
+    #[test]
+    fn streamed_scrollback_matches_decompressed_unicode_search() {
+        use crate::terminal::ScrollbackLine;
+        let mut seed = 0x5eed_f05_u64;
+        let alphabet = [
+            ' ', 'a', 'A', 'İ', 'Σ', 'ß', '中', '🦀', '\u{301}', 'i', 'x',
+        ];
+        let mut rows = Vec::new();
+        for n in 0..512 {
+            let mut row = Vec::new();
+            for i in 0..(n % 97) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let mut cell = TerminalCell {
+                    character: alphabet[(seed as usize) % alphabet.len()],
+                    foreground: if i % 3 == 0 {
+                        Color::Rgb(1, 2, 3)
+                    } else {
+                        Color::Default
+                    },
+                    background: if i % 7 == 0 {
+                        Color::Indexed(5)
+                    } else {
+                        Color::Default
+                    },
+                    hyperlink: if i % 2 == 0 { 7 } else { 0 },
+                    ..Default::default()
+                };
+                cell.flags.set_bold(i % 2 == 0);
+                cell.flags.set_blink(i % 5 == 0);
+                cell.flags
+                    .set_wide(cell.character == '中' || cell.character == '🦀');
+                row.push(cell);
+                if cell.flags.wide() {
+                    let mut continuation = TerminalCell::default();
+                    continuation.flags.set_wide_continuation(true);
+                    row.push(continuation);
+                }
+            }
+            // Hyperlink/style-only spaces are retained by compression but
+            // trimmed by search, unlike colored spaces and continuations.
+            let mut trailing = TerminalCell {
+                hyperlink: 8,
+                ..Default::default()
+            };
+            trailing.flags.set_bold(true);
+            row.extend([trailing; 7]);
+            row.extend([TerminalCell::default(); 13]);
+            rows.push(ScrollbackLine::compress(&row, n % 2 == 0));
+        }
+        let decoded: Vec<_> = rows.iter().map(ScrollbackLine::decompress).collect();
+        for regex in [false, true] {
+            for case in [false, true] {
+                for query in [
+                    "a", "A", " ", "  ", "İ", "i", "i\u{307}", "Σ", "σ", "ß", "中", "🦀",
+                    "\u{301}", "aa", "x ", "[a中]+", ".", "^$", "absent",
+                ] {
+                    let expected = SearchEngine::search_lines(
+                        decoded
+                            .iter()
+                            .map(|row| SearchLine::Cells(Cow::Borrowed(row))),
+                        query,
+                        regex,
+                        case,
+                        &mut None,
+                    );
+                    let actual = SearchEngine::search_lines(
+                        rows.iter().map(ScrollbackLine::search_text),
+                        query,
+                        regex,
+                        case,
+                        &mut None,
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "query={query:?}, regex={regex}, case={case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_scratch_is_released_before_plain_or_live_row_is_requested() {
+        use crate::terminal::ScrollbackLine;
+        // Always disable the hook on exit, including assertion unwinding.
+        struct ObservationGuard;
+        impl Drop for ObservationGuard {
+            fn drop(&mut self) {
+                super::OBSERVED_SEARCH_SCRATCH.with(|observed| observed.set(None));
+            }
+        }
+        let _guard = ObservationGuard;
+        let live = [TerminalCell::default(); 10];
+        let cell = TerminalCell {
+            character: 'İ',
+            foreground: Color::Red,
+            ..Default::default()
+        };
+        // The 4096-column row follows normal routing and expands its spans
+        // during lowercase literal search. Explicit Scrollback input also
+        // tests the regex loop's retention contract for an oversized row;
+        // normal routing currently sends such wide rows to the bulk fallback.
+        for (use_regex, case_sensitive, cols, normal_routing) in [
+            (false, false, 4096, true),
+            (false, true, 65535, false),
+            (true, false, 65535, false),
+            (true, true, 65535, false),
+        ] {
+            let row = ScrollbackLine::compress(&vec![cell; cols], false);
+            let mut preflight = super::SearchScratch::default();
+            preflight.scrollback(&row, !use_regex && !case_sensitive);
+            assert!(preflight.columns.capacity() > super::SearchScratch::MAX_COLUMN_CAPACITY);
+            drop(preflight);
+            for live_first in [false, true] {
+                super::OBSERVED_SEARCH_SCRATCH.with(|observed| observed.set(Some((0, 0))));
+                let first = if normal_routing {
+                    let line = row.search_text();
+                    assert!(matches!(line, SearchLine::Scrollback(_)));
+                    line
+                } else {
+                    SearchLine::Scrollback(&row)
+                };
+                let plain = SearchLine::Text("plain");
+                let cells = SearchLine::Cells(Cow::Borrowed(&live));
+                let tail = if live_first {
+                    [cells, plain]
+                } else {
+                    [plain, cells]
+                };
+                let mut requested = 0;
+                let rows = std::iter::once(first).chain(tail).map(|line| {
+                    if requested > 0 {
+                        let (text, columns) = super::OBSERVED_SEARCH_SCRATCH
+                            .with(|observed| observed.get().unwrap());
+                        assert!(
+                            text <= super::SearchScratch::MAX_TEXT_CAPACITY
+                                && columns <= super::SearchScratch::MAX_COLUMN_CAPACITY,
+                            "oversized scratch before row {requested}: text={text}, columns={columns}, regex={use_regex}, case={case_sensitive}, live_first={live_first}"
+                        );
+                    }
+                    requested += 1;
+                    line
+                });
+                let (matches, error) = SearchEngine::search_lines(
+                    rows,
+                    "absent",
+                    use_regex,
+                    case_sensitive,
+                    &mut None,
+                );
+                assert!(matches.is_empty());
+                assert!(error.is_none());
+                assert_eq!(requested, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_scrollback_scratch_releases_oversized_buffers() {
+        use crate::terminal::ScrollbackLine;
+        let mut scratch = super::SearchScratch::default();
+        let cell = TerminalCell {
+            character: 'İ',
+            foreground: Color::Red,
+            ..Default::default()
+        };
+        let longest = ScrollbackLine::compress(&vec![cell; usize::from(u16::MAX)], false);
+        scratch.scrollback(&longest, true);
+        assert_eq!(scratch.columns.len(), 2 * usize::from(u16::MAX));
+        assert_eq!(scratch.columns.last().copied(), Some((65534, 65535)));
+        assert!(scratch.text.capacity() > super::SearchScratch::MAX_TEXT_CAPACITY);
+        assert!(scratch.columns.capacity() > super::SearchScratch::MAX_COLUMN_CAPACITY);
+        scratch.release_oversized();
+        assert_eq!(scratch.text.capacity(), 0);
+        assert_eq!(scratch.columns.capacity(), 0);
+        let short = ScrollbackLine::compress(&[cell], false);
+        scratch.scrollback(&short, true);
+        assert_eq!(scratch.text, "i\u{307}");
+        assert_eq!(scratch.columns, [(0, 1), (0, 1)]);
+        assert!(scratch.text.capacity() <= super::SearchScratch::MAX_TEXT_CAPACITY);
+        assert!(scratch.columns.capacity() <= super::SearchScratch::MAX_COLUMN_CAPACITY);
+        let (text_capacity, column_capacity) =
+            (scratch.text.capacity(), scratch.columns.capacity());
+        for _ in 0..100 {
+            scratch.scrollback(&short, false);
+            assert_eq!(scratch.text, "İ");
+            assert_eq!(scratch.columns, [(0, 1)]);
+            assert_eq!(
+                (scratch.text.capacity(), scratch.columns.capacity()),
+                (text_capacity, column_capacity)
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_scrollback_trims_style_links_but_preserves_color_and_wide_spaces() {
+        use crate::terminal::ScrollbackLine;
+        for kind in 0..5 {
+            let mut cell = TerminalCell::default();
+            match kind {
+                0 => cell.flags.set_bold(true),
+                1 => cell.hyperlink = 7,
+                2 => cell.foreground = Color::Blue,
+                3 => cell.background = Color::Blue,
+                _ => cell.flags.set_wide_continuation(true),
+            }
+            let cells = [
+                TerminalCell {
+                    character: 'x',
+                    ..Default::default()
+                },
+                TerminalCell::default(),
+                cell,
+                TerminalCell::default(),
+            ];
+            let row = ScrollbackLine::compress(&cells, false);
+            for fold in [false, true] {
+                let expected = SearchEngine::line_text_and_columns(&row.decompress(), fold);
+                let mut scratch = super::SearchScratch::default();
+                scratch.scrollback(&row, fold);
+                assert_eq!((scratch.text, scratch.columns), expected, "kind={kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_scrollback_rle_cap_and_row_replacement_parity() {
+        use crate::terminal::ScrollbackLine;
+        let cell = TerminalCell {
+            character: 'a',
+            foreground: Color::Red,
+            hyperlink: 9,
+            ..Default::default()
+        };
+        let long = ScrollbackLine::compress(&vec![cell; 600], true);
+        let rows = vec![long; 40];
+        let expected: Vec<_> = rows.iter().map(ScrollbackLine::decompress).collect();
+        for regex in [false, true] {
+            let actual = SearchEngine::search_lines(
+                rows.iter().map(ScrollbackLine::search_text),
+                "a",
+                regex,
+                true,
+                &mut None,
+            );
+            let oracle = SearchEngine::search_lines(
+                expected
+                    .iter()
+                    .map(|row| SearchLine::Cells(Cow::Borrowed(row))),
+                "a",
+                regex,
+                true,
+                &mut None,
+            );
+            assert_eq!(actual, oracle);
+            assert_eq!(actual.0.len(), 20_000);
+            assert_eq!(
+                actual.0.last().map(|m| (m.line, m.col_start, m.col_end)),
+                Some((33, 199, 200))
+            );
+            assert!(actual.1.is_some());
+        }
+        // No retained text/index can outlive replacement or reordering.
+        let changed = ScrollbackLine::compress(
+            &[TerminalCell {
+                character: 'z',
+                ..cell
+            }],
+            false,
+        );
+        let rows = [changed.clone(), rows[0].clone(), changed];
+        let actual = SearchEngine::search_lines(
+            rows.iter().map(ScrollbackLine::search_text),
+            "z",
+            false,
+            true,
+            &mut None,
+        );
+        assert_eq!(
+            actual
+                .0
+                .iter()
+                .map(|m| (m.line, m.col_start, m.col_end))
+                .collect::<Vec<_>>(),
+            [(0, 0, 1), (2, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn streamed_scrollback_mixed_plain_live_and_oversized_rows_match() {
+        use crate::terminal::ScrollbackLine;
+        let cell = TerminalCell {
+            character: 'İ',
+            foreground: Color::Red,
+            ..Default::default()
+        };
+        let long = ScrollbackLine::compress(&vec![cell; usize::from(u16::MAX)], false);
+        let live = vec![
+            TerminalCell {
+                character: 'x',
+                ..Default::default()
+            };
+            10
+        ];
+        for regex in [false, true] {
+            for case in [false, true] {
+                let actual = SearchEngine::search_lines(
+                    std::iter::once(long.search_text()).chain((0..100).flat_map(|_| {
+                        [
+                            SearchLine::Text("a x"),
+                            SearchLine::Cells(Cow::Borrowed(&live)),
+                        ]
+                    })),
+                    "x",
+                    regex,
+                    case,
+                    &mut None,
+                );
+                let decoded = long.decompress();
+                let expected = SearchEngine::search_lines(
+                    std::iter::once(SearchLine::Cells(Cow::Borrowed(&decoded))).chain(
+                        (0..100).flat_map(|_| {
+                            [
+                                SearchLine::Text("a x"),
+                                SearchLine::Cells(Cow::Borrowed(&live)),
+                            ]
+                        }),
+                    ),
+                    "x",
+                    regex,
+                    case,
+                    &mut None,
+                );
+                assert_eq!(actual, expected);
+                assert_eq!(actual.0.len(), 1100);
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_scrollback_width_budget_preserves_bulk_fallback() {
+        use crate::terminal::ScrollbackLine;
+        let cell = TerminalCell {
+            character: 'İ',
+            foreground: Color::Red,
+            ..Default::default()
+        };
+        for cols in [4095, 4096, 4097, 8192, 65535] {
+            let row = ScrollbackLine::compress(&vec![cell; cols], false);
+            if cols <= 4096 {
+                assert!(matches!(row.search_text(), SearchLine::Scrollback(_)));
+            } else {
+                assert!(matches!(row.search_text(), SearchLine::Cells(_)));
+            }
+            for regex in [false, true] {
+                for case in [false, true] {
+                    let decoded = row.decompress();
+                    let expected = SearchEngine::search_lines(
+                        [SearchLine::Cells(Cow::Borrowed(&decoded))],
+                        "i",
+                        regex,
+                        case,
+                        &mut None,
+                    );
+                    let actual = SearchEngine::search_lines(
+                        [row.search_text()],
+                        "i",
+                        regex,
+                        case,
+                        &mut None,
+                    );
+                    assert_eq!(actual, expected, "cols={cols}, regex={regex}, case={case}");
+                }
+            }
+        }
     }
 }

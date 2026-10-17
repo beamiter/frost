@@ -645,10 +645,13 @@ enum CompressedLineData {
 
 /// One searchable buffer row: either borrowed narrow text with an identity
 /// character→column map (the common all-default-attributes scrollback row),
-/// or full cell data that still needs the wide/continuation-aware mapping.
+/// borrowed compressed history, or live cell data. The latter two preserve
+/// the wide/continuation-aware column mapping.
 pub enum SearchLine<'a> {
     Text(&'a str),
     Cells(Cow<'a, [TerminalCell]>),
+    /// Borrowed compressed history, streamed into per-query search scratch.
+    Scrollback(&'a ScrollbackLine),
 }
 
 /// Allocation-free geometry needed to plan a projected history document.
@@ -816,11 +819,20 @@ impl ScrollbackLine {
     /// with default attributes by construction, so the character index is
     /// the terminal column and trailing blanks stay unsearchable exactly
     /// like the decompressed path's structural-padding trim. `Encoded` rows
-    /// fall back to decompressing for the wide/continuation-aware mapping.
+    /// within the streaming width budget are borrowed too, then streamed
+    /// with their original cell columns. Oversized rows keep the bulk path.
     pub fn search_text(&self) -> SearchLine<'_> {
         match &self.data {
             CompressedLineData::Plain(text, _) => SearchLine::Text(text),
-            CompressedLineData::Encoded(_) => SearchLine::Cells(Cow::Owned(self.decompress())),
+            // Very wide rows exceed the small scratch retention budget. Keep
+            // their existing bulk decode/search path: streaming saves memory
+            // churn at terminal widths but can cost latency on oversized rows.
+            // 4096 single-column spans fit the 64 KiB map budget on 64-bit;
+            // lowercase expansions may exceed it and are released after use.
+            CompressedLineData::Encoded(_) if self.cols > 4096 => {
+                SearchLine::Cells(Cow::Owned(self.decompress()))
+            }
+            CompressedLineData::Encoded(_) => SearchLine::Scrollback(self),
         }
     }
 
@@ -1062,6 +1074,83 @@ impl ScrollbackLine {
         // Pad to cols
         cells.resize(cols, TerminalCell::default());
         cells
+    }
+
+    /// Upper bound for search's initial per-row scratch reservation.
+    pub(crate) fn search_column_count(&self) -> usize {
+        usize::from(self.cols)
+    }
+
+    /// Visit retained cells without allocating a decompressed row. Implicit
+    /// trailing default blanks cannot affect searchable text and are omitted.
+    pub(crate) fn visit_search_cells(&self, mut visit: impl FnMut(usize, TerminalCell)) {
+        match &self.data {
+            CompressedLineData::Plain(text, _) => {
+                for (column, character) in text.chars().enumerate() {
+                    visit(
+                        column,
+                        TerminalCell {
+                            character,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            CompressedLineData::Encoded(data) => {
+                Self::visit_encoded_cells(data, usize::from(self.cols), visit);
+            }
+        }
+    }
+
+    // Keep this storage-format reader in parity with decode_cells. Unlike the
+    // bulk path, it emits only the retained prefix and allocates no cell vector.
+    // Differential tests compare it with the pinned pre-streaming decoder.
+    fn visit_encoded_cells(data: &[u8], cols: usize, mut visit: impl FnMut(usize, TerminalCell)) {
+        let mut column = 0;
+        let mut pos = 0;
+        while pos < data.len() && column < cols {
+            let ch_len = data[pos] as usize;
+            pos += 1;
+            if pos + ch_len > data.len() {
+                break;
+            }
+            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
+                .ok()
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ');
+            pos += ch_len;
+
+            let fg = Self::decode_color(data, &mut pos);
+            let bg = Self::decode_color(data, &mut pos);
+            let f = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let extra_flags = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let hyperlink = u16::from_le_bytes([
+                data.get(pos).copied().unwrap_or(0),
+                data.get(pos + 1).copied().unwrap_or(0),
+            ]);
+            pos += 2;
+            let run = data.get(pos).copied().unwrap_or(1).max(1);
+            pos += 1;
+
+            let mut flags = Self::decode_flags(f);
+            flags.set_wide(extra_flags & 1 != 0);
+            flags.set_wide_continuation(extra_flags & 2 != 0);
+            flags.set_blink(extra_flags & 4 != 0);
+
+            let cell = TerminalCell {
+                character: ch,
+                foreground: fg,
+                background: bg,
+                flags,
+                hyperlink,
+            };
+            for _ in 0..usize::from(run).min(cols - column) {
+                visit(column, cell);
+                column += 1;
+            }
+        }
     }
 }
 
@@ -20064,6 +20153,11 @@ mod tests {
         match line {
             super::SearchLine::Text(text) => text.to_string(),
             super::SearchLine::Cells(cells) => cells.iter().map(|cell| cell.character).collect(),
+            super::SearchLine::Scrollback(line) => line
+                .decompress()
+                .iter()
+                .map(|cell| cell.character)
+                .collect(),
         }
     }
 
@@ -23074,5 +23168,112 @@ mod block_spacing_tests {
                 .is_none());
         }
         PROJECTION_PLAN_BUILD_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+}
+
+// Regression oracle pinned to fb477d1c; deliberately independent of the streaming visitor.
+#[cfg(test)]
+impl ScrollbackLine {
+    fn pinned_decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
+        let mut cells = Vec::with_capacity(cols);
+        let mut pos = 0;
+        while pos < data.len() {
+            let ch_len = data[pos] as usize;
+            pos += 1;
+            if pos + ch_len > data.len() {
+                break;
+            }
+            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
+                .ok()
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ');
+            pos += ch_len;
+
+            let fg = Self::decode_color(data, &mut pos);
+            let bg = Self::decode_color(data, &mut pos);
+            let f = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let extra_flags = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let hyperlink = u16::from_le_bytes([
+                data.get(pos).copied().unwrap_or(0),
+                data.get(pos + 1).copied().unwrap_or(0),
+            ]);
+            pos += 2;
+            let run = data.get(pos).copied().unwrap_or(1).max(1);
+            pos += 1;
+
+            let mut flags = Self::decode_flags(f);
+            flags.set_wide(extra_flags & 1 != 0);
+            flags.set_wide_continuation(extra_flags & 2 != 0);
+            flags.set_blink(extra_flags & 4 != 0);
+
+            let cell = TerminalCell {
+                character: ch,
+                foreground: fg,
+                background: bg,
+                flags,
+                hyperlink,
+            };
+            for _ in 0..run {
+                cells.push(cell);
+            }
+        }
+        // Pad to cols
+        cells.resize(cols, TerminalCell::default());
+        cells
+    }
+}
+
+#[cfg(test)]
+mod decoder_parity {
+    use super::*;
+    #[test]
+    fn stored_decoder_rle_boundary_clipping_parity() {
+        let cell = TerminalCell {
+            character: 'İ',
+            foreground: Color::Rgb(1, 2, 3),
+            hyperlink: 65535,
+            ..Default::default()
+        };
+        for n in [0, 1, 254, 255, 256, 510, 511, 600] {
+            let bytes = ScrollbackLine::encode_cells(&vec![cell; n]);
+            for cols in [0, 1, 17, 254, 255, 256, 511, 601] {
+                for length in 0..=bytes.len() {
+                    let mut streamed = Vec::new();
+                    ScrollbackLine::visit_encoded_cells(&bytes[..length], cols, |_, cell| {
+                        streamed.push(cell)
+                    });
+                    streamed.resize(cols, TerminalCell::default());
+                    assert_eq!(
+                        streamed,
+                        ScrollbackLine::pinned_decode_cells(&bytes[..length], cols)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn stored_decoder_matches_pinned_oracle_on_truncation_and_runs() {
+        let mut seed = 0xdefaced_u64;
+        for length in 0..128 {
+            for _ in 0..64 {
+                let mut bytes = Vec::new();
+                for _ in 0..length {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    bytes.push(seed as u8);
+                }
+                for cols in [0, 1, 2, 17, 255, 512] {
+                    let mut streamed = Vec::new();
+                    ScrollbackLine::visit_encoded_cells(&bytes, cols, |_, cell| {
+                        streamed.push(cell)
+                    });
+                    streamed.resize(cols, TerminalCell::default());
+                    assert_eq!(streamed, ScrollbackLine::pinned_decode_cells(&bytes, cols));
+                }
+            }
+        }
     }
 }
