@@ -4259,6 +4259,9 @@ enum Message {
     TaskFinishNative(agent_task::TaskId),
     TaskFollowUpInput(agent_task_ui::TaskFollowUpRef, String),
     TaskFollowUpSend(agent_task_ui::TaskFollowUpRef),
+    TaskRequestDiscardSavedDrafts(std::sync::Arc<()>),
+    TaskCancelDiscardSavedDrafts(std::sync::Arc<()>),
+    TaskDiscardSavedDrafts(std::sync::Arc<()>),
     TaskApprovalDeny(agent_task::TaskId, agent_task::ApprovalId),
     TaskDiffOpen(agent_task::TaskId),
     TaskDiffClose(std::sync::Arc<()>),
@@ -16214,6 +16217,15 @@ impl Frost {
                 }
             }
             Message::AgentLaunch(provider) => self.agent_launch_in_tab(provider),
+            Message::TaskRequestDiscardSavedDrafts(reference) => {
+                self.task_panel.request_discard_saved_drafts(&reference);
+            }
+            Message::TaskCancelDiscardSavedDrafts(reference) => {
+                self.task_panel.cancel_discard_saved_drafts(&reference);
+            }
+            Message::TaskDiscardSavedDrafts(reference) => {
+                self.task_panel.discard_saved_drafts(&reference);
+            }
             Message::TaskFollowUpInput(reference, value) => {
                 if self.task_follow_up_is_current(&reference) {
                     self.task_panel
@@ -16238,7 +16250,7 @@ impl Frost {
                     &text,
                     agent_task_ui::prompt_policy(&self.config),
                 ) {
-                    Ok(()) => self.task_panel.follow_up.clear(),
+                    Ok(()) => self.task_panel.clear_follow_up(),
                     Err(error) => self.push_toast(error.to_string(), ToastKind::Warning),
                 }
             }
@@ -28487,6 +28499,39 @@ impl Frost {
                     .on_press(Message::TaskDashboardClear),
             );
         }
+        if self.task_panel.saved_draft_count() > 0 {
+            if let Some(confirmation) = self.task_panel.draft_discard_confirmation() {
+                body = body.push(
+                    text(format!(
+                        "Permanently discard {} saved drafts? Current draft stays.",
+                        self.task_panel.saved_draft_count()
+                    ))
+                    .size(self.chrome_font_size()),
+                );
+                body = body.push(
+                    row![
+                        button(text("Confirm discard").size(self.chrome_font_size()))
+                            .on_press(Message::TaskDiscardSavedDrafts(confirmation.clone())),
+                        button(text("Cancel").size(self.chrome_font_size()))
+                            .on_press(Message::TaskCancelDiscardSavedDrafts(confirmation)),
+                    ]
+                    .spacing(6),
+                );
+            } else {
+                body = body.push(
+                    button(
+                        text(format!(
+                            "Discard saved drafts ({})",
+                            self.task_panel.saved_draft_count()
+                        ))
+                        .size(self.chrome_font_size()),
+                    )
+                    .on_press(Message::TaskRequestDiscardSavedDrafts(
+                        self.task_panel.draft_cleanup_reference(),
+                    )),
+                );
+            }
+        }
         let selected_hidden = self.task_panel.selected.is_some_and(|id| {
             self.task_manager
                 .get(id)
@@ -28869,6 +28914,11 @@ impl Frost {
                 send = send.on_press(Message::TaskFollowUpSend(reference));
             }
             card = card.push(row![input, send].spacing(6));
+            card = card.push(
+                text(self.task_panel.follow_up_feedback(completed_turns))
+                    .size(self.chrome_font_size())
+                    .style(text::secondary),
+            );
         }
 
         // Review / validation / completion actions once the provider has

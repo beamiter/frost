@@ -159,8 +159,6 @@ pub(crate) fn terminal_session_id(session_id: usize) -> String {
 }
 
 /// A follow-up turn may be sent only when it carries visible text, stays
-/// inside the native byte budget, and the live session has turn headroom.
-/// A follow-up turn may be sent only when it carries visible text, stays
 /// inside the native byte budget, the live session has turn headroom, and the
 /// payload is not a neutralized spoofing paste.
 pub(crate) fn native_follow_up_can_send(text: &str, completed_turns: usize) -> bool {
@@ -210,7 +208,8 @@ pub(crate) fn bound_follow_up(text: impl Into<String>) -> String {
         }
         text.truncate(end);
     }
-    text
+    // Drop spare allocation from a large paste before retaining this draft.
+    text.into_boxed_str().into_string()
 }
 
 /// Fully prepared task registration produced by the background worktree
@@ -436,6 +435,9 @@ pub(crate) struct TaskPanel {
     /// Draft review feedback for the selected task's next native turn.
     pub(crate) follow_up: String,
     follow_up_epoch: Arc<()>,
+    follow_up_notice: Option<&'static str>,
+    draft_discard_confirmation: Option<Arc<()>>,
+    follow_up_drafts: std::collections::HashMap<TaskId, (String, Option<&'static str>)>,
     pub(crate) pending_creation: Option<PendingTaskCreation>,
     /// Failed-block context waiting for an explicit provider choice.
     pub(crate) provider_picker: Option<TaskProviderPicker>,
@@ -454,6 +456,9 @@ impl TaskPanel {
             dashboard_view: crate::agent_task::DashboardView::All,
             follow_up: String::new(),
             follow_up_epoch: Arc::new(()),
+            follow_up_notice: None,
+            draft_discard_confirmation: None,
+            follow_up_drafts: std::collections::HashMap::new(),
             pending_creation: None,
             provider_picker: None,
             diff: crate::agent_task::AgentDiffPanel::new(),
@@ -475,8 +480,26 @@ impl TaskPanel {
 
     pub(crate) fn select(&mut self, task_id: Option<TaskId>) {
         self.close_diff();
+        // Remove the destination before parking the current draft, so moving
+        // between retained drafts never temporarily exceeds the budget.
+        let restored = task_id.and_then(|id| self.follow_up_drafts.remove(&id));
+        if let Some(previous) = self.selected {
+            if !self.follow_up.is_empty() && task_id != self.selected {
+                self.follow_up_drafts.insert(
+                    previous,
+                    (
+                        std::mem::take(&mut self.follow_up),
+                        self.follow_up_notice.take(),
+                    ),
+                );
+            }
+        }
+        if task_id != self.selected {
+            let (draft, notice) = restored.unwrap_or_default();
+            self.follow_up = draft;
+            self.follow_up_notice = notice;
+        }
         self.selected = task_id;
-        self.follow_up.clear();
         self.retire_follow_up();
     }
 
@@ -535,6 +558,7 @@ impl TaskPanel {
     /// Hiding the composer revokes callbacks but keeps its editable draft.
     pub(crate) fn retire_follow_up(&mut self) {
         self.follow_up_epoch = Arc::new(());
+        self.draft_discard_confirmation = None;
     }
 
     pub(crate) fn follow_up_reference(
@@ -590,12 +614,108 @@ impl TaskPanel {
         Some(text)
     }
 
+    pub(crate) fn saved_draft_count(&self) -> usize {
+        self.follow_up_drafts.len()
+    }
+
+    pub(crate) fn draft_cleanup_reference(&self) -> Arc<()> {
+        self.follow_up_epoch.clone()
+    }
+
+    pub(crate) fn request_discard_saved_drafts(&mut self, reference: &Arc<()>) {
+        if Arc::ptr_eq(reference, &self.follow_up_epoch) && !self.follow_up_drafts.is_empty() {
+            self.draft_discard_confirmation = Some(Arc::new(()));
+        }
+    }
+
+    pub(crate) fn draft_discard_confirmation(&self) -> Option<Arc<()>> {
+        self.draft_discard_confirmation.clone()
+    }
+
+    pub(crate) fn cancel_discard_saved_drafts(&mut self, reference: &Arc<()>) {
+        if self
+            .draft_discard_confirmation
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, reference))
+        {
+            self.draft_discard_confirmation = None;
+        }
+    }
+
+    pub(crate) fn discard_saved_drafts(&mut self, reference: &Arc<()>) {
+        if self
+            .draft_discard_confirmation
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, reference))
+        {
+            self.follow_up_drafts.clear();
+            // The selected draft and its truncation/rejection notice are not
+            // part of this explicitly confirmed parked-draft deletion.
+            self.retire_follow_up();
+        }
+    }
+
+    pub(crate) fn clear_follow_up(&mut self) {
+        self.follow_up = String::new();
+        self.follow_up_notice = None;
+    }
+
+    pub(crate) fn follow_up_feedback(&self, completed_turns: usize) -> String {
+        let reason = if self.follow_up.is_empty() && self.follow_up_drafts.len() >= 16 {
+            "Draft limit reached (16 drafts / 256 KiB). Open a saved draft to clear/send it, or discard saved drafts below."
+        } else if completed_turns >= CODEX_APP_SERVER_LIVE_TURN_MAX {
+            "Turn limit reached."
+        } else if let Some(notice) = self.follow_up_notice {
+            notice
+        } else if !native_follow_up_can_send(&self.follow_up, completed_turns) {
+            "Enter visible review feedback to send."
+        } else {
+            "Ready to send."
+        };
+        format!(
+            "{} / {} bytes · {} / {} turns · {}",
+            self.follow_up.len(),
+            NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+            completed_turns,
+            CODEX_APP_SERVER_LIVE_TURN_MAX,
+            reason
+        )
+    }
+
     pub(crate) fn set_follow_up(&mut self, text: impl Into<String>) {
-        let text = bound_follow_up(text);
-        if follow_up_is_unsafe(&text) {
+        let raw = text.into();
+        // Existing drafts remain editable and navigable at capacity; only a
+        // seventeenth draft is refused. No user text is silently evicted.
+        if self.follow_up.is_empty() && self.follow_up_drafts.len() >= 16 && !raw.is_empty() {
+            self.follow_up_notice = Some("Draft limit reached. Input rejected; saved drafts kept.");
             return;
         }
-        self.follow_up = text;
+        // Check the entire paste before bounding it: an unsafe tail must not
+        // disappear at the byte limit and silently turn rejection into sending.
+        if raw.chars().any(|ch| {
+            ch == '\u{fffd}'
+                || (!ch.is_control() && jterm_core::review_input::is_visual_spoofing_character(ch))
+        }) {
+            self.follow_up_notice =
+                Some("Input rejected: invisible or misleading characters. Draft kept.");
+            return;
+        }
+        let clean_bytes: usize = raw
+            .chars()
+            .filter(|ch| matches!(ch, '\n' | '\t') || !ch.is_control())
+            .map(char::len_utf8)
+            .sum();
+        let controls_removed = raw
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'));
+        self.follow_up = bound_follow_up(raw);
+        self.follow_up_notice = if clean_bytes > NATIVE_AGENT_FOLLOW_UP_MAX_BYTES {
+            Some("Input truncated to the byte limit; review before sending.")
+        } else if controls_removed {
+            Some("Terminal control characters removed; review before sending.")
+        } else {
+            None
+        };
     }
 }
 
@@ -1124,7 +1244,7 @@ mod tests {
         let take = send.find("begin_follow_up_send").unwrap();
         let dispatch = send.find("prompt_codex").unwrap();
         let clear = send
-            .find("Ok(()) => self.task_panel.follow_up.clear()")
+            .find("Ok(()) => self.task_panel.clear_follow_up()")
             .unwrap();
         assert!(guard < take && take < dispatch && dispatch < clear);
         let input = source
@@ -1144,6 +1264,191 @@ mod tests {
         assert!(direct_assignment.is_match("self.task_panel.selected = Some(id);"));
         assert!(!direct_assignment.is_match("self.task_panel.selected == Some(id)"));
         assert!(!direct_assignment.is_match(source));
+    }
+
+    #[test]
+    fn follow_up_drafts_and_notices_follow_task_identity() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        panel.set_follow_up("A draft");
+        let stale = panel.follow_up_reference(a, 1);
+        panel.select(Some(b));
+        assert!(panel.follow_up.is_empty());
+        panel.set_follow_up("B\rdraft");
+        assert!(panel.follow_up_feedback(1).contains("removed"));
+        panel.select(Some(a));
+        assert_eq!(panel.follow_up, "A draft");
+        assert!(!panel.follow_up_feedback(1).contains("removed"));
+        assert!(!panel.edit_follow_up(&stale, 1, "stale".into()));
+        assert_eq!(panel.begin_follow_up_send(&stale, 1), None);
+        let send = panel.follow_up_reference(a, 1);
+        assert_eq!(
+            panel.begin_follow_up_send(&send, 1).as_deref(),
+            Some("A draft")
+        );
+        // Failed dispatch preserves the draft but retires the attempt.
+        assert_eq!(panel.begin_follow_up_send(&send, 1), None);
+        panel.select(Some(b));
+        assert_eq!(panel.follow_up, "Bdraft");
+        assert!(panel.follow_up_feedback(1).contains("removed"));
+        panel.select(Some(a));
+        assert_eq!(panel.follow_up, "A draft");
+        let retry = panel.follow_up_reference(a, 1);
+        assert!(panel.begin_follow_up_send(&retry, 1).is_some());
+        panel.clear_follow_up(); // Successful synchronous runtime admission.
+        panel.select(Some(b));
+        panel.select(Some(a));
+        assert!(panel.follow_up.is_empty());
+        assert!(panel.follow_up_feedback(1).contains("Enter visible"));
+    }
+
+    #[test]
+    fn follow_up_feedback_reports_bounds_and_rejects_unsafe_tail() {
+        let mut panel = TaskPanel::new();
+        panel.set_follow_up("keep\n\tthis");
+        for unsafe_character in ['\u{202e}', '\u{e0000}', '\u{fffd}', '\u{00a0}'] {
+            panel.set_follow_up(format!(
+                "{}{}",
+                "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES),
+                unsafe_character
+            ));
+            assert_eq!(panel.follow_up, "keep\n\tthis");
+            assert!(panel.follow_up_feedback(1).contains("rejected"));
+        }
+        panel.set_follow_up("界".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES));
+        assert!(panel.follow_up.len() <= NATIVE_AGENT_FOLLOW_UP_MAX_BYTES);
+        assert!(panel.follow_up.ends_with('界'));
+        assert!(panel.follow_up_feedback(1).contains("truncated"));
+        assert!(panel.follow_up_feedback(1).contains(&format!(
+            "{} / {} bytes",
+            panel.follow_up.len(),
+            NATIVE_AGENT_FOLLOW_UP_MAX_BYTES
+        )));
+        panel.set_follow_up("review\r\n\tthis");
+        assert_eq!(panel.follow_up, "review\n\tthis");
+        assert!(panel.follow_up_feedback(1).contains("removed"));
+        assert!(panel
+            .follow_up_feedback(CODEX_APP_SERVER_LIVE_TURN_MAX)
+            .contains("Turn limit"));
+        assert!(!native_follow_up_can_send(
+            &panel.follow_up,
+            CODEX_APP_SERVER_LIVE_TURN_MAX
+        ));
+        panel.set_follow_up("\n\t ");
+        assert!(panel.follow_up_feedback(1).contains("Enter visible"));
+    }
+
+    #[test]
+    fn follow_up_large_paste_does_not_retain_large_allocation() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        panel.set_follow_up("x".repeat(8 * 1024 * 1024));
+        assert_eq!(panel.follow_up.len(), NATIVE_AGENT_FOLLOW_UP_MAX_BYTES);
+        assert_eq!(panel.follow_up.capacity(), panel.follow_up.len());
+        panel.select(Some(b));
+        assert_eq!(
+            panel.follow_up_drafts[&a].0.capacity(),
+            NATIVE_AGENT_FOLLOW_UP_MAX_BYTES
+        );
+        panel.select(Some(a));
+        panel.clear_follow_up();
+        assert_eq!(panel.follow_up.capacity(), 0);
+        panel.select(Some(b));
+        assert!(!panel.follow_up_drafts.contains_key(&a));
+    }
+
+    #[test]
+    fn follow_up_storage_is_bounded_without_silent_eviction() {
+        let mut panel = TaskPanel::new();
+        for _ in 0..10_000 {
+            panel.select(Some(TaskId::new()));
+        }
+        assert!(panel.follow_up_drafts.is_empty());
+        let ids: Vec<_> = (0..16).map(|_| TaskId::new()).collect();
+        for id in &ids {
+            panel.select(Some(*id));
+            panel.set_follow_up("x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES));
+        }
+        let refused = TaskId::new();
+        panel.select(Some(refused));
+        assert_eq!(panel.selected, Some(refused));
+        assert!(panel.follow_up.is_empty());
+        panel.set_follow_up("seventeenth draft");
+        assert!(panel.follow_up.is_empty());
+        assert!(panel.follow_up_feedback(1).contains("Draft limit reached"));
+        assert_eq!(panel.follow_up_drafts.len(), 16);
+        let total_capacity = panel.follow_up.capacity()
+            + panel
+                .follow_up_drafts
+                .values()
+                .map(|(text, _)| text.capacity())
+                .sum::<usize>();
+        assert!(total_capacity <= 256 * 1024);
+        let stale_cleanup = panel.draft_cleanup_reference();
+        // Existing drafts remain accessible/editable at capacity.
+        panel.select(Some(ids[0]));
+        assert_eq!(panel.follow_up.len(), NATIVE_AGENT_FOLLOW_UP_MAX_BYTES);
+        panel.set_follow_up("edited existing draft");
+        assert_eq!(panel.follow_up, "edited existing draft");
+        panel.discard_saved_drafts(&stale_cleanup);
+        assert_eq!(panel.saved_draft_count(), 15);
+        panel.clear_follow_up();
+        panel.select(Some(refused));
+        panel.set_follow_up("now admitted");
+        assert_eq!(panel.follow_up, "now admitted");
+        let cleanup = panel.draft_cleanup_reference();
+        panel.request_discard_saved_drafts(&cleanup);
+        let confirmation = panel.draft_discard_confirmation().unwrap();
+        panel.discard_saved_drafts(&confirmation);
+        assert_eq!(panel.saved_draft_count(), 0);
+        assert_eq!(panel.follow_up, "now admitted");
+        panel.select(None); // Archive/hide must not be blocked by draft state.
+        assert_eq!(panel.selected, None);
+    }
+
+    #[test]
+    fn saved_draft_discard_requires_current_confirmation_and_keeps_current_notice() {
+        let mut panel = TaskPanel::new();
+        let a = TaskId::new();
+        let b = TaskId::new();
+        panel.select(Some(a));
+        panel.set_follow_up("saved draft");
+        panel.select(Some(b));
+        panel.set_follow_up("current\rdraft");
+        let notice = panel.follow_up_notice;
+        let request = panel.draft_cleanup_reference();
+        panel.discard_saved_drafts(&request);
+        assert_eq!(panel.saved_draft_count(), 1); // First click cannot delete.
+        panel.request_discard_saved_drafts(&request);
+        let cancelled = panel.draft_discard_confirmation().unwrap();
+        panel.cancel_discard_saved_drafts(&cancelled);
+        panel.discard_saved_drafts(&cancelled);
+        assert_eq!(panel.saved_draft_count(), 1);
+        panel.request_discard_saved_drafts(&request);
+        let stale = panel.draft_discard_confirmation().unwrap();
+        panel.retire_follow_up(); // Selection, visibility and send epochs use this.
+        panel.discard_saved_drafts(&stale);
+        assert_eq!(panel.saved_draft_count(), 1);
+        panel.request_discard_saved_drafts(&request);
+        assert!(panel.draft_discard_confirmation().is_none());
+        let current = panel.draft_cleanup_reference();
+        panel.request_discard_saved_drafts(&current);
+        let confirmed = panel.draft_discard_confirmation().unwrap();
+        panel.discard_saved_drafts(&confirmed);
+        assert_eq!(panel.saved_draft_count(), 0);
+        assert_eq!(panel.follow_up, "currentdraft");
+        assert_eq!(panel.follow_up_notice, notice);
+        assert!(panel.follow_up_feedback(1).contains("removed"));
+        assert!(panel.draft_discard_confirmation().is_none());
+        panel.select(Some(a));
+        panel.set_follow_up("new saved draft");
+        panel.select(Some(b));
+        panel.discard_saved_drafts(&confirmed);
+        assert_eq!(panel.saved_draft_count(), 1); // Duplicate cannot clear new drafts.
     }
 
     #[test]
