@@ -1268,6 +1268,7 @@ dependencies = [
  "toml",
  "unicode-normalization",
  "uuid",
+ "zbus",
 ]
 
 [[package]]
@@ -2003,7 +2004,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=d7dc25ef8d3a54c9126571589591b26f70854f18#d7dc25ef8d3a54c9126571589591b26f70854f18"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=3883dc42bae9e5bfb60a46f758a9074b09f2ca7e#3883dc42bae9e5bfb60a46f758a9074b09f2ca7e"
 dependencies = [
  "crossbeam-channel",
  "dirs",

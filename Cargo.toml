@@ -22,7 +22,7 @@ cosmic-text = "0.15"
 iced_winit = { version = "=0.14.0", default-features = false }
 libc = "0.2"
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d7dc25ef8d3a54c9126571589591b26f70854f18" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "3883dc42bae9e5bfb60a46f758a9074b09f2ca7e" }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 log = "0.4"
@@ -41,6 +41,8 @@ fuzzy-matcher = "0.3"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+# Reuse the already locked portal transport; keep its existing async-io runtime.
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io"] }
 
 [profile.dev]
 incremental = true
@@ -67,4 +69,4 @@ wayland-client = { path = "vendor/wayland-client" }
 
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "d7dc25ef8d3a54c9126571589591b26f70854f18", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "3883dc42bae9e5bfb60a46f758a9074b09f2ca7e", features = ["session-parity-tests"] }

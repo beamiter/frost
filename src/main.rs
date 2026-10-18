@@ -38,7 +38,11 @@ mod organism;
 mod organism_activity;
 mod organism_block;
 mod organism_hover;
+mod organism_motion_control;
+mod organism_motion_observation;
 mod organism_preview;
+mod organism_system_motion;
+mod organism_wake_plan;
 mod organism_watch;
 mod paste_feedback;
 mod persistence;
@@ -4710,7 +4714,8 @@ enum Message {
     SetOrganismMotion(organism::MotionChoice),
     SetOrganismPose(organism::Pose),
     OrganismPreviewAction(organism_preview::PreviewRequest),
-    OrganismTick,
+    OrganismTick(organism_wake_plan::WakeCause),
+    OrganismSystemMotion(organism_system_motion::Event),
     OrganismBodyObserved(
         usize,
         u64,
@@ -6353,6 +6358,8 @@ struct Frost {
     terminal_interaction_epoch: u64,
     terminal_pane_owners: Option<TerminalPaneOwners>,
     organism: organism::Organism,
+    organism_motion_control: organism_motion_control::MotionControl,
+    organism_wake_counts: organism_wake_plan::WakeCounters,
     organism_pointer_buttons: Vec<iced::mouse::Button>,
     organism_body_geometry: Option<(usize, terminal_view::OrganismBodyGeometry)>,
     organism_geometry_epoch: u64,
@@ -6740,6 +6747,8 @@ impl Frost {
             terminal_pane_owners: None,
             config,
             organism: organism::Organism::default(),
+            organism_motion_control: organism_motion_control::MotionControl::default(),
+            organism_wake_counts: organism_wake_plan::WakeCounters::default(),
             organism_pointer_buttons: Vec::new(),
             organism_body_geometry: None,
             organism_geometry_epoch: 0,
@@ -6891,6 +6900,7 @@ impl Frost {
         // Re-apply the saved tabs once the sessions exist. The snapshot is
         // external input, so every index is validated before use.
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
+        app.sync_organism_motion(false);
         app.sync_organism_attention_owner();
         app.sync_theme_colors();
         // The startup banner occupies real layout space even for a single pane.
@@ -7320,10 +7330,7 @@ impl Frost {
                 if self.config.experimental_task_sidebar != config.experimental_task_sidebar {
                     self.task_panel.retire_panel_callbacks();
                 }
-                self.organism.motion_changed(
-                    self.config.ascii_organism_motion,
-                    config.ascii_organism_motion,
-                );
+                self.prepare_organism_motion_config(config.ascii_organism_motion);
                 self.remote_host_editor.retire();
                 self.before_clipboard_permission_change(config.allow_clipboard_read);
                 self.config = config;
@@ -15506,6 +15513,7 @@ impl Frost {
         self.sync_terminal_ime_owner();
         self.sync_terminal_pane_owners();
         let task = self.update_message(message);
+        self.sync_organism_motion(false);
         self.organism.observe_agent(
             self.agent
                 .session
@@ -17628,7 +17636,12 @@ impl Frost {
                         state.bookmark_key_claimed = false;
                     }
                 }
+                let resumed = f && !self.focused;
                 self.focused = f;
+                if resumed {
+                    // Event-driven reattach after a missing/disconnected bus.
+                    self.sync_organism_motion(true);
+                }
                 if !f {
                     self.organism.close_preview();
                     self.organism.retreat();
@@ -18771,8 +18784,7 @@ impl Frost {
             }
             Message::SetOrganismMotion(choice) => {
                 let next = choice.configured();
-                self.organism
-                    .motion_changed(self.config.ascii_organism_motion, next);
+                self.prepare_organism_motion_config(next);
                 self.config.ascii_organism_motion = next;
                 self.config_dirty = true;
             }
@@ -18820,7 +18832,12 @@ impl Frost {
                 let facts = self.organism_attention_facts();
                 self.organism.leave_live_greeting(facts);
             }
-            Message::OrganismTick => {
+            Message::OrganismSystemMotion(event) => {
+                let transition = self.organism_motion_control.observe(event);
+                self.apply_organism_motion_transition(transition);
+            }
+            Message::OrganismTick(cause) => {
+                self.organism_wake_counts.record(&cause);
                 if self.config.ascii_organism_enabled {
                     let ids: Vec<usize> = self.sessions.iter().map(|s| s.id).collect();
                     self.organism.retain_sessions(&ids);
@@ -19008,10 +19025,7 @@ impl Frost {
                     Ok(revision) => {
                         let old_scale = self.scale_factor();
                         self.task_panel.retire_panel_callbacks();
-                        self.organism.motion_changed(
-                            self.config.ascii_organism_motion,
-                            reset.ascii_organism_motion,
-                        );
+                        self.prepare_organism_motion_config(reset.ascii_organism_motion);
                         self.remote_host_editor.retire();
                         self.before_clipboard_permission_change(reset.allow_clipboard_read);
                         self.config = reset;
@@ -19038,10 +19052,7 @@ impl Frost {
                             // memory and retry it as dirty on the next tick.
                             let old_scale = self.scale_factor();
                             self.task_panel.retire_panel_callbacks();
-                            self.organism.motion_changed(
-                                self.config.ascii_organism_motion,
-                                reset.ascii_organism_motion,
-                            );
+                            self.prepare_organism_motion_config(reset.ascii_organism_motion);
                             self.remote_host_editor.retire();
                             self.before_clipboard_permission_change(reset.allow_clipboard_read);
                             self.config = reset;
@@ -22820,6 +22831,57 @@ impl Frost {
         self.organism.sync_live_attention_owner(owner);
     }
 
+    fn organism_effective_motion(&self) -> Option<organism::Motion> {
+        Some(self.organism_motion_control.resolution().effective.into())
+    }
+
+    fn apply_organism_motion_transition(
+        &mut self,
+        transition: Option<organism_motion_control::Transition>,
+    ) {
+        if let Some(change) = transition {
+            self.organism
+                .motion_changed(Some(change.previous.into()), Some(change.effective.into()));
+        }
+    }
+
+    fn prepare_organism_motion_config(&mut self, configured: Option<organism::Motion>) {
+        let relevant = self.config.ascii_organism_enabled || self.organism_preview_visible();
+        let transition =
+            self.organism_motion_control
+                .reconcile(configured.map(Into::into), relevant, false);
+        self.apply_organism_motion_transition(transition);
+    }
+
+    fn sync_organism_motion(&mut self, foreground_resume: bool) {
+        let relevant = self.config.ascii_organism_enabled || self.organism_preview_visible();
+        let transition = self.organism_motion_control.reconcile(
+            self.config.ascii_organism_motion.map(Into::into),
+            relevant,
+            foreground_resume,
+        );
+        self.apply_organism_motion_transition(transition);
+    }
+
+    fn organism_motion_description(&self) -> &'static str {
+        use jterm_core::organism_motion::{Motion, ResolutionReason};
+        let resolution = self.organism_motion_control.resolution();
+        match (resolution.reason, resolution.effective) {
+            (ResolutionReason::Explicit, _) => {
+                "Explicit motion stays unchanged when desktop preferences change."
+            }
+            (ResolutionReason::Fallback, _) => {
+                "Automatic uses Calm until a desktop animation preference is available."
+            }
+            (ResolutionReason::System, Motion::Full) => {
+                "Automatic uses Full: the desktop reports no reduced-motion preference."
+            }
+            (ResolutionReason::System, _) => {
+                "Automatic uses Calm: the desktop requests reduced motion."
+            }
+        }
+    }
+
     fn organism_owner(&self) -> Option<usize> {
         self.organism_observation_owner()
             .filter(|_| !self.organism.is_retreating())
@@ -22848,7 +22910,7 @@ impl Frost {
 
     fn organism_watch_owner(&self) -> Option<usize> {
         self.organism_owner()
-            .filter(|_| self.config.ascii_organism_motion != Some(organism::Motion::Static))
+            .filter(|_| self.organism_effective_motion() != Some(organism::Motion::Static))
     }
 
     fn organism_watch_source(&self) -> Option<(usize, i32, u64)> {
@@ -22874,7 +22936,7 @@ impl Frost {
     fn greet_companion(&mut self, target: Option<usize>) {
         let refusal = if !self.config.ascii_organism_enabled {
             Some("Enable ASCII Organism in Settings before greeting.")
-        } else if self.config.ascii_organism_motion == Some(organism::Motion::Static) {
+        } else if self.organism_effective_motion() == Some(organism::Motion::Static) {
             Some("Choose Full or Calm motion before greeting the live companion.")
         } else if target.is_none()
             || target != self.organism_owner()
@@ -22937,7 +22999,7 @@ impl Frost {
     fn organism_interaction_eligible(&self) -> bool {
         self.organism_layout().presentable()
             && self.organism_owner().is_some()
-            && self.config.ascii_organism_motion != Some(organism::Motion::Static)
+            && self.organism_effective_motion() != Some(organism::Motion::Static)
             && self.organism_pointer_buttons.is_empty()
             && self.dragging_tab.is_none()
             && self.pane_drag.is_none()
@@ -23011,7 +23073,7 @@ impl Frost {
                 id,
                 running,
                 settled,
-                self.config.ascii_organism_motion,
+                self.organism_effective_motion(),
                 attention_facts,
             )
         });
@@ -23776,7 +23838,7 @@ impl Frost {
     /// admission. There is one body owner and no body in Static/traditional UI.
     fn organism_body_owner(&self) -> Option<usize> {
         if !self.config.is_card_mode()
-            || self.config.ascii_organism_motion == Some(organism::Motion::Static)
+            || self.organism_effective_motion() == Some(organism::Motion::Static)
             || self.organism_geometry_epoch == u64::MAX
             || !self.organism_pointer_buttons.is_empty()
             || self.dragging_tab.is_some()
@@ -24002,7 +24064,7 @@ impl Frost {
                     sess.terminal
                         .running_duration_ms()
                         .is_some_and(|ms| ms >= 60_000),
-                    self.config.ascii_organism_motion,
+                    self.organism_effective_motion(),
                     self.organism_attention_facts(),
                 );
                 terminal_view::OrganismBody {
@@ -24011,7 +24073,7 @@ impl Frost {
                     sprite: presentation.sprite,
                     walking_sprite: presentation.walking_sprite,
                     tone: presentation.tone,
-                    frame: self.organism.paint_frame(self.config.ascii_organism_motion),
+                    frame: self.organism.paint_frame(self.organism_effective_motion()),
                     wander: presentation.wander,
                     bottom: presentation.bottom,
                 }
@@ -24025,7 +24087,7 @@ impl Frost {
                                 id,
                                 sess.terminal.is_command_running(),
                                 false,
-                                self.config.ascii_organism_motion,
+                                self.organism_effective_motion(),
                                 self.organism_attention_facts(),
                             )
                         })
@@ -26000,7 +26062,7 @@ impl Frost {
         let motion = organism::MotionChoice::from_config(self.config.ascii_organism_motion);
         let preview = self
             .organism
-            .preview_presentation(self.config.ascii_organism_motion);
+            .preview_presentation(self.organism_effective_motion());
         let availability = preview.hello;
         use organism_preview::PreviewAction;
         let demo_button = |action, label: &'static str| -> Element<'_, Message> {
@@ -26094,7 +26156,7 @@ impl Frost {
             pick_list(organism::MotionChoice::ALL,
                 Some(organism::MotionChoice::from_config(self.config.ascii_organism_motion)),
                 Message::SetOrganismMotion).text_size(self.effective_font_size()),
-            text("Automatic currently uses Calm; desktop animation preferences are not available.").size(self.effective_font_size()),
+            text(self.organism_motion_description()).size(self.effective_font_size()),
             text(motion.description()).size(self.effective_font_size()),
             text(motion.interaction_hint()).size(self.effective_font_size()),
             text("Output rhythm reflects observed activity, not command progress.").size(self.effective_font_size()),
@@ -27202,6 +27264,12 @@ impl Frost {
         };
 
         let mut lines = column![text("Diagnostics").size(self.effective_font_size())].spacing(3);
+        let wakes = self.organism_wake_counts.snapshot();
+        lines = lines
+            .push(stat("Motion", format!("{:?} / {:?}", self.organism_motion_control.resolution(), self.organism_motion_control.source())))
+            .push(stat("Organism wake", format!("live {} preview {} maintenance {}", wakes.live_animation, wakes.preview_animation, wakes.maintenance)))
+            .push(stat("Expiry wake", format!("preview {}/{}/{} retreat {} completion {} attention {}", wakes.preview_boundary, wakes.preview_greeting, wakes.preview_cooldown, wakes.retreat_expiry, wakes.completion_expiry, wakes.live_attention)))
+            .push(text("Delivered organism causes since launch; not frame or application-wide wake counts.").size(self.effective_font_size()));
         lines = lines
             .push(stat("Grid", format!("{}x{}", self.cols, self.rows)))
             .push(stat("Sessions", format!("{}", self.sessions.len())))
@@ -30412,6 +30480,11 @@ impl Frost {
             _ => None,
         });
         subs.push(events);
+        if let Some(epoch) = self.organism_motion_control.subscription_epoch() {
+            subs.push(
+                organism_system_motion::subscription(epoch).map(Message::OrganismSystemMotion),
+            );
+        }
         let preview_visible = self.organism_preview_visible();
         let live_layout = self.organism_layout();
         let attention_facts = self.organism_attention_facts();
@@ -30439,34 +30512,55 @@ impl Frost {
                     })
             });
         let live_visible = live_layout.maintenance_eligible(self.focused) && native_visible;
+        let effective = self.organism_motion_control.resolution().effective;
         let preview_full = preview_visible
             && self.organism.preview_animation_enabled()
-            && self.config.ascii_organism_motion == Some(organism::Motion::Full);
-        if preview_full || live_visible {
-            let full = preview_full
-                || (self.config.ascii_organism_motion == Some(organism::Motion::Full)
-                    && self.organism_owner().is_some());
-            let millis = if full { 100 } else { 900 };
+            && effective == jterm_core::organism_motion::Motion::Full;
+        if let Some(reason) = organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts {
+            motion: effective,
+            focused: self.focused,
+            live_presentable: live_layout.presentable(),
+            native_visible,
+            live_owner: self.organism_owner().is_some(),
+            preview_visible,
+            preview_animation_enabled: self.organism.preview_animation_enabled(),
+        }) {
             subs.push(
-                iced::time::every(std::time::Duration::from_millis(millis))
-                    .map(|_| Message::OrganismTick),
+                iced::time::every(reason.interval())
+                    .with(reason)
+                    .map(|(reason, _)| {
+                        Message::OrganismTick(organism_wake_plan::WakeCause::Periodic(reason))
+                    }),
             );
         }
-        // Calm/Static preview needs only greeting expiry and cooldown wakes.
-        // Absolute keys prevent unrelated redraws from postponing the deadline.
+        // Preserve the existing absolute one-shots. Attribution groups equal
+        // timestamps, without postponing expiry or adding a maintenance timer.
+        use organism_wake_plan::{DeadlineReason, DeadlineRequest};
+        let now = std::time::Instant::now();
+        let mut deadlines = [None; 6];
         if preview_visible && !preview_full {
-            if let Some(deadline) = self.organism.preview_deadline() {
-                subs.push(organism_deadline_subscription(deadline));
+            if let Some((at, reason)) = self.organism.preview_deadline() {
+                deadlines[0] = Some(DeadlineRequest {
+                    at,
+                    reason,
+                    generation: 0,
+                });
             }
         }
-        // The dormant 900ms heartbeat must not extend retreat or a completion
-        // hold. Only the eligible foreground owner gets a finite expiry wake.
         if let Some(owner) = self.organism_observation_owner() {
-            if let Some(deadline) = self.organism.retreat_deadline() {
-                subs.push(organism_deadline_subscription(deadline));
+            if let Some(at) = self.organism.retreat_deadline() {
+                deadlines[3] = Some(DeadlineRequest {
+                    at,
+                    reason: DeadlineReason::RetreatExpiry,
+                    generation: owner as u64,
+                });
             }
-            if let Some(deadline) = self.organism.reaction_deadline(owner) {
-                subs.push(organism_deadline_subscription(deadline));
+            if let Some(at) = self.organism.reaction_deadline(owner) {
+                deadlines[4] = Some(DeadlineRequest {
+                    at,
+                    reason: DeadlineReason::CompletionExpiry,
+                    generation: owner as u64,
+                });
             }
         }
         if organism_pointer_observation_needed(
@@ -30474,7 +30568,7 @@ impl Frost {
             live_layout.glyph || (self.config.is_card_mode() && live_layout.presentable()),
             self.organism.explicit_greeting_active(attention_facts),
             !self.organism_pointer_buttons.is_empty(),
-            self.config.ascii_organism_motion,
+            self.organism_effective_motion(),
         ) {
             // Observe without consuming or rerouting the original mouse event.
             // A narrow explicit hold observes input only while active; after a
@@ -30488,9 +30582,16 @@ impl Frost {
             }));
         }
         if self.organism_interaction_eligible() {
-            if let Some(deadline) = self.organism.live_greeting_deadline(attention_facts) {
-                subs.push(organism_deadline_subscription(deadline));
+            if let Some(at) = self.organism.live_greeting_deadline(attention_facts) {
+                deadlines[5] = Some(DeadlineRequest {
+                    at,
+                    reason: DeadlineReason::LiveAttention,
+                    generation: self.organism_geometry_epoch,
+                });
             }
+        }
+        for wake in organism_wake_plan::deadlines(now, deadlines) {
+            subs.push(organism_deadline_subscription(wake));
         }
         // A right-press on a tab carries no coordinates, so the context menu
         // needs the pointer tracked separately. Track it only while a tab is
@@ -31511,12 +31612,14 @@ fn clipboard_5522_response_for_mime(mime_type: &str, data: &[u8]) -> Vec<u8> {
     output
 }
 
-fn organism_deadline_subscription(deadline: std::time::Instant) -> Subscription<Message> {
-    Subscription::run_with(deadline, |deadline| {
-        let deadline = *deadline;
+fn organism_deadline_subscription(
+    wake: organism_wake_plan::DeadlineWake<std::time::Instant>,
+) -> Subscription<Message> {
+    Subscription::run_with(wake, |wake| {
+        let wake = wake.clone();
         iced::futures::stream::once(async move {
-            tokio::time::sleep_until(deadline.into()).await;
-            Message::OrganismTick
+            tokio::time::sleep_until(wake.at.into()).await;
+            Message::OrganismTick(organism_wake_plan::WakeCause::Deadline(wake))
         })
     })
 }
@@ -33357,8 +33460,7 @@ mod tests {
             .unwrap()
             .1;
         let reload = reload.split_once("self.config = config;").unwrap().0;
-        assert!(reload.contains("self.organism.motion_changed("));
-        assert!(reload.contains("self.config.ascii_organism_motion"));
+        assert!(reload.contains("self.prepare_organism_motion_config("));
         assert!(reload.contains("config.ascii_organism_motion"));
         let reset = source
             .split_once("            Message::ConfigReset => {")
@@ -33368,7 +33470,12 @@ mod tests {
             .split_once("            Message::ConfigTick => {")
             .unwrap()
             .0;
-        assert_eq!(reset.matches("self.organism.motion_changed(").count(), 2);
+        assert_eq!(
+            reset
+                .matches("self.prepare_organism_motion_config(")
+                .count(),
+            2
+        );
         assert_eq!(reset.matches("reset.ascii_organism_motion").count(), 2);
         let control = source
             .split_once("            Message::SetOrganismMotion(choice) => {")
@@ -33378,7 +33485,7 @@ mod tests {
             .split_once("            Message::SetOrganismPose")
             .unwrap()
             .0;
-        assert!(control.contains(".motion_changed(self.config.ascii_organism_motion, next)"));
+        assert!(control.contains("self.prepare_organism_motion_config(next)"));
         assert!(control.contains("self.config.ascii_organism_motion = next;"));
     }
 
@@ -34031,7 +34138,10 @@ mod tests {
         assert!(subs.contains("let live_layout = self.organism_layout()"));
         assert!(subs.contains("live_layout.maintenance_eligible(self.focused)"));
         assert!(subs.contains("organism_pointer_observation_needed("));
-        assert!(subs.contains("let millis = if full { 100 } else { 900 }"));
+        assert!(subs.contains("organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts"));
+        assert!(subs.contains("motion: effective"));
+        assert!(subs.contains("live_owner: self.organism_owner().is_some()"));
+        assert!(subs.contains("iced::time::every(reason.interval())"));
         assert_eq!(subs.matches("iced::time::every(").count(), 1);
         let resize = source
             .split_once("            Message::Resized(size) => {")
@@ -34048,7 +34158,7 @@ mod tests {
             .split_once("    fn sync_organism_geometry(")
             .unwrap()
             .1
-            .split_once("    fn organism_owner(")
+            .split_once("    fn organism_effective_motion(")
             .unwrap()
             .0;
         assert!(sync.contains("!self.config.is_card_mode() && layout.glyph"));
@@ -42056,7 +42166,7 @@ mod tests {
         assert!(entry.contains("self.sync_organism_attention_owner();"));
         assert!(!entry.contains("poll_live_greeting"));
         let tick = source
-            .split_once("            Message::OrganismTick => {")
+            .split_once("            Message::OrganismTick(cause) => {")
             .unwrap()
             .1
             .split_once("            Message::SetBottomBar")
@@ -42283,7 +42393,7 @@ mod tests {
             .split_once("    fn sync_organism_geometry(")
             .unwrap()
             .1
-            .split_once("    fn organism_owner(")
+            .split_once("    fn organism_effective_motion(")
             .unwrap()
             .0;
         assert!(sync.contains("if !layout.presentable()"));
@@ -42578,7 +42688,7 @@ mod tests {
             .split_once("            Message::OrganismHoverEnter(id, epoch) => {")
             .unwrap()
             .1
-            .split_once("            Message::OrganismTick => {")
+            .split_once("            Message::OrganismTick(cause) => {")
             .unwrap()
             .0;
         assert!(hover.contains("self.organism_owner() == Some(id)"));
@@ -42605,7 +42715,11 @@ mod tests {
             .split_once("        // A right-press on a tab")
             .unwrap()
             .0;
-        assert!(subscription.contains("if preview_full || live_visible"));
+        assert!(
+            subscription.contains("organism_wake_plan::periodic(organism_wake_plan::ScheduleFacts")
+        );
+        assert!(subscription.contains("preview_visible,"));
+        assert!(subscription.contains("live_presentable: live_layout.presentable()"));
         assert!(subscription.contains("if preview_visible && !preview_full"));
         assert!(subscription.contains("self.organism.preview_deadline()"));
         assert!(subscription.contains("if let Some(owner) = self.organism_observation_owner()"));
@@ -42619,9 +42733,12 @@ mod tests {
             .split_once("fn pty_subscription(")
             .unwrap()
             .0;
-        assert!(deadline.contains("Subscription::run_with(deadline"));
+        assert!(deadline.contains("Subscription::run_with(wake"));
         assert!(deadline.contains("stream::once"));
-        assert!(deadline.contains("sleep_until(deadline.into())"));
+        assert!(deadline.contains("sleep_until(wake.at.into())"));
+        assert!(deadline.contains("WakeCause::Deadline(wake)"));
+        assert!(subscription.contains("organism_wake_plan::deadlines(now, deadlines)"));
+        assert!(subscription.contains("organism_deadline_subscription(wake)"));
     }
 
     #[test]
@@ -42657,7 +42774,16 @@ mod tests {
             .unwrap()
             .0;
         assert!(expiry.contains("self.organism.reaction_deadline(owner)"));
-        assert!(expiry.contains("organism_deadline_subscription(deadline)"));
+        assert!(expiry.contains("reason: DeadlineReason::CompletionExpiry"));
+        assert!(expiry.contains("generation: owner as u64"));
+        let dispatch = source
+            .split_once("        for wake in organism_wake_plan::deadlines(now, deadlines) {")
+            .unwrap()
+            .1
+            .split_once("        // A right-press on a tab")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("organism_deadline_subscription(wake)"));
         assert!(!expiry.contains("time::every"));
         assert!(!expiry.contains("sessions.iter()"));
     }
@@ -42682,7 +42808,7 @@ mod tests {
             .0;
         assert!(display_owner.contains("self.organism_observation_owner()"));
         let tick = source
-            .split_once("            Message::OrganismTick => {")
+            .split_once("            Message::OrganismTick(cause) => {")
             .unwrap()
             .1
             .split_once("            Message::SetBottomBar(")

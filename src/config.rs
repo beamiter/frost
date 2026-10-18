@@ -152,7 +152,7 @@ pub struct Config {
     /// Reserve a full-body card by default when enabled; explicit collapse is retained.
     #[serde(default = "default_organism_expanded")]
     pub ascii_organism_expanded: bool,
-    /// Missing means Automatic (currently a disclosed Calm fallback).
+    /// Missing means Automatic: follow a verified desktop preference, otherwise Calm.
     #[serde(default)]
     pub ascii_organism_motion: Option<crate::organism::Motion>,
 

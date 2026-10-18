@@ -51,6 +51,27 @@ pub enum Motion {
     Static,
 }
 
+// Representation-only conversion; the shared core remains the sole resolver.
+impl From<Motion> for jterm_core::organism_motion::Motion {
+    fn from(value: Motion) -> Self {
+        match value {
+            Motion::Full => Self::Full,
+            Motion::Calm => Self::Calm,
+            Motion::Static => Self::Static,
+        }
+    }
+}
+
+impl From<jterm_core::organism_motion::Motion> for Motion {
+    fn from(value: jterm_core::organism_motion::Motion) -> Self {
+        match value {
+            jterm_core::organism_motion::Motion::Full => Self::Full,
+            jterm_core::organism_motion::Motion::Calm => Self::Calm,
+            jterm_core::organism_motion::Motion::Static => Self::Static,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for Motion {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
@@ -76,7 +97,10 @@ impl MotionChoice {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Automatic | Self::Calm => "Still poses that respond to work.",
+            Self::Automatic => {
+                "Follows the desktop animation preference; uses Calm when unavailable."
+            }
+            Self::Calm => "Still poses that respond to work.",
             Self::Full => "Animated poses that respond to work.",
             Self::Static => "Still poses that respond to work; no output rhythm.",
         }
@@ -751,9 +775,25 @@ impl Organism {
         }
     }
 
-    pub fn preview_deadline(&self) -> Option<Instant> {
-        self.preview_deadline_at(self.born.elapsed())
-            .map(|deadline| self.born + deadline)
+    pub fn preview_deadline(&self) -> Option<(Instant, crate::organism_wake_plan::DeadlineReason)> {
+        self.preview_deadline_with_reason_at(self.born.elapsed())
+            .map(|(deadline, reason)| (self.born + deadline, reason))
+    }
+
+    fn preview_deadline_with_reason_at(
+        &self,
+        now: Duration,
+    ) -> Option<(Duration, crate::organism_wake_plan::DeadlineReason)> {
+        use crate::organism_wake_plan::DeadlineReason;
+        let deadline = self.preview_deadline_at(now)?;
+        let reason = if self.preview_sequence.sample(now).is_some() {
+            DeadlineReason::PreviewBoundary
+        } else if deadline == self.preview_deadlines.greeting_until {
+            DeadlineReason::PreviewGreeting
+        } else {
+            DeadlineReason::PreviewCooldown
+        };
+        Some((deadline, reason))
     }
 
     fn preview_deadline_at(&self, now: Duration) -> Option<Duration> {
@@ -2291,7 +2331,11 @@ mod tests {
 
     #[test]
     fn motion_help_matches_the_live_capabilities() {
-        assert_eq!(
+        assert!(MotionChoice::Automatic.description().contains("desktop"));
+        assert!(MotionChoice::Automatic
+            .description()
+            .contains("Calm when unavailable"));
+        assert_ne!(
             MotionChoice::Automatic.description(),
             MotionChoice::Calm.description()
         );
@@ -3604,5 +3648,50 @@ mod tests {
             Organism::frame_at(Some(Motion::Static), Duration::from_secs(1)),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod motion_reason_tests {
+    use super::*;
+    use crate::organism_wake_plan::DeadlineReason;
+
+    #[test]
+    fn representation_conversion_round_trips_all_explicit_values() {
+        for value in [Motion::Full, Motion::Calm, Motion::Static] {
+            assert_eq!(
+                Motion::from(jterm_core::organism_motion::Motion::from(value)),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn preview_reason_keeps_the_same_absolute_deadline_for_every_pose() {
+        let mut organism = Organism::default();
+        let start = Duration::from_secs(10);
+        organism.preview_deadlines.accepted(start);
+        for pose in PreviewPose::ALL {
+            organism.pose = Pose(pose);
+            for now in [
+                start,
+                start + GentleInteraction::HOLD,
+                start + GentleInteraction::COOLDOWN,
+            ] {
+                let previous = organism.preview_deadline_at(now);
+                let tagged = organism.preview_deadline_with_reason_at(now);
+                assert_eq!(tagged.map(|(at, _)| at), previous);
+                if let Some((at, reason)) = tagged {
+                    assert_eq!(
+                        reason,
+                        if at == organism.preview_deadlines.greeting_until {
+                            DeadlineReason::PreviewGreeting
+                        } else {
+                            DeadlineReason::PreviewCooldown
+                        }
+                    );
+                }
+            }
+        }
     }
 }
