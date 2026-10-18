@@ -1151,7 +1151,7 @@ mod tests {
     fn replay_shared_session_parity_corpus(
         fixtures: Vec<jterm_core::session_parity::Fixture>,
         chunkings: &[jterm_core::session_parity::Chunking],
-    ) -> Result<(), SessionParityIdentityMismatch> {
+    ) -> Result<(), Box<SessionParityIdentityMismatch>> {
         use jterm_core::session_parity::{chunks, Completion, Expected};
         for fixture in fixtures {
             for &chunking in chunkings {
@@ -1223,14 +1223,14 @@ mod tests {
                         .enumerate()
                     {
                         if actual.id != wanted.id {
-                            return Err(SessionParityIdentityMismatch {
+                            return Err(Box::new(SessionParityIdentityMismatch {
                                 fixture: fixture.id.clone(),
                                 chunking: format!("{chunking:?}"),
                                 checkpoint: step_index,
                                 field: format!("completed[{index}].id"),
                                 expected: wanted.id.clone(),
                                 observed: actual.id.clone(),
-                            });
+                            }));
                         }
                     }
                     assert_eq!(observed, expected, "{context}");
@@ -1308,7 +1308,7 @@ mod tests {
             let mismatch = replay_shared_session_parity_corpus(vec![mutated], &[chunking])
                 .expect_err("the real replay must consume the mutated completion identity");
             assert_eq!(
-                mismatch,
+                *mismatch,
                 SessionParityIdentityMismatch {
                     fixture: "identity_dedup".to_owned(),
                     chunking: format!("{chunking:?}"),
