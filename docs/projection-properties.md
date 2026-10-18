@@ -9,6 +9,10 @@
   replays the first failing sequence/prefix. Failures print seed, case and the
   complete operation prefix. Reduce the prefix to isolate the first failure;
   this is not a structural delta-debugger.
+- `FROST_PROJECTION_SELECTION_CASE=0 python3 scripts/test-projection-properties.py`
+  replays one partial-history-selection case. Failures print the selection
+  seed, case, width, sample, both endpoints and mode. This selector is separate
+  from `FROST_PROJECTION_CASE`; other tests still run normally.
 - Normal `cargo test` also runs `projection_properties` and the additional
   `projection_state_properties` module. The latter calls the actual terminal
   resize, policy and session-owned viewport entry points. The isolated runner
@@ -43,6 +47,21 @@ partial/reversed/block selections, continuation-only selection, hidden prefixes,
 all-hidden output, adjacent collapse ranges, wide boundaries, summary ownership
 and valid trailing-blank fallback. The pure text core is shared with production;
 its original cache/revision guards remain in the caller.
+
+A separate partial-history-selection corpus uses seed `0x46524f5354504152`:
+2,048 histories, 16 endpoint pairs each, both normal and rectangular selection,
+and both drag directions, for 131,072 exact text assertions. Widths are
+`[1, 2, 3, 4, 7, 13, 31, 80, 255, 256, 1024]`. Expected rows, hard/soft wraps
+and selected text come from the original tagged cells and an eager glyph
+packer, never production plans, raw slices or mapping helpers. Materialized
+cells and raw identities are also compared against that independent ledger.
+Fixtures include empty hard rows, style-only blank wrapped prefixes, retained
+hyperlink spaces, wide pairs, blink and RGB/underline styling. Compression
+must preserve the original cells even when projection trims structural blanks.
+A hand-written regression distinguishes selectable empty rows from padding on
+nonempty rows and covers partial wide-cell, soft-wrap and rectangular copying.
+These randomized partial selections cover identity history reflow; randomized
+partial collapse/chrome and live-grid selection remain outside this corpus.
 
 The isolated runner extracts production types and algorithms verbatim. Its only
 `TerminalState` replacement is fixture storage and allocation; it does not

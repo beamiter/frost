@@ -438,6 +438,606 @@ fn check_case(case: usize, limit: usize) {
     }
 }
 
+// Independent dense source-token model; no production plan/mapping input.
+#[derive(Clone, Copy, Debug)]
+struct DenseCollapseRange {
+    zone: u64,
+    start: (usize, usize),
+    end: (usize, usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DenseCollapseRow {
+    Raw {
+        source_row: usize,
+        start: usize,
+        end: usize,
+        wrapped: bool,
+    },
+    Summary {
+        zone: u64,
+        hidden_rows: usize,
+    },
+}
+
+fn dense_collapse_rows(
+    original: &[Vec<TerminalCell>],
+    wrapped: &[bool],
+    ranges: &[DenseCollapseRange],
+) -> Vec<DenseCollapseRow> {
+    assert!(!original.is_empty());
+    let width = original[0].len();
+    assert!(width > 0 && wrapped.len() == original.len());
+    for row in original {
+        assert_eq!(row.len(), width);
+        for (col, cell) in row.iter().enumerate() {
+            assert!(!cell.character.is_control());
+            assert!(!(cell.flags.wide() && cell.flags.wide_continuation()));
+            if cell.flags.wide() {
+                assert!(col + 1 < width && row[col + 1].flags.wide_continuation());
+            }
+            if cell.flags.wide_continuation() {
+                assert!(col > 0 && row[col - 1].flags.wide());
+            }
+        }
+    }
+    let mut owners = vec![vec![None; width]; original.len()];
+    let mut previous_end = (0, 0);
+    let mut zones = BTreeSet::new();
+    for range in ranges {
+        assert!(range.start.0 < original.len() && range.end.0 < original.len());
+        assert!(range.start.1 <= width && range.end.1 <= width);
+        let start = range.start.0 * width + range.start.1;
+        let end = range.end.0 * width + range.end.1;
+        assert!(start < end, "collapse must own at least one dense cell");
+        assert!(
+            range.start >= previous_end,
+            "admitted tuple intervals must not overlap"
+        );
+        assert!(zones.insert(range.zone));
+        for &(row, col) in &[range.start, range.end] {
+            assert!(col == width || !original[row][col].flags.wide_continuation());
+        }
+        previous_end = range.end;
+        for (row, labels) in owners.iter_mut().enumerate() {
+            for (col, owner) in labels.iter_mut().enumerate() {
+                if (start..end).contains(&(row * width + col)) {
+                    assert!(owner.replace(range.zone).is_none());
+                }
+            }
+        }
+    }
+    let mut document = Vec::new();
+    let mut emitted = BTreeSet::new();
+    for (row, labels) in owners.iter().enumerate() {
+        let mut start = 0;
+        while start < width {
+            let owner = labels[start];
+            let end = (start + 1..width)
+                .find(|&col| labels[col] != owner)
+                .unwrap_or(width);
+            if let Some(zone) = owner {
+                if emitted.insert(zone) {
+                    let hidden_rows = owners
+                        .iter()
+                        .filter(|line| line.contains(&Some(zone)))
+                        .count();
+                    document.push(DenseCollapseRow::Summary { zone, hidden_rows });
+                }
+            } else {
+                document.push(DenseCollapseRow::Raw {
+                    source_row: row,
+                    start,
+                    end,
+                    wrapped: end == width && wrapped[row],
+                });
+            }
+            start = end;
+        }
+    }
+    document
+}
+
+fn dense_visible_point(
+    rows: &[DenseCollapseRow],
+    source: (usize, usize),
+) -> Option<(usize, usize)> {
+    rows.iter().enumerate().find_map(|(index, row)| match row {
+        DenseCollapseRow::Raw {
+            source_row,
+            start,
+            end,
+            ..
+        } if *source_row == source.0 && (*start..*end).contains(&source.1) => {
+            Some((index, source.1))
+        }
+        _ => None,
+    })
+}
+
+fn dense_collapse_text(
+    rows: &[DenseCollapseRow],
+    original: &[Vec<TerminalCell>],
+    anchor: (usize, usize),
+    active: (usize, usize),
+    mode: SelectionMode,
+) -> String {
+    let (first, last) = (anchor.min(active), anchor.max(active));
+    let mut fragments = Vec::new();
+    for (index, row) in rows.iter().enumerate().take(last.0 + 1).skip(first.0) {
+        if let DenseCollapseRow::Raw {
+            source_row,
+            start,
+            end,
+            wrapped,
+        } = row
+        {
+            let text: String = (*start..*end)
+                .filter(|&col| match mode {
+                    SelectionMode::Normal => (first..=last).contains(&(index, col)),
+                    SelectionMode::Block => {
+                        (anchor.1.min(active.1)..=anchor.1.max(active.1)).contains(&col)
+                    }
+                })
+                .filter_map(|col| {
+                    let cell = original[*source_row][col];
+                    (!cell.flags.wide_continuation()).then_some(cell.character)
+                })
+                .collect();
+            // An empty rectangle intersection is still a traversed raw row.
+            fragments.push((index, *wrapped, text));
+        }
+    }
+    let mut output = String::new();
+    for (index, fragment) in fragments.iter().enumerate() {
+        if let Some(previous) = index.checked_sub(1).map(|i| &fragments[i]) {
+            let summary_gap = rows[previous.0 + 1..fragment.0]
+                .iter()
+                .any(|row| matches!(row, DenseCollapseRow::Summary { .. }));
+            if mode == SelectionMode::Block || !previous.1 || summary_gap {
+                output.push('\n');
+            }
+        }
+        output.push_str(&fragment.2);
+    }
+    output
+}
+
+fn dense_ascii(rows: &[&str]) -> Vec<Vec<TerminalCell>> {
+    rows.iter()
+        .map(|row| {
+            row.chars()
+                .map(|character| TerminalCell {
+                    character,
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn check_dense_collapse_case(
+    name: &str,
+    original: Vec<Vec<TerminalCell>>,
+    wrapped: &[bool],
+    ranges: &[DenseCollapseRange],
+    literal_rows: &[DenseCollapseRow],
+    literal_texts: &[((usize, usize), (usize, usize), SelectionMode, &str)],
+) {
+    let width = original[0].len();
+    assert!(original.iter().all(|row| row.len() == width));
+    assert_eq!(wrapped.len(), original.len());
+    let expected = dense_collapse_rows(&original, wrapped, ranges);
+    assert_eq!(
+        expected, literal_rows,
+        "{name}: model must match hand-written geometry"
+    );
+    for &(a, b, mode, text) in literal_texts {
+        let a = dense_visible_point(&expected, a).unwrap();
+        let b = dense_visible_point(&expected, b).unwrap();
+        assert_eq!(
+            dense_collapse_text(&expected, &original, a, b, mode),
+            text,
+            "{name}: model must match hand-written text"
+        );
+    }
+    let mut terminal = TerminalState::new(width, original.len());
+    for (row, cells) in original.iter().enumerate() {
+        terminal.grid.set_row(row, cells.clone());
+        terminal.grid.row_wrapped[row] = wrapped[row];
+    }
+    let ids: Vec<_> = (0..original.len())
+        .map(|row| terminal.grid.raw_row_id(row).unwrap())
+        .collect();
+    assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), ids.len());
+    let resolved: Vec<_> = ranges
+        .iter()
+        .map(|range| ResolvedCollapse {
+            range: FinishedOutputRange {
+                zone_id: range.zone,
+                start: RawCellBoundary {
+                    row: ids[range.start.0],
+                    col: range.start.1,
+                },
+                end: RawCellBoundary {
+                    row: ids[range.end.0],
+                    col: range.end.1,
+                },
+            },
+            start_absolute: range.start.0,
+            end_absolute: range.end.0,
+        })
+        .collect();
+    let plan = terminal
+        .identity_projection_plan(width)
+        .splice_collapses(&resolved, 42);
+    assert_eq!(
+        plan.rows.len(),
+        expected.len(),
+        "{name}: document row count"
+    );
+    let view = viewport(&terminal, &plan, 0, plan.rows.len());
+    for (row, model) in expected.iter().enumerate() {
+        match model {
+            DenseCollapseRow::Raw { wrapped, .. } => {
+                assert_eq!(plan.rows[row].kind, ProjectedRowKind::Raw, "{name}");
+                assert_eq!(
+                    plan.rows[row].wrapped, *wrapped,
+                    "{name}: fragment hard/soft boundary"
+                );
+            }
+            DenseCollapseRow::Summary { zone, hidden_rows } => match plan.rows[row].kind {
+                ProjectedRowKind::CollapsedSummary {
+                    key,
+                    hidden_range,
+                    hidden_display_rows,
+                } => {
+                    assert_eq!(key.zone_id, *zone, "{name}");
+                    assert_eq!(key.policy_revision, 42);
+                    assert_eq!(
+                        hidden_display_rows, *hidden_rows,
+                        "{name}: hidden physical row count"
+                    );
+                    assert_eq!(
+                        hidden_range,
+                        resolved
+                            .iter()
+                            .find(|range| range.range.zone_id == *zone)
+                            .unwrap()
+                            .range
+                    );
+                }
+                other => panic!("{name}: expected summary, got {other:?}"),
+            },
+        }
+        for col in 0..width {
+            let source = match model {
+                DenseCollapseRow::Raw {
+                    source_row,
+                    start,
+                    end,
+                    ..
+                } if (*start..*end).contains(&col) => Some(*source_row),
+                _ => None,
+            };
+            let origin = source.map(|source_row| RawCellOrigin {
+                row: ids[source_row],
+                col,
+            });
+            assert_eq!(
+                view.view_to_raw(ViewportCell { row, col }),
+                origin,
+                "{name}: doc={row}:{col}"
+            );
+            let cell = source.map_or(TerminalCell::default(), |source_row| {
+                original[source_row][col]
+            });
+            assert_eq!(
+                view.cells()[row][col],
+                cell,
+                "{name}: materialized doc={row}:{col}"
+            );
+        }
+    }
+    let mut visible = Vec::new();
+    for (source_row, id) in ids.iter().copied().enumerate() {
+        for col in 0..width {
+            let point = dense_visible_point(&expected, (source_row, col));
+            let origin = RawCellOrigin { row: id, col };
+            assert_eq!(
+                plan.selection_point_for_anchor(ProjectedSelectionAnchor::Cell(origin)),
+                point,
+                "{name}: selectable source={source_row}:{col}"
+            );
+            if let Some(point) = point {
+                visible.push(point);
+            } else {
+                let owner = ranges
+                    .iter()
+                    .find(|range| {
+                        let position = source_row * width + col;
+                        (range.start.0 * width + range.start.1..range.end.0 * width + range.end.1)
+                            .contains(&position)
+                    })
+                    .unwrap();
+                let summary = expected.iter().position(|row| matches!(row, DenseCollapseRow::Summary { zone, .. } if *zone == owner.zone)).unwrap();
+                assert_eq!(
+                    plan.document_row_for_anchor(ProjectedTopAnchor::RawCell(origin)),
+                    Some(summary),
+                    "{name}: hidden ownership"
+                );
+            }
+        }
+    }
+    if visible.is_empty() {
+        assert_eq!(
+            copy_projected_cells(
+                &plan,
+                &selected_all(&plan),
+                &terminal.scrollback,
+                &terminal.grid
+            ),
+            Some(String::new()),
+            "{name}: all hidden"
+        );
+    }
+    for &a in &visible {
+        for &b in &visible {
+            for mode in [SelectionMode::Normal, SelectionMode::Block] {
+                let mut selection = selected_all(&plan);
+                selection.anchor.point = a;
+                selection.active.point = b;
+                selection.mode = mode;
+                let expected_text = dense_collapse_text(&expected, &original, a, b, mode);
+                assert_eq!(
+                    copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid),
+                    Some(expected_text),
+                    "{name}: endpoints={a:?}..{b:?} mode={mode:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn partial_collapse_dense_model_matches_literal_counterexamples() {
+    use DenseCollapseRow::{Raw, Summary};
+    let raw = |source_row, start, end, wrapped| Raw {
+        source_row,
+        start,
+        end,
+        wrapped,
+    };
+    let range = |zone, start, end| DenseCollapseRange { zone, start, end };
+    check_dense_collapse_case(
+        "single-row partial",
+        dense_ascii(&["ABCDEF"]),
+        &[false],
+        &[range(1, (0, 2), (0, 4))],
+        &[
+            raw(0, 0, 2, false),
+            Summary {
+                zone: 1,
+                hidden_rows: 1,
+            },
+            raw(0, 4, 6, false),
+        ],
+        &[
+            ((0, 0), (0, 5), SelectionMode::Normal, "AB\nEF"),
+            ((0, 1), (0, 4), SelectionMode::Block, "B\nE"),
+        ],
+    );
+    check_dense_collapse_case(
+        "multi-row partial",
+        dense_ascii(&["ABCDEF", "GHIJKL", "MNOPQR"]),
+        &[true, true, false],
+        &[range(2, (1, 1), (2, 3))],
+        &[
+            raw(0, 0, 6, true),
+            raw(1, 0, 1, false),
+            Summary {
+                zone: 2,
+                hidden_rows: 2,
+            },
+            raw(2, 3, 6, false),
+        ],
+        &[((0, 4), (2, 5), SelectionMode::Normal, "EFG\nPQR")],
+    );
+    check_dense_collapse_case(
+        "hidden soft continuation",
+        dense_ascii(&["ABCDEF", "GHIJKL", "MNOPQR"]),
+        &[true, true, false],
+        &[range(3, (1, 0), (1, 6))],
+        &[
+            raw(0, 0, 6, true),
+            Summary {
+                zone: 3,
+                hidden_rows: 1,
+            },
+            raw(2, 0, 6, false),
+        ],
+        &[((0, 4), (2, 2), SelectionMode::Normal, "EF\nMNO")],
+    );
+    check_dense_collapse_case(
+        "adjacent distinct zones",
+        dense_ascii(&["ABCDEFGH"]),
+        &[false],
+        &[range(7, (0, 1), (0, 3)), range(8, (0, 3), (0, 6))],
+        &[
+            raw(0, 0, 1, false),
+            Summary {
+                zone: 7,
+                hidden_rows: 1,
+            },
+            Summary {
+                zone: 8,
+                hidden_rows: 1,
+            },
+            raw(0, 6, 8, false),
+        ],
+        &[((0, 0), (0, 7), SelectionMode::Normal, "A\nGH")],
+    );
+    check_dense_collapse_case(
+        "all hidden including blanks",
+        dense_ascii(&["ABCDEF", "      "]),
+        &[true, false],
+        &[range(9, (0, 0), (1, 6))],
+        &[Summary {
+            zone: 9,
+            hidden_rows: 2,
+        }],
+        &[],
+    );
+    check_dense_collapse_case(
+        "hidden prefix",
+        dense_ascii(&["ABCDEF"]),
+        &[false],
+        &[range(10, (0, 0), (0, 2))],
+        &[
+            Summary {
+                zone: 10,
+                hidden_rows: 1,
+            },
+            raw(0, 2, 6, false),
+        ],
+        &[((0, 2), (0, 5), SelectionMode::Normal, "CDEF")],
+    );
+    check_dense_collapse_case(
+        "hidden soft suffix",
+        dense_ascii(&["ABCDEF", "GHIJKL"]),
+        &[true, false],
+        &[range(11, (0, 2), (0, 6))],
+        &[
+            raw(0, 0, 2, false),
+            Summary {
+                zone: 11,
+                hidden_rows: 1,
+            },
+            raw(1, 0, 6, false),
+        ],
+        &[((0, 0), (1, 5), SelectionMode::Normal, "AB\nGHIJKL")],
+    );
+    check_dense_collapse_case(
+        "end at next row zero",
+        dense_ascii(&["ABCDEF", "GHIJKL"]),
+        &[false, false],
+        &[range(12, (0, 4), (1, 0))],
+        &[
+            raw(0, 0, 4, false),
+            Summary {
+                zone: 12,
+                hidden_rows: 1,
+            },
+            raw(1, 0, 6, false),
+        ],
+        &[((0, 2), (1, 1), SelectionMode::Normal, "CD\nGH")],
+    );
+    check_dense_collapse_case(
+        "empty rectangle intersection remains a traversed fragment",
+        dense_ascii(&["ABCDEF", "GHIJKL", "MNOPQR"]),
+        &[false, false, false],
+        &[range(14, (1, 0), (1, 4))],
+        &[
+            raw(0, 0, 6, false),
+            Summary {
+                zone: 14,
+                hidden_rows: 1,
+            },
+            raw(1, 4, 6, false),
+            raw(2, 0, 6, false),
+        ],
+        &[((0, 3), (2, 3), SelectionMode::Block, "D\n\nP")],
+    );
+    check_dense_collapse_case(
+        "start at previous row width",
+        dense_ascii(&["ABCDEF", "GHIJKL"]),
+        &[true, false],
+        &[range(15, (0, 6), (1, 2))],
+        &[
+            raw(0, 0, 6, true),
+            Summary {
+                zone: 15,
+                hidden_rows: 1,
+            },
+            raw(1, 2, 6, false),
+        ],
+        &[((0, 4), (1, 5), SelectionMode::Normal, "EF\nIJKL")],
+    );
+    check_dense_collapse_case(
+        "summary before selection does not break later soft continuation",
+        dense_ascii(&["ABCDEF", "GHIJKL"]),
+        &[true, false],
+        &[range(16, (0, 0), (0, 2))],
+        &[
+            Summary {
+                zone: 16,
+                hidden_rows: 1,
+            },
+            raw(0, 2, 6, true),
+            raw(1, 0, 6, false),
+        ],
+        &[((0, 4), (1, 3), SelectionMode::Normal, "EFGHIJ")],
+    );
+    let mut wide = dense_ascii(&["A中 BCD🙂 "]);
+    for col in [1, 6] {
+        wide[0][col].flags.set_wide(true);
+        wide[0][col + 1].flags.set_wide_continuation(true);
+    }
+    check_dense_collapse_case(
+        "whole wide pair hidden",
+        wide,
+        &[false],
+        &[range(13, (0, 1), (0, 3))],
+        &[
+            raw(0, 0, 1, false),
+            Summary {
+                zone: 13,
+                hidden_rows: 1,
+            },
+            raw(0, 3, 8, false),
+        ],
+        &[
+            ((0, 0), (0, 7), SelectionMode::Normal, "A\nBCD🙂"),
+            ((0, 7), (0, 7), SelectionMode::Normal, ""),
+        ],
+    );
+}
+
+#[test]
+#[should_panic(expected = "collapse must own at least one dense cell")]
+fn dense_collapse_model_rejects_zero_cell_seam_interval() {
+    dense_collapse_rows(
+        &dense_ascii(&["ABCDEF", "GHIJKL"]),
+        &[true, false],
+        &[DenseCollapseRange {
+            zone: 1,
+            start: (0, 6),
+            end: (1, 0),
+        }],
+    );
+}
+
+#[test]
+#[should_panic(expected = "admitted tuple intervals must not overlap")]
+fn dense_collapse_model_rejects_token_disjoint_tuple_overlap() {
+    dense_collapse_rows(
+        &dense_ascii(&["ABCDEF", "GHIJKL"]),
+        &[true, false],
+        &[
+            DenseCollapseRange {
+                zone: 1,
+                start: (0, 0),
+                end: (1, 0),
+            },
+            DenseCollapseRange {
+                zone: 2,
+                start: (0, 6),
+                end: (1, 1),
+            },
+        ],
+    );
+}
+
 #[test]
 fn seeded_projection_ten_thousand_sequences() {
     let replay = std::env::var("FROST_PROJECTION_CASE")
@@ -824,4 +1424,392 @@ fn wide_collapse_boundaries_and_adjacent_ranges_preserve_survivors() {
             2
         );
     }
+}
+
+const PARTIAL_SELECTION_SEED: u64 = 0x4652_4f53_5450_4152;
+const PARTIAL_SELECTION_CASES: usize = 2048;
+const PARTIAL_SELECTION_WIDTHS: [usize; 11] = [1, 2, 3, 4, 7, 13, 31, 80, 255, 256, 1024];
+
+// Construct hard/soft row boundaries from the original ledger. The eager
+// glyph packer does not inspect plans, slices, mappings or materialized cells.
+fn eager_history_rows(raw: &[Raw], width: usize) -> Vec<(Vec<Token>, bool)> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    for (index, row) in raw.iter().enumerate() {
+        if !row.wrapped || index + 1 == raw.len() {
+            let rows = eager_rows(&raw[start..=index], width);
+            let count = rows.len();
+            result.extend(
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, cells)| (cells, i + 1 < count)),
+            );
+            start = index + 1;
+        }
+    }
+    result
+}
+
+fn eager_selected_text(
+    rows: &[(Vec<Token>, bool)],
+    width: usize,
+    anchor: (usize, usize),
+    active: (usize, usize),
+    mode: SelectionMode,
+) -> String {
+    let (first, last) = (anchor.min(active), anchor.max(active));
+    let mut text = String::new();
+    for (row, (tokens, wrapped)) in rows.iter().enumerate().take(last.0 + 1).skip(first.0) {
+        for col in 0..width {
+            let selected = match mode {
+                SelectionMode::Normal => (first..=last).contains(&(row, col)),
+                SelectionMode::Block => {
+                    (anchor.1.min(active.1)..=anchor.1.max(active.1)).contains(&col)
+                }
+            };
+            if !selected {
+                continue;
+            }
+            if tokens.is_empty() {
+                // An empty logical line owns a selectable blank row. Padding
+                // at the end of a nonempty history line owns no raw cells.
+                text.push(' ');
+            } else if let Some((_, cell)) = tokens.get(col) {
+                if !cell.flags.wide_continuation() {
+                    text.push(cell.character);
+                }
+            }
+        }
+        if row != last.0 && (mode == SelectionMode::Block || !wrapped) {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn partial_selection_fixture(case: usize) -> (TerminalState, Vec<Raw>) {
+    let mut rng = Rng(PARTIAL_SELECTION_SEED.wrapping_add(case as u64));
+    let mut terminal = TerminalState::new(16, 2);
+    let mut raw = Vec::new();
+    for index in 0..(6 + rng.pick(7)) {
+        let length = 1 + rng.pick(64);
+        let kind = if index < 3 { index } else { rng.pick(5) };
+        let mut cells = match kind {
+            0 | 1 => vec![TerminalCell::default(); length],
+            2 => vec![
+                TerminalCell {
+                    hyperlink: 1 + rng.pick(u16::MAX as usize) as u16,
+                    ..Default::default()
+                };
+                length
+            ],
+            _ => corpus(&mut rng),
+        };
+        if kind == 1 {
+            // Compression retains these cells, while projection deliberately
+            // trims their style-only spaces. Every case has an empty hard row
+            // and an empty wrapped prefix, not just nonempty random text.
+            for cell in &mut cells {
+                cell.foreground = Color::Rgb(17, 83, 201);
+                cell.flags.set_blink(true);
+                cell.flags.set_underline(UnderlineStyle::Curly);
+            }
+        } else if kind >= 3 {
+            for cell in &mut cells {
+                if cell.character != ' ' && rng.pick(3) == 0 {
+                    cell.hyperlink = 1 + rng.pick(u16::MAX as usize) as u16;
+                    cell.flags.set_blink(true);
+                }
+            }
+        }
+        let wrapped = match index {
+            0 | 2 => false,
+            1 => true,
+            _ => rng.pick(2) == 0,
+        };
+        let line = ScrollbackLine::compress(&cells, wrapped);
+        assert_eq!(
+            line.decompress(),
+            cells,
+            "selection case={case} row={index}"
+        );
+        raw.push(Raw {
+            id: line.raw_row_id(),
+            cells,
+            wrapped,
+        });
+        terminal.scrollback.push_back(line);
+    }
+    (terminal, raw)
+}
+
+#[test]
+fn seeded_partial_history_selections_match_independent_eager_text() {
+    let replay = std::env::var("FROST_PROJECTION_SELECTION_CASE")
+        .ok()
+        .map(|s| s.parse::<usize>().unwrap());
+    let cases = replay.map_or(0..PARTIAL_SELECTION_CASES, |case| case..case + 1);
+    let mut checks = 0;
+    for case in cases {
+        let width = PARTIAL_SELECTION_WIDTHS[case % PARTIAL_SELECTION_WIDTHS.len()];
+        let (terminal, raw) = partial_selection_fixture(case);
+        let expected_rows = eager_history_rows(&raw, width);
+        let plan = ProjectionPlan::identity(
+            terminal
+                .scrollback
+                .iter()
+                .enumerate()
+                .map(|(i, row)| row.layout(i)),
+            [],
+            width,
+        );
+        assert_eq!(plan.rows.len(), expected_rows.len(), "case={case}");
+        let full = viewport(&terminal, &plan, 0, expected_rows.len());
+        for (row, (tokens, wrapped)) in expected_rows.iter().enumerate() {
+            assert_eq!(full.row_wrapped()[row], *wrapped, "case={case} row={row}");
+            for col in 0..width {
+                let expected = tokens.get(col);
+                assert_eq!(
+                    full.view_to_raw(ViewportCell { row, col }),
+                    expected.map(|(origin, _)| *origin),
+                    "case={case} row={row} col={col}"
+                );
+                assert_eq!(
+                    full.cells()[row][col],
+                    expected.map_or(TerminalCell::default(), |(_, cell)| *cell),
+                    "case={case} row={row} col={col}"
+                );
+            }
+        }
+        let mut rng = Rng(PARTIAL_SELECTION_SEED ^ case as u64);
+        for sample in 0..16 {
+            let anchor = (rng.pick(expected_rows.len()), rng.pick(width));
+            let active = (rng.pick(expected_rows.len()), rng.pick(width));
+            for mode in [SelectionMode::Normal, SelectionMode::Block] {
+                let expected = eager_selected_text(&expected_rows, width, anchor, active, mode);
+                for (start, end) in [(anchor, active), (active, anchor)] {
+                    let mut selection = selected_all(&plan);
+                    selection.anchor.point = start;
+                    selection.active.point = end;
+                    selection.mode = mode;
+                    assert_eq!(
+                        copy_projected_cells(
+                            &plan,
+                            &selection,
+                            &terminal.scrollback,
+                            &terminal.grid,
+                        )
+                        .as_deref(),
+                        Some(expected.as_str()),
+                        "seed={PARTIAL_SELECTION_SEED:#x} case={case} width={width} sample={sample} anchor={start:?} active={end:?} mode={mode:?}"
+                    );
+                    checks += 1;
+                }
+            }
+        }
+    }
+    println!("partial history selection properties: seed={PARTIAL_SELECTION_SEED:#x}, checks={checks}, widths={PARTIAL_SELECTION_WIDTHS:?}; replay with FROST_PROJECTION_SELECTION_CASE");
+}
+
+#[test]
+fn partial_history_selection_keeps_blank_rows_and_soft_wraps_distinct() {
+    let mut terminal = TerminalState::new(3, 2);
+    terminal.scrollback.push_back(ascii_row("AB", true));
+    let mut wide = vec![TerminalCell::default(); 4];
+    for (cell, character) in wide.iter_mut().zip(['C', '中', ' ', 'D']) {
+        cell.character = character;
+    }
+    wide[1].flags.set_wide(true);
+    wide[2].flags.set_wide_continuation(true);
+    terminal
+        .scrollback
+        .push_back(ScrollbackLine::compress(&wide, false));
+    terminal.scrollback.push_back(ascii_row("    ", false));
+    terminal.scrollback.push_back(ascii_row("E   ", false));
+    let plan = ProjectionPlan::identity(
+        terminal
+            .scrollback
+            .iter()
+            .enumerate()
+            .map(|(i, row)| row.layout(i)),
+        [],
+        3,
+    );
+    // At width 3: ABC (soft), 中·D (hard), a blank hard row, then E.
+    // These expectations are hand-written, independent of either oracle.
+    for (anchor, active, mode, expected) in [
+        ((0, 2), (3, 0), SelectionMode::Normal, "C中D\n   \nE"),
+        ((3, 0), (0, 2), SelectionMode::Normal, "C中D\n   \nE"),
+        ((0, 1), (3, 2), SelectionMode::Block, "BC\nD\n  \n"),
+        ((3, 2), (0, 1), SelectionMode::Block, "BC\nD\n  \n"),
+        ((1, 1), (1, 1), SelectionMode::Normal, ""),
+        ((2, 1), (2, 2), SelectionMode::Normal, "  "),
+        ((3, 1), (3, 2), SelectionMode::Normal, ""),
+    ] {
+        let mut selection = selected_all(&plan);
+        selection.anchor.point = anchor;
+        selection.active.point = active;
+        selection.mode = mode;
+        assert_eq!(
+            copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid)
+                .as_deref(),
+            Some(expected),
+            "anchor={anchor:?} active={active:?} mode={mode:?}"
+        );
+    }
+}
+// Independent diagnostic for live-grid selection with inserted host chrome.
+// Endpoints always belong to original raw cells; chrome-only selection and
+// spare-tail trimming are deliberately outside this corpus.
+const LIVE_CHROME_SEED: u64 = 0x4652_4f53_544c_4956;
+const LIVE_CHROME_CASES: usize = 1024;
+const LIVE_CHROME_WIDTHS: [usize; 11] = [1, 2, 3, 4, 7, 13, 31, 80, 255, 256, 1024];
+
+fn live_grid_expected_text(
+    original: &[Vec<TerminalCell>],
+    wrapped: &[bool],
+    anchor: (usize, usize),
+    active: (usize, usize),
+    mode: SelectionMode,
+) -> String {
+    let (first, last) = (anchor.min(active), anchor.max(active));
+    let mut output = String::new();
+    for (row, cells) in original.iter().enumerate().take(last.0 + 1).skip(first.0) {
+        for (col, cell) in cells.iter().enumerate() {
+            let selected = match mode {
+                SelectionMode::Normal => (first..=last).contains(&(row, col)),
+                SelectionMode::Block => {
+                    (anchor.1.min(active.1)..=anchor.1.max(active.1)).contains(&col)
+                }
+            };
+            if selected && !cell.flags.wide_continuation() {
+                output.push(cell.character);
+            }
+        }
+        if row != last.0 && (matches!(mode, SelectionMode::Block) || !wrapped[row]) {
+            output.push('\n');
+        }
+    }
+    output
+}
+
+#[test]
+fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
+    let replay = std::env::var("FROST_LIVE_CHROME_CASE")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("valid case index"));
+    assert!(replay.is_none_or(|case| case < LIVE_CHROME_CASES));
+    let mut checked = 0;
+    let mut accepted_boundaries = 0;
+    let mut rejected_boundaries = 0;
+    for case in 0..LIVE_CHROME_CASES {
+        if replay.is_some_and(|selected| selected != case) {
+            continue;
+        }
+        let mut rng = Rng(LIVE_CHROME_SEED.wrapping_add(case as u64));
+        let width = LIVE_CHROME_WIDTHS[case % LIVE_CHROME_WIDTHS.len()];
+        let rows = 2 + rng.pick(5);
+        let mut terminal = TerminalState::new(width, rows);
+        let mut original = Vec::new();
+        let mut wrapped = Vec::new();
+        let mut boundaries = Vec::new();
+        let mut expected_document = Vec::new();
+        let mut document_row_for_raw = Vec::new();
+        for row in 0..rows {
+            let mut cells = vec![TerminalCell::default(); width];
+            let mut col = 0;
+            while col < width {
+                let kind = rng.pick(7);
+                if kind == 0 && col + 1 < width {
+                    cells[col].character = if rng.pick(2) == 0 { '中' } else { '🙂' };
+                    cells[col].flags.set_wide(true);
+                    cells[col + 1].flags.set_wide_continuation(true);
+                    col += 2;
+                    continue;
+                }
+                if kind == 1 {
+                    cells[col].character = 'é';
+                } else if kind >= 4 {
+                    cells[col].character = char::from(b'a' + rng.pick(26) as u8);
+                } else if kind == 2 {
+                    cells[col].background = Color::Indexed(17);
+                    cells[col].flags.set_bold(true);
+                    cells[col].hyperlink = 1;
+                }
+                col += 1;
+            }
+            terminal.grid.set_row(row, cells.clone());
+            original.push(cells);
+            let soft = row + 1 < rows && rng.pick(2) == 0;
+            terminal.grid.row_wrapped[row] = soft;
+            wrapped.push(soft);
+            let chrome_rows = 1 + rng.pick(3);
+            boundaries.push(ChromeBoundary {
+                next: terminal.grid.raw_row_id(row).unwrap(),
+                kind: ChromeKind::Organism,
+                rows: chrome_rows,
+            });
+            // Native chrome is admitted only before a standalone raw row.
+            // Fixed grid rows are never joined or reflowed; a soft predecessor
+            // is the only failed admission condition in this fixture domain.
+            if row == 0 || !wrapped[row - 1] {
+                expected_document.extend(std::iter::repeat_n(None, chrome_rows));
+                accepted_boundaries += 1;
+            } else {
+                rejected_boundaries += 1;
+            }
+            document_row_for_raw.push(expected_document.len());
+            expected_document.push(Some(row));
+        }
+        let plan = terminal
+            .identity_projection_plan(width)
+            .splice_native_chrome(&boundaries, 0, rows);
+        assert_eq!(
+            plan.rows.len(),
+            expected_document.len(),
+            "case={case} width={width}"
+        );
+        let view = viewport(&terminal, &plan, 0, plan.rows.len());
+        for (document_row, raw_row) in expected_document.iter().enumerate() {
+            for col in 0..width {
+                let expected_origin = raw_row.map(|row| RawCellOrigin {
+                    row: terminal.grid.raw_row_id(row).unwrap(),
+                    col,
+                });
+                assert_eq!(
+                    view.view_to_raw(ViewportCell {
+                        row: document_row,
+                        col
+                    }),
+                    expected_origin,
+                    "case={case} width={width} document_row={document_row} col={col}"
+                );
+                if let Some(row) = raw_row {
+                    assert_eq!(view.cells()[document_row][col], original[*row][col]);
+                }
+            }
+        }
+        for sample in 0..16 {
+            let anchor = (rng.pick(rows), rng.pick(width));
+            let active = (rng.pick(rows), rng.pick(width));
+            for mode in [SelectionMode::Normal, SelectionMode::Block] {
+                let expected = live_grid_expected_text(&original, &wrapped, anchor, active, mode);
+                for (a, b) in [(anchor, active), (active, anchor)] {
+                    let mut selection = selected_all(&plan);
+                    selection.anchor.point = (document_row_for_raw[a.0], a.1);
+                    selection.active.point = (document_row_for_raw[b.0], b.1);
+                    selection.mode = mode;
+                    assert_eq!(copy_projected_cells(&plan, &selection, &terminal.scrollback, &terminal.grid),
+                               Some(expected.clone()),
+                               "seed={LIVE_CHROME_SEED:#x} case={case} width={width} sample={sample} a={a:?} b={b:?} mode={mode:?}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, if replay.is_some() { 64 } else { 65_536 });
+    if replay.is_none() {
+        assert!(accepted_boundaries > 0 && rejected_boundaries > 0);
+    }
+    eprintln!("live-grid/chrome seed={LIVE_CHROME_SEED:#x} checks={checked} accepted_boundaries={accepted_boundaries} rejected_boundaries={rejected_boundaries}");
 }
