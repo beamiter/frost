@@ -2206,6 +2206,67 @@ mod tests {
     }
 
     #[test]
+    fn loaded_deep_tree_summary_uses_first_observed_node_limit_exactly() {
+        let leaf = r#"{"kind":"leaf","session":0}"#;
+        let mut deep = leaf.to_string();
+        for _ in 0..65 {
+            deep = format!(r#"{{"kind":"split","axis":"vertical","children":[{deep},{leaf}]}}"#);
+        }
+        let contents = format!(
+            r#"{{"version":2,"sessions":[{{"cwd":null}}],"active_index":0,"tabs":[{{"tree":{leaf},"focus":0}},{{"tree":{deep}}}],"active_tab":0}}"#
+        );
+        let root = scratch("native-summary-1");
+        let path = root.join("session_history.json");
+        write_private(&path, &contents);
+        let SnapshotLoad::Loaded {
+            snapshot, report, ..
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("fixture must be a recoverable Loaded snapshot");
+        };
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.tabs.len(), 1);
+        assert_eq!(report.count(RepairKind::LayoutNodes), 1);
+        assert_eq!(report.count(RepairKind::LayoutDepth), 0);
+        assert_eq!(report.summary(), "1 layouts discarded at the node limit");
+    }
+
+    #[test]
+    fn loaded_35_sessions_summary_reports_three_skipped_and_32_retained_exactly() {
+        let sessions = std::iter::repeat_n(r#"{"cwd":null}"#, 35)
+            .collect::<Vec<_>>()
+            .join(",");
+        let tabs = (0..32)
+            .map(|index| {
+                format!(r#"{{"tree":{{"kind":"leaf","session":{index}}},"focus":{index}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let contents = format!(
+            r#"{{"version":2,"sessions":[{sessions}],"active_index":0,"tabs":[{tabs}],"active_tab":0}}"#
+        );
+        let root = scratch("native-summary-2");
+        let path = root.join("session_history.json");
+        write_private(&path, &contents);
+        let SnapshotLoad::Loaded {
+            snapshot, report, ..
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("fixture must be a recoverable Loaded snapshot");
+        };
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(snapshot.sessions.len(), 32);
+        assert_eq!(snapshot.tabs.len(), 32);
+        assert_eq!(report.count(RepairKind::ExtraSessions), 3);
+        assert_eq!(report.count(RepairKind::ExtraTabs), 0);
+        assert_eq!(
+            report.summary(),
+            "3 extra sessions skipped (restored only the first 32)"
+        );
+    }
+
+    #[test]
     fn recovery_resource_categories_are_observed_not_inferred_from_deep_input() {
         let leaf = r#"{"kind":"leaf","session":0}"#;
         let mut deep = leaf.to_string();

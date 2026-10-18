@@ -28,6 +28,14 @@ import uuid
 
 READY = 'FROSTRECOVERYREADY'
 SUMMARY = 'Recovered saved session: 1 invalid tab titles removed'
+CASE_SUMMARIES = {
+    'repaired': SUMMARY,
+    'blocked': SUMMARY,
+    'deep': 'Recovered saved session: 1 layouts discarded at the node limit',
+    'excess_sessions': ('Recovered saved session: 3 extra sessions skipped '
+                        '(restored only the first 32)'),
+}
+LIMIT_CASES = {'deep': 1, 'excess_sessions': 32}
 PRESERVED = 'The original saved session was preserved before repairs are saved.'
 PAUSED = ('The original saved session could not be preserved. Automatic session saving '
           'is paused for this run; terminals remain usable.')
@@ -46,16 +54,28 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def fixture_bytes(home, repaired):
+def fixture_bytes(home, case):
+    require(case in ('clean', *CASE_SUMMARIES), 'Unknown fixture case')
     snapshot = {
         'version': 2,
         'sessions': [{'cwd': str(home)}],
         'active_index': 0,
         'tabs': [{'tree': {'kind': 'leaf', 'session': 0}, 'focus': 0,
-                  'title': 'bad\u0001title' if repaired else 'R07 CLEAN',
+                  'title': 'bad\u0001title' if case in ('repaired', 'blocked') else 'R07 CLEAN',
                   'pinned': False, 'marked': False, 'private_title': False}],
         'active_tab': 0,
     }
+    if case == 'deep':
+        deep = {'kind': 'leaf', 'session': 0}
+        for _ in range(65):
+            deep = {'kind': 'split', 'axis': 'vertical', 'ratios': [0.5, 0.5],
+                    'children': [deep, {'kind': 'leaf', 'session': 0}]}
+        snapshot['tabs'][0]['title'] = None
+        snapshot['tabs'].append(dict(snapshot['tabs'][0], tree=deep))
+    elif case == 'excess_sessions':
+        snapshot['sessions'] = [{'cwd': str(home)} for _ in range(35)]
+        snapshot['tabs'] = [dict(snapshot['tabs'][0], tree={'kind': 'leaf', 'session': index},
+                                 focus=index, title=None) for index in range(32)]
     return (json.dumps(snapshot, indent=2) + '\n').encode()
 
 
@@ -165,12 +185,12 @@ def banner_evidence(words, expected):
                 'Unexpected preservation notice')
         require(not [word for word in words if word['text'] == 'Dismiss'], 'Unexpected Dismiss button')
         return {'expected': expected, 'positive_anchor': READY}
-    require(expected in ('repaired', 'blocked'), 'Unknown expected banner state')
+    require(expected in CASE_SUMMARIES, 'Unknown expected banner state')
     dismiss = unique_dismiss(words)
     # The button is a separate action column, not part of a wrapped paragraph.
     # Restrict text to the actual column left of its unique measured box.
     report_words = [word for word in words if word['left'] + word['width'] <= dismiss['left']]
-    summary = exact_phrase(report_words, SUMMARY)
+    summary = exact_phrase(report_words, CASE_SUMMARIES[expected])
     notice = exact_phrase(report_words, PAUSED if expected == 'blocked' else PRESERVED)
     require(len(summary) == len(notice) == 1, 'Missing or ambiguous exact recovery/preservation wording')
     matched = summary[0] + notice[0]
@@ -181,7 +201,7 @@ def banner_evidence(words, expected):
             'Dismiss is not vertically adjacent to the recovery banner')
     require(dismiss['left'] > min(word['left'] for word in matched) + 150,
             'Dismiss is not in the banner action column')
-    return {'expected': expected, 'summary': SUMMARY,
+    return {'expected': expected, 'summary': CASE_SUMMARIES[expected],
             'notice': PAUSED if expected == 'blocked' else PRESERVED,
             'positive_anchor': READY, 'dismiss': dismiss}
 
@@ -196,6 +216,35 @@ def parse_record(line):
     rows, cols = map(int, dimensions)
     require(rows > 0 and cols > 0, 'PTY dimensions must be positive')
     return {'label': label, 'pid': int(pid), 'tty': tty, 'rows': rows, 'cols': cols}
+
+
+def parse_shell_starts(data, parent_pid):
+    starts = []
+    for line in data.splitlines(keepends=True):
+        if not line.endswith('\n'):
+            continue  # A concurrent single append may not have completed yet.
+        parts = line.rstrip('\n').split('\t')
+        require(len(parts) == 3 and all(value.isdecimal() for value in parts[:2]),
+                'Malformed fixture shell-start record')
+        pid, parent = map(int, parts[:2])
+        require(pid > 1 and pid != parent and parent == parent_pid and parts[2].startswith('/dev/pts/'),
+                'Fixture shell-start record does not identify a child of this Frost process')
+        starts.append({'pid': pid, 'parent': parent, 'tty': parts[2]})
+    require(len(starts) <= 35 and len({item['pid'] for item in starts}) == len(starts)
+            and len({item['tty'] for item in starts}) == len(starts),
+            'Duplicate or excessive fixture shell-start records')
+    return starts
+
+
+def verify_shell_owner(status, environ, parent_pid, parent_running, marker, owner):
+    fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
+    require(fields.get('Uid', '').split() == [str(owner)] * 4,
+            'Fixture shell UID does not match the test user')
+    parent = fields.get('PPid', '').strip()
+    require(parent == str(parent_pid) or (not parent_running and parent == '1'),
+            'Fixture shell is not owned by this Frost process')
+    require(('FROST_RECOVERY_RECORD=' + str(marker)).encode() in environ.split(b'\0'),
+            'Fixture shell environment does not belong to this isolated case')
 
 
 def identity(record):
@@ -369,6 +418,8 @@ class Case:
         self.window = None
         self.original = None
         self.counter = 0
+        self.shell_handles = {}
+        self.shell_starts = self.out / 'fixture-shell-starts.tsv'
         self.started = time.monotonic()
         self.result.update(case=name, status='running', shell_records=[], assertions=[])
 
@@ -395,6 +446,83 @@ class Case:
 
     def ready(self, label):
         return self.record(label, 'clear; r07_ready', original=self.original is not None)
+
+    def track_fixture_shells(self):
+        """Only limit cases register shell identities; never signal by bare PID."""
+        if self.name not in LIMIT_CASES or self.app is None or not self.shell_starts.exists():
+            return []
+        starts = parse_shell_starts(read_regular(self.shell_starts)[0].decode(), self.app.pid)
+        for item in starts:
+            pid = item['pid']
+            if pid in self.shell_handles:
+                continue
+            fd = None
+            try:
+                fd = os.pidfd_open(pid)
+                proc = Path('/proc') / str(pid)
+                status = (proc / 'status').read_text()
+                with (proc / 'environ').open('rb') as stream:
+                    environ = stream.read(1024 * 1024 + 1)
+                require(len(environ) <= 1024 * 1024, 'Fixture shell environment exceeds safety cap')
+                verify_shell_owner(status, environ, self.app.pid, self.app.poll() is None,
+                                   self.records, os.geteuid())
+                self.shell_handles[pid] = fd
+                fd = None
+            except (ProcessLookupError, FileNotFoundError):
+                # A failed startup/close can already have reaped its own child.
+                require(self.app.poll() is not None, 'Fixture shell exited during restoration')
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        return starts
+
+    def verify_restored_shells(self):
+        expected = LIMIT_CASES[self.name]
+        require(hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'),
+                'Linux pidfd ownership tracking is required for limit fixtures')
+        def ready():
+            starts = self.track_fixture_shells()
+            require(len(starts) <= expected, 'More fixture shells spawned than the accepted limit')
+            require(not any(select.select([fd], [], [], 0)[0] for fd in self.shell_handles.values()),
+                    'An accepted fixture shell exited before restoration verification')
+            return starts if len(starts) == len(self.shell_handles) == expected else None
+        starts = self.module.wait_for(ready, f'{expected} verified live fixture shells', timeout=10)
+        require(self.original['pid'] in self.shell_handles, 'Active shell missing from owned restore set')
+        require(any(item['pid'] == self.original['pid'] and item['tty'] == self.original['tty']
+                    for item in starts), 'Active shell TTY differs from its verified startup identity')
+        self.result['restored_shells'] = starts
+        self.result['assertions'].append(f'Exactly {expected} live restored shells verified by parent, UID, case environment and pidfd')
+
+    def cleanup_fixture_shells(self):
+        """Bounded cleanup of pinned, previously verified fixture processes only."""
+        if not self.shell_handles:
+            return
+        def alive():
+            return [pid for pid, fd in self.shell_handles.items()
+                    if not select.select([fd], [], [], 0)[0]]
+        before = alive()
+        try:
+            for signum in (signal.SIGTERM, signal.SIGKILL):
+                for pid in alive():
+                    try:
+                        signal.pidfd_send_signal(self.shell_handles[pid], signum)
+                    except ProcessLookupError:
+                        pass
+                deadline = time.monotonic() + 1
+                while alive() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            remaining = alive()
+            self.result['fixture_shell_cleanup'] = {
+                'verified_count': len(self.shell_handles),
+                'survived_app_shutdown': before, 'remaining': remaining,
+            }
+            require(not remaining, 'Verified fixture shells survived bounded pidfd cleanup')
+            require(not before or self.result['status'] != 'pass',
+                    'Frost left verified fixture shells alive after graceful close')
+        finally:
+            for fd in self.shell_handles.values():
+                os.close(fd)
+            self.shell_handles.clear()
 
     def observe(self, expected, label):
         deadline = min(self.deadline, time.monotonic() + 12)
@@ -465,7 +593,7 @@ class Case:
 
     def backups(self):
         files = sorted(self.snapshot.parent.glob('session_history.json.recovered-*'))
-        require(len(files) == (1 if self.name == 'repaired' else 0), 'Unexpected original-backup count')
+        require(len(files) == (0 if self.name in ('clean', 'blocked') else 1), 'Unexpected original-backup count')
         for path in files:
             uuid.UUID(path.name.removeprefix('session_history.json.recovered-'))
             require(read_regular(path)[0] == self.raw, 'Backup differs from exact input bytes')
@@ -514,6 +642,9 @@ class Case:
 
     def execute(self):
         self.budget()
+        if self.name in LIMIT_CASES:
+            require(hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'),
+                    'Linux pidfd ownership tracking is required for limit fixtures')
         smoke = self.smoke
         self.runtime = ShortRuntime()
         smoke.env['XDG_RUNTIME_DIR'] = str(self.runtime.path)
@@ -531,7 +662,13 @@ class Case:
 r07() { printf '%s\t%s\t%s\t%s\n' "$1" "$$" "$(tty)" "$(stty size)" >> "$FROST_RECOVERY_RECORD"; }
 r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\105\101\104\131\n'; }
 ''')
-        self.raw = fixture_bytes(home, self.name != 'clean')
+            if self.name in LIMIT_CASES:
+                write_new_private(self.shell_starts, b'')
+                smoke.env['FROST_RECOVERY_SHELL_STARTS'] = str(self.shell_starts)
+                profile.write(r'''
+printf '%s\t%s\t%s\n' "$$" "$PPID" "$(tty)" >> "$FROST_RECOVERY_SHELL_STARTS"
+''')
+        self.raw = fixture_bytes(home, self.name)
         self.snapshot = smoke.config.parent / 'session_history.json'
         write_new_private(self.snapshot, self.raw)
         self.source_inode = read_regular(self.snapshot)[1]
@@ -557,8 +694,10 @@ r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\1
         require((smoke.config.parent / 'instance.lock').read_text() == str(self.app.pid),
                 'Test process did not acquire the real first-instance lock')
         self.original = self.ready('original-ready')
+        if self.name in LIMIT_CASES:
+            self.verify_restored_shells()
         expected = 'absent' if self.name == 'clean' else self.name
-        self.observe(expected, 'startup')
+        startup = self.observe(expected, 'startup')
         self.backups()
         if self.name == 'blocked':
             self.directory.verify()
@@ -570,10 +709,13 @@ r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\1
             self.check_original_unchanged('permission restored and two autosave ticks elapsed', wait=True)
         if self.name == 'repaired':
             self.geometry()
-        self.tab_round_trip('visible-banner')
-        self.ready('after-tab-ready')
-        evidence = self.observe(expected, 'after-successful-tab-actions')
-        if self.name != 'clean':
+        if self.name in LIMIT_CASES:
+            self.dismiss(startup)
+        else:
+            self.tab_round_trip('visible-banner')
+            self.ready('after-tab-ready')
+            evidence = self.observe(expected, 'after-successful-tab-actions')
+        if self.name not in ('clean', *LIMIT_CASES):
             if self.name == 'blocked':
                 self.check_original_unchanged('successful tab creation while banner visible')
             self.dismiss(evidence)
@@ -595,11 +737,18 @@ r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\1
             self.check_original_unchanged('graceful close with a writable directory')
         else:
             saved = json.loads(read_regular(self.snapshot)[0])
-            require(len(saved['sessions']) == (2 if self.name == 'clean' else 3),
-                    'Successful tab operations were not persisted')
+            expected_count = LIMIT_CASES.get(self.name, 2 if self.name == 'clean' else 3)
+            require(len(saved['sessions']) == expected_count,
+                    f'Expected exactly {expected_count} persisted accepted sessions; restore/spawn/save mismatch')
+            if self.name in LIMIT_CASES:
+                require(len(saved['tabs']) == expected_count,
+                        'Accepted limit-fixture tabs were lost when saving')
+                self.result['saved_accepted_sessions'] = expected_count
             if self.name == 'repaired':
                 require(saved['tabs'][0].get('title') is None, 'Invalid fixture title was persisted')
-            self.result['assertions'].append('Ordinary session writes persisted the actual new tabs after close')
+            self.result['assertions'].append('Ordinary session writes persisted the accepted sessions after close'
+                                             if self.name in LIMIT_CASES else
+                                             'Ordinary session writes persisted the actual new tabs after close')
         self.backups()
         lines = self.records.read_text().splitlines(keepends=True)
         require(all(line.endswith('\n') for line in lines), 'Incomplete final shell record')
@@ -612,6 +761,10 @@ r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\1
     def cleanup(self):
         errors = []
         try:
+            self.track_fixture_shells()
+        except Exception as error:
+            errors.append('fixture shell registration: ' + repr(error))
+        try:
             if self.directory is not None:
                 self.directory.close()
         except Exception as error:
@@ -620,6 +773,10 @@ r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\1
             self.smoke.close()
         except Exception as error:
             errors.append('process cleanup: ' + repr(error))
+        try:
+            self.cleanup_fixture_shells()
+        except Exception as error:
+            errors.append('fixture shell cleanup: ' + repr(error))
         try:
             if self.runtime is not None:
                 # Remove only after every tracked compositor/app process stops.
@@ -671,7 +828,7 @@ def main(argv=None):
     started = time.monotonic()
     deadline = started + SUITE_BUDGET_SECONDS
     try:
-        for name in ('clean', 'repaired', 'blocked'):
+        for name in ('clean', 'repaired', 'blocked', 'deep', 'excess_sessions'):
             details = {}
             result['cases'].append(details)
             case = Case(module, args, name, details, deadline)
@@ -712,11 +869,74 @@ class PureTests(unittest.TestCase):
         return output
 
     def test_minimal_fixture_has_only_one_title_defect(self):
-        clean = json.loads(fixture_bytes(Path('/synthetic/home'), False))
-        repaired = json.loads(fixture_bytes(Path('/synthetic/home'), True))
+        clean = json.loads(fixture_bytes(Path('/synthetic/home'), 'clean'))
+        repaired = json.loads(fixture_bytes(Path('/synthetic/home'), 'repaired'))
         repaired['tabs'][0]['title'] = clean['tabs'][0]['title']
         self.assertEqual(clean, repaired)
         self.assertEqual(clean['tabs'][0]['tree'], {'kind': 'leaf', 'session': 0})
+
+    def test_deep_fixture_keeps_active_valid_tab_before_65_nested_splits(self):
+        fixture = json.loads(fixture_bytes(Path('/synthetic/home'), 'deep'))
+        self.assertEqual(len(fixture['sessions']), 1)
+        self.assertEqual(fixture['active_tab'], 0)
+        self.assertEqual(fixture['tabs'][0]['tree'], {'kind': 'leaf', 'session': 0})
+        tree = fixture['tabs'][1]['tree']
+        count = 0
+        while tree['kind'] == 'split':
+            self.assertEqual(tree['axis'], 'vertical')
+            self.assertEqual(tree['ratios'], [0.5, 0.5])
+            self.assertEqual(tree['children'][1], {'kind': 'leaf', 'session': 0})
+            tree = tree['children'][0]
+            count += 1
+        self.assertEqual(count, 65)
+        self.assertEqual(tree, {'kind': 'leaf', 'session': 0})
+        self.assertTrue(all(tab['title'] is None for tab in fixture['tabs']))
+
+    def test_excess_fixture_is_35_sessions_with_32_distinct_valid_tabs(self):
+        fixture = json.loads(fixture_bytes(Path('/synthetic/home'), 'excess_sessions'))
+        self.assertEqual(fixture['sessions'], [{'cwd': '/synthetic/home'}] * 35)
+        self.assertEqual(len(fixture['tabs']), 32)
+        self.assertEqual(fixture['active_index'], fixture['active_tab'])
+        self.assertEqual(fixture['active_tab'], 0)
+        for index, tab in enumerate(fixture['tabs']):
+            self.assertEqual(tab['tree'], {'kind': 'leaf', 'session': index})
+            self.assertEqual(tab['focus'], index)
+            self.assertIsNone(tab['title'])
+
+    def test_limit_banners_require_the_exact_case_specific_summary(self):
+        for case in LIMIT_CASES:
+            words = self.words([PRESERVED, CASE_SUMMARIES[case], READY])
+            words.append({'text': 'Dismiss', 'confidence': 95, 'left': 1100, 'top': 50,
+                          'width': 60, 'height': 15, 'line': (1, 99, 1, 1)})
+            self.assertEqual(banner_evidence(words, case)['summary'], CASE_SUMMARIES[case])
+            self.assertRaises(AssertionError, banner_evidence, words, 'repaired')
+            other = 'deep' if case == 'excess_sessions' else 'excess_sessions'
+            self.assertRaises(AssertionError, banner_evidence, words, other)
+
+    def test_shell_manifest_requires_unique_children_of_exact_parent(self):
+        data = ''.join(f'{200 + index}\t123\t/dev/pts/{index}\n' for index in range(32))
+        self.assertEqual(len(parse_shell_starts(data, 123)), 32)
+        self.assertEqual(len(parse_shell_starts(data + 'partial', 123)), 32)
+        for bad in ('200\t999\t/dev/pts/0\n', '1\t123\t/dev/pts/0\n',
+                    '123\t123\t/dev/pts/0\n', '200\t123\t/dev/null\n',
+                    '200\t123\t/dev/pts/0\n200\t123\t/dev/pts/1\n',
+                    '200\t123\t/dev/pts/0\n201\t123\t/dev/pts/0\n'):
+            self.assertRaises(AssertionError, parse_shell_starts, bad, 123)
+
+    def test_shell_owner_requires_uid_parent_and_exact_case_marker(self):
+        status = 'Name:\tbash\nPPid:\t123\nUid:\t1000\t1000\t1000\t1000\n'
+        marker = Path('/synthetic/owned/shell-records.tsv')
+        environ = b'HOME=/synthetic/home\0FROST_RECOVERY_RECORD=' + str(marker).encode() + b'\0'
+        verify_shell_owner(status, environ, 123, True, marker, 1000)
+        verify_shell_owner(status.replace('PPid:\t123', 'PPid:\t1'), environ,
+                           123, False, marker, 1000)
+        for bad_status, bad_environ in (
+                (status.replace('PPid:\t123', 'PPid:\t999'), environ),
+                (status.replace('PPid:\t123', 'PPid:\t1'), environ),
+                (status.replace('1000', '1001'), environ),
+                (status, environ.replace(b'records.tsv', b'records.tsv-other'))):
+            self.assertRaises(AssertionError, verify_shell_owner, bad_status, bad_environ,
+                              123, True, marker, 1000)
 
     def test_ocr_boxes_map_outward_without_changing_text_or_confidence(self):
         original = dict(self.words(['Dismiss'])[0], left=201, top=101, width=121, height=31)
