@@ -616,13 +616,15 @@ fn dense_ascii(rows: &[&str]) -> Vec<Vec<TerminalCell>> {
         .collect()
 }
 
+type DenseLiteralText<'a> = ((usize, usize), (usize, usize), SelectionMode, &'a str);
+
 fn check_dense_collapse_case(
     name: &str,
     original: Vec<Vec<TerminalCell>>,
     wrapped: &[bool],
     ranges: &[DenseCollapseRange],
     literal_rows: &[DenseCollapseRow],
-    literal_texts: &[((usize, usize), (usize, usize), SelectionMode, &str)],
+    literal_texts: &[DenseLiteralText<'_>],
 ) {
     let width = original[0].len();
     assert!(original.iter().all(|row| row.len() == width));
@@ -710,7 +712,7 @@ fn check_dense_collapse_case(
                 other => panic!("{name}: expected summary, got {other:?}"),
             },
         }
-        for col in 0..width {
+        for (col, _) in original[0].iter().enumerate() {
             let source = match model {
                 DenseCollapseRow::Raw {
                     source_row,
@@ -1771,7 +1773,7 @@ fn seeded_live_grid_raw_endpoint_copy_is_invariant_under_legal_chrome() {
         );
         let view = viewport(&terminal, &plan, 0, plan.rows.len());
         for (document_row, raw_row) in expected_document.iter().enumerate() {
-            for col in 0..width {
+            for (col, _) in original[0].iter().enumerate() {
                 let expected_origin = raw_row.map(|row| RawCellOrigin {
                     row: terminal.grid.raw_row_id(row).unwrap(),
                     col,
