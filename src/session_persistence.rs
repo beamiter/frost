@@ -1,5 +1,7 @@
 //! 会话持久化：记录每个标签页的工作目录与活动索引，在重启后恢复。
 //! 端口自 ember `session_persistence.rs`，精简为 frost 实际需要的字段。
+use crate::recovery_report::RepairKind;
+pub use crate::recovery_report::{PreservationOutcome, RecoveryReport};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -94,9 +96,45 @@ pub enum SnapshotLoad {
     Missing,
     /// Boxed：快照本体比另外两个 variant 大一个数量级，而这个枚举在启动时
     /// 只会构造一次，多一次间接寻址换的是每个调用点都不用搬 240 字节。
-    Loaded(Box<SessionsSnapshot>),
+    Loaded {
+        snapshot: Box<SessionsSnapshot>,
+        report: RecoveryReport,
+        /// Exact bounded bytes kept until startup reference validation finishes.
+        original: Option<String>,
+    },
     /// 文件存在但读不出来或解析不了；字节仍在原处等待隔离。
     Unreadable(String),
+}
+
+/// Preserve exactly the bounded bytes consumed by this load, even if the
+/// source pathname has since been replaced or removed. The existing publisher
+/// validates the private parent, uses a no-replace destination, and fsyncs.
+/// Never delete old backups or move the possibly changed live source here.
+pub fn prepare_repaired_snapshot(
+    path: &Path,
+    report: &RecoveryReport,
+    original: Option<&str>,
+) -> PreservationOutcome {
+    if report.is_empty() {
+        return PreservationOutcome::Unchanged;
+    }
+    let Some(original) = original else {
+        return PreservationOutcome::Blocked;
+    };
+    let Some(name) = path.file_name() else {
+        return PreservationOutcome::Blocked;
+    };
+    let mut backup_name = name.to_os_string();
+    backup_name.push(format!(".recovered-{}", uuid::Uuid::new_v4()));
+    let backup = path.with_file_name(backup_name);
+    match crate::persistence::write_new_private_file(
+        &backup,
+        original.as_bytes(),
+        MAX_SNAPSHOT_BYTES,
+    ) {
+        Ok(()) => PreservationOutcome::Preserved,
+        Err(_) => PreservationOutcome::Blocked,
+    }
 }
 
 /// 单个会话快照（frost 仅需要 cwd 来重新 spawn）。
@@ -192,26 +230,16 @@ pub struct SessionsSnapshot {
 #[derive(Clone, Copy)]
 struct DecodeBudget {
     text: jterm_core::bounded_json::TextBudget,
-    extra_sessions: usize,
-    invalid_cwds: usize,
-    invalid_titles: usize,
-    invalid_tab_layouts: bool,
-    invalid_legacy_tree: bool,
-    invalid_legacy_split: bool,
-    active_tab_repaired: bool,
+    report: RecoveryReport,
+    layout_failure: Option<RepairKind>,
 }
 
 impl DecodeBudget {
     fn new(text_bytes: usize) -> Self {
         Self {
             text: jterm_core::bounded_json::TextBudget::new(text_bytes),
-            extra_sessions: 0,
-            invalid_cwds: 0,
-            invalid_titles: 0,
-            invalid_tab_layouts: false,
-            invalid_legacy_tree: false,
-            invalid_legacy_split: false,
-            active_tab_repaired: false,
+            report: RecoveryReport::default(),
+            layout_failure: None,
         }
     }
 
@@ -223,39 +251,12 @@ impl DecodeBudget {
         self.text.charge(field, bytes)
     }
 
-    fn warnings(self, restored_sessions: usize) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if self.extra_sessions > 0 {
-            warnings.push(format!(
-                "restored only the first {MAX_RESTORED_SESSIONS} of {} sessions",
-                restored_sessions + self.extra_sessions
-            ));
-        }
-        if self.invalid_cwds > 0 {
-            warnings.push(format!(
-                "discarded {} oversized or invalid working directories",
-                self.invalid_cwds
-            ));
-        }
-        if self.invalid_titles > 0 {
-            warnings.push(format!(
-                "discarded {} oversized or invalid tab titles",
-                self.invalid_titles
-            ));
-        }
-        if self.invalid_tab_layouts {
-            warnings.push("discarded oversized or invalid tab layouts".to_string());
-        }
-        if self.invalid_legacy_tree {
-            warnings.push("discarded invalid legacy pane layout".to_string());
-        }
-        if self.invalid_legacy_split {
-            warnings.push("discarded invalid legacy split layout".to_string());
-        }
-        if self.active_tab_repaired {
-            warnings.push("active tab index was outside the restored list".to_string());
-        }
-        warnings
+    /// Roll back discarded fields and owned-text charges, then account for
+    /// exactly one whole-object discard, with its observed resource reason.
+    fn discard(&mut self, before: Self, fallback: RepairKind) {
+        let reason = self.layout_failure.unwrap_or(fallback);
+        *self = before;
+        self.report.add(reason, 1);
     }
 }
 
@@ -387,7 +388,7 @@ impl serde::de::Visitor<'_> for CwdValueVisitor<'_> {
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
         if restored_cwd_is_unsafe(value) {
-            self.budget.invalid_cwds += 1;
+            self.budget.report.add(RepairKind::InvalidCwd, 1);
             return Ok(None);
         }
         self.budget.charge_text::<E>("cwd", value.len())?;
@@ -485,7 +486,7 @@ impl<'de> serde::de::Visitor<'de> for SessionsSeed<'_> {
             sessions.push(session);
         }
         while seq.next_element_seed(DiscardSessionSeed)?.is_some() {
-            budget.extra_sessions = budget.extra_sessions.saturating_add(1);
+            budget.report.add(RepairKind::ExtraSessions, 1);
         }
         Ok(sessions)
     }
@@ -711,9 +712,11 @@ impl serde::de::Visitor<'_> for AxisSeed<'_> {
     }
 }
 
-struct RatiosSeed;
+struct RatiosSeed<'a> {
+    budget: &'a mut DecodeBudget,
+}
 
-impl<'de> serde::de::DeserializeSeed<'de> for RatiosSeed {
+impl<'de> serde::de::DeserializeSeed<'de> for RatiosSeed<'_> {
     type Value = Vec<f32>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -724,7 +727,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for RatiosSeed {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for RatiosSeed {
+impl<'de> serde::de::Visitor<'de> for RatiosSeed<'_> {
     type Value = Vec<f32>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -748,14 +751,18 @@ impl<'de> serde::de::Visitor<'de> for RatiosSeed {
         }
         // The old sanitizer silently truncated surplus ratios to the pane
         // count. Preserve that compatibility without constructing them.
-        while seq.next_element::<f32>()?.is_some() {}
+        while seq.next_element::<f32>()?.is_some() {
+            self.budget.report.add(RepairKind::LayoutAdjusted, 1);
+        }
         Ok(ratios)
     }
 }
 
-struct PanesSeed;
+struct PanesSeed<'a> {
+    budget: &'a mut DecodeBudget,
+}
 
-impl<'de> serde::de::DeserializeSeed<'de> for PanesSeed {
+impl<'de> serde::de::DeserializeSeed<'de> for PanesSeed<'_> {
     type Value = Vec<usize>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -766,7 +773,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for PanesSeed {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for PanesSeed {
+impl<'de> serde::de::Visitor<'de> for PanesSeed<'_> {
     type Value = Vec<usize>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -791,6 +798,7 @@ impl<'de> serde::de::Visitor<'de> for PanesSeed {
             panes.push(pane);
         }
         if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            self.budget.layout_failure = Some(RepairKind::LayoutPanes);
             return Err(A::Error::custom(format_args!(
                 "legacy split exceeds its {MAX_RESTORED_PANES_PER_TAB}-pane limit"
             )));
@@ -843,13 +851,17 @@ impl<'de> serde::de::Visitor<'de> for SplitSeed<'_> {
                     if ratios.is_some() {
                         return Err(A::Error::duplicate_field("ratios"));
                     }
-                    ratios = Some(map.next_value_seed(RatiosSeed)?);
+                    ratios = Some(map.next_value_seed(RatiosSeed {
+                        budget: self.budget,
+                    })?);
                 }
                 SnapshotField::Panes => {
                     if panes.is_some() {
                         return Err(A::Error::duplicate_field("panes"));
                     }
-                    panes = Some(map.next_value_seed(PanesSeed)?);
+                    panes = Some(map.next_value_seed(PanesSeed {
+                        budget: self.budget,
+                    })?);
                 }
                 SnapshotField::Focused => {
                     if focused.is_some() {
@@ -984,9 +996,11 @@ impl<'de> serde::de::Visitor<'de> for RawTreeNodeSeed {
     }
 }
 
-struct RawChildrenSeed;
+struct RawChildrenSeed<'a> {
+    budget: &'a mut DecodeBudget,
+}
 
-impl<'de> serde::de::DeserializeSeed<'de> for RawChildrenSeed {
+impl<'de> serde::de::DeserializeSeed<'de> for RawChildrenSeed<'_> {
     type Value = Vec<&'de serde_json::value::RawValue>;
 
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -997,7 +1011,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for RawChildrenSeed {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for RawChildrenSeed {
+impl<'de> serde::de::Visitor<'de> for RawChildrenSeed<'_> {
     type Value = Vec<&'de serde_json::value::RawValue>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1022,6 +1036,7 @@ impl<'de> serde::de::Visitor<'de> for RawChildrenSeed {
             children.push(raw);
         }
         if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            self.budget.layout_failure = Some(RepairKind::LayoutPanes);
             return Err(A::Error::custom(format_args!(
                 "pane split exceeds its {MAX_RESTORED_PANES_PER_TAB}-child limit"
             )));
@@ -1043,19 +1058,24 @@ fn decode_axis(
     Ok(axis)
 }
 
-fn decode_ratios(raw: &serde_json::value::RawValue) -> Result<Vec<f32>, serde_json::Error> {
+fn decode_ratios(
+    raw: &serde_json::value::RawValue,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<f32>, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    let ratios = serde::de::DeserializeSeed::deserialize(RatiosSeed, &mut deserializer)?;
+    let ratios = serde::de::DeserializeSeed::deserialize(RatiosSeed { budget }, &mut deserializer)?;
     deserializer.end()?;
     drop(deserializer);
     Ok(ratios)
 }
 
-fn decode_raw_children(
-    raw: &serde_json::value::RawValue,
-) -> Result<Vec<&serde_json::value::RawValue>, serde_json::Error> {
+fn decode_raw_children<'a>(
+    raw: &'a serde_json::value::RawValue,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<&'a serde_json::value::RawValue>, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    let children = serde::de::DeserializeSeed::deserialize(RawChildrenSeed, &mut deserializer)?;
+    let children =
+        serde::de::DeserializeSeed::deserialize(RawChildrenSeed { budget }, &mut deserializer)?;
     deserializer.end()?;
     drop(deserializer);
     Ok(children)
@@ -1068,11 +1088,13 @@ fn decode_tree_node(
     depth: usize,
 ) -> Result<PaneTreeSnapshot, serde_json::Error> {
     if depth > MAX_RESTORED_LAYOUT_DEPTH {
+        budget.layout_failure = Some(RepairKind::LayoutDepth);
         return Err(<serde_json::Error as serde::de::Error>::custom(
             format_args!("pane tree exceeds its {MAX_RESTORED_LAYOUT_DEPTH}-level depth limit"),
         ));
     }
     if tree_budget.nodes >= MAX_RESTORED_LAYOUT_NODES {
+        budget.layout_failure = Some(RepairKind::LayoutNodes);
         return Err(<serde_json::Error as serde::de::Error>::custom(
             format_args!("pane tree exceeds its {MAX_RESTORED_LAYOUT_NODES}-node limit"),
         ));
@@ -1096,6 +1118,7 @@ fn decode_tree_node(
                     .get(),
             )?;
             if tree_budget.leaves >= MAX_RESTORED_PANES_PER_TAB {
+                budget.layout_failure = Some(RepairKind::LayoutPanes);
                 return Err(<serde_json::Error as serde::de::Error>::custom(
                     format_args!("pane tree exceeds its {MAX_RESTORED_PANES_PER_TAB}-pane limit"),
                 ));
@@ -1112,11 +1135,13 @@ fn decode_tree_node(
             let ratios = staged
                 .ratios
                 .optional::<serde_json::Error>("ratios")?
-                .map(decode_ratios)
+                .map(|raw| decode_ratios(raw, budget))
                 .transpose()?
                 .unwrap_or_default();
-            let raw_children =
-                decode_raw_children(staged.children.required::<serde_json::Error>("children")?)?;
+            let raw_children = decode_raw_children(
+                staged.children.required::<serde_json::Error>("children")?,
+                budget,
+            )?;
             if !(2..=MAX_RESTORED_PANES_PER_TAB).contains(&raw_children.len()) {
                 return Err(<serde_json::Error as serde::de::Error>::custom(
                     format_args!(
@@ -1202,12 +1227,12 @@ impl serde::de::Visitor<'_> for TitleValueVisitor<'_> {
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
         if restored_tab_title_raw_is_invalid(value) {
-            self.budget.invalid_titles += 1;
+            self.budget.report.add(RepairKind::InvalidTitle, 1);
             return Ok(None);
         }
         let bounded = bound_tab_title_draft(value);
         if restored_tab_title_is_invalid(&bounded) {
-            self.budget.invalid_titles += 1;
+            self.budget.report.add(RepairKind::InvalidTitle, 1);
             return Ok(None);
         }
         self.budget.charge_text::<E>("tab title", bounded.len())?;
@@ -1312,7 +1337,7 @@ impl<'de> serde::de::Visitor<'de> for RawTabSeed<'_> {
 
 struct RawTabs<'de> {
     tabs: Vec<&'de serde_json::value::RawValue>,
-    truncated: bool,
+    truncated: usize,
 }
 
 struct RawTabsSeed;
@@ -1344,17 +1369,14 @@ impl<'de> serde::de::Visitor<'de> for RawTabsSeed {
         let mut input_count = 0;
         while input_count < MAX_RESTORED_TABS {
             let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? else {
-                return Ok(RawTabs {
-                    tabs,
-                    truncated: false,
-                });
+                return Ok(RawTabs { tabs, truncated: 0 });
             };
             input_count += 1;
             tabs.push(raw);
         }
-        let mut truncated = false;
+        let mut truncated = 0usize;
         while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-            truncated = true;
+            truncated = truncated.saturating_add(1);
         }
         Ok(RawTabs { tabs, truncated })
     }
@@ -1392,9 +1414,7 @@ fn decode_tabs(
     let staged = serde::de::DeserializeSeed::deserialize(RawTabsSeed, &mut deserializer)?;
     deserializer.end()?;
     drop(deserializer);
-    if staged.truncated {
-        budget.invalid_tab_layouts = true;
-    }
+    budget.report.add(RepairKind::ExtraTabs, staged.truncated);
     let mut tabs = Vec::with_capacity(staged.tabs.len());
     let mut retained_input_indices = Vec::with_capacity(staged.tabs.len());
     for (input_index, raw_tab) in staged.tabs.into_iter().enumerate() {
@@ -1405,8 +1425,7 @@ fn decode_tabs(
                 retained_input_indices.push(input_index);
             }
             Err(_) => {
-                *budget = before;
-                budget.invalid_tab_layouts = true;
+                budget.discard(before, RepairKind::InvalidTab);
             }
         }
     }
@@ -1468,7 +1487,7 @@ fn raw_is_null(raw: &serde_json::value::RawValue) -> bool {
 fn decode_bounded_snapshot_with_text_budget(
     content: &str,
     text_budget: usize,
-) -> Result<(SessionsSnapshot, Vec<String>), serde_json::Error> {
+) -> Result<(SessionsSnapshot, RecoveryReport), serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(content);
     let raw = serde::de::DeserializeSeed::deserialize(RawSessionsSeed, &mut deserializer)?;
     deserializer.end()?;
@@ -1490,8 +1509,7 @@ fn decode_bounded_snapshot_with_text_budget(
             match decode_tabs(raw_tabs, &mut budget) {
                 Ok(tabs) => tabs,
                 Err(_) => {
-                    budget = before;
-                    budget.invalid_tab_layouts = true;
+                    budget.discard(before, RepairKind::InvalidTabsContainer);
                     DecodedTabs {
                         tabs: Vec::new(),
                         retained_input_indices: Vec::new(),
@@ -1505,7 +1523,9 @@ fn decode_bounded_snapshot_with_text_budget(
         },
     };
     let (active_tab, active_tab_repaired) = remap_active_tab(raw.active_tab, &decoded_tabs);
-    budget.active_tab_repaired = active_tab_repaired;
+    budget
+        .report
+        .add(RepairKind::ActiveTab, usize::from(active_tab_repaired));
 
     let tree = match raw.tree.filter(|raw_tree| !raw_is_null(raw_tree)) {
         Some(raw_tree) => {
@@ -1513,8 +1533,7 @@ fn decode_bounded_snapshot_with_text_budget(
             match decode_tree(raw_tree, &mut budget) {
                 Ok(tree) => Some(tree),
                 Err(_) => {
-                    budget = before;
-                    budget.invalid_legacy_tree = true;
+                    budget.discard(before, RepairKind::LegacyTree);
                     None
                 }
             }
@@ -1528,8 +1547,7 @@ fn decode_bounded_snapshot_with_text_budget(
             match decode_split(raw_split, &mut budget) {
                 Ok(split) => Some(split),
                 Err(_) => {
-                    budget = before;
-                    budget.invalid_legacy_split = true;
+                    budget.discard(before, RepairKind::LegacySplit);
                     None
                 }
             }
@@ -1537,7 +1555,7 @@ fn decode_bounded_snapshot_with_text_budget(
         None => None,
     };
 
-    let warnings = budget.warnings(sessions.len());
+    let warnings = budget.report;
     Ok((
         SessionsSnapshot {
             version: raw.version,
@@ -1554,7 +1572,7 @@ fn decode_bounded_snapshot_with_text_budget(
 
 fn decode_bounded_snapshot(
     content: &str,
-) -> Result<(SessionsSnapshot, Vec<String>), serde_json::Error> {
+) -> Result<(SessionsSnapshot, RecoveryReport), serde_json::Error> {
     decode_bounded_snapshot_with_text_budget(content, MAX_RESTORED_TEXT_BYTES)
 }
 
@@ -1594,7 +1612,7 @@ impl SessionsSnapshot {
     /// 建成 0700、文件 0600 —— 快照里每个 pane 的 cwd 就是用户文件系统的地图。
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let (json, warnings) = self.bounded_json()?;
-        for warning in warnings {
+        for warning in warnings.messages() {
             log::warn!("[SessionPersistence] {warning}");
         }
         crate::persistence::write_snapshot_atomic(path, json.as_bytes(), MAX_SNAPSHOT_BYTES)?;
@@ -1617,17 +1635,21 @@ impl SessionsSnapshot {
         };
         match decode_bounded_snapshot(&content) {
             Ok((mut snapshot, mut warnings)) => {
-                warnings.extend(snapshot.sanitize());
-                for warning in warnings {
+                warnings.merge(snapshot.sanitize());
+                for warning in warnings.messages() {
                     log::warn!("[SessionPersistence] {warning}");
                 }
-                SnapshotLoad::Loaded(Box::new(snapshot))
+                SnapshotLoad::Loaded {
+                    snapshot: Box::new(snapshot),
+                    report: warnings,
+                    original: Some(content),
+                }
             }
             Err(error) => SnapshotLoad::Unreadable(error.to_string()),
         }
     }
 
-    fn bounded_json(&self) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+    fn bounded_json(&self) -> Result<(String, RecoveryReport), Box<dyn std::error::Error>> {
         let mut bounded = self.clone();
         let warnings = bounded.sanitize();
         let json = serde_json::to_string_pretty(&bounded)?;
@@ -1700,13 +1722,13 @@ impl SessionsSnapshot {
         });
     }
 
-    fn sanitize(&mut self) -> Vec<String> {
-        let mut warnings = Vec::new();
+    fn sanitize(&mut self) -> RecoveryReport {
+        let mut warnings = RecoveryReport::default();
         if self.sessions.len() > MAX_RESTORED_SESSIONS {
-            warnings.push(format!(
-                "restored only the first {MAX_RESTORED_SESSIONS} of {} sessions",
-                self.sessions.len()
-            ));
+            warnings.add(
+                RepairKind::ExtraSessions,
+                self.sessions.len() - MAX_RESTORED_SESSIONS,
+            );
             self.sessions.truncate(MAX_RESTORED_SESSIONS);
         }
         let mut invalid_cwds = 0usize;
@@ -1721,22 +1743,32 @@ impl SessionsSnapshot {
             }
         }
         if invalid_cwds > 0 {
-            warnings.push(format!(
-                "discarded {invalid_cwds} oversized or invalid working directories"
-            ));
+            warnings.add(RepairKind::InvalidCwd, invalid_cwds);
         }
         if self
             .active_index
             .is_some_and(|index| index >= self.sessions.len())
         {
             self.active_index = self.sessions.len().checked_sub(1);
-            warnings.push("active session index was outside the restored list".to_string());
+            warnings.add(RepairKind::ActiveSession, 1);
         }
 
-        let original_tabs = self.tabs.len();
+        warnings.add(
+            RepairKind::ExtraTabs,
+            self.tabs.len().saturating_sub(MAX_RESTORED_TABS),
+        );
         self.tabs.truncate(MAX_RESTORED_TABS);
         self.tabs
-            .retain_mut(|tab| sanitize_tree_shape(&mut tab.tree));
+            .retain_mut(|tab| match sanitize_tree_shape(&mut tab.tree) {
+                Ok(adjusted) => {
+                    warnings.add(RepairKind::LayoutAdjusted, usize::from(adjusted));
+                    true
+                }
+                Err(reason) => {
+                    warnings.add(reason, 1);
+                    false
+                }
+            });
         // 标题是自由文本，会原样出现在标签栏上：控制字符和超长串在这里就
         // 丢弃，而不是等到渲染时才发现。视觉欺骗字符与实时路径一样替换为
         // U+FFFD；替换后为空的标题按无效处理。
@@ -1753,20 +1785,23 @@ impl SessionsSnapshot {
             }
         }
         if invalid_titles > 0 {
-            warnings.push(format!(
-                "discarded {invalid_titles} oversized or invalid tab titles"
-            ));
+            warnings.add(RepairKind::InvalidTitle, invalid_titles);
         }
-        if self.tabs.len() != original_tabs {
-            warnings.push("discarded oversized or invalid tab layouts".to_string());
-        }
-        if self
-            .tree
-            .as_mut()
-            .is_some_and(|tree| !sanitize_tree_shape(tree))
-        {
-            self.tree = None;
-            warnings.push("discarded invalid legacy pane layout".to_string());
+        if let Some(tree) = self.tree.as_mut() {
+            match sanitize_tree_shape(tree) {
+                Ok(adjusted) => warnings.add(RepairKind::LayoutAdjusted, usize::from(adjusted)),
+                Err(reason) => {
+                    self.tree = None;
+                    warnings.add(
+                        if reason == RepairKind::InvalidTab {
+                            RepairKind::LegacyTree
+                        } else {
+                            reason
+                        },
+                        1,
+                    );
+                }
+            }
         }
         if self.split.as_mut().is_some_and(|split| {
             if !matches!(split.mode.as_str(), "vertical" | "horizontal")
@@ -1774,19 +1809,24 @@ impl SessionsSnapshot {
             {
                 return true;
             }
+            if ratios_need_repair(split.panes.len(), &split.ratios)
+                || split.focused >= split.panes.len()
+            {
+                warnings.add(RepairKind::LayoutAdjusted, 1);
+            }
             split.ratios.truncate(split.panes.len());
             split.focused = split.focused.min(split.panes.len().saturating_sub(1));
             false
         }) {
             self.split = None;
-            warnings.push("discarded invalid legacy split layout".to_string());
+            warnings.add(RepairKind::LegacySplit, 1);
         }
         if self
             .active_tab
             .is_some_and(|index| index >= self.tabs.len())
         {
             self.active_tab = self.tabs.len().checked_sub(1);
-            warnings.push("active tab index was outside the restored list".to_string());
+            warnings.add(RepairKind::ActiveTab, 1);
         }
         warnings
     }
@@ -1909,40 +1949,63 @@ fn first_leaf(tree: &PaneTreeSnapshot) -> Option<usize> {
     }
 }
 
-fn sanitize_tree_shape(tree: &mut PaneTreeSnapshot) -> bool {
+/// Missing/empty ratios are a supported legacy default, not damage. Explicit
+/// unusable ratios are replaced by equal shares in the existing core converter.
+fn ratios_need_repair(panes: usize, ratios: &[f32]) -> bool {
+    if ratios.is_empty() {
+        return false;
+    }
+    let sum: f32 = ratios.iter().sum();
+    ratios.len() != panes
+        || ratios
+            .iter()
+            .any(|ratio| !ratio.is_finite() || *ratio <= 0.0)
+        || !sum.is_finite()
+        || sum <= f32::EPSILON
+}
+
+fn sanitize_tree_shape(tree: &mut PaneTreeSnapshot) -> Result<bool, RepairKind> {
     fn visit(
         tree: &mut PaneTreeSnapshot,
         depth: usize,
         nodes: &mut usize,
         leaves: &mut usize,
-    ) -> bool {
-        if depth > MAX_RESTORED_LAYOUT_DEPTH || *nodes >= MAX_RESTORED_LAYOUT_NODES {
-            return false;
+    ) -> Result<bool, RepairKind> {
+        if depth > MAX_RESTORED_LAYOUT_DEPTH {
+            return Err(RepairKind::LayoutDepth);
+        }
+        if *nodes >= MAX_RESTORED_LAYOUT_NODES {
+            return Err(RepairKind::LayoutNodes);
         }
         *nodes += 1;
+        let mut adjusted = false;
         match tree {
             PaneTreeSnapshot::Leaf { .. } => {
                 *leaves += 1;
-                *leaves <= MAX_RESTORED_PANES_PER_TAB
+                if *leaves > MAX_RESTORED_PANES_PER_TAB {
+                    return Err(RepairKind::LayoutPanes);
+                }
             }
             PaneTreeSnapshot::Split {
                 axis,
                 ratios,
                 children,
             } => {
-                if !matches!(axis.as_str(), "vertical" | "horizontal")
-                    || !(2..=MAX_RESTORED_PANES_PER_TAB).contains(&children.len())
-                {
-                    return false;
+                if !matches!(axis.as_str(), "vertical" | "horizontal") || children.len() < 2 {
+                    return Err(RepairKind::InvalidTab);
                 }
+                if children.len() > MAX_RESTORED_PANES_PER_TAB {
+                    return Err(RepairKind::LayoutPanes);
+                }
+                adjusted |= ratios_need_repair(children.len(), ratios);
                 ratios.truncate(children.len());
-                children
-                    .iter_mut()
-                    .all(|child| visit(child, depth + 1, nodes, leaves))
+                for child in children {
+                    adjusted |= visit(child, depth + 1, nodes, leaves)?;
+                }
             }
         }
+        Ok(adjusted)
     }
-
     visit(tree, 0, &mut 0, &mut 0)
 }
 
@@ -2091,8 +2154,286 @@ mod tests {
 
     fn decode_and_sanitize(contents: &str) -> (SessionsSnapshot, Vec<String>) {
         let (mut snapshot, mut warnings) = decode_bounded_snapshot(contents).unwrap();
-        warnings.extend(snapshot.sanitize());
-        (snapshot, warnings)
+        warnings.merge(snapshot.sanitize());
+        (snapshot, warnings.messages())
+    }
+
+    fn decoded_report(contents: &str) -> (SessionsSnapshot, RecoveryReport) {
+        let (mut snapshot, mut report) = decode_bounded_snapshot(contents).unwrap();
+        report.merge(snapshot.sanitize());
+        (snapshot, report)
+    }
+
+    #[test]
+    fn recovery_report_counts_retained_repairs_and_whole_discards_once() {
+        let json = r#"{"version":2,"sessions":[{"cwd":"bad\u0000cwd"}],"tabs":[
+            {"tree":{"kind":"leaf","session":0},"title":"bad\u202ename"},
+            {"tree":{"kind":"split","axis":"bad","children":[]},"title":"bad\u0000name"},
+            {"tree":{"kind":"leaf","session":0},"title":"good"}
+        ]}"#;
+        let (mut snapshot, report) = decoded_report(json);
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(report.count(RepairKind::InvalidCwd), 1);
+        assert_eq!(report.count(RepairKind::InvalidTitle), 1);
+        assert_eq!(report.count(RepairKind::InvalidTab), 1);
+        assert!(!report.summary().contains("bad"));
+        assert_eq!(snapshot.tabs[1].title.as_deref(), Some("good"));
+        assert!(
+            snapshot.sanitize().is_empty(),
+            "already-applied repairs must not repeat"
+        );
+    }
+
+    #[test]
+    fn recovery_report_counts_extra_objects_without_inspecting_their_defects() {
+        let sessions = std::iter::repeat_n(r#"{"cwd":null}"#, 35)
+            .collect::<Vec<_>>()
+            .join(",");
+        let tabs = std::iter::repeat_n(r#"{"tree":{"kind":"leaf","session":0}}"#, 36)
+            .collect::<Vec<_>>()
+            .join(",");
+        let (snapshot, report) = decoded_report(&format!(
+            r#"{{"version":2,"sessions":[{sessions}],"tabs":[{tabs}]}}"#
+        ));
+        assert_eq!(snapshot.sessions.len(), 32);
+        assert_eq!(snapshot.tabs.len(), 32);
+        assert_eq!(report.count(RepairKind::ExtraSessions), 3);
+        assert_eq!(report.count(RepairKind::ExtraTabs), 4);
+        assert_eq!(report.count(RepairKind::InvalidTab), 0);
+        let (_, malformed) = decoded_report(r#"{"version":2,"sessions":[],"tabs":{}}"#);
+        assert_eq!(malformed.count(RepairKind::InvalidTabsContainer), 1);
+        assert_eq!(malformed.count(RepairKind::InvalidTab), 0);
+    }
+
+    #[test]
+    fn recovery_resource_categories_are_observed_not_inferred_from_deep_input() {
+        let leaf = r#"{"kind":"leaf","session":0}"#;
+        let mut deep = leaf.to_string();
+        for _ in 0..=MAX_RESTORED_LAYOUT_DEPTH {
+            deep = format!(r#"{{"kind":"split","axis":"vertical","children":[{deep},{leaf}]}}"#);
+        }
+        let (_, report) = decoded_report(&format!(
+            r#"{{"version":2,"sessions":[{{"cwd":null}}],"tabs":[{{"tree":{deep}}},{{"tree":{leaf}}}]}}"#
+        ));
+        assert_eq!(report.count(RepairKind::LayoutNodes), 1);
+        assert_eq!(report.count(RepairKind::LayoutDepth), 0);
+        assert_eq!(report.count(RepairKind::InvalidTab), 0);
+        let raw = serde_json::value::RawValue::from_string(leaf.to_string()).unwrap();
+        let mut budget = DecodeBudget::new(MAX_RESTORED_TEXT_BYTES);
+        assert!(decode_tree_node(
+            &raw,
+            &mut budget,
+            &mut TreeBudget::new(),
+            MAX_RESTORED_LAYOUT_DEPTH + 1
+        )
+        .is_err());
+        assert_eq!(budget.layout_failure, Some(RepairKind::LayoutDepth));
+        let children = std::iter::repeat_n(leaf, 13).collect::<Vec<_>>().join(",");
+        let (_, panes) = decoded_report(&format!(
+            r#"{{"version":2,"sessions":[{{"cwd":null}}],"tabs":[{{"tree":{{"kind":"split","axis":"vertical","children":[{children}]}}}}]}}"#
+        ));
+        assert_eq!(panes.count(RepairKind::LayoutPanes), 1);
+        assert_eq!(panes.count(RepairKind::InvalidTab), 0);
+    }
+
+    #[test]
+    fn repaired_load_retains_exact_bytes_and_backup_never_moves_a_replaced_source() {
+        let root = scratch("repair-exact-bytes");
+        let path = root.join("session_history.json");
+        let original = "{\n  \"version\": 2, \"sessions\": [], \"tabs\": {}\n}\n";
+        write_private(&path, original);
+        let SnapshotLoad::Loaded {
+            snapshot,
+            report,
+            original: retained,
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("recoverable snapshot")
+        };
+        assert!(snapshot.sessions.is_empty());
+        assert!(!report.is_empty());
+        assert_eq!(retained.as_deref(), Some(original));
+        // A later external replacement must not be renamed or used as the backup.
+        write_private(&path, "new external bytes");
+        assert_eq!(
+            prepare_repaired_snapshot(&path, &report, retained.as_deref()),
+            PreservationOutcome::Preserved
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new external bytes");
+        let backups = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), original.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            prepare_repaired_snapshot(&path, &report, retained.as_deref()),
+            PreservationOutcome::Preserved
+        );
+        assert!(
+            !path.exists(),
+            "preservation must never recreate the source"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preservation_failure_blocks_without_chmod_or_overwriting_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("repair-unsafe-parent");
+        let path = root.join("session_history.json");
+        let original = r#"{"version":2,"sessions":[],"tabs":{}}"#;
+        write_private(&path, original);
+        let SnapshotLoad::Loaded {
+            report,
+            original: retained,
+            ..
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("recoverable snapshot")
+        };
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let outcome = prepare_repaired_snapshot(&path, &report, retained.as_deref());
+        assert_eq!(outcome, PreservationOutcome::Blocked);
+        assert!(outcome.writes_blocked());
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_loaded_snapshot_has_no_report_or_backup() {
+        let root = scratch("clean-no-report");
+        let path = root.join("session_history.json");
+        write_private(&path, r#"{"version":1,"sessions":[{"cwd":null}]}"#);
+        let SnapshotLoad::Loaded {
+            report, original, ..
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("clean snapshot")
+        };
+        assert!(report.is_empty());
+        assert!(
+            original.is_some(),
+            "startup must still validate pane references"
+        );
+        assert_eq!(
+            prepare_repaired_snapshot(&path, &report, None),
+            PreservationOutcome::Unchanged
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn layout_normalization_is_a_boolean_fact_and_preserves_the_source() {
+        let root = scratch("layout-normalization");
+        let path = root.join("session_history.json");
+        let ratios = std::iter::repeat_n("1", 20).collect::<Vec<_>>().join(",");
+        let original = format!(
+            r#"{{"version":1,"sessions":[{{"cwd":null}}],"split":{{"mode":"vertical","panes":[0,0],"focused":9,"ratios":[{ratios}]}}}}"#
+        );
+        write_private(&path, &original);
+        let SnapshotLoad::Loaded {
+            mut snapshot,
+            report,
+            original: retained,
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("normalizable snapshot")
+        };
+        assert_eq!(report.count(RepairKind::LayoutAdjusted), 1);
+        assert_eq!(snapshot.split.as_ref().unwrap().ratios.len(), 2);
+        assert_eq!(snapshot.split.as_ref().unwrap().focused, 1);
+        assert_eq!(retained.as_deref(), Some(original.as_str()));
+        assert!(snapshot.sanitize().is_empty());
+        assert_eq!(
+            prepare_repaired_snapshot(&path, &report, retained.as_deref()),
+            PreservationOutcome::Preserved
+        );
+        let source = r#"{"version":2,"sessions":[{"cwd":null}],"tabs":[{"tree":{"kind":"split","axis":"vertical","ratios":[1,2,3],"children":[{"kind":"leaf","session":0},{"kind":"leaf","session":0}]}}]}"#;
+        let (_, report) = decoded_report(source);
+        assert_eq!(report.count(RepairKind::LayoutAdjusted), 1);
+        // The same speculative ratio repair in a discarded tab is rolled back.
+        let source = format!(
+            r#"{{"version":2,"sessions":[],"tabs":[{{"tree":{{"kind":"split","axis":"vertical","ratios":[{ratios}],"children":[]}}}}]}}"#
+        );
+        let (_, report) = decoded_report(&source);
+        assert_eq!(report.count(RepairKind::LayoutAdjusted), 0);
+        assert_eq!(report.count(RepairKind::InvalidTab), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_bytes_or_symlink_parent_fail_closed_without_touching_source() {
+        use std::os::unix::fs::symlink;
+        let root = scratch("backup-symlink-parent");
+        let safe = root.join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        let path = safe.join("session_history.json");
+        write_private(&path, "original bytes");
+        let mut report = RecoveryReport::default();
+        report.add(RepairKind::InvalidTab, 1);
+        assert_eq!(
+            prepare_repaired_snapshot(&path, &report, None),
+            PreservationOutcome::Blocked
+        );
+        let link = root.join("link");
+        symlink(&safe, &link).unwrap();
+        assert_eq!(
+            prepare_repaired_snapshot(
+                &link.join("session_history.json"),
+                &report,
+                Some("original bytes")
+            ),
+            PreservationOutcome::Blocked
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_unusable_ratios_report_but_normal_weights_and_defaults_are_quiet() {
+        for ratios in [
+            vec![0.0, 1.0],
+            vec![-1.0, 1.0],
+            vec![1.0],
+            vec![f32::MAX, f32::MAX],
+            vec![1e-30, 1e-30],
+        ] {
+            assert!(ratios_need_repair(2, &ratios));
+            assert_eq!(
+                jterm_core::pane_layout::normalized_shares(2, &ratios),
+                vec![0.5, 0.5]
+            );
+        }
+        for ratios in [vec![], vec![1.0, 2.0], vec![0.25, 0.75]] {
+            assert!(!ratios_need_repair(2, &ratios));
+        }
+        for raw in ["[0,1]", "[-1,1]", "[1]", "[1e-30,1e-30]"] {
+            let (_, report) = decoded_report(&format!(
+                r#"{{"version":1,"sessions":[{{"cwd":null}},{{"cwd":null}}],"split":{{"mode":"vertical","panes":[0,1],"focused":0,"ratios":{raw}}}}}"#
+            ));
+            assert_eq!(report.count(RepairKind::LayoutAdjusted), 1);
+        }
     }
 
     #[cfg(unix)]
@@ -2194,7 +2535,7 @@ mod tests {
         );
         snapshot.save(&path).unwrap();
 
-        let SnapshotLoad::Loaded(back) = SessionsSnapshot::load(&path) else {
+        let SnapshotLoad::Loaded { snapshot: back, .. } = SessionsSnapshot::load(&path) else {
             panic!("a snapshot this app just wrote must load");
         };
         assert_eq!(back.sessions.len(), 1);
@@ -2522,7 +2863,10 @@ mod tests {
         };
         write_private(&path, serde_json::to_vec(&snapshot).unwrap());
 
-        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+        let SnapshotLoad::Loaded {
+            snapshot: restored, ..
+        } = SessionsSnapshot::load(&path)
+        else {
             panic!("bounded valid JSON should load");
         };
         assert_eq!(restored.sessions.len(), MAX_RESTORED_SESSIONS);
@@ -2572,7 +2916,10 @@ mod tests {
         };
         write_private(&path, serde_json::to_vec(&snapshot).unwrap());
 
-        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+        let SnapshotLoad::Loaded {
+            snapshot: restored, ..
+        } = SessionsSnapshot::load(&path)
+        else {
             panic!("bounded valid JSON should load");
         };
         assert_eq!(restored.tabs[0].title.as_deref(), Some("build"));
@@ -2633,7 +2980,10 @@ mod tests {
         };
         write_private(&path, serde_json::to_vec(&snapshot).unwrap());
 
-        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+        let SnapshotLoad::Loaded {
+            snapshot: restored, ..
+        } = SessionsSnapshot::load(&path)
+        else {
             panic!("bounded valid JSON should load");
         };
         assert_eq!(restored.sessions[0].cwd, None);
@@ -2674,7 +3024,10 @@ mod tests {
         };
         write_private(&path, serde_json::to_vec(&snapshot).unwrap());
 
-        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+        let SnapshotLoad::Loaded {
+            snapshot: restored, ..
+        } = SessionsSnapshot::load(&path)
+        else {
             panic!("bounded valid JSON should load");
         };
         assert_eq!(restored.tabs[0].title, None);
@@ -2699,7 +3052,10 @@ mod tests {
                  "active_tab":0}"#,
         );
 
-        let SnapshotLoad::Loaded(restored) = SessionsSnapshot::load(&path) else {
+        let SnapshotLoad::Loaded {
+            snapshot: restored, ..
+        } = SessionsSnapshot::load(&path)
+        else {
             panic!("legacy snapshot should load");
         };
         assert_eq!(restored.tabs.len(), 1);
@@ -2756,9 +3112,7 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("restored only the first")));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("tab layouts")));
+        assert!(warnings.iter().any(|warning| warning.contains("layout")));
     }
 
     #[test]
@@ -2782,9 +3136,7 @@ mod tests {
         );
         let (snapshot, warnings) = decode_and_sanitize(&invalid_ratio);
         assert!(snapshot.tabs.is_empty());
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("tab layouts")));
+        assert!(warnings.iter().any(|warning| warning.contains("layout")));
     }
 
     #[test]
@@ -2860,9 +3212,7 @@ mod tests {
             PaneTreeSnapshot::Leaf { session: 1 }
         ));
         assert_eq!(snapshot.active_tab, Some(1));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("tab layouts")));
+        assert!(warnings.iter().any(|warning| warning.contains("layout")));
     }
 
     #[test]
@@ -2915,9 +3265,7 @@ mod tests {
         assert!(snapshot.tabs.is_empty());
         assert!(snapshot.tree.is_none());
         assert_eq!(snapshot.split.as_ref().unwrap().panes, vec![0, 1]);
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("tab layouts")));
+        assert!(warnings.iter().any(|warning| warning.contains("layout")));
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("legacy pane layout")));
@@ -2944,9 +3292,7 @@ mod tests {
         assert_eq!(snapshot.tabs.len(), 2);
         assert_eq!(snapshot.tabs[0].title.as_deref(), Some("before"));
         assert_eq!(snapshot.tabs[1].title.as_deref(), Some("after"));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("tab layouts")));
+        assert!(warnings.iter().any(|warning| warning.contains("layout")));
     }
 
     #[test]

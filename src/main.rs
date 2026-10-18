@@ -45,6 +45,7 @@ mod persistence;
 mod pty;
 #[cfg(all(test, unix))]
 mod readline_preservation_tests;
+mod recovery_report;
 mod remote_fs;
 mod remote_host_editor;
 mod review_text;
@@ -1751,11 +1752,52 @@ enum PendingClose {
     Tab,
 }
 
+/// Startup-only repair facts survive fallback, successful terminal actions and
+/// dismissal. This is separate from transient spawn diagnostics and never gates
+/// input or font zoom. Dismissal changes visibility, not preservation or saving.
+#[derive(Clone, Copy, Debug, Default)]
+struct StartupRecovery {
+    report: session_persistence::RecoveryReport,
+    preservation: session_persistence::PreservationOutcome,
+    dismissed: bool,
+}
+
+impl StartupRecovery {
+    fn new(
+        report: session_persistence::RecoveryReport,
+        preservation: session_persistence::PreservationOutcome,
+    ) -> Self {
+        Self {
+            report,
+            preservation,
+            dismissed: false,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        !self.dismissed && !self.report.is_empty()
+    }
+
+    fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
+
+    /// Three lines of chrome with local scrolling for longer summaries. A fixed
+    /// height keeps layout/PTY geometry exact without measuring untrusted text.
+    fn banner_height(&self, font_size: f32) -> f32 {
+        if self.visible() {
+            (font_size.clamp(8.0, 32.0) * 1.3 * 3.0 + 12.0).ceil()
+        } else {
+            0.0
+        }
+    }
+}
+
 /// What `restore_or_spawn` recovered: the sessions it could bring back, plus
 /// the snapshot's layout fields, which the caller validates against them.
-#[derive(Default)]
-struct RestoredState {
-    sessions: Vec<Session>,
+/// The generic session type permits fallback tests without starting a PTY.
+struct RestoredState<S = Session> {
+    sessions: Vec<S>,
     active: usize,
     next_id: usize,
     tabs: Vec<session_persistence::TabSnapshot>,
@@ -1764,10 +1806,54 @@ struct RestoredState {
     legacy_tree: Option<session_persistence::PaneTreeSnapshot>,
     legacy_split: Option<session_persistence::SplitSnapshot>,
     diagnostic: Option<String>,
-    /// The configured snapshot was unreadable and could not be quarantined.
+    startup_recovery: StartupRecovery,
+    /// The configured snapshot was unreadable or repaired and its original
+    /// bytes could not be preserved.
     /// Preserve its bytes for this process lifetime instead of letting the
     /// first autosave destroy the only recoverable copy.
     session_writes_blocked: bool,
+}
+
+impl<S> Default for RestoredState<S> {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            active: 0,
+            next_id: 0,
+            tabs: Vec::new(),
+            active_tab: None,
+            legacy_tree: None,
+            legacy_split: None,
+            diagnostic: None,
+            startup_recovery: StartupRecovery::default(),
+            session_writes_blocked: false,
+        }
+    }
+}
+
+impl<S> RestoredState<S> {
+    /// Pure state assembly shared by disabled/missing, empty-load and failed-
+    /// restore fallbacks. The caller supplies the result of any actual spawn.
+    fn from_spawn_result<E: std::fmt::Display>(result: Result<S, E>, id_start: usize) -> Self {
+        match result {
+            Ok(session) => Self {
+                sessions: vec![session],
+                next_id: id_start + 1,
+                ..Self::default()
+            },
+            Err(error) => Self {
+                next_id: id_start,
+                diagnostic: Some(crate::review_text::bound_diagnostic_text(error.to_string())),
+                ..Self::default()
+            },
+        }
+    }
+
+    fn with_recovery(mut self, startup_recovery: StartupRecovery) -> Self {
+        self.session_writes_blocked |= startup_recovery.preservation.writes_blocked();
+        self.startup_recovery = startup_recovery;
+        self
+    }
 }
 
 /// State for the Ctrl+Shift+L quick tab switcher overlay.
@@ -3737,6 +3823,84 @@ fn pane_tree_from_legacy(split: &session_persistence::SplitSnapshot) -> Option<P
     })
 }
 
+/// Shared conversion for the original-file validation pass and actual restore.
+/// Legacy migration/default focus are intentional; only rejected content reports
+/// damage here. All input is already bounded by the snapshot decoder.
+fn restored_tab_candidates(
+    saved_tabs: &[session_persistence::TabSnapshot],
+    legacy_tree: Option<&session_persistence::PaneTreeSnapshot>,
+    legacy_split: Option<&session_persistence::SplitSnapshot>,
+    active_session: usize,
+    report: &mut session_persistence::RecoveryReport,
+) -> Vec<RestoredTab> {
+    if saved_tabs.is_empty() {
+        let tree = legacy_tree.and_then(|snapshot| {
+            let tree = pane_tree_from_snapshot(snapshot);
+            if tree.is_none() {
+                report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+            }
+            tree
+        });
+        tree.or_else(|| {
+            legacy_split.and_then(|snapshot| {
+                let tree = pane_tree_from_legacy(snapshot);
+                if tree.is_none() {
+                    report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+                }
+                tree
+            })
+        })
+        // Preserve v1 focus behavior without calling this synthesized default a repair.
+        .map(|tree| vec![RestoredTab::plain(tree, Some(active_session))])
+        .unwrap_or_default()
+    } else {
+        saved_tabs
+            .iter()
+            .filter_map(|snapshot| {
+                let Some(tree) = pane_tree_from_snapshot(&snapshot.tree) else {
+                    report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+                    return None;
+                };
+                Some(RestoredTab {
+                    tree,
+                    focus: snapshot.focus,
+                    title: snapshot.title.clone(),
+                    pinned: snapshot.pinned,
+                    marked: snapshot.marked,
+                    private_title: snapshot.private_title,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Exercise the real restore conversion/ownership validator before spawn-result
+/// pruning can hide malformed original references. This bounded pass changes no
+/// snapshot state; later shell failures/remapping and ordinary v1 migration are
+/// not file repairs. Its report is merged before preserving the exact raw bytes.
+fn inspect_restored_snapshot(
+    snapshot: &session_persistence::SessionsSnapshot,
+) -> session_persistence::RecoveryReport {
+    let mut report = session_persistence::RecoveryReport::default();
+    let active = snapshot.active_index.unwrap_or(0);
+    let candidates = restored_tab_candidates(
+        &snapshot.tabs,
+        snapshot.tree.as_ref(),
+        snapshot.split.as_ref(),
+        active,
+        &mut report,
+    );
+    let _ = build_restored_tabs_with_report(
+        candidates,
+        snapshot.sessions.len(),
+        active,
+        snapshot.active_tab,
+        !snapshot.tabs.is_empty(),
+        &mut report,
+    );
+    report
+}
+
 /// Turn validated pane trees into the tab list, and say which tab is active.
 ///
 /// Every index came from a snapshot, so it is checked here: a tab keeps only
@@ -3753,6 +3917,24 @@ fn build_restored_tabs(
     active_session: usize,
     saved_active_tab: Option<usize>,
 ) -> (Vec<Tab>, usize, usize) {
+    build_restored_tabs_with_report(
+        trees,
+        session_count,
+        active_session,
+        saved_active_tab,
+        false,
+        &mut session_persistence::RecoveryReport::default(),
+    )
+}
+
+fn build_restored_tabs_with_report(
+    trees: Vec<RestoredTab>,
+    session_count: usize,
+    active_session: usize,
+    saved_active_tab: Option<usize>,
+    report_explicit_focus: bool,
+    report: &mut session_persistence::RecoveryReport,
+) -> (Vec<Tab>, usize, usize) {
     let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut tabs: Vec<Tab> = Vec::new();
     let mut next_id = 0usize;
@@ -3767,19 +3949,29 @@ fn build_restored_tabs(
             private_title,
         } = restored;
         if !valid_restored_layout(&tree, session_count) {
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
             continue;
         }
         let leaves = tree.leaves();
         if leaves.iter().any(|leaf| claimed.contains(leaf)) {
             // A leaf is already owned by an earlier tab; drop this whole tab
             // and let the adoption pass place its sessions.
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
             continue;
         }
         claimed.extend(leaves.iter().copied());
+        if report_explicit_focus
+            && saved_focus.is_some_and(|session| !tree.contains_session(session))
+        {
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+        }
         let focus = saved_focus
             .filter(|session| tree.contains_session(*session))
             .or_else(|| leaves.first().copied());
-        let Some(focus) = focus else { continue };
+        let Some(focus) = focus else {
+            report.add(crate::recovery_report::RepairKind::ReferencesAdjusted, 1);
+            continue;
+        };
         if saved_active_tab == Some(saved_index) {
             restored_active_tab = Some(tabs.len());
         }
@@ -4298,6 +4490,8 @@ enum Message {
     RemoteHostRemove(remote_host_editor::RowTarget),
     /// Hide the jsh notice until the next launch.
     JshNoticeDismiss,
+    /// Hide only the recovery banner; retain the report and write protection.
+    SessionRecoveryDismiss,
     SetAiEnabled(bool),
     SetAiProvider(String),
     SetAiModel(String),
@@ -6243,6 +6437,8 @@ struct Frost {
     keybindings_revision: Option<persistence::FileRevision>,
     keybindings_diagnostics: Vec<String>,
     session_diagnostic: Option<String>,
+    /// Durable startup repair facts, independent of ephemeral shell errors.
+    startup_recovery: StartupRecovery,
     /// Persistent settings-panel changes are live-applied immediately and saved
     /// on the next config tick. Ephemeral font zoom never sets this flag.
     /// 温度输入框的原始文本（含合法值之外的中间编辑态）。
@@ -6268,9 +6464,9 @@ struct Frost {
     /// save is skipped while this is false, so a fully idle app does no per-tab
     /// `readlink` or JSON serialization on every tick.
     session_dirty: bool,
-    /// Fail closed after an unreadable startup snapshot could not be moved
-    /// aside. The user can repair/move it and restart; this instance will not
-    /// overwrite evidence it was unable to preserve.
+    /// Fail closed when an unreadable or repaired startup snapshot could not
+    /// be preserved. The user can repair/move it and restart; this instance
+    /// will not overwrite evidence it was unable to preserve.
     session_writes_blocked: bool,
     /// Diagnostics (F12): wall-clock microseconds spent ingesting the
     /// most recent PTY-output batch (parse + refresh) and its byte count, used
@@ -6524,6 +6720,7 @@ impl Frost {
             legacy_tree: saved_tree,
             legacy_split: saved_split,
             diagnostic: session_diagnostic,
+            startup_recovery,
             session_writes_blocked,
         } = Self::restore_or_spawn(&config, cols, rows, is_first_instance);
 
@@ -6595,6 +6792,7 @@ impl Frost {
             keybindings_revision,
             keybindings_diagnostics: keybindings_load.diagnostics,
             session_diagnostic,
+            startup_recovery,
             ai_temperature_draft,
             ai_key_draft: String::new(),
             config_dirty: false,
@@ -6695,6 +6893,11 @@ impl Frost {
         app.restore_tabs(saved_tabs, saved_active_tab, saved_tree, saved_split);
         app.sync_organism_attention_owner();
         app.sync_theme_colors();
+        // The startup banner occupies real layout space even for a single pane.
+        if app.startup_recovery.visible() {
+            let term_w = (app.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+            (app.cols, app.rows) = app.metrics.grid_size(term_w, app.term_height());
+        }
         app.relayout();
         // The file tree carries a snapshot of the configured remote hosts.
         app.sidebar.set_hosts(app.config.remote_hosts.clone());
@@ -8564,7 +8767,8 @@ impl Frost {
 
     fn term_height(&self) -> f32 {
         terminal_height_after_chrome(
-            self.win_size.height,
+            (self.win_size.height - self.startup_recovery.banner_height(self.chrome_font_size()))
+                .max(0.0),
             self.effective_font_size(),
             self.chrome_font_size(),
             self.config.bottom_bar,
@@ -8715,26 +8919,20 @@ impl Frost {
     }
 
     /// Startup session setup: when `restore_session` is enabled and a snapshot
-    /// exists, respawn one session per saved tab at its recorded cwd; otherwise
-    /// (or on any failure) fall back to a single default session. The fourth
-    /// element is the saved split layout (validated and applied by the caller).
+    /// exists, respawn each saved terminal at its recorded cwd; otherwise fall
+    /// back to a single default session. Keep startup repair facts and write
+    /// protection even when the saved session list is empty or every spawn fails.
     fn restore_or_spawn(
         config: &Config,
         cols: usize,
         rows: usize,
         is_first_instance: bool,
     ) -> RestoredState {
-        let default = |id_start: usize| match Session::spawn(config, id_start, cols, rows, None) {
-            Ok(session) => RestoredState {
-                sessions: vec![session],
-                next_id: id_start + 1,
-                ..RestoredState::default()
-            },
-            Err(error) => RestoredState {
-                next_id: id_start,
-                diagnostic: Some(crate::review_text::bound_diagnostic_text(error.to_string())),
-                ..RestoredState::default()
-            },
+        let default = |id_start: usize| {
+            RestoredState::from_spawn_result(
+                Session::spawn(config, id_start, cols, rows, None),
+                id_start,
+            )
         };
         if !config.restore_session || !is_first_instance {
             return default(0);
@@ -8742,10 +8940,25 @@ impl Frost {
         let Ok(path) = config.session_history_path() else {
             return default(0);
         };
-        let mut snapshot = match session_persistence::SessionsSnapshot::load(&path) {
-            session_persistence::SnapshotLoad::Loaded(s) if !s.sessions.is_empty() => s,
-            session_persistence::SnapshotLoad::Loaded(_)
-            | session_persistence::SnapshotLoad::Missing => return default(0),
+        let (mut snapshot, startup_recovery) = match session_persistence::SessionsSnapshot::load(
+            &path,
+        ) {
+            session_persistence::SnapshotLoad::Loaded {
+                snapshot,
+                mut report,
+                original,
+            } => {
+                report.merge(inspect_restored_snapshot(&snapshot));
+                // Preserve the exact bytes captured by load before any fallback
+                // can return a state eligible for automatic session saving.
+                let preservation = session_persistence::prepare_repaired_snapshot(
+                    &path,
+                    &report,
+                    original.as_deref(),
+                );
+                (snapshot, StartupRecovery::new(report, preservation))
+            }
+            session_persistence::SnapshotLoad::Missing => return default(0),
             // Quarantine before returning, because returning is what lets the
             // app start — and `save_session_snapshot` then writes a fresh
             // snapshot over this same path on the first periodic tick. Retaining
@@ -8785,6 +8998,9 @@ impl Frost {
                 return state;
             }
         };
+        if snapshot.sessions.is_empty() {
+            return default(0).with_recovery(startup_recovery);
+        }
         let mut sessions = Vec::new();
         let mut next_id = 0usize;
         let mut restore_warnings = Vec::new();
@@ -8832,7 +9048,13 @@ impl Frost {
             }
         }
         if sessions.is_empty() {
-            return default(0);
+            let mut state = default(0).with_recovery(startup_recovery);
+            if let Some(error) = state.diagnostic.take() {
+                restore_warnings.push(error);
+            }
+            state.diagnostic = (!restore_warnings.is_empty())
+                .then(|| crate::review_text::bound_diagnostic_text(restore_warnings.join("\n")));
+            return state;
         }
         snapshot.retain_restored_sessions(&restored);
         let active = snapshot.active_index.unwrap_or(0).min(sessions.len() - 1);
@@ -8851,7 +9073,8 @@ impl Frost {
             legacy_split: snapshot.split,
             diagnostic: (!restore_warnings.is_empty())
                 .then(|| crate::review_text::bound_diagnostic_text(restore_warnings.join("\n"))),
-            session_writes_blocked: false,
+            startup_recovery,
+            session_writes_blocked: startup_recovery.preservation.writes_blocked(),
         }
     }
 
@@ -9924,32 +10147,13 @@ impl Frost {
         if self.sessions.is_empty() {
             return;
         }
-        // A v1 snapshot has one global tree: it described the panes the user
-        // last saw, so it migrates into the first tab rather than scattering.
-        let migrated: Vec<RestoredTab> = if saved_tabs.is_empty() {
-            legacy_tree
-                .as_ref()
-                .and_then(pane_tree_from_snapshot)
-                .or_else(|| legacy_split.as_ref().and_then(pane_tree_from_legacy))
-                // v1 had no per-tab focus; the snapshot's active session is
-                // the pane the user was in, so seed the migrated tab with it.
-                .map(|tree| vec![RestoredTab::plain(tree, Some(self.active))])
-                .unwrap_or_default()
-        } else {
-            saved_tabs
-                .iter()
-                .filter_map(|snapshot| {
-                    pane_tree_from_snapshot(&snapshot.tree).map(|tree| RestoredTab {
-                        tree,
-                        focus: snapshot.focus,
-                        title: snapshot.title.clone(),
-                        pinned: snapshot.pinned,
-                        marked: snapshot.marked,
-                        private_title: snapshot.private_title,
-                    })
-                })
-                .collect()
-        };
+        let migrated = restored_tab_candidates(
+            &saved_tabs,
+            legacy_tree.as_ref(),
+            legacy_split.as_ref(),
+            self.active,
+            &mut session_persistence::RecoveryReport::default(),
+        );
 
         let (tabs, active_tab, next_tab_id) =
             build_restored_tabs(migrated, self.sessions.len(), self.active, saved_active_tab);
@@ -15981,6 +16185,13 @@ impl Frost {
                 }
             }
             Message::JshNoticeDismiss => self.jsh_notice_dismissed = true,
+            Message::SessionRecoveryDismiss => {
+                self.startup_recovery.dismiss();
+                let term_w = (self.term_width() - terminal_view::SCROLLBAR_WIDTH).max(0.0);
+                (self.cols, self.rows) = self.metrics.grid_size(term_w, self.term_height());
+                self.relayout();
+                self.refresh_active_context();
+            }
             Message::AgentClose => self.agent.close(),
             Message::CommandCorrectionResolved(session_id, generation, result) => {
                 // The toggle or an Agent session may have changed mid-flight;
@@ -20493,6 +20704,51 @@ impl Frost {
             .align_bottom(Length::Fill)
             .padding(iced::Padding::from(0).right(16.0).bottom(bottom))
             .into()
+    }
+
+    /// A bounded in-layout startup notice. Only its own scroll area and Dismiss
+    /// button handle pointer events; no overlay or input focus is introduced.
+    fn session_recovery_banner(&self) -> Option<Element<'_, Message>> {
+        if !self.startup_recovery.visible() {
+            return None;
+        }
+        let font_size = self.chrome_font_size();
+        let mut details = column![].spacing(2).width(Length::Fill);
+        if let Some(notice) = self.startup_recovery.preservation.notice() {
+            details = details.push(
+                text(crate::review_text::bound_diagnostic_text(notice))
+                    .size(font_size)
+                    .wrapping(text::Wrapping::Word)
+                    .style(text::warning),
+            );
+        }
+        details = details.push(
+            text(crate::review_text::bound_diagnostic_text(format!(
+                "Recovered saved session: {}",
+                self.startup_recovery.report.summary()
+            )))
+            .size(font_size)
+            .wrapping(text::Wrapping::Word),
+        );
+        let bar = row![
+            scrollable(details).width(Length::Fill).height(Length::Fill),
+            button(text("Dismiss").size(font_size))
+                .on_press(Message::SessionRecoveryDismiss)
+                .padding([3, 9])
+                .style(self.ghost_btn_style()),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+        Some(
+            container(bar)
+                .width(Length::Fill)
+                .height(Length::Fixed(
+                    self.startup_recovery.banner_height(font_size),
+                ))
+                .padding([6, 10])
+                .style(self.chrome_bar_style())
+                .into(),
+        )
     }
 
     /// Persistent load diagnostics. Unlike transient toasts, these remain
@@ -25195,6 +25451,14 @@ impl Frost {
             .center(Length::Fill)
             .padding(24)
             .into();
+            let empty: Element<'_, Message> = if let Some(banner) = self.session_recovery_banner() {
+                column![banner, empty]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                empty
+            };
             return if self.config_diagnostic.is_some() || !self.keybindings_diagnostics.is_empty() {
                 stack![empty, self.diagnostics_overlay()].into()
             } else {
@@ -25339,6 +25603,9 @@ impl Frost {
         let mut chrome = column![self.font_zoom_region(font_zoom::Group::Chrome, self.tab_bar())];
         if let Some(notice) = self.jsh_notice() {
             chrome = chrome.push(notice);
+        }
+        if let Some(banner) = self.session_recovery_banner() {
+            chrome = chrome.push(banner);
         }
         chrome = chrome.push(main_area);
         if self.config.bottom_bar {
@@ -43580,5 +43847,373 @@ mod bounded_clipboard_lifecycle_tests {
                     < body.find("session_by_identity(id, fd)").unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_recovery_tests {
+    use super::{RestoredState, StartupRecovery};
+    use crate::recovery_report::{PreservationOutcome, RecoveryReport, RepairKind};
+
+    fn repaired(preservation: PreservationOutcome) -> StartupRecovery {
+        let mut report = RecoveryReport::default();
+        report.add(RepairKind::InvalidTitle, 2);
+        report.add(RepairKind::InvalidCwd, 1);
+        StartupRecovery::new(report, preservation)
+    }
+
+    #[test]
+    fn clean_startup_has_no_banner_or_write_block() {
+        let state = RestoredState::from_spawn_result(Ok::<_, &str>(()), 0);
+        assert!(!state.startup_recovery.visible());
+        assert_eq!(state.startup_recovery.banner_height(13.0), 0.0);
+        assert!(state.startup_recovery.report.is_empty());
+        assert!(!state.session_writes_blocked);
+        assert!(state.diagnostic.is_none());
+    }
+
+    #[test]
+    fn fallback_success_and_failure_keep_the_recovery_report() {
+        for preservation in [PreservationOutcome::Preserved, PreservationOutcome::Blocked] {
+            for result in [Ok(()), Err("default shell could not start")] {
+                let succeeds = result.is_ok();
+                let recovery = repaired(preservation);
+                let state = RestoredState::from_spawn_result(result, 4).with_recovery(recovery);
+                assert_eq!(state.sessions.len(), usize::from(succeeds));
+                assert_eq!(state.next_id, 4 + usize::from(succeeds));
+                assert_eq!(state.diagnostic.is_some(), !succeeds);
+                assert_eq!(state.startup_recovery.report, recovery.report);
+                assert_eq!(state.startup_recovery.preservation, preservation);
+                assert!(state.startup_recovery.visible());
+                assert_eq!(state.session_writes_blocked, preservation.writes_blocked());
+            }
+        }
+    }
+
+    #[test]
+    fn dismiss_retains_facts_and_never_unblocks_saving() {
+        let mut state = RestoredState::<()>::from_spawn_result(Err("shell failed"), 0)
+            .with_recovery(repaired(PreservationOutcome::Blocked));
+        let report = state.startup_recovery.report;
+        // Successful retry/new-tab paths clear the separate spawn diagnostic.
+        state.sessions.push(());
+        state.diagnostic = None;
+        assert!(state.startup_recovery.visible());
+        state.startup_recovery.dismiss();
+        state.startup_recovery.dismiss();
+        assert!(!state.startup_recovery.visible());
+        assert_eq!(state.startup_recovery.banner_height(13.0), 0.0);
+        assert_eq!(state.startup_recovery.report, report);
+        assert_eq!(
+            state.startup_recovery.preservation,
+            PreservationOutcome::Blocked
+        );
+        assert!(state.session_writes_blocked);
+    }
+
+    #[test]
+    fn attaching_recovery_cannot_clear_an_existing_write_block() {
+        let state = RestoredState::<()> {
+            session_writes_blocked: true,
+            ..RestoredState::default()
+        }
+        .with_recovery(repaired(PreservationOutcome::Preserved));
+        assert!(state.session_writes_blocked);
+    }
+
+    #[test]
+    fn banner_height_is_bounded_and_independent_of_repair_count() {
+        let mut recovery = repaired(PreservationOutcome::Preserved);
+        let height = recovery.banner_height(13.0);
+        recovery.report.add(RepairKind::InvalidTitle, usize::MAX);
+        assert_eq!(recovery.banner_height(13.0), height);
+        for size in [0.0, 8.0, 13.0, 32.0, 10000.0] {
+            assert!((1.0..=137.0).contains(&recovery.banner_height(size)));
+        }
+    }
+
+    #[test]
+    fn source_preserves_loaded_bytes_before_either_fallback() {
+        let source = include_str!("main.rs");
+        let restore = source
+            .split_once("    fn restore_or_spawn(")
+            .unwrap()
+            .1
+            .split_once("    fn save_session_snapshot(")
+            .unwrap()
+            .0;
+        assert!(restore.contains("original.as_deref()"));
+        assert!(
+            restore.find("prepare_repaired_snapshot(").unwrap()
+                < restore.find("if snapshot.sessions.is_empty()").unwrap()
+        );
+        assert!(
+            restore.find("prepare_repaired_snapshot(").unwrap()
+                < restore.find("if sessions.is_empty()").unwrap()
+        );
+        assert_eq!(
+            restore
+                .matches("default(0).with_recovery(startup_recovery)")
+                .count(),
+            2
+        );
+        assert!(restore
+            .contains("session_writes_blocked: startup_recovery.preservation.writes_blocked()"));
+        assert!(restore.contains("SnapshotLoad::Unreadable(reason)"));
+        assert!(restore.contains("quarantine_corrupt(&path)"));
+        assert!(restore.contains("state.session_writes_blocked = true;"));
+    }
+
+    #[test]
+    fn source_banner_is_in_layout_and_dismiss_preserves_permissions() {
+        let source = include_str!("main.rs");
+        let banner = source
+            .split_once("    fn session_recovery_banner(")
+            .unwrap()
+            .1
+            .split_once("    fn diagnostics_overlay(")
+            .unwrap()
+            .0;
+        assert!(banner.contains("bound_diagnostic_text"));
+        assert!(banner.contains("scrollable(details)"));
+        assert!(!banner.contains("stack!["));
+        assert!(!banner.contains("mouse_area("));
+        assert!(!banner.contains("operation::focus"));
+        let view = source
+            .split_once("    fn view(&self)")
+            .unwrap()
+            .1
+            .split_once("    fn search_bar(")
+            .unwrap()
+            .0;
+        assert_eq!(view.matches("self.session_recovery_banner()").count(), 2);
+        assert!(view.contains("column![banner, empty]"));
+        assert!(view.contains("chrome = chrome.push(banner)"));
+        let zoom = source
+            .split_once("    fn font_zoom_enabled(")
+            .unwrap()
+            .1
+            .split_once("    fn font_zoom_region<'a>(")
+            .unwrap()
+            .0;
+        assert!(!zoom.contains("startup_recovery"));
+        let dismiss = source
+            .split_once("            Message::SessionRecoveryDismiss => {")
+            .unwrap()
+            .1
+            .split_once("            Message::AgentClose")
+            .unwrap()
+            .0;
+        assert!(dismiss.contains("self.startup_recovery.dismiss()"));
+        assert!(!dismiss.contains("session_writes_blocked"));
+        assert!(!dismiss.contains("session_diagnostic"));
+        assert!(dismiss.contains("self.relayout()"));
+    }
+}
+
+#[cfg(test)]
+mod layout_reference_recovery_tests {
+    use super::{inspect_restored_snapshot, restored_tab_candidates};
+    use crate::recovery_report::{PreservationOutcome, RecoveryReport, RepairKind};
+    use crate::session_persistence::{
+        PaneTreeSnapshot, SessionSnapshot, SessionsSnapshot, SnapshotLoad, SplitSnapshot,
+        TabSnapshot,
+    };
+
+    fn leaf(session: usize) -> PaneTreeSnapshot {
+        PaneTreeSnapshot::Leaf { session }
+    }
+
+    fn split(sessions: &[usize]) -> PaneTreeSnapshot {
+        PaneTreeSnapshot::Split {
+            axis: "vertical".to_string(),
+            ratios: vec![1.0 / sessions.len() as f32; sessions.len()],
+            children: sessions.iter().copied().map(leaf).collect(),
+        }
+    }
+
+    fn tab(tree: PaneTreeSnapshot, focus: Option<usize>) -> TabSnapshot {
+        TabSnapshot {
+            tree,
+            focus,
+            title: None,
+            pinned: false,
+            marked: false,
+            private_title: false,
+        }
+    }
+
+    fn snapshot(tabs: Vec<TabSnapshot>) -> SessionsSnapshot {
+        SessionsSnapshot::new(
+            vec![SessionSnapshot { cwd: None }; 3],
+            Some(2),
+            tabs,
+            Some(0),
+        )
+    }
+
+    #[test]
+    fn original_invalid_and_duplicate_references_are_not_hidden_by_pruning() {
+        for tree in [split(&[0, 9]), split(&[0, 0])] {
+            let mut saved = snapshot(vec![tab(tree, None), tab(leaf(1), None)]);
+            let report = inspect_restored_snapshot(&saved);
+            assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+            saved.retain_restored_sessions(&[true, true, true]);
+            // The preflight report stays true even if later pruning fixes a tree.
+            assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+            assert_eq!(saved.sessions.len(), 3);
+        }
+    }
+
+    #[test]
+    fn cross_tab_ownership_reports_once_and_keeps_existing_restore_behavior() {
+        let saved = snapshot(vec![
+            tab(leaf(0), Some(0)),
+            tab(leaf(0), Some(0)),
+            tab(leaf(1), None),
+        ]);
+        let mut report = RecoveryReport::default();
+        let candidates = restored_tab_candidates(&saved.tabs, None, None, 2, &mut report);
+        let (tabs, active, _) =
+            super::build_restored_tabs_with_report(candidates, 3, 2, Some(2), true, &mut report);
+        assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(
+            tabs.iter().map(|tab| tab.sessions()).collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        assert_eq!(tabs[active].focus, 1);
+        let plain = super::build_restored_tabs(
+            restored_tab_candidates(&saved.tabs, None, None, 2, &mut RecoveryReport::default()),
+            3,
+            2,
+            Some(2),
+        );
+        assert_eq!(plain.1, active);
+        assert_eq!(
+            plain.0.iter().map(|tab| tab.sessions()).collect::<Vec<_>>(),
+            tabs.iter().map(|tab| tab.sessions()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_invalid_focus_reports_but_absent_focus_is_normal() {
+        let explicit = snapshot(vec![tab(leaf(0), Some(2))]);
+        assert_eq!(
+            inspect_restored_snapshot(&explicit).count(RepairKind::ReferencesAdjusted),
+            1
+        );
+        let implicit = snapshot(vec![tab(leaf(0), None)]);
+        assert!(inspect_restored_snapshot(&implicit).is_empty());
+    }
+
+    #[test]
+    fn legacy_migration_orphan_adoption_and_spawn_remapping_are_silent() {
+        let mut legacy = snapshot(Vec::new());
+        legacy.version = 1;
+        legacy.active_tab = None;
+        // The active session is an orphan, so the migration's synthesized focus
+        // is outside this tree. That is an ordinary default, not damaged data.
+        legacy.tree = Some(split(&[0, 1]));
+        assert!(inspect_restored_snapshot(&legacy).is_empty());
+        let mut current = snapshot(vec![tab(leaf(0), Some(0)), tab(leaf(1), None)]);
+        assert!(inspect_restored_snapshot(&current).is_empty());
+        current.retain_restored_sessions(&[false, true, true]);
+        assert!(inspect_restored_snapshot(&current).is_empty());
+    }
+
+    #[test]
+    fn rejected_conversion_reports_and_still_uses_legacy_fallback() {
+        let mut saved = snapshot(Vec::new());
+        saved.tree = Some(PaneTreeSnapshot::Split {
+            axis: "invalid".to_string(),
+            ratios: vec![0.5, 0.5],
+            children: vec![leaf(0), leaf(1)],
+        });
+        saved.split = Some(SplitSnapshot {
+            mode: "vertical".to_string(),
+            ratios: vec![0.5, 0.5],
+            panes: vec![0, 1],
+            focused: 0,
+        });
+        let mut report = RecoveryReport::default();
+        let converted = restored_tab_candidates(
+            &saved.tabs,
+            saved.tree.as_ref(),
+            saved.split.as_ref(),
+            2,
+            &mut report,
+        );
+        assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].tree.leaves(), vec![0, 1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_only_repair_preserves_exact_loaded_bytes_before_any_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("frost-r07-references-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("session_history.json");
+        let raw = "{\n  \"version\": 2, \"sessions\": [{\"cwd\":null},{\"cwd\":null}], \"tabs\": [{\"tree\":{\"kind\":\"leaf\",\"session\":0}},{\"tree\":{\"kind\":\"leaf\",\"session\":0}}]\n}\n";
+        crate::persistence::write_new_private_file(&path, raw.as_bytes(), 1024 * 1024).unwrap();
+        let SnapshotLoad::Loaded {
+            snapshot,
+            mut report,
+            original,
+        } = SessionsSnapshot::load(&path)
+        else {
+            panic!("reference-only damage is recoverable");
+        };
+        assert!(
+            report.is_empty(),
+            "decoder shape/field repair is not involved"
+        );
+        report.merge(inspect_restored_snapshot(&snapshot));
+        assert_eq!(report.count(RepairKind::ReferencesAdjusted), 1);
+        assert_eq!(original.as_deref(), Some(raw));
+        assert_eq!(
+            crate::session_persistence::prepare_repaired_snapshot(
+                &path,
+                &report,
+                original.as_deref()
+            ),
+            PreservationOutcome::Preserved
+        );
+        let backup = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| *entry != path)
+            .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), raw.as_bytes());
+        assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_preflight_precedes_preservation_and_spawn_result_pruning() {
+        let source = include_str!("main.rs");
+        let restore = source
+            .split_once("    fn restore_or_spawn(")
+            .unwrap()
+            .1
+            .split_once("    fn save_session_snapshot(")
+            .unwrap()
+            .0;
+        assert!(
+            restore
+                .find("report.merge(inspect_restored_snapshot(&snapshot))")
+                .unwrap()
+                < restore.find("prepare_repaired_snapshot(").unwrap()
+        );
+        assert!(
+            restore
+                .find("report.merge(inspect_restored_snapshot(&snapshot))")
+                .unwrap()
+                < restore.find("snapshot.retain_restored_sessions(").unwrap()
+        );
     }
 }
