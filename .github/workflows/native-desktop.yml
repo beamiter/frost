@@ -108,6 +108,14 @@ jobs:
       - name: Exercise actual clipboard widgets PRIMARY and idle ownership
         if: ${{ !cancelled() && steps.clipboard_owner.outcome == 'success' }}
         run: python3 scripts/native-clipboard-ui.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --owner "$RUNNER_TEMP/frost-clipboard/native-clipboard-owner" --pointer "$RUNNER_TEMP/frost-clipboard/native-pointer" --output native-smoke-artifacts/wayland-clipboard-ui
+      - name: Exercise X11 recovery report and preservation gate
+        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend x11 --output native-smoke-artifacts/x11-recovery-report
+      - name: Exercise Wayland recovery report and preservation gate
+        timeout-minutes: 5
+        if: ${{ !cancelled() && steps.clipboard_owner.outcome == 'success' }}
+        run: python3 scripts/native-recovery-report.py --runner scripts/native-desktop-smoke.py --binary "$RUNNER_TEMP/frost-installed/bin/frost" --backend wayland --pointer "$RUNNER_TEMP/frost-clipboard/native-pointer" --output native-smoke-artifacts/wayland-recovery-report
       - name: Preserve screenshots and PTY evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
