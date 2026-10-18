@@ -21,6 +21,7 @@ import signal
 import stat
 import struct
 import subprocess
+import tempfile
 import time
 import unittest
 import uuid
@@ -31,6 +32,7 @@ PRESERVED = 'The original saved session was preserved before repairs are saved.'
 PAUSED = ('The original saved session could not be preserved. Automatic session saving '
           'is paused for this run; terminals remain usable.')
 SCREEN = (1280, 900)
+OCR_SCALE = 2
 AUTOSAVE_OBSERVATION_SECONDS = 3.2  # Two existing 1500 ms ConfigTick intervals.
 SUITE_BUDGET_SECONDS = 240  # Leave time for cleanup inside the 5-minute CI step.
 
@@ -69,6 +71,53 @@ def parse_ocr(tsv):
             'line': tuple(int(row[key]) for key in ('page_num', 'block_num', 'par_num', 'line_num')),
         })
     return words
+
+
+def original_coordinates(words):
+    """Map the fixed whole-image enlargement back, rounding boxes outwards."""
+    output = []
+    for word in words:
+        left, top, width, height = (word[key] for key in ('left', 'top', 'width', 'height'))
+        require(0 <= left < left + width <= SCREEN[0] * OCR_SCALE
+                and 0 <= top < top + height <= SCREEN[1] * OCR_SCALE,
+                'OCR word is outside the processed image')
+        right = (left + width + OCR_SCALE - 1) // OCR_SCALE
+        bottom = (top + height + OCR_SCALE - 1) // OCR_SCALE
+        output.append(dict(word, left=left // OCR_SCALE, top=top // OCR_SCALE,
+                           width=right - left // OCR_SCALE, height=bottom - top // OCR_SCALE,
+                           processed_box=[left, top, width, height]))
+    return output
+
+
+def png_extent(path):
+    data = path.read_bytes()
+    require(len(data) >= 24 and data[:8] == b'\x89PNG\r\n\x1a\n', 'Invalid PNG evidence')
+    return struct.unpack('>II', data[16:24])
+
+
+def capture_ocr(png, run):
+    """One fixed pipeline for every case; no phrase-specific image adaptation.
+
+    Dark 14px text was invisible to raw psm11 in the first hosted capture.
+    Invert to dark-on-light, enlarge before binarizing to preserve antialiasing,
+    then remove the dark-theme background. Never crop or synthesize text.
+    """
+    require(png_extent(png) == SCREEN,
+            'Unexpected desktop capture extent; refusing guessed pointer coordinates')
+    processed = png.with_suffix('.ocr.png')
+    command = ['convert', str(png), '-colorspace', 'Gray', '-negate',
+               '-filter', 'Lanczos', '-resize', f'{OCR_SCALE * 100}%',
+               '-threshold', '80%', str(processed)]
+    run(command, capture_output=True)
+    require(png_extent(processed) == tuple(value * OCR_SCALE for value in SCREEN),
+            'OCR preprocessing changed the expected coordinate transform')
+    tsv = run(['tesseract', str(processed), 'stdout', '--psm', '11', 'tsv'],
+              text=True, capture_output=True).stdout
+    tsv_path = png.with_suffix('.ocr.tsv')
+    tsv_path.write_text(tsv)
+    words = original_coordinates(parse_ocr(tsv))
+    return words, {'original': png.name, 'processed': processed.name, 'tsv': tsv_path.name,
+                   'preprocessing': command, 'scale': OCR_SCALE, 'offset': [0, 0]}
 
 
 def ocr_lines(words):
@@ -254,6 +303,55 @@ def read_regular(path):
         return data, (info.st_dev, info.st_ino)
 
 
+def verify_runtime_identity(current, opened, identity, owner):
+    require(stat.S_ISDIR(current.st_mode) and stat.S_ISDIR(opened.st_mode)
+            and current.st_uid == opened.st_uid == owner,
+            'Private runtime owner/type changed')
+    require((current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino) == identity,
+            'Private runtime identity changed; refusing cleanup')
+    require(stat.S_IMODE(current.st_mode) == stat.S_IMODE(opened.st_mode) == 0o700,
+            'Private runtime permissions changed')
+
+
+def runtime_socket_fits(path):
+    # Linux sockaddr_un.sun_path has 108 bytes, including the trailing NUL.
+    return len(os.fsencode(str(path) + '/sway-ipc.4294967295.2147483647.sock')) < 108
+
+
+class ShortRuntime:
+    """Fresh, short runtime, independent of the artifact directory's nesting."""
+    def __init__(self):
+        self.path = Path(tempfile.mkdtemp(prefix='fr07-', dir='/tmp'))
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        info = os.fstat(self.fd)
+        self.inode, self.owner = (info.st_dev, info.st_ino), os.geteuid()
+        try:
+            self.verify()
+            require(runtime_socket_fits(self.path), 'Private runtime path is too long for Sway IPC')
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    def verify(self):
+        verify_runtime_identity(os.stat(self.path, follow_symlinks=False), os.fstat(self.fd),
+                                self.inode, self.owner)
+
+    def close(self):
+        try:
+            self.verify()
+            # Sway/Wayland leave only flat sockets/lockfiles. Use the pinned fd,
+            # never traverse a link or recursively remove an unexpected tree.
+            for name in os.listdir(self.fd):
+                info = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                require(not stat.S_ISDIR(info.st_mode) and info.st_uid == self.owner,
+                        'Unexpected runtime entry; refusing recursive cleanup')
+                os.unlink(name, dir_fd=self.fd)
+            self.verify()
+            os.rmdir(self.path)
+        finally:
+            os.close(self.fd)
+
+
 class Case:
     def __init__(self, module, args, name, result, deadline):
         self.module, self.args, self.name, self.result, self.deadline = module, args, name, result, deadline
@@ -265,6 +363,7 @@ class Case:
         self.records = self.out / 'shell-records.tsv'
         self.smoke.env['FROST_RECOVERY_RECORD'] = str(self.records)
         self.directory = None
+        self.runtime = None
         self.pointer = None
         self.app = None
         self.window = None
@@ -306,21 +405,17 @@ class Case:
             name = f'{label}-{self.counter:02d}'
             self.smoke.screenshot(name)
             png = self.out / (name + '.png')
-            data = png.read_bytes()
-            require(data[:8] == b'\x89PNG\r\n\x1a\n' and struct.unpack('>II', data[16:24]) == SCREEN,
-                    'Unexpected desktop capture extent; refusing guessed pointer coordinates')
-            tsv = self.smoke.run(['tesseract', str(png), 'stdout', '--psm', '11', 'tsv'],
-                                 text=True, capture_output=True).stdout
-            (self.out / (name + '.tsv')).write_text(tsv)
-            words = parse_ocr(tsv)
+            words, transform = capture_ocr(png, self.smoke.run)
             try:
                 evidence = banner_evidence(words, expected)
                 evidence['screenshot'] = name + '.png'
+                evidence.update(ocr=transform, words=words)
                 (self.out / (name + '.json')).write_text(json.dumps(evidence, indent=2))
                 return evidence
             except AssertionError as error:
                 last_error = str(error)
-                (self.out / (name + '.json')).write_text(json.dumps({'error': last_error, 'words': words}, indent=2))
+                (self.out / (name + '.json')).write_text(json.dumps(
+                    {'error': last_error, 'ocr': transform, 'words': words}, indent=2))
                 time.sleep(0.2)  # Retry observation only; never re-send input/click.
         raise AssertionError(f'{label}: {last_error}')
 
@@ -420,6 +515,9 @@ class Case:
     def execute(self):
         self.budget()
         smoke = self.smoke
+        self.runtime = ShortRuntime()
+        smoke.env['XDG_RUNTIME_DIR'] = str(self.runtime.path)
+        self.result['private_runtime'] = {'path': str(self.runtime.path), 'inode': self.runtime.inode}
         self.directory = PrivateDirectory(smoke.config.parent, self.out)
         config = ('shell = "/bin/bash"\nterminal_mode = "normal"\nrestore_session = true\n'
                   'font_size = 14\nchrome_font_size = 14\nui_scale = 1\n'
@@ -522,6 +620,14 @@ r07_ready() { printf '\106\122\117\123\124\122\105\103\117\126\105\122\131\122\1
             self.smoke.close()
         except Exception as error:
             errors.append('process cleanup: ' + repr(error))
+        try:
+            if self.runtime is not None:
+                # Remove only after every tracked compositor/app process stops.
+                require(all(process.poll() is not None for process in self.smoke.processes),
+                        'Tracked processes remain alive; preserving private runtime')
+                self.runtime.close()
+        except Exception as error:
+            errors.append('runtime cleanup: ' + repr(error))
         if errors:
             self.result.update(status='fail', cleanup_errors=errors)
         self.result['elapsed_seconds'] = time.monotonic() - self.started
@@ -611,6 +717,32 @@ class PureTests(unittest.TestCase):
         repaired['tabs'][0]['title'] = clean['tabs'][0]['title']
         self.assertEqual(clean, repaired)
         self.assertEqual(clean['tabs'][0]['tree'], {'kind': 'leaf', 'session': 0})
+
+    def test_ocr_boxes_map_outward_without_changing_text_or_confidence(self):
+        original = dict(self.words(['Dismiss'])[0], left=201, top=101, width=121, height=31)
+        mapped = original_coordinates([original])[0]
+        self.assertEqual([mapped[key] for key in ('left', 'top', 'width', 'height')],
+                         [100, 50, 61, 16])
+        self.assertEqual(mapped['processed_box'], [201, 101, 121, 31])
+        for key in ('text', 'confidence', 'line'):
+            self.assertEqual(mapped[key], original[key])
+        for bad in (dict(original, left=-1), dict(original, width=0),
+                    dict(original, left=SCREEN[0] * OCR_SCALE)):
+            self.assertRaises(AssertionError, original_coordinates, [bad])
+
+    def test_short_runtime_limits_and_identity_reject_replacement(self):
+        from types import SimpleNamespace
+        self.assertTrue(runtime_socket_fits(Path('/tmp/fr07-12345678')))
+        self.assertFalse(runtime_socket_fits(Path('/tmp/' + 'x' * 80)))
+        self.assertFalse(runtime_socket_fits(Path('/tmp/' + '\u754c' * 30)))
+        fields = dict(st_mode=stat.S_IFDIR | 0o700, st_uid=1000, st_dev=7, st_ino=11)
+        original = SimpleNamespace(**fields)
+        verify_runtime_identity(original, original, (7, 11), 1000)
+        for change in ({'st_ino': 12}, {'st_uid': 1001}, {'st_mode': stat.S_IFDIR | 0o755},
+                       {'st_mode': stat.S_IFLNK | 0o700}):
+            changed = SimpleNamespace(**dict(fields, **change))
+            self.assertRaises(AssertionError, verify_runtime_identity,
+                              changed, original, (7, 11), 1000)
 
     def test_clean_requires_positive_anchor(self):
         self.assertRaises(AssertionError, banner_evidence, [], 'absent')
