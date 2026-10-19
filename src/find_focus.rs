@@ -1,20 +1,61 @@
 //! Restore Find keyboard focus without moving its caret or reversing selection.
 use iced::advanced::text;
-use iced::advanced::widget::Tree;
 use iced::advanced::widget::{operation, Id, Operation};
+use iced::advanced::widget::{tree, Tree};
 use iced::advanced::{layout, mouse, overlay, renderer, Clipboard, Layout, Shell, Widget};
 use iced::widget::text_input::{self, Value};
-use iced::{Element, Event, Length, Rectangle, Size, Vector};
+use iced::{keyboard, Element, Event, Length, Rectangle, Size, Vector};
 use std::any::Any;
 
 struct Input<'a, Message, Theme, Renderer> {
     id: Id,
     value: Value,
     content: Element<'a, Message, Theme, Renderer>,
+    on_reveal: Option<Box<dyn Fn(keyboard::Event) -> Message + 'a>>,
+    interaction_enabled: bool,
 }
 
-/// Only the Find input opts in; all pointer, touch, keyboard and IME events
-/// still pass through the unmodified Iced input.
+enum Composition {
+    Idle,
+    Active,
+    // Empty preedit can mean either candidate confirmation or cancellation
+    // without a later Commit/Closed. Own at most one fresh candidate key.
+    Empty,
+}
+
+impl Composition {
+    fn cancel(&mut self) {
+        if matches!(self, Self::Active) {
+            *self = Self::Empty;
+        }
+    }
+}
+
+struct InputState {
+    composition: Composition,
+    window_focused: bool,
+}
+
+fn sync_input_ownership<P: text::Paragraph + 'static>(tree: &mut Tree, interaction_enabled: bool) {
+    if !interaction_enabled
+        || !tree.children[0]
+            .state
+            .downcast_ref::<text_input::State<P>>()
+            .is_focused()
+    {
+        tree.state.downcast_mut::<InputState>().composition.cancel();
+    }
+}
+
+fn reveal_chord(event: &keyboard::Event) -> bool {
+    matches!(event, keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        modifiers, ..
+    } if modifiers.control() && !modifiers.shift() && !modifiers.alt() && !modifiers.logo())
+}
+
+/// Only the Find input opts in. A focused exact Ctrl+Enter can activate its
+/// rendered hidden-match target; other editing events stay with the Iced input.
 pub(crate) fn input<
     'a,
     Message: Clone + 'a,
@@ -24,22 +65,38 @@ pub(crate) fn input<
     id: Id,
     value: &str,
     content: text_input::TextInput<'a, Message, Theme, Renderer>,
+    on_reveal: Option<Box<dyn Fn(keyboard::Event) -> Message + 'a>>,
+    interaction_enabled: bool,
 ) -> Element<'a, Message, Theme, Renderer> {
     Element::new(Input {
         id: id.clone(),
         value: Value::new(value),
         content: content.id(id).into(),
+        on_reveal,
+        interaction_enabled,
     })
 }
 
 impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
     for Input<'_, Message, Theme, Renderer>
 {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<InputState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(InputState {
+            composition: Composition::Idle,
+            window_focused: true,
+        })
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(self.content.as_widget())]
     }
     fn diff(&self, tree: &mut Tree) {
         tree.diff_children(std::slice::from_ref(&self.content));
+        sync_input_ownership::<Renderer::Paragraph>(tree, self.interaction_enabled);
     }
 
     fn size(&self) -> Size<Length> {
@@ -92,6 +149,7 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
+        sync_input_ownership::<Renderer::Paragraph>(tree, self.interaction_enabled);
         let mut request = RestoreFocus(false);
         operation.custom(Some(&self.id), layout.bounds(), &mut request);
         if request.0 {
@@ -113,6 +171,58 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        sync_input_ownership::<Renderer::Paragraph>(tree, self.interaction_enabled);
+        let focused = tree.children[0]
+            .state
+            .downcast_ref::<text_input::State<Renderer::Paragraph>>()
+            .is_focused();
+        let state = tree.state.downcast_mut::<InputState>();
+        match event {
+            Event::InputMethod(iced::advanced::input_method::Event::Preedit(text, _))
+                if focused && self.interaction_enabled && state.window_focused =>
+            {
+                // X11 can start composition with empty preedit as well.
+                state.composition = if text.is_empty() {
+                    Composition::Empty
+                } else {
+                    Composition::Active
+                };
+            }
+            Event::InputMethod(
+                iced::advanced::input_method::Event::Opened
+                | iced::advanced::input_method::Event::Closed
+                | iced::advanced::input_method::Event::Commit(_),
+            ) => state.composition = Composition::Idle,
+            Event::Window(iced::window::Event::Unfocused) => {
+                state.window_focused = false;
+                state.composition.cancel();
+            }
+            Event::Window(iced::window::Event::Focused) => state.window_focused = true,
+            Event::Keyboard(event)
+                if focused
+                    && self.interaction_enabled
+                    && state.window_focused
+                    && reveal_chord(event) =>
+            {
+                if let Some(on_reveal) = &self.on_reveal {
+                    if matches!(event, keyboard::Event::KeyPressed { repeat: false, .. }) {
+                        match state.composition {
+                            Composition::Idle => shell.publish(on_reveal(event.clone())),
+                            Composition::Active => {}
+                            // Preserve one candidate-confirmation press, but
+                            // recover if cancellation sends no Commit/Closed.
+                            // Native ownership still holds its physical repeats.
+                            Composition::Empty => state.composition = Composition::Idle,
+                        }
+                    }
+                    // The existing captured/native Enter path owns the hold;
+                    // never also navigate the search or forward it to the PTY.
+                    shell.capture_event();
+                    return;
+                }
+            }
+            _ => {}
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -123,6 +233,7 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
             shell,
             viewport,
         );
+        sync_input_ownership::<Renderer::Paragraph>(tree, self.interaction_enabled);
     }
 
     fn mouse_interaction(
@@ -224,7 +335,9 @@ mod tests {
                         input(
                             id.clone(),
                             query,
-                            text_input("", query).width(200).on_input(Message::Input)
+                            text_input("", query).width(200).on_input(Message::Input),
+                            None,
+                            true,
                         ),
                         button(label).width(60).on_press(Message::Toggle),
                     ]
@@ -329,6 +442,8 @@ mod tests {
             id.clone(),
             "draft",
             text_input("", "draft").width(100).on_input(|_| ()),
+            None,
+            true,
         );
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
@@ -413,5 +528,71 @@ mod tests {
             .unwrap()
             .0;
         assert!(bar.contains("find_focus::input("));
+    }
+}
+
+#[cfg(test)]
+mod keyboard_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_reveal_refocus_preserves_unicode_caret_and_directed_selection() {
+        type State = text_input::State<<() as text::Renderer>::Paragraph>;
+        for (start, end) in [(2, 2), (1, 3), (3, 1)] {
+            let query = "aé👩‍💻z";
+            let value = Value::new(query);
+            let id = Id::new("find-key-cursor");
+            let mut element: Element<'_, bool, iced::Theme, ()> = input(
+                id.clone(),
+                query,
+                iced::widget::text_input("", query)
+                    .width(200)
+                    .on_input(|_| false),
+                Some(Box::new(|_| true)),
+                true,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = Rectangle::with_size(Size::new(300.0, 60.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let state = tree.children[0].state.downcast_mut::<State>();
+            state.focus();
+            state.select_range(start, end);
+            let before = state.cursor().state(&value);
+            let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            });
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &(),
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+            assert_eq!(messages, [true]);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &(), &mut Refocus(id));
+            let state = tree.children[0].state.downcast_mut::<State>();
+            assert!(state.is_focused());
+            assert_eq!(state.cursor().state(&value), before);
+            assert_eq!(messages, [true], "no synthetic query input or IME commit");
+        }
     }
 }

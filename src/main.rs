@@ -4674,6 +4674,7 @@ enum Message {
     SearchToggleCase,
     SearchInput(String),
     SearchRevealMatch(Box<SearchRevealTarget>),
+    SearchRevealKey(Box<SearchRevealTarget>, keyboard::Event),
     SearchReplaceFindInput(String),
     SearchReplaceReplaceInput(String),
     SearchReplaceToggleRegex,
@@ -18531,6 +18532,19 @@ impl Frost {
                 }
             }
             Message::SearchRevealMatch(target) => return self.reveal_hidden_search_match(&target),
+            Message::SearchRevealKey(target, event) => {
+                // Widget actions precede captured-key subscription messages.
+                // Claim the same native hold before revealing, and respect a
+                // terminal IME candidate whose owner changed to this overlay.
+                self.native_enter_ownership.lock().claim_pressed();
+                if self.terminal_ime.claim_enter(&event)
+                    || !self.focused
+                    || !self.terminal_mouse_active()
+                {
+                    return Task::none();
+                }
+                return self.reveal_hidden_search_match(&target);
+            }
             Message::SearchInput(value) => {
                 self.search.set_query(value);
                 self.recompute_search();
@@ -25820,6 +25834,16 @@ impl Frost {
                 button::secondary
             });
 
+        // The same higher-priority modals that block pane interaction also
+        // shadow Find. Its input may still retain widget focus underneath.
+        let reveal_key = reveal
+            .as_ref()
+            .filter(|_| self.terminal_mouse_active())
+            .map(|target| {
+                let target = target.clone();
+                Box::new(move |event| Message::SearchRevealKey(Box::new(target.clone()), event))
+                    as Box<dyn Fn(keyboard::Event) -> Message>
+            });
         let input = find_focus::input(
             SEARCH_INPUT_ID.clone(),
             &self.search.query,
@@ -25827,6 +25851,8 @@ impl Frost {
                 .on_input(Message::SearchInput)
                 .size(self.effective_font_size())
                 .width(Length::Fixed(220.0)),
+            reveal_key,
+            self.terminal_mouse_active(),
         );
         let mut bar = row![text("Find:").size(self.effective_font_size()), input]
             .spacing(8)
@@ -25840,7 +25866,7 @@ impl Frost {
             content = content.push(
                 row![
                     text("Match is hidden in a collapsed block").size(self.effective_font_size()),
-                    button(text("Reveal match").size(self.effective_font_size()))
+                    button(text("Reveal match (Ctrl+Enter)").size(self.effective_font_size()))
                         .on_press(Message::SearchRevealMatch(Box::new(target)))
                         .padding([4, 8]),
                 ]
@@ -36352,6 +36378,10 @@ mod tests {
         assert_eq!(prompt_jump_target(prompts.into_iter(), 15, false), Some(23));
         assert_eq!(prompt_jump_target(prompts.into_iter(), 2, true), None);
         assert_eq!(prompt_jump_target(prompts.into_iter(), 23, false), None);
+    }
+
+    mod find_reveal_keyboard {
+        include!("find_reveal_tests.rs");
     }
 
     struct SearchRevealFixture {
