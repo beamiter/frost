@@ -1,0 +1,46 @@
+name: Vim9 rewrite validation
+on:
+  push:
+    branches: [work/vim9-rewrite-20261020]
+permissions:
+  contents: write
+concurrency:
+  group: vim9-rewrite
+  cancel-in-progress: false
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Prepare bounded source excerpts
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          source = Path('src/main.rs').read_text()
+          folder = Path('.vim9-review')
+          folder.mkdir(exist_ok=True)
+          lines = source.splitlines(keepends=True)
+          for i in range(0, len(lines), 300):
+              (folder / f'main-{i + 1:05}.txt').write_text(''.join(lines[i:i + 300]))
+          index = []
+          for i, line in enumerate(lines, 1):
+              if re.match(r'^(?:pub(?:\([^)]*\))? )?(?:fn |struct |enum |impl )', line) or re.match(r'^    (?:pub(?:\([^)]*\))? )?fn ', line):
+                  index.append(f'{i}: {line.rstrip()}')
+          (folder / 'index.txt').write_text('\n'.join(index) + '\n')
+          print('Source lines:', len(lines))
+          print('\n'.join(index[:250]))
+          PY
+      - name: Retain inspection only on rewrite branch
+        shell: bash
+        run: |
+          test "$GITHUB_REF_NAME" = work/vim9-rewrite-20261020
+          git config user.name 'Frost IDE integration'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .vim9-review
+          if ! git diff --cached --quiet; then
+            git commit -m 'Record source excerpts for isolated Vim9 rewrite'
+            git push origin HEAD:refs/heads/work/vim9-rewrite-20261020
+          fi
