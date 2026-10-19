@@ -13,6 +13,7 @@ mod ai_chat_store;
 mod ai_chats;
 mod ai_command;
 mod ansi;
+mod block_compare;
 mod block_export;
 mod block_mode;
 mod block_review;
@@ -1381,6 +1382,9 @@ fn command_requires_block_context(command: &keybindings::Command) -> bool {
             | C::BlockCopyMarkdown
             | C::BlockExportSessionMarkdown
             | C::BlockExportSessionJson
+            | C::BlockCompareSelected
+            | C::BlockExportSelectedMarkdown
+            | C::BlockExportSelectedJson
             | C::BlockSearch
             | C::BlockToggleBookmark
             | C::BlockJumpPrevBookmark
@@ -2800,6 +2804,7 @@ struct BlockReview {
     commands: Option<String>,
     command_error: Option<String>,
     bracketed: bool,
+    comparison: Option<block_compare::ComparisonState>,
 }
 
 impl BlockReview {
@@ -5051,6 +5056,10 @@ enum Message {
     BlockReviewKeepOpen,
     BlockReviewInsert,
     BlockReviewCopy,
+    BlockReviewCompare,
+    BlockReviewExport(block_export::SessionExportFormat),
+    BlockComparisonFinished(block_compare::ComparisonResult),
+    BlockComparisonCopy,
     BlockReadingNavigate(bool),
     BlockGoLive,
     /// Presentation-only bulk folding, bound to the pane that drew the control.
@@ -11019,6 +11028,13 @@ impl Frost {
             C::BlockExportSessionJson => {
                 self.block_export_session_task(block_export::SessionExportFormat::Json)
             }
+            C::BlockCompareSelected => self.block_compare_selected_task(false),
+            C::BlockExportSelectedMarkdown => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Markdown, false)
+            }
+            C::BlockExportSelectedJson => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Json, false)
+            }
             C::BlockSearch => self.toggle_block_search(),
             C::BlockMenu => return self.open_selected_block_menu(),
             C::BlockToggleBookmark => {
@@ -14415,6 +14431,22 @@ impl Frost {
         greeting_target: Option<usize>,
     ) -> Task<Message> {
         use command_palette::PaletteAction;
+        if matches!(
+            action,
+            PaletteAction::BlockCompareSelected
+                | PaletteAction::BlockExportSelectedMarkdown
+                | PaletteAction::BlockExportSelectedJson
+        ) && greeting_target.is_none_or(|target| {
+            self.sessions
+                .get(self.active)
+                .is_none_or(|session| session.id != target)
+        }) {
+            self.push_toast(
+                "The source pane changed. Reopen the command palette in the pane to review.",
+                ToastKind::Warning,
+            );
+            return Task::none();
+        }
         self.palette.record_use(action);
         match action {
             PaletteAction::GreetCompanion => {
@@ -14612,6 +14644,13 @@ impl Frost {
             }
             PaletteAction::BlockExportSessionJson => {
                 self.block_export_session_task(block_export::SessionExportFormat::Json)
+            }
+            PaletteAction::BlockCompareSelected => self.block_compare_selected_task(false),
+            PaletteAction::BlockExportSelectedMarkdown => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Markdown, false)
+            }
+            PaletteAction::BlockExportSelectedJson => {
+                self.block_export_selected_task(block_export::SessionExportFormat::Json, false)
             }
             PaletteAction::BlockSearch => self.toggle_block_search(),
             PaletteAction::BlockToggleBookmark => self.block_toggle_target_bookmark(),
@@ -19780,6 +19819,12 @@ impl Frost {
             Message::BlockReviewKeepOpen => {}
             Message::BlockReviewInsert => return self.confirm_block_review(),
             Message::BlockReviewCopy => return self.copy_block_review(),
+            Message::BlockReviewCompare => return self.block_compare_selected_task(true),
+            Message::BlockReviewExport(format) => {
+                return self.block_export_selected_task(format, true)
+            }
+            Message::BlockComparisonFinished(result) => self.finish_block_comparison(result),
+            Message::BlockComparisonCopy => return self.copy_block_comparison(),
             Message::BlockReadingNavigate(older) => {
                 if self.ensure_block_action_available("Reading history") {
                     let target = self.sessions.get_mut(self.active).and_then(|sess| {
@@ -22499,6 +22544,7 @@ impl Frost {
             commands: None,
             command_error: None,
             bracketed: false,
+            comparison: None,
         })
     }
 
@@ -22569,7 +22615,6 @@ impl Frost {
             .command_zones
             .iter()
             .filter(|z| sess.block_selection.contains(z.id))
-            .take(128)
             .map(|z| z.id)
             .collect::<Vec<_>>();
         let mut sources = String::new();
@@ -22600,6 +22645,7 @@ impl Frost {
             .command_zones
             .iter()
             .filter(|z| ids.contains(&z.id))
+            .take(128)
         {
             if preview.len() >= 65536 {
                 preview.push_str("\n[Selection preview clipped]");
@@ -22634,6 +22680,7 @@ impl Frost {
             commands: commands.map(|commands| commands.text),
             command_error,
             bracketed,
+            comparison: None,
         });
         Task::none()
     }
@@ -22739,6 +22786,40 @@ impl Frost {
             .on_press(Message::BlockReviewClose)
             .style(self.ghost_btn_style())]
         .spacing(8);
+        let current_sources = self.block_review_sources_current(review);
+        if review.comparison.is_some() {
+            actions = actions.push(
+                button(text("Copy comparison").size(self.effective_font_size())).on_press_maybe(
+                    review
+                        .comparison
+                        .as_ref()
+                        .is_some_and(|state| state.ready)
+                        .then_some(Message::BlockComparisonCopy),
+                ),
+            );
+        } else if review.ids.len() == 2 {
+            actions = actions.push(
+                button(text("Compare output").size(self.effective_font_size()))
+                    .on_press_maybe(current_sources.then_some(Message::BlockReviewCompare)),
+            );
+        }
+        for (label, format) in [
+            (
+                "Export selection MD",
+                block_export::SessionExportFormat::Markdown,
+            ),
+            (
+                "Export selection JSON",
+                block_export::SessionExportFormat::Json,
+            ),
+        ] {
+            actions = actions.push(
+                button(text(label).size(self.effective_font_size())).on_press_maybe(
+                    (current_sources && !self.block_export_in_flight)
+                        .then_some(Message::BlockReviewExport(format)),
+                ),
+            );
+        }
         if review.commands.is_some() || review.command_error.is_some() {
             actions = actions.push(
                 button(text("Copy commands").size(self.effective_font_size()))
@@ -22755,7 +22836,13 @@ impl Frost {
             }
             actions = actions.push(insert);
         }
-        let status = if let Some(reason) = review.command_error.as_deref() {
+        let status = if review.comparison.is_some() {
+            if current_sources {
+                "Read-only comparison of the two captured outputs. Copy includes source details and any limits."
+            } else {
+                "Original comparison snapshot. Selection changed; reopen Review before exporting."
+            }
+        } else if let Some(reason) = review.command_error.as_deref() {
             reason
         } else if !live {
             "Source changed or was evicted. Close and reopen to review the current pane."
@@ -35020,6 +35107,7 @@ mod tests {
             commands: Some("echo one\necho two".into()),
             command_error: None,
             bracketed: true,
+            comparison: None,
         };
         for session_id in [7, 8] {
             for ids in [&[1, 2][..], &[2, 1][..], &[1][..], &[][..]] {
@@ -35101,6 +35189,7 @@ mod tests {
             commands: Some("echo one\necho two".into()),
             command_error: None,
             bracketed: true,
+            comparison: None,
         };
         assert!(review.matches_selection(7, &[4, 9], "echo one\necho two", true));
         assert!(!review.matches_selection(8, &[4, 9], "echo one\necho two", true));

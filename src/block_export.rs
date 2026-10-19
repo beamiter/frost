@@ -8,6 +8,7 @@ use crate::block_mode;
 use crate::persistence;
 use crate::terminal::{TerminalState, ZoneOutputExport};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ const MAX_SESSION_EXPORT_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 pub const SESSION_EXPORT_SCHEMA: &str = "frost.block-session";
 pub const SESSION_EXPORT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_SELECTED_BLOCKS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionExportFormat {
@@ -100,6 +102,7 @@ pub struct SessionExportSnapshot {
     pub captured_at_ms: u64,
     pub captured_tz_offset_secs: i32,
     pub blocks: Vec<SessionExportBlock>,
+    pub selection_only: bool,
 }
 
 #[derive(Serialize)]
@@ -122,6 +125,7 @@ struct JsonSessionExport<'a> {
     captured_at_ms: u64,
     captured_tz_offset_secs: i32,
     block_order: &'static str,
+    scope: &'static str,
     retention: SessionExportRetention,
     blocks: &'a [SessionExportBlock],
 }
@@ -221,19 +225,30 @@ fn snapshot_zone(
     zone: &crate::terminal::CommandZone,
     now_ms: u64,
     source_bytes: &mut usize,
+    retained_only: bool,
 ) -> io::Result<SessionExportBlock> {
-    let (output, output_truncated, output_unavailable) =
-        match terminal.zone_output_export_capped(zone.id) {
-            Some(ZoneOutputExport::Available { text, truncated }) => (text, truncated, false),
-            Some(ZoneOutputExport::Empty) => (String::new(), false, false),
-            Some(ZoneOutputExport::Unavailable) => (String::new(), false, true),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "retained command block disappeared during export snapshot",
-                ));
-            }
-        };
+    let (output, output_truncated, output_unavailable) = match if retained_only {
+        Some(match &zone.captured_output {
+            Some((text, truncated)) => ZoneOutputExport::Available {
+                text: text.clone(),
+                truncated: *truncated,
+            },
+            None if zone.captured_output_evicted => ZoneOutputExport::Unavailable,
+            None => ZoneOutputExport::Empty,
+        })
+    } else {
+        terminal.zone_output_export_capped(zone.id)
+    } {
+        Some(ZoneOutputExport::Available { text, truncated }) => (text, truncated, false),
+        Some(ZoneOutputExport::Empty) => (String::new(), false, false),
+        Some(ZoneOutputExport::Unavailable) => (String::new(), false, true),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "retained command block disappeared during export snapshot",
+            ));
+        }
+    };
     let record_bytes = output
         .len()
         .saturating_add(zone.command.as_ref().map_or(0, String::len))
@@ -279,6 +294,7 @@ fn snapshot_with_blocks(
         captured_at_ms: now_ms,
         captured_tz_offset_secs: block_mode::local_offset_secs((now_ms / 1000) as i64),
         blocks,
+        selection_only: false,
     }
 }
 
@@ -297,7 +313,13 @@ pub fn snapshot_session(
     let mut blocks = Vec::with_capacity(terminal.command_zones.len());
 
     for zone in &terminal.command_zones {
-        blocks.push(snapshot_zone(terminal, zone, now_ms, &mut source_bytes)?);
+        blocks.push(snapshot_zone(
+            terminal,
+            zone,
+            now_ms,
+            &mut source_bytes,
+            false,
+        )?);
     }
     Ok(snapshot_with_blocks(pane_session_id, now_ms, blocks))
 }
@@ -320,8 +342,57 @@ pub fn snapshot_block(
         )
     })?;
     let mut source_bytes = 0usize;
-    let block = snapshot_zone(terminal, zone, now_ms, &mut source_bytes)?;
+    let block = snapshot_zone(terminal, zone, now_ms, &mut source_bytes, false)?;
     Ok(snapshot_with_blocks(pane_session_id, now_ms, vec![block]))
+}
+
+/// Snapshot exactly the requested stable identities in terminal order. Missing
+/// or duplicate identities reject the entire operation before output is cloned.
+/// Only finalization captures are used; an evicted capture stays unavailable
+/// even if unrelated text is now visible at its old row coordinates.
+pub fn snapshot_selected(
+    terminal: &TerminalState,
+    pane_session_id: usize,
+    ids: &[u64],
+) -> io::Result<SessionExportSnapshot> {
+    if ids.is_empty() || ids.len() > MAX_SELECTED_BLOCKS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("select between 1 and {MAX_SELECTED_BLOCKS} retained blocks"),
+        ));
+    }
+    let wanted: HashSet<_> = ids.iter().copied().collect();
+    if wanted.len() != ids.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "selected block identities are duplicated",
+        ));
+    }
+    let zones: Vec<_> = terminal
+        .command_zones
+        .iter()
+        .filter(|zone| wanted.contains(&zone.id))
+        .collect();
+    if zones.len() != wanted.len()
+        || zones.iter().map(|zone| zone.id).collect::<HashSet<_>>() != wanted
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "a selected block is no longer retained; review the complete selection again",
+        ));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut source_bytes = 0;
+    let blocks = zones
+        .into_iter()
+        .map(|zone| snapshot_zone(terminal, zone, now_ms, &mut source_bytes, true))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut snapshot = snapshot_with_blocks(pane_session_id, now_ms, blocks);
+    snapshot.selection_only = true;
+    Ok(snapshot)
 }
 
 struct BoundedBuffer {
@@ -389,6 +460,11 @@ fn serialize_session(
                 captured_at_ms: snapshot.captured_at_ms,
                 captured_tz_offset_secs: snapshot.captured_tz_offset_secs,
                 block_order: "oldest_first",
+                scope: if snapshot.selection_only {
+                    "selected_blocks"
+                } else {
+                    "retained_session"
+                },
                 retention: snapshot.retention(),
                 blocks: &snapshot.blocks,
             };
@@ -397,7 +473,15 @@ fn serialize_session(
             writer.write_all(b"\n")?;
         }
         SessionExportFormat::Markdown => {
-            writeln!(writer, "# Terminal Session Export\n")?;
+            writeln!(
+                writer,
+                "# Terminal {} Export\n",
+                if snapshot.selection_only {
+                    "Selection"
+                } else {
+                    "Session"
+                }
+            )?;
             writeln!(writer, "Pane session: {}", snapshot.pane_session_id)?;
             writeln!(
                 writer,
@@ -407,10 +491,22 @@ fn serialize_session(
                     snapshot.captured_tz_offset_secs
                 )
             )?;
-            writeln!(writer, "Total retained blocks: {}\n", snapshot.blocks.len())?;
+            writeln!(
+                writer,
+                "{} blocks: {}\n",
+                if snapshot.selection_only {
+                    "Selected"
+                } else {
+                    "Total retained"
+                },
+                snapshot.blocks.len()
+            )?;
             writeln!(writer, "---\n")?;
             for (index, block) in snapshot.blocks.iter().enumerate() {
                 writeln!(writer, "## Block #{}\n", index + 1)?;
+                if snapshot.selection_only {
+                    writeln!(writer, "Terminal block ID: {}\n", block.id)?;
+                }
                 writer.write_all(block.markdown().as_bytes())?;
                 writeln!(writer, "\n---\n")?;
             }
@@ -433,9 +529,25 @@ fn write_session_export(
     format: SessionExportFormat,
     contents: &[u8],
 ) -> io::Result<PathBuf> {
+    write_export_with_scope(directory, stamp, format, contents, false)
+}
+
+fn write_export_with_scope(
+    directory: &Path,
+    stamp: &str,
+    format: SessionExportFormat,
+    contents: &[u8],
+    selection_only: bool,
+) -> io::Result<PathBuf> {
     persistence::ensure_private_directory(directory)?;
     for attempt in 0..100u32 {
-        let path = directory.join(export_file_name(stamp, format.extension(), attempt));
+        let name = export_file_name(stamp, format.extension(), attempt);
+        let name = if selection_only {
+            name.replacen("session-", "selection-", 1)
+        } else {
+            name
+        };
+        let path = directory.join(name);
         match persistence::write_new_private_file(&path, contents, MAX_SESSION_EXPORT_BYTES as u64)
         {
             Ok(()) => return Ok(path),
@@ -469,7 +581,11 @@ pub fn export_session_to_file(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no user data directory"))?
         .join("frost")
         .join("exports");
-    write_session_export(&directory, &export_stamp(), format, &contents)
+    if snapshot.selection_only {
+        write_export_with_scope(&directory, &export_stamp(), format, &contents, true)
+    } else {
+        write_session_export(&directory, &export_stamp(), format, &contents)
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +642,7 @@ mod tests {
             captured_at_ms: 0,
             captured_tz_offset_secs: 0,
             blocks,
+            selection_only: false,
         }
     }
 
@@ -639,6 +756,74 @@ mod tests {
             assert!(!document.contains("beta-command"));
             assert!(!document.contains("beta-output"));
         }
+    }
+
+    #[test]
+    fn selected_snapshot_is_sparse_ordered_and_explicit_in_both_formats() {
+        let mut terminal = TerminalState::new(80, 12);
+        for (command, output) in [
+            ("alpha", "first"),
+            ("unrelated", "private-middle"),
+            ("omega", "last"),
+        ] {
+            terminal.process_input(format!(
+                "\u{1b}]133;A\u{7}$ \u{1b}]133;B\u{7}{command}\r\n\u{1b}]133;C;cmdline_url={command}\u{7}{output}\r\n\u{1b}]133;D;exit_code=0\u{7}"
+            ).as_bytes());
+        }
+        let selected = snapshot_selected(&terminal, 42, &[2, 0]).unwrap();
+        assert!(selected.selection_only);
+        assert_eq!(
+            selected
+                .blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        for format in [SessionExportFormat::Markdown, SessionExportFormat::Json] {
+            let document =
+                String::from_utf8(serialize_session(&selected, format).unwrap()).unwrap();
+            assert!(document.contains("alpha") && document.contains("omega"));
+            assert!(!document.contains("unrelated") && !document.contains("private-middle"));
+            if format == SessionExportFormat::Markdown {
+                assert!(document.starts_with("# Terminal Selection Export"));
+                assert!(document.contains("Terminal block ID: 2"));
+            } else {
+                let json: serde_json::Value = serde_json::from_str(&document).unwrap();
+                assert_eq!(json["scope"], "selected_blocks");
+                assert_eq!(json["blocks"][1]["id"], 2);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_snapshot_refuses_missing_duplicate_empty_and_over_budget_sets() {
+        let mut terminal = TerminalState::new(80, 12);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo\r\n\x1b]133;C;cmdline_url=echo\x07done\r\n\x1b]133;D;exit_code=0\x07");
+        assert!(snapshot_selected(&terminal, 42, &[]).is_err());
+        assert!(snapshot_selected(&terminal, 42, &[0, 0]).is_err());
+        assert!(snapshot_selected(&terminal, 42, &[0, 999]).is_err());
+        assert!(snapshot_selected(&terminal, 42, &vec![0; MAX_SELECTED_BLOCKS + 1]).is_err());
+        assert_eq!(
+            snapshot_selected(&terminal, 42, &[0]).unwrap().blocks.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_export_preserves_eviction_even_while_old_rows_are_available() {
+        let mut terminal = TerminalState::new(80, 12);
+        terminal.process_input(b"\x1b]133;A\x07$ \x1b]133;B\x07echo\r\n\x1b]133;C;cmdline_url=echo\x07retained rows\r\n\x1b]133;D;exit_code=0\x07");
+        terminal.command_zones[0].captured_output = None;
+        terminal.command_zones[0].captured_output_evicted = true;
+        let selected = snapshot_selected(&terminal, 42, &[0]).unwrap();
+        assert!(selected.blocks[0].output_unavailable);
+        assert!(selected.blocks[0].output.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(
+            &serialize_session(&selected, SessionExportFormat::Json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["retention"]["output_unavailable"], 1);
     }
 
     #[test]

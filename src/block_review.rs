@@ -56,7 +56,7 @@ pub fn preview(value: &str, limit: usize) -> String {
     for character in value.chars() {
         if character == '\n'
             || (!character.is_control()
-                && !jterm_core::review_input::is_visual_spoofing_character(character))
+                && !jterm_core::review_input::is_terminal_visual_spoofing_character(character))
         {
             if character.len_utf8() > limit.saturating_sub(text.len()) {
                 clipped = true;
