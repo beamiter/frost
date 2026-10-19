@@ -7,40 +7,49 @@ permissions:
 concurrency:
   group: vim9-rewrite
   cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
 jobs:
-  inspect:
+  validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: Prepare bounded source excerpts
-        shell: bash
+      - name: Apply bounded integration edits
+        run: python3 scripts/apply-vim9-rewrite.py
+      - name: Install Linux dependencies
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          source = Path('src/main.rs').read_text()
-          folder = Path('.vim9-review')
-          folder.mkdir(exist_ok=True)
-          lines = source.splitlines(keepends=True)
-          for i in range(0, len(lines), 300):
-              (folder / f'main-{i + 1:05}.txt').write_text(''.join(lines[i:i + 300]))
-          index = []
-          for i, line in enumerate(lines, 1):
-              if re.match(r'^(?:pub(?:\([^)]*\))? )?(?:fn |struct |enum |impl )', line) or re.match(r'^    (?:pub(?:\([^)]*\))? )?fn ', line):
-                  index.append(f'{i}: {line.rstrip()}')
-          (folder / 'index.txt').write_text('\n'.join(index) + '\n')
-          print('Source lines:', len(lines))
-          print('\n'.join(index[:250]))
-          PY
-      - name: Retain inspection only on rewrite branch
-        shell: bash
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libfontconfig1-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev vim ripgrep xvfb xdotool
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: vim9-rewrite
+          cache-on-failure: true
+      - name: Format and retain actual product source
         run: |
+          cargo fmt --all
           test "$GITHUB_REF_NAME" = work/vim9-rewrite-20261020
           git config user.name 'Frost IDE integration'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .vim9-review
+          git add src Cargo.toml Cargo.lock deny.toml scripts tests
           if ! git diff --cached --quiet; then
-            git commit -m 'Record source excerpts for isolated Vim9 rewrite'
+            git commit -m 'Integrate and format the native Vim9 workbench'
             git push origin HEAD:refs/heads/work/vim9-rewrite-20261020
           fi
+          echo "VALIDATED_SOURCE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git show --stat --oneline HEAD
+      - name: Check actual test targets with exact pinned dependencies
+        run: cargo check --tests --locked
+      - name: Run native workbench unit contracts
+        run: cargo test --bin frost --locked vim9_ide::tests -- --test-threads=1
+      - name: Run real Vim9 PTY round trip when present
+        run: cargo test --bin frost --locked vim9_ide::tests::real_vim9_native_pty -- --ignored --exact --test-threads=1
+      - name: Confirm clean formatting and report validated commit
+        run: |
+          cargo fmt --all -- --check
+          echo "Validated source commit: $VALIDATED_SOURCE" >> "$GITHUB_STEP_SUMMARY"
