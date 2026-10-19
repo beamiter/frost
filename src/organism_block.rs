@@ -113,17 +113,24 @@ pub(crate) fn travel_band(surface: Surface) -> Option<Rect> {
         .then_some(rect)
 }
 
-/// The travel band is wholly default-cell blank space, never a text estimate.
-pub(crate) fn placement(surface: Surface) -> Option<Rect> {
+/// Validate the blank-space envelope once for both placement and wandering.
+/// Callers never reconstruct a less restrictive travel area from the body.
+pub(crate) fn layout(surface: Surface) -> Option<(Rect, Rect)> {
     let band = travel_band(surface)?;
     let width = BODY_COLS as f32 * surface.cell.0 + 2.0 * (BODY_PAD_X + BODY_BORDER);
     let height = BODY_ROWS as f32 * surface.cell.1 + 2.0 * (BODY_PAD_Y + BODY_BORDER);
-    Some(Rect {
+    let body = Rect {
         x: band.x + band.width - width,
         y: band.y,
         width,
         height,
-    })
+    };
+    Some((body, band))
+}
+
+#[cfg(test)]
+fn placement(surface: Surface) -> Option<Rect> {
+    layout(surface).map(|(body, _)| body)
 }
 
 /// Same quiet edge/pacing/edge/pacing cycle as the GTK reference, using the

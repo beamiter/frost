@@ -3615,6 +3615,9 @@ pub struct TerminalState {
     /// the cwd comes only from `/proc/<pid>/cwd`, which is the *local* shell's
     /// directory and therefore always wrong once the pane is running ssh.
     current_working_dir: Option<String>,
+    /// A bounded directory reported for the current idle shell, retired at execution.
+    /// Kept separate from command-start attribution and the sticky OSC 7 cache.
+    organism_idle_cwd: Option<String>,
 
     // Global background color set by vim (CSI ... m)
     pub global_bg: Color,
@@ -4003,6 +4006,7 @@ impl TerminalState {
             icon_title: String::new(),
             title_stack: Vec::new(),
             current_working_dir: None,
+            organism_idle_cwd: None,
             global_bg: Color::Default,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -4888,7 +4892,14 @@ impl TerminalState {
                     // remote path must leave the last
                     // known local directory alone rather
                     // than blanking it.
-                    if let Some(cwd) = Self::decode_osc7_cwd(value) {
+                    let accepted = Self::decode_osc7_cwd(value);
+                    let idle_cwd = accepted.as_deref().filter(|_| {
+                        !self.use_alt_buffer
+                            && !self.is_command_running()
+                            && !self.prompt_submission_pending
+                    });
+                    self.observe_organism_idle_cwd(idle_cwd);
+                    if let Some(cwd) = accepted {
                         self.current_working_dir = Some(cwd);
                     }
                 } else if command == "8" {
@@ -5131,6 +5142,13 @@ impl TerminalState {
         }
         match mark {
             'A' => {
+                if seen_cwd {
+                    self.observe_organism_idle_cwd(metadata_cwd.as_deref());
+                } else if self.is_command_running() || self.prompt_submission_pending {
+                    // A missing D cannot carry the previous execution's cwd
+                    // into a fresh prompt, even when the sticky OSC 7 remains.
+                    self.organism_idle_cwd = None;
+                }
                 self.watch_batch.ended |= self.is_command_running();
                 self.watch_batch.boundary = true;
                 // A fresh prompt while a command was still mid-output (`C`
@@ -5209,6 +5227,7 @@ impl TerminalState {
                         self.current_command_id.clone_from(&mark_id);
                     }
                     if seen_cwd {
+                        self.observe_organism_idle_cwd(metadata_cwd.as_deref());
                         self.current_command_cwd = metadata_cwd;
                     }
                     let typeahead = std::mem::take(&mut self.pending_prompt_typeahead);
@@ -5227,6 +5246,7 @@ impl TerminalState {
                 // Command executed (output begins)
                 if let ZoneState::CommandStarted(prompt_start, cmd_start) = self.current_zone_state
                 {
+                    self.organism_idle_cwd = None;
                     // Anything printed while the prompt was idle stays inline
                     // when a command starts before the next A; Anvil/Forge do
                     // not splice it into the command's output block.
@@ -5415,6 +5435,7 @@ impl TerminalState {
                 // Markdown export and the agent prompt. So D may only FILL an
                 // empty slot, for a shell that reports cwd on D but not on C;
                 // it may never replace one. ember and forge both guard this.
+                self.observe_organism_idle_cwd(metadata_cwd.as_deref());
                 let command_cwd = self.current_command_cwd.take();
                 let cwd = command_cwd
                     .clone()
@@ -7168,6 +7189,29 @@ impl TerminalState {
     /// The cwd the child last reported through OSC 7, if any.
     pub fn current_working_dir(&self) -> Option<&str> {
         self.current_working_dir.as_deref()
+    }
+
+    fn observe_organism_idle_cwd(&mut self, cwd: Option<&str>) {
+        let bounded = cwd.filter(|cwd| {
+            cwd.starts_with('/')
+                && cwd.len() <= 2048
+                && jterm_core::execution_journal::is_valid_jsh_cwd(cwd)
+        });
+        if self.organism_idle_cwd.as_deref() != bounded {
+            self.organism_idle_cwd = bounded.map(str::to_owned);
+        }
+    }
+
+    /// Fresh, bounded directory evidence for the idle companion only. This
+    /// never falls back to a previous command or to the sticky process cache.
+    pub(crate) fn organism_idle_working_dir(&self) -> Option<&str> {
+        if self.use_alt_buffer
+            || self.prompt_submission_pending
+            || !matches!(self.current_zone_state, ZoneState::CommandStarted(_, _))
+        {
+            return None;
+        }
+        self.organism_idle_cwd.as_deref()
     }
 
     /// Decode an OSC 7 payload into a local filesystem path.
@@ -10289,6 +10333,7 @@ impl TerminalState {
                     self.watch_batch.interrupted = true;
                     self.watch_batch.boundary = true;
                     self.use_alt_buffer = true;
+                    self.organism_idle_cwd = None;
                     // Retained cells keep their keys, but an unterminated
                     // primary-screen link must not arm alternate-screen text.
                     self.current_hyperlink = None;
@@ -14801,6 +14846,101 @@ mod tests {
             assert_eq!(completed.len(), 1);
             assert_eq!(completed[0].command_cwd.as_deref(), Some("/source"));
             assert!(terminal.take_completed_commands().is_empty());
+        }
+    }
+
+    #[test]
+    fn organism_idle_directory_uses_the_finished_shell_location_without_rewriting_start() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_batch(b"\x1b]133;A;cwd=/source\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.organism_idle_working_dir(), Some("/source"));
+        terminal.process_batch(b"cd /destination\r\n\x1b]133;C;cwd=/source\x07");
+        assert_eq!(terminal.organism_idle_working_dir(), None);
+        terminal.process_batch(b"\x1b]133;D;0;cwd=/destination\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.organism_idle_working_dir(), Some("/destination"));
+        let completed = terminal.take_completed_commands();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].command_cwd.as_deref(), Some("/source"));
+    }
+
+    #[test]
+    fn organism_idle_directory_never_reuses_sticky_osc7_after_work_or_alt_screen() {
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_batch(b"\x1b]7;file://localhost/source\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.organism_idle_working_dir(), Some("/source"));
+        terminal.process_batch(
+            b"cd /destination\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+        );
+        assert_eq!(terminal.current_working_dir(), Some("/source"));
+        assert_eq!(terminal.organism_idle_working_dir(), None);
+        terminal.process_batch(b"\x1b]7;file://localhost/destination\x07");
+        assert_eq!(terminal.organism_idle_working_dir(), Some("/destination"));
+        terminal.process_batch(b"\x1b[?1049h\x1b[?1049l");
+        assert_eq!(terminal.organism_idle_working_dir(), None);
+        assert_eq!(terminal.current_working_dir(), Some("/destination"));
+        terminal.process_batch(b"run\r\n\x1b]133;C\x07\x1b]7;file://localhost/child-directory\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        // Output-time cwd and a missing D never prove the next prompt's cwd.
+        assert_eq!(terminal.organism_idle_working_dir(), None);
+    }
+
+    #[test]
+    fn organism_idle_directory_rejects_invalid_remote_relative_and_stale_end_metadata() {
+        for invalid in [
+            "\x1b]7;file://definitely-remote.invalid/remote\x07",
+            "\x1b]133;A;cwd=/first;cwd=/second\x07$ \x1b]133;B\x07",
+            "\x1b]133;A;cwd=relative\x07$ \x1b]133;B\x07",
+            "\x1b]133;A;cwd=/bad%0Apath\x07$ \x1b]133;B\x07",
+        ] {
+            let mut terminal = TerminalState::new(80, 24);
+            terminal.process_batch(b"\x1b]133;A;cwd=/source\x07$ \x1b]133;B\x07");
+            assert_eq!(terminal.organism_idle_working_dir(), Some("/source"));
+            terminal.process_batch(invalid.as_bytes());
+            assert_eq!(terminal.organism_idle_working_dir(), None, "{invalid:?}");
+        }
+        let mut terminal = TerminalState::new(80, 24);
+        terminal.process_batch(b"\x1b]133;A;cwd=/source\x07$ \x1b]133;B\x07run\r\n\x1b]133;C;id=current;cwd=/source\x07");
+        terminal.process_batch(b"\x1b]133;D;0;id=stale;cwd=/wrong\x07");
+        assert!(terminal.is_command_running());
+        assert_eq!(terminal.organism_idle_working_dir(), None);
+        terminal
+            .process_batch(b"\x1b]133;D;0;id=current;cwd=/right\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(terminal.organism_idle_working_dir(), Some("/right"));
+    }
+
+    #[test]
+    fn organism_idle_directory_bounds_storage_at_every_metadata_boundary() {
+        for length in [2048, 2049] {
+            let cwd = format!("/{}", "x".repeat(length - 1));
+            let expected = (length <= 2048).then_some(cwd.as_str());
+            for (source, report) in [
+                ("OSC 7", format!("\x1b]7;file://localhost{cwd}\x07")),
+                (
+                    "OSC 133 A",
+                    format!("\x1b]133;A;cwd={cwd}\x07$ \x1b]133;B\x07"),
+                ),
+                (
+                    "OSC 133 B",
+                    format!("\x1b]133;A\x07$ \x1b]133;B;cwd={cwd}\x07"),
+                ),
+                (
+                    "OSC 133 D",
+                    format!("run\r\n\x1b]133;C;cwd=/source\x07\x1b]133;D;0;cwd={cwd}\x07\x1b]133;A\x07$ \x1b]133;B\x07"),
+                ),
+            ] {
+                let mut terminal = TerminalState::new(80, 24);
+                terminal.process_batch(b"\x1b]133;A;cwd=/source\x07$ \x1b]133;B\x07");
+                terminal.process_batch(report.as_bytes());
+                assert_eq!(
+                    terminal.organism_idle_cwd.as_deref(),
+                    expected,
+                    "stored {source} cwd with {length} bytes"
+                );
+                assert_eq!(
+                    terminal.organism_idle_working_dir(),
+                    expected,
+                    "idle {source} cwd with {length} bytes"
+                );
+            }
         }
     }
 

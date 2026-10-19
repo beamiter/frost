@@ -383,6 +383,15 @@ fn organism_settings_hint(
     }
 }
 
+/// Calendar knowledge is sampled on existing native event/tick boundaries.
+fn organism_local_day() -> Option<i64> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let millis = elapsed.as_millis().min(u64::MAX as u128) as u64;
+    Some(jterm_core::organism_memory::local_day_at_ms(millis))
+}
+
 /// Live eligibility never changes the reserved card height.
 fn companion_strip_height(enabled: bool, expanded: bool, bottom_bar: bool) -> f32 {
     if enabled && expanded && bottom_bar {
@@ -15879,6 +15888,7 @@ impl Frost {
                 // Observe only live session identities, before processing this
                 // batch so enabling during C..D cannot replay that command.
                 if self.config.ascii_organism_enabled {
+                    self.organism.observe_work_day(organism_local_day());
                     if let Some(sess) = self
                         .sessions
                         .iter()
@@ -15961,6 +15971,12 @@ impl Frost {
                             }
                             self.organism
                                 .batch_finished(id, sess.terminal.is_command_running());
+                            self.organism.observe_work_context(
+                                id,
+                                sess.terminal.organism_idle_working_dir(),
+                            );
+                        } else {
+                            self.organism.observe_work_context(id, None);
                         }
                     }
                 }
@@ -19162,8 +19178,10 @@ impl Frost {
             Message::OrganismTick(cause) => {
                 self.organism_wake_counts.record(&cause);
                 if self.config.ascii_organism_enabled {
-                    let ids: Vec<usize> = self.sessions.iter().map(|s| s.id).collect();
-                    self.organism.retain_sessions(&ids);
+                    // Closing a pane removes its life by stable ID. Animation
+                    // needs only the active owner; never rescan/reallocate the
+                    // complete pane set just to retain it on every frame.
+                    self.organism.observe_work_day(organism_local_day());
                     if let Some(sess) = self.sessions.get(self.active) {
                         if !sess.managed_remote && !sess.transcript_read_only() {
                             self.organism
@@ -19172,6 +19190,10 @@ impl Frost {
                                 self.organism
                                     .set_remote(sess.id, sess.observed_ssh_command().is_some());
                             }
+                            self.organism.observe_work_context(
+                                sess.id,
+                                sess.terminal.organism_idle_working_dir(),
+                            );
                         }
                     }
                 }
@@ -23534,6 +23556,7 @@ impl Frost {
         });
         let presentation =
             presentation.unwrap_or_else(organism::LivePresentation::passive_presence);
+        let companion_color = terminal_view::organism_tone_color(presentation.tone, &self.theme);
         let companion_height = self.organism_strip_height();
         let companion: Element<'_, Message> = if !layout.body || presentation.explanation.is_empty()
         {
@@ -23545,7 +23568,7 @@ impl Frost {
                 .font(iced::Font::MONOSPACE)
                 .size(13)
                 .line_height(iced::widget::text::LineHeight::Absolute(16.0.into()))
-                .color(self.c_accent())
+                .color(companion_color)
                 .into();
             let detail = layout.explanation.then(|| {
                 let mut header = row![text("ASCII organism")
@@ -23556,11 +23579,11 @@ impl Frost {
                     })]
                 .spacing(8)
                 .align_y(iced::Alignment::Center);
-                // Frost has no persistent organism memory. Keep that boundary
-                // visible without crowding the narrower body-first card.
+                // A qualitative life readout stays secondary to real results.
+                // Memory and motion controls remain in the companion settings.
                 if layout.glyph {
                     header = header.push(Space::new().width(Length::Fill)).push(
-                        text("volatile · no LLM")
+                        text(presentation.life)
                             .size(self.effective_font_size())
                             .color(self.c_text_dim()),
                     );
@@ -23568,10 +23591,17 @@ impl Frost {
                 column![
                     header,
                     container(
-                        text(presentation.explanation.clone().into_owned())
-                            .size(self.effective_font_size())
-                            .line_height(iced::widget::text::LineHeight::Relative(1.3))
-                            .wrapping(text::Wrapping::WordOrGlyph),
+                        column![
+                            text(presentation.status.clone().into_owned())
+                                .size(self.effective_font_size())
+                                .color(companion_color)
+                                .wrapping(text::Wrapping::None),
+                            text(presentation.explanation.clone().into_owned())
+                                .size(self.effective_font_size())
+                                .color(self.c_text_dim())
+                                .wrapping(text::Wrapping::None),
+                        ]
+                        .spacing(2),
                     )
                     .height(Length::Fixed(self.effective_font_size() * 2.6))
                     .clip(true),
@@ -23580,7 +23610,7 @@ impl Frost {
                 .width(Length::Fill)
                 .into()
             });
-            let accent = self.c_accent();
+            let accent = companion_color;
             let border = blend(self.c_border(), accent, 0.35);
             let background = self.with_window_opacity(blend(self.c_panel(), accent, 0.035));
             companion_card_content(body, detail, self.companion_toggle(true))
@@ -23610,6 +23640,8 @@ impl Frost {
                 glyph,
                 sprite,
                 explanation,
+                status,
+                life,
                 ..
             } = presentation;
             let candidate_visible = self.organism_hover_eligible()
@@ -23632,7 +23664,7 @@ impl Frost {
                     text(glyph)
                         .font(iced::Font::MONOSPACE)
                         .size(11)
-                        .color(self.c_text_dim()),
+                        .color(companion_color),
                     Space::new().width(Length::Fill),
                     cue,
                 ]
@@ -23649,13 +23681,19 @@ impl Frost {
                             container(text(sprite).font(iced::Font::MONOSPACE).size(13))
                                 .width(Length::Fixed(200.0))
                                 .height(Length::Fixed(72.0)),
+                            text(status.into_owned())
+                                .size(self.effective_font_size())
+                                .color(companion_color),
                             text(explanation.into_owned()).size(self.effective_font_size()),
+                            text(life)
+                                .size(self.effective_font_size())
+                                .color(self.c_text_dim()),
                         ]
                         .spacing(8),
                     )
                     .padding(8)
                     .width(Length::Fixed(220.0))
-                    .max_height(160.0)
+                    .max_height(220.0)
                     // Tooltip overlays otherwise pass an unbounded draw viewport.
                     .clip(true);
                     tooltip(slot, detail, tooltip::Position::Top).into()
@@ -34286,7 +34324,9 @@ mod tests {
             .split_once("    fn companion_toggle(")
             .unwrap()
             .0;
-        assert!(bar.contains("text(\"volatile · no LLM\")"));
+        assert!(bar.contains("text(presentation.life)"));
+        assert!(bar.contains("text(presentation.status.clone().into_owned())"));
+        assert!(bar.contains("terminal_view::organism_tone_color(presentation.tone, &self.theme)"));
         assert!(bar.contains(".size(self.effective_font_size())"));
         assert!(bar.contains("weight: iced::font::Weight::Bold"));
         assert!(bar.contains(".height(Length::Fixed(self.effective_font_size() * 2.6))"));

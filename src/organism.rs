@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use jterm_core::organism::{
     classify_command, sprite_frame_with_context, sticky_glyph_with_context, AmbientMind, Behavior,
     BodyLanguage, CircadianPhase, LifeState, NativeOrganism, RenderContext, RepoVigil, Tone,
-    WatchRhythm,
 };
 use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
 use serde::{Deserialize, Serialize};
@@ -162,10 +161,20 @@ impl fmt::Display for Pose {
 
 pub use jterm_core::organism_clock::WindowLife;
 
+/// Only reducer-authored, content-free feedback survives the event drain.
+/// The original hold controls its lifetime; no command or terminal text is kept.
+struct CompletionFeedback {
+    behavior: Behavior,
+    status: String,
+    tone: Tone,
+}
+
 struct SessionLife {
     native: NativeOrganism,
     /// Volatile command-scoped cwd, bounded independently of terminal history.
     work_context: Option<String>,
+    /// Fresh idle-directory evidence matches the command-at-start scope.
+    work_context_current: bool,
     ambient: AmbientMind,
     context: RenderContext,
     /// A command already running when enabled is deliberately not replayed.
@@ -173,6 +182,7 @@ struct SessionLife {
     /// No event-source activation epoch exists: discard the initial PTY batch.
     quarantine_batch: bool,
     reaction_until: Option<Instant>,
+    completion: Option<CompletionFeedback>,
     remote: bool,
     next_remote_probe: Instant,
 }
@@ -182,17 +192,20 @@ impl SessionLife {
         Self {
             native: NativeOrganism::from_persisted_state(LifeState::default()),
             work_context: None,
+            work_context_current: false,
             ambient: AmbientMind::seeded(id as u64),
             context: PreviewPose::Calm.context(),
             accept_completion: !running,
             quarantine_batch: true,
             reaction_until: None,
+            completion: None,
             remote: true,
             next_remote_probe: now,
         }
     }
 
     fn set_work_context(&mut self, cwd: Option<&str>) {
+        self.work_context_current = false;
         let bounded = cwd.filter(|cwd| !cwd.is_empty() && cwd.len() <= 2048);
         if bounded.is_none() || bounded != self.work_context.as_deref() {
             // Unknown locations cannot join two commands into one work loop.
@@ -245,7 +258,9 @@ pub struct LivePresentation {
     /// Same shared pose with the presentation-only native walking flag.
     pub walking_sprite: String,
     pub explanation: Cow<'static, str>,
-    pub status: &'static str,
+    pub status: Cow<'static, str>,
+    /// A qualitative description of the creature, never the user's state.
+    pub life: &'static str,
     pub tone: Option<Tone>,
     pub wander: Option<u64>,
     pub bottom: bool,
@@ -261,7 +276,8 @@ impl LivePresentation {
             sprite: sprite_frame_with_context(context, 0).into_owned(),
             walking_sprite: sprite_frame_with_context(context, 0).into_owned(),
             explanation: Cow::Borrowed("Quietly here. Live reactions are paused in this context."),
-            status: "quiet · live reactions paused",
+            status: Cow::Borrowed("quiet · live reactions paused"),
+            life: "quietly here",
             tone: Some(Tone::Quiet),
             wander: None,
             bottom: true,
@@ -272,20 +288,7 @@ impl LivePresentation {
 /// Describe only the output rhythm already selected for this render snapshot.
 /// These observations do not infer command progress, intent, or stalled work.
 fn live_explanation(context: RenderContext) -> Cow<'static, str> {
-    let base = jterm_core::organism_daily::behavior_explanation(context.behavior);
-    if !matches!(
-        context.behavior,
-        Behavior::WatchCommand | Behavior::WatchSettled
-    ) {
-        return Cow::Borrowed(base);
-    }
-    let observation = match context.watch_rhythm {
-        WatchRhythm::Steady => return Cow::Borrowed(base),
-        WatchRhythm::Busy => "Recent output activity.",
-        WatchRhythm::Waiting => "No new output observed recently.",
-        WatchRhythm::Resumed => "Output activity resumed.",
-    };
-    Cow::Owned(format!("{base} {observation}"))
+    Cow::Borrowed(jterm_core::organism_daily::context_explanation(context))
 }
 
 pub struct PreviewPresentation {
@@ -348,6 +351,7 @@ pub struct Organism {
     sessions: HashMap<usize, SessionLife>,
     born: Instant,
     life: WindowLife,
+    work_day: Option<i64>,
     retreat_until: Instant,
     pub pose: Pose,
     hello: GentleInteraction,
@@ -369,6 +373,7 @@ impl Default for Organism {
             sessions: HashMap::new(),
             born: now,
             life: WindowLife::new_at(Duration::ZERO),
+            work_day: None,
             retreat_until: now,
             pose: Pose(PreviewPose::Calm),
             hello: GentleInteraction::default(),
@@ -398,6 +403,44 @@ impl Organism {
             self.cancel_live_greeting();
             self.enabled = enabled;
             self.life = WindowLife::new_at(self.born.elapsed());
+            self.work_day = None;
+        }
+    }
+
+    /// The host supplies local civil-day knowledge on existing event/tick
+    /// boundaries. A new or unknown day retires old work loops, preserving the
+    /// window's continuous physiology and short completion hold.
+    pub fn observe_work_day(&mut self, day: Option<i64>) {
+        if !self.enabled || self.work_day == day {
+            return;
+        }
+        self.work_day = day;
+        for life in self.sessions.values_mut() {
+            life.set_work_context(None);
+            life.ambient.interrupt();
+            if life.context.behavior.is_repo_vigil() {
+                life.context = PreviewPose::Calm.context();
+            }
+        }
+    }
+
+    /// Location evidence is supplied by the native prompt parser, never by
+    /// polling a process, replaying a command or guessing from visible text.
+    pub fn observe_work_context(&mut self, id: usize, idle_cwd: Option<&str>) {
+        if let Some(life) = self.sessions.get_mut(&id) {
+            let current = self.enabled
+                && self.work_day.is_some()
+                && !life.remote
+                && idle_cwd.is_some_and(|cwd| {
+                    cwd.starts_with('/')
+                        && cwd.len() <= 2048
+                        && life.work_context.as_deref() == Some(cwd)
+                });
+            life.work_context_current = current;
+            if !current && life.context.behavior.is_repo_vigil() {
+                life.ambient.interrupt();
+                life.context = PreviewPose::Calm.context();
+            }
         }
     }
 
@@ -441,6 +484,9 @@ impl Organism {
         }
         if let Some(life) = self.sessions.get_mut(&id) {
             life.remote = remote;
+            if remote {
+                life.work_context_current = false;
+            }
             life.next_remote_probe = Instant::now() + Duration::from_millis(900);
         }
     }
@@ -453,10 +499,6 @@ impl Organism {
         self.watch.reset_owner(id);
         self.live_attention.cancel(&id);
         self.sessions.remove(&id);
-    }
-
-    pub fn retain_sessions(&mut self, ids: &[usize]) {
-        self.sessions.retain(|id, _| ids.contains(id));
     }
 
     /// Called only from the existing completion drain, never by frame timers.
@@ -546,6 +588,13 @@ impl Organism {
             false,
         );
         life.reaction_until = Some(self.born + now + reaction.hold_duration());
+        life.completion = Some(CompletionFeedback {
+            behavior: reaction.behavior,
+            // All text comes from the shared reducer. Bound even that text so
+            // future metadata additions cannot turn the card into a transcript.
+            status: reaction.description.chars().take(240).collect(),
+            tone: reaction.tone,
+        });
     }
 
     pub fn batch_finished(&mut self, id: usize, running: bool) {
@@ -553,6 +602,20 @@ impl Organism {
             self.live_attention.cancel(&id);
         }
         if let Some(life) = self.sessions.get_mut(&id) {
+            if running {
+                life.work_context_current = false;
+                // A newly observed command supersedes the previous result.
+                // Keep its earned physiology, but never replay that result if
+                // the next shell boundary has no trustworthy completion.
+                life.reaction_until = None;
+                life.completion = None;
+                life.ambient.interrupt();
+                life.context = RenderContext::new(
+                    Behavior::Idle,
+                    BodyLanguage::from_state(self.life.state()),
+                    false,
+                );
+            }
             if life.quarantine_batch {
                 life.quarantine_batch = false;
                 life.accept_completion = !running;
@@ -835,9 +898,10 @@ impl Organism {
         self.sessions
             .get(&id)
             .filter(|life| {
-                !life
-                    .reaction_until
-                    .is_some_and(|deadline| now >= deadline.saturating_duration_since(self.born))
+                (!life.context.behavior.is_repo_vigil() || life.work_context_current)
+                    && !life.reaction_until.is_some_and(|deadline| {
+                        now >= deadline.saturating_duration_since(self.born)
+                    })
             })
             .map(|life| life.context)
             .unwrap_or_else(|| PreviewPose::Calm.context())
@@ -878,11 +942,16 @@ impl Organism {
                 .is_none_or(|deadline| elapsed >= deadline.saturating_duration_since(self.born))
             {
                 life.reaction_until = None;
+                life.completion = None;
                 let behavior = life.ambient.step(
                     self.life.state(),
                     self.life.idle_for(elapsed).as_secs_f32(),
                     dt,
-                    RepoVigil::None,
+                    if life.work_context_current && self.work_day.is_some() {
+                        life.native.repo_vigil()
+                    } else {
+                        RepoVigil::None
+                    },
                 );
                 life.context = RenderContext::new(
                     behavior.display(),
@@ -1171,6 +1240,18 @@ impl Organism {
                 .map_or(context, |snapshot| snapshot.presentation)
         };
         let frame = Self::frame_at(motion, now);
+        // Running work and an explicit greeting own the visible pose. A stale
+        // completion must never relabel either, nor flash after a background
+        // hold has expired before this pane receives its next tick.
+        let completion = (!running)
+            .then(|| self.sessions.get(&id))
+            .flatten()
+            .filter(|life| {
+                life.reaction_until
+                    .is_some_and(|deadline| now < deadline.saturating_duration_since(self.born))
+            })
+            .and_then(|life| life.completion.as_ref())
+            .filter(|feedback| feedback.behavior == context.behavior);
         LivePresentation {
             glyph: sticky_glyph_with_context(context, frame).into_owned(),
             sprite: sprite_frame_with_context(context, frame).into_owned(),
@@ -1183,6 +1264,7 @@ impl Organism {
             )
             .into_owned(),
             explanation: live_explanation(context),
+            life: jterm_core::organism_daily::life_description(self.life.state()),
             wander: (motion == Some(Motion::Full)
                 && matches!(context.behavior, Behavior::Idle | Behavior::Explore))
             .then_some(if context.behavior == Behavior::Explore {
@@ -1203,37 +1285,29 @@ impl Organism {
                     | Behavior::GuardRecovery
                     | Behavior::GuardCautious
             ),
-            status: match context.behavior {
-                Behavior::WatchCommand | Behavior::WatchSettled | Behavior::WatchAgent => {
-                    "watching · command running"
-                }
-                Behavior::InspectError
-                | Behavior::SitNearError
-                | Behavior::GuardFailure
-                | Behavior::GuardStuck => "quiet · keeping an eye on the last result",
-                Behavior::Celebrate
-                | Behavior::CelebrateBig
-                | Behavior::RestAfterPush
-                | Behavior::GuardRecovery => "settled · work completed",
-                Behavior::Approach => "hello · keeping you company",
-                _ => "quiet · waiting for a real Block event",
-            },
-            tone: Some(match context.behavior {
-                Behavior::InspectError
-                | Behavior::SitNearError
-                | Behavior::GuardFailure
-                | Behavior::GuardStuck => Tone::Error,
-                Behavior::Celebrate
-                | Behavior::CelebrateBig
-                | Behavior::RestAfterPush
-                | Behavior::GuardRecovery => Tone::Success,
-                Behavior::UnknownOutcome | Behavior::GuardCautious => Tone::Warning,
-                Behavior::WatchCommand
-                | Behavior::WatchSettled
-                | Behavior::WatchAgent
-                | Behavior::Approach => Tone::Active,
-                _ => Tone::Quiet,
-            }),
+            status: completion.map_or_else(
+                || Cow::Borrowed(jterm_core::organism_daily::behavior_label(context.behavior)),
+                |feedback| Cow::Owned(feedback.status.clone()),
+            ),
+            tone: Some(completion.map_or_else(
+                || match context.behavior {
+                    Behavior::InspectError
+                    | Behavior::SitNearError
+                    | Behavior::GuardFailure
+                    | Behavior::GuardStuck => Tone::Error,
+                    Behavior::Celebrate
+                    | Behavior::CelebrateBig
+                    | Behavior::RestAfterPush
+                    | Behavior::GuardRecovery => Tone::Success,
+                    Behavior::UnknownOutcome | Behavior::GuardCautious => Tone::Warning,
+                    Behavior::WatchCommand
+                    | Behavior::WatchSettled
+                    | Behavior::WatchAgent
+                    | Behavior::Approach => Tone::Active,
+                    _ => Tone::Quiet,
+                },
+                |feedback| feedback.tone,
+            )),
         }
     }
 
@@ -1277,6 +1351,7 @@ impl Organism {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jterm_core::organism::WatchRhythm;
 
     #[test]
     fn agent_lifecycle_edges_are_deduplicated_and_disabled_edges_are_consumed() {
@@ -2359,23 +2434,39 @@ mod tests {
 
     #[test]
     fn live_watch_explanation_preserves_behavior_and_names_only_observed_rhythm() {
-        for behavior in [Behavior::WatchCommand, Behavior::WatchSettled] {
+        for behavior in [
+            Behavior::WatchCommand,
+            Behavior::WatchSettled,
+            Behavior::WatchAgent,
+        ] {
             let context = RenderContext::new(
                 behavior,
                 BodyLanguage::from_state(LifeState::default()),
                 false,
             );
-            let base = jterm_core::organism_daily::behavior_explanation(behavior);
             assert!(matches!(live_explanation(context), Cow::Borrowed(_)));
             for (rhythm, observation) in [
-                (WatchRhythm::Busy, "Recent output activity."),
-                (WatchRhythm::Waiting, "No new output observed recently."),
-                (WatchRhythm::Resumed, "Output activity resumed."),
+                (
+                    WatchRhythm::Busy,
+                    "Following an active stream of command output.",
+                ),
+                (
+                    WatchRhythm::Waiting,
+                    "Keeping watch while output is quiet; the command has not finished.",
+                ),
+                (
+                    WatchRhythm::Resumed,
+                    "Perking up as command output resumes.",
+                ),
             ] {
                 assert_eq!(
                     live_explanation(context.with_watch_rhythm(rhythm)),
-                    format!("{base} {observation}")
+                    observation,
                 );
+                assert!(matches!(
+                    live_explanation(context.with_watch_rhythm(rhythm)),
+                    Cow::Borrowed(_)
+                ));
             }
         }
     }
@@ -2388,7 +2479,7 @@ mod tests {
             Behavior::InspectError,
             Behavior::Celebrate,
             Behavior::UnknownOutcome,
-            Behavior::WatchAgent,
+            Behavior::Sleep,
         ] {
             for rhythm in [
                 WatchRhythm::Steady,
@@ -2433,7 +2524,7 @@ mod tests {
                     organism.presentation_at(1, true, settled, motion, Duration::from_millis(4100));
                 assert_eq!(
                     first.explanation,
-                    format!("{base} No new output observed recently.")
+                    "Keeping watch while output is quiet; the command has not finished."
                 );
                 assert_eq!(first.explanation, next.explanation);
             }
@@ -3088,6 +3179,276 @@ mod tests {
             organism.batch_finished(id, false);
         }
         organism
+    }
+
+    #[test]
+    fn completion_readout_preserves_real_outcome_duration_and_core_tone() {
+        for (command, exit, duration, phrase, tone) in [
+            (
+                "cargo test --token=private-value",
+                Some(101),
+                Some(1_200),
+                "exit 101",
+                Tone::Error,
+            ),
+            (
+                "cargo test --token=private-value",
+                Some(0),
+                Some(1_200),
+                "build/test passed",
+                Tone::Success,
+            ),
+            (
+                "git push origin private-branch",
+                Some(0),
+                Some(1_200),
+                "git push completed",
+                Tone::Success,
+            ),
+            (
+                "echo private-value",
+                None,
+                Some(1_200),
+                "status unknown",
+                Tone::Warning,
+            ),
+            (
+                "sleep 60 private-value",
+                Some(0),
+                Some(60_000),
+                "command finished cleanly",
+                Tone::Quiet,
+            ),
+        ] {
+            let mut organism = completion_fixture(&[1, 2]);
+            organism.completed_at(
+                1,
+                command,
+                exit,
+                duration,
+                Some("/private-location"),
+                Duration::ZERO,
+            );
+            let before = values(organism.life.state());
+            for motion in [Some(Motion::Full), Some(Motion::Calm), Some(Motion::Static)] {
+                let sample =
+                    organism.presentation_at(1, false, false, motion, Duration::from_millis(100));
+                assert!(sample.status.contains(phrase), "{}", sample.status);
+                assert!(sample.status.contains(if duration == Some(60_000) {
+                    "60.0s"
+                } else {
+                    "1.2s"
+                }));
+                assert_eq!(sample.tone, Some(tone));
+                assert!(sample.status.chars().count() <= 240);
+                assert!(!sample.status.contains("private"));
+                assert!(!sample.explanation.contains("private"));
+                assert!(!sample.life.contains("private"));
+                let other =
+                    organism.presentation_at(2, false, false, motion, Duration::from_millis(100));
+                assert_ne!(other.status, sample.status);
+            }
+            assert_eq!(values(organism.life.state()), before);
+        }
+    }
+
+    #[test]
+    fn repeated_clean_builds_keep_the_shared_quiet_acknowledgment() {
+        let mut organism = completion_fixture(&[1]);
+        for index in 0..8 {
+            let now = Duration::from_secs(index * 3);
+            organism.completed_at(1, "cargo test", Some(0), Some(250), Some("/project"), now);
+            let sample = organism.presentation_at(1, false, false, Some(Motion::Calm), now);
+            assert_eq!(
+                sample.tone,
+                Some(if index >= 6 {
+                    Tone::Quiet
+                } else {
+                    Tone::Success
+                })
+            );
+            assert!(sample.status.contains("build/test passed"));
+            assert!(sample.status.contains("250ms"));
+        }
+    }
+
+    #[test]
+    fn completion_readout_expires_and_cannot_relabel_new_work_or_greetings() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed_at(1, "echo done", Some(0), Some(15), None, Duration::ZERO);
+        let at = Duration::from_millis(100);
+        assert!(organism
+            .presentation_at(1, false, false, Some(Motion::Calm), at)
+            .status
+            .contains("15ms"));
+        let running = organism.presentation_at(1, true, false, Some(Motion::Full), at);
+        assert_eq!(running.status, "Watching command");
+        assert_eq!(running.tone, Some(Tone::Active));
+        let context = organism.sessions[&1].context;
+        organism.live_attention.test_explicit(1, at, context);
+        let greeting = organism.presentation_at(1, false, false, Some(Motion::Calm), at);
+        assert_eq!(greeting.status, "Coming closer");
+        assert_eq!(greeting.tone, Some(Tone::Active));
+        organism.cancel_live_greeting();
+        let expired = organism.presentation_at(
+            1,
+            false,
+            false,
+            Some(Motion::Static),
+            Duration::from_millis(1500),
+        );
+        assert_eq!(expired.status, "Keeping company");
+        assert!(!expired.status.contains("15ms"));
+        // No tick is necessary to invalidate an expired background readout.
+        assert!(organism.sessions[&1].completion.is_some());
+    }
+
+    #[test]
+    fn closing_a_pane_releases_its_feedback_without_an_animation_sweep() {
+        let mut organism = completion_fixture(&[4, 11]);
+        organism.completed_at(4, "cargo test", Some(101), None, None, Duration::ZERO);
+        organism.completed_at(11, "git push", Some(0), None, None, Duration::ZERO);
+        organism.forget_session(4);
+        assert!(!organism.sessions.contains_key(&4));
+        assert_eq!(organism.sessions.len(), 1);
+        let remaining = organism.presentation_at(
+            11,
+            false,
+            false,
+            Some(Motion::Calm),
+            Duration::from_millis(100),
+        );
+        assert!(remaining.status.contains("git push completed"));
+        organism.set_enabled(false);
+        assert!(organism.sessions.is_empty());
+    }
+
+    #[test]
+    fn new_native_work_retires_feedback_without_replaying_the_previous_result() {
+        let mut organism = completion_fixture(&[1]);
+        organism.completed_at(1, "cargo test", Some(101), Some(50), None, Duration::ZERO);
+        let before = values(organism.life.state());
+        organism.batch_finished(1, true);
+        assert!(organism.sessions[&1].completion.is_none());
+        assert!(organism.sessions[&1].reaction_until.is_none());
+        organism.batch_finished(1, false);
+        let after = organism.presentation_at(
+            1,
+            false,
+            false,
+            Some(Motion::Calm),
+            Duration::from_millis(100),
+        );
+        assert_eq!(after.status, "Keeping company");
+        assert_eq!(values(organism.life.state()), before);
+    }
+
+    #[test]
+    fn native_vigil_follows_failure_recovery_and_push_only_in_the_known_idle_scope() {
+        let mut organism = completion_fixture(&[1]);
+        organism.observe_work_day(Some(10));
+        for (index, expected) in [
+            Behavior::GuardFailure,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = Duration::from_secs(index as u64 * 12);
+            organism.completed_at(1, "cargo test", Some(101), Some(50), Some("/project"), at);
+            organism.observe_work_context(1, Some("/project"));
+            organism.tick_at(Some(1), false, false, at + Duration::from_secs(11));
+            assert_eq!(organism.sessions[&1].context.behavior, expected);
+            let sample = organism.presentation_at(
+                1,
+                false,
+                false,
+                Some(Motion::Calm),
+                at + Duration::from_secs(11),
+            );
+            assert!(sample.status.contains("Keeping watch"));
+            assert!(!sample.status.contains("50ms"));
+        }
+        organism.completed_at(
+            1,
+            "cargo test",
+            Some(0),
+            Some(50),
+            Some("/project"),
+            Duration::from_secs(36),
+        );
+        organism.observe_work_context(1, Some("/project"));
+        organism.tick_at(Some(1), false, false, Duration::from_secs(44));
+        assert_eq!(
+            organism.sessions[&1].context.behavior,
+            Behavior::GuardRecovery
+        );
+        organism.completed_at(
+            1,
+            "git push",
+            Some(0),
+            Some(50),
+            Some("/project"),
+            Duration::from_secs(45),
+        );
+        organism.observe_work_context(1, Some("/project"));
+        organism.tick_at(Some(1), false, false, Duration::from_secs(51));
+        assert!(!organism.sessions[&1].context.behavior.is_repo_vigil());
+    }
+
+    #[test]
+    fn missing_changed_remote_or_new_day_scope_retires_the_vigil_without_life_rewards() {
+        for (cwd, day, remote) in [
+            (None, Some(10), false),
+            (Some("/other"), Some(10), false),
+            (Some("/project"), Some(11), false),
+            (Some("/project"), None, false),
+            (Some("/project"), Some(10), true),
+        ] {
+            let mut organism = completion_fixture(&[1]);
+            organism.observe_work_day(Some(10));
+            organism.completed_at(
+                1,
+                "cargo test",
+                Some(101),
+                None,
+                Some("/project"),
+                Duration::ZERO,
+            );
+            organism.observe_work_context(1, Some("/project"));
+            organism.tick_at(Some(1), false, false, Duration::from_secs(6));
+            assert_eq!(
+                organism.sessions[&1].context.behavior,
+                Behavior::GuardFailure
+            );
+            let before = values(organism.life.state());
+            organism.observe_work_day(day);
+            organism.set_remote(1, remote);
+            organism.observe_work_context(1, cwd);
+            assert!(!organism
+                .base_context_at(1, Duration::from_secs(6))
+                .behavior
+                .is_repo_vigil());
+            assert_eq!(values(organism.life.state()), before);
+            if day != Some(10) {
+                assert_eq!(organism.sessions[&1].native.repo_vigil(), RepoVigil::None);
+            }
+        }
+    }
+
+    #[test]
+    fn idle_readout_describes_the_painted_body_without_allocating_watch_text() {
+        let mut organism = completion_fixture(&[1]);
+        let mut life = organism.life.state();
+        life.energy = 0.1;
+        organism.life.replace_state(life);
+        let sample =
+            organism.presentation_at(1, false, false, Some(Motion::Static), Duration::ZERO);
+        assert!(sample.life.contains("Low energy"));
+        assert_eq!(sample.explanation, "Dozing while its energy recovers.");
+        assert!(matches!(sample.explanation, Cow::Borrowed(_)));
+        assert_eq!(sample.status, "Keeping company");
     }
 
     #[test]

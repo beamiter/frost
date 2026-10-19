@@ -51,7 +51,10 @@ pub(crate) struct OrganismBodyObservation {
     pub ticket: Option<LiveAttentionTicket>,
 }
 
-fn organism_tone_color(tone: Option<jterm_core::organism::Tone>, theme: &Theme) -> Color {
+pub(crate) fn organism_tone_color(
+    tone: Option<jterm_core::organism::Tone>,
+    theme: &Theme,
+) -> Color {
     use jterm_core::organism::Tone;
     match tone {
         Some(Tone::Error) => theme.ansi_color(1),
@@ -1375,11 +1378,25 @@ impl<'a, Message> TermWidget<'a, Message> {
             bounds.y + self.metrics.padding,
         );
         let card = self.card_geometry(bounds, segment).body;
+        // A clipped/incomplete card cannot contain the live body. Reject it
+        // before examining blank cells, including during history scrolling.
+        if !segment.real_top
+            || !segment.real_bottom
+            || !native_body_rect(clip).includes(native_body_rect(card))
+            || self.cursor.0 < segment.start_row
+            || self.cursor.0 >= segment.end_row
+        {
+            return None;
+        }
         // Complete default cells only. Styled blanks, wide continuations, links,
         // badges and synthetic rows are occupied; no prompt/password guessing.
+        // Only the suffix after the cursor can host the body. Start at its
+        // bottom and stop at the first occupied row; preceding history cannot
+        // change the verified blank-space envelope below that row.
         let mut last_occupied_row = None;
         let mut columns = usize::MAX;
-        for row in segment.start_row..segment.end_row {
+        let suffix_start = self.cursor.0.checked_add(1)?;
+        for row in (suffix_start..segment.end_row).rev() {
             let cells = self.grid.get(row)?;
             columns = columns.min(cells.len());
             let block = self.blocks.get(row)?;
@@ -1388,6 +1405,7 @@ impl<'a, Message> TermWidget<'a, Message> {
                 || block.collapsed_summary.is_some()
             {
                 last_occupied_row = Some(row);
+                break;
             }
         }
         let surface = organism_block::Surface {
@@ -1402,8 +1420,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             columns,
             complete: segment.real_top && segment.real_bottom,
         };
-        let travel = organism_block::travel_band(surface)?;
-        let mut resting = organism_block::placement(surface)?;
+        let (mut resting, travel) = organism_block::layout(surface)?;
         if body.bottom {
             resting.y = travel.y + travel.height - resting.height;
         }
@@ -1413,7 +1430,7 @@ impl<'a, Message> TermWidget<'a, Message> {
             epoch: body.epoch,
             projection: self.projection_key.clone()?,
             rect,
-            travel: organism_block::travel_band(surface)?,
+            travel,
         })
     }
 
@@ -4667,7 +4684,7 @@ where
                         );
                         chrome_text(
                             renderer,
-                            presentation.status,
+                            &presentation.status,
                             Rectangle {
                                 x: detail_x,
                                 y: top + text_h + 3.0,
@@ -4703,11 +4720,11 @@ where
                             alpha(default_fg, 0.5),
                             clip,
                         );
-                        let badge_w = 19.0 * cw;
+                        let badge_w = presentation.life.chars().count() as f32 * cw;
                         if detail_w > 14.0 * cw + 12.0 + badge_w {
                             chrome_text(
                                 renderer,
-                                "volatile · no LLM",
+                                presentation.life,
                                 Rectangle {
                                     x: area.x + area.width - 12.0 - 3.0 * cw - badge_w,
                                     y: top,
